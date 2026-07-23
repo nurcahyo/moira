@@ -1,3 +1,6 @@
+[deployment]
+environment = "development"
+
 [server]
 host = "127.0.0.1"
 port = 8080
@@ -8,6 +11,7 @@ max_connections = 10
 min_connections = 1
 connect_timeout_seconds = 5
 require = false
+migrate_on_startup = true
 
 [secrets]
 master_key_base64 = ""
@@ -39,6 +43,9 @@ prefix_length = 20
 [provider_security]
 allow_private_provider_urls = false
 allow_http_provider_urls = false
+
+[cors]
+allowed_origins = ["*"]
 
 [docs]
 expose_admin = false

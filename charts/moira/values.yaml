@@ -1,4 +1,4 @@
-replicaCount: 2
+replicaCount: 1
 
 image:
   repository: ghcr.io/example/moira
@@ -28,13 +28,13 @@ resources:
     memory: 2Gi
 
 autoscaling:
-  enabled: true
-  minReplicas: 2
-  maxReplicas: 10
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 1
   targetCPUUtilizationPercentage: 70
 
 podDisruptionBudget:
-  enabled: true
+  enabled: false
   minAvailable: 1
 
 networkPolicy:
@@ -45,22 +45,28 @@ serviceMonitor:
   interval: 30s
 
 config:
+  MOIRA_DEPLOYMENT__ENVIRONMENT: "production"
   MOIRA_SERVER__HOST: "0.0.0.0"
   MOIRA_SERVER__PORT: "8080"
   MOIRA_DATABASE__REQUIRE: "true"
-  MOIRA_REDIS__ENABLED: "true"
+  MOIRA_DATABASE__MIGRATE_ON_STARTUP: "false"
+  MOIRA_SECRETS__KEY_ID: "production-v1"
+  MOIRA_SECRETS__ALLOW_INSECURE_DEV_KEY: "false"
+  MOIRA_AUTH__ADMIN__ENABLED: "true"
+  MOIRA_AUTH__CALLER__DEV_TRUST_HEADERS: "false"
+  MOIRA_API_KEYS__PEPPER_VERSION: "production-v1"
+  MOIRA_API_KEYS__ALLOW_INSECURE_DEV_PEPPER: "false"
+  MOIRA_PROVIDER_SECURITY__ALLOW_HTTP_PROVIDER_URLS: "false"
+  MOIRA_CORS__ALLOWED_ORIGINS: "https://moira.example.com"
+  MOIRA_REDIS__ENABLED: "false"
   MOIRA_REDIS__NAMESPACE: "moira"
   MOIRA_REDIS__INVALIDATION_CHANNEL: "moira:runtime-config"
-  MOIRA_WORKERS__ENABLED: "true"
+  MOIRA_WORKERS__ENABLED: "false"
   MOIRA_TELEMETRY__JSON: "true"
   MOIRA_TELEMETRY__PROMETHEUS_ENABLED: "true"
-  MOIRA_TELEMETRY__OTEL_ENABLED: "true"
+  MOIRA_TELEMETRY__OTEL_ENABLED: "false"
 
 secret:
-  create: true
+  create: false
   name: moira-secrets
-  data:
-    MOIRA_DATABASE__URL: "postgres://replace:replace@postgres:5432/moira"
-    MOIRA_REDIS__URL: "redis://redis:6379/0"
-    MOIRA_SECRETS__MASTER_KEY_BASE64: "replace-with-32-byte-base64-key"
-    MOIRA_API_KEYS__PEPPER_BASE64: "replace-with-32-byte-base64-pepper"
+  data: {}

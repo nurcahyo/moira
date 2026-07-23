@@ -5,34 +5,50 @@ use moira::{
     app::AppState,
     application::{AdminService, MoiraExecutionService, RequestContext},
     build_router,
-    config::Settings,
+    config::{ProcessMode, Settings},
     domain::{DiagnosticExecutionRequest, ExecutionOptions, SystemKeyCreateRequest},
     infra::db,
     security::{Actor, ActorType},
 };
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let mode =
+        ProcessMode::parse(std::env::args().nth(1).as_deref()).context("parse process mode")?;
     let settings = Settings::load().context("load settings")?;
+    settings.validate(mode).context("validate settings")?;
     moira::config::telemetry::init(&settings.telemetry)?;
+    let unsafe_features = settings.unsafe_development_features(mode);
+    if !unsafe_features.is_empty() {
+        warn!(
+            features = ?unsafe_features,
+            "unsafe development configuration is active"
+        );
+    }
 
-    match std::env::args().nth(1).as_deref() {
-        Some("bootstrap-system-key") => {
+    match mode {
+        ProcessMode::Migrate => {
+            migrate(settings).await?;
+            return Ok(());
+        }
+        ProcessMode::BootstrapSystemKey => {
             bootstrap_system_key(settings).await?;
             return Ok(());
         }
-        Some("execute-test") => {
+        ProcessMode::ExecuteTest => {
             execute_test(settings).await?;
             return Ok(());
         }
-        _ => {}
+        ProcessMode::Serve => {}
     }
 
     let pool = db::connect(&settings.database).await?;
-    if let Some(pool) = &pool {
-        db::migrate(pool).await?;
+    if settings.database.migrate_on_startup {
+        if let Some(pool) = &pool {
+            db::migrate(pool).await?;
+        }
     }
 
     let addr: SocketAddr = settings.server.bind_addr()?;
@@ -46,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
             state.circuits.clone(),
         )
     });
-    let app = build_router(state);
+    let app = build_router(state)?;
 
     let listener = TcpListener::bind(addr)
         .await
@@ -62,6 +78,15 @@ async fn main() -> anyhow::Result<()> {
         supervisor.shutdown().await;
     }
 
+    Ok(())
+}
+
+async fn migrate(settings: Settings) -> anyhow::Result<()> {
+    let pool = db::connect(&settings.database)
+        .await?
+        .context("database url is required for migrate")?;
+    db::migrate(&pool).await?;
+    info!("database migrations completed");
     Ok(())
 }
 
