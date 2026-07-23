@@ -904,7 +904,7 @@ impl MoiraExecutionService {
             .update_attempt(
                 attempt_id,
                 &ExecutionAttemptUpdate {
-                    status: AttemptStatus::Failed,
+                    status: attempt_status_for_failure(failure.class),
                     failure_class: Some(failure.class),
                     provider_status_code,
                     latency_ms: Some(elapsed_ms(started)),
@@ -1333,15 +1333,21 @@ impl EventCollector {
             payload,
         };
         self.next_sequence += 1;
-        self.forward_now(event.clone());
-        self.events.push(event);
+        if self.live_tx.is_some() {
+            self.forward_now(event);
+        } else {
+            self.events.push(event);
+        }
     }
 
     fn push_existing(&mut self, mut event: RuntimeEventEnvelope) {
         event.sequence = self.next_sequence;
         self.next_sequence += 1;
-        self.forward_now(event.clone());
-        self.events.push(event);
+        if self.live_tx.is_some() {
+            self.forward_now(event);
+        } else {
+            self.events.push(event);
+        }
     }
 
     async fn push_stream(
@@ -1382,7 +1388,9 @@ impl EventCollector {
                 }
             }
         }
-        self.events.push(event);
+        if self.live_tx.is_none() {
+            self.events.push(event);
+        }
         Ok(())
     }
 
@@ -1626,7 +1634,7 @@ fn failed_outcome(
     ExecutionOutcome {
         request_id: command.request_id,
         execution_id: command.execution_id,
-        status: ExecutionStatus::Failed,
+        status: execution_status_for_failure(failure.class),
         output_text: None,
         structured_output: None,
         usage: UsageSummary::default(),
@@ -1692,12 +1700,12 @@ fn supported_credential_types(
     use crate::domain::CredentialType;
     match provider_type {
         ProviderType::AzureOpenAi => &[CredentialType::AzureOpenAi, CredentialType::ApiKey],
-        ProviderType::OpenAi
-        | ProviderType::OpenAiCompatible
-        | ProviderType::Local
-        | ProviderType::Anthropic
-        | ProviderType::Gemini
-        | ProviderType::DeepSeek => &[CredentialType::ApiKey, CredentialType::BearerToken],
+        ProviderType::OpenAi | ProviderType::OpenAiCompatible | ProviderType::Local => {
+            &[CredentialType::ApiKey, CredentialType::BearerToken]
+        }
+        ProviderType::Anthropic | ProviderType::Gemini | ProviderType::DeepSeek => {
+            &[CredentialType::ApiKey]
+        }
         ProviderType::Custom => &[],
     }
 }
@@ -1768,14 +1776,28 @@ fn attempt_summary(
         provider_id: candidate.provider_id,
         provider_model_id: candidate.provider_model_id,
         credential_id,
-        status: if failure_class.is_some() {
-            AttemptStatus::Failed
-        } else {
-            AttemptStatus::Succeeded
-        },
+        status: failure_class
+            .map(attempt_status_for_failure)
+            .unwrap_or(AttemptStatus::Succeeded),
         failure_class,
         latency_ms: Some(elapsed_ms(started)),
         usage,
+    }
+}
+
+fn attempt_status_for_failure(failure_class: ExecutionFailureClass) -> AttemptStatus {
+    if failure_class == ExecutionFailureClass::RequestCancelled {
+        AttemptStatus::Cancelled
+    } else {
+        AttemptStatus::Failed
+    }
+}
+
+fn execution_status_for_failure(failure_class: ExecutionFailureClass) -> ExecutionStatus {
+    if failure_class == ExecutionFailureClass::RequestCancelled {
+        ExecutionStatus::Cancelled
+    } else {
+        ExecutionStatus::Failed
     }
 }
 
@@ -1842,6 +1864,36 @@ mod tests {
     use super::*;
     use crate::domain::ExecutionOptions;
     use crate::{app::AppState, config::Settings, security::ActorType};
+
+    #[test]
+    fn cancellation_uses_terminal_cancelled_states() {
+        assert_eq!(
+            attempt_status_for_failure(ExecutionFailureClass::RequestCancelled),
+            AttemptStatus::Cancelled
+        );
+        assert_eq!(
+            execution_status_for_failure(ExecutionFailureClass::RequestCancelled),
+            ExecutionStatus::Cancelled
+        );
+        assert_eq!(
+            attempt_status_for_failure(ExecutionFailureClass::ProviderUnavailable),
+            AttemptStatus::Failed
+        );
+    }
+
+    #[test]
+    fn provider_credential_types_match_runtime_factory_support() {
+        use crate::domain::CredentialType;
+
+        assert_eq!(
+            supported_credential_types(ProviderType::Anthropic),
+            &[CredentialType::ApiKey]
+        );
+        assert_eq!(
+            supported_credential_types(ProviderType::OpenAiCompatible),
+            &[CredentialType::ApiKey, CredentialType::BearerToken]
+        );
+    }
 
     #[test]
     fn admin_scope_allows_runtime_overrides_for_non_consumers() {
