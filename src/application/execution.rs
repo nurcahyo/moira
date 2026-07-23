@@ -622,30 +622,27 @@ impl MoiraExecutionService {
                         last_failure = Some(failure.clone());
                         if failure.retryable && retries < runtime_policy.max_retries {
                             retries += 1;
-                            if sleep_for_retry(
+                            match sleep_for_retry(
                                 retries,
                                 &candidate.runtime_policy,
                                 execution_deadline,
+                                &cancellation,
                             )
                             .await
                             {
-                                continue;
+                                RetryWait::Ready => continue,
+                                RetryWait::Deadline => last_failure = Some(deadline_failure()),
+                                RetryWait::Cancelled => last_failure = Some(cancelled_failure()),
                             }
-                            last_failure = Some(deadline_failure());
                         }
                         break;
                     }
                     Err(_) => {
-                        let failure = if bounded_by_total_deadline
-                            || remaining_execution_time(execution_deadline).is_none()
-                        {
-                            deadline_failure()
-                        } else {
-                            ExecutionFailure::new(
-                                ExecutionFailureClass::ProviderTimeout,
-                                "provider request exceeded effective deadline",
-                            )
-                        };
+                        let failure = attempt_timeout_failure(
+                            bounded_by_total_deadline
+                                || remaining_execution_time(execution_deadline).is_none(),
+                            events.output_committed(),
+                        );
                         self.state
                             .circuits
                             .on_failure(
@@ -676,16 +673,18 @@ impl MoiraExecutionService {
                         last_failure = Some(failure.clone());
                         if failure.retryable && retries < runtime_policy.max_retries {
                             retries += 1;
-                            if sleep_for_retry(
+                            match sleep_for_retry(
                                 retries,
                                 &candidate.runtime_policy,
                                 execution_deadline,
+                                &cancellation,
                             )
                             .await
                             {
-                                continue;
+                                RetryWait::Ready => continue,
+                                RetryWait::Deadline => last_failure = Some(deadline_failure()),
+                                RetryWait::Cancelled => last_failure = Some(cancelled_failure()),
                             }
-                            last_failure = Some(deadline_failure());
                         }
                         break;
                     }
@@ -1292,6 +1291,7 @@ struct EventCollector {
     live_tx: Option<mpsc::Sender<Result<RuntimeEventEnvelope, ExecutionFailure>>>,
     cancellation: CancellationToken,
     delivery_failure: Option<ExecutionFailure>,
+    output_committed: bool,
 }
 
 impl EventCollector {
@@ -1304,6 +1304,7 @@ impl EventCollector {
             live_tx: None,
             cancellation: CancellationToken::new(),
             delivery_failure: None,
+            output_committed: false,
         }
     }
 
@@ -1320,6 +1321,7 @@ impl EventCollector {
             live_tx: Some(live_tx),
             cancellation,
             delivery_failure: None,
+            output_committed: false,
         }
     }
 
@@ -1425,6 +1427,14 @@ impl EventCollector {
         self.delivery_failure.clone()
     }
 
+    fn mark_output_committed(&mut self) {
+        self.output_committed = true;
+    }
+
+    fn output_committed(&self) -> bool {
+        self.output_committed
+    }
+
     fn into_events(self) -> Vec<RuntimeEventEnvelope> {
         self.events
     }
@@ -1508,6 +1518,7 @@ async fn execute_rig_stream(
                     .await?;
                 text.push_str(&delta);
                 committed = true;
+                events.mark_output_committed();
             }
             RuntimeStreamItem::ToolCallStarted {
                 internal_call_id,
@@ -1526,6 +1537,7 @@ async fn execute_rig_stream(
                     )
                     .await?;
                 committed = true;
+                events.mark_output_committed();
             }
             RuntimeStreamItem::ToolCallDelta {
                 id,
@@ -1544,6 +1556,7 @@ async fn execute_rig_stream(
                     )
                     .await?;
                 committed = true;
+                events.mark_output_committed();
             }
             RuntimeStreamItem::UsageUpdated {
                 usage: updated_usage,
@@ -1805,13 +1818,21 @@ fn elapsed_ms(started: Instant) -> i64 {
     i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryWait {
+    Ready,
+    Deadline,
+    Cancelled,
+}
+
 async fn sleep_for_retry(
     retry_number: usize,
     policy: &ProviderRuntimePolicyRecord,
     deadline: Instant,
-) -> bool {
+    cancellation: &CancellationToken,
+) -> RetryWait {
     let Some(remaining) = remaining_execution_time(deadline) else {
-        return false;
+        return RetryWait::Deadline;
     };
     let base = policy.retry_base_delay_ms.max(0) as u64;
     let max = policy.retry_max_delay_ms.max(0) as u64;
@@ -1820,12 +1841,23 @@ async fn sleep_for_retry(
     if delay > 0 {
         let delay = Duration::from_millis(delay);
         if delay >= remaining {
-            tokio::time::sleep(remaining).await;
-            return false;
+            tokio::select! {
+                _ = cancellation.cancelled() => return RetryWait::Cancelled,
+                _ = tokio::time::sleep(remaining) => return RetryWait::Deadline,
+            }
         }
-        tokio::time::sleep(delay).await;
+        tokio::select! {
+            _ = cancellation.cancelled() => return RetryWait::Cancelled,
+            _ = tokio::time::sleep(delay) => {}
+        }
     }
-    remaining_execution_time(deadline).is_some()
+    if cancellation.is_cancelled() {
+        RetryWait::Cancelled
+    } else if remaining_execution_time(deadline).is_some() {
+        RetryWait::Ready
+    } else {
+        RetryWait::Deadline
+    }
 }
 
 fn remaining_execution_time(deadline: Instant) -> Option<Duration> {
@@ -1839,6 +1871,25 @@ fn deadline_failure() -> ExecutionFailure {
         ExecutionFailureClass::DeadlineExceeded,
         "execution exceeded its total deadline",
     )
+}
+
+fn attempt_timeout_failure(
+    bounded_by_total_deadline: bool,
+    output_committed: bool,
+) -> ExecutionFailure {
+    let mut failure = if bounded_by_total_deadline {
+        deadline_failure()
+    } else {
+        ExecutionFailure::new(
+            ExecutionFailureClass::ProviderTimeout,
+            "provider request exceeded effective deadline",
+        )
+    };
+    if output_committed {
+        failure.retryable = false;
+        failure.fallback_eligible = false;
+    }
+    failure
 }
 
 pub async fn execute_diagnostic(
@@ -1893,6 +1944,19 @@ mod tests {
             supported_credential_types(ProviderType::OpenAiCompatible),
             &[CredentialType::ApiKey, CredentialType::BearerToken]
         );
+    }
+
+    #[test]
+    fn timeout_after_stream_output_cannot_retry_or_fallback() {
+        let failure = attempt_timeout_failure(false, true);
+        assert_eq!(failure.class, ExecutionFailureClass::ProviderTimeout);
+        assert!(!failure.retryable);
+        assert!(!failure.fallback_eligible);
+
+        let deadline = attempt_timeout_failure(true, true);
+        assert_eq!(deadline.class, ExecutionFailureClass::DeadlineExceeded);
+        assert!(!deadline.retryable);
+        assert!(!deadline.fallback_eligible);
     }
 
     #[test]

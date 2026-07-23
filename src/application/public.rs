@@ -361,6 +361,8 @@ impl PublicExecutionService {
             .runtime
             .internal_stream_queue_capacity
             .max(1);
+        let send_timeout =
+            Duration::from_secs(self.state.settings.public_api.heartbeat_seconds.max(1));
         let (public_tx, mut public_rx) = mpsc::channel(capacity);
         let service = self.clone();
         tokio::spawn(async move {
@@ -373,6 +375,7 @@ impl PublicExecutionService {
                     response,
                     handle,
                     public_tx,
+                    send_timeout,
                 )
                 .await;
         });
@@ -394,6 +397,7 @@ impl PublicExecutionService {
         response: PublicResponseRecord,
         mut handle: crate::domain::ExecutionStreamHandle,
         public_tx: mpsc::Sender<PublicSseEnvelope>,
+        send_timeout: Duration,
     ) {
         let mut sequence = 1u64;
         let mut disconnected = false;
@@ -402,23 +406,26 @@ impl PublicExecutionService {
             ("response.created", json!({ "status": "in_progress" })),
             ("response.in_progress", json!({})),
         ] {
-            if public_tx
-                .send(public_sse(
+            if send_public_event(
+                &public_tx,
+                public_sse(
                     response.id,
                     response.execution_id,
                     response.request_id.clone(),
                     sequence,
                     event_type,
                     payload,
-                ))
-                .await
-                .is_err()
+                ),
+                send_timeout,
+            )
+            .await
             {
+                sequence += 1;
+            } else {
                 disconnected = true;
                 handle.cancel();
                 break;
             }
-            sequence += 1;
         }
 
         while !disconnected {
@@ -436,11 +443,11 @@ impl PublicExecutionService {
                     let Some(mapped) = map_runtime_event(response.id, &event, sequence) else {
                         continue;
                     };
-                    if public_tx.send(mapped).await.is_err() {
+                    if send_public_event(&public_tx, mapped, send_timeout).await {
+                        sequence += 1;
+                    } else {
                         disconnected = true;
                         handle.cancel();
-                    } else {
-                        sequence += 1;
                     }
                 }
             }
@@ -460,7 +467,24 @@ impl PublicExecutionService {
                 outcome.as_ref().ok().and_then(|value| value.as_ref().ok()),
                 &policy,
             );
-            let _ = self.public_repo.cancel_response(response.id, &update).await;
+            if self
+                .public_repo
+                .cancel_response(response.id, &update)
+                .await
+                .is_err()
+            {
+                let _ = self
+                    .audit(
+                        &actor,
+                        &ctx,
+                        "response.stream.cancellation_persistence_failed",
+                        AuditResult::Failed,
+                        Some(response.id.to_string()),
+                        json!({ "execution_id": response.execution_id }),
+                    )
+                    .await;
+                return;
+            }
             let _ = self
                 .audit(
                     &actor,
@@ -529,15 +553,22 @@ impl PublicExecutionService {
                                 }),
                             )
                         }
-                        Err(error) => terminal_failure(
-                            &response,
-                            sequence,
-                            &ctx,
-                            ExecutionFailure::new(
+                        Err(error) => {
+                            let failure = ExecutionFailure::new(
                                 ExecutionFailureClass::InternalError,
                                 error.to_string(),
-                            ),
-                        ),
+                            );
+                            let failure_update = failure_update(&failure, &policy);
+                            if self
+                                .public_repo
+                                .fail_response(response.id, &failure_update)
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            terminal_failure(&response, sequence, &ctx, failure)
+                        }
                     }
                 }
                 ExecutionStatus::Failed => {
@@ -548,7 +579,14 @@ impl PublicExecutionService {
                         )
                     });
                     let update = terminal_update_from_outcome(&outcome, &policy, Some(&failure));
-                    let _ = self.public_repo.fail_response(response.id, &update).await;
+                    if self
+                        .public_repo
+                        .fail_response(response.id, &update)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                     let _ = self
                         .audit(
                             &actor,
@@ -566,7 +604,14 @@ impl PublicExecutionService {
                 }
                 ExecutionStatus::Cancelled => {
                     let update = cancellation_update(Some(&outcome), &policy);
-                    let _ = self.public_repo.cancel_response(response.id, &update).await;
+                    if self
+                        .public_repo
+                        .cancel_response(response.id, &update)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                     let _ = self
                         .audit(
                             &actor,
@@ -583,10 +628,24 @@ impl PublicExecutionService {
             Ok(Err(failure)) => {
                 let update = failure_update(&failure, &policy);
                 if failure.class == ExecutionFailureClass::RequestCancelled {
-                    let _ = self.public_repo.cancel_response(response.id, &update).await;
+                    if self
+                        .public_repo
+                        .cancel_response(response.id, &update)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                     terminal_cancelled(&response, sequence, &ctx)
                 } else {
-                    let _ = self.public_repo.fail_response(response.id, &update).await;
+                    if self
+                        .public_repo
+                        .fail_response(response.id, &update)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                     terminal_failure(&response, sequence, &ctx, failure)
                 }
             }
@@ -596,12 +655,19 @@ impl PublicExecutionService {
                     format!("stream outcome unavailable: {error}"),
                 );
                 let update = failure_update(&failure, &policy);
-                let _ = self.public_repo.fail_response(response.id, &update).await;
+                if self
+                    .public_repo
+                    .fail_response(response.id, &update)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
                 terminal_failure(&response, sequence, &ctx, failure)
             }
         };
 
-        let _ = public_tx.send(terminal).await;
+        let _ = send_public_event(&public_tx, terminal, send_timeout).await;
     }
 
     pub async fn get_response(
@@ -1733,6 +1799,19 @@ fn public_sse(
     }
 }
 
+async fn send_public_event(
+    tx: &mpsc::Sender<PublicSseEnvelope>,
+    event: PublicSseEnvelope,
+    send_timeout: Duration,
+) -> bool {
+    tokio::select! {
+        _ = tx.closed() => false,
+        result = tokio::time::timeout(send_timeout, tx.send(event)) => {
+            matches!(result, Ok(Ok(())))
+        }
+    }
+}
+
 fn public_access(actor: &Actor, privileged: bool) -> PublicAccess {
     PublicAccess {
         privileged,
@@ -1963,5 +2042,40 @@ mod tests {
         assert_eq!(mapped.response_id, format!("resp_{response_id}"));
         assert_eq!(mapped.execution_id, format!("exec_{execution_id}"));
         assert_eq!(mapped.payload, json!({ "delta": "hello" }));
+    }
+
+    #[tokio::test]
+    async fn stalled_public_consumer_hits_bounded_send_timeout() {
+        let (tx, _rx) = mpsc::channel(1);
+        assert!(
+            send_public_event(
+                &tx,
+                public_sse(
+                    Uuid::now_v7(),
+                    Uuid::now_v7(),
+                    "req-test".to_string(),
+                    1,
+                    "response.created",
+                    json!({})
+                ),
+                Duration::from_millis(10),
+            )
+            .await
+        );
+        assert!(
+            !send_public_event(
+                &tx,
+                public_sse(
+                    Uuid::now_v7(),
+                    Uuid::now_v7(),
+                    "req-test".to_string(),
+                    2,
+                    "response.in_progress",
+                    json!({})
+                ),
+                Duration::from_millis(10),
+            )
+            .await
+        );
     }
 }

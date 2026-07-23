@@ -66,41 +66,6 @@ data:
   MOIRA_TELEMETRY__PROMETHEUS_ENABLED: "true"
   MOIRA_TELEMETRY__OTEL_ENABLED: "false"
 ---
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: moira-migrate
-  labels:
-    app.kubernetes.io/name: moira
-spec:
-  backoffLimit: 3
-  template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: moira-migrate
-    spec:
-      serviceAccountName: moira
-      restartPolicy: OnFailure
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 10001
-        fsGroup: 10001
-      containers:
-        - name: migrate
-          image: ghcr.io/example/moira:latest
-          imagePullPolicy: IfNotPresent
-          args: ["migrate"]
-          envFrom:
-            - configMapRef:
-                name: moira-config
-            - secretRef:
-                name: moira-secrets
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop: ["ALL"]
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -222,6 +187,14 @@ spec:
   egress:
     - to:
         - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
       ports:
         - protocol: TCP
           port: 5432

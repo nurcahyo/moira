@@ -48,7 +48,11 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
       - name: Verify migrations against clean pgvector PostgreSQL
+        env:
+          PGPASSWORD: postgres
+          MOIRA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/moira_migration_test
         run: >-
+          createdb -h localhost -U postgres moira_migration_test &&
           cargo test --test security_foundation
           security_foundation_migration_creates_contract_tables_when_configured
           -- --exact --nocapture

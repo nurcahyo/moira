@@ -44,12 +44,10 @@ impl PgSetupRepository {
 
 const SETUP_READINESS_SQL: &str = r#"
 with
-selected_route as (
+eligible_routes as (
     select id
     from route_definitions
     where status = 'active' and deleted_at is null
-    order by case when route_key = 'general' then 0 else 1 end, created_at asc, id asc
-    limit 1
 ),
 eligible_applications as (
     select a.id
@@ -101,7 +99,7 @@ eligible_credentials as (
 matching_policies as (
     select rp.id, rp.application_id, rp.external_tenant_id, rp.provider_id
     from routing_policies rp
-    join selected_route sr on sr.id = rp.route_id
+    join eligible_routes er on er.id = rp.route_id
     join supported_providers p on p.id = rp.provider_id
     join eligible_models pm
       on pm.id = rp.provider_model_id
@@ -122,7 +120,7 @@ select
           and 'moira:admin' = any(scopes)
     ) as root_system_key,
     exists(select 1 from eligible_applications) as application,
-    exists(select 1 from selected_route) as route,
+    exists(select 1 from eligible_routes) as route,
     exists(select 1 from supported_providers) as provider,
     exists(select 1 from eligible_models) as provider_model,
     exists(select 1 from eligible_credentials) as provider_credential,
