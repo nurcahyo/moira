@@ -425,6 +425,45 @@ impl PgPublicRepository {
         public_response_record_from_row(&row)
     }
 
+    pub async fn cancel_response(
+        &self,
+        id: Uuid,
+        update: &ResponseTerminalUpdate,
+    ) -> Result<PublicResponseRecord, AppError> {
+        let usage = serde_json::to_value(&update.usage)
+            .map_err(|err| AppError::Internal(format!("encode usage summary: {err}")))?;
+        let row = sqlx::query(&response_select(
+            r#"
+            update responses
+            set status = 'cancelled',
+                route_id = $2,
+                provider_id = $3,
+                provider_model_id = $4,
+                output_summary = $5,
+                usage_summary = $6,
+                failure_class = $7,
+                failure_message = $8,
+                output_persisted = $9,
+                cancelled_at = now()
+            where id = $1 and status in ('queued', 'in_progress')
+            returning *
+            "#,
+        ))
+        .bind(id)
+        .bind(update.route_id)
+        .bind(update.provider_id)
+        .bind(update.provider_model_id)
+        .bind(&update.output_summary)
+        .bind(&usage)
+        .bind(&update.failure_class)
+        .bind(&update.failure_message)
+        .bind(update.output_persisted)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| AppError::conflict("response_terminal", "response is already terminal"))?;
+        public_response_record_from_row(&row)
+    }
+
     pub async fn find_response_authorized(
         &self,
         id: Uuid,

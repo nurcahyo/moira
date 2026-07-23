@@ -87,7 +87,7 @@ pub async fn create_response(
     responses(
         (
             status = 200,
-            description = "Server-sent event stream; Idempotency-Key is not supported",
+            description = "Live server-sent event stream ending with exactly one response.completed, response.failed, or response.cancelled event; Idempotency-Key is not supported",
             body = PublicSseEnvelope,
             content_type = "text/event-stream",
             headers(("X-Request-Id" = String, description = "Request correlation identifier"))
@@ -362,7 +362,7 @@ pub async fn capabilities(
     responses(
         (
             status = 200,
-            description = "OpenAI-compatible JSON response or server-sent event stream",
+            description = "OpenAI-compatible JSON response or live server-sent event stream ending with exactly one terminal response event",
             content(
                 (PublicResponse = "application/json"),
                 (PublicSseEnvelope = "text/event-stream")

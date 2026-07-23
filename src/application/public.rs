@@ -9,11 +9,14 @@ use rig_core::{
 };
 use serde::Serialize;
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
     app::AppState,
-    application::{ConversationExecutionLink, ConversationService, RequestContext},
+    application::{
+        ConversationExecutionLink, ConversationService, ExecutionService, RequestContext,
+    },
     domain::{
         ApplicationExecutionPolicyPutRequest, ApplicationExecutionPolicyRecord, AuditLogInsert,
         AuditResult, CallerRuntimeIdentity, ExecutionCommand, ExecutionFailure,
@@ -329,133 +332,275 @@ impl PublicExecutionService {
         )
         .await?;
 
-        let service = self.clone();
-        Ok(Box::pin(stream! {
-            let mut sequence = 1u64;
-            yield Ok(public_sse(
-                response.id,
-                response.execution_id,
-                response.request_id.clone(),
-                sequence,
-                "response.created",
-                json!({ "status": "in_progress" }),
-            ));
-            sequence += 1;
-            yield Ok(public_sse(
-                response.id,
-                response.execution_id,
-                response.request_id.clone(),
-                sequence,
-                "response.in_progress",
-                json!({}),
-            ));
-            sequence += 1;
+        let execution = crate::application::MoiraExecutionService::new(self.state.clone())?;
+        let handle = match execution.execute_stream(prepared.command).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                let failure = ExecutionFailure::new(
+                    ExecutionFailureClass::InternalError,
+                    "stream execution failed to start",
+                );
+                let update = ResponseTerminalUpdate {
+                    route_id: None,
+                    provider_id: None,
+                    provider_model_id: None,
+                    output_summary: json!({ "persistence_mode": policy.persistence_mode }),
+                    usage: PublicUsageSummary::default(),
+                    failure_class: Some(failure_code(failure.class).to_string()),
+                    failure_message: Some(error.to_string()),
+                    output_persisted: false,
+                };
+                let _ = self.public_repo.fail_response(response.id, &update).await;
+                return Err(error);
+            }
+        };
 
-            let result = match crate::application::MoiraExecutionService::new(service.state.clone()) {
-                Ok(execution) => execution.execute_with_events(prepared.command.clone()).await,
-                Err(error) => Err(error),
-            };
-            match result {
-                Ok((outcome, events)) => {
-                    for event in events {
-                        if let Some(mapped) = map_runtime_event(response.id, &event, sequence) {
-                            sequence += 1;
-                            yield Ok(mapped);
-                        }
-                    }
-                    match outcome.status {
-                        ExecutionStatus::Succeeded => {
-                            let update = terminal_update_from_outcome(&outcome, &policy, None);
-                            if let Err(error) = service.public_repo.complete_response(response.id, &update).await {
-                                yield Err(error);
-                                return;
-                            }
-                            if let Err(error) = service.record_conversation_assistant(
-                                &actor,
-                                &ctx,
-                                conversation_link.as_ref(),
-                                response.id,
-                                response.execution_id,
-                                outcome.output_text.as_deref(),
-                            ).await {
-                                yield Err(error);
-                                return;
-                            }
-                            if let Err(error) = service.audit(
-                                &actor,
-                                &ctx,
-                                "response.stream.completed",
-                                AuditResult::Success,
-                                Some(response.id.to_string()),
-                                json!({ "execution_id": response.execution_id }),
-                            ).await {
-                                yield Err(error);
-                                return;
-                            }
-                            yield Ok(public_sse(
-                                response.id,
-                                response.execution_id,
-                                response.request_id.clone(),
-                                sequence,
-                                "response.completed",
-                                json!({ "status": "completed", "usage": PublicUsageSummary::from(outcome.usage) }),
-                            ));
-                        }
-                        ExecutionStatus::Failed | ExecutionStatus::Cancelled => {
-                            let failure = outcome.failure.clone().unwrap_or_else(|| {
-                                ExecutionFailure::new(ExecutionFailureClass::InternalError, "execution failed")
-                            });
-                            let update = terminal_update_from_outcome(&outcome, &policy, Some(&failure));
-                            if let Err(error) = service.public_repo.fail_response(response.id, &update).await {
-                                yield Err(error);
-                                return;
-                            }
-                            yield Ok(public_sse(
-                                response.id,
-                                response.execution_id,
-                                response.request_id.clone(),
-                                sequence,
-                                "response.failed",
-                                json!({
-                                    "error": {
-                                        "code": failure_code(failure.class),
-                                        "message": failure.message,
-                                        "request_id": ctx.request_id
-                                    }
-                                }),
-                            ));
-                        }
-                    }
-                }
-                Err(error) => {
-                    let failure = ExecutionFailure::new(
-                        ExecutionFailureClass::InternalError,
-                        "stream execution failed",
-                    );
-                    let _ = service.public_repo.fail_response(
-                        response.id,
-                        &ResponseTerminalUpdate {
-                            route_id: None,
-                            provider_id: None,
-                            provider_model_id: None,
-                            output_summary: json!({ "persistence_mode": policy.persistence_mode }),
-                            usage: PublicUsageSummary::default(),
-                            failure_class: Some(failure_code(failure.class).to_string()),
-                            failure_message: Some(error.to_string()),
-                            output_persisted: false,
-                        },
-                    ).await;
-                    yield Ok(public_sse(
-                        response.id,
-                        response.execution_id,
-                        response.request_id.clone(),
-                        sequence,
-                        "response.failed",
-                        json!({ "error": { "code": "internal_error", "message": error.to_string(), "request_id": ctx.request_id } }),
-                    ));
-                }
+        let capacity = self
+            .state
+            .settings
+            .runtime
+            .internal_stream_queue_capacity
+            .max(1);
+        let (public_tx, mut public_rx) = mpsc::channel(capacity);
+        let service = self.clone();
+        tokio::spawn(async move {
+            service
+                .supervise_public_stream(
+                    actor,
+                    ctx,
+                    policy,
+                    conversation_link,
+                    response,
+                    handle,
+                    public_tx,
+                )
+                .await;
+        });
+
+        Ok(Box::pin(stream! {
+            while let Some(envelope) = public_rx.recv().await {
+                yield Ok(envelope);
             }
         }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn supervise_public_stream(
+        &self,
+        actor: Actor,
+        ctx: RequestContext,
+        policy: ApplicationExecutionPolicyRecord,
+        conversation_link: Option<ConversationExecutionLink>,
+        response: PublicResponseRecord,
+        mut handle: crate::domain::ExecutionStreamHandle,
+        public_tx: mpsc::Sender<PublicSseEnvelope>,
+    ) {
+        let mut sequence = 1u64;
+        let mut disconnected = false;
+
+        for (event_type, payload) in [
+            ("response.created", json!({ "status": "in_progress" })),
+            ("response.in_progress", json!({})),
+        ] {
+            if public_tx
+                .send(public_sse(
+                    response.id,
+                    response.execution_id,
+                    response.request_id.clone(),
+                    sequence,
+                    event_type,
+                    payload,
+                ))
+                .await
+                .is_err()
+            {
+                disconnected = true;
+                handle.cancel();
+                break;
+            }
+            sequence += 1;
+        }
+
+        while !disconnected {
+            tokio::select! {
+                _ = public_tx.closed() => {
+                    disconnected = true;
+                    handle.cancel();
+                }
+                event = handle.events.recv() => {
+                    let event = match event {
+                        Some(Ok(event)) => event,
+                        Some(Err(_)) => continue,
+                        None => break,
+                    };
+                    let Some(mapped) = map_runtime_event(response.id, &event, sequence) else {
+                        continue;
+                    };
+                    if public_tx.send(mapped).await.is_err() {
+                        disconnected = true;
+                        handle.cancel();
+                    } else {
+                        sequence += 1;
+                    }
+                }
+            }
+        }
+
+        if disconnected {
+            while handle.events.recv().await.is_some() {}
+        }
+
+        let outcome = (&mut handle.outcome).await;
+        if !disconnected && public_tx.is_closed() {
+            disconnected = true;
+            handle.cancel();
+        }
+        if disconnected {
+            let update = cancellation_update(
+                outcome.as_ref().ok().and_then(|value| value.as_ref().ok()),
+                &policy,
+            );
+            let _ = self.public_repo.cancel_response(response.id, &update).await;
+            let _ = self
+                .audit(
+                    &actor,
+                    &ctx,
+                    "response.stream.cancelled",
+                    AuditResult::Failed,
+                    Some(response.id.to_string()),
+                    json!({ "execution_id": response.execution_id }),
+                )
+                .await;
+            return;
+        }
+
+        let terminal = match outcome {
+            Ok(Ok(outcome)) => match outcome.status {
+                ExecutionStatus::Succeeded => {
+                    let update = terminal_update_from_outcome(&outcome, &policy, None);
+                    match self
+                        .public_repo
+                        .complete_response(response.id, &update)
+                        .await
+                    {
+                        Ok(_) => {
+                            if let Err(error) = self
+                                .record_conversation_assistant(
+                                    &actor,
+                                    &ctx,
+                                    conversation_link.as_ref(),
+                                    response.id,
+                                    response.execution_id,
+                                    outcome.output_text.as_deref(),
+                                )
+                                .await
+                            {
+                                terminal_failure(
+                                    &response,
+                                    sequence,
+                                    &ctx,
+                                    ExecutionFailure::new(
+                                        ExecutionFailureClass::InternalError,
+                                        error.to_string(),
+                                    ),
+                                )
+                            } else {
+                                let _ = self
+                                    .audit(
+                                        &actor,
+                                        &ctx,
+                                        "response.stream.completed",
+                                        AuditResult::Success,
+                                        Some(response.id.to_string()),
+                                        json!({ "execution_id": response.execution_id }),
+                                    )
+                                    .await;
+                                public_sse(
+                                    response.id,
+                                    response.execution_id,
+                                    response.request_id.clone(),
+                                    sequence,
+                                    "response.completed",
+                                    json!({
+                                        "status": "completed",
+                                        "usage": PublicUsageSummary::from(outcome.usage)
+                                    }),
+                                )
+                            }
+                        }
+                        Err(error) => terminal_failure(
+                            &response,
+                            sequence,
+                            &ctx,
+                            ExecutionFailure::new(
+                                ExecutionFailureClass::InternalError,
+                                error.to_string(),
+                            ),
+                        ),
+                    }
+                }
+                ExecutionStatus::Failed => {
+                    let failure = outcome.failure.clone().unwrap_or_else(|| {
+                        ExecutionFailure::new(
+                            ExecutionFailureClass::InternalError,
+                            "execution failed",
+                        )
+                    });
+                    let update = terminal_update_from_outcome(&outcome, &policy, Some(&failure));
+                    let _ = self.public_repo.fail_response(response.id, &update).await;
+                    let _ = self
+                        .audit(
+                            &actor,
+                            &ctx,
+                            "response.stream.failed",
+                            AuditResult::Failed,
+                            Some(response.id.to_string()),
+                            json!({
+                                "execution_id": response.execution_id,
+                                "failure_class": failure.class
+                            }),
+                        )
+                        .await;
+                    terminal_failure(&response, sequence, &ctx, failure)
+                }
+                ExecutionStatus::Cancelled => {
+                    let update = cancellation_update(Some(&outcome), &policy);
+                    let _ = self.public_repo.cancel_response(response.id, &update).await;
+                    let _ = self
+                        .audit(
+                            &actor,
+                            &ctx,
+                            "response.stream.cancelled",
+                            AuditResult::Failed,
+                            Some(response.id.to_string()),
+                            json!({ "execution_id": response.execution_id }),
+                        )
+                        .await;
+                    terminal_cancelled(&response, sequence, &ctx)
+                }
+            },
+            Ok(Err(failure)) => {
+                let update = failure_update(&failure, &policy);
+                if failure.class == ExecutionFailureClass::RequestCancelled {
+                    let _ = self.public_repo.cancel_response(response.id, &update).await;
+                    terminal_cancelled(&response, sequence, &ctx)
+                } else {
+                    let _ = self.public_repo.fail_response(response.id, &update).await;
+                    terminal_failure(&response, sequence, &ctx, failure)
+                }
+            }
+            Err(error) => {
+                let failure = ExecutionFailure::new(
+                    ExecutionFailureClass::InternalError,
+                    format!("stream outcome unavailable: {error}"),
+                );
+                let update = failure_update(&failure, &policy);
+                let _ = self.public_repo.fail_response(response.id, &update).await;
+                terminal_failure(&response, sequence, &ctx, failure)
+            }
+        };
+
+        let _ = public_tx.send(terminal).await;
     }
 
     pub async fn get_response(
@@ -1466,7 +1611,9 @@ fn map_runtime_event(
     sequence: u64,
 ) -> Option<PublicSseEnvelope> {
     let (event_type, payload) = match event.event_type {
-        RuntimeEventType::ExecutionStarted => ("response.in_progress", json!({})),
+        RuntimeEventType::ExecutionStarted
+        | RuntimeEventType::ExecutionCompleted
+        | RuntimeEventType::ExecutionFailed => return None,
         RuntimeEventType::RoutingStarted => ("response.routing.started", event.payload.clone()),
         RuntimeEventType::RouteSelected => ("response.routing.completed", event.payload.clone()),
         RuntimeEventType::ModelSelected => ("response.model.selected", event.payload.clone()),
@@ -1479,10 +1626,6 @@ fn map_runtime_event(
             ("response.provider_attempt.failed", event.payload.clone())
         }
         RuntimeEventType::FallbackSelected => ("response.fallback.selected", event.payload.clone()),
-        RuntimeEventType::ExecutionCompleted => {
-            ("response.output_text.done", event.payload.clone())
-        }
-        RuntimeEventType::ExecutionFailed => ("response.failed", event.payload.clone()),
         RuntimeEventType::ToolCallStarted
         | RuntimeEventType::ToolCallDelta
         | RuntimeEventType::ToolCallCompleted
@@ -1496,6 +1639,78 @@ fn map_runtime_event(
         event_type,
         payload,
     ))
+}
+
+fn failure_update(
+    failure: &ExecutionFailure,
+    policy: &ApplicationExecutionPolicyRecord,
+) -> ResponseTerminalUpdate {
+    ResponseTerminalUpdate {
+        route_id: None,
+        provider_id: None,
+        provider_model_id: None,
+        output_summary: json!({ "persistence_mode": policy.persistence_mode }),
+        usage: PublicUsageSummary::default(),
+        failure_class: Some(failure_code(failure.class).to_string()),
+        failure_message: Some(failure.message.clone()),
+        output_persisted: false,
+    }
+}
+
+fn cancellation_update(
+    outcome: Option<&ExecutionOutcome>,
+    policy: &ApplicationExecutionPolicyRecord,
+) -> ResponseTerminalUpdate {
+    let failure =
+        ExecutionFailure::new(ExecutionFailureClass::RequestCancelled, "stream cancelled");
+    outcome
+        .map(|outcome| terminal_update_from_outcome(outcome, policy, Some(&failure)))
+        .unwrap_or_else(|| failure_update(&failure, policy))
+}
+
+fn terminal_failure(
+    response: &PublicResponseRecord,
+    sequence: u64,
+    ctx: &RequestContext,
+    failure: ExecutionFailure,
+) -> PublicSseEnvelope {
+    public_sse(
+        response.id,
+        response.execution_id,
+        response.request_id.clone(),
+        sequence,
+        "response.failed",
+        json!({
+            "status": "failed",
+            "error": {
+                "code": failure_code(failure.class),
+                "message": failure.message,
+                "request_id": ctx.request_id
+            }
+        }),
+    )
+}
+
+fn terminal_cancelled(
+    response: &PublicResponseRecord,
+    sequence: u64,
+    ctx: &RequestContext,
+) -> PublicSseEnvelope {
+    public_sse(
+        response.id,
+        response.execution_id,
+        response.request_id.clone(),
+        sequence,
+        "response.cancelled",
+        json!({
+            "status": "cancelled",
+            "error": {
+                "code": "request_cancelled",
+                "message": "stream cancelled",
+                "request_id": ctx.request_id
+            }
+        }),
+    )
 }
 
 fn public_sse(
@@ -1706,5 +1921,46 @@ mod tests {
         let state = AppState::new(crate::config::Settings::default(), None).unwrap();
         let metadata = json!({ "api_key": "sk-test" });
         assert!(validate_metadata(&state, &metadata).is_err());
+    }
+
+    #[test]
+    fn internal_terminal_events_are_not_public_sse_events() {
+        let response_id = Uuid::now_v7();
+        for event_type in [
+            RuntimeEventType::ExecutionStarted,
+            RuntimeEventType::ExecutionCompleted,
+            RuntimeEventType::ExecutionFailed,
+        ] {
+            let event = RuntimeEventEnvelope {
+                request_id: "req-test".to_string(),
+                execution_id: Uuid::now_v7(),
+                sequence: 1,
+                timestamp: Utc::now(),
+                event_type,
+                payload: json!({}),
+            };
+            assert!(map_runtime_event(response_id, &event, 1).is_none());
+        }
+    }
+
+    #[test]
+    fn runtime_delta_keeps_the_public_envelope_contract() {
+        let response_id = Uuid::now_v7();
+        let execution_id = Uuid::now_v7();
+        let event = RuntimeEventEnvelope {
+            request_id: "req-test".to_string(),
+            execution_id,
+            sequence: 7,
+            timestamp: Utc::now(),
+            event_type: RuntimeEventType::OutputTextDelta,
+            payload: json!({ "delta": "hello" }),
+        };
+
+        let mapped = map_runtime_event(response_id, &event, 3).expect("delta should be public");
+        assert_eq!(mapped.event_type, "response.output_text.delta");
+        assert_eq!(mapped.sequence, 3);
+        assert_eq!(mapped.response_id, format!("resp_{response_id}"));
+        assert_eq!(mapped.execution_id, format!("exec_{execution_id}"));
+        assert_eq!(mapped.payload, json!({ "delta": "hello" }));
     }
 }

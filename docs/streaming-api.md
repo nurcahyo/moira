@@ -17,7 +17,12 @@ Events use the envelope:
 }
 ```
 
-Event types include `response.created`, `response.in_progress`, mapped runtime events, `response.completed`, and `response.failed`. The transport sends heartbeat keep-alives using `public_api.heartbeat_seconds`.
+Event types include `response.created`, `response.in_progress`, mapped runtime events, and exactly one terminal event:
 
-The current transport is wired to the Phase 3 execution event collector. It preserves the public SSE contract, but token events may be emitted after the upstream execution finishes rather than as true first-token live streaming.
+- `response.completed` after successful persistence
+- `response.failed` after an execution or persistence failure
+- `response.cancelled` when execution is cancelled
 
+The transport sends heartbeat keep-alives using `public_api.heartbeat_seconds`. Runtime deltas are forwarded through a bounded channel as they arrive; they are not replayed after provider completion.
+
+Dropping the client connection cancels the supervised execution. Moira waits for the execution attempt to become terminal, persists the public response as `cancelled`, and records the cancellation audit event. Partial streamed output is not appended to conversation history.

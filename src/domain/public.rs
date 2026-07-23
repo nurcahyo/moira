@@ -231,7 +231,10 @@ pub struct PublicSseEnvelope {
     pub request_id: String,
     pub sequence: u64,
     pub timestamp: DateTime<Utc>,
+    /// Event name. A stream ends with exactly one `response.completed`,
+    /// `response.failed`, or `response.cancelled` event.
     #[serde(rename = "type")]
+    #[schema(example = "response.cancelled")]
     pub event_type: String,
     pub payload: Value,
 }
