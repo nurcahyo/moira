@@ -253,7 +253,6 @@ impl RuntimeModelHandle {
                 }
                 RuntimeStreamItem::FinalMetadata {
                     provider_request_id: request_id,
-                    ..
                 } => provider_request_id = request_id,
             }
         }
@@ -303,7 +302,6 @@ pub enum RuntimeStreamItem {
     },
     FinalMetadata {
         provider_request_id: Option<String>,
-        provider_response: Option<Value>,
     },
 }
 
@@ -352,8 +350,6 @@ where
 
     Ok(Box::pin(async_stream::stream! {
         let mut reported_usage = false;
-        let mut provider_response = None;
-
         while let Some(item) = stream.next().await {
             let item = match item {
                 Ok(item) => item,
@@ -391,7 +387,6 @@ where
                 StreamedAssistantContent::Final(response) => {
                     let usage = usage_from_rig(response.token_usage());
                     reported_usage = usage.has_any();
-                    provider_response = serde_json::to_value(response).ok();
                     yield Ok(RuntimeStreamItem::UsageUpdated { usage });
                 }
                 StreamedAssistantContent::Reasoning(_)
@@ -409,7 +404,6 @@ where
 
         yield Ok(RuntimeStreamItem::FinalMetadata {
             provider_request_id: stream.message_id.clone(),
-            provider_response,
         });
     }))
 }

@@ -91,8 +91,11 @@ eligible_credentials as (
           (p.provider_type = 'azure_openai'
               and pc.credential_type in ('azure_openai', 'api_key'))
           or
-          (p.provider_type <> 'azure_openai'
+          (p.provider_type in ('openai_compatible', 'openai', 'local')
               and pc.credential_type in ('api_key', 'bearer_token'))
+          or
+          (p.provider_type in ('anthropic', 'gemini', 'deepseek')
+              and pc.credential_type = 'api_key')
       )
 ),
 matching_policies as (
@@ -181,6 +184,7 @@ mod tests {
     fn readiness_query_matches_runtime_credential_compatibility() {
         assert!(SETUP_READINESS_SQL.contains("'azure_openai', 'api_key'"));
         assert!(SETUP_READINESS_SQL.contains("'api_key', 'bearer_token'"));
+        assert!(SETUP_READINESS_SQL.contains("'anthropic', 'gemini', 'deepseek'"));
         assert!(!SETUP_READINESS_SQL.contains("'custom'"));
     }
 }
