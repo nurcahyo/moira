@@ -34,6 +34,7 @@ jobs:
           --health-retries 10
     env:
       MOIRA_DATABASE__URL: postgres://postgres:postgres@localhost:5432/moira
+      MOIRA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/moira
       MOIRA_DATABASE__REQUIRE: true
       MOIRA_REDIS__ENABLED: true
       MOIRA_REDIS__URL: redis://localhost:6379/0
@@ -46,6 +47,11 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
+      - name: Verify migrations against clean pgvector PostgreSQL
+        run: >-
+          cargo test --test security_foundation
+          security_foundation_migration_creates_contract_tables_when_configured
+          -- --exact --nocapture
 
   supply-chain:
     runs-on: ubuntu-latest

@@ -1,8 +1,24 @@
 use moira::{config::DatabaseSettings, infra::db};
 
+fn migration_test_database_url() -> Option<String> {
+    match std::env::var("MOIRA_TEST_DATABASE_URL") {
+        Ok(url) if !url.trim().is_empty() => Some(url),
+        _ if std::env::var("CI").is_ok_and(|value| value.eq_ignore_ascii_case("true")) => {
+            panic!(
+                "MOIRA_TEST_DATABASE_URL must be set when CI=true; \
+                 refusing to skip the migration contract"
+            );
+        }
+        _ => {
+            eprintln!("skipping migration contract: set MOIRA_TEST_DATABASE_URL to run it locally");
+            None
+        }
+    }
+}
+
 #[tokio::test]
 async fn security_foundation_migration_creates_contract_tables_when_configured() {
-    let Ok(url) = std::env::var("MOIRA_TEST_DATABASE_URL") else {
+    let Some(url) = migration_test_database_url() else {
         return;
     };
     let settings = DatabaseSettings {
