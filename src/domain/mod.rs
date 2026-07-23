@@ -13,8 +13,10 @@ pub use admin::{
     CredentialSecret, CredentialStatus, CredentialType, IdempotencyRecord, JwtClaimMapping,
     KeyStatus, ListResponse, PageQuery, ProviderCreateRequest, ProviderModelCreateRequest,
     ProviderModelPatchRequest, ProviderModelRecord, ProviderPatchRequest, ProviderRecord,
-    ProviderType, ResourceStatus, RotateCredentialRequest, ScopeType, SystemKeyCreateRequest,
-    TrustedJwtIssuerCreateRequest, TrustedJwtIssuerPatchRequest, TrustedJwtIssuerRecord,
+    ProviderType, ResourceStatus, RotateCredentialRequest, ScopeType, SetupCheckName,
+    SetupCheckState, SetupChecks, SetupDeploymentEnvironment, SetupStatus, SetupStatusResponse,
+    SystemKeyCreateRequest, TrustedJwtIssuerCreateRequest, TrustedJwtIssuerPatchRequest,
+    TrustedJwtIssuerRecord,
 };
 pub use conversation::{
     ConversationContentPersistence, ConversationCreateRequest, ConversationMessageCreateRequest,

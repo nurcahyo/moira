@@ -59,6 +59,7 @@ fn documented_router() -> OpenApiRouter<AppState> {
             conversation::delete_memory
         ))
         .routes(routes!(public::openai_responses_compat))
+        .routes(routes!(admin::get_setup_status))
         .routes(routes!(admin::list_applications, admin::create_application))
         .routes(routes!(
             admin::get_application,
@@ -247,6 +248,7 @@ mod tests {
             "/api/v1/memories",
             "/api/v1/memories/{id}",
             "/v1/responses",
+            "/api/v1/admin/setup/status",
             "/api/v1/admin/applications",
             "/api/v1/admin/applications/{id}",
             "/api/v1/admin/applications/{id}/enable",
@@ -329,7 +331,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(operation_count, 130);
+        assert_eq!(operation_count, 131);
     }
 
     #[test]
@@ -459,13 +461,50 @@ mod tests {
                                 .flat_map(|requirement| requirement.keys().map(String::as_str))
                         })
                         .collect();
+                    let expected = if path == "/api/v1/admin/setup/status" {
+                        BTreeSet::from(["bearerAuth", "systemKeyAuth"])
+                    } else {
+                        BTreeSet::from(["bearerAuth", "consumerKeyAuth", "systemKeyAuth"])
+                    };
                     assert_eq!(
-                        alternatives,
-                        BTreeSet::from(["bearerAuth", "consumerKeyAuth", "systemKeyAuth"]),
+                        alternatives, expected,
                         "unexpected security alternatives for {method} {path}"
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn setup_status_contract_is_typed_and_exact() {
+        let value = serde_json::to_value(documented_router().into_openapi()).unwrap();
+        let operation = &value["paths"]["/api/v1/admin/setup/status"]["get"];
+        assert_eq!(operation["operationId"], "get_setup_status");
+        let responses = operation["responses"].as_object().unwrap();
+        assert_eq!(
+            responses
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["200", "401", "403", "500", "503"])
+        );
+        assert_eq!(
+            responses["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/SetupStatusResponse"
+        );
+
+        for schema in [
+            "SetupStatus",
+            "SetupDeploymentEnvironment",
+            "SetupCheckState",
+            "SetupCheckName",
+            "SetupChecks",
+            "SetupStatusResponse",
+        ] {
+            assert!(
+                value["components"]["schemas"][schema].is_object(),
+                "missing setup schema {schema}"
+            );
         }
     }
 

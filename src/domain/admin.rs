@@ -135,6 +135,64 @@ pub enum AuditResult {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupStatus {
+    SetupRequired,
+    ConfigurationIncomplete,
+    Ready,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupDeploymentEnvironment {
+    Development,
+    Test,
+    Production,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupCheckState {
+    Ready,
+    Missing,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupCheckName {
+    Database,
+    RootSystemKey,
+    Application,
+    Route,
+    Provider,
+    ProviderModel,
+    ProviderCredential,
+    RoutingPolicy,
+    ExecutablePath,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub struct SetupChecks {
+    pub database: SetupCheckState,
+    pub root_system_key: SetupCheckState,
+    pub application: SetupCheckState,
+    pub route: SetupCheckState,
+    pub provider: SetupCheckState,
+    pub provider_model: SetupCheckState,
+    pub provider_credential: SetupCheckState,
+    pub routing_policy: SetupCheckState,
+    pub executable_path: SetupCheckState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub struct SetupStatusResponse {
+    pub status: SetupStatus,
+    pub deployment_environment: SetupDeploymentEnvironment,
+    pub checks: SetupChecks,
+    pub missing: Vec<SetupCheckName>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ApplicationRecord {
     pub id: Uuid,

@@ -2,6 +2,7 @@ mod admin;
 mod conversation;
 mod public;
 mod runtime;
+mod setup;
 
 pub use admin::{AdminRepository, KeyMaterial, PgAdminRepository, StoredCredentialSecret};
 pub use conversation::{
@@ -16,3 +17,4 @@ pub use runtime::{
     ExecutionAttemptInsert, ExecutionAttemptUpdate, PgRuntimeRepository,
     RuntimeCredentialCandidate, UsageRecordInsert, execution_failure_class_to_db,
 };
+pub use setup::{PgSetupRepository, SetupReadinessSnapshot};

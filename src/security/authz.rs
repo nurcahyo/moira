@@ -7,6 +7,7 @@ use super::{Actor, ActorType};
 pub const ADMIN_SCOPE: &str = "moira:admin";
 pub const ADMIN_SCOPES: &[&str] = &[
     ADMIN_SCOPE,
+    "moira:setup:read",
     "moira:applications:read",
     "moira:applications:write",
     "moira:applications:delete",
@@ -177,5 +178,14 @@ mod tests {
 
         assert!(authz.require(&actor, "moira:responses:create").is_ok());
         assert!(authz.require(&consumer, "moira:responses:create").is_err());
+        assert!(authz.require(&actor, "moira:setup:read").is_ok());
+        assert!(authz.require(&consumer, "moira:setup:read").is_err());
+
+        let setup_reader = Actor {
+            actor_type: ActorType::TrustedJwt,
+            scopes: vec!["moira:setup:read".to_string()],
+            ..Actor::default()
+        };
+        assert!(authz.require(&setup_reader, "moira:setup:read").is_ok());
     }
 }

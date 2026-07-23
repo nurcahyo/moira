@@ -14,6 +14,7 @@ List endpoints use `limit` with default `50` and max `200`. Responses are shaped
 
 ## Endpoint Groups
 
+- Setup readiness: `GET /api/v1/admin/setup/status`
 - Applications: `/api/v1/admin/applications`
 - Providers: `/api/v1/admin/providers`
 - Provider models: `/api/v1/admin/providers/{provider_id}/models` and `/api/v1/admin/provider-models/{id}`
@@ -31,3 +32,9 @@ List endpoints use `limit` with default `50` and max `200`. Responses are shaped
 - Runtime diagnostics: `/api/v1/admin/runtime/diagnose`, disabled by default and requiring `moira:runtime:diagnose`
 
 OpenAPI is served at `/openapi.json`; admin paths are exposed only when `MOIRA_DOCS__EXPOSE_ADMIN=true`.
+
+Setup readiness is a read-only structural check. It reports coarse component states and whether
+the default route has an executable application, provider, model, policy, and compatible global
+or application credential. It does not decrypt credentials, contact providers, or return resource
+identifiers, names, counts, or secret metadata. Access requires a system key or trusted JWT with
+`moira:setup:read`; `moira:admin` implies that scope.

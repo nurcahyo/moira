@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::{
     app::AppState,
     application::{
-        AdminService, PublicExecutionService, RequestContext, RuntimeAdminService,
+        AdminService, PublicExecutionService, RequestContext, RuntimeAdminService, SetupService,
         execute_diagnostic,
     },
     domain::{
@@ -22,11 +22,31 @@ use crate::{
         ProviderModelRecord, ProviderPatchRequest, ProviderRecord, ProviderRuntimePolicyPutRequest,
         ProviderRuntimePolicyRecord, RotateCredentialRequest, RouteDefinitionCreateRequest,
         RouteDefinitionPatchRequest, RouteDefinitionRecord, RoutingPolicyCreateRequest,
-        RoutingPolicyPatchRequest, RoutingPolicyRecord, SystemKeyCreateRequest,
-        TrustedJwtIssuerCreateRequest, TrustedJwtIssuerPatchRequest, TrustedJwtIssuerRecord,
+        RoutingPolicyPatchRequest, RoutingPolicyRecord, SetupStatusResponse,
+        SystemKeyCreateRequest, TrustedJwtIssuerCreateRequest, TrustedJwtIssuerPatchRequest,
+        TrustedJwtIssuerRecord,
     },
     error::{AppError, ErrorResponse},
 };
+
+#[utoipa::path(
+    get, path = "/api/v1/admin/setup/status", tag = "admin-setup",
+    responses(
+        (status = 200, description = "Current structural setup readiness", body = SetupStatusResponse),
+        (status = 401, description = "Authentication failed", body = ErrorResponse),
+        (status = 403, description = "Caller type or scope is not permitted", body = ErrorResponse),
+        (status = 500, description = "Setup inspection failed", body = ErrorResponse),
+        (status = 503, description = "PostgreSQL is unavailable", body = ErrorResponse)
+    ),
+    security(("bearerAuth" = []), ("systemKeyAuth" = []))
+)]
+pub async fn get_setup_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<SetupStatusResponse>, AppError> {
+    let actor = admin_actor(&state, &headers).await?;
+    SetupService::new(&state)?.status(&actor).await.map(Json)
+}
 
 async fn admin_actor(
     state: &AppState,
