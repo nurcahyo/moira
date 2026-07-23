@@ -405,6 +405,10 @@ impl CapacityExhaustion {
 
 impl From<CapacityExhaustion> for ExecutionFailure {
     fn from(exhaustion: CapacityExhaustion) -> Self {
+        let provider_specific = matches!(
+            exhaustion.scope(),
+            CapacityScope::ProviderRequest | CapacityScope::ProviderStream
+        );
         let message = match exhaustion.scope() {
             CapacityScope::Global => "global execution capacity is exhausted",
             CapacityScope::ProviderRequest => "provider request capacity is exhausted",
@@ -413,7 +417,10 @@ impl From<CapacityExhaustion> for ExecutionFailure {
             CapacityScope::User => "user execution capacity is exhausted",
             CapacityScope::LimiterRegistry => "dynamic limiter registry capacity is exhausted",
         };
-        ExecutionFailure::new(ExecutionFailureClass::CapacityExhausted, message)
+        let mut failure = ExecutionFailure::new(ExecutionFailureClass::CapacityExhausted, message);
+        failure.retryable = false;
+        failure.fallback_eligible = provider_specific;
+        failure
     }
 }
 

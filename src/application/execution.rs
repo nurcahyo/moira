@@ -1,13 +1,18 @@
 use std::{sync::Arc, time::Instant};
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use rig_core::{
     OneOrMany,
     completion::{CompletionRequest, Message},
 };
 use secrecy::SecretString;
 use serde_json::{Value, json};
-use tokio::{sync::mpsc, time::Duration};
+use tokio::{
+    sync::{mpsc, oneshot},
+    time::Duration,
+};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
@@ -16,8 +21,8 @@ use crate::{
     domain::{
         AgentProfileRecord, AttemptStatus, AuditLogInsert, AuditResult, CallerRuntimeIdentity,
         CredentialDecision, DiagnosticExecutionRequest, DiagnosticExecutionResponse,
-        EffectiveExecutionPolicy, ExecutionCommand, ExecutionEventStream, ExecutionFailure,
-        ExecutionFailureClass, ExecutionOutcome, ExecutionStatus, ModelCandidate, ModelDecision,
+        EffectiveExecutionPolicy, ExecutionCommand, ExecutionFailure, ExecutionFailureClass,
+        ExecutionOutcome, ExecutionStatus, ExecutionStreamHandle, ModelCandidate, ModelDecision,
         ModelSelectionReason, ProviderAttemptSummary, ProviderRuntimePolicyRecord, ProviderType,
         ResolvedCredential, ResolvedProviderConfiguration, RouteDecision, RouteSelectionReason,
         RuntimeEventEnvelope, RuntimeEventType, UsageSummary,
@@ -31,7 +36,7 @@ use crate::{
         },
     },
     orchestration::{
-        RigRuntimeFactory, RuntimeCacheKey, RuntimeEventSeed, RuntimeFactory, RuntimeModelHandle,
+        RigRuntimeFactory, RuntimeCacheKey, RuntimeFactory, RuntimeModelHandle, RuntimeStreamItem,
     },
     security::{Actor, ActorType, CredentialAadParts, SecretCipher, credential_aad},
 };
@@ -42,7 +47,7 @@ pub trait ExecutionService: Send + Sync {
     async fn execute_stream(
         &self,
         command: ExecutionCommand,
-    ) -> Result<ExecutionEventStream, AppError>;
+    ) -> Result<ExecutionStreamHandle, AppError>;
 }
 
 #[derive(Clone)]
@@ -107,6 +112,24 @@ impl MoiraExecutionService {
         mut command: ExecutionCommand,
         events: &mut EventCollector,
     ) -> Result<ExecutionOutcome, AppError> {
+        let total_timeout_ms = command
+            .options
+            .timeout_ms
+            .unwrap_or(
+                self.state
+                    .settings
+                    .runtime
+                    .default_execution_timeout_seconds
+                    * 1_000,
+            )
+            .min(
+                self.state
+                    .settings
+                    .runtime
+                    .maximum_execution_timeout_seconds
+                    * 1_000,
+            );
+        let execution_deadline = Instant::now() + Duration::from_millis(total_timeout_ms);
         let mut attempts = Vec::new();
         if let Some(failure) = self.validate_command(&mut command).await? {
             events.push(
@@ -301,6 +324,16 @@ impl MoiraExecutionService {
             let runtime_policy = effective_runtime_policy(&policy, &candidate.runtime_policy);
             let mut retries = 0usize;
             loop {
+                let Some(remaining) = remaining_execution_time(execution_deadline) else {
+                    let failure = deadline_failure();
+                    return Ok(failed_outcome(
+                        command,
+                        Some(route),
+                        Some(model),
+                        attempts,
+                        failure,
+                    ));
+                };
                 if total_attempts >= self.state.settings.runtime.maximum_total_upstream_attempts {
                     let failure = ExecutionFailure::new(
                         ExecutionFailureClass::DeadlineExceeded,
@@ -362,16 +395,19 @@ impl MoiraExecutionService {
                 let permits = match self
                     .state
                     .concurrency
-                    .acquire(
+                    .acquire_scoped(
                         candidate.provider_id,
-                        candidate.runtime_policy.max_concurrent_requests as usize,
+                        candidate.runtime_policy.max_concurrent_requests.max(1) as usize,
+                        command.options.stream,
+                        candidate.runtime_policy.max_concurrent_streams.max(1) as usize,
                         command.application_id,
                         command.external_user_id.as_deref(),
                     )
                     .await
                 {
                     Ok(permits) => permits,
-                    Err(failure) => {
+                    Err(exhaustion) => {
+                        let failure: ExecutionFailure = exhaustion.into();
                         self.complete_failed_attempt(
                             attempt_id,
                             started,
@@ -441,27 +477,33 @@ impl MoiraExecutionService {
                     }
                 };
 
+                let cancellation = events.cancellation();
                 let execution = async {
                     if command.options.stream {
                         execute_rig_stream(
                             handle.clone(),
                             request,
-                            &command,
-                            events.next_sequence(),
+                            events,
+                            Duration::from_millis(
+                                candidate.runtime_policy.stream_idle_timeout_ms.max(1) as u64,
+                            ),
                         )
                         .await
                     } else {
                         execute_rig_completion(handle.clone(), request).await
                     }
                 };
+                let attempt_timeout =
+                    remaining.min(Duration::from_millis(runtime_policy.timeout_ms));
+                let bounded_by_total_deadline =
+                    attempt_timeout < Duration::from_millis(runtime_policy.timeout_ms);
+                let result = tokio::select! {
+                    _ = cancellation.cancelled() => Ok(Err(cancelled_failure())),
+                    result = tokio::time::timeout(attempt_timeout, execution) => result,
+                };
                 drop(permits);
 
-                match tokio::time::timeout(
-                    Duration::from_millis(runtime_policy.timeout_ms),
-                    execution,
-                )
-                .await
-                {
+                match result {
                     Ok(Ok(output)) => {
                         let latency_ms = elapsed_ms(started);
                         self.runtime_repo
@@ -580,16 +622,30 @@ impl MoiraExecutionService {
                         last_failure = Some(failure.clone());
                         if failure.retryable && retries < runtime_policy.max_retries {
                             retries += 1;
-                            sleep_for_retry(retries, &candidate.runtime_policy).await;
-                            continue;
+                            if sleep_for_retry(
+                                retries,
+                                &candidate.runtime_policy,
+                                execution_deadline,
+                            )
+                            .await
+                            {
+                                continue;
+                            }
+                            last_failure = Some(deadline_failure());
                         }
                         break;
                     }
                     Err(_) => {
-                        let failure = ExecutionFailure::new(
-                            ExecutionFailureClass::ProviderTimeout,
-                            "provider request exceeded effective deadline",
-                        );
+                        let failure = if bounded_by_total_deadline
+                            || remaining_execution_time(execution_deadline).is_none()
+                        {
+                            deadline_failure()
+                        } else {
+                            ExecutionFailure::new(
+                                ExecutionFailureClass::ProviderTimeout,
+                                "provider request exceeded effective deadline",
+                            )
+                        };
                         self.state
                             .circuits
                             .on_failure(
@@ -617,11 +673,19 @@ impl MoiraExecutionService {
                             started,
                             UsageSummary::default(),
                         ));
-                        last_failure = Some(failure);
-                        if retries < runtime_policy.max_retries {
+                        last_failure = Some(failure.clone());
+                        if failure.retryable && retries < runtime_policy.max_retries {
                             retries += 1;
-                            sleep_for_retry(retries, &candidate.runtime_policy).await;
-                            continue;
+                            if sleep_for_retry(
+                                retries,
+                                &candidate.runtime_policy,
+                                execution_deadline,
+                            )
+                            .await
+                            {
+                                continue;
+                            }
+                            last_failure = Some(deadline_failure());
                         }
                         break;
                     }
@@ -938,32 +1002,32 @@ impl ExecutionService for MoiraExecutionService {
     async fn execute_stream(
         &self,
         command: ExecutionCommand,
-    ) -> Result<ExecutionEventStream, AppError> {
+    ) -> Result<ExecutionStreamHandle, AppError> {
         let (tx, rx) = mpsc::channel(self.state.settings.runtime.internal_stream_queue_capacity);
+        let (outcome_tx, outcome_rx) = oneshot::channel();
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
         let service = self.clone();
         tokio::spawn(async move {
-            match service.execute_with_events(command).await {
-                Ok((outcome, events)) => {
-                    for event in events {
-                        if tx.send(Ok(event)).await.is_err() {
-                            return;
-                        }
-                    }
-                    if let Some(failure) = outcome.failure {
-                        let _ = tx.send(Err(failure)).await;
-                    }
-                }
+            let mut events = EventCollector::streaming(&command, tx, task_cancellation);
+            events.push(RuntimeEventType::ExecutionStarted, json!({}));
+            let outcome = match service.execute_inner(command, &mut events).await {
+                Ok(outcome) => Ok(outcome),
                 Err(err) => {
-                    let _ = tx
-                        .send(Err(ExecutionFailure::new(
-                            ExecutionFailureClass::InternalError,
-                            err.to_string(),
-                        )))
-                        .await;
+                    let failure = ExecutionFailure::new(
+                        ExecutionFailureClass::InternalError,
+                        err.to_string(),
+                    );
+                    events.push(
+                        RuntimeEventType::ExecutionFailed,
+                        json!({ "failure_class": failure.class }),
+                    );
+                    Err(failure)
                 }
-            }
+            };
+            let _ = outcome_tx.send(outcome);
         });
-        Ok(rx)
+        Ok(ExecutionStreamHandle::new(rx, outcome_rx, cancellation))
     }
 }
 
@@ -1225,6 +1289,9 @@ struct EventCollector {
     execution_id: Uuid,
     next_sequence: u64,
     events: Vec<RuntimeEventEnvelope>,
+    live_tx: Option<mpsc::Sender<Result<RuntimeEventEnvelope, ExecutionFailure>>>,
+    cancellation: CancellationToken,
+    delivery_failure: Option<ExecutionFailure>,
 }
 
 impl EventCollector {
@@ -1234,29 +1301,120 @@ impl EventCollector {
             execution_id: command.execution_id,
             next_sequence: 1,
             events: Vec::new(),
+            live_tx: None,
+            cancellation: CancellationToken::new(),
+            delivery_failure: None,
+        }
+    }
+
+    fn streaming(
+        command: &ExecutionCommand,
+        live_tx: mpsc::Sender<Result<RuntimeEventEnvelope, ExecutionFailure>>,
+        cancellation: CancellationToken,
+    ) -> Self {
+        Self {
+            request_id: command.request_id.clone(),
+            execution_id: command.execution_id,
+            next_sequence: 1,
+            events: Vec::new(),
+            live_tx: Some(live_tx),
+            cancellation,
+            delivery_failure: None,
         }
     }
 
     fn push(&mut self, event_type: RuntimeEventType, payload: Value) {
-        self.events.push(RuntimeEventEnvelope {
+        let event = RuntimeEventEnvelope {
             request_id: self.request_id.clone(),
             execution_id: self.execution_id,
             sequence: self.next_sequence,
             timestamp: chrono::Utc::now(),
             event_type,
             payload,
-        });
+        };
         self.next_sequence += 1;
+        self.forward_now(event.clone());
+        self.events.push(event);
     }
 
     fn push_existing(&mut self, mut event: RuntimeEventEnvelope) {
         event.sequence = self.next_sequence;
         self.next_sequence += 1;
+        self.forward_now(event.clone());
         self.events.push(event);
     }
 
-    fn next_sequence(&self) -> u64 {
-        self.next_sequence
+    async fn push_stream(
+        &mut self,
+        event_type: RuntimeEventType,
+        payload: Value,
+        send_timeout: Duration,
+    ) -> Result<(), ExecutionFailure> {
+        if let Some(failure) = self.delivery_failure.clone() {
+            return Err(failure);
+        }
+        let event = RuntimeEventEnvelope {
+            request_id: self.request_id.clone(),
+            execution_id: self.execution_id,
+            sequence: self.next_sequence,
+            timestamp: chrono::Utc::now(),
+            event_type,
+            payload,
+        };
+        self.next_sequence += 1;
+
+        if let Some(tx) = &self.live_tx {
+            tokio::select! {
+                _ = self.cancellation.cancelled() => {
+                    return Err(cancelled_failure());
+                }
+                result = tokio::time::timeout(send_timeout, tx.send(Ok(event.clone()))) => {
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => return Err(cancelled_failure()),
+                        Err(_) => {
+                            return Err(ExecutionFailure::new(
+                                ExecutionFailureClass::StreamBackpressureExceeded,
+                                "stream consumer did not accept output before the delivery deadline",
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        self.events.push(event);
+        Ok(())
+    }
+
+    fn forward_now(&mut self, event: RuntimeEventEnvelope) {
+        let Some(tx) = &self.live_tx else {
+            return;
+        };
+        if self.delivery_failure.is_some() {
+            return;
+        }
+        match tx.try_send(Ok(event)) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.delivery_failure = Some(cancelled_failure());
+                self.cancellation.cancel();
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.delivery_failure = Some(ExecutionFailure::new(
+                    ExecutionFailureClass::StreamBackpressureExceeded,
+                    "stream consumer did not keep pace with execution lifecycle events",
+                ));
+                self.cancellation.cancel();
+            }
+        }
+    }
+
+    fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    fn delivery_failure(&self) -> Option<ExecutionFailure> {
+        self.delivery_failure.clone()
     }
 
     fn into_events(self) -> Vec<RuntimeEventEnvelope> {
@@ -1281,26 +1439,136 @@ async fn execute_rig_completion(
 async fn execute_rig_stream(
     handle: Arc<RuntimeModelHandle>,
     request: CompletionRequest,
-    command: &ExecutionCommand,
-    next_sequence: u64,
+    events: &mut EventCollector,
+    idle_timeout: Duration,
 ) -> Result<ExecutionRunOutput, ExecutionFailure> {
-    let output = handle
-        .stream(
-            request,
-            RuntimeEventSeed {
-                request_id: command.request_id.clone(),
-                execution_id: command.execution_id,
-                next_sequence,
-            },
-        )
-        .await?;
+    if let Some(failure) = events.delivery_failure() {
+        return Err(failure);
+    }
+    let cancellation = events.cancellation();
+    let mut stream = tokio::select! {
+        _ = cancellation.cancelled() => return Err(cancelled_failure()),
+        result = handle.start_stream(request) => result?,
+    };
+    let mut text = String::new();
+    let mut usage = UsageSummary::default();
+    let mut provider_request_id = None;
+    let mut committed = false;
+
+    loop {
+        let item = tokio::select! {
+            _ = cancellation.cancelled() => return Err(cancelled_failure()),
+            result = tokio::time::timeout(idle_timeout, stream.next()) => {
+                match result {
+                    Ok(item) => item,
+                    Err(_) => {
+                        let mut failure = ExecutionFailure::new(
+                            ExecutionFailureClass::ProviderTimeout,
+                            "provider stream exceeded the idle timeout",
+                        );
+                        if committed {
+                            failure.retryable = false;
+                            failure.fallback_eligible = false;
+                        }
+                        return Err(failure);
+                    }
+                }
+            }
+        };
+
+        let Some(item) = item else {
+            break;
+        };
+        let item = match item {
+            Ok(item) => item,
+            Err(mut failure) => {
+                if committed {
+                    failure.retryable = false;
+                    failure.fallback_eligible = false;
+                }
+                return Err(failure);
+            }
+        };
+        match item {
+            RuntimeStreamItem::TextDelta { text: delta } => {
+                events
+                    .push_stream(
+                        RuntimeEventType::OutputTextDelta,
+                        json!({ "text": delta }),
+                        idle_timeout,
+                    )
+                    .await?;
+                text.push_str(&delta);
+                committed = true;
+            }
+            RuntimeStreamItem::ToolCallStarted {
+                internal_call_id,
+                name,
+                arguments,
+            } => {
+                events
+                    .push_stream(
+                        RuntimeEventType::ToolCallStarted,
+                        json!({
+                            "internal_call_id": internal_call_id,
+                            "name": name,
+                            "arguments": arguments
+                        }),
+                        idle_timeout,
+                    )
+                    .await?;
+                committed = true;
+            }
+            RuntimeStreamItem::ToolCallDelta {
+                id,
+                internal_call_id,
+                content,
+            } => {
+                events
+                    .push_stream(
+                        RuntimeEventType::ToolCallDelta,
+                        json!({
+                            "id": id,
+                            "internal_call_id": internal_call_id,
+                            "content": content
+                        }),
+                        idle_timeout,
+                    )
+                    .await?;
+                committed = true;
+            }
+            RuntimeStreamItem::UsageUpdated {
+                usage: updated_usage,
+            } => {
+                usage = updated_usage;
+                events
+                    .push_stream(
+                        RuntimeEventType::UsageUpdated,
+                        json!({ "usage": usage }),
+                        idle_timeout,
+                    )
+                    .await?;
+            }
+            RuntimeStreamItem::FinalMetadata {
+                provider_request_id: request_id,
+            } => provider_request_id = request_id,
+        }
+    }
+
     Ok(ExecutionRunOutput {
-        text: output.text,
+        text,
         structured_output: None,
-        usage: output.usage,
-        provider_request_id: None,
-        events: output.events,
+        usage,
+        provider_request_id,
+        events: Vec::new(),
     })
+}
+
+fn cancelled_failure() -> ExecutionFailure {
+    ExecutionFailure::new(
+        ExecutionFailureClass::RequestCancelled,
+        "execution stream was cancelled by its consumer",
+    )
 }
 
 fn build_completion_request(
@@ -1515,14 +1783,40 @@ fn elapsed_ms(started: Instant) -> i64 {
     i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
 }
 
-async fn sleep_for_retry(retry_number: usize, policy: &ProviderRuntimePolicyRecord) {
+async fn sleep_for_retry(
+    retry_number: usize,
+    policy: &ProviderRuntimePolicyRecord,
+    deadline: Instant,
+) -> bool {
+    let Some(remaining) = remaining_execution_time(deadline) else {
+        return false;
+    };
     let base = policy.retry_base_delay_ms.max(0) as u64;
     let max = policy.retry_max_delay_ms.max(0) as u64;
     let exponential = base.saturating_mul(2_u64.saturating_pow(retry_number as u32));
     let delay = exponential.min(max);
     if delay > 0 {
-        tokio::time::sleep(Duration::from_millis(delay)).await;
+        let delay = Duration::from_millis(delay);
+        if delay >= remaining {
+            tokio::time::sleep(remaining).await;
+            return false;
+        }
+        tokio::time::sleep(delay).await;
     }
+    remaining_execution_time(deadline).is_some()
+}
+
+fn remaining_execution_time(deadline: Instant) -> Option<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+}
+
+fn deadline_failure() -> ExecutionFailure {
+    ExecutionFailure::new(
+        ExecutionFailureClass::DeadlineExceeded,
+        "execution exceeded its total deadline",
+    )
 }
 
 pub async fn execute_diagnostic(

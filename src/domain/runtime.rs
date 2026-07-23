@@ -534,8 +534,40 @@ pub enum RuntimeEventType {
     ExecutionFailed,
 }
 
-pub type ExecutionEventStream =
-    tokio::sync::mpsc::Receiver<Result<RuntimeEventEnvelope, ExecutionFailure>>;
+#[derive(Debug)]
+pub struct ExecutionStreamHandle {
+    pub events: tokio::sync::mpsc::Receiver<Result<RuntimeEventEnvelope, ExecutionFailure>>,
+    pub outcome: tokio::sync::oneshot::Receiver<Result<ExecutionOutcome, ExecutionFailure>>,
+    cancellation: tokio_util::sync::CancellationToken,
+}
+
+impl ExecutionStreamHandle {
+    pub fn new(
+        events: tokio::sync::mpsc::Receiver<Result<RuntimeEventEnvelope, ExecutionFailure>>,
+        outcome: tokio::sync::oneshot::Receiver<Result<ExecutionOutcome, ExecutionFailure>>,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        Self {
+            events,
+            outcome,
+            cancellation,
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    pub fn cancellation_token(&self) -> tokio_util::sync::CancellationToken {
+        self.cancellation.clone()
+    }
+}
+
+impl Drop for ExecutionStreamHandle {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
