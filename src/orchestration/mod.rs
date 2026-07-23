@@ -14,5 +14,6 @@ pub use resolver::{
 };
 pub use runtime_factory::{
     RigRuntimeFactory, RuntimeCompletionOutput, RuntimeEventSeed, RuntimeFactory,
-    RuntimeModelHandle, RuntimeStreamOutput, classify_completion_error, usage_from_rig,
+    RuntimeItemStream, RuntimeModelHandle, RuntimeStreamItem, RuntimeStreamOutput,
+    classify_completion_error, usage_from_rig,
 };

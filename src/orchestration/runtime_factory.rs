@@ -1,5 +1,7 @@
+use std::pin::Pin;
+
 use async_trait::async_trait;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use rig_core::{
     OneOrMany,
     client::CompletionClient,
@@ -201,14 +203,108 @@ impl RuntimeModelHandle {
         request: CompletionRequest,
         base_event: RuntimeEventSeed,
     ) -> Result<RuntimeStreamOutput, ExecutionFailure> {
+        let mut stream = self.start_stream(request).await?;
+        let mut seed = base_event;
+        let mut text = String::new();
+        let mut usage = UsageSummary::default();
+        let mut provider_request_id = None;
+        let mut events = Vec::new();
+
+        while let Some(item) = stream.next().await {
+            match item? {
+                RuntimeStreamItem::TextDelta { text: delta } => {
+                    text.push_str(&delta);
+                    events.push(next_event(
+                        &mut seed,
+                        RuntimeEventType::OutputTextDelta,
+                        json!({ "text": delta }),
+                    ));
+                }
+                RuntimeStreamItem::ToolCallStarted {
+                    internal_call_id,
+                    name,
+                    ..
+                } => events.push(next_event(
+                    &mut seed,
+                    RuntimeEventType::ToolCallStarted,
+                    json!({
+                        "internal_call_id": internal_call_id,
+                        "name": name
+                    }),
+                )),
+                RuntimeStreamItem::ToolCallDelta {
+                    id,
+                    internal_call_id,
+                    ..
+                } => events.push(next_event(
+                    &mut seed,
+                    RuntimeEventType::ToolCallDelta,
+                    json!({ "id": id, "internal_call_id": internal_call_id }),
+                )),
+                RuntimeStreamItem::UsageUpdated {
+                    usage: updated_usage,
+                } => {
+                    usage = updated_usage;
+                    events.push(next_event(
+                        &mut seed,
+                        RuntimeEventType::UsageUpdated,
+                        json!({ "usage": usage }),
+                    ));
+                }
+                RuntimeStreamItem::FinalMetadata {
+                    provider_request_id: request_id,
+                    ..
+                } => provider_request_id = request_id,
+            }
+        }
+
+        Ok(RuntimeStreamOutput {
+            text,
+            usage,
+            provider_request_id,
+            events,
+        })
+    }
+
+    pub async fn start_stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<RuntimeItemStream, ExecutionFailure> {
         match self {
-            Self::OpenAi(model) => stream_with_model(model, request, base_event).await,
-            Self::Anthropic(model) => stream_with_model(model, request, base_event).await,
-            Self::Gemini(model) => stream_with_model(model, request, base_event).await,
-            Self::DeepSeek(model) => stream_with_model(model, request, base_event).await,
-            Self::AzureOpenAi(model) => stream_with_model(model, request, base_event).await,
+            Self::OpenAi(model) => start_stream_with_model(model, request).await,
+            Self::Anthropic(model) => start_stream_with_model(model, request).await,
+            Self::Gemini(model) => start_stream_with_model(model, request).await,
+            Self::DeepSeek(model) => start_stream_with_model(model, request).await,
+            Self::AzureOpenAi(model) => start_stream_with_model(model, request).await,
         }
     }
+}
+
+pub type RuntimeItemStream =
+    Pin<Box<dyn Stream<Item = Result<RuntimeStreamItem, ExecutionFailure>> + Send>>;
+
+#[derive(Debug, Clone)]
+pub enum RuntimeStreamItem {
+    TextDelta {
+        text: String,
+    },
+    ToolCallStarted {
+        internal_call_id: String,
+        name: String,
+        arguments: Value,
+    },
+    ToolCallDelta {
+        id: String,
+        internal_call_id: String,
+        content: Value,
+    },
+    UsageUpdated {
+        usage: UsageSummary,
+    },
+    FinalMetadata {
+        provider_request_id: Option<String>,
+        provider_response: Option<Value>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +318,7 @@ pub struct RuntimeEventSeed {
 pub struct RuntimeStreamOutput {
     pub text: String,
     pub usage: UsageSummary,
+    pub provider_request_id: Option<String>,
     pub events: Vec<RuntimeEventEnvelope>,
 }
 
@@ -239,75 +336,82 @@ where
     Ok(output_from_response(response))
 }
 
-async fn stream_with_model<M>(
+async fn start_stream_with_model<M>(
     model: &M,
     request: CompletionRequest,
-    mut seed: RuntimeEventSeed,
-) -> Result<RuntimeStreamOutput, ExecutionFailure>
+) -> Result<RuntimeItemStream, ExecutionFailure>
 where
     M: RigCompletionModel,
-    M::StreamingResponse: Clone + Unpin + rig_core::completion::GetTokenUsage + Serialize,
+    M::StreamingResponse:
+        Clone + Unpin + rig_core::completion::GetTokenUsage + Serialize + Send + 'static,
 {
     let mut stream = model
         .stream(request)
         .await
         .map_err(classify_completion_error)?;
-    let mut events = Vec::new();
-    let mut text = String::new();
-    let mut usage = UsageSummary::default();
-    while let Some(item) = stream.next().await {
-        let item = item.map_err(classify_completion_error)?;
-        match item {
-            StreamedAssistantContent::Text(delta) => {
-                text.push_str(&delta.text);
-                events.push(next_event(
-                    &mut seed,
-                    RuntimeEventType::OutputTextDelta,
-                    json!({ "text": delta.text }),
-                ));
-            }
-            StreamedAssistantContent::ToolCall {
-                tool_call,
-                internal_call_id,
-            } => events.push(next_event(
-                &mut seed,
-                RuntimeEventType::ToolCallStarted,
-                json!({
-                    "internal_call_id": internal_call_id,
-                    "name": tool_call.function.name
-                }),
-            )),
-            StreamedAssistantContent::ToolCallDelta {
-                id,
-                internal_call_id,
-                ..
-            } => events.push(next_event(
-                &mut seed,
-                RuntimeEventType::ToolCallDelta,
-                json!({ "id": id, "internal_call_id": internal_call_id }),
-            )),
-            StreamedAssistantContent::Reasoning(_)
-            | StreamedAssistantContent::ReasoningDelta { .. } => {}
-            StreamedAssistantContent::Final(response) => {
-                usage = usage_from_rig(response.token_usage());
-                events.push(next_event(
-                    &mut seed,
-                    RuntimeEventType::UsageUpdated,
-                    json!({ "usage": usage }),
-                ));
-            }
-            StreamedAssistantContent::Unknown(_) => {}
-        }
-    }
 
-    if !usage.has_any() {
-        usage = usage_from_rig(stream.usage());
-    }
-    Ok(RuntimeStreamOutput {
-        text,
-        usage,
-        events,
-    })
+    Ok(Box::pin(async_stream::stream! {
+        let mut reported_usage = false;
+        let mut provider_response = None;
+
+        while let Some(item) = stream.next().await {
+            let item = match item {
+                Ok(item) => item,
+                Err(error) => {
+                    yield Err(classify_completion_error(error));
+                    return;
+                }
+            };
+
+            match item {
+                StreamedAssistantContent::Text(delta) => {
+                    yield Ok(RuntimeStreamItem::TextDelta { text: delta.text });
+                }
+                StreamedAssistantContent::ToolCall {
+                    tool_call,
+                    internal_call_id,
+                } => {
+                    yield Ok(RuntimeStreamItem::ToolCallStarted {
+                        internal_call_id,
+                        name: tool_call.function.name,
+                        arguments: tool_call.function.arguments,
+                    });
+                }
+                StreamedAssistantContent::ToolCallDelta {
+                    id,
+                    internal_call_id,
+                    content,
+                } => {
+                    yield Ok(RuntimeStreamItem::ToolCallDelta {
+                        id,
+                        internal_call_id,
+                        content: serde_json::to_value(content).unwrap_or(Value::Null),
+                    });
+                }
+                StreamedAssistantContent::Final(response) => {
+                    let usage = usage_from_rig(response.token_usage());
+                    reported_usage = usage.has_any();
+                    provider_response = serde_json::to_value(response).ok();
+                    yield Ok(RuntimeStreamItem::UsageUpdated { usage });
+                }
+                StreamedAssistantContent::Reasoning(_)
+                | StreamedAssistantContent::ReasoningDelta { .. }
+                | StreamedAssistantContent::Unknown(_) => {}
+            }
+        }
+
+        if !reported_usage {
+            let usage = usage_from_rig(stream.usage());
+            if usage.has_any() {
+                yield Ok(RuntimeStreamItem::UsageUpdated { usage });
+            }
+        }
+
+        yield Ok(RuntimeStreamItem::FinalMetadata {
+            provider_request_id: stream.message_id.clone(),
+            provider_response,
+        });
+    }))
 }
 
 fn output_from_response<T>(response: CompletionResponse<T>) -> RuntimeCompletionOutput {
@@ -431,6 +535,7 @@ impl UsageSummaryExt for UsageSummary {
 mod tests {
     use super::*;
     use crate::domain::CredentialType;
+    use futures_util::stream;
 
     #[test]
     fn runtime_handle_debug_does_not_expose_secret_shape() {
@@ -445,5 +550,41 @@ mod tests {
         let mut usage = Usage::new();
         usage.total_tokens = 12;
         assert_eq!(usage_from_rig(usage).total_tokens, Some(12));
+    }
+
+    #[tokio::test]
+    async fn semantic_stream_preserves_item_order_and_in_band_failures() {
+        let failure = ExecutionFailure::new(
+            ExecutionFailureClass::ProviderInvalidResponse,
+            "provider stream item failed",
+        );
+        let mut items: RuntimeItemStream = Box::pin(stream::iter(vec![
+            Ok(RuntimeStreamItem::TextDelta {
+                text: "first".to_string(),
+            }),
+            Ok(RuntimeStreamItem::UsageUpdated {
+                usage: UsageSummary {
+                    output_tokens: Some(1),
+                    ..UsageSummary::default()
+                },
+            }),
+            Err(failure),
+        ]));
+
+        assert!(matches!(
+            items.next().await,
+            Some(Ok(RuntimeStreamItem::TextDelta { text })) if text == "first"
+        ));
+        assert!(matches!(
+            items.next().await,
+            Some(Ok(RuntimeStreamItem::UsageUpdated { usage }))
+                if usage.output_tokens == Some(1)
+        ));
+        assert!(matches!(
+            items.next().await,
+            Some(Err(error))
+                if error.class == ExecutionFailureClass::ProviderInvalidResponse
+        ));
+        assert!(items.next().await.is_none());
     }
 }
