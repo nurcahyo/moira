@@ -186,6 +186,11 @@ impl<'a> RuntimeAdminService<'a> {
             return Ok(replay);
         }
         validate_routing_policy(&request)?;
+        self.ensure_provider_model_belongs_to_provider(
+            request.provider_id,
+            request.provider_model_id,
+        )
+        .await?;
         let record = self
             .runtime_repo
             .create_routing_policy(Uuid::now_v7(), &request)
@@ -241,6 +246,14 @@ impl<'a> RuntimeAdminService<'a> {
             .authz
             .require(actor, "moira:routing-policies:write")?;
         validate_routing_policy_patch(&request)?;
+        let current = self.runtime_repo.get_routing_policy(id).await?;
+        let (provider_id, provider_model_id) = effective_routing_policy_target(
+            current.provider_id,
+            current.provider_model_id,
+            &request,
+        );
+        self.ensure_provider_model_belongs_to_provider(provider_id, provider_model_id)
+            .await?;
         let record = self.runtime_repo.patch_routing_policy(id, &request).await?;
         self.invalidate_runtime().await;
         self.audit_success(
@@ -253,6 +266,24 @@ impl<'a> RuntimeAdminService<'a> {
         )
         .await?;
         Ok(record)
+    }
+
+    async fn ensure_provider_model_belongs_to_provider(
+        &self,
+        provider_id: Uuid,
+        provider_model_id: Uuid,
+    ) -> Result<(), AppError> {
+        if self
+            .runtime_repo
+            .provider_model_belongs_to_provider(provider_id, provider_model_id)
+            .await?
+        {
+            return Ok(());
+        }
+        Err(AppError::unprocessable(
+            "routing_policy_provider_model_mismatch",
+            "provider_model_id must belong to provider_id",
+        ))
     }
 
     pub async fn delete_routing_policy(
@@ -784,6 +815,19 @@ fn validate_routing_policy_patch(request: &RoutingPolicyPatchRequest) -> Result<
     Ok(())
 }
 
+fn effective_routing_policy_target(
+    current_provider_id: Uuid,
+    current_provider_model_id: Uuid,
+    request: &RoutingPolicyPatchRequest,
+) -> (Uuid, Uuid) {
+    (
+        request.provider_id.unwrap_or(current_provider_id),
+        request
+            .provider_model_id
+            .unwrap_or(current_provider_model_id),
+    )
+}
+
 fn validate_agent_profile(
     temperature: Option<f64>,
     max_tokens: Option<i64>,
@@ -852,5 +896,39 @@ mod tests {
             ..ProviderRuntimePolicyPutRequest::default()
         };
         assert!(validate_runtime_policy(&request).is_err());
+    }
+
+    #[test]
+    fn routing_policy_patch_uses_effective_provider_and_model() {
+        let current_provider_id = Uuid::now_v7();
+        let current_provider_model_id = Uuid::now_v7();
+        let replacement_provider_id = Uuid::now_v7();
+        let replacement_provider_model_id = Uuid::now_v7();
+
+        let provider_patch = RoutingPolicyPatchRequest {
+            provider_id: Some(replacement_provider_id),
+            ..RoutingPolicyPatchRequest::default()
+        };
+        assert_eq!(
+            effective_routing_policy_target(
+                current_provider_id,
+                current_provider_model_id,
+                &provider_patch,
+            ),
+            (replacement_provider_id, current_provider_model_id)
+        );
+
+        let model_patch = RoutingPolicyPatchRequest {
+            provider_model_id: Some(replacement_provider_model_id),
+            ..RoutingPolicyPatchRequest::default()
+        };
+        assert_eq!(
+            effective_routing_policy_target(
+                current_provider_id,
+                current_provider_model_id,
+                &model_patch,
+            ),
+            (current_provider_id, replacement_provider_model_id)
+        );
     }
 }

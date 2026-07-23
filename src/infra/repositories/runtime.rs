@@ -298,6 +298,21 @@ impl PgRuntimeRepository {
         routing_policy_record_from_row(&row)
     }
 
+    pub async fn provider_model_belongs_to_provider(
+        &self,
+        provider_id: Uuid,
+        provider_model_id: Uuid,
+    ) -> Result<bool, AppError> {
+        sqlx::query_scalar(
+            "select exists(select 1 from provider_models where id = $1 and provider_id = $2)",
+        )
+        .bind(provider_model_id)
+        .bind(provider_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(AppError::from)
+    }
+
     pub async fn patch_routing_policy(
         &self,
         id: Uuid,
@@ -679,7 +694,9 @@ impl PgRuntimeRepository {
                 coalesce(prp.version, 1) as runtime_version
             from routing_policies rp
             join providers p on p.id = rp.provider_id
-            join provider_models pm on pm.id = rp.provider_model_id
+            join provider_models pm
+              on pm.id = rp.provider_model_id
+             and pm.provider_id = rp.provider_id
             left join provider_runtime_policies prp on prp.provider_id = p.id
             where rp.route_id = $1
               and rp.status = 'active'
