@@ -45,10 +45,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let pool = db::connect(&settings.database).await?;
-    if settings.database.migrate_on_startup {
-        if let Some(pool) = &pool {
-            db::migrate(pool).await?;
-        }
+    if settings.database.migrate_on_startup
+        && let Some(pool) = &pool
+    {
+        db::migrate(pool).await?;
     }
 
     let addr: SocketAddr = settings.server.bind_addr()?;

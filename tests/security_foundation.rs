@@ -27,6 +27,7 @@ async fn security_foundation_migration_creates_contract_tables_when_configured()
         min_connections: 1,
         connect_timeout_seconds: 5,
         require: true,
+        migrate_on_startup: false,
     };
     let pool = db::connect(&settings)
         .await
