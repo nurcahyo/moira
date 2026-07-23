@@ -36,6 +36,7 @@ This list tracks what is still left to harden or complete after the current Phas
 - TODO: Add durable or cross-instance strategy notes for concurrency limits and circuit breakers; the current controls are in-memory per process.
 - TODO: Complete pricing and cost normalization so `usage_records.estimated_total_cost` is populated when model pricing is configured.
 - TODO: Add provider/runtime integration tests with deterministic test doubles for retries, fallback, timeout, cancellation, circuit open, credential failure, and malformed provider responses.
+- TODO: Extend the total execution deadline across slow routing, credential resolution, runtime construction, and terminal persistence without abandoning active-attempt cleanup.
 - TODO: Add structured-output execution tests that verify schema mapping, provider behavior, and `StructuredOutputInvalid` classification.
 - TODO: Add runtime-cache tests for invalidation, TTL expiry, provider/runtime-policy changes, and stale-handle cleanup.
 - TODO: Add benchmarks or load tests for candidate selection, runtime cache behavior, concurrency limits, and streaming backpressure.
@@ -43,6 +44,7 @@ This list tracks what is still left to harden or complete after the current Phas
 ## Phase 4: Public Responses API And SSE
 
 - TODO: Add regression coverage proving public SSE emits provider deltas live instead of replaying collected events after execution completes.
+- TODO: Add database-backed stream lifecycle tests proving stalled readers and disconnects release permits and leave no attempt `started` or response `in_progress`.
 - TODO: Record non-streaming client disconnect/cancellation audit events reliably.
 - TODO: Implement response persistence modes beyond metadata-only, including encrypted content storage, retrieval, retention, and cleanup semantics.
 - TODO: Add retention cleanup for expired `responses` and idempotency records.
@@ -83,6 +85,7 @@ This list tracks what is still left to harden or complete after the current Phas
 
 - TODO: Replace in-memory public rate limiting with Redis-backed distributed token buckets and request actor fingerprints.
 - TODO: Replace in-memory execution concurrency with Redis-backed distributed global, provider, application, and user concurrency permits.
+- TODO: Add cluster admission or a database lease that prevents out-of-band scaling beyond one API replica until distributed controls replace the MVP Helm gate.
 - TODO: Move HTTP idempotency execution locking to distributed Redis locks while keeping PostgreSQL as the durable replay ledger.
 - TODO: Add Redis Pub/Sub runtime invalidation listeners for all API instances and publish invalidation events from every runtime-config mutation.
 - TODO: Add leader election for singleton workers such as cleanup, cache warming, provider health probing, and OAuth refresh.
