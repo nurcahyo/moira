@@ -89,7 +89,10 @@ Run the API:
 cargo run
 ```
 
-When a database URL is configured, Moira applies migrations during startup. The default listener is `http://127.0.0.1:8080`.
+Development applies migrations during startup by default. Production requires
+`MOIRA_DATABASE__MIGRATE_ON_STARTUP=false`; run `cargo run -- migrate` as a
+controlled release step before starting the API. The default listener is
+`http://127.0.0.1:8080`.
 
 Smoke-check the process:
 
@@ -155,7 +158,10 @@ Minimal administrative setup:
 15. Optionally enable memory policy before using explicit `/api/v1/memories`
 ```
 
-`cargo run` and the bootstrap command both apply migrations when the database is configured. The bootstrap command prints the raw system key once; save it in your secret manager or current shell and send it as `X-Moira-System-Key` for admin API calls.
+Run `cargo run -- migrate` before production bootstrap or deployment. Development
+commands may migrate on startup when `database.migrate_on_startup` is enabled.
+The bootstrap command prints the raw system key once; store it in your secret
+manager and send it as `X-Moira-System-Key` for admin API calls.
 
 ## Runtime Verification
 
