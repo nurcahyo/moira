@@ -484,7 +484,7 @@ impl PublicExecutionService {
                         .await
                     {
                         Ok(_) => {
-                            if let Err(error) = self
+                            let conversation_result = self
                                 .record_conversation_assistant(
                                     &actor,
                                     &ctx,
@@ -493,17 +493,18 @@ impl PublicExecutionService {
                                     response.execution_id,
                                     outcome.output_text.as_deref(),
                                 )
-                                .await
-                            {
-                                terminal_failure(
-                                    &response,
-                                    sequence,
-                                    &ctx,
-                                    ExecutionFailure::new(
-                                        ExecutionFailureClass::InternalError,
-                                        error.to_string(),
-                                    ),
-                                )
+                                .await;
+                            if conversation_result.is_err() {
+                                let _ = self
+                                    .audit(
+                                        &actor,
+                                        &ctx,
+                                        "response.stream.conversation_persistence_failed",
+                                        AuditResult::Failed,
+                                        Some(response.id.to_string()),
+                                        json!({ "execution_id": response.execution_id }),
+                                    )
+                                    .await;
                             } else {
                                 let _ = self
                                     .audit(
@@ -515,18 +516,18 @@ impl PublicExecutionService {
                                         json!({ "execution_id": response.execution_id }),
                                     )
                                     .await;
-                                public_sse(
-                                    response.id,
-                                    response.execution_id,
-                                    response.request_id.clone(),
-                                    sequence,
-                                    "response.completed",
-                                    json!({
-                                        "status": "completed",
-                                        "usage": PublicUsageSummary::from(outcome.usage)
-                                    }),
-                                )
                             }
+                            public_sse(
+                                response.id,
+                                response.execution_id,
+                                response.request_id.clone(),
+                                sequence,
+                                "response.completed",
+                                json!({
+                                    "status": "completed",
+                                    "usage": PublicUsageSummary::from(outcome.usage)
+                                }),
+                            )
                         }
                         Err(error) => terminal_failure(
                             &response,

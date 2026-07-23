@@ -12,7 +12,6 @@ This list tracks what is still left to harden or complete after the current Phas
 - TODO: Add pepper-rotation tests that verify old API-key hashes remain verifiable while new keys use the active pepper version.
 - TODO: Add JWT cache bound/eviction tests and negative tests for disallowed algorithms, audience mismatch, and delegation without scope.
 - TODO: Add security log assertions proving raw API keys, JWTs, ciphertext, nonces, and decrypted secrets are never emitted through tracing or audit metadata.
-- TODO: Add production startup guardrails that reject exposed deployments when admin auth is disabled, dev-trusted caller headers are enabled, or insecure dev master-key/API-key pepper fallbacks are active.
 
 ## Phase 2: Admin APIs And Runtime Config
 
@@ -32,10 +31,8 @@ This list tracks what is still left to harden or complete after the current Phas
 ## Phase 3: Provider Runtime, Routing, And Rig Execution
 
 - TODO: Implement the Rig `Agent`/`AgentRunner` path for approved tool-enabled agent profiles instead of only direct completion.
-- TODO: Carry live internal streaming from Rig through `ExecutionService::execute_stream` with bounded backpressure and cancellation propagation all the way to consumers.
 - TODO: Make custom providers executable only after a safe explicit provider contract exists; they are currently configurable but rejected at runtime.
 - TODO: Use provider health snapshots and circuit state as first-class candidate filters and ranking inputs, not only static active configuration.
-- TODO: Fix execution concurrency permit lifetime so global, provider, application, and user permits are held for the entire upstream provider call, including retries and streaming.
 - TODO: Add durable or cross-instance strategy notes for concurrency limits and circuit breakers; the current controls are in-memory per process.
 - TODO: Complete pricing and cost normalization so `usage_records.estimated_total_cost` is populated when model pricing is configured.
 - TODO: Add provider/runtime integration tests with deterministic test doubles for retries, fallback, timeout, cancellation, circuit open, credential failure, and malformed provider responses.
@@ -45,9 +42,8 @@ This list tracks what is still left to harden or complete after the current Phas
 
 ## Phase 4: Public Responses API And SSE
 
-- TODO: Replace collector-backed SSE with true live first-token streaming from the Phase 3 stream path.
 - TODO: Add regression coverage proving public SSE emits provider deltas live instead of replaying collected events after execution completes.
-- TODO: Record client disconnect/cancellation audit events reliably for streaming and non-streaming public requests.
+- TODO: Record non-streaming client disconnect/cancellation audit events reliably.
 - TODO: Implement response persistence modes beyond metadata-only, including encrypted content storage, retrieval, retention, and cleanup semantics.
 - TODO: Add retention cleanup for expired `responses` and idempotency records.
 - TODO: Implement full public body-size, decompression, content-type, timeout, secure-header, tracing, and panic middleware.
