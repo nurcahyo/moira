@@ -1,0 +1,247 @@
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: moira-api
+value: 100000
+globalDefault: false
+description: "Priority for Moira API pods."
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: moira
+  labels:
+    app.kubernetes.io/name: moira
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: moira
+  labels:
+    app.kubernetes.io/name: moira
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: moira
+  labels:
+    app.kubernetes.io/name: moira
+subjects:
+  - kind: ServiceAccount
+    name: moira
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: moira
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: moira-config
+  labels:
+    app.kubernetes.io/name: moira
+data:
+  MOIRA_SERVER__HOST: "0.0.0.0"
+  MOIRA_SERVER__PORT: "8080"
+  MOIRA_DATABASE__REQUIRE: "true"
+  MOIRA_REDIS__ENABLED: "true"
+  MOIRA_REDIS__NAMESPACE: "moira"
+  MOIRA_REDIS__INVALIDATION_CHANNEL: "moira:runtime-config"
+  MOIRA_WORKERS__ENABLED: "true"
+  MOIRA_TELEMETRY__JSON: "true"
+  MOIRA_TELEMETRY__PROMETHEUS_ENABLED: "true"
+  MOIRA_TELEMETRY__OTEL_ENABLED: "true"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: moira-secrets
+  labels:
+    app.kubernetes.io/name: moira
+type: Opaque
+stringData:
+  MOIRA_DATABASE__URL: "postgres://replace:replace@postgres:5432/moira"
+  MOIRA_REDIS__URL: "redis://redis:6379/0"
+  MOIRA_SECRETS__MASTER_KEY_BASE64: "replace-with-32-byte-base64-key"
+  MOIRA_API_KEYS__PEPPER_BASE64: "replace-with-32-byte-base64-pepper"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: moira
+  labels:
+    app.kubernetes.io/name: moira
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: moira
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: moira
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "8080"
+    spec:
+      serviceAccountName: moira
+      priorityClassName: moira-api
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: moira
+          image: ghcr.io/example/moira:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: moira-config
+            - secretRef:
+                name: moira-secrets
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: moira
+  labels:
+    app.kubernetes.io/name: moira
+spec:
+  selector:
+    app.kubernetes.io/name: moira
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: moira
+  labels:
+    app.kubernetes.io/name: moira
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+spec:
+  rules:
+    - host: moira.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: moira
+                port:
+                  name: http
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: moira
+  labels:
+    app.kubernetes.io/name: moira
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: moira
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: moira
+  labels:
+    app.kubernetes.io/name: moira
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: moira
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: moira
+  labels:
+    app.kubernetes.io/name: moira
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: moira
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 6379
+        - protocol: TCP
+          port: 443
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: moira
+  labels:
+    app.kubernetes.io/name: moira
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: moira
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s

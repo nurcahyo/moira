@@ -1,0 +1,7 @@
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: {{ include "moira.fullname" . }}
+value: 100000
+globalDefault: false
+description: "Priority for Moira API pods."

@@ -1,0 +1,473 @@
+use std::{convert::Infallible, time::Duration};
+
+use axum::{
+    Json,
+    extract::{Path, Query, State},
+    http::{HeaderMap, HeaderValue, header},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
+};
+use futures_util::{Stream, StreamExt};
+use uuid::Uuid;
+
+use crate::{
+    app::AppState,
+    application::{PublicExecutionService, RequestContext},
+    domain::{
+        ExecutionQuery, ListResponse, OpenAiResponseCompatRequest, PublicCapabilities,
+        PublicExecutionSummary, PublicModelResource, PublicResponse, PublicResponseRequest,
+        PublicRouteResource, PublicSseEnvelope, PublicUsageRecord, UsageQuery,
+    },
+    error::{AppError, ErrorResponse},
+};
+
+async fn public_actor(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<crate::security::Actor, AppError> {
+    state.auth.authenticate_caller(state.pool()?, headers).await
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/responses",
+    tag = "responses",
+    request_body = PublicResponseRequest,
+    params(
+        ("Idempotency-Key" = Option<String>, Header, description = "Optional replay key for non-streaming response creation"),
+        ("X-Request-Id" = Option<String>, Header, description = "Optional caller-provided correlation identifier")
+    ),
+    responses(
+        (
+            status = 200,
+            description = "Response completed",
+            body = PublicResponse,
+            headers(("X-Request-Id" = String, description = "Request correlation identifier"))
+        ),
+        (status = 400, description = "Malformed request", body = ErrorResponse),
+        (status = 401, description = "Authentication failed", body = ErrorResponse),
+        (status = 403, description = "Operation is not permitted", body = ErrorResponse),
+        (status = 409, description = "Idempotency or execution conflict", body = ErrorResponse),
+        (status = 422, description = "Request violates execution policy", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
+        (status = 502, description = "Upstream provider failed", body = ErrorResponse),
+        (status = 503, description = "Required infrastructure is unavailable", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearerAuth" = []),
+        ("systemKeyAuth" = []),
+        ("consumerKeyAuth" = [])
+    )
+)]
+pub async fn create_response(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<PublicResponseRequest>,
+) -> Result<(HeaderMap, Json<PublicResponse>), AppError> {
+    let actor = public_actor(&state, &headers).await?;
+    let ctx = RequestContext::from_headers(&headers);
+    let response = PublicExecutionService::new(&state)?
+        .create_response(&actor, &ctx, request)
+        .await?;
+    state.metrics.record_public_response_created();
+    Ok((json_headers(&ctx.request_id), Json(response)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/responses/stream",
+    tag = "responses",
+    request_body = PublicResponseRequest,
+    params(
+        ("X-Request-Id" = Option<String>, Header, description = "Optional caller-provided correlation identifier")
+    ),
+    responses(
+        (
+            status = 200,
+            description = "Server-sent event stream; Idempotency-Key is not supported",
+            body = PublicSseEnvelope,
+            content_type = "text/event-stream",
+            headers(("X-Request-Id" = String, description = "Request correlation identifier"))
+        ),
+        (status = 400, description = "Malformed request", body = ErrorResponse),
+        (status = 401, description = "Authentication failed", body = ErrorResponse),
+        (status = 403, description = "Operation is not permitted", body = ErrorResponse),
+        (status = 422, description = "Request violates execution policy", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
+        (status = 502, description = "Upstream provider failed", body = ErrorResponse),
+        (status = 503, description = "Required infrastructure is unavailable", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearerAuth" = []),
+        ("systemKeyAuth" = []),
+        ("consumerKeyAuth" = [])
+    )
+)]
+pub async fn stream_response(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<PublicResponseRequest>,
+) -> Result<
+    (
+        HeaderMap,
+        Sse<impl Stream<Item = Result<Event, Infallible>>>,
+    ),
+    AppError,
+> {
+    let actor = public_actor(&state, &headers).await?;
+    let ctx = RequestContext::from_headers(&headers);
+    let request_id = ctx.request_id.clone();
+    let heartbeat_seconds = state.settings.public_api.heartbeat_seconds;
+    let stream = PublicExecutionService::new(&state)?
+        .stream_response(actor, ctx, request)
+        .await?
+        .map(|result| Ok::<_, Infallible>(sse_event(result)));
+    state.metrics.record_public_stream_started();
+    Ok((
+        sse_headers(&request_id),
+        Sse::new(stream).keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(heartbeat_seconds.max(1)))
+                .text("heartbeat"),
+        ),
+    ))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/responses/{response_id}",
+    tag = "responses",
+    params(("response_id" = String, Path, description = "Public response identifier")),
+    responses(
+        (
+            status = 200,
+            description = "Stored response",
+            body = PublicResponse,
+            headers(("X-Request-Id" = String, description = "Request correlation identifier"))
+        ),
+        (status = 400, description = "Invalid response identifier", body = ErrorResponse),
+        (status = 401, description = "Authentication failed", body = ErrorResponse),
+        (status = 403, description = "Operation is not permitted", body = ErrorResponse),
+        (status = 404, description = "Response was not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearerAuth" = []),
+        ("systemKeyAuth" = []),
+        ("consumerKeyAuth" = [])
+    )
+)]
+pub async fn get_response(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(response_id): Path<String>,
+) -> Result<(HeaderMap, Json<PublicResponse>), AppError> {
+    let actor = public_actor(&state, &headers).await?;
+    let ctx = RequestContext::from_headers(&headers);
+    let id = parse_public_id(&response_id, "resp")?;
+    let response = PublicExecutionService::new(&state)?
+        .get_response(&actor, &ctx, id)
+        .await?;
+    Ok((json_headers(&ctx.request_id), Json(response)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/executions/{execution_id}",
+    tag = "executions",
+    params(("execution_id" = String, Path, description = "Public execution identifier")),
+    responses(
+        (status = 200, description = "Execution summary", body = PublicExecutionSummary),
+        (status = 400, description = "Invalid execution identifier", body = ErrorResponse),
+        (status = 401, description = "Authentication failed", body = ErrorResponse),
+        (status = 403, description = "Operation is not permitted", body = ErrorResponse),
+        (status = 404, description = "Execution was not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearerAuth" = []),
+        ("systemKeyAuth" = []),
+        ("consumerKeyAuth" = [])
+    )
+)]
+pub async fn get_execution(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(execution_id): Path<String>,
+) -> Result<(HeaderMap, Json<PublicExecutionSummary>), AppError> {
+    let actor = public_actor(&state, &headers).await?;
+    let ctx = RequestContext::from_headers(&headers);
+    let id = parse_public_id(&execution_id, "exec")?;
+    let response = PublicExecutionService::new(&state)?
+        .get_execution(&actor, &ctx, id)
+        .await?;
+    Ok((json_headers(&ctx.request_id), Json(response)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/executions",
+    tag = "executions",
+    params(ExecutionQuery),
+    responses(
+        (status = 200, description = "Paginated execution summaries", body = ListResponse<PublicExecutionSummary>),
+        (status = 400, description = "Invalid query", body = ErrorResponse),
+        (status = 401, description = "Authentication failed", body = ErrorResponse),
+        (status = 403, description = "Operation is not permitted", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearerAuth" = []),
+        ("systemKeyAuth" = []),
+        ("consumerKeyAuth" = [])
+    )
+)]
+pub async fn list_executions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ExecutionQuery>,
+) -> Result<(HeaderMap, Json<ListResponse<PublicExecutionSummary>>), AppError> {
+    let actor = public_actor(&state, &headers).await?;
+    let ctx = RequestContext::from_headers(&headers);
+    let response = PublicExecutionService::new(&state)?
+        .list_executions(&actor, &query)
+        .await?;
+    Ok((json_headers(&ctx.request_id), Json(response)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/usage",
+    tag = "usage",
+    params(UsageQuery),
+    responses(
+        (status = 200, description = "Paginated usage records", body = ListResponse<PublicUsageRecord>),
+        (status = 400, description = "Invalid query", body = ErrorResponse),
+        (status = 401, description = "Authentication failed", body = ErrorResponse),
+        (status = 403, description = "Operation is not permitted", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearerAuth" = []),
+        ("systemKeyAuth" = []),
+        ("consumerKeyAuth" = [])
+    )
+)]
+pub async fn list_usage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<UsageQuery>,
+) -> Result<(HeaderMap, Json<ListResponse<PublicUsageRecord>>), AppError> {
+    let actor = public_actor(&state, &headers).await?;
+    let ctx = RequestContext::from_headers(&headers);
+    let response = PublicExecutionService::new(&state)?
+        .list_usage(&actor, &ctx, &query)
+        .await?;
+    Ok((json_headers(&ctx.request_id), Json(response)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/models",
+    tag = "discovery",
+    responses(
+        (status = 200, description = "Models available to the caller", body = ListResponse<PublicModelResource>),
+        (status = 401, description = "Authentication failed", body = ErrorResponse),
+        (status = 403, description = "Operation is not permitted", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearerAuth" = []),
+        ("systemKeyAuth" = []),
+        ("consumerKeyAuth" = [])
+    )
+)]
+pub async fn list_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<(HeaderMap, Json<ListResponse<PublicModelResource>>), AppError> {
+    let actor = public_actor(&state, &headers).await?;
+    let ctx = RequestContext::from_headers(&headers);
+    let response = PublicExecutionService::new(&state)?
+        .list_models(&actor)
+        .await?;
+    Ok((json_headers(&ctx.request_id), Json(response)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/routes",
+    tag = "discovery",
+    responses(
+        (status = 200, description = "Routes available to the caller", body = ListResponse<PublicRouteResource>),
+        (status = 401, description = "Authentication failed", body = ErrorResponse),
+        (status = 403, description = "Operation is not permitted", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearerAuth" = []),
+        ("systemKeyAuth" = []),
+        ("consumerKeyAuth" = [])
+    )
+)]
+pub async fn list_routes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<(HeaderMap, Json<ListResponse<PublicRouteResource>>), AppError> {
+    let actor = public_actor(&state, &headers).await?;
+    let ctx = RequestContext::from_headers(&headers);
+    let response = PublicExecutionService::new(&state)?
+        .list_routes(&actor)
+        .await?;
+    Ok((json_headers(&ctx.request_id), Json(response)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/capabilities",
+    tag = "discovery",
+    responses(
+        (status = 200, description = "Capabilities and limits for the caller", body = PublicCapabilities),
+        (status = 401, description = "Authentication failed", body = ErrorResponse),
+        (status = 403, description = "Operation is not permitted", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearerAuth" = []),
+        ("systemKeyAuth" = []),
+        ("consumerKeyAuth" = [])
+    )
+)]
+pub async fn capabilities(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<(HeaderMap, Json<PublicCapabilities>), AppError> {
+    let actor = public_actor(&state, &headers).await?;
+    let ctx = RequestContext::from_headers(&headers);
+    let response = PublicExecutionService::new(&state)?
+        .capabilities(&actor)
+        .await?;
+    Ok((json_headers(&ctx.request_id), Json(response)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/responses",
+    tag = "compatibility",
+    request_body = OpenAiResponseCompatRequest,
+    responses(
+        (
+            status = 200,
+            description = "OpenAI-compatible JSON response or server-sent event stream",
+            content(
+                (PublicResponse = "application/json"),
+                (PublicSseEnvelope = "text/event-stream")
+            )
+        ),
+        (status = 400, description = "Malformed or unsupported compatibility request", body = ErrorResponse),
+        (status = 401, description = "Authentication failed", body = ErrorResponse),
+        (status = 403, description = "Operation is not permitted", body = ErrorResponse),
+        (status = 404, description = "Compatibility endpoint is disabled", body = ErrorResponse),
+        (status = 422, description = "Request violates execution policy", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
+        (status = 502, description = "Upstream provider failed", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearerAuth" = []),
+        ("systemKeyAuth" = []),
+        ("consumerKeyAuth" = [])
+    )
+)]
+pub async fn openai_responses_compat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<OpenAiResponseCompatRequest>,
+) -> Result<Response, AppError> {
+    if !state.settings.public_api.openai_responses_compat_enabled {
+        return Err(AppError::NotFound("compatibility endpoint".to_string()));
+    }
+    let actor = public_actor(&state, &headers).await?;
+    let ctx = RequestContext::from_headers(&headers);
+    let service = PublicExecutionService::new(&state)?;
+    let stream_requested = request.stream;
+    let public_request = service.openai_compat_to_public(request)?;
+    if stream_requested {
+        let request_id = ctx.request_id.clone();
+        let heartbeat_seconds = state.settings.public_api.heartbeat_seconds;
+        let stream = service
+            .stream_response(actor, ctx, public_request)
+            .await?
+            .map(|result| Ok::<_, Infallible>(sse_event(result)));
+        state.metrics.record_public_stream_started();
+        Ok((
+            sse_headers(&request_id),
+            Sse::new(stream).keep_alive(
+                KeepAlive::new()
+                    .interval(Duration::from_secs(heartbeat_seconds.max(1)))
+                    .text("heartbeat"),
+            ),
+        )
+            .into_response())
+    } else {
+        let response = service
+            .create_response(&actor, &ctx, public_request)
+            .await?;
+        state.metrics.record_public_response_created();
+        Ok((json_headers(&ctx.request_id), Json(response)).into_response())
+    }
+}
+
+fn sse_event(result: Result<crate::domain::PublicSseEnvelope, AppError>) -> Event {
+    match result {
+        Ok(envelope) => Event::default()
+            .event(envelope.event_type.clone())
+            .id(envelope.sequence.to_string())
+            .data(serde_json::to_string(&envelope).unwrap_or_else(|_| "{}".to_string())),
+        Err(error) => Event::default()
+            .event("response.failed")
+            .data(serde_json::json!({ "error": { "code": "internal_error", "message": error.to_string() } }).to_string()),
+    }
+}
+
+fn json_headers(request_id: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        headers.insert(header::HeaderName::from_static("x-request-id"), value);
+    }
+    headers
+}
+
+fn sse_headers(request_id: &str) -> HeaderMap {
+    let mut headers = json_headers(request_id);
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-store"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    headers
+}
+
+fn parse_public_id(value: &str, prefix: &str) -> Result<Uuid, AppError> {
+    let expected = format!("{prefix}_");
+    let raw = value
+        .strip_prefix(&expected)
+        .ok_or_else(|| AppError::BadRequest(format!("{prefix} id has invalid prefix")))?;
+    Uuid::parse_str(raw).map_err(|_| AppError::BadRequest(format!("{prefix} id is invalid")))
+}

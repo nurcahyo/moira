@@ -1,0 +1,4 @@
+interface:
+  display_name: "Moira OpenAPI"
+  short_description: "Generate and maintain Moira API documentation"
+  default_prompt: "Use $moira-openapi to document every Moira API route and validate the generated OpenAPI contract."
