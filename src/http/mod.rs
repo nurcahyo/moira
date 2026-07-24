@@ -531,6 +531,117 @@ mod tests {
     }
 
     #[test]
+    fn atomic_admin_idempotency_contract_is_explicit() {
+        let value = serde_json::to_value(documented_router().into_openapi()).unwrap();
+        let operations = [
+            ("/api/v1/admin/applications", "post", "201", false, false),
+            ("/api/v1/admin/providers", "post", "201", false, false),
+            (
+                "/api/v1/admin/providers/{provider_id}/models",
+                "post",
+                "201",
+                false,
+                false,
+            ),
+            (
+                "/api/v1/admin/provider-credentials",
+                "post",
+                "201",
+                false,
+                false,
+            ),
+            (
+                "/api/v1/admin/provider-credentials/{id}/rotate",
+                "post",
+                "200",
+                true,
+                false,
+            ),
+            ("/api/v1/admin/system-keys", "post", "201", false, true),
+            (
+                "/api/v1/admin/system-keys/{id}/rotate",
+                "post",
+                "200",
+                false,
+                true,
+            ),
+            ("/api/v1/admin/consumer-keys", "post", "201", false, true),
+            (
+                "/api/v1/admin/consumer-keys/{id}/rotate",
+                "post",
+                "200",
+                false,
+                true,
+            ),
+            ("/api/v1/admin/jwt-issuers", "post", "201", false, false),
+        ];
+
+        for (path, method, success_status, requires_if_match, once_only_secret) in operations {
+            let operation = &value["paths"][path][method];
+            assert!(
+                parameter_named(operation, "Idempotency-Key"),
+                "{method} {path} is missing Idempotency-Key"
+            );
+            assert_eq!(
+                parameter_required(operation, "If-Match"),
+                requires_if_match,
+                "unexpected If-Match contract for {method} {path}"
+            );
+
+            let responses = operation["responses"]
+                .as_object()
+                .expect("operation responses");
+            assert!(
+                responses.contains_key(success_status),
+                "{method} {path} is missing success status {success_status}"
+            );
+            assert!(
+                responses.contains_key("409"),
+                "{method} {path} must explicitly document idempotency conflicts"
+            );
+            assert_eq!(
+                responses["409"]["content"]["application/json"]["schema"]["$ref"],
+                "#/components/schemas/ErrorResponse",
+                "{method} {path} must use ErrorResponse for idempotency conflicts"
+            );
+            let conflict_description = responses["409"]["description"]
+                .as_str()
+                .expect("409 description");
+            for code in ["idempotency_conflict", "idempotency_in_progress"] {
+                assert!(
+                    conflict_description.contains(code),
+                    "{method} {path} 409 description is missing {code}"
+                );
+            }
+
+            if once_only_secret {
+                let success_description = responses[success_status]["description"]
+                    .as_str()
+                    .expect("success description");
+                assert!(
+                    success_description.contains("replay")
+                        && success_description.contains("secret_retrievable"),
+                    "{method} {path} must document sanitized secret replays"
+                );
+            }
+        }
+
+        let error_schema = &value["components"]["schemas"]["ErrorResponse"];
+        assert!(
+            error_schema["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|field| field == "error"))
+        );
+        let error_detail_schema = &value["components"]["schemas"]["ErrorDetail"];
+        assert!(
+            error_detail_schema["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|field| field == "request_id")),
+            "replayed deterministic errors must carry the current request ID"
+        );
+    }
+
+    #[test]
     fn every_local_schema_reference_resolves() {
         let value = serde_json::to_value(documented_router().into_openapi()).unwrap();
         let schemas = value["components"]["schemas"]
@@ -543,6 +654,17 @@ mod tests {
         operation["parameters"]
             .as_array()
             .is_some_and(|parameters| parameters.iter().any(|parameter| parameter["name"] == name))
+    }
+
+    fn parameter_required(operation: &Value, name: &str) -> bool {
+        operation["parameters"]
+            .as_array()
+            .is_some_and(|parameters| {
+                parameters
+                    .iter()
+                    .find(|parameter| parameter["name"] == name)
+                    .is_some_and(|parameter| parameter["required"] == true)
+            })
     }
 
     fn assert_refs_resolve(value: &Value, schemas: &serde_json::Map<String, Value>) {

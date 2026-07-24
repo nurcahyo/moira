@@ -1,19 +1,21 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 
-use chrono::{Duration, Utc};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::Serialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
     app::AppState,
-    application::RequestContext,
+    application::{
+        AdminCommandIdempotency, AdminCommandMutation, AdminCommandRunner, AdminCommandSpec,
+        RequestContext,
+    },
     domain::{
         ApiKeyRecord, ApiKeyRotateRequest, ApiKeySecretResponse, ApplicationCreateRequest,
         ApplicationPatchRequest, ApplicationRecord, ApplicationSlug, AuditLogInsert,
         AuditLogRecord, AuditResult, ConsumerKeyCreateRequest, CredentialCreateRequest,
         CredentialPatchRequest, CredentialRecord, CredentialScope, CredentialSecret,
-        ExternalApplicationId, ExternalTenantId, ExternalUserId, IdempotencyRecord, ListResponse,
+        ExternalApplicationId, ExternalTenantId, ExternalUserId, ListResponse,
         ProviderCreateRequest, ProviderModelCreateRequest, ProviderModelPatchRequest,
         ProviderModelRecord, ProviderPatchRequest, ProviderRecord, RotateCredentialRequest,
         SystemKeyCreateRequest, TrustedJwtIssuerCreateRequest, TrustedJwtIssuerPatchRequest,
@@ -21,12 +23,14 @@ use crate::{
     },
     error::AppError,
     infra::{
-        pg_rows::{credential_type_to_db, scope_type_to_db},
-        repositories::{AdminRepository, KeyMaterial, PgAdminRepository},
+        pg_rows::{credential_record_from_row, credential_type_to_db, scope_type_to_db},
+        repositories::{
+            AdminRepository, KeyMaterial, PgAdminCommandTransaction, PgAdminRepository,
+        },
     },
     security::{
         Actor, AuthorizationService, CredentialAadParts, ENVELOPE_VERSION_V1, SecretCipher,
-        credential_aad, request_hash, secret_fingerprint,
+        credential_aad, secret_fingerprint,
     },
 };
 
@@ -52,36 +56,38 @@ impl<'a> AdminService<'a> {
         self.state
             .authz
             .require(actor, "moira:applications:write")?;
-        if let Some(replay) = self
-            .idempotency_replay(ctx, actor, "application.create", &request)
-            .await?
-        {
-            return Ok(replay);
-        }
-        validate_application_identifiers(
-            request.external_application_id.as_deref(),
-            request.application_slug.as_deref(),
-        )?;
-        require_non_empty("display_name", &request.display_name)?;
-        let record = self
-            .repo
-            .create_application(Uuid::now_v7(), &request)
+        let spec = admin_command_spec(ctx, actor, "application.create", json!({}), &request)?;
+        let actor = actor.clone();
+        let ctx = ctx.clone();
+        let outcome = AdminCommandRunner::new(self.repo.clone())
+            .execute(spec, |transaction| {
+                Box::pin(async move {
+                    validate_application_identifiers(
+                        request.external_application_id.as_deref(),
+                        request.application_slug.as_deref(),
+                    )?;
+                    require_non_empty("display_name", &request.display_name)?;
+                    let record = transaction
+                        .create_application(Uuid::now_v7(), &request)
+                        .await?;
+                    transaction
+                        .insert_audit(success_audit(
+                            &actor,
+                            &ctx,
+                            "application.create",
+                            "application",
+                            Some(record.id.to_string()),
+                            json!({
+                                "external_application_id": record.external_application_id,
+                                "application_slug": record.application_slug,
+                            }),
+                        ))
+                        .await?;
+                    AdminCommandMutation::new(record.clone(), 201, Some(record.id.to_string()))
+                })
+            })
             .await?;
-        self.audit_success(
-            actor,
-            ctx,
-            "application.create",
-            "application",
-            Some(record.id.to_string()),
-            json!({
-                "external_application_id": record.external_application_id,
-                "application_slug": record.application_slug,
-            }),
-        )
-        .await?;
-        self.record_idempotency(ctx, actor, "application.create", &request, &record)
-            .await?;
-        Ok(record)
+        Ok(outcome.response)
     }
 
     pub async fn list_applications(
@@ -196,34 +202,52 @@ impl<'a> AdminService<'a> {
         request: ProviderCreateRequest,
     ) -> Result<ProviderRecord, AppError> {
         self.state.authz.require(actor, "moira:providers:write")?;
-        if let Some(replay) = self
-            .idempotency_replay(ctx, actor, "provider.create", &request)
-            .await?
-        {
-            return Ok(replay);
+        let spec = admin_command_spec(ctx, actor, "provider.create", json!({}), &request)?;
+        let actor = actor.clone();
+        let ctx = ctx.clone();
+        let allow_private_provider_urls = self
+            .state
+            .settings
+            .provider_security
+            .allow_private_provider_urls;
+        let allow_http_provider_urls = self
+            .state
+            .settings
+            .provider_security
+            .allow_http_provider_urls;
+        let outcome = AdminCommandRunner::new(self.repo.clone())
+            .execute(spec, |transaction| {
+                Box::pin(async move {
+                    require_non_empty("display_name", &request.display_name)?;
+                    let base_url = match request.base_url.as_deref() {
+                        Some(value) => Some(validate_provider_base_url(
+                            value,
+                            allow_private_provider_urls,
+                            allow_http_provider_urls,
+                        )?),
+                        None => None,
+                    };
+                    let record = transaction
+                        .create_provider(Uuid::now_v7(), &request, base_url)
+                        .await?;
+                    transaction
+                        .insert_audit(success_audit(
+                            &actor,
+                            &ctx,
+                            "provider.create",
+                            "provider",
+                            Some(record.id.to_string()),
+                            json!({ "provider_type": record.provider_type }),
+                        ))
+                        .await?;
+                    AdminCommandMutation::new(record.clone(), 201, Some(record.id.to_string()))
+                })
+            })
+            .await?;
+        if !outcome.replayed {
+            self.schedule_runtime_cache_invalidation();
         }
-        require_non_empty("display_name", &request.display_name)?;
-        let base_url = match request.base_url.as_deref() {
-            Some(value) => Some(self.validate_provider_base_url(value)?),
-            None => None,
-        };
-        let record = self
-            .repo
-            .create_provider(Uuid::now_v7(), &request, base_url)
-            .await?;
-        self.state.runtime_cache.invalidate_all().await;
-        self.audit_success(
-            actor,
-            ctx,
-            "provider.create",
-            "provider",
-            Some(record.id.to_string()),
-            json!({ "provider_type": record.provider_type }),
-        )
-        .await?;
-        self.record_idempotency(ctx, actor, "provider.create", &request, &record)
-            .await?;
-        Ok(record)
+        Ok(outcome.response)
     }
 
     pub async fn list_providers(
@@ -326,31 +350,41 @@ impl<'a> AdminService<'a> {
         request: ProviderModelCreateRequest,
     ) -> Result<ProviderModelRecord, AppError> {
         self.state.authz.require(actor, "moira:models:write")?;
-        if let Some(replay) = self
-            .idempotency_replay(ctx, actor, "provider_model.create", &request)
-            .await?
-        {
-            return Ok(replay);
-        }
-        require_non_empty("model_key", &request.model_key)?;
-        self.repo.get_provider(provider_id).await?;
-        let record = self
-            .repo
-            .create_provider_model(Uuid::now_v7(), provider_id, &request)
-            .await?;
-        self.state.runtime_cache.invalidate_all().await;
-        self.audit_success(
-            actor,
+        let spec = admin_command_spec(
             ctx,
+            actor,
             "provider_model.create",
-            "provider_model",
-            Some(record.id.to_string()),
             json!({ "provider_id": provider_id }),
-        )
-        .await?;
-        self.record_idempotency(ctx, actor, "provider_model.create", &request, &record)
+            &request,
+        )?;
+        let actor = actor.clone();
+        let ctx = ctx.clone();
+        let outcome = AdminCommandRunner::new(self.repo.clone())
+            .execute(spec, |transaction| {
+                Box::pin(async move {
+                    require_non_empty("model_key", &request.model_key)?;
+                    require_active_row(transaction, "providers", provider_id, "provider").await?;
+                    let record = transaction
+                        .create_provider_model(Uuid::now_v7(), provider_id, &request)
+                        .await?;
+                    transaction
+                        .insert_audit(success_audit(
+                            &actor,
+                            &ctx,
+                            "provider_model.create",
+                            "provider_model",
+                            Some(record.id.to_string()),
+                            json!({ "provider_id": provider_id }),
+                        ))
+                        .await?;
+                    AdminCommandMutation::new(record.clone(), 201, Some(record.id.to_string()))
+                })
+            })
             .await?;
-        Ok(record)
+        if !outcome.replayed {
+            self.schedule_runtime_cache_invalidation();
+        }
+        Ok(outcome.response)
     }
 
     pub async fn list_provider_models(
@@ -453,53 +487,60 @@ impl<'a> AdminService<'a> {
         request: CredentialCreateRequest,
     ) -> Result<CredentialRecord, AppError> {
         self.state.authz.require(actor, "moira:credentials:write")?;
-        if let Some(replay) = self
-            .idempotency_replay(ctx, actor, "credential.create", &request)
-            .await?
-        {
-            return Ok(replay);
+        let spec = admin_command_spec(ctx, actor, "credential.create", json!({}), &request)?;
+        let actor = actor.clone();
+        let ctx = ctx.clone();
+        let cipher = self.state.cipher.clone();
+        let outcome = AdminCommandRunner::new(self.repo.clone())
+            .execute(spec, |transaction| {
+                Box::pin(async move {
+                    require_active_row(transaction, "providers", request.provider_id, "provider")
+                        .await?;
+                    validate_credential_scope(&request)?;
+                    authorize_credential_scope(&actor, &request.scope)?;
+                    validate_credential_secret(&request.credential_type, &request.secret)?;
+                    let id = Uuid::now_v7();
+                    let plaintext = serde_json::to_vec(&request.secret).map_err(|err| {
+                        AppError::BadRequest(format!("invalid credential secret: {err}"))
+                    })?;
+                    let aad = credential_aad(CredentialAadParts {
+                        credential_id: id,
+                        provider_id: request.provider_id,
+                        credential_type: credential_type_to_db(&request.credential_type),
+                        scope_type: scope_type_to_db(&request.scope.scope_type()),
+                        external_tenant_id: request.scope.external_tenant_id(),
+                        application_id: request.scope.application_id(),
+                        external_user_id: request.scope.external_user_id(),
+                        encryption_version: ENVELOPE_VERSION_V1,
+                    });
+                    let encrypted = cipher.encrypt(&plaintext, aad.as_bytes())?;
+                    let fingerprint = secret_fingerprint(&plaintext);
+                    let masked = mask_credential_secret(&request.secret);
+                    let record = transaction
+                        .create_credential(id, &request, &encrypted, &fingerprint, &masked)
+                        .await?;
+                    transaction
+                        .insert_audit(success_audit(
+                            &actor,
+                            &ctx,
+                            "credential.create",
+                            "provider_credential",
+                            Some(record.id.to_string()),
+                            json!({
+                                "provider_id": record.provider_id,
+                                "credential_type": record.credential_type,
+                                "scope": record.scope,
+                            }),
+                        ))
+                        .await?;
+                    AdminCommandMutation::new(record.clone(), 201, Some(record.id.to_string()))
+                })
+            })
+            .await?;
+        if !outcome.replayed {
+            self.schedule_runtime_cache_invalidation();
         }
-        self.repo.get_provider(request.provider_id).await?;
-        validate_credential_scope(&request)?;
-        let id = Uuid::now_v7();
-        authorize_credential_scope(actor, &request.scope)?;
-        validate_credential_secret(&request.credential_type, &request.secret)?;
-        let plaintext = serde_json::to_vec(&request.secret)
-            .map_err(|err| AppError::BadRequest(format!("invalid credential secret: {err}")))?;
-        let aad = credential_aad(CredentialAadParts {
-            credential_id: id,
-            provider_id: request.provider_id,
-            credential_type: credential_type_to_db(&request.credential_type),
-            scope_type: scope_type_to_db(&request.scope.scope_type()),
-            external_tenant_id: request.scope.external_tenant_id(),
-            application_id: request.scope.application_id(),
-            external_user_id: request.scope.external_user_id(),
-            encryption_version: ENVELOPE_VERSION_V1,
-        });
-        let encrypted = self.state.cipher.encrypt(&plaintext, aad.as_bytes())?;
-        let fingerprint = secret_fingerprint(&plaintext);
-        let masked = mask_credential_secret(&request.secret);
-        let record = self
-            .repo
-            .create_credential(id, &request, &encrypted, &fingerprint, &masked)
-            .await?;
-        self.state.runtime_cache.invalidate_all().await;
-        self.audit_success(
-            actor,
-            ctx,
-            "credential.create",
-            "provider_credential",
-            Some(record.id.to_string()),
-            json!({
-                "provider_id": record.provider_id,
-                "credential_type": record.credential_type,
-                "scope": record.scope,
-            }),
-        )
-        .await?;
-        self.record_idempotency(ctx, actor, "credential.create", &request, &record)
-            .await?;
-        Ok(record)
+        Ok(outcome.response)
     }
 
     pub async fn list_credentials(
@@ -575,52 +616,72 @@ impl<'a> AdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         request: RotateCredentialRequest,
     ) -> Result<CredentialRecord, AppError> {
         self.state
             .authz
             .require(actor, "moira:credentials:rotate")?;
-        if let Some(replay) = self
-            .idempotency_replay(ctx, actor, "credential.rotate", &request)
-            .await?
-        {
-            return Ok(replay);
-        }
-        let existing = self.repo.load_credential_secret(id).await?;
-        authorize_credential_record(actor, &existing.record)?;
-        validate_credential_secret(&existing.record.credential_type, &request.secret)?;
-        let plaintext = serde_json::to_vec(&request.secret)
-            .map_err(|err| AppError::BadRequest(format!("invalid credential secret: {err}")))?;
-        let aad = credential_aad(CredentialAadParts {
-            credential_id: existing.record.id,
-            provider_id: existing.record.provider_id,
-            credential_type: credential_type_to_db(&existing.record.credential_type),
-            scope_type: scope_type_to_db(&existing.record.scope_type),
-            external_tenant_id: existing.record.external_tenant_id.as_deref(),
-            application_id: existing.record.application_id,
-            external_user_id: existing.record.external_user_id.as_deref(),
-            encryption_version: ENVELOPE_VERSION_V1,
-        });
-        let encrypted = self.state.cipher.encrypt(&plaintext, aad.as_bytes())?;
-        let fingerprint = secret_fingerprint(&plaintext);
-        let masked = mask_credential_secret(&request.secret);
-        let record = self
-            .repo
-            .rotate_credential(id, &encrypted, &fingerprint, &masked)
-            .await?;
-        self.state.runtime_cache.invalidate_all().await;
-        self.audit_success(
-            actor,
+        let spec = admin_command_spec(
             ctx,
+            actor,
             "credential.rotate",
-            "provider_credential",
-            Some(id.to_string()),
-            json!({}),
-        )
-        .await?;
-        self.record_idempotency(ctx, actor, "credential.rotate", &request, &record)
+            json!({ "credential_id": id }),
+            &request,
+        )?
+        .with_expected_version(Some(expected_version));
+        let actor = actor.clone();
+        let ctx = ctx.clone();
+        let cipher = self.state.cipher.clone();
+        let outcome = AdminCommandRunner::new(self.repo.clone())
+            .execute(spec, |transaction| {
+                Box::pin(async move {
+                    let existing = load_credential_record(transaction, id).await?;
+                    authorize_credential_record(&actor, &existing)?;
+                    validate_credential_secret(&existing.credential_type, &request.secret)?;
+                    let plaintext = serde_json::to_vec(&request.secret).map_err(|err| {
+                        AppError::BadRequest(format!("invalid credential secret: {err}"))
+                    })?;
+                    let aad = credential_aad(CredentialAadParts {
+                        credential_id: existing.id,
+                        provider_id: existing.provider_id,
+                        credential_type: credential_type_to_db(&existing.credential_type),
+                        scope_type: scope_type_to_db(&existing.scope_type),
+                        external_tenant_id: existing.external_tenant_id.as_deref(),
+                        application_id: existing.application_id,
+                        external_user_id: existing.external_user_id.as_deref(),
+                        encryption_version: ENVELOPE_VERSION_V1,
+                    });
+                    let encrypted = cipher.encrypt(&plaintext, aad.as_bytes())?;
+                    let fingerprint = secret_fingerprint(&plaintext);
+                    let masked = mask_credential_secret(&request.secret);
+                    let record = transaction
+                        .rotate_credential(
+                            id,
+                            Some(expected_version),
+                            &encrypted,
+                            &fingerprint,
+                            &masked,
+                        )
+                        .await?;
+                    transaction
+                        .insert_audit(success_audit(
+                            &actor,
+                            &ctx,
+                            "credential.rotate",
+                            "provider_credential",
+                            Some(id.to_string()),
+                            json!({}),
+                        ))
+                        .await?;
+                    AdminCommandMutation::new(record.clone(), 200, Some(record.id.to_string()))
+                })
+            })
             .await?;
-        Ok(record)
+        if !outcome.replayed {
+            self.schedule_runtime_cache_invalidation();
+        }
+        Ok(outcome.response)
     }
 
     pub async fn validate_credential(
@@ -743,56 +804,68 @@ impl<'a> AdminService<'a> {
         &self,
         actor: &Actor,
         ctx: &RequestContext,
-        mut request: SystemKeyCreateRequest,
+        request: SystemKeyCreateRequest,
     ) -> Result<ApiKeySecretResponse, AppError> {
         self.state.authz.require(actor, "moira:system-keys:write")?;
-        request.scopes = validate_key_request(
-            actor,
-            &self.state.authz,
-            &request.display_name,
-            &request.scopes,
-        )?;
-        if let Some(replay) = self
-            .idempotency_replay(ctx, actor, "system_key.create", &request)
-            .await?
-        {
-            return Ok(replay);
-        }
-        let generated = self.state.key_hasher.generate("moira_sys")?;
-        let record = self
-            .repo
-            .create_system_key(
-                Uuid::now_v7(),
-                &request,
-                &generated.key_prefix,
-                &generated.key_hash,
-                &generated.fingerprint,
-                &generated.pepper_version,
-            )
-            .await?;
-        self.audit_success(
-            actor,
-            ctx,
-            "system_key.create",
-            "system_api_key",
-            Some(record.id.to_string()),
-            json!({ "scopes": record.scopes }),
-        )
-        .await?;
-        let response = ApiKeySecretResponse {
-            resource: record,
-            secret: Some(generated.raw_key),
-            secret_retrievable: true,
-        };
-        self.record_idempotency(
+        let spec = admin_command_spec(
             ctx,
             actor,
             "system_key.create",
+            json!({ "key_type": "system" }),
             &request,
-            &sanitized_key_response(&response.resource),
-        )
-        .await?;
-        Ok(response)
+        )?;
+        let actor = actor.clone();
+        let ctx = ctx.clone();
+        let authz = self.state.authz.clone();
+        let key_hasher = self.state.key_hasher.clone();
+        let outcome = AdminCommandRunner::new(self.repo.clone())
+            .execute(spec, |transaction| {
+                Box::pin(async move {
+                    let mut request = request;
+                    request.scopes = validate_key_request(
+                        &actor,
+                        &authz,
+                        &request.display_name,
+                        &request.scopes,
+                    )?;
+                    let generated = key_hasher.generate("moira_sys")?;
+                    let record = transaction
+                        .create_system_key(
+                            Uuid::now_v7(),
+                            &request,
+                            KeyMaterial {
+                                key_prefix: &generated.key_prefix,
+                                key_hash: &generated.key_hash,
+                                fingerprint: &generated.fingerprint,
+                                pepper_version: &generated.pepper_version,
+                            },
+                        )
+                        .await?;
+                    transaction
+                        .insert_audit(success_audit(
+                            &actor,
+                            &ctx,
+                            "system_key.create",
+                            "system_api_key",
+                            Some(record.id.to_string()),
+                            json!({ "scopes": record.scopes }),
+                        ))
+                        .await?;
+                    let response = ApiKeySecretResponse {
+                        resource: record.clone(),
+                        secret: Some(generated.raw_key),
+                        secret_retrievable: true,
+                    };
+                    AdminCommandMutation::with_replay_response(
+                        response,
+                        sanitized_key_response(&record),
+                        201,
+                        Some(record.id.to_string()),
+                    )
+                })
+            })
+            .await?;
+        Ok(outcome.response)
     }
 
     pub async fn list_system_keys(
@@ -816,64 +889,86 @@ impl<'a> AdminService<'a> {
         &self,
         actor: &Actor,
         ctx: &RequestContext,
-        mut request: ConsumerKeyCreateRequest,
+        request: ConsumerKeyCreateRequest,
     ) -> Result<ApiKeySecretResponse, AppError> {
         self.state
             .authz
             .require(actor, "moira:consumer-keys:write")?;
-        request.scopes = validate_key_request(
-            actor,
-            &self.state.authz,
-            &request.display_name,
-            &request.scopes,
-        )?;
-        if let Some(replay) = self
-            .idempotency_replay(ctx, actor, "consumer_key.create", &request)
-            .await?
-        {
-            return Ok(replay);
-        }
-        self.repo.get_application(request.application_id).await?;
-        let generated = self.state.key_hasher.generate("moira_cons")?;
-        let record = self
-            .repo
-            .create_consumer_key(
-                Uuid::now_v7(),
-                request.application_id,
-                &request.display_name,
-                &request.scopes,
-                request.expires_at,
-                KeyMaterial {
-                    key_prefix: &generated.key_prefix,
-                    key_hash: &generated.key_hash,
-                    fingerprint: &generated.fingerprint,
-                    pepper_version: &generated.pepper_version,
-                },
-            )
-            .await?;
-        self.audit_success(
-            actor,
-            ctx,
-            "consumer_key.create",
-            "consumer_api_key",
-            Some(record.id.to_string()),
-            json!({ "application_id": record.application_id, "scopes": record.scopes }),
-        )
-        .await?;
-        let response = ApiKeySecretResponse {
-            resource: record,
-            secret: Some(generated.raw_key),
-            secret_retrievable: true,
-        };
-        self.record_idempotency(
+        let spec = admin_command_spec(
             ctx,
             actor,
             "consumer_key.create",
+            json!({
+                "key_type": "consumer",
+                "application_id": request.application_id,
+            }),
             &request,
-            &sanitized_key_response(&response.resource),
-        )
-        .await?;
-        Ok(response)
+        )?;
+        let actor = actor.clone();
+        let ctx = ctx.clone();
+        let authz = self.state.authz.clone();
+        let key_hasher = self.state.key_hasher.clone();
+        let outcome = AdminCommandRunner::new(self.repo.clone())
+            .execute(spec, |transaction| {
+                Box::pin(async move {
+                    let mut request = request;
+                    request.scopes = validate_key_request(
+                        &actor,
+                        &authz,
+                        &request.display_name,
+                        &request.scopes,
+                    )?;
+                    require_active_row(
+                        transaction,
+                        "applications",
+                        request.application_id,
+                        "application",
+                    )
+                    .await?;
+                    let generated = key_hasher.generate("moira_cons")?;
+                    let record = transaction
+                        .create_consumer_key(
+                            Uuid::now_v7(),
+                            request.application_id,
+                            &request.display_name,
+                            &request.scopes,
+                            request.expires_at,
+                            KeyMaterial {
+                                key_prefix: &generated.key_prefix,
+                                key_hash: &generated.key_hash,
+                                fingerprint: &generated.fingerprint,
+                                pepper_version: &generated.pepper_version,
+                            },
+                        )
+                        .await?;
+                    transaction
+                        .insert_audit(success_audit(
+                            &actor,
+                            &ctx,
+                            "consumer_key.create",
+                            "consumer_api_key",
+                            Some(record.id.to_string()),
+                            json!({
+                                "application_id": record.application_id,
+                                "scopes": record.scopes,
+                            }),
+                        ))
+                        .await?;
+                    let response = ApiKeySecretResponse {
+                        resource: record.clone(),
+                        secret: Some(generated.raw_key),
+                        secret_retrievable: true,
+                    };
+                    AdminCommandMutation::with_replay_response(
+                        response,
+                        sanitized_key_response(&record),
+                        201,
+                        Some(record.id.to_string()),
+                    )
+                })
+            })
+            .await?;
+        Ok(outcome.response)
     }
 
     pub async fn list_consumer_keys(
@@ -921,47 +1016,59 @@ impl<'a> AdminService<'a> {
         } else {
             "consumer_key.rotate"
         };
-        if let Some(replay) = self
-            .idempotency_replay(ctx, actor, operation, &request)
-            .await?
-        {
-            return Ok(replay);
-        }
-        let generated = self.state.key_hasher.generate(namespace)?;
-        let record = self
-            .repo
-            .rotate_key(
-                table,
-                id,
-                &generated.key_prefix,
-                &generated.key_hash,
-                &generated.fingerprint,
-                &generated.pepper_version,
-            )
-            .await?;
-        self.audit_success(
-            actor,
-            ctx,
-            "api_key.rotate",
-            table,
-            Some(id.to_string()),
-            json!({}),
-        )
-        .await?;
-        let response = ApiKeySecretResponse {
-            resource: record,
-            secret: Some(generated.raw_key),
-            secret_retrievable: true,
-        };
-        self.record_idempotency(
+        let spec = admin_command_spec(
             ctx,
             actor,
             operation,
+            json!({ "key_type": table, "key_id": id }),
             &request,
-            &sanitized_key_response(&response.resource),
-        )
-        .await?;
-        Ok(response)
+        )?;
+        let actor = actor.clone();
+        let ctx = ctx.clone();
+        let key_hasher = self.state.key_hasher.clone();
+        let table = table.to_string();
+        let namespace = namespace.to_string();
+        let outcome = AdminCommandRunner::new(self.repo.clone())
+            .execute(spec, |transaction| {
+                Box::pin(async move {
+                    let generated = key_hasher.generate(&namespace)?;
+                    let record = transaction
+                        .rotate_key(
+                            &table,
+                            id,
+                            KeyMaterial {
+                                key_prefix: &generated.key_prefix,
+                                key_hash: &generated.key_hash,
+                                fingerprint: &generated.fingerprint,
+                                pepper_version: &generated.pepper_version,
+                            },
+                        )
+                        .await?;
+                    transaction
+                        .insert_audit(success_audit(
+                            &actor,
+                            &ctx,
+                            "api_key.rotate",
+                            &table,
+                            Some(id.to_string()),
+                            json!({}),
+                        ))
+                        .await?;
+                    let response = ApiKeySecretResponse {
+                        resource: record.clone(),
+                        secret: Some(generated.raw_key),
+                        secret_retrievable: true,
+                    };
+                    AdminCommandMutation::with_replay_response(
+                        response,
+                        sanitized_key_response(&record),
+                        200,
+                        Some(record.id.to_string()),
+                    )
+                })
+            })
+            .await?;
+        Ok(outcome.response)
     }
 
     pub async fn revoke_key(
@@ -1022,31 +1129,33 @@ impl<'a> AdminService<'a> {
         request: TrustedJwtIssuerCreateRequest,
     ) -> Result<TrustedJwtIssuerRecord, AppError> {
         self.state.authz.require(actor, "moira:jwt-issuers:write")?;
-        if let Some(replay) = self
-            .idempotency_replay(ctx, actor, "jwt_issuer.create", &request)
-            .await?
-        {
-            return Ok(replay);
-        }
-        validate_https_url("jwks_url", &request.jwks_url)?;
-        validate_jwt_algorithm_list(&request.allowed_algorithms)?;
-        require_non_empty("issuer", &request.issuer)?;
-        let record = self
-            .repo
-            .create_trusted_jwt_issuer(Uuid::now_v7(), &request)
+        let spec = admin_command_spec(ctx, actor, "jwt_issuer.create", json!({}), &request)?;
+        let actor = actor.clone();
+        let ctx = ctx.clone();
+        let outcome = AdminCommandRunner::new(self.repo.clone())
+            .execute(spec, |transaction| {
+                Box::pin(async move {
+                    validate_https_url("jwks_url", &request.jwks_url)?;
+                    validate_jwt_algorithm_list(&request.allowed_algorithms)?;
+                    require_non_empty("issuer", &request.issuer)?;
+                    let record = transaction
+                        .create_trusted_jwt_issuer(Uuid::now_v7(), &request)
+                        .await?;
+                    transaction
+                        .insert_audit(success_audit(
+                            &actor,
+                            &ctx,
+                            "jwt_issuer.create",
+                            "trusted_jwt_issuer",
+                            Some(record.id.to_string()),
+                            json!({ "issuer": record.issuer }),
+                        ))
+                        .await?;
+                    AdminCommandMutation::new(record.clone(), 201, Some(record.id.to_string()))
+                })
+            })
             .await?;
-        self.audit_success(
-            actor,
-            ctx,
-            "jwt_issuer.create",
-            "trusted_jwt_issuer",
-            Some(record.id.to_string()),
-            json!({ "issuer": record.issuer }),
-        )
-        .await?;
-        self.record_idempotency(ctx, actor, "jwt_issuer.create", &request, &record)
-            .await?;
-        Ok(record)
+        Ok(outcome.response)
     }
 
     pub async fn list_trusted_jwt_issuers(
@@ -1217,87 +1326,6 @@ impl<'a> AdminService<'a> {
             .await
     }
 
-    async fn idempotency_replay<Req, Resp>(
-        &self,
-        ctx: &RequestContext,
-        actor: &Actor,
-        operation: &str,
-        request: &Req,
-    ) -> Result<Option<Resp>, AppError>
-    where
-        Req: Serialize,
-        Resp: DeserializeOwned,
-    {
-        let Some(key) = &ctx.idempotency_key else {
-            return Ok(None);
-        };
-        let actor_fingerprint = actor_fingerprint(actor);
-        let key_hash = request_hash(key.as_bytes());
-        let request_hash = normalized_request_hash(request)?;
-        let Some(record) = self
-            .repo
-            .get_idempotency_record(&key_hash, &actor_fingerprint, operation)
-            .await?
-        else {
-            return Ok(None);
-        };
-        if record.request_hash != request_hash {
-            return Err(AppError::conflict(
-                "idempotency_conflict",
-                "same Idempotency-Key was used with a different request",
-            ));
-        }
-        let Some(response_body) = record.response_body else {
-            return Ok(None);
-        };
-        serde_json::from_value(response_body)
-            .map(Some)
-            .map_err(|err| AppError::Internal(format!("decode idempotent response: {err}")))
-    }
-
-    async fn record_idempotency<Req, Resp>(
-        &self,
-        ctx: &RequestContext,
-        actor: &Actor,
-        operation: &str,
-        request: &Req,
-        response: &Resp,
-    ) -> Result<(), AppError>
-    where
-        Req: Serialize,
-        Resp: Serialize,
-    {
-        let Some(key) = &ctx.idempotency_key else {
-            return Ok(());
-        };
-        let response_body = serde_json::to_value(response).ok();
-        let resource_id = response_body
-            .as_ref()
-            .and_then(|value| value.get("id"))
-            .and_then(Value::as_str)
-            .or_else(|| {
-                response_body
-                    .as_ref()
-                    .and_then(|value| value.get("resource"))
-                    .and_then(|value| value.get("id"))
-                    .and_then(Value::as_str)
-            })
-            .map(ToOwned::to_owned);
-        let record = IdempotencyRecord {
-            id: Uuid::now_v7(),
-            idempotency_key_hash: request_hash(key.as_bytes()),
-            actor_fingerprint: actor_fingerprint(actor),
-            operation: operation.to_string(),
-            request_hash: normalized_request_hash(request)?,
-            response_status: Some(200),
-            response_body,
-            resource_id,
-            expires_at: Utc::now() + Duration::hours(24),
-        };
-        self.repo.put_idempotency_record(&record).await?;
-        Ok(())
-    }
-
     fn validate_provider_base_url(&self, value: &str) -> Result<String, AppError> {
         validate_provider_base_url(
             value,
@@ -1310,6 +1338,13 @@ impl<'a> AdminService<'a> {
                 .provider_security
                 .allow_http_provider_urls,
         )
+    }
+
+    fn schedule_runtime_cache_invalidation(&self) {
+        let cache = self.state.runtime_cache.clone();
+        std::mem::drop(tokio::spawn(async move {
+            cache.invalidate_all().await;
+        }));
     }
 }
 
@@ -1332,24 +1367,114 @@ fn validate_application_identifiers(
 }
 
 fn actor_fingerprint(actor: &Actor) -> String {
-    secret_fingerprint(
-        format!(
-            "{:?}:{}:{}",
-            actor.actor_type,
-            actor.subject.as_deref().unwrap_or(""),
-            actor
-                .api_key_id
-                .map(|id| id.to_string())
-                .unwrap_or_default()
-        )
-        .as_bytes(),
-    )
+    let identity = serde_json::to_vec(&(
+        actor.actor_type,
+        &actor.subject,
+        actor.api_key_id,
+        actor.trusted_jwt_issuer_id,
+        actor.internal_application_id,
+        &actor.application_id,
+        &actor.tenant_id,
+        &actor.external_user_id,
+        &actor.external_tenant_id,
+        &actor.delegated_subject,
+    ))
+    .expect("actor identity fields are serializable");
+    secret_fingerprint(&identity)
 }
 
-fn normalized_request_hash<T: Serialize>(request: &T) -> Result<String, AppError> {
-    serde_json::to_vec(request)
-        .map(|bytes| request_hash(&bytes))
-        .map_err(|err| AppError::BadRequest(format!("invalid idempotent request: {err}")))
+fn admin_command_spec<T: Serialize>(
+    ctx: &RequestContext,
+    actor: &Actor,
+    operation: &str,
+    path: Value,
+    request: &T,
+) -> Result<AdminCommandSpec, AppError> {
+    AdminCommandSpec::new(operation, path, request).map(|spec| {
+        spec.with_idempotency(
+            ctx.idempotency_key
+                .as_ref()
+                .map(|key| AdminCommandIdempotency {
+                    key: key.clone(),
+                    actor_fingerprint: actor_fingerprint(actor),
+                }),
+        )
+    })
+}
+
+fn success_audit(
+    actor: &Actor,
+    ctx: &RequestContext,
+    action: &str,
+    resource_type: &str,
+    resource_id: Option<String>,
+    metadata: Value,
+) -> AuditLogInsert {
+    AuditLogInsert {
+        request_id: Some(ctx.request_id.clone()),
+        actor_type: Some(format!("{:?}", actor.actor_type).to_ascii_lowercase()),
+        actor_subject: actor.subject.clone(),
+        delegated_subject: actor.delegated_subject.clone(),
+        external_user_id: actor.external_user_id.clone(),
+        external_tenant_id: actor.external_tenant_id.clone(),
+        application_id: actor.internal_application_id,
+        resource_type: resource_type.to_string(),
+        resource_id,
+        action: action.to_string(),
+        result: AuditResult::Success,
+        source_ip: ctx.source_ip,
+        user_agent: ctx.user_agent.clone(),
+        metadata,
+    }
+}
+
+async fn require_active_row(
+    transaction: &mut PgAdminCommandTransaction,
+    table: &str,
+    id: Uuid,
+    resource_name: &str,
+) -> Result<(), AppError> {
+    let query = match table {
+        "applications" => "select 1 from applications where id = $1 and deleted_at is null",
+        "providers" => "select 1 from providers where id = $1 and deleted_at is null",
+        _ => {
+            return Err(AppError::Internal(format!(
+                "unsupported admin command resource table {table}"
+            )));
+        }
+    };
+    let exists = sqlx::query_scalar::<_, i32>(query)
+        .bind(id)
+        .fetch_optional(transaction.connection())
+        .await?
+        .is_some();
+    if exists {
+        Ok(())
+    } else {
+        Err(AppError::NotFound(format!("{resource_name} {id}")))
+    }
+}
+
+async fn load_credential_record(
+    transaction: &mut PgAdminCommandTransaction,
+    id: Uuid,
+) -> Result<CredentialRecord, AppError> {
+    let row = sqlx::query(
+        r#"
+        select id, provider_id, credential_type, scope_type, external_tenant_id,
+               application_id, external_user_id, encryption_algorithm,
+               encryption_version, secret_fingerprint, masked_secret, status,
+               priority, expires_at, last_validated_at, last_used_at, metadata,
+               created_at, updated_at, deleted_at, version, display_name
+        from provider_credentials
+        where id = $1 and deleted_at is null
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(transaction.connection())
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("provider credential {id}")))?;
+    credential_record_from_row(&row)
 }
 
 fn sanitized_key_response(resource: &ApiKeyRecord) -> ApiKeySecretResponse {
@@ -1546,7 +1671,8 @@ fn validate_key_request(
     }
     let normalized = AuthorizationService::normalize_scopes(scopes)?;
     if !authz.can_grant(actor, &normalized) {
-        return Err(AppError::conflict(
+        return Err(AppError::coded(
+            axum::http::StatusCode::FORBIDDEN,
             "system_key_scope_escalation",
             "principal cannot mint scopes broader than its effective scopes",
         ));

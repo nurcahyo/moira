@@ -8,6 +8,8 @@ When `MOIRA_DOCS__EXPOSE_ADMIN=false`, `/api/v1/admin/**` paths are removed from
 
 The document defines bearer JWT, `X-Moira-System-Key`, and `X-Consumer-Key` security schemes. Operations describe their actual request bodies, path and query parameters, success statuses, typed errors, content types, and supported `ETag`, `If-Match`, `Idempotency-Key`, and `X-Request-Id` headers.
 
-Plaintext provider secrets, API-key hashes, ciphertext, nonces, peppers, decrypted JWT material, embedding vectors, extraction prompts, protected instructions, and parser internals remain excluded. API-key create and rotate responses document the once-only `secret` field. `/v1/chat/completions` remains intentionally unregistered.
+The ten atomic admin create/rotate operations explicitly document `Idempotency-Key`, their exact `201` create or `200` rotate status, and `409` responses for `idempotency_conflict` and `idempotency_in_progress`. Credential rotation also documents required `If-Match`. Deterministic replayed errors keep their original sanitized payload while receiving the current request's `X-Request-Id` and body `request_id`.
+
+Plaintext provider secrets, API-key hashes, ciphertext, nonces, peppers, decrypted JWT material, embedding vectors, extraction prompts, protected instructions, and parser internals remain excluded. API-key create and rotate responses document that only the winning request receives the once-only `secret`; replays set it to null and set `secret_retrievable` to false. `/v1/chat/completions` remains intentionally unregistered.
 
 When changing an endpoint, follow `.agents/skills/moira-openapi/SKILL.md` and run the standard Rust checks. Contract tests verify path and method coverage, unique operation IDs, schema references, public admin filtering, security schemes, parameters, statuses, and streaming/metrics content types.

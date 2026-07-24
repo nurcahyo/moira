@@ -100,6 +100,7 @@ fn ensure_version(actual: i64, expected: i64) -> Result<(), AppError> {
     params(("Idempotency-Key" = Option<String>, Header, description = "Optional replay key")),
     responses(
         (status = 201, description = "Application created", body = ApplicationRecord, headers(("ETag" = String, description = "Current resource version"))),
+        (status = 409, description = "idempotency_conflict or idempotency_in_progress", body = ErrorResponse),
         (status = "4XX", description = "Request, authentication, authorization, or conflict error", body = ErrorResponse),
         (status = "5XX", description = "Infrastructure or internal error", body = ErrorResponse)
     ),
@@ -345,6 +346,7 @@ pub async fn put_application_execution_policy(
     params(("Idempotency-Key" = Option<String>, Header, description = "Optional replay key")),
     responses(
         (status = 201, description = "Provider created", body = ProviderRecord, headers(("ETag" = String, description = "Current resource version"))),
+        (status = 409, description = "idempotency_conflict or idempotency_in_progress", body = ErrorResponse),
         (status = "4XX", description = "Request, authentication, authorization, or conflict error", body = ErrorResponse),
         (status = "5XX", description = "Infrastructure or internal error", body = ErrorResponse)
     ),
@@ -538,6 +540,7 @@ pub async fn disable_provider(
     ),
     responses(
         (status = 201, description = "Provider model created", body = ProviderModelRecord, headers(("ETag" = String, description = "Current resource version"))),
+        (status = 409, description = "idempotency_conflict or idempotency_in_progress", body = ErrorResponse),
         (status = "4XX", description = "Request, authentication, authorization, conflict, or not-found error", body = ErrorResponse),
         (status = "5XX", description = "Infrastructure or internal error", body = ErrorResponse)
     ),
@@ -741,6 +744,7 @@ pub async fn disable_provider_model(
     params(("Idempotency-Key" = Option<String>, Header, description = "Optional replay key")),
     responses(
         (status = 201, description = "Credential created; plaintext secret is never returned", body = CredentialRecord, headers(("ETag" = String, description = "Current resource version"))),
+        (status = 409, description = "idempotency_conflict or idempotency_in_progress", body = ErrorResponse),
         (status = "4XX", description = "Request, authentication, authorization, or conflict error", body = ErrorResponse),
         (status = "5XX", description = "Infrastructure or internal error", body = ErrorResponse)
     ),
@@ -877,6 +881,7 @@ pub async fn delete_credential(
     ),
     responses(
         (status = 200, description = "Credential rotated; plaintext secret is never returned", body = CredentialRecord, headers(("ETag" = String, description = "Current resource version"))),
+        (status = 409, description = "idempotency_conflict or idempotency_in_progress", body = ErrorResponse),
         (status = "4XX", description = "Request, authentication, authorization, conflict, or not-found error", body = ErrorResponse),
         (status = "5XX", description = "Infrastructure or internal error", body = ErrorResponse)
     ),
@@ -890,8 +895,9 @@ pub async fn rotate_credential(
 ) -> Result<(HeaderMap, Json<CredentialRecord>), AppError> {
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
+    let expected_version = require_if_match(&headers)?;
     let record = AdminService::new(&state)?
-        .rotate_credential(&actor, &ctx, id, request)
+        .rotate_credential(&actor, &ctx, id, expected_version, request)
         .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
@@ -1051,7 +1057,8 @@ pub async fn delete_user_credential(
     request_body = SystemKeyCreateRequest,
     params(("Idempotency-Key" = Option<String>, Header, description = "Optional replay key")),
     responses(
-        (status = 201, description = "System key created; secret is returned once", body = ApiKeySecretResponse),
+        (status = 201, description = "System key created; replay returns secret_retrievable false and no raw secret", body = ApiKeySecretResponse),
+        (status = 409, description = "idempotency_conflict or idempotency_in_progress", body = ErrorResponse),
         (status = "4XX", description = "Request, authentication, authorization, or conflict error", body = ErrorResponse),
         (status = "5XX", description = "Infrastructure or internal error", body = ErrorResponse)
     ),
@@ -1121,7 +1128,8 @@ pub async fn get_system_key(
         ("Idempotency-Key" = Option<String>, Header, description = "Optional replay key")
     ),
     responses(
-        (status = 200, description = "System key rotated; secret is returned once", body = ApiKeySecretResponse),
+        (status = 200, description = "System key rotated; replay returns secret_retrievable false and no raw secret", body = ApiKeySecretResponse),
+        (status = 409, description = "idempotency_conflict or idempotency_in_progress", body = ErrorResponse),
         (status = "4XX", description = "Authentication, authorization, conflict, or not-found error", body = ErrorResponse),
         (status = "5XX", description = "Infrastructure or internal error", body = ErrorResponse)
     ),
@@ -1198,7 +1206,8 @@ pub async fn delete_system_key(
     request_body = ConsumerKeyCreateRequest,
     params(("Idempotency-Key" = Option<String>, Header, description = "Optional replay key")),
     responses(
-        (status = 201, description = "Consumer key created; secret is returned once", body = ApiKeySecretResponse),
+        (status = 201, description = "Consumer key created; replay returns secret_retrievable false and no raw secret", body = ApiKeySecretResponse),
+        (status = 409, description = "idempotency_conflict or idempotency_in_progress", body = ErrorResponse),
         (status = "4XX", description = "Request, authentication, authorization, or conflict error", body = ErrorResponse),
         (status = "5XX", description = "Infrastructure or internal error", body = ErrorResponse)
     ),
@@ -1268,7 +1277,8 @@ pub async fn get_consumer_key(
         ("Idempotency-Key" = Option<String>, Header, description = "Optional replay key")
     ),
     responses(
-        (status = 200, description = "Consumer key rotated; secret is returned once", body = ApiKeySecretResponse),
+        (status = 200, description = "Consumer key rotated; replay returns secret_retrievable false and no raw secret", body = ApiKeySecretResponse),
+        (status = 409, description = "idempotency_conflict or idempotency_in_progress", body = ErrorResponse),
         (status = "4XX", description = "Authentication, authorization, conflict, or not-found error", body = ErrorResponse),
         (status = "5XX", description = "Infrastructure or internal error", body = ErrorResponse)
     ),
@@ -1346,6 +1356,7 @@ pub async fn delete_consumer_key(
     params(("Idempotency-Key" = Option<String>, Header, description = "Optional replay key")),
     responses(
         (status = 201, description = "Trusted JWT issuer created", body = TrustedJwtIssuerRecord, headers(("ETag" = String, description = "Current resource version"))),
+        (status = 409, description = "idempotency_conflict or idempotency_in_progress", body = ErrorResponse),
         (status = "4XX", description = "Request, authentication, authorization, or conflict error", body = ErrorResponse),
         (status = "5XX", description = "Infrastructure or JWKS error", body = ErrorResponse)
     ),

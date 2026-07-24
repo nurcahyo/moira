@@ -5,7 +5,8 @@ This list tracks what is still left to harden or complete after the current Phas
 ## Phase 1: Security Foundation
 
 - TODO: Complete repository trait coverage for every PostgreSQL repository, including public/runtime repositories, so services can depend on traits consistently.
-- TODO: Move sensitive multi-step operations into explicit service-owned database transactions where create/update, audit, idempotency, and secret/key state must commit atomically.
+- TODO: Extend service-owned command transactions beyond the ten core idempotent admin create/rotate operations to every remaining sensitive multi-step update, revoke, and delete flow.
+- TODO: Replace unkeyed admin command request hashes with versioned HMAC-SHA-256 using a dedicated idempotency pepper, so secret-bearing request hashes cannot be used as offline credential verifiers after a database-only compromise.
 - TODO: Quarantine or remove unused legacy scaffolding that still models old provider/config concepts, such as legacy `owner_scope` DTOs and unregistered chat-route types, once compatibility is confirmed unnecessary.
 - TODO: Add deeper credential-resolution integration tests for the full precedence order across user, application, tenant, and global scopes.
 - TODO: Expand AAD regression tests to prove credential ciphertext fails to decrypt when any bound AAD field changes.
@@ -18,14 +19,14 @@ This list tracks what is still left to harden or complete after the current Phas
 - TODO: Split `AdminService` into focused domain services for applications, providers, models, credentials, JWT issuers, system keys, consumer keys, audit queries, idempotency, validation, and runtime invalidation.
 - TODO: Replace simplified list pagination with real opaque cursor pagination using stable `created_at DESC, id DESC` ordering and `has_more`/`next_cursor` calculation.
 - TODO: Require `If-Match` consistently on every versioned mutation and upsert, including application execution policy PUT, and return `409 resource_version_conflict` for stale versions.
-- TODO: Lock idempotency records during execution and use transactional idempotency writes so duplicate create/rotate requests execute exactly once under concurrency.
-- TODO: Ensure idempotent replays preserve the original response status and sanitized body for both success and failure paths.
+- TODO: Extend atomic idempotency and sanitized deterministic-failure replay to the runtime-policy, RAG, conversation, memory, and other endpoints that advertise `Idempotency-Key`.
 - TODO: Reject unknown query fields consistently on all admin list/filter endpoints.
 - TODO: Finish centralized validation coverage for metadata depth/size, secret-like keys, custom headers, dangerous outbound headers, priorities, capabilities, expiration windows, and scope narrowing.
 - TODO: Harden JWKS refresh with full SSRF checks, strict timeout, response size and content-type limits, valid JWKS parsing, singleflight refresh, old-cache retention on failure, and audit records.
 - TODO: Add production HTTP middleware for body limits, content-type enforcement, request timeout, panic handling, secure response headers, redacted tracing, and no compression for once-only key secret responses.
 - TODO: Align configurable `maximum_request_bytes` policy with the actual Axum body-limit layer, including per-route public/admin limits and tests for oversized JSON requests.
 - TODO: Add integration tests for every admin route group covering CRUD/actions, filters, cursor pagination, audit writes, dependency conflicts, soft deletion, stale versions, and runtime cache invalidation.
+- TODO: Add fault-injection coverage for admin replay serialization, ledger finalization, connection loss, commit failure, and post-commit runtime-cache invalidation count.
 - TODO: Add cross-application consumer isolation tests that verify hidden/denied resources cannot be enumerated.
 
 ## Phase 3: Provider Runtime, Routing, And Rig Execution

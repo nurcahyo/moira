@@ -8,7 +8,9 @@ Admin requests authenticate with exactly one of:
 - `X-Moira-System-Key: <raw-system-key>`
 - `X-Consumer-Key: <raw-consumer-key>`
 
-Conflicting credentials are rejected. All state-changing versioned resources use `If-Match: "<version>"` and return `ETag: "<version>"`. Create, rotate, and provider runtime policy upsert operations that support `Idempotency-Key` store only hashed idempotency keys and sanitized responses.
+Conflicting credentials are rejected. All state-changing versioned resources use `If-Match: "<version>"` and return `ETag: "<version>"`. Credential rotation requires `If-Match`; the expected version participates in the idempotency command hash and is checked inside the mutation transaction.
+
+The ten core application, provider, provider-model, credential, API-key, and JWT-issuer create/rotate operation identities support atomic `Idempotency-Key` execution. Successful creates return and replay `201`; rotations return and replay `200`. A reused key with different command input returns `409 idempotency_conflict`, while a bounded wait for an active winner returns `409 idempotency_in_progress`. Deterministic business failures replay with their original sanitized error and a fresh request ID. Raw API-key secrets are available only to the winning request.
 
 List endpoints use `limit` with default `50` and max `200`. Responses are shaped as `{ "data": [], "pagination": { "next_cursor": null, "has_more": false } }`.
 

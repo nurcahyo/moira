@@ -96,6 +96,10 @@ pub enum ScopeType {
     User,
 }
 
+fn default_scope_type() -> ScopeType {
+    ScopeType::Global
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CredentialType {
@@ -385,22 +389,22 @@ pub struct CredentialRecord {
     pub credential_type: CredentialType,
     pub scope: CredentialScope,
     pub display_name: Option<String>,
-    #[serde(skip_serializing)]
+    #[serde(skip_serializing, default = "default_scope_type")]
     #[schema(ignore)]
     pub scope_type: ScopeType,
-    #[serde(skip_serializing)]
+    #[serde(skip_serializing, default)]
     #[schema(ignore)]
     pub external_tenant_id: Option<String>,
-    #[serde(skip_serializing)]
+    #[serde(skip_serializing, default)]
     #[schema(ignore)]
     pub application_id: Option<Uuid>,
-    #[serde(skip_serializing)]
+    #[serde(skip_serializing, default)]
     #[schema(ignore)]
     pub external_user_id: Option<String>,
-    #[serde(skip_serializing)]
+    #[serde(skip_serializing, default)]
     #[schema(ignore)]
     pub encryption_algorithm: String,
-    #[serde(skip_serializing)]
+    #[serde(skip_serializing, default)]
     #[schema(ignore)]
     pub encryption_version: i32,
     pub secret_fingerprint: String,

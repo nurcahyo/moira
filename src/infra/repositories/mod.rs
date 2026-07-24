@@ -4,7 +4,10 @@ mod public;
 mod runtime;
 mod setup;
 
-pub use admin::{AdminRepository, KeyMaterial, PgAdminRepository, StoredCredentialSecret};
+pub use admin::{
+    AdminIdempotencyClaim, AdminIdempotencyClaimOutcome, AdminRepository, KeyMaterial,
+    PgAdminCommandTransaction, PgAdminRepository, StoredCredentialSecret,
+};
 pub use conversation::{
     ConversationAccess, ConversationInsert, ConversationMessageInsert, MemoryInsert,
     PgConversationRepository,
