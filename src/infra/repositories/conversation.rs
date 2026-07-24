@@ -1265,6 +1265,12 @@ fn memory_select(inner: &str) -> String {
 }
 
 fn rag_document_select(inner: &str) -> String {
+    // The outer `order by` is load-bearing, not decorative. An inner query's own
+    // `order by` only decides which rows the CTE keeps under its `limit`; it does not
+    // survive into the outer result, and the joins below let the planner emit rows in
+    // whatever order suits it (a hash join driven by rag_document_versions reorders
+    // them by that table's heap). Restating the ordering here keeps
+    // list_rag_documents newest-first. Single-row call sites are unaffected.
     format!(
         r#"
         with document_rows as ({inner})
@@ -1274,10 +1280,50 @@ fn rag_document_select(inner: &str) -> String {
         from document_rows
         join rag_collections c on c.id = document_rows.collection_id
         left join rag_document_versions v on v.id = document_rows.current_version_id
+        order by document_rows.created_at desc, document_rows.id desc
         "#
     )
 }
 
 fn message_sequence(value: Option<&str>) -> Option<i64> {
     value.and_then(|value| value.strip_prefix("msgseq_").unwrap_or(value).parse().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rag_document_select;
+
+    /// The list endpoint's ordering is a property of the OUTER select, and is asserted here at the
+    /// SQL level rather than through a query.
+    ///
+    /// `list_rag_documents` puts `order by d.created_at desc, d.id desc` inside the CTE, where it
+    /// only decides which rows survive the `limit`; the outer select does not inherit it. Once
+    /// `rag_document_select` joins `rag_document_versions`, the planner may drive the outer result
+    /// from that table and emit documents in its heap order.
+    ///
+    /// A behavioural test cannot be trusted to catch this: the planner only switches to the
+    /// reordering hash join once the table is large enough, so at fixture scale it keeps a nested
+    /// loop and the CTE order survives by accident — an end-to-end assertion passes even with the
+    /// clause deleted. Asserting the emitted SQL is deterministic and fails the moment the clause is
+    /// removed, at any table size.
+    #[test]
+    fn rag_document_select_orders_the_outer_result() {
+        let sql = rag_document_select("select d.* from rag_documents d");
+
+        let left_join = sql
+            .find("left join rag_document_versions")
+            .expect("the ingestion_status projection depends on this join");
+        let order_by = sql
+            .find("order by document_rows.created_at desc, document_rows.id desc")
+            .expect("the outer select must restate the newest-first ordering");
+
+        assert!(
+            order_by > left_join,
+            "the ordering must apply to the joined outer result, not inside the CTE:\n{sql}"
+        );
+        assert!(
+            sql.contains("v.ingestion_status as ingestion_status"),
+            "every read path must project the current version's ingestion_status:\n{sql}"
+        );
+    }
 }
