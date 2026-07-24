@@ -1,0 +1,4 @@
+interface:
+  display_name: "Moira Project Structure"
+  short_description: "Follow Moira's Rust service layout and boundaries."
+  default_prompt: "Use the Moira project structure skill to place code, tests, migrations, and docs in the right layer."

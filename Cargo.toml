@@ -1,0 +1,37 @@
+[package]
+name = "moira"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+
+[dependencies]
+aes-gcm = "0.10"
+anyhow = "1"
+argon2 = "0.5"
+async-stream = "0.3"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["macros"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+config = { version = "0.15", default-features = false, features = ["toml", "yaml"] }
+futures-util = "0.3"
+jsonwebtoken = "9"
+opentelemetry = "0.32"
+redis = { version = "0.32", default-features = false, features = ["tokio-comp"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+rig-core = "0.40"
+secrecy = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", features = ["chrono", "json", "migrate", "postgres", "runtime-tokio-rustls", "uuid"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "request-id", "trace", "util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+utoipa = { version = "5", features = ["chrono", "uuid"] }
+utoipa-axum = "0.2"
+url = "2"
+uuid = { version = "1", features = ["serde", "v4", "v7"] }

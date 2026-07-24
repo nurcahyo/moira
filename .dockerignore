@@ -1,0 +1,10 @@
+.git
+.github
+target
+*.log
+.env
+.env.*
+config/local.toml
+docs
+deploy
+charts
