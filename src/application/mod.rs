@@ -1,4 +1,5 @@
 mod admin;
+mod admin_command;
 mod context;
 mod conversation;
 mod execution;
@@ -7,6 +8,10 @@ mod runtime_admin;
 mod setup;
 
 pub use admin::AdminService;
+pub use admin_command::{
+    AdminCommandIdempotency, AdminCommandMutation, AdminCommandOutcome, AdminCommandRunner,
+    AdminCommandSpec,
+};
 pub use context::RequestContext;
 pub use conversation::{ContextPlanner, ConversationExecutionLink, ConversationService};
 pub use execution::{ExecutionService, MoiraExecutionService, execute_diagnostic};

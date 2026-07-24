@@ -25,6 +25,8 @@ pub enum AppError {
         code: &'static str,
         message: String,
     },
+    #[error("{}: {}", .0.code, .0.message)]
+    Replayed(Box<ReplayedError>),
     #[error("unauthorized: {0}")]
     Unauthorized(String),
     #[error("forbidden: {0}")]
@@ -62,6 +64,16 @@ pub struct ErrorDetail {
     pub details: Option<Value>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ReplayedError {
+    pub status: StatusCode,
+    pub code: String,
+    pub message_key: String,
+    pub message: String,
+    pub message_args: Value,
+    pub details: Option<Value>,
+}
+
 impl AppError {
     pub fn coded(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
         Self::Api {
@@ -80,6 +92,18 @@ impl AppError {
     }
 
     pub fn error_response(&self, request_id: Option<String>) -> ErrorResponse {
+        if let Self::Replayed(replay) = self {
+            return ErrorResponse {
+                error: ErrorDetail {
+                    code: replay.code.clone(),
+                    message_key: replay.message_key.clone(),
+                    message: replay.message.clone(),
+                    message_args: replay.message_args.clone(),
+                    request_id: request_id.unwrap_or_else(generate_request_id),
+                    details: replay.details.clone(),
+                },
+            };
+        }
         ErrorResponse {
             error: ErrorDetail::from((self, request_id)),
         }
@@ -89,6 +113,7 @@ impl AppError {
         match self {
             Self::BadRequest(_) | Self::Config(_) => StatusCode::BAD_REQUEST,
             Self::Api { status, .. } => *status,
+            Self::Replayed(replay) => replay.status,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
@@ -100,10 +125,11 @@ impl AppError {
         }
     }
 
-    fn code(&self) -> &'static str {
+    fn code(&self) -> &str {
         match self {
             Self::BadRequest(_) => "bad_request",
             Self::Api { code, .. } => code,
+            Self::Replayed(replay) => &replay.code,
             Self::Unauthorized(_) => "unauthorized",
             Self::Forbidden(_) => "forbidden",
             Self::NotFound(_) => "not_found",
@@ -131,6 +157,7 @@ impl AppError {
             | Self::Config(message)
             | Self::Internal(message) => message.clone(),
             Self::Api { message, .. } => message.clone(),
+            Self::Replayed(replay) => replay.message.clone(),
             Self::DatabaseUnavailable => "database is not configured".to_string(),
             Self::Sqlx(_) => "database error".to_string(),
             Self::Reqwest(_) => "http client error".to_string(),
@@ -139,8 +166,33 @@ impl AppError {
     }
 
     fn response_text(&self) -> ResponseText {
+        if let Self::Replayed(replay) = self {
+            return ResponseText::with_args(
+                replay.message_key.clone(),
+                replay.message.clone(),
+                replay.message_args.clone(),
+            );
+        }
         let message_key = self.message_key();
         ResponseText::new(message_key, self.english_message())
+    }
+
+    pub fn is_cacheable_admin_failure(&self) -> bool {
+        matches!(
+            self.status(),
+            StatusCode::BAD_REQUEST
+                | StatusCode::NOT_FOUND
+                | StatusCode::CONFLICT
+                | StatusCode::UNPROCESSABLE_ENTITY
+        ) && !matches!(
+            self,
+            Self::Sqlx(_)
+                | Self::Reqwest(_)
+                | Self::Redis(_)
+                | Self::Internal(_)
+                | Self::Unauthorized(_)
+                | Self::Forbidden(_)
+        )
     }
 }
 
@@ -184,6 +236,16 @@ impl From<&AppError> for ErrorDetail {
 impl From<(&AppError, Option<String>)> for ErrorDetail {
     fn from(value: (&AppError, Option<String>)) -> Self {
         let (error, request_id) = value;
+        if let AppError::Replayed(replay) = error {
+            return Self {
+                code: replay.code.clone(),
+                message_key: replay.message_key.clone(),
+                message: replay.message.clone(),
+                message_args: replay.message_args.clone(),
+                request_id: request_id.unwrap_or_else(generate_request_id),
+                details: replay.details.clone(),
+            };
+        }
         Self::new(
             error.code().to_string(),
             error.response_text(),
