@@ -12,9 +12,9 @@ const MIGRATION_CONTRACT_TIMEOUT: Duration = Duration::from_secs(30);
 fn migration_test_database_url() -> Option<String> {
     match std::env::var("MOIRA_TEST_DATABASE_URL") {
         Ok(url) if !url.trim().is_empty() => Some(url),
-        _ if std::env::var("CI").is_ok_and(|value| value.eq_ignore_ascii_case("true")) => {
+        _ if std::env::var_os("CI").is_some() => {
             panic!(
-                "MOIRA_TEST_DATABASE_URL must be set when CI=true; \
+                "MOIRA_TEST_DATABASE_URL must be set in CI; \
                  refusing to skip the migration contract"
             );
         }

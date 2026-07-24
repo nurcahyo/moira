@@ -8,6 +8,7 @@ use moira::{
         ConsumerKeyCreateRequest, ConversationMessageQuery, ConversationQuery, ExecutionQuery,
         MemoryPatchRequest, MemoryPolicyPutRequest, MemoryQuery, UsageQuery,
     },
+    error::AppError,
     security::{Actor, ActorType},
 };
 use serde_json::{Value, json};
@@ -193,68 +194,60 @@ async fn trusted_jwt_requires_a_valid_application_binding_for_public_reads() {
         .await
         .expect("authenticate otherwise valid unbound JWT");
     assert_eq!(unbound.actor_type, ActorType::TrustedJwt);
-    assert!(
+    assert_forbidden(
         public
             .list_executions(&unbound, &ExecutionQuery::default())
-            .await
-            .is_err(),
-        "an unbound TrustedJwt must not acquire wildcard public access"
+            .await,
     );
-    assert!(
+    assert_forbidden(
         public
             .create_response(
                 &unbound,
                 &request_context(),
                 public_response_request("unbound-route"),
             )
-            .await
-            .is_err()
+            .await,
     );
-    assert!(
+    assert_forbidden(
         public
             .stream_response(
                 unbound.clone(),
                 request_context(),
                 public_response_request("unbound-route"),
             )
-            .await
-            .is_err()
+            .await,
     );
-    assert!(public.list_models(&unbound).await.is_err());
-    assert!(public.list_routes(&unbound).await.is_err());
-    assert!(public.capabilities(&unbound).await.is_err());
+    assert_forbidden(public.list_models(&unbound).await);
+    assert_forbidden(public.list_routes(&unbound).await);
+    assert_forbidden(public.capabilities(&unbound).await);
 
     let resources = seed_public_resources(&fixture, fixture.application_id, "unbound-target").await;
     let conversations = ConversationService::new(&fixture.state).expect("conversation service");
-    assert!(
+    assert_forbidden(
         conversations
             .list_conversations(&unbound, &ConversationQuery::default())
-            .await
-            .is_err()
+            .await,
     );
-    assert!(
+    assert_forbidden(
         conversations
             .list_messages(
                 &unbound,
                 &resources.conversation_id,
                 &ConversationMessageQuery::default(),
             )
-            .await
-            .is_err()
+            .await,
     );
-    assert!(
+    assert_forbidden(
         conversations
             .get_memory(&unbound, &resources.memory_id)
-            .await
-            .is_err()
+            .await,
     );
-    assert!(
+    assert_forbidden(
         conversations
             .list_memories(&unbound, &MemoryQuery::default())
-            .await
-            .is_err()
+            .await,
     );
-    assert!(
+    assert_forbidden(
         conversations
             .patch_memory(
                 &unbound,
@@ -265,14 +258,12 @@ async fn trusted_jwt_requires_a_valid_application_binding_for_public_reads() {
                     ..MemoryPatchRequest::default()
                 },
             )
-            .await
-            .is_err()
+            .await,
     );
-    assert!(
+    assert_forbidden(
         conversations
             .delete_memory(&unbound, &request_context(), &resources.memory_id)
-            .await
-            .is_err()
+            .await,
     );
 
     let malformed = fixture
@@ -297,6 +288,20 @@ async fn application_bound_actor_cannot_read_another_app_public_resources() {
     let application_b = create_application(&fixture, "application-b").await;
     let own = seed_public_resources(&fixture, fixture.application_id, "application-a").await;
     let other = seed_public_resources(&fixture, application_b, "application-b").await;
+    let tenant_specific =
+        seed_public_resources(&fixture, fixture.application_id, "tenant-specific").await;
+    sqlx::query("update routing_policies set external_tenant_id = 'tenant-b' where route_id = $1")
+        .bind(tenant_specific.route_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("scope routing policy to another tenant");
+    let unconfigured =
+        seed_public_resources(&fixture, fixture.application_id, "unconfigured-route").await;
+    sqlx::query("delete from routing_policies where route_id = $1")
+        .bind(unconfigured.route_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("remove routing policy from unconfigured route");
     let actor = application_actor(fixture.application_id, PUBLIC_READ_SCOPES);
     let public = PublicExecutionService::new(&fixture.state).expect("public execution service");
     let conversations = ConversationService::new(&fixture.state).expect("conversation service");
@@ -349,12 +354,13 @@ async fn application_bound_actor_cannot_read_another_app_public_resources() {
         .list_executions(&actor, &ExecutionQuery::default())
         .await
         .expect("list application executions");
-    assert!(
-        executions
-            .data
-            .iter()
-            .any(|item| item.execution_id == format!("exec_{}", own.execution_id))
-    );
+    let own_execution = executions
+        .data
+        .iter()
+        .find(|item| item.execution_id == format!("exec_{}", own.execution_id))
+        .expect("own execution is visible");
+    assert_eq!(own_execution.attempt_count, 2);
+    assert_eq!(own_execution.latency_ms, Some(20));
     assert!(
         !executions
             .data
@@ -379,19 +385,41 @@ async fn application_bound_actor_cannot_read_another_app_public_resources() {
             .any(|item| { item.execution_id == format!("exec_{}", other.execution_id) })
     );
 
+    let discovery_actor = Actor {
+        external_tenant_id: Some("tenant-a".to_string()),
+        ..actor.clone()
+    };
     let models = public
-        .list_models(&actor)
+        .list_models(&discovery_actor)
         .await
         .expect("list application models");
     assert!(models.data.iter().any(|item| item.id == own.model_id));
     assert!(!models.data.iter().any(|item| item.id == other.model_id));
+    assert!(
+        !models
+            .data
+            .iter()
+            .any(|item| item.id == tenant_specific.model_id)
+    );
 
     let routes = public
-        .list_routes(&actor)
+        .list_routes(&discovery_actor)
         .await
         .expect("list application routes");
     assert!(routes.data.iter().any(|item| item.id == own.route_id));
     assert!(!routes.data.iter().any(|item| item.id == other.route_id));
+    assert!(
+        !routes
+            .data
+            .iter()
+            .any(|item| item.id == tenant_specific.route_id)
+    );
+    assert!(
+        !routes
+            .data
+            .iter()
+            .any(|item| item.id == unconfigured.route_id)
+    );
 
     assert_eq!(
         conversations
@@ -580,6 +608,13 @@ fn application_actor(application_id: Uuid, scopes: &[&str]) -> Actor {
     }
 }
 
+fn assert_forbidden<T>(result: Result<T, AppError>) {
+    let error = result
+        .err()
+        .expect("expected application-binding authorization failure");
+    assert_eq!(error.status(), axum::http::StatusCode::FORBIDDEN);
+}
+
 async fn create_application(fixture: &LifecycleFixture, label: &str) -> Uuid {
     let id = Uuid::now_v7();
     let suffix = id.simple();
@@ -725,6 +760,31 @@ async fn seed_public_resources(
     .execute(&mut *tx)
     .await
     .expect("insert usage record");
+    for (attempt_number, latency_ms) in [(1, 10_i64), (2, 20_i64)] {
+        sqlx::query(
+            r#"
+            insert into execution_attempts (
+                id, request_id, execution_id, attempt_number, application_id,
+                route_id, provider_id, provider_model_id, status, completed_at,
+                latency_ms, metadata
+            )
+            values ($1, $2, $3, $4, $5, $6, $7, $8, 'succeeded', now(), $9, $10)
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(format!("authz-request-{suffix}"))
+        .bind(execution_id)
+        .bind(attempt_number)
+        .bind(application_id)
+        .bind(route_id)
+        .bind(provider_id)
+        .bind(model_id)
+        .bind(latency_ms)
+        .bind(json!({ "test_fixture": true }))
+        .execute(&mut *tx)
+        .await
+        .expect("insert execution attempt");
+    }
     sqlx::query(
         r#"
         insert into conversations (
