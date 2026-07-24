@@ -1,0 +1,4 @@
+interface:
+  display_name: "Moira Rig Completions"
+  short_description: "Build and read non-streaming Rig completions"
+  default_prompt: "Use $moira-rig-completions to build Moira's CompletionRequest, map caller messages into rig_core Message types, and narrow CompletionResponse and Usage correctly."

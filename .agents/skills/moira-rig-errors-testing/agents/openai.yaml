@@ -1,0 +1,4 @@
+interface:
+  display_name: "Moira Rig Errors and Testing"
+  short_description: "Map rig-core failures to Moira errors and test the Rig boundary"
+  default_prompt: "Use $moira-rig-errors-testing to classify a rig-core CompletionError into Moira's ExecutionFailure and AppError, decide retry/fallback/circuit behaviour, keep provider bodies and secrets out of surfaced messages, and write or review tests at the Rig boundary."

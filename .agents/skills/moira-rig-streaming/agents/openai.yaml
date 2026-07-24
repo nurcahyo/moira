@@ -1,0 +1,4 @@
+interface:
+  display_name: "Moira Rig Streaming"
+  short_description: "Bridge Rig streaming completions to Moira SSE"
+  default_prompt: "Use $moira-rig-streaming to adapt rig-core streaming chunks into Moira runtime events and the public SSE contract."
