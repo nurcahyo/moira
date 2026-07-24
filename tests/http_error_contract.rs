@@ -1,6 +1,6 @@
 use axum::{
     body::{Body, to_bytes},
-    http::{Request, StatusCode, header},
+    http::{Request, StatusCode},
 };
 use moira::{app::AppState, build_router, config::Settings};
 use serde_json::Value;
