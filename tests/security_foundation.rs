@@ -1,4 +1,5 @@
 use moira::{config::DatabaseSettings, infra::db};
+use uuid::Uuid;
 
 fn migration_test_database_url() -> Option<String> {
     match std::env::var("MOIRA_TEST_DATABASE_URL") {
@@ -141,10 +142,57 @@ async fn security_foundation_migration_creates_contract_tables_when_configured()
         "output_summary",
         "usage_summary",
         "conversation_id",
+        "updated_at",
     ])
     .fetch_all(&pool)
     .await
     .expect("list response columns");
 
-    assert_eq!(response_columns.len(), 5);
+    assert_eq!(response_columns.len(), 6);
+
+    sqlx::query("alter table responses drop column updated_at")
+        .execute(&pool)
+        .await
+        .expect("simulate pre-0008 responses schema");
+    let response_id = Uuid::now_v7();
+    let execution_id = Uuid::now_v7();
+    let initial_version = sqlx::query_scalar::<_, i64>(
+        r#"
+        insert into responses (id, execution_id, request_id, status)
+        values ($1, $2, $3, 'in_progress')
+        returning version
+        "#,
+    )
+    .bind(response_id)
+    .bind(execution_id)
+    .bind(format!("migration-contract-{execution_id}"))
+    .fetch_one(&pool)
+    .await
+    .expect("insert response migration contract row");
+    sqlx::query(include_str!("../migrations/0008_response_updated_at.sql"))
+        .execute(&pool)
+        .await
+        .expect("apply response updated_at upgrade migration");
+    let updated_at_backfilled =
+        sqlx::query_scalar::<_, bool>("select updated_at is not null from responses where id = $1")
+            .bind(response_id)
+            .fetch_one(&pool)
+            .await
+            .expect("verify response updated_at backfill");
+    let terminal_version = sqlx::query_scalar::<_, i64>(
+        r#"
+        update responses
+        set status = 'cancelled', cancelled_at = now()
+        where id = $1
+        returning version
+        "#,
+    )
+    .bind(response_id)
+    .fetch_one(&pool)
+    .await
+    .expect("terminalize response migration contract row");
+
+    assert_eq!(initial_version, 1);
+    assert!(updated_at_backfilled);
+    assert_eq!(terminal_version, 2);
 }
