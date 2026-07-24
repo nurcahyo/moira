@@ -426,7 +426,7 @@ async fn all_ten_admin_operation_identities_replay_the_same_resource() {
     let issuer_key = fixture.key("inventory-issuer");
     let issuer_body = json!({
         "issuer": format!("https://issuer-{}.example", fixture.suffix),
-        "jwks_url": "http://127.0.0.1:9/jwks",
+        "jwks_url": "https://issuer.example/jwks",
         "expected_audiences": [],
         "allowed_algorithms": ["RS256"],
         "subject_claim": "sub",
@@ -908,6 +908,10 @@ async fn concurrent_key_create_returns_plaintext_to_exactly_one_caller() {
             + usize::from(second.body["secret"].is_string()),
         1
     );
+    let raw_secret = first.body["secret"]
+        .as_str()
+        .or_else(|| second.body["secret"].as_str())
+        .expect("one winning response contains the one-time secret");
     assert_eq!(
         usize::from(first.body["secret_retrievable"] == true)
             + usize::from(second.body["secret_retrievable"] == true),
@@ -940,9 +944,10 @@ async fn concurrent_key_create_returns_plaintext_to_exactly_one_caller() {
     .fetch_one(&fixture.pool)
     .await
     .expect("stored key replay");
-    assert!(replay_json["secret"].is_null());
-    assert_eq!(replay_json["secret_retrievable"], false);
-    assert!(!replay_json.to_string().contains("moira_sys_"));
+    assert_eq!(replay_json["kind"], "success");
+    assert!(replay_json["body"]["secret"].is_null());
+    assert_eq!(replay_json["body"]["secret_retrievable"], false);
+    assert!(!replay_json.to_string().contains(raw_secret));
 }
 
 fn spawn_post(
