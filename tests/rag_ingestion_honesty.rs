@@ -372,6 +372,21 @@ async fn create_rag_document_with_inline_content_reports_pending_ingestion_statu
         "pending",
         "the version written by the create path must be persisted as 'pending'"
     );
+
+    // Pins a deliberate side effect of the response-row re-select. Setting
+    // current_version_id fires the rag_documents_bump_version BEFORE UPDATE trigger, so
+    // re-selecting after that update reports version 2 where the old insert-RETURNING row
+    // reported 1. The handler derives its ETag from this value, so the create response's
+    // ETag changed from "1" to "2" for content-carrying creates. That is a correction --
+    // the old ETag was stale against the committed row and an immediate If-Match would
+    // have spuriously conflicted -- but it is a visible contract change, so it is asserted
+    // here rather than left to drift unnoticed.
+    assert_eq!(
+        created.field("version"),
+        &json!(2),
+        "a content-carrying create must report the post-trigger version: {}",
+        created.body
+    );
 }
 
 /// Test 3 — `null`, and specifically not `"pending"`. Proves the `Option` is real rather than a
@@ -549,6 +564,17 @@ async fn reindex_supersedes_the_previous_version_without_ever_writing_indexed() 
         versions[0].superseded,
         "version 1 must carry superseded_at after reindex: {versions:?}"
     );
+    // Pins the consequence of the supersession CASE becoming a no-op. It only rewrites
+    // 'indexed' into 'superseded', and nothing reaches 'indexed' any more, so a superseded
+    // version keeps 'pending' and RagIngestionStatus::Superseded is currently unreachable.
+    // superseded_at above remains the authoritative signal. Asserted explicitly because the
+    // count(*) = 0 check below is laundered by that same CASE: were a write site to regress
+    // to 'indexed', supersession would rewrite it to 'superseded' and the count would still
+    // read zero. Plan 11 is expected to change this line when a real pipeline lands.
+    assert_eq!(
+        versions[0].ingestion_status, "pending",
+        "a superseded version keeps its stored status; nothing reaches 'indexed' to convert: {versions:?}"
+    );
     assert_eq!(versions[1].id, second_version_id);
     assert_eq!(versions[1].version_number, 2);
     assert!(
@@ -669,5 +695,82 @@ async fn rag_document_error_responses_carry_catalog_message_keys() {
         !message.trim().is_empty(),
         "message must be a non-empty default English string: {}",
         result.body
+    );
+}
+
+/// Test 8 — the document list must stay newest-first, end to end.
+///
+/// This is behavioural coverage of the ordering contract, and deliberately NOT the regression guard
+/// for it. Measured honestly: with the outer `order by` deleted this test still passes at fixture
+/// scale, because PostgreSQL only switches to the reordering hash join once
+/// `rag_document_versions` is large enough — around five thousand rows in the reproduction. Below
+/// that it keeps a nested loop and the CTE's ordering survives by accident. Seeding that many rows
+/// per run would be the only way to make this fail reliably, which is not worth the runtime.
+///
+/// The deterministic guard is the unit test `rag_document_select_orders_the_outer_result` in
+/// `src/infra/repositories/conversation.rs`, which asserts the clause in the emitted SQL and fails
+/// the instant it is removed. This test still earns its place: it proves the ordering holds through
+/// the real HTTP surface, including after re-ingestion moves a document's current version to the
+/// end of the version heap.
+#[tokio::test]
+async fn list_rag_documents_stays_newest_first_after_reingestion() {
+    let Some(fixture) = RagFixture::new().await else {
+        return;
+    };
+    let collection_id = fixture.create_collection("list-order").await;
+
+    let mut created_ids = Vec::new();
+    for index in 0..5 {
+        let created = fixture
+            .create_document(
+                &collection_id,
+                &format!("list-order-{index}"),
+                Some(DOCUMENT_BODY),
+            )
+            .await;
+        assert_eq!(
+            created.status,
+            StatusCode::CREATED,
+            "create document {index} failed: {}",
+            created.body
+        );
+        created_ids.push(created.document_id());
+    }
+
+    // Give the two OLDEST documents the NEWEST version rows.
+    for document_id in created_ids.iter().take(2) {
+        let ingested = fixture.ingest(document_id, REVISED_BODY, None).await;
+        assert_eq!(
+            ingested.status,
+            StatusCode::OK,
+            "ingest failed: {}",
+            ingested.body
+        );
+    }
+
+    let listed = fixture.list_documents(&collection_id).await;
+    assert_eq!(
+        listed.status,
+        StatusCode::OK,
+        "list documents failed: {}",
+        listed.body
+    );
+    let listed_ids: Vec<String> = listed.body["data"]
+        .as_array()
+        .unwrap_or_else(|| panic!("list response has no data array: {}", listed.body))
+        .iter()
+        .map(|entry| {
+            entry["id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("listed document id is not a string: {entry}"))
+                .to_string()
+        })
+        .collect();
+
+    let expected: Vec<String> = created_ids.iter().rev().cloned().collect();
+    assert_eq!(
+        listed_ids, expected,
+        "documents must be listed newest-first regardless of version heap order: {}",
+        listed.body
     );
 }
