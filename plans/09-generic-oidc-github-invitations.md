@@ -374,7 +374,7 @@ The one-way dependency rule (pages → organisms → molecules → atoms) is enf
   - `granted_identity_always_has_an_email` — every `admin_identities` row created by redemption has a non-null `email` (D5: `AdminIdentityRecord.email` is `String`).
 - `tests/http_error_contract.rs` (extended) — every new error code returns a non-empty `message_key` **and** `message`, and every new key exists in the catalog (CONVENTIONS §4.5).
 - `src/http/mod.rs` — route-coverage and atomic-idempotency-contract tests extended to include every new path with its `Idempotency-Key`/`If-Match` expectations.
-- DB-dependent tests fail closed in CI (`panic!` when `CI` is set and `MOIRA_TEST_DATABASE_URL` is absent) — the existing pattern.
+- DB-dependent tests fail closed in CI (`panic!` when **`CI=true`** and `MOIRA_TEST_DATABASE_URL` is absent (value check per `CONVENTIONS.md` §3 — never `var_os("CI").is_some()`)) — the existing pattern.
 
 **Console unit** (`bun test`):
 - `console/tests/unit/lib/github.test.ts` — verified-primary-email extraction across null / unverified / noreply-only / multiple-emails cases; org-membership check pass and fail; every call is server-side.

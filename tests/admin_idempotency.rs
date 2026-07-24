@@ -46,8 +46,10 @@ impl Fixture {
         let serial = SERIAL.lock().await;
         let database_url = match env::var("MOIRA_TEST_DATABASE_URL") {
             Ok(value) if !value.trim().is_empty() => value,
-            _ if env::var_os("CI").is_some() => {
-                panic!("MOIRA_TEST_DATABASE_URL is required in CI for admin idempotency tests")
+            _ if env::var("CI").is_ok_and(|value| value.eq_ignore_ascii_case("true")) => {
+                panic!(
+                    "MOIRA_TEST_DATABASE_URL is required when CI=true for admin idempotency tests"
+                )
             }
             _ => {
                 eprintln!(

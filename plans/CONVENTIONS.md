@@ -90,7 +90,7 @@ bun run build
 - **Unit** — `#[cfg(test)] mod tests` beside the code (pure logic, mappers, validators, hashing, cursor encode/decode, policy decisions). No database required.
 - **E2E / integration** — a file under `tests/` driving the real HTTP surface against a **real PostgreSQL 16 + pgvector** (the audit environment), following the existing harness in `tests/support/mod.rs`. Existing exemplars to imitate: `tests/admin_idempotency.rs` (9 tests), `tests/execution_lifecycle.rs` (14 tests), `tests/public_authorization.rs`, `tests/http_error_contract.rs`.
 - **Concurrency tests must use acknowledgement gates, not `sleep()`** (see finding P2-12). New sleep-based interleaving is rejected in review.
-- DB-dependent tests must fail closed in CI (`panic!` when `CI` is set and `MOIRA_TEST_DATABASE_URL` is absent) — the existing pattern.
+- DB-dependent tests must fail closed in CI (`panic!` when **`CI=true`** and `MOIRA_TEST_DATABASE_URL` is absent) — the existing pattern. **Match on the value, not merely on the variable being present:** use `env::var("CI").is_ok_and(|v| v.eq_ignore_ascii_case("true"))`, never `env::var_os("CI").is_some()`. The latter also fires for `CI=false`, `CI=0`, and `CI=""`, which several shells, IDE terminals, and tool wrappers export — turning an intended local *skip* into a hard panic. GitHub Actions sets `CI=true`, so the value check is strictly correct and strictly safer. All three existing call sites (`tests/support/mod.rs`, `tests/security_foundation.rs`, `tests/admin_idempotency.rs`) use this form; any new DB-dependent test file must copy it verbatim so the harness cannot diverge.
 
 ### Frontend (plans 08, 09)
 - **Unit** — `bun test` for pure modules (Moira client, JWT/claim helpers, policy guards, atoms/molecules rendering).
