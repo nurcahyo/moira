@@ -895,8 +895,9 @@ pub async fn rotate_credential(
 ) -> Result<(HeaderMap, Json<CredentialRecord>), AppError> {
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
+    let expected_version = require_if_match(&headers)?;
     let record = AdminService::new(&state)?
-        .rotate_credential(&actor, &ctx, id, request)
+        .rotate_credential(&actor, &ctx, id, expected_version, request)
         .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
