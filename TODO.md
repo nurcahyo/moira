@@ -1,0 +1,26 @@
+# TODO
+
+Hardening items, leftovers, deferred follow-ups and known gaps surfaced while executing the
+iteration plans. Nothing here is silently dropped: an item that is not done lives here, and an item
+needing a human decision lives in [`NEED_CONFIRMATION.md`](./NEED_CONFIRMATION.md).
+
+Format: `- [ ] <item> — source: <plan> — <why deferred>`
+
+## From plan 02a (MVP boundary honesty)
+
+- [ ] Wire `pub mod i18n;` into `src/lib.rs` and make the catalog load-bearing (finding P0-5) — source: plans/02a-mvp-boundary-honesty.md — `src/i18n/` is orphaned, so `moira::i18n::is_known_key` is neither compiled nor reachable from `tests/`. 02a adds zero keys so it had nothing to assert; the plan assigns wiring to 02b Wave 0 / plan 04 Wave 0 and the enforcement test to plan 05.
+- [ ] Implement real `Idempotency-Key` replay on the four RAG write routes — source: plans/02a-mvp-boundary-honesty.md — deliberately deferred to plans/02b-idempotency-replay.md per CONVENTIONS.md §0 decision D1/D2. Until it lands the parameter is accepted and ignored, which 02a states honestly in the spec and docs.
+- [ ] Delete Sentence B and the `rag_write_routes_carry_the_interim_idempotency_disclaimer` unit test — source: plans/02a-mvp-boundary-honesty.md — they exist only to describe the interim window between 02a and 02b. 02b's Definition of Done includes removing them, and replacing `repeated_ingest_with_the_same_idempotency_key_creates_two_versions_until_02b` with its inverse.
+- [ ] Document that six admin routes still advertise unimplemented replay — source: plans/02a-mvp-boundary-honesty.md — `docs/idempotency.md`'s new paragraph names only conversation/memory/RAG, but `PUT .../execution-policy`, `PUT .../users/{external_user_id}/provider-credentials/{id}`, `POST .../routes`, `POST .../routing-policies`, `POST .../agent-profiles` and `PUT .../providers/{provider_id}/runtime-policy` also declare the header without replaying. Incompleteness rather than falsehood; `docs/todo.md:22` tracks the slice and 02b should close it.
+- [ ] Add an authn/authz negative test on a RAG route — source: plans/02a-mvp-boundary-honesty.md — the new e2e suite sends no credentials and relies on `admin_settings.enabled = false` yielding a `DevAdmin` actor, so a regression stripping auth from these routes would not be caught by it. Security review proved 02a changes auth byte-for-byte-not-at-all (126 `security(...)` annotations and 209 guard call sites identical), so this is a pre-existing coverage gap, not one 02a introduced.
+- [ ] Revisit `RagIngestionStatus::Superseded`, now unreachable — source: plans/02a-mvp-boundary-honesty.md — the supersession `CASE` only rewrites `'indexed'` into `'superseded'`, and nothing reaches `'indexed'` any more, so superseded versions keep `'pending'`. `superseded_at` remains the authoritative signal. Plan 11 should restore a meaningful terminal status when a real pipeline lands.
+- [ ] Tighten `public_response_schema_documents_always_empty_citations` — source: plans/02a-mvp-boundary-honesty.md — it matches lowercased substrings (`"empty"`, `"not wired"`) while every sibling OpenAPI test matches verbatim constants, so it would survive prose drift. It does catch deletion of the description.
+- [ ] Give `rag_document_select(inner: &str)` a compile-time contract — source: plans/02a-mvp-boundary-honesty.md — every one of its five call sites passes a string literal today (verified), but the signature cannot enforce that, so a future dynamic call site would introduce SQL injection without any type-level objection.
+- [ ] Keyset pagination on the RAG list endpoints (finding P1-4) — source: plans/02a-mvp-boundary-honesty.md — assigned to plan 04. Note that plan 04 must build on the outer `order by document_rows.created_at desc, document_rows.id desc` that 02a restored in `rag_document_select`; the ordering it depends on was briefly broken by this branch's join.
+- [ ] Automated drift gating for the honesty text 02a wrote — source: plans/02a-mvp-boundary-honesty.md — OpenAPI drift is plan 05, i18n catalog ↔ JSON mirror drift is plan 06. Until then the only protection is `conversation_memory_rag_operations_document_the_mvp_preview_boundary` plus review.
+- [ ] Full RAG/memory pipeline: chunking, embeddings, retrieval, context injection, real citations — source: plans/02a-mvp-boundary-honesty.md — plan 11. 02a only makes the current no-op behaviour honest; keep its wording until plan 11's behaviour is verified.
+
+## Cross-cutting / infrastructure
+
+- [ ] Make DB-dependent test suites fail loudly when the database is absent locally — source: plans/02a-mvp-boundary-honesty.md — with `MOIRA_TEST_DATABASE_URL` unset and `CI` unset, all e2e tests return early and report `ok` in ~0.01s having proven nothing, so the literal CONVENTIONS §2 `cargo test --workspace --all-features` gate is fully green on a machine with no database. The `CI=true` path does panic correctly. Systemic, inherited from `tests/support/mod.rs`, not introduced by 02a; until it changes, PR test evidence must show the DB-backed run, not merely a green transcript.
+- [ ] Re-run the 02a gates against PostgreSQL 16 in CI — source: plans/02a-mvp-boundary-honesty.md — local verification used PostgreSQL 18.3 because Docker is unavailable on the dev machine. See [`NEED_CONFIRMATION.md`](./NEED_CONFIRMATION.md).

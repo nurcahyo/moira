@@ -586,6 +586,7 @@ pub struct RagDocumentRecord {
     pub mime_type: String,
     pub status: RagDocumentStatus,
     pub current_version_id: Option<Uuid>,
+    pub ingestion_status: Option<RagIngestionStatus>,
     pub metadata: Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -618,4 +619,74 @@ pub struct RagDocumentIngestRequest {
 
 pub fn empty_object() -> Value {
     Value::Object(Default::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_rag_document_record(
+        ingestion_status: Option<RagIngestionStatus>,
+    ) -> RagDocumentRecord {
+        RagDocumentRecord {
+            id: "doc_123".to_string(),
+            object: "rag.document".to_string(),
+            collection_id: "col_123".to_string(),
+            external_document_id: Some("ext-1".to_string()),
+            title: "Title".to_string(),
+            source_type: "text".to_string(),
+            source_uri: None,
+            mime_type: "text/plain".to_string(),
+            status: RagDocumentStatus::Active,
+            current_version_id: Some(Uuid::nil()),
+            ingestion_status,
+            metadata: empty_object(),
+            created_at: DateTime::<Utc>::UNIX_EPOCH,
+            updated_at: DateTime::<Utc>::UNIX_EPOCH,
+            deleted_at: None,
+            version: 1,
+        }
+    }
+
+    #[test]
+    fn rag_document_record_serializes_ingestion_status_as_snake_case() {
+        let record = sample_rag_document_record(Some(RagIngestionStatus::Pending));
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["ingestion_status"], "pending");
+
+        let record = sample_rag_document_record(None);
+        let value = serde_json::to_value(&record).unwrap();
+        // The key must be present as an explicit JSON null, not omitted: a
+        // `skip_serializing_if` regression on this field must fail this test.
+        assert!(
+            value.as_object().unwrap().contains_key("ingestion_status"),
+            "ingestion_status key must be present even when None"
+        );
+        assert_eq!(value["ingestion_status"], Value::Null);
+    }
+
+    #[test]
+    fn rag_document_record_round_trips_through_serde() {
+        for ingestion_status in [
+            None,
+            Some(RagIngestionStatus::Pending),
+            Some(RagIngestionStatus::Downloading),
+            Some(RagIngestionStatus::Parsing),
+            Some(RagIngestionStatus::Chunking),
+            Some(RagIngestionStatus::Embedding),
+            Some(RagIngestionStatus::Indexed),
+            Some(RagIngestionStatus::Failed),
+            Some(RagIngestionStatus::Superseded),
+        ] {
+            let record = sample_rag_document_record(ingestion_status);
+            let json = serde_json::to_string(&record).unwrap();
+            let round_tripped: RagDocumentRecord = serde_json::from_str(&json).unwrap();
+            assert_eq!(round_tripped.ingestion_status, ingestion_status);
+            assert_eq!(round_tripped.id, record.id);
+            assert_eq!(round_tripped.collection_id, record.collection_id);
+            assert_eq!(round_tripped.current_version_id, record.current_version_id);
+            assert_eq!(round_tripped.status, record.status);
+            assert_eq!(round_tripped.version, record.version);
+        }
+    }
 }

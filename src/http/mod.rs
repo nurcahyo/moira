@@ -650,10 +650,230 @@ mod tests {
         assert_refs_resolve(&value, schemas);
     }
 
+    /// The four RAG write operations that carry `Idempotency-Key` and the interim
+    /// disclaimer (Sentence B) per `plans/02a-mvp-boundary-honesty.md` §5.
+    const RAG_WRITE_OPERATIONS: [(&str, &str); 4] = [
+        ("/api/v1/admin/rag-collections", "post"),
+        (
+            "/api/v1/admin/rag-collections/{collection_id}/documents",
+            "post",
+        ),
+        ("/api/v1/admin/rag-documents/{id}/ingest", "post"),
+        ("/api/v1/admin/rag-documents/{id}/reindex", "post"),
+    ];
+
+    /// The seven conversation/memory/policy operations that carry only the short
+    /// Sentence A (no `Idempotency-Key`, no Sentence B).
+    const OTHER_PREVIEW_OPERATIONS: [(&str, &str); 7] = [
+        ("/api/v1/conversations", "post"),
+        ("/api/v1/conversations/{id}/messages", "post"),
+        ("/api/v1/memories", "post"),
+        (
+            "/api/v1/admin/applications/{application_id}/conversation-policy",
+            "put",
+        ),
+        (
+            "/api/v1/admin/applications/{application_id}/memory-policy",
+            "put",
+        ),
+        (
+            "/api/v1/admin/applications/{application_id}/retrieval-policy",
+            "put",
+        ),
+        (
+            "/api/v1/admin/applications/{application_id}/embedding-policy",
+            "put",
+        ),
+    ];
+
+    const SENTENCE_A_RAG_WRITE: &str = "Persistence primitive: no retrieval, chunking, or embedding pipeline runs, and stored content is not used to influence model responses. See docs/conversation-memory-rag-api.md.";
+    const SENTENCE_A_SHORT: &str = "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.";
+    const SENTENCE_B_INTERIM_IDEMPOTENCY: &str = "Idempotency-Key is accepted but replay is not implemented yet; retrying can duplicate side effects.";
+    const IDEMPOTENCY_KEY_PARAMETER_DESCRIPTION: &str = "Optional replay key. Replay is not yet implemented on this route; see plans/02b-idempotency-replay.md.";
+
+    #[test]
+    fn rag_write_routes_still_declare_the_idempotency_key_parameter() {
+        // Guard against a stale "remove the parameter" instinct: CONVENTIONS.md §0
+        // decision D1 settled that P0-2 is fixed by implementing real replay (02b),
+        // not by removing Idempotency-Key from these routes.
+        let value = serde_json::to_value(documented_router().into_openapi()).unwrap();
+        for (path, method) in RAG_WRITE_OPERATIONS {
+            let operation = &value["paths"][path][method];
+            assert!(
+                parameter_named(operation, "Idempotency-Key"),
+                "{method} {path} must still declare Idempotency-Key"
+            );
+            assert_eq!(
+                parameter_description(operation, "Idempotency-Key"),
+                Some(IDEMPOTENCY_KEY_PARAMETER_DESCRIPTION),
+                "{method} {path} Idempotency-Key description drifted"
+            );
+        }
+    }
+
+    #[test]
+    fn rag_collection_document_route_keeps_its_collection_id_path_parameter() {
+        let value = serde_json::to_value(documented_router().into_openapi()).unwrap();
+        let operation =
+            &value["paths"]["/api/v1/admin/rag-collections/{collection_id}/documents"]["post"];
+        let parameter = operation["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|parameter| parameter["name"] == "collection_id")
+            .expect("collection_id path parameter must survive");
+        assert_eq!(parameter["in"], "path");
+        assert_eq!(parameter["required"], true);
+        assert_eq!(parameter["description"], "RAG collection identifier");
+    }
+
+    #[test]
+    fn conversation_memory_rag_operations_document_the_mvp_preview_boundary() {
+        // Assert Sentence A only (the permanent boundary text). Sentence B is
+        // deliberately checked by a separate test that plan 02b deletes.
+        let value = serde_json::to_value(documented_router().into_openapi()).unwrap();
+        for (path, method) in RAG_WRITE_OPERATIONS {
+            let operation = &value["paths"][path][method];
+            let description = operation["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{method} {path} is missing an operation description"));
+            assert!(
+                !description.is_empty(),
+                "{method} {path} description must not be empty"
+            );
+            assert!(
+                description.contains("used to influence model responses"),
+                "{method} {path} description is missing the invariant phrase"
+            );
+            assert!(
+                description.contains(SENTENCE_A_RAG_WRITE),
+                "{method} {path} description is missing Sentence A verbatim"
+            );
+        }
+        for (path, method) in OTHER_PREVIEW_OPERATIONS {
+            let operation = &value["paths"][path][method];
+            let description = operation["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{method} {path} is missing an operation description"));
+            assert!(
+                !description.is_empty(),
+                "{method} {path} description must not be empty"
+            );
+            assert!(
+                description.contains("used to influence model responses"),
+                "{method} {path} description is missing the invariant phrase"
+            );
+            assert!(
+                description.contains(SENTENCE_A_SHORT),
+                "{method} {path} description is missing the short Sentence A verbatim"
+            );
+        }
+    }
+
+    #[test]
+    fn rag_write_routes_carry_the_interim_idempotency_disclaimer() {
+        // THIS IS THE TEST PLAN 02b DELETES: once real replay is implemented,
+        // Sentence B ("retrying can duplicate side effects") and the
+        // plans/02b-idempotency-replay.md pointer both become false.
+        let value = serde_json::to_value(documented_router().into_openapi()).unwrap();
+        for (path, method) in RAG_WRITE_OPERATIONS {
+            let operation = &value["paths"][path][method];
+            let description = operation["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{method} {path} is missing an operation description"));
+            assert!(
+                description.contains(SENTENCE_B_INTERIM_IDEMPOTENCY),
+                "{method} {path} description is missing Sentence B verbatim"
+            );
+            let parameter_description = parameter_description(operation, "Idempotency-Key")
+                .unwrap_or_else(|| {
+                    panic!("{method} {path} is missing the Idempotency-Key parameter")
+                });
+            assert!(
+                parameter_description.contains("plans/02b-idempotency-replay.md"),
+                "{method} {path} Idempotency-Key description must name plans/02b-idempotency-replay.md"
+            );
+        }
+    }
+
+    #[test]
+    fn rag_document_record_schema_exposes_ingestion_status() {
+        let value = serde_json::to_value(documented_router().into_openapi()).unwrap();
+        let property =
+            &value["components"]["schemas"]["RagDocumentRecord"]["properties"]["ingestion_status"];
+        assert!(
+            property.is_object(),
+            "RagDocumentRecord.ingestion_status schema is missing"
+        );
+        // utoipa represents Option<RagIngestionStatus> as a `oneOf` of `null` and a
+        // `$ref` to the enum schema rather than a bare `$ref`.
+        let one_of = property["oneOf"]
+            .as_array()
+            .expect("ingestion_status must be a oneOf wrapping the optional enum");
+        assert!(
+            one_of.iter().any(|variant| variant["type"] == "null"),
+            "ingestion_status oneOf must allow null"
+        );
+        assert!(
+            one_of
+                .iter()
+                .any(|variant| variant["$ref"] == "#/components/schemas/RagIngestionStatus"),
+            "ingestion_status oneOf must reference RagIngestionStatus"
+        );
+
+        let enum_schema = &value["components"]["schemas"]["RagIngestionStatus"];
+        let variants: BTreeSet<_> = enum_schema["enum"]
+            .as_array()
+            .expect("RagIngestionStatus must enumerate its variants")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            variants,
+            BTreeSet::from([
+                "pending",
+                "downloading",
+                "parsing",
+                "chunking",
+                "embedding",
+                "indexed",
+                "failed",
+                "superseded",
+            ])
+        );
+    }
+
+    #[test]
+    fn public_response_schema_documents_always_empty_citations() {
+        let value = serde_json::to_value(documented_router().into_openapi()).unwrap();
+        let description = value["components"]["schemas"]["PublicResponse"]["properties"]
+            ["citations"]["description"]
+            .as_str()
+            .expect("PublicResponse.citations must carry a description");
+        assert!(!description.is_empty());
+        assert!(
+            description.to_lowercase().contains("empty"),
+            "citations description must state that the array is always empty: {description}"
+        );
+        assert!(
+            description.to_lowercase().contains("not wired"),
+            "citations description must state that retrieval is not wired: {description}"
+        );
+    }
+
     fn parameter_named(operation: &Value, name: &str) -> bool {
         operation["parameters"]
             .as_array()
             .is_some_and(|parameters| parameters.iter().any(|parameter| parameter["name"] == name))
+    }
+
+    fn parameter_description<'a>(operation: &'a Value, name: &str) -> Option<&'a str> {
+        operation["parameters"].as_array().and_then(|parameters| {
+            parameters
+                .iter()
+                .find(|parameter| parameter["name"] == name)
+                .and_then(|parameter| parameter["description"].as_str())
+        })
     }
 
     fn parameter_required(operation: &Value, name: &str) -> bool {

@@ -34,3 +34,8 @@ The core admin operation identities are:
 Only the winning system-key or consumer-key command receives the raw secret. Its replay preserves the original status but returns `secret: null` and `secret_retrievable: false`. A lost one-time secret must be recovered by rotating with a new idempotency key.
 
 Streaming does not support idempotency because replaying a partially delivered SSE stream is unsafe.
+
+Conversation, memory, and RAG endpoints do **not** replay today. `Idempotency-Key`
+is advertised on the RAG create/ingest/reindex routes and is accepted, but no replay
+is performed yet, so retrying a create can duplicate side effects. Implementing real
+replay for those routes is the next change to this document.

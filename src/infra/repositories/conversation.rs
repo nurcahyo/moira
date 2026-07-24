@@ -12,7 +12,7 @@ use crate::{
         MemoryCreateRequest, MemoryPatchRequest, MemoryPolicyPutRequest, MemoryPolicyRecord,
         MemoryQuery, MemoryRecord, MemoryScope, RagCollectionCreateRequest,
         RagCollectionPatchRequest, RagCollectionQuery, RagCollectionRecord, RagCollectionStatus,
-        RagDocumentCreateRequest, RagDocumentIngestRequest, RagDocumentRecord,
+        RagDocumentCreateRequest, RagDocumentIngestRequest, RagDocumentRecord, RagIngestionStatus,
         RetrievalPolicyPutRequest, RetrievalPolicyRecord,
     },
     error::AppError,
@@ -24,7 +24,7 @@ use crate::{
         memory_consent_mode_to_db, memory_policy_record_from_row, memory_record_from_row,
         memory_scope_to_db, memory_sensitivity_to_db, memory_status_to_db, memory_type_to_db,
         rag_collection_record_from_row, rag_collection_status_to_db,
-        rag_collection_visibility_to_db, rag_document_record_from_row,
+        rag_collection_visibility_to_db, rag_document_record_from_row, rag_ingestion_status_to_db,
         retrieval_policy_record_from_row,
     },
 };
@@ -1032,7 +1032,7 @@ impl PgConversationRepository {
                 "RAG collection not found",
             )
         })?;
-        let row = sqlx::query(&rag_document_select(
+        let mut row = sqlx::query(&rag_document_select(
             r#"
             insert into rag_documents (
                 id, public_id, collection_id, external_document_id, title,
@@ -1055,13 +1055,14 @@ impl PgConversationRepository {
         .await?;
         if let (Some(content), Some(hash)) = (&request.content, content_hash) {
             let version_id = Uuid::now_v7();
+            // Honest status: no chunking/embedding pipeline exists yet (see plans/11-rag-memory-intelligence.md). Content is stored verbatim; ingestion_status reflects "not yet processed", not "indexed for retrieval".
             sqlx::query(
                 r#"
                 insert into rag_document_versions (
                     id, document_id, version_number, content_plain, content_hash,
                     content_size_bytes, ingestion_status, metadata
                 )
-                values ($1, $2, 1, $3, $4, $5, 'indexed', $6)
+                values ($1, $2, 1, $3, $4, $5, $6, $7)
                 "#,
             )
             .bind(version_id)
@@ -1069,6 +1070,7 @@ impl PgConversationRepository {
             .bind(content)
             .bind(hash)
             .bind(content.len() as i64)
+            .bind(rag_ingestion_status_to_db(RagIngestionStatus::Pending))
             .bind(&request.metadata)
             .execute(&mut *tx)
             .await?;
@@ -1077,6 +1079,16 @@ impl PgConversationRepository {
                 .bind(version_id)
                 .execute(&mut *tx)
                 .await?;
+            // The row returned by the insert above predates the version insert, so it would
+            // report a null ingestion_status. Re-select it so the response reflects the
+            // version that was just created. Skipped entirely when no version exists, which
+            // keeps `ingestion_status: null` honest for a create without inline content.
+            row = sqlx::query(&rag_document_select(
+                "select d.* from rag_documents d where d.id = $1",
+            ))
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
         }
         tx.commit().await?;
         rag_document_record_from_row(&row)
@@ -1174,6 +1186,7 @@ impl PgConversationRepository {
         .bind(document_id)
         .execute(&mut *tx)
         .await?;
+        // Honest status: no chunking/embedding pipeline exists yet (see plans/11-rag-memory-intelligence.md). Content is stored verbatim; ingestion_status reflects "not yet processed", not "indexed for retrieval".
         sqlx::query(
             r#"
             insert into rag_document_versions (
@@ -1181,7 +1194,7 @@ impl PgConversationRepository {
                 content_size_bytes, source_etag, source_last_modified,
                 ingestion_status, metadata
             )
-            values ($1, $2, $3, $4, $5, $6, $7, $8, 'indexed', $9)
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             "#,
         )
         .bind(version_id)
@@ -1192,6 +1205,7 @@ impl PgConversationRepository {
         .bind(content.len() as i64)
         .bind(&request.source_etag)
         .bind(request.source_last_modified)
+        .bind(rag_ingestion_status_to_db(RagIngestionStatus::Pending))
         .bind(&request.metadata)
         .execute(&mut *tx)
         .await?;
@@ -1251,16 +1265,65 @@ fn memory_select(inner: &str) -> String {
 }
 
 fn rag_document_select(inner: &str) -> String {
+    // The outer `order by` is load-bearing, not decorative. An inner query's own
+    // `order by` only decides which rows the CTE keeps under its `limit`; it does not
+    // survive into the outer result, and the joins below let the planner emit rows in
+    // whatever order suits it (a hash join driven by rag_document_versions reorders
+    // them by that table's heap). Restating the ordering here keeps
+    // list_rag_documents newest-first. Single-row call sites are unaffected.
     format!(
         r#"
         with document_rows as ({inner})
-        select document_rows.*, c.public_id as collection_public_id
+        select document_rows.*,
+               c.public_id as collection_public_id,
+               v.ingestion_status as ingestion_status
         from document_rows
         join rag_collections c on c.id = document_rows.collection_id
+        left join rag_document_versions v on v.id = document_rows.current_version_id
+        order by document_rows.created_at desc, document_rows.id desc
         "#
     )
 }
 
 fn message_sequence(value: Option<&str>) -> Option<i64> {
     value.and_then(|value| value.strip_prefix("msgseq_").unwrap_or(value).parse().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rag_document_select;
+
+    /// The list endpoint's ordering is a property of the OUTER select, and is asserted here at the
+    /// SQL level rather than through a query.
+    ///
+    /// `list_rag_documents` puts `order by d.created_at desc, d.id desc` inside the CTE, where it
+    /// only decides which rows survive the `limit`; the outer select does not inherit it. Once
+    /// `rag_document_select` joins `rag_document_versions`, the planner may drive the outer result
+    /// from that table and emit documents in its heap order.
+    ///
+    /// A behavioural test cannot be trusted to catch this: the planner only switches to the
+    /// reordering hash join once the table is large enough, so at fixture scale it keeps a nested
+    /// loop and the CTE order survives by accident — an end-to-end assertion passes even with the
+    /// clause deleted. Asserting the emitted SQL is deterministic and fails the moment the clause is
+    /// removed, at any table size.
+    #[test]
+    fn rag_document_select_orders_the_outer_result() {
+        let sql = rag_document_select("select d.* from rag_documents d");
+
+        let left_join = sql
+            .find("left join rag_document_versions")
+            .expect("the ingestion_status projection depends on this join");
+        let order_by = sql
+            .find("order by document_rows.created_at desc, document_rows.id desc")
+            .expect("the outer select must restate the newest-first ordering");
+
+        assert!(
+            order_by > left_join,
+            "the ordering must apply to the joined outer result, not inside the CTE:\n{sql}"
+        );
+        assert!(
+            sql.contains("v.ingestion_status as ingestion_status"),
+            "every read path must project the current version's ingestion_status:\n{sql}"
+        );
+    }
 }

@@ -18,5 +18,24 @@ The only optional compatibility route is `POST /v1/responses`, gated by `public_
 
 All JSON responses include `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and propagated `X-Request-Id`.
 
+## MVP boundary: conversations, memory, and RAG
+
+`/api/v1/conversations`, `/api/v1/memories`, and the admin RAG endpoints under
+`/api/v1/admin/rag-collections` and `/api/v1/admin/rag-documents` are **persistence
+and configuration primitives only** in this release. They store and version content
+durably and enforce policy, but:
+
+- No retrieval, chunking, or embedding pipeline runs. `ingestion_status` on a RAG
+  document reflects storage, not indexing for retrieval.
+- Conversation history, explicit memories, and RAG documents are not loaded into the
+  prompt sent to a provider. `POST /v1/responses` always returns `citations: []`.
+- No summarization runs; `conversation_summaries` is never populated.
+- `Idempotency-Key` is advertised on the RAG create/ingest/reindex routes but its
+  replay implementation has not shipped yet: until it does, retrying a create can
+  duplicate side effects. Real replay exists today only for `/v1/responses` and the
+  admin command routes documented in `docs/idempotency.md`.
+
+Full retrieval/memory intelligence is tracked separately and is not part of this MVP.
+
 Do not send real provider secrets, API keys, authorization headers, JWTs, or private documents in prompts while developing locally. Moira does not return provider credentials or raw key material from these routes.
 
