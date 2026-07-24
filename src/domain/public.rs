@@ -164,6 +164,9 @@ pub struct PublicResponse {
     pub model: Option<PublicModelRef>,
     pub conversation: Option<PublicConversationRef>,
     pub output: Vec<PublicOutputItem>,
+    /// Always an empty array: RAG retrieval is not wired into response generation in
+    /// this release, so no citation is ever produced. See
+    /// plans/11-rag-memory-intelligence.md for the tracked follow-up.
     pub citations: Vec<PublicCitation>,
     pub usage: PublicUsageSummary,
     pub metadata: Value,

@@ -31,6 +31,7 @@ pub struct ConversationExecutionLink {
     pub user_message_id: String,
 }
 
+// NOTE: this ordering is a design placeholder for the future context-assembly pipeline (plans/11-rag-memory-intelligence.md). It is not currently consumed by prepare_response_conversation and does not affect what is sent to the provider.
 pub struct ContextPlanner;
 
 impl ContextPlanner {
@@ -311,6 +312,7 @@ impl ConversationService {
         Ok(record)
     }
 
+    // Persists the user's message for later retrieval by GET endpoints; does not load history, summaries, memories, or RAG content into the prompt sent to the provider. See docs/conversation-memory-rag-api.md for the MVP boundary.
     pub async fn prepare_response_conversation(
         &self,
         actor: &Actor,

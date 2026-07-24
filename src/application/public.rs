@@ -1654,6 +1654,7 @@ fn public_response_from_record(
             .clone()
             .map(|id| PublicConversationRef { id }),
         output,
+        // Always empty: RAG retrieval is not wired into response generation (see plans/11-rag-memory-intelligence.md).
         citations: Vec::new(),
         usage: record.usage.clone(),
         metadata: record.metadata.clone(),

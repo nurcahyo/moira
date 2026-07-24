@@ -57,6 +57,7 @@ fn etag_headers(version: i64) -> HeaderMap {
     post,
     path = "/api/v1/conversations",
     tag = "conversations",
+    description = "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.",
     request_body = ConversationCreateRequest,
     responses(
         (status = 201, description = "Conversation created", body = ConversationRecord),
@@ -281,6 +282,7 @@ pub async fn list_messages(
     post,
     path = "/api/v1/conversations/{id}/messages",
     tag = "conversation-messages",
+    description = "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.",
     request_body = ConversationMessageCreateRequest,
     params(("id" = String, Path, description = "Conversation identifier")),
     responses(
@@ -312,6 +314,7 @@ pub async fn create_message(
     post,
     path = "/api/v1/memories",
     tag = "memories",
+    description = "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.",
     request_body = MemoryCreateRequest,
     responses(
         (status = 201, description = "Memory created", body = MemoryRecord),
@@ -481,6 +484,7 @@ pub async fn get_conversation_policy(
     put,
     path = "/api/v1/admin/applications/{application_id}/conversation-policy",
     tag = "admin-policies",
+    description = "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.",
     request_body = ConversationPolicyPutRequest,
     params(("application_id" = Uuid, Path, description = "Application identifier")),
     responses(
@@ -532,6 +536,7 @@ pub async fn get_memory_policy(
     put,
     path = "/api/v1/admin/applications/{application_id}/memory-policy",
     tag = "admin-policies",
+    description = "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.",
     request_body = MemoryPolicyPutRequest,
     params(("application_id" = Uuid, Path, description = "Application identifier")),
     responses(
@@ -583,6 +588,7 @@ pub async fn get_retrieval_policy(
     put,
     path = "/api/v1/admin/applications/{application_id}/retrieval-policy",
     tag = "admin-policies",
+    description = "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.",
     request_body = RetrievalPolicyPutRequest,
     params(("application_id" = Uuid, Path, description = "Application identifier")),
     responses(
@@ -634,6 +640,7 @@ pub async fn get_embedding_policy(
     put,
     path = "/api/v1/admin/applications/{application_id}/embedding-policy",
     tag = "admin-policies",
+    description = "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.",
     request_body = EmbeddingPolicyPutRequest,
     params(("application_id" = Uuid, Path, description = "Application identifier")),
     responses(
@@ -661,8 +668,9 @@ pub async fn put_embedding_policy(
     post,
     path = "/api/v1/admin/rag-collections",
     tag = "admin-rag",
+    description = "Persistence primitive: no retrieval, chunking, or embedding pipeline runs, and stored content is not used to influence model responses. See docs/conversation-memory-rag-api.md. Idempotency-Key is accepted but replay is not implemented yet; retrying can duplicate side effects.",
     request_body = RagCollectionCreateRequest,
-    params(("Idempotency-Key" = Option<String>, Header, description = "Optional replay key")),
+    params(("Idempotency-Key" = Option<String>, Header, description = "Optional replay key. Replay is not yet implemented on this route; see plans/02b-idempotency-replay.md.")),
     responses(
         (status = 201, description = "RAG collection created", body = RagCollectionRecord, headers(("ETag" = String, description = "Current resource version"))),
         (status = "4XX", description = "Request, authentication, authorization, or conflict error", body = ErrorResponse),
@@ -841,10 +849,11 @@ pub async fn disable_rag_collection(
     post,
     path = "/api/v1/admin/rag-collections/{collection_id}/documents",
     tag = "admin-rag",
+    description = "Persistence primitive: no retrieval, chunking, or embedding pipeline runs, and stored content is not used to influence model responses. See docs/conversation-memory-rag-api.md. Idempotency-Key is accepted but replay is not implemented yet; retrying can duplicate side effects.",
     request_body = RagDocumentCreateRequest,
     params(
         ("collection_id" = String, Path, description = "RAG collection identifier"),
-        ("Idempotency-Key" = Option<String>, Header, description = "Optional replay key")
+        ("Idempotency-Key" = Option<String>, Header, description = "Optional replay key. Replay is not yet implemented on this route; see plans/02b-idempotency-replay.md.")
     ),
     responses(
         (status = 201, description = "RAG document created", body = RagDocumentRecord, headers(("ETag" = String, description = "Current resource version"))),
@@ -948,10 +957,11 @@ pub async fn delete_rag_document(
     post,
     path = "/api/v1/admin/rag-documents/{id}/ingest",
     tag = "admin-rag",
+    description = "Persistence primitive: no retrieval, chunking, or embedding pipeline runs, and stored content is not used to influence model responses. See docs/conversation-memory-rag-api.md. Idempotency-Key is accepted but replay is not implemented yet; retrying can duplicate side effects.",
     request_body = RagDocumentIngestRequest,
     params(
         ("id" = String, Path, description = "RAG document identifier"),
-        ("Idempotency-Key" = Option<String>, Header, description = "Optional replay key")
+        ("Idempotency-Key" = Option<String>, Header, description = "Optional replay key. Replay is not yet implemented on this route; see plans/02b-idempotency-replay.md.")
     ),
     responses(
         (status = 200, description = "RAG document ingestion scheduled or completed", body = RagDocumentRecord, headers(("ETag" = String, description = "Current resource version"))),
@@ -978,10 +988,11 @@ pub async fn ingest_rag_document(
     post,
     path = "/api/v1/admin/rag-documents/{id}/reindex",
     tag = "admin-rag",
+    description = "Persistence primitive: no retrieval, chunking, or embedding pipeline runs, and stored content is not used to influence model responses. See docs/conversation-memory-rag-api.md. Idempotency-Key is accepted but replay is not implemented yet; retrying can duplicate side effects.",
     request_body = RagDocumentIngestRequest,
     params(
         ("id" = String, Path, description = "RAG document identifier"),
-        ("Idempotency-Key" = Option<String>, Header, description = "Optional replay key")
+        ("Idempotency-Key" = Option<String>, Header, description = "Optional replay key. Replay is not yet implemented on this route; see plans/02b-idempotency-replay.md.")
     ),
     responses(
         (status = 200, description = "RAG document reindexing scheduled or completed", body = RagDocumentRecord, headers(("ETag" = String, description = "Current resource version"))),

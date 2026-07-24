@@ -19,7 +19,7 @@ This list tracks what is still left to harden or complete after the current Phas
 - TODO: Split `AdminService` into focused domain services for applications, providers, models, credentials, JWT issuers, system keys, consumer keys, audit queries, idempotency, validation, and runtime invalidation.
 - TODO: Replace simplified list pagination with real opaque cursor pagination using stable `created_at DESC, id DESC` ordering and `has_more`/`next_cursor` calculation.
 - TODO: Require `If-Match` consistently on every versioned mutation and upsert, including application execution policy PUT, and return `409 resource_version_conflict` for stale versions.
-- TODO: Extend atomic idempotency and sanitized deterministic-failure replay to the runtime-policy, RAG, conversation, memory, and other endpoints that advertise `Idempotency-Key`.
+- TODO: Extend atomic idempotency and sanitized deterministic-failure replay to the runtime-policy, RAG, conversation, memory, and other endpoints that advertise `Idempotency-Key`. (For the RAG/conversation/memory slice, see `plans/02b-idempotency-replay.md`.)
 - TODO: Reject unknown query fields consistently on all admin list/filter endpoints.
 - TODO: Finish centralized validation coverage for metadata depth/size, secret-like keys, custom headers, dangerous outbound headers, priorities, capabilities, expiration windows, and scope narrowing.
 - TODO: Harden JWKS refresh with full SSRF checks, strict timeout, response size and content-type limits, valid JWKS parsing, singleflight refresh, old-cache retention on failure, and audit records.
@@ -74,7 +74,7 @@ This list tracks what is still left to harden or complete after the current Phas
 - TODO: Wire Rig embedding integration for both memory and RAG paths, and document the exact Rig embedding API/version assumptions.
 - TODO: Implement RAG vector, keyword, and hybrid retrieval with collection/document/version filters, diversity controls, required-retrieval behavior, and provenance.
 - TODO: Populate response `citations` from retrieved context source provenance when retrieval is used, while keeping exact spans absent unless supported by the source.
-- TODO: Document MVP scope clearly so conversation, explicit memory, and RAG endpoints are advertised as persistence/configuration primitives until retrieval, chunking, embeddings, context injection, and citations are wired end to end.
+- TODO: Document MVP scope clearly so conversation, explicit memory, and RAG endpoints are advertised as persistence/configuration primitives until retrieval, chunking, embeddings, context injection, and citations are wired end to end. (Descoped for MVP: plans/02a-mvp-boundary-honesty.md makes the current no-op behavior honest in the API contract; full implementation remains tracked here for plans/11-rag-memory-intelligence.md.)
 - TODO: Add response-time conversation history loading and tokenizer-aware context budgeting; return `context_length_exceeded` when required content cannot fit.
 - TODO: Add conversation export packaging and deletion propagation for derived memories, vectors, context plans, retrieval runs, and response conversation links.
 - TODO: Enforce optimistic concurrency, `If-Match`, and idempotency consistently for Phase 5 public and admin create/update/ingest operations.
