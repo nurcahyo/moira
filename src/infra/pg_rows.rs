@@ -13,8 +13,8 @@ use crate::{
         ProviderConfig, ProviderKind, ProviderModelRecord, ProviderModelRuntimeConfig,
         ProviderRecord, ProviderRuntimePolicyRecord, ProviderType, PublicResponseRecord,
         PublicResponseStatus, PublicUsageSummary, RagCollectionRecord, RagCollectionStatus,
-        RagCollectionVisibility, RagDocumentRecord, RagDocumentStatus, ResourceStatus,
-        ResponsePersistenceMode, RetrievalPolicyRecord, RouteDefinitionRecord,
+        RagCollectionVisibility, RagDocumentRecord, RagDocumentStatus, RagIngestionStatus,
+        ResourceStatus, ResponsePersistenceMode, RetrievalPolicyRecord, RouteDefinitionRecord,
         RouteSelectionStrategy, RoutingPolicyRecord, RuntimePolicyStatus, ScopeType,
         TrustedJwtIssuerRecord,
     },
@@ -637,6 +637,10 @@ pub fn rag_document_record_from_row(
         mime_type: row.try_get("mime_type")?,
         status: rag_document_status_from_db(row.try_get::<String, _>("status")?)?,
         current_version_id: row.try_get("current_version_id")?,
+        ingestion_status: row
+            .try_get::<Option<String>, _>("ingestion_status")?
+            .map(rag_ingestion_status_from_db)
+            .transpose()?,
         metadata: row.try_get("metadata")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
@@ -1088,6 +1092,35 @@ pub fn rag_document_status_to_db(value: RagDocumentStatus) -> &'static str {
     }
 }
 
+pub fn rag_ingestion_status_from_db(value: String) -> Result<RagIngestionStatus, AppError> {
+    match value.as_str() {
+        "pending" => Ok(RagIngestionStatus::Pending),
+        "downloading" => Ok(RagIngestionStatus::Downloading),
+        "parsing" => Ok(RagIngestionStatus::Parsing),
+        "chunking" => Ok(RagIngestionStatus::Chunking),
+        "embedding" => Ok(RagIngestionStatus::Embedding),
+        "indexed" => Ok(RagIngestionStatus::Indexed),
+        "failed" => Ok(RagIngestionStatus::Failed),
+        "superseded" => Ok(RagIngestionStatus::Superseded),
+        _ => Err(AppError::Internal(format!(
+            "unknown rag ingestion status {value}"
+        ))),
+    }
+}
+
+pub fn rag_ingestion_status_to_db(value: RagIngestionStatus) -> &'static str {
+    match value {
+        RagIngestionStatus::Pending => "pending",
+        RagIngestionStatus::Downloading => "downloading",
+        RagIngestionStatus::Parsing => "parsing",
+        RagIngestionStatus::Chunking => "chunking",
+        RagIngestionStatus::Embedding => "embedding",
+        RagIngestionStatus::Indexed => "indexed",
+        RagIngestionStatus::Failed => "failed",
+        RagIngestionStatus::Superseded => "superseded",
+    }
+}
+
 pub fn execution_failure_class_from_db(value: String) -> Result<ExecutionFailureClass, AppError> {
     match value.as_str() {
         "invalid_execution_request" => Ok(ExecutionFailureClass::InvalidExecutionRequest),
@@ -1273,5 +1306,51 @@ fn credential_scope_from_parts(
             application_id,
             external_tenant_id,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rag_ingestion_status_round_trips_all_eight_variants() {
+        // These strings must match the DB CHECK constraint on
+        // rag_document_versions.ingestion_status exactly (verified against
+        // migrations/0007_conversations_memory_rag.sql:382-383):
+        // 'pending','downloading','parsing','chunking','embedding','indexed',
+        // 'failed','superseded'.
+        let cases = [
+            (RagIngestionStatus::Pending, "pending"),
+            (RagIngestionStatus::Downloading, "downloading"),
+            (RagIngestionStatus::Parsing, "parsing"),
+            (RagIngestionStatus::Chunking, "chunking"),
+            (RagIngestionStatus::Embedding, "embedding"),
+            (RagIngestionStatus::Indexed, "indexed"),
+            (RagIngestionStatus::Failed, "failed"),
+            (RagIngestionStatus::Superseded, "superseded"),
+        ];
+
+        for (variant, db_value) in cases {
+            assert_eq!(
+                rag_ingestion_status_to_db(variant),
+                db_value,
+                "unexpected DB literal for {variant:?}"
+            );
+            assert_eq!(
+                rag_ingestion_status_from_db(db_value.to_string()).unwrap(),
+                variant,
+                "unexpected variant parsed from {db_value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rag_ingestion_status_from_db_rejects_unknown_value() {
+        let result = rag_ingestion_status_from_db("indexing-in-progress".to_string());
+        assert!(
+            result.is_err(),
+            "an out-of-vocabulary DB string must error, not silently default"
+        );
     }
 }
