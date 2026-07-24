@@ -990,8 +990,9 @@ impl ConversationService {
     }
 
     async fn ensure_memory_write(&self, actor: &Actor, memory_id: &str) -> Result<(), AppError> {
+        let privileged = matches!(actor.actor_type, ActorType::SystemKey | ActorType::DevAdmin);
         self.repo
-            .find_memory_authorized(memory_id, &conversation_access(actor, false)?)
+            .find_memory_authorized(memory_id, &conversation_access(actor, privileged)?)
             .await
             .map(|_| ())
     }
@@ -1278,5 +1279,13 @@ mod tests {
         let access = conversation_access(&trusted_jwt, false).unwrap();
         assert_eq!(access.application_id, Some(application_id));
         assert!(!access.privileged);
+
+        let system = Actor {
+            actor_type: ActorType::SystemKey,
+            ..Actor::default()
+        };
+        let access = conversation_access(&system, true).unwrap();
+        assert_eq!(access.application_id, None);
+        assert!(access.privileged);
     }
 }

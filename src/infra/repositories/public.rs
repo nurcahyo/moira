@@ -521,15 +521,16 @@ impl PgPublicRepository {
         access: &PublicAccess,
         query: &ExecutionQuery,
     ) -> Result<Vec<PublicExecutionSummary>, AppError> {
-        let rows = sqlx::query(&execution_summary_sql(
-            r#"
+        let rows = sqlx::query(&format!(
+            "{}\norder by r.created_at desc, r.id desc\nlimit $5",
+            execution_summary_sql(
+                r#"
             where ($1::boolean
                    or (($2::uuid is null or r.application_id = $2)
                        and ($3::text is null or r.external_tenant_id = $3)
                        and ($4::text is null or r.external_user_id = $4)))
-            order by r.created_at desc, r.id desc
-            limit $5
-            "#,
+            "#
+            )
         ))
         .bind(access.privileged)
         .bind(access.application_id)

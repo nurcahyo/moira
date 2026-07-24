@@ -345,6 +345,22 @@ async fn application_bound_actor_cannot_read_another_app_public_resources() {
             .await
             .is_err()
     );
+    let executions = public
+        .list_executions(&actor, &ExecutionQuery::default())
+        .await
+        .expect("list application executions");
+    assert!(
+        executions
+            .data
+            .iter()
+            .any(|item| item.execution_id == format!("exec_{}", own.execution_id))
+    );
+    assert!(
+        !executions
+            .data
+            .iter()
+            .any(|item| item.execution_id == format!("exec_{}", other.execution_id))
+    );
 
     let usage = public
         .list_usage(&actor, &request_context(), &UsageQuery::default())
