@@ -340,7 +340,7 @@ Both layers are mandatory (`CONVENTIONS.md` §3): a unit layer beside the code w
 
 ### E2E / integration (under `tests/`, real PostgreSQL 16 + pgvector, `tests/support/mod.rs` harness)
 
-Every file below follows the existing fail-closed pattern (`tests/support/mod.rs:430-437`: `panic!` when `CI` is set and `MOIRA_TEST_DATABASE_URL` is absent) so none can silently skip in CI. All of them run inside the existing `cargo test --workspace --all-features` step (`.github/workflows/ci.yml:49`) — **no new CI job is required**, which is what makes "the gate is a test" the simplest correct shape here.
+Every file below follows the existing fail-closed pattern (`tests/support/mod.rs:430-437`: `panic!` when **`CI=true`** and `MOIRA_TEST_DATABASE_URL` is absent (value check per `CONVENTIONS.md` §3 — never `var_os("CI").is_some()`)) so none can silently skip in CI. All of them run inside the existing `cargo test --workspace --all-features` step (`.github/workflows/ci.yml:49`) — **no new CI job is required**, which is what makes "the gate is a test" the simplest correct shape here.
 
 **`tests/openapi_drift.rs`** (new — the CI OpenAPI-drift gate, P1-10a):
 - `served_openapi_document_matches_committed_docs_openapi_json` — drive `GET /openapi.json` through the real router (not `MoiraApiDoc::openapi()` directly — see Re-audit corrections; the served document is the one that went through `finalize_document` and the route registrations), parse both sides into `serde_json::Value`, and assert structural equality so key ordering cannot cause false failures.
