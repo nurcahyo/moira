@@ -1,0 +1,4 @@
+interface:
+  display_name: "Moira Rig Tools"
+  short_description: "Define and execute Rig tools inside Moira"
+  default_prompt: "Use $moira-rig-tools to implement the rig-core 0.40 Tool trait, assemble tool sets, wire tool definitions into CompletionRequest, drive the tool loop, and map tool failures into Moira's error model."

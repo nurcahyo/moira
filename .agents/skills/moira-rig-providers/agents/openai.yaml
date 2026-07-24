@@ -1,0 +1,4 @@
+interface:
+  display_name: "Moira Rig Providers"
+  short_description: "Build and configure Rig provider clients in Moira"
+  default_prompt: "Use $moira-rig-providers to construct or change a Rig provider client in Moira's RuntimeFactory, apply the correct base URL, credential, and Azure endpoint rules, and add a new provider variant end to end."

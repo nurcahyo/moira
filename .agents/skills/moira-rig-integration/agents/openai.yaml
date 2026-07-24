@@ -1,0 +1,4 @@
+interface:
+  display_name: "Moira Rig Integration"
+  short_description: "Entry point for all Rig work in Moira"
+  default_prompt: "Use $moira-rig-integration to enforce the Moira/Rig boundary, verify rig-core 0.40 APIs against the vendored crate, and route to the right Rig sub-skill."

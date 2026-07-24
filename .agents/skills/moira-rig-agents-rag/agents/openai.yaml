@@ -1,0 +1,4 @@
+interface:
+  display_name: "Moira Rig Agents and RAG"
+  short_description: "Agents, extractors, embeddings, and RAG in Moira"
+  default_prompt: "Use $moira-rig-agents-rag to decide whether an Agent, Extractor, embedding, or vector-store abstraction belongs in Moira, and to wire AgentBuilder, structured output, pgvector retrieval, and RAG correctly against rig-core 0.40."
