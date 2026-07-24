@@ -35,7 +35,6 @@ This list tracks what is still left to harden or complete after the current Phas
 - TODO: Use provider health snapshots and circuit state as first-class candidate filters and ranking inputs, not only static active configuration.
 - TODO: Add durable or cross-instance strategy notes for concurrency limits and circuit breakers; the current controls are in-memory per process.
 - TODO: Complete pricing and cost normalization so `usage_records.estimated_total_cost` is populated when model pricing is configured.
-- TODO: Add provider/runtime integration tests with deterministic test doubles for retries, fallback, timeout, cancellation, circuit open, credential failure, and malformed provider responses.
 - TODO: Extend the total execution deadline across slow routing, credential resolution, runtime construction, and terminal persistence without abandoning active-attempt cleanup.
 - TODO: Add structured-output execution tests that verify schema mapping, provider behavior, and `StructuredOutputInvalid` classification.
 - TODO: Add runtime-cache tests for invalidation, TTL expiry, provider/runtime-policy changes, and stale-handle cleanup.
@@ -43,8 +42,7 @@ This list tracks what is still left to harden or complete after the current Phas
 
 ## Phase 4: Public Responses API And SSE
 
-- TODO: Add regression coverage proving public SSE emits provider deltas live instead of replaying collected events after execution completes.
-- TODO: Add database-backed stream lifecycle tests proving stalled readers and disconnects release permits and leave no attempt `started` or response `in_progress`.
+- TODO: Add a database-backed public SSE test for a connected client that stops reading without disconnecting, proving bounded send timeout releases permits and leaves no attempt `started` or response `in_progress`.
 - TODO: Record non-streaming client disconnect/cancellation audit events reliably.
 - TODO: Implement response persistence modes beyond metadata-only, including encrypted content storage, retrieval, retention, and cleanup semantics.
 - TODO: Add retention cleanup for expired `responses` and idempotency records.
@@ -109,8 +107,6 @@ This list tracks what is still left to harden or complete after the current Phas
 
 ## Cross-Phase Verification
 
-- TODO: Run clean PostgreSQL migration validation in CI against `pgvector/pgvector:pg16`.
-- TODO: Set `MOIRA_TEST_DATABASE_URL` in CI so the database-backed migration contract test runs instead of being skipped.
 - TODO: Add OpenAPI generation validation in CI.
 - TODO: Add secret-leak snapshot tests for HTTP responses, OpenAPI schemas, audit metadata, and logs.
 - TODO: Add prompt/content-leak snapshot tests for conversation messages, memories, RAG documents, vector records, retrieval diagnostics, HTTP responses, audit metadata, and logs.

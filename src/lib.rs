@@ -25,7 +25,11 @@ use tower_http::{
     trace::TraceLayer,
 };
 
-use crate::{app::AppState, config::CorsSettings, error::AppError};
+use crate::{
+    app::AppState,
+    config::CorsSettings,
+    error::{AppError, REQUEST_ID},
+};
 
 pub fn build_router(state: AppState) -> Result<Router, AppError> {
     let metrics_state = state.clone();
@@ -37,6 +41,7 @@ pub fn build_router(state: AppState) -> Result<Router, AppError> {
         .layer(middleware::from_fn(secure_response_headers))
         .layer(DefaultBodyLimit::max(512 * 1024))
         .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn(request_id_context))
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));
 
@@ -45,6 +50,15 @@ pub fn build_router(state: AppState) -> Result<Router, AppError> {
     }
 
     Ok(router.with_state(state))
+}
+
+async fn request_id_context(req: Request<Body>, next: Next) -> Response {
+    let request_id = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    REQUEST_ID.scope(request_id, next.run(req)).await
 }
 
 fn cors_layer(settings: &CorsSettings) -> Result<Option<CorsLayer>, AppError> {
