@@ -17,9 +17,9 @@ use crate::{
     app::AppState,
     domain::{
         AuditResult, ConversationStatus, CredentialType, MemoryStatus, MemoryType,
-        RagCollectionStatus, ScopeType,
+        RagCollectionStatus, ResponseText, ScopeType,
     },
-    error::{AppError, ErrorResponse},
+    error::{AppError, ErrorDetail, ErrorResponse},
 };
 
 #[derive(OpenApi)]
@@ -33,8 +33,11 @@ use crate::{
         AuditResult,
         ConversationStatus,
         CredentialType,
+        ErrorDetail,
+        ErrorResponse,
         MemoryStatus,
         MemoryType,
+        ResponseText,
         RagCollectionStatus,
         ScopeType
     )),
@@ -51,7 +54,6 @@ use crate::{
         (name = "conversations", description = "Public conversations"),
         (name = "conversation-messages", description = "Conversation messages"),
         (name = "memories", description = "Explicit memory"),
-        (name = "admin-setup", description = "Deployment setup readiness"),
         (name = "admin-applications", description = "Application administration"),
         (name = "admin-policies", description = "Application policy administration"),
         (name = "admin-providers", description = "Provider administration"),

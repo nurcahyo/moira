@@ -89,10 +89,7 @@ Run the API:
 cargo run
 ```
 
-Development applies migrations during startup by default. Production requires
-`MOIRA_DATABASE__MIGRATE_ON_STARTUP=false`; run `cargo run -- migrate` as a
-controlled release step before starting the API. The default listener is
-`http://127.0.0.1:8080`.
+When a database URL is configured, Moira applies migrations during startup. The default listener is `http://127.0.0.1:8080`.
 
 Smoke-check the process:
 
@@ -122,6 +119,7 @@ The generated operations include:
 - JSON, SSE, Prometheus, and HTML content types
 - bearer JWT, `X-Moira-System-Key`, and `X-Consumer-Key` security alternatives
 - once-only API-key secret envelopes without exposing stored hashes or encrypted credential material
+- keyed user-facing API messages with English fallbacks for curl, Postman, and UI translation layers
 
 Admin paths are filtered from the public document by default. To request the complete document, enable admin exposure and authenticate with a caller authorized for `moira:admin`:
 
@@ -158,10 +156,7 @@ Minimal administrative setup:
 15. Optionally enable memory policy before using explicit `/api/v1/memories`
 ```
 
-Run `cargo run -- migrate` before production bootstrap or deployment. Development
-commands may migrate on startup when `database.migrate_on_startup` is enabled.
-The bootstrap command prints the raw system key once; store it in your secret
-manager and send it as `X-Moira-System-Key` for admin API calls.
+`cargo run` and the bootstrap command both apply migrations when the database is configured. The bootstrap command prints the raw system key once; save it in your secret manager or current shell and send it as `X-Moira-System-Key` for admin API calls.
 
 ## Runtime Verification
 
@@ -187,3 +182,5 @@ cargo test security_foundation_migration_creates_contract_tables_when_configured
 ```
 
 See [docs/conversations.md](docs/conversations.md), [docs/conversation-api.md](docs/conversation-api.md), [docs/conversation-persistence.md](docs/conversation-persistence.md), [docs/context-planning.md](docs/context-planning.md), [docs/conversation-summarization.md](docs/conversation-summarization.md), [docs/memory-architecture.md](docs/memory-architecture.md), [docs/memory-policy.md](docs/memory-policy.md), [docs/memory-consent.md](docs/memory-consent.md), [docs/memory-extraction.md](docs/memory-extraction.md), [docs/memory-retrieval.md](docs/memory-retrieval.md), [docs/memory-correction-and-deletion.md](docs/memory-correction-and-deletion.md), [docs/rag-architecture.md](docs/rag-architecture.md), [docs/rag-collections.md](docs/rag-collections.md), [docs/document-ingestion.md](docs/document-ingestion.md), [docs/document-chunking.md](docs/document-chunking.md), [docs/embeddings.md](docs/embeddings.md), [docs/pgvector.md](docs/pgvector.md), [docs/retrieval-ranking.md](docs/retrieval-ranking.md), [docs/retrieval-citations.md](docs/retrieval-citations.md), [docs/rag-security.md](docs/rag-security.md), [docs/conversation-memory-rag-api.md](docs/conversation-memory-rag-api.md), [docs/data-retention-and-deletion.md](docs/data-retention-and-deletion.md), [docs/public-api.md](docs/public-api.md), [docs/responses-api.md](docs/responses-api.md), [docs/streaming-api.md](docs/streaming-api.md), [docs/public-authentication.md](docs/public-authentication.md), [docs/public-authorization.md](docs/public-authorization.md), [docs/idempotency.md](docs/idempotency.md), [docs/response-persistence.md](docs/response-persistence.md), [docs/execution-and-usage-api.md](docs/execution-and-usage-api.md), [docs/model-and-route-discovery.md](docs/model-and-route-discovery.md), [docs/openai-compatibility.md](docs/openai-compatibility.md), [docs/admin-api.md](docs/admin-api.md), [docs/application-management.md](docs/application-management.md), [docs/provider-management.md](docs/provider-management.md), [docs/provider-credential-management.md](docs/provider-credential-management.md), [docs/jwt-issuer-management.md](docs/jwt-issuer-management.md), [docs/system-and-consumer-keys.md](docs/system-and-consumer-keys.md), [docs/audit-api.md](docs/audit-api.md), [docs/runtime-architecture.md](docs/runtime-architecture.md), [docs/rig-integration.md](docs/rig-integration.md), [docs/task-routing.md](docs/task-routing.md), [docs/model-routing.md](docs/model-routing.md), [docs/credential-resolution-runtime.md](docs/credential-resolution-runtime.md), [docs/provider-runtime-factory.md](docs/provider-runtime-factory.md), [docs/provider-pools.md](docs/provider-pools.md), [docs/concurrency-and-backpressure.md](docs/concurrency-and-backpressure.md), [docs/retry-and-fallback.md](docs/retry-and-fallback.md), [docs/circuit-breakers.md](docs/circuit-breakers.md), [docs/runtime-events.md](docs/runtime-events.md), [docs/execution-attempts-and-usage.md](docs/execution-attempts-and-usage.md), [docs/runtime-diagnostics.md](docs/runtime-diagnostics.md), [docs/runtime-cache-invalidation.md](docs/runtime-cache-invalidation.md), [docs/deployment.md](docs/deployment.md), [docs/kubernetes.md](docs/kubernetes.md), [docs/redis.md](docs/redis.md), [docs/otel.md](docs/otel.md), [docs/prometheus.md](docs/prometheus.md), [docs/grafana.md](docs/grafana.md), [docs/production-checklist.md](docs/production-checklist.md), [docs/security.md](docs/security.md), [docs/disaster-recovery.md](docs/disaster-recovery.md), [docs/scaling.md](docs/scaling.md), [docs/load-testing.md](docs/load-testing.md), [docs/chaos-testing.md](docs/chaos-testing.md), [docs/enterprise-operations.md](docs/enterprise-operations.md), [docs/todo.md](docs/todo.md), and [docs/openapi.md](docs/openapi.md). See [docs/project-structure.md](docs/project-structure.md) for module boundaries and agent guidance.
+
+For the response localization contract, see [docs/i18n-response-contract.md](docs/i18n-response-contract.md) and the runtime registry at [src/i18n/catalog/](src/i18n/catalog/). The directory index lives in [src/i18n/catalog/mod.rs](/Users/nalhide/Project/motrait/moira/src/i18n/catalog/mod.rs), with error translations in [src/i18n/catalog/errors.rs](/Users/nalhide/Project/motrait/moira/src/i18n/catalog/errors.rs) and notice translations in [src/i18n/catalog/notices.rs](/Users/nalhide/Project/motrait/moira/src/i18n/catalog/notices.rs). The docs copy lives at [docs/i18n-response-catalog.json](docs/i18n-response-catalog.json).
