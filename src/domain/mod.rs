@@ -1,5 +1,6 @@
 mod admin;
 mod conversation;
+mod i18n;
 mod ids;
 mod models;
 mod public;
@@ -32,6 +33,7 @@ pub use conversation::{
     RagIngestionStatus, ResponseConversationInput, RetrievalPolicyPutRequest,
     RetrievalPolicyRecord,
 };
+pub use i18n::{ResponseText, ResponseTextArgs};
 pub use ids::{
     AgentProfileId, ApplicationId, ApplicationSlug, AttemptId, AuditEventId, ConsumerKeyId,
     ExecutionId, ExternalApplicationId, ExternalTenantId, ExternalUserId, ProviderCredentialId,
@@ -56,12 +58,12 @@ pub use runtime::{
     AgentProfileCreateRequest, AgentProfilePatchRequest, AgentProfileRecord, AttemptStatus,
     CallerRuntimeIdentity, CredentialDecision, CredentialDecisionSource,
     DiagnosticExecutionRequest, DiagnosticExecutionResponse, EffectiveExecutionPolicy,
-    ExecutionCommand, ExecutionFailure, ExecutionFailureClass, ExecutionOptions, ExecutionOutcome,
-    ExecutionStatus, ExecutionStreamHandle, ModelCandidate, ModelDecision, ModelSelectionReason,
-    ProviderAttemptSummary, ProviderModelRuntimeConfig, ProviderRuntimePolicyPutRequest,
-    ProviderRuntimePolicyRecord, ResolvedCredential, ResolvedProviderConfiguration, RouteDecision,
-    RouteDefinitionCreateRequest, RouteDefinitionPatchRequest, RouteDefinitionRecord,
-    RouteSelectionReason, RouteSelectionStrategy, RoutingPolicyCreateRequest,
-    RoutingPolicyPatchRequest, RoutingPolicyRecord, RuntimeEventEnvelope, RuntimeEventType,
-    RuntimePolicyStatus, UsageSummary,
+    ExecutionCommand, ExecutionFailure, ExecutionFailureClass, ExecutionStreamHandle,
+    ExecutionOptions, ExecutionOutcome, ExecutionStatus, ModelCandidate, ModelDecision,
+    ModelSelectionReason, ProviderAttemptSummary, ProviderModelRuntimeConfig,
+    ProviderRuntimePolicyPutRequest, ProviderRuntimePolicyRecord, ResolvedCredential,
+    ResolvedProviderConfiguration, RouteDecision, RouteDefinitionCreateRequest,
+    RouteDefinitionPatchRequest, RouteDefinitionRecord, RouteSelectionReason,
+    RouteSelectionStrategy, RoutingPolicyCreateRequest, RoutingPolicyPatchRequest,
+    RoutingPolicyRecord, RuntimeEventEnvelope, RuntimeEventType, RuntimePolicyStatus, UsageSummary,
 };

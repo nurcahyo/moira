@@ -1,0 +1,64 @@
+//! Moira i18n catalog index.
+//!
+//! Directory guide:
+//! - `README.md` explains the layout for agents and contributors.
+//! - `errors.rs` owns `moira.error.*` entries.
+//! - `notices.rs` owns `moira.notice.*` entries.
+//! - `mod.rs` provides lookups and catalog-level validation.
+//!
+//! Keep the docs mirror in `docs/i18n-response-catalog.json` synchronized with this code.
+
+mod errors;
+mod notices;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct I18nEntry {
+    pub key: &'static str,
+    pub default_message: &'static str,
+    pub description: &'static str,
+}
+
+pub use errors::RESPONSE_ERROR_CATALOG;
+pub use notices::RESPONSE_NOTICE_CATALOG;
+
+pub fn all_entries() -> impl Iterator<Item = &'static I18nEntry> {
+    RESPONSE_ERROR_CATALOG
+        .iter()
+        .chain(RESPONSE_NOTICE_CATALOG.iter())
+}
+
+pub fn is_known_key(key: &str) -> bool {
+    all_entries().any(|entry| entry.key == key)
+}
+
+pub fn default_message_for_key(key: &str) -> Option<&'static str> {
+    all_entries()
+        .find(|entry| entry.key == key)
+        .map(|entry| entry.default_message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_catalog_keys_are_unique() {
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in all_entries() {
+            assert!(seen.insert(entry.key), "duplicate key: {}", entry.key);
+        }
+    }
+
+    #[test]
+    fn default_messages_can_be_resolved() {
+        assert_eq!(
+            default_message_for_key("moira.error.bad_request"),
+            Some("The request could not be processed.")
+        );
+        assert_eq!(
+            default_message_for_key("moira.notice.response_completed"),
+            Some("The response completed successfully.")
+        );
+        assert_eq!(default_message_for_key("moira.error.unknown"), None);
+    }
+}
