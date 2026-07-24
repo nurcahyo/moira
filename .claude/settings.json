@@ -1,0 +1,8 @@
+{
+  "enabledPlugins": {
+    "github@claude-plugins-official": true,
+    "cicd-automation@claude-code-workflows": true,
+    "rust-analyzer-lsp@claude-plugins-official": true,
+    "qdrant-skills@claude-plugins-official": true
+  }
+}
