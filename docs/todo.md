@@ -43,6 +43,7 @@ This list tracks what is still left to harden or complete after the current Phas
 ## Phase 4: Public Responses API And SSE
 
 - TODO: Add a database-backed public SSE test for a connected client that stops reading without disconnecting, proving bounded send timeout releases permits and leaves no attempt `started` or response `in_progress`.
+- TODO: Replace scheduling-delay-based post-delta provider failure tests with explicit producer/consumer acknowledgement gates.
 - TODO: Record non-streaming client disconnect/cancellation audit events reliably.
 - TODO: Implement response persistence modes beyond metadata-only, including encrypted content storage, retrieval, retention, and cleanup semantics.
 - TODO: Add retention cleanup for expired `responses` and idempotency records.
@@ -112,6 +113,8 @@ This list tracks what is still left to harden or complete after the current Phas
 - TODO: Add prompt/content-leak snapshot tests for conversation messages, memories, RAG documents, vector records, retrieval diagnostics, HTTP responses, audit metadata, and logs.
 - TODO: Add concurrency tests for simultaneous credential rotations, key rotations, idempotent creates, public response creation, conversation message appends, memory updates, and RAG ingestion.
 - TODO: Add documented manual smoke tests for bootstrap system key, admin setup, route/model configuration, credential setup, internal execution, public response creation, streaming, conversation attach, explicit memory, and direct-text RAG ingestion.
+- TODO: Isolate database-backed integration test binaries or add deterministic teardown so repeated local runs cannot accumulate routing, issuer, credential, or application fixtures.
+- TODO: Support migration-contract validation in restricted CI databases that cannot create and forcibly drop temporary databases.
 
 ## Not TODO For Phases 1-6
 

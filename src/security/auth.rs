@@ -205,15 +205,7 @@ impl AuthService {
         }
 
         if self.caller_settings.dev_trust_headers {
-            let actor = Actor {
-                actor_type: ActorType::TrustedJwt,
-                subject: header_string(headers, "x-moira-user-id"),
-                tenant_id: header_string(headers, "x-moira-tenant-id"),
-                application_id: header_string(headers, "x-moira-application-id"),
-                external_user_id: header_string(headers, "x-moira-user-id"),
-                external_tenant_id: header_string(headers, "x-moira-tenant-id"),
-                ..Actor::default()
-            };
+            let actor = actor_from_trusted_headers(headers)?;
             if actor.subject.is_some()
                 || actor.tenant_id.is_some()
                 || actor.application_id.is_some()
@@ -464,15 +456,7 @@ impl CallerAuthenticator {
 
     pub async fn identify(&self, headers: &HeaderMap) -> Result<Actor, AppError> {
         if self.settings.dev_trust_headers {
-            let actor = Actor {
-                actor_type: ActorType::TrustedJwt,
-                subject: header_string(headers, "x-moira-user-id"),
-                tenant_id: header_string(headers, "x-moira-tenant-id"),
-                application_id: header_string(headers, "x-moira-application-id"),
-                external_user_id: header_string(headers, "x-moira-user-id"),
-                external_tenant_id: header_string(headers, "x-moira-tenant-id"),
-                ..Actor::default()
-            };
+            let actor = actor_from_trusted_headers(headers)?;
             if actor.subject.is_some()
                 || actor.tenant_id.is_some()
                 || actor.application_id.is_some()
@@ -537,10 +521,10 @@ async fn validate_static_jwt(
     let claims = decode::<StaticClaims>(token, &key, &validation)
         .map_err(|err| AppError::Unauthorized(err.to_string()))?
         .claims;
-    Ok(actor_from_static_claims(claims))
+    actor_from_static_claims(claims)
 }
 
-fn actor_from_static_claims(claims: StaticClaims) -> Actor {
+fn actor_from_static_claims(claims: StaticClaims) -> Result<Actor, AppError> {
     let mut scopes = Vec::new();
     if let Some(scope) = claims.scope {
         scopes.extend(scope.split_whitespace().map(ToOwned::to_owned));
@@ -549,17 +533,23 @@ fn actor_from_static_claims(claims: StaticClaims) -> Actor {
         scopes.extend(scp);
     }
 
-    Actor {
+    let subject = claims.sub.ok_or_else(|| {
+        AppError::Unauthorized("trusted JWT subject claim is required".to_string())
+    })?;
+    let internal_application_id = parse_application_id(claims.application_id.as_deref())?;
+
+    Ok(Actor {
         actor_type: ActorType::TrustedJwt,
-        subject: claims.sub.clone(),
+        subject: Some(subject.clone()),
         tenant_id: claims.tenant_id.clone(),
         application_id: claims.application_id.clone(),
-        external_user_id: claims.sub,
+        external_user_id: Some(subject),
         external_tenant_id: claims.tenant_id,
+        internal_application_id,
         roles: claims.roles.unwrap_or_default(),
         scopes,
         ..Actor::default()
-    }
+    })
 }
 
 fn actor_from_trusted_claims(
@@ -576,20 +566,26 @@ fn actor_from_trusted_claims(
     scopes.sort();
     scopes.dedup();
 
-    let subject = claim_string(&claims, &issuer.subject_claim);
+    let subject = claim_string(&claims, &issuer.subject_claim).ok_or_else(|| {
+        AppError::Unauthorized(format!(
+            "trusted JWT subject claim '{}' is required",
+            issuer.subject_claim
+        ))
+    })?;
     let external_user_id = issuer
         .user_id_claim
         .as_deref()
         .and_then(|claim| claim_string(&claims, claim))
-        .or_else(|| subject.clone());
+        .or_else(|| Some(subject.clone()));
     let external_tenant_id = issuer
         .tenant_id_claim
         .as_deref()
         .and_then(|claim| claim_string(&claims, claim));
-    let application_id = issuer
-        .application_id_claim
-        .as_deref()
-        .and_then(|claim| claim_string(&claims, claim));
+    let application_id = match issuer.application_id_claim.as_deref() {
+        Some(claim_name) => application_id_claim(&claims, claim_name)?,
+        None => None,
+    };
+    let internal_application_id = parse_application_id(application_id.as_deref())?;
     let delegated_user = issuer
         .delegated_user_claim
         .as_deref()
@@ -617,20 +613,58 @@ fn actor_from_trusted_claims(
 
     Ok(Actor {
         actor_type: ActorType::TrustedJwt,
-        subject,
+        subject: Some(subject),
         tenant_id: delegated_tenant.clone().or(external_tenant_id.clone()),
         application_id: application_id.clone(),
         external_user_id: delegated_user.clone().or(external_user_id),
         external_tenant_id: delegated_tenant.or(external_tenant_id),
-        internal_application_id: application_id
-            .as_deref()
-            .and_then(|value| Uuid::parse_str(value).ok()),
+        internal_application_id,
         delegated_subject: delegated_user,
         roles,
         scopes,
         trusted_jwt_issuer_id: Some(issuer.id),
         api_key_id: None,
     })
+}
+
+fn actor_from_trusted_headers(headers: &HeaderMap) -> Result<Actor, AppError> {
+    let subject = header_string(headers, "x-moira-user-id");
+    let tenant_id = header_string(headers, "x-moira-tenant-id");
+    let application_id = header_string(headers, "x-moira-application-id");
+    let internal_application_id = parse_application_id(application_id.as_deref())?;
+
+    Ok(Actor {
+        actor_type: ActorType::TrustedJwt,
+        subject: subject.clone(),
+        tenant_id: tenant_id.clone(),
+        application_id,
+        external_user_id: subject,
+        external_tenant_id: tenant_id,
+        internal_application_id,
+        ..Actor::default()
+    })
+}
+
+fn parse_application_id(value: Option<&str>) -> Result<Option<Uuid>, AppError> {
+    value
+        .map(|value| {
+            Uuid::parse_str(value).map_err(|_| {
+                AppError::Unauthorized(
+                    "trusted JWT application identifier must be a valid UUID".to_string(),
+                )
+            })
+        })
+        .transpose()
+}
+
+fn application_id_claim(claims: &Value, claim_name: &str) -> Result<Option<String>, AppError> {
+    match claims.get(claim_name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if !value.is_empty() => Ok(Some(value.clone())),
+        Some(_) => Err(AppError::Unauthorized(
+            "trusted JWT application identifier must be a non-empty UUID string".to_string(),
+        )),
+    }
 }
 
 fn combine_consumer_and_jwt(consumer: Actor, jwt: Actor) -> Result<Actor, AppError> {
@@ -792,19 +826,124 @@ mod tests {
 
     #[test]
     fn actor_claims_merge_scope_formats() {
+        let application_id = Uuid::now_v7();
+        let application_id_text = application_id.to_string();
         let actor = actor_from_static_claims(StaticClaims {
             sub: Some("user-1".to_string()),
             tenant_id: Some("tenant-1".to_string()),
-            application_id: Some("app-1".to_string()),
+            application_id: Some(application_id_text.clone()),
             roles: Some(vec!["admin".to_string()]),
             scope: Some("read write".to_string()),
             scp: Some(vec!["moira.admin".to_string()]),
-        });
+        })
+        .unwrap();
 
         assert_eq!(actor.subject.as_deref(), Some("user-1"));
         assert_eq!(actor.tenant_id.as_deref(), Some("tenant-1"));
-        assert_eq!(actor.application_id.as_deref(), Some("app-1"));
+        assert_eq!(
+            actor.application_id.as_deref(),
+            Some(application_id_text.as_str())
+        );
+        assert_eq!(actor.internal_application_id, Some(application_id));
         assert_eq!(actor.scopes, vec!["read", "write", "moira.admin"]);
+    }
+
+    #[test]
+    fn static_claims_reject_malformed_application_identifier() {
+        let result = actor_from_static_claims(StaticClaims {
+            sub: None,
+            tenant_id: None,
+            application_id: Some("not-a-uuid".to_string()),
+            roles: None,
+            scope: None,
+            scp: None,
+        });
+
+        assert!(matches!(result, Err(AppError::Unauthorized(_))));
+    }
+
+    #[test]
+    fn static_claims_require_subject() {
+        let result = actor_from_static_claims(StaticClaims {
+            sub: None,
+            tenant_id: None,
+            application_id: Some(Uuid::now_v7().to_string()),
+            roles: None,
+            scope: None,
+            scp: None,
+        });
+
+        assert!(matches!(result, Err(AppError::Unauthorized(_))));
+    }
+
+    fn trusted_issuer_with_application_claim() -> TrustedIssuerConfig {
+        TrustedIssuerConfig {
+            id: Uuid::now_v7(),
+            issuer: "https://issuer.example".to_string(),
+            jwks_url: "https://issuer.example/jwks".to_string(),
+            expected_audiences: Vec::new(),
+            allowed_algorithms: vec!["RS256".to_string()],
+            subject_claim: "sub".to_string(),
+            user_id_claim: None,
+            tenant_id_claim: None,
+            application_id_claim: Some("application_id".to_string()),
+            roles_claim: None,
+            scopes_claim: Some("scope".to_string()),
+            delegated_user_claim: None,
+            delegated_tenant_claim: None,
+            clock_skew_seconds: 60,
+            allow_delegation: false,
+        }
+    }
+
+    #[test]
+    fn trusted_issuer_claims_reject_malformed_application_identifier() {
+        let issuer = trusted_issuer_with_application_claim();
+        let result = actor_from_trusted_claims(
+            &issuer,
+            json!({
+                "sub": "user-1",
+                "application_id": "not-a-uuid"
+            }),
+        );
+
+        assert!(matches!(result, Err(AppError::Unauthorized(_))));
+    }
+
+    #[test]
+    fn trusted_issuer_claims_reject_non_string_application_identifier() {
+        let issuer = trusted_issuer_with_application_claim();
+        let result = actor_from_trusted_claims(
+            &issuer,
+            json!({
+                "sub": "user-1",
+                "application_id": 42
+            }),
+        );
+
+        assert!(matches!(result, Err(AppError::Unauthorized(_))));
+    }
+
+    #[test]
+    fn trusted_issuer_claims_require_configured_subject() {
+        let issuer = trusted_issuer_with_application_claim();
+        let result = actor_from_trusted_claims(
+            &issuer,
+            json!({
+                "application_id": Uuid::now_v7().to_string()
+            }),
+        );
+
+        assert!(matches!(result, Err(AppError::Unauthorized(_))));
+    }
+
+    #[test]
+    fn trusted_issuer_claims_allow_missing_application_for_admin_authentication() {
+        let issuer = trusted_issuer_with_application_claim();
+        let actor = actor_from_trusted_claims(&issuer, json!({ "sub": "admin-1" })).unwrap();
+
+        assert_eq!(actor.actor_type, ActorType::TrustedJwt);
+        assert_eq!(actor.internal_application_id, None);
     }
 
     #[test]

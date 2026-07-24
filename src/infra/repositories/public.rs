@@ -521,15 +521,16 @@ impl PgPublicRepository {
         access: &PublicAccess,
         query: &ExecutionQuery,
     ) -> Result<Vec<PublicExecutionSummary>, AppError> {
-        let rows = sqlx::query(&execution_summary_sql(
-            r#"
+        let rows = sqlx::query(&format!(
+            "{}\norder by r.created_at desc, r.id desc\nlimit $5",
+            execution_summary_sql(
+                r#"
             where ($1::boolean
                    or (($2::uuid is null or r.application_id = $2)
                        and ($3::text is null or r.external_tenant_id = $3)
                        and ($4::text is null or r.external_user_id = $4)))
-            order by r.created_at desc, r.id desc
-            limit $5
-            "#,
+            "#
+            )
         ))
         .bind(access.privileged)
         .bind(access.application_id)
@@ -609,8 +610,9 @@ impl PgPublicRepository {
               and p.status = 'active'
               and p.deleted_at is null
               and ($1::boolean
-                   or (($2::uuid is null or rp.application_id is null or rp.application_id = $2)
-                       and ($3::text is null or rp.external_tenant_id is null or rp.external_tenant_id = $3)))
+                   or ((rp.application_id is null or rp.application_id = $2)
+                       and (rp.external_tenant_id is null
+                            or ($3::text is not null and rp.external_tenant_id = $3))))
             order by pm.id, rp.priority asc, rp.weight desc
             limit $4
             "#,
@@ -643,8 +645,9 @@ impl PgPublicRepository {
               and p.status = 'active'
               and p.deleted_at is null
               and ($2::boolean
-                   or (($3::uuid is null or rp.application_id is null or rp.application_id = $3)
-                       and ($4::text is null or rp.external_tenant_id is null or rp.external_tenant_id = $4)))
+                   or ((rp.application_id is null or rp.application_id = $3)
+                       and (rp.external_tenant_id is null
+                            or ($4::text is not null and rp.external_tenant_id = $4))))
             order by rp.priority asc, rp.weight desc, pm.id asc
             limit 1
             "#,
@@ -677,9 +680,10 @@ impl PgPublicRepository {
             where rd.status = 'active'
               and rd.deleted_at is null
               and ($1::boolean
-                   or rp.id is null
-                   or (($2::uuid is null or rp.application_id is null or rp.application_id = $2)
-                       and ($3::text is null or rp.external_tenant_id is null or rp.external_tenant_id = $3)))
+                   or (rp.id is not null
+                       and (rp.application_id is null or rp.application_id = $2)
+                       and (rp.external_tenant_id is null
+                            or ($3::text is not null and rp.external_tenant_id = $3))))
             group by rd.id, rd.route_key, rd.display_name, rd.description
             order by rd.route_key asc
             limit $4

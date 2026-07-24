@@ -109,7 +109,8 @@ impl PublicExecutionService {
         request: PublicResponseRequest,
     ) -> Result<PublicResponse, AppError> {
         self.state.authz.require(actor, "moira:responses:create")?;
-        let application_id = effective_application_id(actor);
+        let access = public_access(actor, false)?;
+        let application_id = access.application_id;
         let policy = self.execution_policy(application_id).await?;
         if !policy.responses_enabled {
             return Err(AppError::coded(
@@ -118,7 +119,6 @@ impl PublicExecutionService {
                 "responses are disabled for this application",
             ));
         }
-        let access = public_access(actor, false);
         self.check_rate_limit(actor, application_id, policy.rate_limit_requests_per_minute)
             .await?;
 
@@ -260,11 +260,6 @@ impl PublicExecutionService {
             }
         }?;
 
-        if !access.privileged {
-            // Keep the access calculation live in the create path; this guards future
-            // mapper expansions from accidentally dropping application isolation.
-            let _ = access.application_id;
-        }
         Ok(mapped)
     }
 
@@ -282,7 +277,7 @@ impl PublicExecutionService {
             ));
         }
         self.state.authz.require(&actor, "moira:responses:stream")?;
-        let application_id = effective_application_id(&actor);
+        let application_id = public_access(&actor, false)?.application_id;
         let policy = self.execution_policy(application_id).await?;
         if !policy.streaming_enabled {
             return Err(AppError::coded(
@@ -677,15 +672,13 @@ impl PublicExecutionService {
         response_id: Uuid,
     ) -> Result<PublicResponse, AppError> {
         self.state.authz.require(actor, "moira:responses:read")?;
+        let access = public_access(
+            actor,
+            can_read_all(actor, "moira:responses:read", &self.state),
+        )?;
         let record = self
             .public_repo
-            .find_response_authorized(
-                response_id,
-                &public_access(
-                    actor,
-                    can_read_all(actor, "moira:responses:read", &self.state),
-                ),
-            )
+            .find_response_authorized(response_id, &access)
             .await?;
         self.audit(
             actor,
@@ -706,15 +699,13 @@ impl PublicExecutionService {
         execution_id: Uuid,
     ) -> Result<PublicExecutionSummary, AppError> {
         self.state.authz.require(actor, "moira:executions:read")?;
+        let access = public_access(
+            actor,
+            can_read_all(actor, "moira:executions:read", &self.state),
+        )?;
         let record = self
             .public_repo
-            .find_execution_authorized(
-                execution_id,
-                &public_access(
-                    actor,
-                    can_read_all(actor, "moira:executions:read", &self.state),
-                ),
-            )
+            .find_execution_authorized(execution_id, &access)
             .await?;
         self.audit(
             actor,
@@ -734,14 +725,12 @@ impl PublicExecutionService {
         query: &ExecutionQuery,
     ) -> Result<ListResponse<PublicExecutionSummary>, AppError> {
         self.state.authz.require(actor, "moira:executions:read")?;
+        let access = public_access(
+            actor,
+            can_read_all(actor, "moira:executions:read", &self.state),
+        )?;
         self.public_repo
-            .list_executions_authorized(
-                &public_access(
-                    actor,
-                    can_read_all(actor, "moira:executions:read", &self.state),
-                ),
-                query,
-            )
+            .list_executions_authorized(&access, query)
             .await
             .map(ListResponse::new)
     }
@@ -753,12 +742,10 @@ impl PublicExecutionService {
         query: &UsageQuery,
     ) -> Result<ListResponse<PublicUsageRecord>, AppError> {
         self.state.authz.require(actor, "moira:usage:read")?;
+        let access = public_access(actor, can_read_all(actor, "moira:usage:read", &self.state))?;
         let records = self
             .public_repo
-            .list_usage_authorized(
-                &public_access(actor, can_read_all(actor, "moira:usage:read", &self.state)),
-                query,
-            )
+            .list_usage_authorized(&access, query)
             .await?;
         self.audit(
             actor,
@@ -777,8 +764,9 @@ impl PublicExecutionService {
         actor: &Actor,
     ) -> Result<ListResponse<PublicModelResource>, AppError> {
         self.state.authz.require(actor, "moira:models:read")?;
+        let access = public_access(actor, false)?;
         self.public_repo
-            .list_visible_models(&public_access(actor, false), 200)
+            .list_visible_models(&access, 200)
             .await
             .map(ListResponse::new)
     }
@@ -788,8 +776,9 @@ impl PublicExecutionService {
         actor: &Actor,
     ) -> Result<ListResponse<PublicRouteResource>, AppError> {
         self.state.authz.require(actor, "moira:routes:read")?;
+        let access = public_access(actor, false)?;
         self.public_repo
-            .list_visible_routes(&public_access(actor, false), 200)
+            .list_visible_routes(&access, 200)
             .await
             .map(ListResponse::new)
     }
@@ -797,7 +786,7 @@ impl PublicExecutionService {
     pub async fn capabilities(&self, actor: &Actor) -> Result<PublicCapabilities, AppError> {
         self.state.authz.require(actor, "moira:capabilities:read")?;
         let policy = self
-            .execution_policy(effective_application_id(actor))
+            .execution_policy(public_access(actor, false)?.application_id)
             .await?;
         Ok(PublicCapabilities {
             streaming: policy.streaming_enabled,
@@ -914,7 +903,7 @@ impl PublicExecutionService {
         stream: bool,
     ) -> Result<PreparedExecution, AppError> {
         validate_request(&self.state, actor, &request, &policy, stream)?;
-        let access = public_access(actor, false);
+        let access = public_access(actor, false)?;
         let model_hint = match request.model.take() {
             Some(model) => Some(resolve_model_hint(&self.public_repo, &access, &model).await?),
             None => None,
@@ -1812,13 +1801,25 @@ async fn send_public_event(
     }
 }
 
-fn public_access(actor: &Actor, privileged: bool) -> PublicAccess {
-    PublicAccess {
+fn public_access(actor: &Actor, privileged: bool) -> Result<PublicAccess, AppError> {
+    let application_id = effective_application_id(actor);
+    if matches!(
+        actor.actor_type,
+        ActorType::ConsumerKey | ActorType::TrustedJwt
+    ) && !privileged
+        && application_id.is_none()
+    {
+        return Err(AppError::Forbidden(
+            "application-bound caller identity is required for public access".to_string(),
+        ));
+    }
+
+    Ok(PublicAccess {
         privileged,
-        application_id: effective_application_id(actor),
+        application_id,
         external_tenant_id: actor.external_tenant_id.clone().or(actor.tenant_id.clone()),
         external_user_id: actor.external_user_id.clone(),
-    }
+    })
 }
 
 fn can_read_all(actor: &Actor, scope: &str, state: &AppState) -> bool {
@@ -1827,12 +1828,7 @@ fn can_read_all(actor: &Actor, scope: &str, state: &AppState) -> bool {
 }
 
 fn effective_application_id(actor: &Actor) -> Option<Uuid> {
-    actor.internal_application_id.or_else(|| {
-        actor
-            .application_id
-            .as_deref()
-            .and_then(|value| Uuid::parse_str(value).ok())
-    })
+    actor.internal_application_id
 }
 
 fn caller_runtime_identity(actor: &Actor) -> CallerRuntimeIdentity {
@@ -2001,6 +1997,56 @@ mod tests {
         let state = AppState::new(crate::config::Settings::default(), None).unwrap();
         let metadata = json!({ "api_key": "sk-test" });
         assert!(validate_metadata(&state, &metadata).is_err());
+    }
+
+    #[test]
+    fn unbound_trusted_jwt_cannot_receive_public_access() {
+        let actor = Actor {
+            actor_type: ActorType::TrustedJwt,
+            scopes: vec!["moira:responses:read".to_string()],
+            ..Actor::default()
+        };
+
+        assert!(matches!(
+            public_access(&actor, false),
+            Err(AppError::Forbidden(_))
+        ));
+    }
+
+    #[test]
+    fn unbound_consumer_key_cannot_receive_public_access() {
+        let actor = Actor {
+            actor_type: ActorType::ConsumerKey,
+            scopes: vec!["moira:responses:read".to_string()],
+            ..Actor::default()
+        };
+
+        assert!(matches!(
+            public_access(&actor, false),
+            Err(AppError::Forbidden(_))
+        ));
+    }
+
+    #[test]
+    fn consumer_and_privileged_actor_access_semantics_are_preserved() {
+        let application_id = Uuid::now_v7();
+        let consumer = Actor {
+            actor_type: ActorType::ConsumerKey,
+            internal_application_id: Some(application_id),
+            ..Actor::default()
+        };
+        let system = Actor {
+            actor_type: ActorType::SystemKey,
+            ..Actor::default()
+        };
+
+        let consumer_access = public_access(&consumer, false).unwrap();
+        assert!(!consumer_access.privileged);
+        assert_eq!(consumer_access.application_id, Some(application_id));
+
+        let privileged_access = public_access(&system, true).unwrap();
+        assert!(privileged_access.privileged);
+        assert_eq!(privileged_access.application_id, None);
     }
 
     #[test]

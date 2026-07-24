@@ -129,7 +129,7 @@ impl ConversationService {
                 &conversation_access(
                     actor,
                     can_read_all(actor, "moira:conversations:read", &self.state),
-                ),
+                )?,
                 query,
             )
             .await
@@ -152,7 +152,7 @@ impl ConversationService {
                 &conversation_access(
                     actor,
                     can_read_all(actor, "moira:conversations:read", &self.state),
-                ),
+                )?,
             )
             .await?;
         self.audit(
@@ -250,7 +250,7 @@ impl ConversationService {
                 &conversation_access(
                     actor,
                     can_read_all(actor, "moira:conversations:read", &self.state),
-                ),
+                )?,
             )
             .await?;
         self.repo
@@ -501,7 +501,7 @@ impl ConversationService {
                 &conversation_access(
                     actor,
                     can_read_all(actor, "moira:memories:read", &self.state),
-                ),
+                )?,
                 query,
             )
             .await
@@ -520,7 +520,7 @@ impl ConversationService {
                 &conversation_access(
                     actor,
                     can_read_all(actor, "moira:memories:read", &self.state),
-                ),
+                )?,
             )
             .await
     }
@@ -533,7 +533,7 @@ impl ConversationService {
         request: MemoryPatchRequest,
     ) -> Result<MemoryRecord, AppError> {
         self.state.authz.require(actor, "moira:memories:write")?;
-        self.get_memory(actor, memory_id).await?;
+        self.ensure_memory_write(actor, memory_id).await?;
         if let Some(content) = &request.content {
             validate_content(content)?;
         }
@@ -571,7 +571,7 @@ impl ConversationService {
         memory_id: &str,
     ) -> Result<(), AppError> {
         self.state.authz.require(actor, "moira:memories:delete")?;
-        self.get_memory(actor, memory_id).await?;
+        self.ensure_memory_write(actor, memory_id).await?;
         self.repo.delete_memory(memory_id).await?;
         self.audit(
             actor,
@@ -984,7 +984,15 @@ impl ConversationService {
         conversation_id: &str,
     ) -> Result<(), AppError> {
         self.repo
-            .find_conversation_authorized(conversation_id, &conversation_access(actor, false))
+            .find_conversation_authorized(conversation_id, &conversation_access(actor, false)?)
+            .await
+            .map(|_| ())
+    }
+
+    async fn ensure_memory_write(&self, actor: &Actor, memory_id: &str) -> Result<(), AppError> {
+        let privileged = matches!(actor.actor_type, ActorType::SystemKey | ActorType::DevAdmin);
+        self.repo
+            .find_memory_authorized(memory_id, &conversation_access(actor, privileged)?)
             .await
             .map(|_| ())
     }
@@ -1029,18 +1037,30 @@ fn required_application_id(actor: &Actor) -> Result<Uuid, AppError> {
     })
 }
 
-pub fn conversation_access(actor: &Actor, privileged: bool) -> ConversationAccess {
-    ConversationAccess {
+pub fn conversation_access(
+    actor: &Actor,
+    privileged: bool,
+) -> Result<ConversationAccess, AppError> {
+    if matches!(
+        actor.actor_type,
+        ActorType::ConsumerKey | ActorType::TrustedJwt
+    ) && actor.internal_application_id.is_none()
+    {
+        return Err(AppError::Forbidden(
+            "application-bound caller identity is required for context access".to_string(),
+        ));
+    }
+
+    Ok(ConversationAccess {
         privileged,
         application_id: actor.internal_application_id,
         external_tenant_id: effective_tenant(actor),
         external_user_id: effective_user(actor),
-    }
+    })
 }
 
 fn can_read_all(actor: &Actor, scope: &str, state: &AppState) -> bool {
-    actor.actor_type != ActorType::ConsumerKey
-        && actor.internal_application_id.is_none()
+    matches!(actor.actor_type, ActorType::SystemKey | ActorType::DevAdmin)
         && state.authz.has_scope(actor, scope)
 }
 
@@ -1207,5 +1227,65 @@ mod tests {
     fn metadata_rejects_secret_like_keys() {
         assert!(validate_metadata(&json!({ "token": "hidden" })).is_err());
         assert!(validate_metadata(&json!({ "ticket": "MOIRA-5" })).is_ok());
+    }
+
+    #[test]
+    fn only_system_and_development_admin_actors_can_read_all_context() {
+        let state = AppState::new(crate::config::Settings::default(), None).unwrap();
+        for actor_type in [ActorType::SystemKey, ActorType::DevAdmin] {
+            let actor = Actor {
+                actor_type,
+                scopes: vec!["moira:conversations:read".to_string()],
+                ..Actor::default()
+            };
+            assert!(can_read_all(&actor, "moira:conversations:read", &state));
+        }
+
+        let trusted_jwt = Actor {
+            actor_type: ActorType::TrustedJwt,
+            scopes: vec![
+                "moira:conversations:read".to_string(),
+                "moira:memories:read".to_string(),
+            ],
+            ..Actor::default()
+        };
+        assert!(!can_read_all(
+            &trusted_jwt,
+            "moira:conversations:read",
+            &state
+        ));
+        assert!(!can_read_all(&trusted_jwt, "moira:memories:read", &state));
+    }
+
+    #[test]
+    fn context_access_requires_consumer_and_trusted_jwt_application_binding() {
+        for actor_type in [ActorType::ConsumerKey, ActorType::TrustedJwt] {
+            let actor = Actor {
+                actor_type,
+                ..Actor::default()
+            };
+            assert!(matches!(
+                conversation_access(&actor, false),
+                Err(AppError::Forbidden(_))
+            ));
+        }
+
+        let application_id = Uuid::now_v7();
+        let trusted_jwt = Actor {
+            actor_type: ActorType::TrustedJwt,
+            internal_application_id: Some(application_id),
+            ..Actor::default()
+        };
+        let access = conversation_access(&trusted_jwt, false).unwrap();
+        assert_eq!(access.application_id, Some(application_id));
+        assert!(!access.privileged);
+
+        let system = Actor {
+            actor_type: ActorType::SystemKey,
+            ..Actor::default()
+        };
+        let access = conversation_access(&system, true).unwrap();
+        assert_eq!(access.application_id, None);
+        assert!(access.privileged);
     }
 }
