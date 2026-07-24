@@ -14,6 +14,7 @@ use moira::{
     security::{Actor, ActorType, request_hash},
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use tokio::{
     sync::{Barrier, Mutex, MutexGuard},
@@ -37,6 +38,7 @@ struct Fixture {
 struct HttpResult {
     status: StatusCode,
     body: Value,
+    etag: Option<String>,
 }
 
 impl Fixture {
@@ -193,6 +195,11 @@ async fn post(
     .expect("HTTP request timed out")
     .expect("HTTP response");
     let status = response.status();
+    let etag = response
+        .headers()
+        .get("etag")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let bytes = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("response body");
@@ -201,7 +208,7 @@ async fn post(
     } else {
         serde_json::from_slice(&bytes).expect("JSON response")
     };
-    HttpResult { status, body }
+    HttpResult { status, body, etag }
 }
 
 fn id(value: &Value) -> Uuid {
@@ -216,6 +223,22 @@ fn key_resource_id(value: &Value) -> Uuid {
 fn assert_error(result: &HttpResult, status: StatusCode, code: &str) {
     assert_eq!(result.status, status, "unexpected body: {}", result.body);
     assert_eq!(result.body["error"]["code"], code);
+}
+
+fn assert_replayed_error(first: &HttpResult, replay: &HttpResult) {
+    assert_eq!(first.status, replay.status);
+    let mut first_error = first.body["error"].clone();
+    let mut replay_error = replay.body["error"].clone();
+    let first_request_id = first_error
+        .as_object_mut()
+        .and_then(|error| error.remove("request_id"))
+        .expect("first error request ID");
+    let replay_request_id = replay_error
+        .as_object_mut()
+        .and_then(|error| error.remove("request_id"))
+        .expect("replayed error request ID");
+    assert_ne!(first_request_id, replay_request_id);
+    assert_eq!(first_error, replay_error);
 }
 
 #[tokio::test]
@@ -631,6 +654,66 @@ async fn command_hash_covers_request_path_and_version_while_scope_covers_actor_a
 }
 
 #[tokio::test]
+async fn trusted_actor_fingerprint_isolates_issuer_and_application_identity() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let service = AdminService::new(&fixture.state).expect("admin service");
+    let key = fixture.key("trusted-identity");
+    let first_application = fixture.create_application("trusted-first", None).await;
+    let second_application = fixture.create_application("trusted-second", None).await;
+    let request = ProviderCreateRequest {
+        provider_type: ProviderType::OpenAiCompatible,
+        display_name: format!("Trusted identity {}", fixture.suffix),
+        base_url: None,
+        metadata: json!({}),
+    };
+    let issuer_id = Uuid::now_v7();
+    let first = Actor {
+        actor_type: ActorType::TrustedJwt,
+        subject: Some("shared-subject".to_string()),
+        trusted_jwt_issuer_id: Some(issuer_id),
+        internal_application_id: Some(id(&first_application.body)),
+        scopes: vec!["moira:admin".to_string()],
+        ..Actor::default()
+    };
+    let second = Actor {
+        trusted_jwt_issuer_id: Some(Uuid::now_v7()),
+        ..first.clone()
+    };
+    let third = Actor {
+        internal_application_id: Some(id(&second_application.body)),
+        ..first.clone()
+    };
+
+    let first_record = service
+        .create_provider(&first, &context(&key), request.clone())
+        .await
+        .expect("first trusted actor command");
+    let second_record = service
+        .create_provider(&second, &context(&key), request.clone())
+        .await
+        .expect("different issuer command");
+    let third_record = service
+        .create_provider(&third, &context(&key), request)
+        .await
+        .expect("different application command");
+
+    assert_ne!(first_record.id, second_record.id);
+    assert_ne!(first_record.id, third_record.id);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from idempotency_records where operation = 'provider.create' and idempotency_key_hash = $1",
+        )
+        .bind(request_hash(key.as_bytes()))
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("trusted actor ledger count"),
+        3
+    );
+}
+
+#[tokio::test]
 async fn expired_record_is_reclaimed_and_deterministic_failure_is_replayed() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -673,14 +756,7 @@ async fn expired_record_is_reclaimed_and_deterministic_failure_is_replayed() {
         .await;
     assert_error(&first_failure, StatusCode::BAD_REQUEST, "bad_request");
     assert_error(&replayed_failure, StatusCode::BAD_REQUEST, "bad_request");
-    assert_eq!(
-        first_failure.body["error"]["message_key"],
-        replayed_failure.body["error"]["message_key"]
-    );
-    assert_ne!(
-        first_failure.body["error"]["request_id"],
-        replayed_failure.body["error"]["request_id"]
-    );
+    assert_replayed_error(&first_failure, &replayed_failure);
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "select count(*) from idempotency_records where operation = 'application.create' and idempotency_key_hash = $1 and response_status = 400 and resource_id is null",
@@ -691,6 +767,101 @@ async fn expired_record_is_reclaimed_and_deterministic_failure_is_replayed() {
         .expect("cached deterministic failure"),
         1
     );
+
+    let invalid_scope_key = fixture.key("invalid-scope");
+    let invalid_scope = json!({
+        "display_name": "Invalid scope",
+        "scopes": ["moira:not-a-real-scope"],
+        "expires_at": null
+    });
+    let first_scope_failure = fixture
+        .post(
+            "/api/v1/admin/system-keys",
+            Some(&invalid_scope_key),
+            None,
+            invalid_scope.clone(),
+        )
+        .await;
+    let replayed_scope_failure = fixture
+        .post(
+            "/api/v1/admin/system-keys",
+            Some(&invalid_scope_key),
+            None,
+            invalid_scope,
+        )
+        .await;
+    assert_error(
+        &first_scope_failure,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "scope_invalid",
+    );
+    assert_replayed_error(&first_scope_failure, &replayed_scope_failure);
+}
+
+#[tokio::test]
+async fn advisory_lock_timeout_is_transient_and_does_not_mutate_or_cache() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let seed_key = fixture.key("lock-seed");
+    let seed = fixture
+        .create_application("lock-seed", Some(&seed_key))
+        .await;
+    assert_eq!(seed.status, StatusCode::CREATED);
+    let actor_fingerprint = sqlx::query_scalar::<_, String>(
+        "select actor_fingerprint from idempotency_records where operation = 'application.create' and idempotency_key_hash = $1",
+    )
+    .bind(request_hash(seed_key.as_bytes()))
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("seed actor fingerprint");
+
+    let key = fixture.key("lock-timeout");
+    let lock_key = advisory_lock_key(
+        &request_hash(key.as_bytes()),
+        &actor_fingerprint,
+        "application.create",
+    );
+    let mut lock_connection = fixture.pool.acquire().await.expect("lock connection");
+    sqlx::query("select pg_advisory_lock($1)")
+        .bind(lock_key)
+        .execute(&mut *lock_connection)
+        .await
+        .expect("hold idempotency advisory lock");
+
+    let slug = format!("lock-timeout-{}", fixture.suffix);
+    let result = timeout(
+        Duration::from_secs(7),
+        fixture.post(
+            "/api/v1/admin/applications",
+            Some(&key),
+            None,
+            json!({
+                "application_slug": slug,
+                "display_name": format!("Lock timeout {}", fixture.suffix),
+                "metadata": {}
+            }),
+        ),
+    )
+    .await
+    .expect("idempotency lock timeout response");
+    sqlx::query("select pg_advisory_unlock($1)")
+        .bind(lock_key)
+        .execute(&mut *lock_connection)
+        .await
+        .expect("release idempotency advisory lock");
+
+    assert_error(&result, StatusCode::CONFLICT, "idempotency_in_progress");
+    assert_eq!(
+        fixture
+            .count(
+                "select count(*) from applications where application_slug = $1",
+                &format!("lock-timeout-{}", fixture.suffix),
+            )
+            .await,
+        0
+    );
+    assert_eq!(fixture.ledger_count("application.create", &key).await, 0);
 }
 
 #[tokio::test]
@@ -717,9 +888,22 @@ async fn audit_failure_and_request_cancellation_roll_back_mutation_and_ledger() 
     let failed = request_with_id(
         fixture.router.clone(),
         "/api/v1/admin/applications",
-        &failed_key,
+        Some(&failed_key),
         &marker,
         failed_body,
+    )
+    .await;
+    let no_key_slug = format!("audit-failure-no-key-{}", fixture.suffix);
+    let no_key_failed = request_with_id(
+        fixture.router.clone(),
+        "/api/v1/admin/applications",
+        None,
+        &marker,
+        json!({
+            "application_slug": no_key_slug,
+            "display_name": format!("Audit failure no key {}", fixture.suffix),
+            "metadata": {}
+        }),
     )
     .await;
     let cleanup =
@@ -729,11 +913,21 @@ async fn audit_failure_and_request_cancellation_roll_back_mutation_and_ledger() 
         .await
         .expect("remove audit failure trigger");
     assert_eq!(failed.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(no_key_failed.status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(
         fixture
             .count(
                 "select count(*) from applications where application_slug = $1",
                 &format!("audit-failure-{}", fixture.suffix),
+            )
+            .await,
+        0
+    );
+    assert_eq!(
+        fixture
+            .count(
+                "select count(*) from applications where application_slug = $1",
+                &format!("audit-failure-no-key-{}", fixture.suffix),
             )
             .await,
         0
@@ -831,16 +1025,32 @@ async fn credential_rotation_enforces_if_match_atomically() {
     let path = format!("/api/v1/admin/provider-credentials/{credential_id}/rotate");
     let key = fixture.key("credential-version");
     let body = json!({"secret": {"api_key": format!("next-{}", fixture.suffix)}});
-    let rotated = fixture
-        .post(&path, Some(&key), Some(version), body.clone())
-        .await;
+    let barrier = std::sync::Arc::new(Barrier::new(3));
+    let first = spawn_post(
+        fixture.router.clone(),
+        barrier.clone(),
+        path.clone(),
+        key.clone(),
+        Some(version),
+        body.clone(),
+    );
+    let second = spawn_post(
+        fixture.router.clone(),
+        barrier.clone(),
+        path.clone(),
+        key.clone(),
+        Some(version),
+        body.clone(),
+    );
+    barrier.wait().await;
+    let rotated = first.await.expect("first credential rotation");
+    let replay = second.await.expect("second credential rotation");
     assert_eq!(rotated.status, StatusCode::OK);
-    assert_eq!(rotated.body["version"], version + 1);
-    let replay = fixture
-        .post(&path, Some(&key), Some(version), body.clone())
-        .await;
     assert_eq!(replay.status, StatusCode::OK);
+    assert_eq!(rotated.body["version"], version + 1);
     assert_eq!(replay.body["version"], version + 1);
+    assert_eq!(rotated.etag, Some(format!("\"{}\"", version + 1)));
+    assert_eq!(replay.etag, rotated.etag);
     let changed_precondition = fixture
         .post(&path, Some(&key), Some(version + 1), body)
         .await;
@@ -859,6 +1069,40 @@ async fn credential_rotation_enforces_if_match_atomically() {
         )
         .await;
     assert_error(&stale, StatusCode::CONFLICT, "resource_version_conflict");
+    let stale_replay = fixture
+        .post(
+            &path,
+            Some(&fixture.key("credential-stale")),
+            Some(version),
+            json!({"secret": {"api_key": "stale-must-not-apply"}}),
+        )
+        .await;
+    assert_error(
+        &stale_replay,
+        StatusCode::CONFLICT,
+        "resource_version_conflict",
+    );
+    assert_replayed_error(&stale, &stale_replay);
+
+    let missing_path = format!(
+        "/api/v1/admin/provider-credentials/{}/rotate",
+        Uuid::now_v7()
+    );
+    let missing_key = fixture.key("credential-missing");
+    let missing_body = json!({"secret": {"api_key": "missing-credential"}});
+    let missing = fixture
+        .post(
+            &missing_path,
+            Some(&missing_key),
+            Some(1),
+            missing_body.clone(),
+        )
+        .await;
+    let missing_replay = fixture
+        .post(&missing_path, Some(&missing_key), Some(1), missing_body)
+        .await;
+    assert_error(&missing, StatusCode::NOT_FOUND, "not_found");
+    assert_replayed_error(&missing, &missing_replay);
     assert_eq!(
         fixture
             .count(
@@ -953,44 +1197,50 @@ async fn concurrent_key_create_returns_plaintext_to_exactly_one_caller() {
 fn spawn_post(
     router: Router,
     barrier: std::sync::Arc<Barrier>,
-    path: &'static str,
+    path: impl Into<String>,
     key: String,
     if_match: Option<i64>,
     body: Value,
 ) -> JoinHandle<HttpResult> {
+    let path = path.into();
     tokio::spawn(async move {
         barrier.wait().await;
-        post(router, path, Some(&key), if_match, body).await
+        post(router, &path, Some(&key), if_match, body).await
     })
 }
 
 async fn request_with_id(
     router: Router,
     path: &str,
-    key: &str,
+    key: Option<&str>,
     request_id: &str,
     body: Value,
 ) -> HttpResult {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json")
+        .header("x-request-id", request_id);
+    if let Some(key) = key {
+        builder = builder.header("idempotency-key", key);
+    }
     let response = router
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(path)
-                .header("content-type", "application/json")
-                .header("idempotency-key", key)
-                .header("x-request-id", request_id)
-                .body(Body::from(body.to_string()))
-                .expect("request"),
-        )
+        .oneshot(builder.body(Body::from(body.to_string())).expect("request"))
         .await
         .expect("response");
     let status = response.status();
+    let etag = response
+        .headers()
+        .get("etag")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let bytes = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("response body");
     HttpResult {
         status,
         body: serde_json::from_slice(&bytes).expect("error JSON"),
+        etag,
     }
 }
 
@@ -1020,6 +1270,17 @@ fn admin_actor(subject: &str) -> Actor {
         scopes: vec!["moira:admin".to_string()],
         ..Actor::default()
     }
+}
+
+fn advisory_lock_key(key_hash: &str, actor_fingerprint: &str, operation: &str) -> i64 {
+    let mut hasher = Sha256::new();
+    hasher.update(key_hash.as_bytes());
+    hasher.update([0]);
+    hasher.update(actor_fingerprint.as_bytes());
+    hasher.update([0]);
+    hasher.update(operation.as_bytes());
+    let digest = hasher.finalize();
+    i64::from_be_bytes(digest[..8].try_into().expect("SHA-256 prefix"))
 }
 
 fn context(key: &str) -> RequestContext {

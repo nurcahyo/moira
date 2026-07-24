@@ -245,7 +245,7 @@ impl<'a> AdminService<'a> {
             })
             .await?;
         if !outcome.replayed {
-            self.state.runtime_cache.invalidate_all().await;
+            self.schedule_runtime_cache_invalidation();
         }
         Ok(outcome.response)
     }
@@ -382,7 +382,7 @@ impl<'a> AdminService<'a> {
             })
             .await?;
         if !outcome.replayed {
-            self.state.runtime_cache.invalidate_all().await;
+            self.schedule_runtime_cache_invalidation();
         }
         Ok(outcome.response)
     }
@@ -533,17 +533,12 @@ impl<'a> AdminService<'a> {
                             }),
                         ))
                         .await?;
-                    AdminCommandMutation::with_replay_response(
-                        record.clone(),
-                        credential_replay_response(&record)?,
-                        201,
-                        Some(record.id.to_string()),
-                    )
+                    AdminCommandMutation::new(record.clone(), 201, Some(record.id.to_string()))
                 })
             })
             .await?;
         if !outcome.replayed {
-            self.state.runtime_cache.invalidate_all().await;
+            self.schedule_runtime_cache_invalidation();
         }
         Ok(outcome.response)
     }
@@ -679,17 +674,12 @@ impl<'a> AdminService<'a> {
                             json!({}),
                         ))
                         .await?;
-                    AdminCommandMutation::with_replay_response(
-                        record.clone(),
-                        credential_replay_response(&record)?,
-                        200,
-                        Some(record.id.to_string()),
-                    )
+                    AdminCommandMutation::new(record.clone(), 200, Some(record.id.to_string()))
                 })
             })
             .await?;
         if !outcome.replayed {
-            self.state.runtime_cache.invalidate_all().await;
+            self.schedule_runtime_cache_invalidation();
         }
         Ok(outcome.response)
     }
@@ -814,15 +804,9 @@ impl<'a> AdminService<'a> {
         &self,
         actor: &Actor,
         ctx: &RequestContext,
-        mut request: SystemKeyCreateRequest,
+        request: SystemKeyCreateRequest,
     ) -> Result<ApiKeySecretResponse, AppError> {
         self.state.authz.require(actor, "moira:system-keys:write")?;
-        request.scopes = validate_key_request(
-            actor,
-            &self.state.authz,
-            &request.display_name,
-            &request.scopes,
-        )?;
         let spec = admin_command_spec(
             ctx,
             actor,
@@ -832,10 +816,18 @@ impl<'a> AdminService<'a> {
         )?;
         let actor = actor.clone();
         let ctx = ctx.clone();
+        let authz = self.state.authz.clone();
         let key_hasher = self.state.key_hasher.clone();
         let outcome = AdminCommandRunner::new(self.repo.clone())
             .execute(spec, |transaction| {
                 Box::pin(async move {
+                    let mut request = request;
+                    request.scopes = validate_key_request(
+                        &actor,
+                        &authz,
+                        &request.display_name,
+                        &request.scopes,
+                    )?;
                     let generated = key_hasher.generate("moira_sys")?;
                     let record = transaction
                         .create_system_key(
@@ -897,17 +889,11 @@ impl<'a> AdminService<'a> {
         &self,
         actor: &Actor,
         ctx: &RequestContext,
-        mut request: ConsumerKeyCreateRequest,
+        request: ConsumerKeyCreateRequest,
     ) -> Result<ApiKeySecretResponse, AppError> {
         self.state
             .authz
             .require(actor, "moira:consumer-keys:write")?;
-        request.scopes = validate_key_request(
-            actor,
-            &self.state.authz,
-            &request.display_name,
-            &request.scopes,
-        )?;
         let spec = admin_command_spec(
             ctx,
             actor,
@@ -920,10 +906,18 @@ impl<'a> AdminService<'a> {
         )?;
         let actor = actor.clone();
         let ctx = ctx.clone();
+        let authz = self.state.authz.clone();
         let key_hasher = self.state.key_hasher.clone();
         let outcome = AdminCommandRunner::new(self.repo.clone())
             .execute(spec, |transaction| {
                 Box::pin(async move {
+                    let mut request = request;
+                    request.scopes = validate_key_request(
+                        &actor,
+                        &authz,
+                        &request.display_name,
+                        &request.scopes,
+                    )?;
                     require_active_row(
                         transaction,
                         "applications",
@@ -1345,6 +1339,13 @@ impl<'a> AdminService<'a> {
                 .allow_http_provider_urls,
         )
     }
+
+    fn schedule_runtime_cache_invalidation(&self) {
+        let cache = self.state.runtime_cache.clone();
+        std::mem::drop(tokio::spawn(async move {
+            cache.invalidate_all().await;
+        }));
+    }
 }
 
 fn validate_application_identifiers(
@@ -1366,18 +1367,20 @@ fn validate_application_identifiers(
 }
 
 fn actor_fingerprint(actor: &Actor) -> String {
-    secret_fingerprint(
-        format!(
-            "{:?}:{}:{}",
-            actor.actor_type,
-            actor.subject.as_deref().unwrap_or(""),
-            actor
-                .api_key_id
-                .map(|id| id.to_string())
-                .unwrap_or_default()
-        )
-        .as_bytes(),
-    )
+    let identity = serde_json::to_vec(&(
+        actor.actor_type,
+        &actor.subject,
+        actor.api_key_id,
+        actor.trusted_jwt_issuer_id,
+        actor.internal_application_id,
+        &actor.application_id,
+        &actor.tenant_id,
+        &actor.external_user_id,
+        &actor.external_tenant_id,
+        &actor.delegated_subject,
+    ))
+    .expect("actor identity fields are serializable");
+    secret_fingerprint(&identity)
 }
 
 fn admin_command_spec<T: Serialize>(
@@ -1480,33 +1483,6 @@ fn sanitized_key_response(resource: &ApiKeyRecord) -> ApiKeySecretResponse {
         secret: None,
         secret_retrievable: false,
     }
-}
-
-fn credential_replay_response(record: &CredentialRecord) -> Result<Value, AppError> {
-    let mut value = serde_json::to_value(record)
-        .map_err(|error| AppError::Internal(format!("encode credential replay: {error}")))?;
-    let object = value.as_object_mut().ok_or_else(|| {
-        AppError::Internal("credential replay did not encode as an object".to_string())
-    })?;
-    object.insert("scope_type".to_string(), json!(record.scope_type));
-    object.insert(
-        "external_tenant_id".to_string(),
-        json!(record.external_tenant_id),
-    );
-    object.insert("application_id".to_string(), json!(record.application_id));
-    object.insert(
-        "external_user_id".to_string(),
-        json!(record.external_user_id),
-    );
-    object.insert(
-        "encryption_algorithm".to_string(),
-        json!(record.encryption_algorithm),
-    );
-    object.insert(
-        "encryption_version".to_string(),
-        json!(record.encryption_version),
-    );
-    Ok(value)
 }
 
 fn validate_credential_scope(request: &CredentialCreateRequest) -> Result<(), AppError> {
@@ -1695,7 +1671,8 @@ fn validate_key_request(
     }
     let normalized = AuthorizationService::normalize_scopes(scopes)?;
     if !authz.can_grant(actor, &normalized) {
-        return Err(AppError::conflict(
+        return Err(AppError::coded(
+            axum::http::StatusCode::FORBIDDEN,
             "system_key_scope_escalation",
             "principal cannot mint scopes broader than its effective scopes",
         ));
