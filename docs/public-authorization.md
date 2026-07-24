@@ -16,3 +16,8 @@ Override scopes are separate: `moira:execution:override-route`, `moira:execution
 
 Consumer callers are isolated to their bound application and delegated identity. Cross-application resources are hidden or denied.
 
+Only system keys and the development admin actor may use global public read
+privileges. Standalone trusted JWT callers must be bound to one internal
+application UUID. Missing application bindings are denied on public routes, and
+malformed configured application claims fail authentication instead of becoming
+unrestricted access. Conversation and memory reads follow the same rule.
