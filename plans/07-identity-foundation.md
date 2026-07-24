@@ -4,23 +4,24 @@
 
 ## Summary
 
-**Objective.** Give Moira a Moira-native way to grant a **human** admin authority without Moira ever issuing passwords or sessions, and to hold the auth-provider configuration that grant depends on as **runtime, database-backed settings** rather than build-time environment. Concretely: a new `admin_identities` table binding admin scope to a stable `(issuer, subject)` pair from an already-trusted JWT issuer; a `setup_state` singleton for setup-required detection; single-use `admin_setup_tokens`; a new `auth_provider_settings` table holding enabled auth methods with their non-secret config and an **encrypted** client secret; the two frozen setup endpoints (`GET /api/v1/admin/setup/claim-status`, `POST /api/v1/admin/setup/claim`); a scope-gated, `If-Match`-versioned, idempotent auth-settings admin surface; and an additive extension to `src/security/auth.rs`'s Actor mapping so a trusted-JWT caller whose `(issuer, subject)` has a grant resolves to admin scope on every subsequent request.
+**Objective.** Give Moira a Moira-native way to grant a **human** admin authority without Moira ever issuing passwords or sessions, and to hold the auth-provider configuration that grant depends on as **runtime, database-backed settings** rather than build-time environment. Concretely: a new `admin_identities` table binding admin scope to a stable `(issuer, subject)` pair from an already-trusted JWT issuer; a `setup_state` singleton for setup-required detection; single-use `admin_setup_tokens`; a new `auth_provider_settings` table holding enabled auth methods with their **non-secret config only** (decision **D7** — the OAuth client secret is owned by the console, never by Moira); the two frozen setup endpoints (`GET /api/v1/admin/setup/claim-status`, `POST /api/v1/admin/setup/claim`); a scope-gated, `If-Match`-versioned, idempotent auth-settings admin surface; and an additive extension to `src/security/auth.rs`'s Actor mapping so a trusted-JWT caller whose `(issuer, subject)` has a grant resolves to admin scope on every subsequent request.
 
 **Why ordered here.** Per `plans/01` §2/§3, this is a **security-critical iteration that must stay pure** — no unrelated refactors (§1.2). It depends on 03 (auth/credential/middleware hardening — JWKS SSRF protection, unkeyed-hash fix, production middleware) and 05 (observability + OpenAPI-drift gate) per the dependency graph (`I03 --> I07`, `I05 --> I07`), and gates 08 (`I07 --> I08`). 06 is "recommended but not required" — this plan is additive (new services, new repositories, new tables) and does not modify the `AdminService` methods 06 splits.
 
 **Why the auth-settings surface is in this plan and not 08.** CONVENTIONS §7.2 is binding: *auth provider configuration is runtime configuration owned by Moira's database*, consistent with how providers, models, routing, and credentials already work (`docs/project-structure.md`: "Runtime provider config belongs in PostgreSQL"). The setup wizard in 08 **writes** that configuration and the console **reads** it at boot and on invalidation — so the storage, encryption, admin API, and cache-invalidation path must exist in Moira **before** 08 starts. Putting it in 08 would mean either a Next.js iteration shipping a Rust migration and a security-critical encryption path, or auth config living in env vars in violation of §7.2. Neither is acceptable. It stays here, backend-only.
 
-**User-visible outcome.** An operator holding the bootstrap system key (existing `bootstrap-system-key` CLI, `src/main.rs`) can (a) configure which auth methods this deployment offers and with what policy, storing any client secret encrypted, and (b) grant a specific human's `(issuer, subject)` Moira admin scope — exactly once per identity, idempotently, and auditably. An unauthenticated caller can check whether setup is still required (a single boolean, no internal detail). After a grant, that human's future trusted-JWT-authenticated requests resolve to `moira:admin` automatically. No password, session cookie, or login page exists in Moira itself.
+**User-visible outcome.** An operator holding the bootstrap system key (existing `bootstrap-system-key` CLI, `src/main.rs`) can (a) configure which auth methods this deployment offers and with what policy — non-secret configuration only; the OAuth client secret is never sent to Moira (**D7**) — and (b) grant a specific human's `(issuer, subject)` Moira admin scope — exactly once per identity, idempotently, and auditably. An unauthenticated caller can check whether setup is still required (a single boolean, no internal detail). After a grant, that human's future trusted-JWT-authenticated requests resolve to `moira:admin` automatically. No password, session cookie, or login page exists in Moira itself.
 
 **Included scope.** P1-11 in full, plus the CONVENTIONS §7.2 runtime-auth-settings requirement:
 - migration `0009_admin_identity_claims.sql` — `admin_identities`, `setup_state`, `admin_setup_tokens`
-- migration `0010_auth_provider_settings.sql` — `auth_provider_settings` (non-secret config + AES-256-GCM-encrypted client secret + NOTIFY trigger)
+- migration `0010_auth_provider_settings.sql` — `auth_provider_settings` (**non-secret config only**, no secret envelope — decision **D7** — + NOTIFY trigger)
 - `GET /api/v1/admin/setup/claim-status` (unauthenticated) and `POST /api/v1/admin/setup/claim` (system-key **or** one-time-token gated)
-- `GET /api/v1/admin/setup/auth-methods` (setup-actor gated) + the eight `/api/v1/admin/auth/providers…` admin routes
+- `GET /api/v1/admin/setup/auth-methods` (setup-actor gated) + the seven `/api/v1/admin/auth/providers…` admin routes
 - `src/security/auth.rs` Actor-mapping extension; `ActorType::SetupToken`; three new `ADMIN_SCOPES` entries
 - verified-email + **DB-backed, deny-by-default** allowed-domain policy enforced at grant time **on every claim path, with no first-claim exemption and no bootstrap bypass** (resolved decision, 2026-07-25)
 - `email` + `email_verified` **required on both the system-key and setup-token claim paths** (resolved decision, 2026-07-25) — which is what makes the domain policy enforceable everywhere and puts a human-identifiable attribute on every grant
-- `GET /api/v1/admin/setup/auth-methods` **authenticated** (resolved decision, 2026-07-25) — the console calls it server-side; only `claim-status` is anonymous
+- `GET /api/v1/admin/setup/auth-methods` **authenticated** (resolved decision **D4**, 2026-07-25) — the console calls it server-side; only `claim-status` is anonymous
+- **no OAuth client secret anywhere in Moira** (resolved decision **D7**, 2026-07-25) — `auth_provider_settings` stores non-secret config only; the console owns the secret in its own `console_auth` database. Moira exposes `client_id` as the drift-protection anchor the console fingerprints against
 - new `moira.error.*` / `moira.notice.*` catalog entries with tests (CONVENTIONS §4)
 - keeping `bootstrap-system-key` as-is, documented as the break-glass root
 
@@ -31,13 +32,13 @@
 ## Branch & Pull Request (CONVENTIONS §1)
 
 - **Branch:** `plan/07-identity-foundation`, cut from the **current `main`**, after 03 and 05 have merged. If 03 has not merged when work begins, the branch stacks on `plan/03-security-hardening`; in that case the PR description must name the base PR and the branch must be rebased once 03 merges.
-- **Commits:** Conventional Commits (`feat: add admin identity claiming`, `feat: store auth provider settings with encrypted client secrets`, `feat: resolve admin grants for trusted jwt actors`, `test: prove first-login-wins is impossible`, `docs: catalog identity error keys`).
+- **Commits:** Conventional Commits (`feat: add admin identity claiming`, `feat: store non-secret auth provider settings`, `feat: resolve admin grants for trusted jwt actors`, `test: prove first-login-wins is impossible`, `docs: catalog identity error keys`).
 - The PR is **not opened** until every gate in CONVENTIONS §2 / Verification passes locally.
 - **PR description — required sections:**
   - **Plan link** — `plans/07-identity-foundation.md`
   - **Findings addressed** — P1-11 (plus CONVENTIONS §7.2 compliance)
   - **Migrations included** — `migrations/0009_admin_identity_claims.sql`, `migrations/0010_auth_provider_settings.sql`
-  - **Breaking API/OpenAPI changes** — none against any *shipped* surface; **11 new operations added** (enumerate them), all under `/api/v1/admin/`. Must additionally reproduce the ⚠️ **frozen-contract change** callout from Interfaces & Contracts: `ClaimAdminIdentityRequest.email` is now required (`Option<String>` → `String`), `email_verified` loses its serde default, and `AdminIdentityRecord.email` is now `String` — a change against the shape plans 08/09 were drafted against, which the coordinator must propagate before 08 starts.
+  - **Breaking API/OpenAPI changes** — none against any *shipped* surface; **10 new operations added** (enumerate them), all under `/api/v1/admin/`. Must additionally reproduce **both** ⚠️ callouts from Interfaces & Contracts: (i) **changed by D7** — the client secret is gone from Moira entirely, `POST /api/v1/admin/auth/providers/{id}/rotate-secret` does not exist, and the operation count is **10, not 11**; (ii) `ClaimAdminIdentityRequest.email` is now required (`Option<String>` → `String`), `email_verified` loses its serde default, and `AdminIdentityRecord.email` is now `String`. Both are changes against the shape plans 08/09 were drafted against, which the coordinator must propagate before 08 starts.
   - **Test evidence** — unit + e2e output summary (see Verification)
   - **Rollback procedure** — see Risks & Rollback
   - **Deferred follow-ups** — see Risks & Rollback
@@ -70,7 +71,7 @@
 | `migrations/` | `0009_admin_identity_claims.sql` (new) | `admin_identities`, `setup_state`, `admin_setup_tokens` |
 | | `0010_auth_provider_settings.sql` (new) | `auth_provider_settings` + version-bump trigger + NOTIFY trigger |
 | `src/domain/` | `identity.rs` (new) | `SetupClaimStatusResponse`, `ClaimAdminIdentityRequest`, `AdminIdentityRecord`, `AdminIdentityStatus`, `GeneratedSetupTokenResponse` |
-| | `auth_settings.rs` (new) | `AuthProviderSettingsRecord`, `…CreateRequest`, `…PatchRequest`, `RotateAuthProviderSecretRequest`, `AuthMethod`, `SetupAuthMethodsResponse`, `PublicAuthMethod` |
+| | `auth_settings.rs` (new) | `AuthProviderSettingsRecord`, `…CreateRequest`, `…PatchRequest`, `AuthMethod`, `SetupAuthMethodsResponse`, `PublicAuthMethod` |
 | | `mod.rs` | two additive `pub use` blocks |
 | `src/infra/repositories/` | `identity.rs` (new) | `AdminIdentityRepository` trait + `PgAdminIdentityRepository` — **trait from day one**, so this plan needs no P2-3-style retrofit |
 | | `auth_settings.rs` (new) | `AuthProviderSettingsRepository` trait + `PgAuthProviderSettingsRepository` |
@@ -79,11 +80,11 @@
 | | `auth_settings.rs` (new) | `AuthProviderSettingsService` |
 | | `mod.rs` | two additive `mod` + `pub use` lines |
 | `src/http/` | `identity.rs` (new) | `get_setup_claim_status`, `claim_admin_identity` |
-| | `auth_settings.rs` (new) | `get_setup_auth_methods` + eight `/admin/auth/providers…` handlers |
+| | `auth_settings.rs` (new) | `get_setup_auth_methods` + seven `/admin/auth/providers…` handlers |
 | | `mod.rs` | additive `mod` lines + `.routes(routes!(...))` registrations in `documented_router()` (`:21-210`), and extension of the existing spec tests in `mod tests` (`:213`) |
 | `src/security/` | `auth.rs` | **additive only**: `ActorType::SetupToken` variant; `apply_admin_identity_grant`; `verify_system_key_only` |
 | | `authz.rs` | **additive only**: three scopes appended to `ADMIN_SCOPES` (`:8-91`); `SetupToken` handled in the two `ActorType` matches (`:119`, `:146`) |
-| | `crypto.rs` | **additive only**: `AuthProviderSecretAadParts` + `auth_provider_secret_aad` beside the existing `CredentialAadParts`/`credential_aad` (`:84-111`) |
+| | `crypto.rs` | **unchanged.** Decision **D7** removes the client secret from Moira, so no new AAD scheme is added. `CredentialAadParts`/`credential_aad` (`:84-111`) keep governing *provider credentials* (the AI-provider API keys) exactly as today |
 | | `mod.rs` | additive re-exports |
 | `src/app/state.rs` | | additive: `auth_settings_cache` field on `AppState` (`:20-39`) |
 | `src/infra/db.rs` | | additive: `listen_once` invalidates the auth-settings cache. **Cross-plan conflict: plan 06 module 14 also edits `listen_once`** — merge deliberately |
@@ -95,7 +96,7 @@
 
 ### Data flow
 
-1. **Auth configuration (operator, runtime).** Operator (system key, or an already-granted admin's trusted JWT) calls `POST /api/v1/admin/auth/providers` with a method (`google_oauth` / `generic_oidc` / `jwks`), its non-secret config, and — for the OAuth methods — a `client_secret`. The service encrypts the secret with the existing `LocalSecretCipher` (`src/security/crypto.rs:42-82`, AES-256-GCM) under a new, purpose-built AAD, stores only the envelope + fingerprint + mask, and returns a record whose secret fields are **never serialized**. The write fires the `moira_runtime_config` NOTIFY trigger, which invalidates the auth-settings cache on every instance via the existing `LISTEN/NOTIFY` path (`src/infra/db.rs:43-80`).
+1. **Auth configuration (operator, runtime).** Operator (system key, or an already-granted admin's trusted JWT) calls `POST /api/v1/admin/auth/providers` with a method (`google_oauth` / `generic_oidc` / `jwks`) and its **non-secret** config — issuer, discovery/authorization/token/userinfo/JWKS URLs, `client_id`, requested scopes, `allowed_email_domains`, allowed algorithms, audiences, redirect URIs. **No `client_secret` is accepted, on any operation** (decision **D7**): the OAuth client secret is owned by the console and lives in the console's own `console_auth` database; Moira neither stores nor returns it, and the request DTO has no field for it. The write fires the `moira_runtime_config` NOTIFY trigger, which invalidates the auth-settings cache on every instance via the existing `LISTEN/NOTIFY` path (`src/infra/db.rs:43-80`).
 2. **Setup-required check (unauthenticated, safe).** `GET /api/v1/admin/setup/claim-status` → `AdminIdentityService::claim_status()` → reads the single `setup_state` row → returns `{ "claimed": bool }` **only**. No enumeration of who is claimed, no count, no timestamp, no issuer/subject. A boolean is the entire contract, deliberately.
 3. **Bootstrap auth discovery (operator/BFF, authenticated).** `GET /api/v1/admin/setup/auth-methods` → the enabled methods' **non-secret** config, so 08's BFF can configure Better Auth server-side. Gated exactly like the existing structural endpoint (`ActorType::SystemKey` or `TrustedJwt`, plus `moira:setup:read`). **Not unauthenticated** — see Security boundaries.
 4. **Claim, path A — system-key-gated.** Operator calls `POST /api/v1/admin/setup/claim` with `X-Moira-System-Key` (verified against `system_api_keys` by the existing key path) carrying `moira:admin`, plus a body naming the target `(issuer, subject, email, email_verified)`. The service validates the target issuer resolves to an **active, registered** `trusted_jwt_issuers` row (Moira never accepts a free-text issuer at claim time), enforces verified-email + allowed-domain policy, and inserts the grant inside the existing `AdminCommandRunner` envelope.
@@ -107,7 +108,12 @@
 - **Human → BFF (08):** out of scope entirely. Moira never runs an OAuth flow (CONVENTIONS §7.1).
 - **BFF/operator → Moira:** the claim endpoint accepts exactly two credential shapes (system key, one-time setup token) and rejects everything else — **including a bare trusted-JWT bearer token with no prior grant**. This is the structural rejection of "first successful admin JWT wins" that `plans/01` §4.4 requires. It is enforced by an explicit allow-list in the handler (`resolve_claim_credential`), **not** by calling `state.auth.authenticate_admin`, which would happily accept a bearer JWT (`src/security/auth.rs:143-145`).
 - **No self-asserted scopes (CONVENTIONS §7.5).** `actor_from_trusted_claims` copies scopes from the JWT verbatim, so an issuer configured with a `scopes_claim` lets its tokens self-assert scopes. For any issuer registered as a **console/BFF** issuer (`auth_provider_settings.trusted_jwt_issuer_id`), this plan **requires `trusted_jwt_issuers.scopes_claim IS NULL`** — validated on write and asserted by a test. Authorization for humans then comes from the `admin_identities` grant table alone, which is the entire point.
-- **Secrets never leave the server.** The client secret is stored only as an AES-256-GCM envelope; the record DTO marks every envelope field `#[serde(skip_serializing)]` + `#[schema(ignore)]` (the exact pattern `CredentialRecord` uses, `src/domain/admin.rs:385-422`), exposing only `secret_fingerprint` and `masked_secret`. There is **no** read-back endpoint for the plaintext client secret in this plan. The setup token is stored only as an Argon2id hash + prefix + fingerprint (mirroring `system_api_keys`) and is returned in plaintext exactly once, at mint time.
+- **Moira stores no OAuth client secret at all — decision `D7` (product owner, 2026-07-25), binding.** `auth_provider_settings` holds **non-secret configuration only**. The OAuth client secret is **owned by the console** and stored in the console's own `console_auth` database (the database Better Auth already requires), encrypted at rest, written by the setup wizard, never sent to Moira, never exposed to the browser, never in `NEXT_PUBLIC_*`.
+  - **Why the secret is not in Moira, stated once so it is not re-litigated.** Better Auth needs the *plaintext* secret in process to run the OAuth authorization-code exchange. Moira's secret envelope is deliberately **write-only**: `SecretCipher` has no read-back path, and there is no endpoint that returns a decrypted secret. Making the secret readable over HTTP so the console could fetch it would break Moira's load-bearing invariant that **a decrypted secret never crosses a network boundary** — an invariant judged more important than the convenience of a single configuration store. So the secret lives where it is actually used, and Moira keeps the invariant intact.
+  - **Consequence for Moira's read surface: there is no secret in the payload at all.** `GET /api/v1/admin/auth/providers`, `GET …/{id}`, and `GET /api/v1/admin/setup/auth-methods` return pure configuration — issuer, URLs, `client_id`, scopes, domains, algorithms, audiences, redirect URIs. Because no secret material exists on the row, these endpoints are **safe to expose to any holder of `moira:auth-settings:read`** (and, for `auth-methods`, `moira:setup:read`) without a secret-redaction argument. The scope gate is still enforced — it is configuration disclosure control, not secret protection. *(This does not relax `GET …/setup/auth-methods`'s authentication requirement one bit: decision `D4` keeps it authenticated because the identity **configuration** is still reconnaissance-worthy. D7 removes the secret; it does not make the configuration public.)*
+  - **Unaffected: Moira's provider credentials.** The AI-provider API keys in `provider_credentials` are **not** touched by D7. They remain encrypted in Moira with `SecretCipher` + `credential_aad`, with the `#[serde(skip_serializing)]` + `#[schema(ignore)]` envelope-hiding pattern on `CredentialRecord` (`src/domain/admin.rs:385-422`) and no read-back path. That pattern is correct and stays exactly where it is; D7 simply means `auth_provider_settings` never needed it.
+- **Drift protection: Moira is the source of truth for `client_id` (CONVENTIONS §0, "D7 consequences").** Two configuration stores can diverge — a `client_id` changed in Moira while the console still holds the old client's secret would fail the code exchange with an opaque provider error. Moira's side of the mitigation is exactly one obligation: **expose `client_id` on the read path so the console can compare it.** That obligation is already met — `client_id` is a plain, non-secret, always-returned field of both `AuthProviderSettingsRecord` and `PublicAuthMethod` (module 3), so the console can read Moira's current `client_id` from `GET /api/v1/admin/setup/auth-methods` (its server-side boot call) or `GET /api/v1/admin/auth/providers/{id}`, fingerprint it, and compare against the fingerprint it stored beside its own secret. **Stated explicitly so plan 08 can bind to it: no new Moira endpoint, field, header, or fingerprint-computation is required — the existing `client_id` on the existing read endpoints is sufficient.** Moira deliberately does **not** compute or store the console's fingerprint: the fingerprint is a console-side artifact of a console-side secret, and having Moira hold it would put half of a secret-derived artifact back on the wrong side of the boundary. The remaining mitigations — the wizard writing both stores in one step and treating partial success as an operator-resolvable failure, and the e2e test asserting the mismatch produces an actionable keyed error — are **plan 08's** deliverables, not this plan's.
+- **Secrets never leave the server.** The setup token is stored only as an Argon2id hash + prefix + fingerprint (mirroring `system_api_keys`) and is returned in plaintext exactly once, at mint time. It is the only secret material this plan writes.
 - **`GET /api/v1/admin/setup/auth-methods` is authenticated. DECIDED (product owner, 2026-07-25) — confirmed, not open.** It requires `ActorType::SystemKey | TrustedJwt` **plus** the `moira:setup:read` scope, exactly like the pre-existing structural endpoint. There is no anonymous variant and no anonymous fallback in this plan.
   - **Rationale:** an unauthenticated variant would let anyone who finds a fresh instance enumerate its identity configuration — which IdP, which issuer, which client id, which allowed email domains — a reconnaissance gift on precisely the surface an attacker would target during the setup window, when the deployment is least defended.
   - **Why the setup wizard still functions:** 08's console calls this endpoint **server-side**, from its BFF, using the system key it already holds (CONVENTIONS §6.5: secrets never descend past the page/server boundary). The browser never calls it and never sees the credential. The wizard's *first* call — the one that must work before any credential exists — is `GET /api/v1/admin/setup/claim-status`, which is anonymous by design.
@@ -200,7 +206,7 @@ for each row execute function moira_bump_resource_version();
 
 #### `migrations/0010_auth_provider_settings.sql`
 
-This is the CONVENTIONS §7.2 table: enabled auth methods and their non-secret config, with the client secret encrypted exactly like a provider credential. Envelope column names are copied verbatim from `provider_credentials` (`0003:138-201`) so the same `EncryptedSecret` round-trip code shape applies.
+This is the CONVENTIONS §7.2 table: enabled auth methods and their **non-secret** config. **Decision `D7`: there is no secret envelope on this table** — no `encrypted_payload`, `encryption_algorithm`, `encryption_version`, `encrypted_data_key`, `nonce`, `secret_fingerprint`, or `masked_secret` column, and therefore no envelope-completeness CHECK constraint. The OAuth client secret is owned by the console and stored in the console's own `console_auth` database. Every column below is safe to read.
 
 ```sql
 create table if not exists auth_provider_settings (
@@ -225,14 +231,9 @@ create table if not exists auth_provider_settings (
     redirect_uris text[] not null default '{}',
     trusted_jwt_issuer_id uuid references trusted_jwt_issuers(id),
 
-    -- encrypted client secret (nullable: the 'jwks' method has none)
-    encrypted_payload bytea,
-    encryption_algorithm varchar(64),
-    encryption_version integer check (encryption_version is null or encryption_version > 0),
-    encrypted_data_key bytea,
-    nonce bytea,
-    secret_fingerprint varchar(128),
-    masked_secret varchar(128),
+    -- NO client-secret columns. Decision D7: the OAuth client secret is owned by
+    -- the console and stored in the console's own console_auth database. Moira
+    -- never stores it and never returns it. Do not add an envelope here.
 
     metadata jsonb not null default '{}'::jsonb,
     status varchar(32) not null default 'active'
@@ -242,25 +243,10 @@ create table if not exists auth_provider_settings (
     deleted_at timestamptz,
     version bigint not null default 1,
 
-    constraint auth_provider_settings_secret_envelope_complete check (
-        (encrypted_payload is null
-            and encryption_algorithm is null
-            and encryption_version is null
-            and nonce is null
-            and secret_fingerprint is null
-            and masked_secret is null)
-        or (encrypted_payload is not null
-            and encryption_algorithm is not null
-            and encryption_version is not null
-            and nonce is not null
-            and secret_fingerprint is not null
-            and masked_secret is not null)
-    ),
     constraint auth_provider_settings_method_shape check (
         (method = 'jwks'
             and jwks_url is not null
-            and client_id is null
-            and encrypted_payload is null)
+            and client_id is null)
         or (method in ('google_oauth', 'generic_oidc')
             and client_id is not null
             and (issuer is not null or discovery_url is not null))
@@ -294,18 +280,18 @@ for each row execute function notify_moira_runtime_config_change();
 
 **Note the DDL statement style must match the surrounding migrations** — verify whether existing triggers use `after insert or update or delete … for each row` and copy that form exactly rather than the shape written above.
 
-**Deliberate non-decisions.** There is no `key_id` column, because `provider_credentials` has none either — `EncryptedSecret.key_id` (`src/security/crypto.rs:27`) is a Rust-only field that `load_credential_secret` reconstructs as `String::new()` (`src/infra/repositories/admin.rs:1194`). Adding key-id-based rotation is a **deferred follow-up for both tables together**, not a thing this plan invents for one of them.
+**Deliberate non-decisions.** No secret-envelope columns and no `key_id` column exist on this table, because no secret is stored on it (**D7**). Envelope key rotation remains a concern of `provider_credentials` alone and stays a deferred follow-up there — see Risks & Rollback. **Do not "restore symmetry" with `provider_credentials` by adding envelope columns here**; the asymmetry is the decision, not an oversight.
 
 ### API & OpenAPI changes
 
-**Eleven new operations**, all under `/api/v1/admin/` — see Interfaces & Contracts for exact shapes. All register in `src/http/mod.rs::documented_router()` (`:21-210`), the claim routes adjacent to the existing `.routes(routes!(admin::get_setup_status))` line and the auth-provider routes adjacent to the `trusted_jwt_issuer` block.
+**Ten new operations**, all under `/api/v1/admin/` — see Interfaces & Contracts for exact shapes. (It was eleven before decision **D7** removed `POST /api/v1/admin/auth/providers/{id}/rotate-secret`; there is no client secret in Moira to rotate.) All register in `src/http/mod.rs::documented_router()` (`:21-210`), the claim routes adjacent to the existing `.routes(routes!(admin::get_setup_status))` line and the auth-provider routes adjacent to the `trusted_jwt_issuer` block.
 
 Two verified facts this plan depends on:
 
 1. **No router-level auth middleware exists on `/api/v1/admin` today** — every admin handler authenticates itself in its own body via `admin_actor(state, headers)` (`src/http/admin.rs:51-56`, a thin wrapper over `state.auth.authenticate_admin`). An unauthenticated handler under the admin prefix is therefore structurally possible. **However, plan 03 lands first and may introduce path-scoped production middleware (P1-3).** If it does, `GET /api/v1/admin/setup/claim-status` must be registered as an explicit, documented, reviewed exemption from any admin-path auth middleware, and `POST /api/v1/admin/setup/claim` from any bearer-required middleware (its credentials are a system key or a body token, not a bearer JWT). **Wave 0 must check 03's landed state for this and stop if the exemption cannot be made cleanly.**
-2. **OpenAPI docs exposure:** when `MOIRA_DOCS__EXPOSE_ADMIN` is false, `public_document` strips every path starting `"/api/v1/admin/"` (`src/http/openapi.rs:156-162`; the authenticated full-doc branch is at `:111-130`). This affects spec visibility only, never routing — `claim-status` still serves unauthenticated traffic regardless. Acceptable: 08's wizard consumes the endpoint, not the public spec. **Note this in the endpoint's doc comment** so nobody "fixes" the spec omission by moving the route out from under `/api/v1/admin/`, which would also move it out of the admin-strip protection for the other ten.
+2. **OpenAPI docs exposure:** when `MOIRA_DOCS__EXPOSE_ADMIN` is false, `public_document` strips every path starting `"/api/v1/admin/"` (`src/http/openapi.rs:156-162`; the authenticated full-doc branch is at `:111-130`). This affects spec visibility only, never routing — `claim-status` still serves unauthenticated traffic regardless. Acceptable: 08's wizard consumes the endpoint, not the public spec. **Note this in the endpoint's doc comment** so nobody "fixes" the spec omission by moving the route out from under `/api/v1/admin/`, which would also move it out of the admin-strip protection for the other nine.
 
-`src/http/mod.rs`'s existing spec tests (`mod tests` at `:213` — 8 tests, notably `generated_openapi_covers_every_registered_route:226`, `every_operation_documents_request_ids_and_protected_operations_document_auth…:422`, `setup_status_contract_is_typed_and_exact:480`, `every_local_schema_reference_resolves:646`) **must be extended, not bypassed**, to cover the eleven new routes. This is required, not optional. In particular `every_operation_documents_request_ids_and_protected_operations_document_auth…` will need an explicit, commented allowance for `get_setup_claim_status` being intentionally unauthenticated.
+`src/http/mod.rs`'s existing spec tests (`mod tests` at `:213` — 8 tests, notably `generated_openapi_covers_every_registered_route:226`, `every_operation_documents_request_ids_and_protected_operations_document_auth…:422`, `setup_status_contract_is_typed_and_exact:480`, `every_local_schema_reference_resolves:646`) **must be extended, not bypassed**, to cover the ten new routes. This is required, not optional. In particular `every_operation_documents_request_ids_and_protected_operations_document_auth…` will need an explicit, commented allowance for `get_setup_claim_status` being intentionally unauthenticated.
 
 ### Backward compatibility
 
@@ -324,8 +310,8 @@ Standard migrate-then-deploy. Both migrations must run before the new binary ser
 - A claim that fails partway is atomic by construction — it runs inside the existing `AdminCommandRunner` envelope, whose correctness the audit's positive findings already establish ("single transaction, `pg_try_advisory_xact_lock` single-winner, savepoint-scoped business-failure rollback, `finalize` once-only").
 - Lost/compromised system key: unaffected by this plan; the existing `system_api_keys` rotation/revocation story governs recovery and is not weakened.
 - Wrongly-granted first admin: a second system-key-gated claim can grant a further admin. The `status`/`revoked_at` columns exist from day one, so an operator can revoke via direct DB access before a dedicated revoke endpoint exists (deliberately deferred — see Risks & Rollback).
-- Lost auth-settings client secret: rotate via `POST /api/v1/admin/auth/providers/{id}/rotate-secret`. The plaintext is unrecoverable by design; there is no read-back path.
-- Corrupted/undecryptable secret: `LocalSecretCipher::decrypt` fails closed with `AppError::Forbidden` (`src/security/crypto.rs:66-81`). The auth-settings service must surface this as a coded, non-leaking error and must never fall back to an unencrypted path.
+- Lost or compromised OAuth client secret: **not a Moira failure mode (D7).** Moira holds no client secret, so there is nothing here to lose, rotate, or corrupt. The operator rotates the secret at the identity provider and updates the console's own `console_auth` store; Moira is involved only if the `client_id` also changes, which is an ordinary `PATCH /api/v1/admin/auth/providers/{id}` — and see the drift-protection contract in Security boundaries for how the console detects a `client_id` that moved out from under its stored secret.
+- Corrupted `auth_provider_settings` row: it is plain configuration, so recovery is a `PATCH` or a disable-and-recreate. There is no decryption step on this table and therefore no fail-closed decrypt path to reason about.
 
 ---
 
@@ -406,7 +392,7 @@ fn default_admin_grant_scopes() -> Vec<String> { vec!["moira:admin".to_string()]
 
 ### Module 3 — `src/domain/auth_settings.rs` (new)
 
-Mirror `CredentialRecord`'s secret-hiding pattern exactly (`src/domain/admin.rs:385-422`): envelope fields present on the struct but marked `#[serde(skip_serializing)]` + `#[schema(ignore)]`, so they never reach the wire or the OpenAPI document; only `secret_fingerprint` and `masked_secret` are public.
+**Decision `D7`: these DTOs carry no secret material of any kind.** There is no `client_secret` field on any request, no envelope fields on the record, no `secret_fingerprint`, no `masked_secret` — so, unlike `CredentialRecord` (`src/domain/admin.rs:385-422`), **no `#[serde(skip_serializing)]` / `#[schema(ignore)]` hiding is needed here**, because there is nothing to hide. Every field below is non-secret configuration and is serialized normally. *(`CredentialRecord`'s hiding pattern is still correct and still required for provider credentials — the AI-provider API keys — which D7 does not touch. Do not delete it there; just do not copy it here, where it would only imply a secret exists.)*
 
 ```rust
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
@@ -425,6 +411,8 @@ pub struct AuthProviderSettingsRecord {
     pub token_url: Option<String>,
     pub userinfo_url: Option<String>,
     pub jwks_url: Option<String>,
+    /// Non-secret. Always returned. This is the value the console fingerprints
+    /// and compares against its own stored fingerprint for D7 drift protection.
     pub client_id: Option<String>,
     pub requested_scopes: Vec<String>,
     pub allowed_email_domains: Vec<String>,
@@ -432,12 +420,6 @@ pub struct AuthProviderSettingsRecord {
     pub expected_audiences: Vec<String>,
     pub redirect_uris: Vec<String>,
     pub trusted_jwt_issuer_id: Option<Uuid>,
-    pub secret_fingerprint: Option<String>,
-    pub masked_secret: Option<String>,
-    #[serde(skip_serializing, default)] #[schema(ignore)]
-    pub encryption_algorithm: Option<String>,
-    #[serde(skip_serializing, default)] #[schema(ignore)]
-    pub encryption_version: Option<i32>,
     pub metadata: Value,
     pub status: ResourceStatus,
     pub created_at: DateTime<Utc>,
@@ -446,7 +428,7 @@ pub struct AuthProviderSettingsRecord {
 }
 ```
 
-Plus `AuthProviderSettingsCreateRequest` (same fields minus server-managed ones, plus `client_secret: Option<String>`), `AuthProviderSettingsPatchRequest` (all `Option<_>`, **no** `client_secret` — rotation is a separate operation, exactly as `CredentialPatchRequest` excludes `secret` and `RotateCredentialRequest` carries it), `RotateAuthProviderSecretRequest { client_secret: String }`, and the bootstrap-read shapes:
+Plus `AuthProviderSettingsCreateRequest` (same fields minus server-managed ones) and `AuthProviderSettingsPatchRequest` (all `Option<_>`). **Neither carries a `client_secret` field, and there is no `RotateAuthProviderSecretRequest` type** — decision **D7**. Both request DTOs are `deny_unknown_fields`, which means a console still sending `client_secret` is **rejected loudly with a schema error rather than silently accepted and dropped** — that is deliberate, and it is what makes a stale 08 client fail fast instead of believing Moira stored a secret it never stored. Then the bootstrap-read shapes:
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -461,34 +443,25 @@ pub struct PublicAuthMethod {
     pub discovery_url: Option<String>,
     pub authorization_url: Option<String>,
     pub jwks_url: Option<String>,
+    /// Non-secret. The D7 drift-protection anchor: the console reads this on
+    /// boot and compares its fingerprint against the one stored beside its own
+    /// client secret. Sufficient on its own — plan 08 needs nothing more.
     pub client_id: Option<String>,
     pub requested_scopes: Vec<String>,
     pub allowed_email_domains: Vec<String>,
 }
 ```
 
-`PublicAuthMethod` is a **deliberately narrower projection** than the full record — it must never gain a field carrying secret material, and a test asserts that (`public_auth_method_never_exposes_secret_fields`).
+`PublicAuthMethod` is a **deliberately narrower projection** than the full record — it must never gain a field carrying secret material, and a test asserts that (`public_auth_method_never_exposes_secret_fields`). Under D7 no such field exists on the source record either, so the test is now a *forward* guard against reintroduction rather than a redaction check.
 
-### Module 4 — `src/security/crypto.rs` AAD extension (additive)
+### Module 4 — `src/security/crypto.rs`: **no change** (decision D7)
 
-`credential_aad`/`CredentialAadParts` (`:84-111`) are credential-shaped (`credential_id`, `provider_id`, `credential_type`, `scope_type`, tenant/app/user, `encryption_version`) and **must not** be reused for an auth-provider secret — a mismatched AAD would either fail to bind meaningfully or invite a copy-paste that binds the wrong fields. Add a sibling, in the same file, in the same `k=v;` format:
+**This module is intentionally empty.** Earlier drafts added an `AuthProviderSecretAadParts` / `auth_provider_secret_aad` sibling beside `CredentialAadParts` / `credential_aad` (`:84-111`) to bind an auth-provider client secret to its `(id, method, issuer, client_id, encryption_version)`. **Decision `D7` deletes that work entirely**: Moira stores no OAuth client secret, so there is no envelope, no AAD, and nothing to bind. `src/security/crypto.rs` and `src/security/mod.rs` are **untouched by this plan**.
 
-```rust
-#[derive(Debug, Clone, Copy)]
-pub struct AuthProviderSecretAadParts<'a> {
-    pub auth_provider_settings_id: uuid::Uuid,
-    pub method: &'a str,
-    pub issuer: &'a str,
-    pub client_id: &'a str,
-    pub encryption_version: i32,
-}
+Two things follow that an implementer must not get wrong:
 
-pub fn auth_provider_secret_aad(parts: AuthProviderSecretAadParts<'_>) -> String
-```
-
-Re-export from `src/security/mod.rs` beside the existing `CredentialAadParts` re-export (`mod.rs:11`). Add a round-trip + tamper unit test mirroring `crypto.rs:117-129`'s `encrypt_round_trip_binds_aad`.
-
-**Important consequence:** because `client_id` and `issuer` are bound into the AAD, changing either via `PATCH` **invalidates the stored secret**. The patch handler must therefore reject a change to `issuer` or `client_id` while an encrypted secret is present, and direct the operator to rotate the secret instead (coded error `auth_provider_secret_rebind_required`, 409). This is a real constraint that falls out of doing AAD binding correctly, and it must be tested.
+- **`credential_aad` / `CredentialAadParts` stay exactly as they are.** They govern **provider credentials** — the AI-provider API keys in `provider_credentials` — which D7 does not touch and which remain encrypted in Moira with `SecretCipher` + AAD, write-only, with no read-back path. Do not remove, generalise, or "share" them.
+- **A whole class of hazard disappears with the AAD.** Because `issuer` and `client_id` were bound into the deleted AAD, changing either via `PATCH` used to invalidate the stored secret, which forced a rebind-or-rotate rule and a `409 auth_provider_secret_rebind_required`. **That hazard no longer exists on the Moira side**: `issuer` and `client_id` are now ordinary mutable configuration fields, freely patchable under the normal `If-Match` rules, with no secret bound to them. The corresponding error code, its i18n entry, and its tests are removed. *(The console still has its own reason to care that `client_id` changed — its stored secret belongs to a specific client — but that is the drift-protection contract in Security boundaries, handled by fingerprint comparison in plan 08, not by an error from Moira.)*
 
 ### Module 5 — `src/infra/repositories/identity.rs` (new)
 
@@ -504,11 +477,11 @@ Re-export from `src/security/mod.rs` beside the existing `CredentialAadParts` re
 
 ### Module 6 — `src/infra/repositories/auth_settings.rs` (new)
 
-`#[async_trait] pub trait AuthProviderSettingsRepository` + `PgAuthProviderSettingsRepository`. Methods mirror the credential repository's shape (`src/infra/repositories/admin.rs:337-436`): `create(id, &request, Option<&EncryptedSecret>, fingerprint, masked)`, `list(limit)`, `get(id)`, `patch(id, &request)`, `rotate_secret(id, expected_version, &EncryptedSecret, fingerprint, masked)` (with the `select version … for update` optimistic-lock check exactly as `rotate_credential` does at `admin.rs:392-403`), `set_status(id, status)`, `set_enabled(id, enabled)`, `soft_delete(id)`, and `list_enabled_public()` for the bootstrap read.
+`#[async_trait] pub trait AuthProviderSettingsRepository` + `PgAuthProviderSettingsRepository`. Methods: `create(id, &request)`, `list(limit)`, `get(id)`, `patch(id, expected_version, &request)` (with the `select version … for update` optimistic-lock check taken from `rotate_credential`'s shape at `admin.rs:392-403` — see module 12 on why the check goes *inside* the transaction), `set_status(id, status)`, `set_enabled(id, expected_version, enabled)`, `soft_delete(id, expected_version)`, and `list_enabled_public()` for the bootstrap read.
 
-The INSERT/SELECT column lists bind `encrypted.ciphertext → encrypted_payload`, `encrypted.algorithm → encryption_algorithm`, `encrypted.version → encryption_version`, `encrypted.encrypted_data_key → encrypted_data_key`, `encrypted.nonce → nonce` — the same mapping as `admin.rs:347-352`. `EncryptedSecret.key_id` is not persisted (consistent with `provider_credentials`); reconstruct as `String::new()` on read, exactly as `load_credential_secret` does (`admin.rs:1194`).
+**There is no `rotate_secret` method and no `EncryptedSecret` parameter anywhere in this repository** — decision **D7**. The INSERT/SELECT column lists contain **only** the non-secret columns of `0010`; there is no envelope mapping to write, which is the reason this repository is materially simpler than the credential repository it was once modelled on.
 
-**No `load_secret`-style method returning plaintext is exposed.** The only decrypt path in this plan is internal validation at rotate time (confirming the new secret round-trips). If 08 later needs the plaintext server-side, that is a separate, reviewed decision.
+**There is no `load_secret`-style method, because there is no secret on this table** — and consequently **no decrypt path exists anywhere in this plan**. If 08 needs an OAuth client secret server-side, it reads it from its **own** `console_auth` database, never from Moira. Adding a secret column plus a read-back here would break the invariant D7 exists to preserve; it is not a follow-up, it is a prohibition.
 
 ### Module 7 — `src/security/auth.rs` extension (the highest-risk diff)
 
@@ -558,12 +531,11 @@ New private `async fn apply_admin_identity_grant(pool: &PgPool, issuer: &str, mu
 
 ### Module 9 — `src/application/auth_settings.rs` (new) — `AuthProviderSettingsService`
 
-Follows `src/application/admin.rs`'s `create_credential`/`rotate_credential` shape (`:483-544`, `:614-685`) — **not** `runtime_admin.rs`'s two-phase non-transactional scheme, because this surface needs encryption plus version-conditional rotation in one transaction.
+Follows `src/application/admin.rs`'s `create_credential` shape (`:483-544`) for the transactional envelope — **not** `runtime_admin.rs`'s two-phase non-transactional scheme, because this surface needs version-conditional mutation in one transaction. It does **not** follow `rotate_credential`, because under decision **D7** there is no secret to encrypt or rotate; only the in-transaction `select … for update` version-check technique is borrowed from it.
 
-- `create(actor, ctx, request)` — `authz.require(actor, "moira:auth-settings:write")`; validate method shape (jwks ⇒ `jwks_url` present, no `client_id`, no secret; oauth methods ⇒ `client_id` present and one of `issuer`/`discovery_url`); validate `allowed_email_domains` entries are syntactically plausible domains; validate URL schemes are `https` (defer any *fetch* to plan 03's SSRF-hardened fetcher — do not fetch here if 03 has not landed); if `trusted_jwt_issuer_id` is set, enforce module 7d's `scopes_claim IS NULL` rule; encrypt `client_secret` with `auth_provider_secret_aad` (module 4) if present; run inside `AdminCommandRunner` with `admin_command_spec(ctx, actor, "auth_provider.create", …)`; insert audit; `AdminCommandMutation::new(record, 201, Some(id))`; on success, invalidate the auth-settings cache (the NOTIFY trigger handles cross-instance; the local invalidation mirrors `schedule_runtime_cache_invalidation`'s pattern).
-- `patch(actor, ctx, id, expected_version, request)` — `If-Match` required. **Reject a change to `issuer` or `client_id` while an encrypted secret exists** (module 4's AAD consequence) with `auth_provider_secret_rebind_required` (409).
-- `rotate_secret(actor, ctx, id, expected_version, request)` — `moira:auth-settings:write`; mirrors `rotate_credential` exactly, including the `select version … for update` check and the `resource_version_conflict` 409.
-- `set_enabled(actor, ctx, id, expected_version, enabled)` — enabling a method with an incomplete config (e.g. `google_oauth` with no encrypted secret) is rejected with `auth_provider_secret_required` (400). **Deny-by-default: `enabled` defaults to `false` on create**, so a half-configured method can never be live by accident.
+- `create(actor, ctx, request)` — `authz.require(actor, "moira:auth-settings:write")`; validate method shape (jwks ⇒ `jwks_url` present, no `client_id`; oauth methods ⇒ `client_id` present and one of `issuer`/`discovery_url`); validate `allowed_email_domains` entries are syntactically plausible domains; validate URL schemes are `https` (defer any *fetch* to plan 03's SSRF-hardened fetcher — do not fetch here if 03 has not landed); if `trusted_jwt_issuer_id` is set, enforce module 7d's `scopes_claim IS NULL` rule; run inside `AdminCommandRunner` with `admin_command_spec(ctx, actor, "auth_provider.create", …)`; insert audit; `AdminCommandMutation::new(record, 201, Some(id))`; on success, invalidate the auth-settings cache (the NOTIFY trigger handles cross-instance; the local invalidation mirrors `schedule_runtime_cache_invalidation`'s pattern). **No `client_secret` is accepted; the DTO has no such field and `deny_unknown_fields` rejects one that is sent.**
+- `patch(actor, ctx, id, expected_version, request)` — `If-Match` required. **`issuer` and `client_id` are freely patchable** — there is no secret bound to them (**D7** removed the AAD that once made a change invalidating, along with the `auth_provider_secret_rebind_required` 409). The console's stale-secret concern is handled console-side by the `client_id` fingerprint comparison described in Security boundaries.
+- `set_enabled(actor, ctx, id, expected_version, enabled)` — enabling a method whose **non-secret** configuration is incomplete (e.g. `generic_oidc` with neither `issuer` nor `discovery_url`, or `jwks` with no `jwks_url`) is rejected with `auth_provider_method_config_incomplete` (400). **Moira cannot and must not check for a client secret here — it does not have one** (D7); whether the console holds a usable secret is the console's precondition, enforced by its own wizard. **Deny-by-default: `enabled` defaults to `false` on create**, so a half-configured method can never be live by accident.
 - `delete(actor, ctx, id, expected_version)` — soft delete; `moira:auth-settings:delete`.
 - `list(actor, query)` / `get(actor, id)` — `moira:auth-settings:read`.
 - `setup_auth_methods(actor)` — **authenticated, decided (see Security boundaries): the method takes an `Actor` and is not callable without one.** `require_setup_actor`-equivalent gating (`ActorType::SystemKey | TrustedJwt`) plus `moira:setup:read`; returns `SetupAuthMethodsResponse` built from `list_enabled_public()`. **Projects to `PublicAuthMethod` explicitly, field by field** — never `..record` spread, so a future field addition cannot silently widen this response. Do not add an anonymous overload, an `Option<Actor>` parameter, or a "public" sibling method; the signature taking a non-optional `Actor` is itself the enforcement, and `setup_auth_methods_requires_a_setup_actor_and_rejects_anonymous` / `setup_auth_methods_rejects_an_unauthenticated_call_with_401` are the tests that hold it.
@@ -689,11 +661,13 @@ fn claim_body_rejection(rejection: JsonRejection) -> AppError {
 
 ### Module 12 — `src/http/auth_settings.rs` (new)
 
-Nine handlers. Follow the trusted-JWT-issuer handlers as the template (`src/http/admin.rs:1353-1571`) — same `security((...))` triple, same `params(PageQuery)` on list, same `etag_headers` (`:58-64`) / `require_if_match` (`:66-77`) / `ensure_version` (`:86-95`) helpers, same `Idempotency-Key` documentation on create.
+Eight handlers (`get_setup_auth_methods` plus the seven provider operations — **there is no `rotate_secret` handler**, decision **D7**). Follow the trusted-JWT-issuer handlers as the template (`src/http/admin.rs:1353-1571`) — same `security((...))` triple, same `params(PageQuery)` on list, same `etag_headers` (`:58-64`) / `require_if_match` (`:66-77`) / `ensure_version` (`:86-95`) helpers, same `Idempotency-Key` documentation on create.
 
-**Known defect to *not* copy:** the existing issuer handlers do their version check as a read-then-compare **outside** the repository transaction (`admin.rs:1449-1452`, `:1480-1483`, `:1532-1535`, `:1563-1566`) — a TOCTOU window. This plan's auth-settings mutations must instead pass `expected_version` **into** the service so the check happens inside the transaction under `select … for update`, exactly as `rotate_credential` does (`src/infra/repositories/admin.rs:392-403`). Note the divergence in the PR so the pre-existing issue is visible and separately trackable, and do **not** "fix" the issuer handlers here (out of scope).
+**Known defect to *not* copy:** the existing issuer handlers do their version check as a read-then-compare **outside** the repository transaction (`admin.rs:1449-1452`, `:1480-1483`, `:1532-1535`, `:1563-1566`) — a TOCTOU window. This plan's auth-settings mutations must instead pass `expected_version` **into** the service so the check happens inside the transaction under `select … for update`, borrowing the technique `rotate_credential` uses (`src/infra/repositories/admin.rs:392-403`) without borrowing its secret handling. Note the divergence in the PR so the pre-existing issue is visible and separately trackable, and do **not** "fix" the issuer handlers here (out of scope).
 
-`GET /api/v1/admin/setup/auth-methods` lives in this file and is tagged `admin-setup` (grouping with the other setup endpoints), while the eight `/admin/auth/providers…` operations are tagged `admin-auth-settings`.
+`GET /api/v1/admin/setup/auth-methods` lives in this file and is tagged `admin-setup` (grouping with the other setup endpoints), while the seven `/admin/auth/providers…` operations are tagged `admin-auth-settings`.
+
+**No route, handler, DTO, or utoipa path for `POST /api/v1/admin/auth/providers/{id}/rotate-secret` may appear in this file or in `documented_router()`.** It was removed by decision **D7** and its absence is part of the frozen contract plans 08/09 bind to.
 
 ---
 
@@ -720,14 +694,15 @@ Every key below must be added to `src/i18n/catalog/errors.rs` / `notices.rs` **w
 | `auth_provider_not_found` | 404 | module 9 | "The auth provider configuration was not found." |
 | `duplicate_auth_provider` | 409 | unique-index violation (module 6) | "An auth provider is already configured for this method and issuer." |
 | `auth_provider_method_unsupported` | 400 | module 9 validation | "The requested auth method is not supported." |
-| `auth_provider_secret_required` | 400 | module 9 create/enable validation | "This auth method requires a client secret." |
-| `auth_provider_secret_not_supported` | 400 | module 9 validation | "This auth method does not accept a client secret." |
-| `auth_provider_secret_rebind_required` | 409 | module 9 patch (module 4's AAD consequence) | "Changing the issuer or client id requires rotating the client secret." |
+| `auth_provider_method_config_incomplete` | 400 | module 9 create/enable validation | "The auth provider configuration is incomplete for this method." |
 | `auth_provider_url_not_allowed` | 400 | module 9 URL validation / plan 03's SSRF fetcher | "The configured URL is not allowed." |
 | `console_issuer_must_not_assert_scopes` | 400 | module 7d | "A console issuer must not map a scopes claim." |
 
+**Removed by decision `D7` — do not add these keys:** `auth_provider_secret_required`, `auth_provider_secret_not_supported`, and `auth_provider_secret_rebind_required`. All three described conditions that can no longer occur, because Moira accepts, stores, and binds no OAuth client secret. `auth_provider_method_config_incomplete` replaces the *non-secret* half of what `auth_provider_secret_required` used to cover (enabling a method whose configuration is structurally incomplete); the secret half has no Moira-side meaning and belongs to the console's own wizard validation.
+
 **Wording notes forced by the resolved decisions:**
 
+- `auth_provider_method_config_incomplete`'s `description` must say what it does **not** cover, or an implementer will re-add a secret check: *"Used when a create or enable request leaves the method's required non-secret configuration incomplete — e.g. `generic_oidc` with neither `issuer` nor `discovery_url`, or `jwks` with no `jwks_url`. Moira never checks for an OAuth client secret: under decision D7 the client secret is owned by the console and Moira does not store it."*
 - `admin_claim_email_required`'s `default_message` **must not** mention setup tokens. Email is required on **both** credential paths now; the earlier wording ("…with a setup token") described the withdrawn carve-out and would actively mislead an operator hitting it on the system-key path. Its `description` should say: *"Used when a claim omits an email address, presents an empty one, or presents a value from which no domain can be extracted. Email is required on both the system-key and setup-token paths; there is no exemption."*
 - `admin_claim_domain_not_allowed` now covers **two** conditions — no enabled auth-provider configuration governs the target issuer (step 1), and the email's domain is absent from a configured `allowed_email_domains` (step 4). One code for both is deliberate: distinguishing them on the wire would tell an unprivileged caller whether a policy exists, and both have the same operator remedy. Its `description` carries the actionable setup guidance required by module 10: *"Used when the deny-by-default email-domain policy refuses a claim, either because no enabled auth-provider configuration governs the target issuer or because the email's domain is not in its `allowed_email_domains`. An unconfigured or empty allow-list denies every claim on every credential path; there is no first-claim exemption. The operator must create and enable an auth-provider configuration with the intended domains before any claim can succeed."* Keep the `default_message` short and user-facing; the guidance lives in `description`, per the catalog's own field semantics.
 
@@ -773,8 +748,8 @@ Two codes this plan's endpoints **will** emit have **no catalog entry today** (v
 **Wave 1 (parallel where genuinely disjoint):**
 - **Agent 1 — module 1** (both migration files). Fully disjoint; runs first.
 - **Agent 2 — modules 2 + 3 + 5 + 6** (domain DTOs and both repositories, sequentially within one agent). The repositories depend on the exact schema and DTO shapes; splitting this across agents buys nothing and costs a handoff. Includes the additive `src/domain/mod.rs` and `src/infra/repositories/mod.rs` re-export lines.
-- **Agent 3 — module 4** (`src/security/crypto.rs` AAD extension + `src/security/mod.rs` re-export). Small, disjoint, and a prerequisite for Agent 4.
-- **Agent 4 — modules 8 + 9 + 10** (both application services, the policy logic, **and module 10's operator setup runbook in `docs/`**). Starts once Agents 2 and 3 have agreed interfaces; lands after them. This is the largest single piece. **Module 10's policy logic stays inside the service method it governs** — do not split it to a separate agent, which would mean two agents editing one function. The runbook ships with the policy, by the same agent, so the deny-by-default behavior and the copy explaining it cannot land apart.
+- **Agent 3 — none.** This agent previously owned module 4 (the `src/security/crypto.rs` AAD extension). Decision **D7** deletes that module, so `src/security/crypto.rs` and `src/security/mod.rs` are untouched and no agent is assigned to them. If a coordinator finds an agent editing `crypto.rs` in this plan's diff, that is a scope violation to flag.
+- **Agent 4 — modules 8 + 9 + 10** (both application services, the policy logic, **and module 10's operator setup runbook in `docs/`**). Starts once Agent 2 has agreed interfaces; lands after it. This is the largest single piece. **Module 10's policy logic stays inside the service method it governs** — do not split it to a separate agent, which would mean two agents editing one function. The runbook ships with the policy, by the same agent, so the deny-by-default behavior and the copy explaining it cannot land apart.
 - **Agent 5 — modules 11 + 12** (both HTTP files + `src/http/mod.rs` registrations + extending `src/http/mod.rs`'s spec tests). Starts once Agent 4's service signatures are agreed.
 - **Agent 6 — module 13** (`src/app/state.rs` auth-settings cache field, `src/infra/db.rs` listener wiring, `src/config/settings.rs` TTL field). Disjoint from all others except the flagged plan-06 overlap on `src/infra/db.rs`.
 - **Agent 7 — the i18n deliverable** (`src/i18n/catalog/errors.rs`, `notices.rs`, `docs/i18n-response-catalog.json`). Fully disjoint; can run in parallel from the start. Must land **before** Agent 5, so the handlers' error paths reference keys that already exist.
@@ -795,6 +770,8 @@ Two codes this plan's endpoints **will** emit have **no catalog entry today** (v
 
 ### Frozen contract (binding on plans 08/09)
 
+**Operation count: 10.** (`claim-status`, `claim`, `auth-methods`, plus seven `/api/v1/admin/auth/providers…` operations.) It was 11 before decision **D7** removed `rotate-secret`.
+
 | Item | Final value |
 |------|-------------|
 | Migrations | `migrations/0009_admin_identity_claims.sql`, `migrations/0010_auth_provider_settings.sql` (re-verify numbering at execution; 0008 was highest at plan time) |
@@ -810,22 +787,38 @@ Two codes this plan's endpoints **will** emit have **no catalog entry today** (v
 | **Auth-settings get** | `GET /api/v1/admin/auth/providers/{id}` — `moira:auth-settings:read` — 200 + `ETag` |
 | **Auth-settings patch** | `PATCH /api/v1/admin/auth/providers/{id}` — `moira:auth-settings:write`, **`If-Match` required** — 200 + `ETag` |
 | **Auth-settings delete** | `DELETE /api/v1/admin/auth/providers/{id}` — `moira:auth-settings:delete`, **`If-Match` required** — 204 |
-| **Auth-settings rotate secret** | `POST /api/v1/admin/auth/providers/{id}/rotate-secret` — `moira:auth-settings:write`, **`If-Match` required** — 200 + `ETag` |
 | **Auth-settings enable** | `POST /api/v1/admin/auth/providers/{id}/enable` — `moira:auth-settings:write`, **`If-Match` required** — 200 + `ETag` |
 | **Auth-settings disable** | `POST /api/v1/admin/auth/providers/{id}/disable` — `moira:auth-settings:write`, **`If-Match` required** — 200 + `ETag` |
 | Structural-status endpoint | `GET /api/v1/admin/setup/status` — **pre-existing, unchanged** (authenticated, granular `SetupStatusResponse`) |
 | Trusted-JWT-issuer endpoints | `/api/v1/admin/jwt-issuers…` — **pre-existing, unchanged**. These *are* CONVENTIONS §7.3 mode 3 (bring-your-own JWKS/JWT); no new surface is invented for it. |
-| Auth methods | `google_oauth`, `generic_oidc`, `jwks` (CONVENTIONS §7.3 modes 1/2/3) |
+| Auth methods | `google_oauth`, `generic_oidc`, `jwks` (CONVENTIONS §7.3 modes 1/2/3) — **unchanged by D7** |
+| **OAuth client secret** | **Not in Moira. Anywhere.** (decision **D7**) `auth_provider_settings` has no secret columns; no request DTO has a `client_secret` field (and `deny_unknown_fields` rejects one that is sent); no response ever contains one; `POST …/{id}/rotate-secret` **does not exist**. The console owns the secret in its own `console_auth` database. |
+| **`auth_provider_settings` columns (non-secret only)** | `id`, `method`, `display_name`, `enabled`, `issuer`, `discovery_url`, `authorization_url`, `token_url`, `userinfo_url`, `jwks_url`, `client_id`, `requested_scopes`, `allowed_email_domains`, `allowed_algorithms`, `expected_audiences`, `redirect_uris`, `trusted_jwt_issuer_id`, `metadata`, `status`, `created_at`, `updated_at`, `deleted_at`, `version`. **No `encrypted_payload` / `encryption_algorithm` / `encryption_version` / `encrypted_data_key` / `nonce` / `secret_fingerprint` / `masked_secret`.** |
+| **D7 drift protection (Moira's obligation)** | Moira is the **source of truth for `client_id`**, and returns it as a plain non-secret field on `GET /api/v1/admin/auth/providers`, `GET …/{id}`, and `GET /api/v1/admin/setup/auth-methods` (`PublicAuthMethod.client_id`). **That is sufficient and complete for the console's fingerprint comparison — plan 08 needs no additional Moira endpoint, field, header, or server-computed fingerprint, and must bind to this.** The console stores a fingerprint of `client_id` beside its own secret, re-reads Moira's `client_id` on load, and raises its own actionable keyed error on mismatch. Moira neither stores nor validates that fingerprint. |
+| **Patching `issuer` / `client_id`** | Freely allowed under the normal `If-Match` rules. **No `409 auth_provider_secret_rebind_required`** — that error is deleted with the secret it protected. |
 | Default granted scope | `["moira:admin"]` (member of `ADMIN_SCOPES`, `src/security/authz.rs:7-91`) |
 | New scopes | `moira:auth-settings:read`, `moira:auth-settings:write`, `moira:auth-settings:delete` — appended to `ADMIN_SCOPES` |
 | New `ActorType` | `SetupToken` (serializes as `"setup_token"`); denied admin implication |
 | New config | `AuthSettings.setup_token_ttl_seconds` (default 900) — **the only** new settings field; auth-method policy including allowed email domains lives in the **database**, per CONVENTIONS §7.2 |
-| New error codes | 18 (see i18n section), each with a `moira.error.<code>` catalog entry |
+| New error codes | 16 (see i18n section), each with a `moira.error.<code>` catalog entry. **D7 removed three** (`auth_provider_secret_required`, `auth_provider_secret_not_supported`, `auth_provider_secret_rebind_required`) and added one (`auth_provider_method_config_incomplete`) |
 | New notice keys | `moira.notice.admin_identity_claimed`, `moira.notice.setup_token_issued` |
 
-> ### ⚠️ FROZEN-CONTRACT CHANGE — plans 08 and 09 must be updated to match
+> ### ⚠️ CHANGED BY D7 — the client secret is gone from Moira; plans 08 and 09 must be updated
 >
-> Product-owner decision 4 (2026-07-25) changes one shape that 08/09 already bind to. Paths, methods, method names, and scope names are **unchanged**; only the claim request/response DTO moves.
+> Product-owner decision **D7** (2026-07-25, CONVENTIONS §0) removes the OAuth client secret from Moira entirely. **This is a simplification of Moira's surface, not an addition.** Paths that remain, methods (`google_oauth|generic_oidc|jwks`), scope names (`moira:auth-settings:{read,write,delete}`), `If-Match` requirements, `Idempotency-Key`, `ETag`, utoipa coverage, and `LISTEN/NOTIFY` invalidation are **all unchanged**.
+>
+> **What changed:**
+> 1. **The frozen contract is now 10 operations, not 11.** `POST /api/v1/admin/auth/providers/{id}/rotate-secret` **no longer exists**. Any 08/09 client, wizard step, or test that calls it must be deleted.
+> 2. **No request to Moira may carry a `client_secret`.** `AuthProviderSettingsCreateRequest` and `AuthProviderSettingsPatchRequest` have no such field, and `deny_unknown_fields` means sending one is a **loud schema error, not a silent drop**. A stale 08 client will fail fast — which is the intent.
+> 3. **No response from Moira contains secret material, including `secret_fingerprint` and `masked_secret`, which are gone from `AuthProviderSettingsRecord`.** Any 08/09 UI rendering a masked secret from Moira has nothing to render and must be removed.
+> 4. **The console now owns the OAuth client secret**, stored encrypted at rest in its own `console_auth` database (which Better Auth already requires), written by the setup wizard, never sent to Moira, never exposed to the browser, never in `NEXT_PUBLIC_*`.
+> 5. **`409 auth_provider_secret_rebind_required` is deleted**, along with the "changing issuer/client_id invalidates the secret" hazard. On the Moira side, `issuer` and `client_id` are ordinary patchable configuration.
+>
+> **Drift protection — plan 08's contract with this plan.** Moira is the **source of truth for `client_id`** and already returns it on every read path (`AuthProviderSettingsRecord.client_id`, `PublicAuthMethod.client_id`). **That is sufficient: 08 needs no new Moira endpoint, field, header, or server-side fingerprint.** Plan 08 must (a) have the wizard write Moira's provider config and the console's secret **in the same step**, treating partial success as an operator-resolvable failure; (b) store a fingerprint of `client_id` beside the secret and compare it against Moira's `client_id` on load, raising a specific actionable keyed error on mismatch instead of letting the OAuth code exchange fail with an opaque provider error; (c) ship an e2e test asserting the mismatch path produces that actionable error. All three are **08 deliverables**; Moira's only obligation is the exposed `client_id`, which is already met.
+>
+> ### ⚠️ FROZEN-CONTRACT CHANGE — claim DTO shape (decision D5)
+>
+> Product-owner decision **D5** (2026-07-25) changes one shape that 08/09 already bind to. Paths, methods, method names, and scope names are **unchanged**; only the claim request/response DTO moves.
 >
 > **`ClaimAdminIdentityRequest.email`: `Option<String>` → `String` (required), and `email_verified` loses `#[serde(default)]` (also required).** Correspondingly `AdminIdentityRecord.email`: `Option<String>` → `String`.
 >
@@ -835,9 +828,11 @@ Two codes this plan's endpoints **will** emit have **no catalog entry today** (v
 > 3. **Plan 08** — `GET /api/v1/admin/setup/auth-methods` is confirmed authenticated: 08 must call it **server-side** from the BFF with the system key. Any 08 draft that fetches it from the browser, or that assumes an anonymous variant, must be corrected. `GET …/setup/claim-status` remains the only anonymous call.
 > 4. **Plan 09** — invitation/additional-admin flows build on the same claim path, so they inherit required-email and deny-by-default domain policy. There is no invitation-based exemption either; an invited admin's email must still be in an allowed domain.
 >
-> Everything else in this table is unchanged and remains binding: `GET /api/v1/admin/setup/claim-status`, `POST /api/v1/admin/setup/claim`, `GET /api/v1/admin/setup/auth-methods`, `/api/v1/admin/auth/providers*`, methods `google_oauth|generic_oidc|jwks`, scopes `moira:auth-settings:{read,write,delete}`.
+> 5. **Plan 08** — the wizard must **stop sending `client_secret` to Moira** and must write it to the console's own `console_auth` store instead (D7 callout above). Remove any rotate-secret call, any masked-secret display sourced from Moira, and any assumption that Moira can hand the secret back.
+>
+> Everything else in this table is unchanged and remains binding: `GET /api/v1/admin/setup/claim-status`, `POST /api/v1/admin/setup/claim`, `GET /api/v1/admin/setup/auth-methods`, the remaining seven `/api/v1/admin/auth/providers*` operations, methods `google_oauth|generic_oidc|jwks`, scopes `moira:auth-settings:{read,write,delete}`, `If-Match` on every mutation, `Idempotency-Key` on create, `ETag` on every record response, full utoipa coverage, and `LISTEN/NOTIFY` cache invalidation.
 
-**08's setup-wizard flow against this contract:** unauthenticated `GET …/setup/claim-status` → if `claimed: false`, the BFF (holding a server-side Moira system key) calls `GET …/setup/auth-methods` **server-side** to learn how to configure Better Auth → the operator creates and **enables** the `auth_provider_settings` row, **including `allowed_email_domains`** (without this the next step always 403s) → the BFF drives the human through OAuth → the BFF calls `POST …/setup/claim` with the system key and the human's `(issuer, subject, email, email_verified)`, all four required → after the grant, the human's own trusted-JWT calls reach the *existing* `GET …/setup/status` for structural readiness. The BFF registers its own JWKS endpoint as a `trusted_jwt_issuer` via the **pre-existing** `/api/v1/admin/jwt-issuers` surface, with `scopes_claim` left NULL (CONVENTIONS §7.5).
+**08's setup-wizard flow against this contract:** unauthenticated `GET …/setup/claim-status` → if `claimed: false`, the BFF (holding a server-side Moira system key) calls `GET …/setup/auth-methods` **server-side** to learn how to configure Better Auth → the operator creates and **enables** the `auth_provider_settings` row in Moira, **including `allowed_email_domains`** (without this the next step always 403s) and **including `client_id`**, while the wizard writes the matching **client secret plus a fingerprint of that `client_id` into the console's own `console_auth` database in the same step** (D7; partial success is a failure the operator must resolve) → the BFF drives the human through OAuth → the BFF calls `POST …/setup/claim` with the system key and the human's `(issuer, subject, email, email_verified)`, all four required → after the grant, the human's own trusted-JWT calls reach the *existing* `GET …/setup/status` for structural readiness. The BFF registers its own JWKS endpoint as a `trusted_jwt_issuer` via the **pre-existing** `/api/v1/admin/jwt-issuers` surface, with `scopes_claim` left NULL (CONVENTIONS §7.5).
 
 ### `GET /api/v1/admin/setup/claim-status`
 
@@ -850,7 +845,7 @@ Two codes this plan's endpoints **will** emit have **no catalog entry today** (v
 
 - **Auth:** `X-Moira-System-Key` (must carry `moira:admin`, verified against `system_api_keys` by `verify_system_key_only`) **or** `setup_token` in the JSON body (verified against `admin_setup_tokens`, single-use). **A bare `Authorization: Bearer <jwt>` alone is rejected 401 regardless of the JWT's scopes** — the structural "no first-login-wins" enforcement.
 - **Headers:** optional `Idempotency-Key`. When present, the claim is replay-safe (identical request + key → identical response, no duplicate grant) via the shared admin envelope. When absent, duplicate *effects* are still impossible because the `(issuer, subject)` unique index rejects a second claim with `409 admin_identity_already_claimed` — but a caller retrying without a key gets 409, not a replay. Documented explicitly in the OpenAPI description.
-- **Request body:** `ClaimAdminIdentityRequest`, `deny_unknown_fields`. **`issuer`, `subject`, `email`, and `email_verified` are all required** (decision 4 — see the frozen-contract change callout above). A body omitting `email` or `email_verified` never reaches the service: the `Json` extractor rejects it and module 11's `claim_body_rejection` returns the standard `ErrorResponse` envelope with `code: "invalid_request"` and `message_key: "moira.error.invalid_request"` at axum's own status (400 malformed JSON, 422 schema violation).
+- **Request body:** `ClaimAdminIdentityRequest`, `deny_unknown_fields`. **`issuer`, `subject`, `email`, and `email_verified` are all required** (decision **D5** — see the frozen-contract change callout above). A body omitting `email` or `email_verified` never reaches the service: the `Json` extractor rejects it and module 11's `claim_body_rejection` returns the standard `ErrorResponse` envelope with `code: "invalid_request"` and `message_key: "moira.error.invalid_request"` at axum's own status (400 malformed JSON, 422 schema violation).
 - **Policy, both paths, no exemptions:** `email_verified` must be `true` (else 403 `admin_claim_email_not_verified`); the email must be non-empty and contain an extractable domain (else 400 `admin_claim_email_required`); an enabled `auth_provider_settings` row must govern the target issuer and list the email's domain in `allowed_email_domains` (else 403 `admin_claim_domain_not_allowed`). **Deny-by-default: unconfigured or empty ⇒ deny.** The system-key path is authorised to *submit* a claim; it is not exempt from *policy*. There is no first-claim exemption and no bootstrap bypass.
 - **201 Created:** new grant. **200 OK:** idempotent replay. Body shape (`AdminIdentityRecord`, including `notice`) identical in both cases; the status code is what distinguishes them. `AdminIdentityRecord.email` is a required `String`.
 - **Status → code mapping:** see the i18n table. Every non-2xx carries the standard `ErrorResponse` envelope with a non-empty `message_key` and `message`.
@@ -865,7 +860,9 @@ Two codes this plan's endpoints **will** emit have **no catalog entry today** (v
 - **Auth:** standard admin authentication (`admin_actor`), plus the new `moira:auth-settings:*` scopes.
 - **Versioning:** `If-Match` **required** on every mutation except create, checked **inside** the transaction under `select … for update` (not the read-then-compare pattern the existing issuer handlers use — see module 12). Stale version → `409 resource_version_conflict`.
 - **Idempotency:** `Idempotency-Key` supported on create, via the shared admin envelope.
-- **Secrets:** `client_secret` is accepted on create and on `rotate-secret` only. It is **never** returned, in any response, ever. `AuthProviderSettingsRecord` exposes only `secret_fingerprint` and `masked_secret`. No read-back endpoint exists.
+- **Secrets: none (decision `D7`).** No operation on this surface accepts a `client_secret`, and no response contains one — there is no `secret_fingerprint` and no `masked_secret` either, because there is no secret to fingerprint or mask. The OAuth client secret is owned by the console and lives in the console's own `console_auth` database. `POST /api/v1/admin/auth/providers/{id}/rotate-secret` **does not exist**.
+- **Read exposure:** because the payload contains no secret material at all, these reads are safe for any holder of `moira:auth-settings:read`. The scope gate remains, as configuration-disclosure control rather than secret protection.
+- **`client_id` is the D7 drift anchor:** always returned, non-secret, and the value the console fingerprints against its own stored secret. Do not remove it from any read projection.
 - **Cache invalidation:** every mutation fires the existing `notify_moira_runtime_config_change()` trigger on channel `moira_runtime_config`, which `listen_once` (`src/infra/db.rs:59-80`) consumes to invalidate the auth-settings cache on **every** instance — CONVENTIONS §7.2's requirement, satisfied through the existing mechanism with no new channel.
 - **Deny-by-default:** `enabled` is `false` on create; enabling a method with an incomplete configuration is rejected 400.
 
@@ -877,9 +874,6 @@ Two codes this plan's endpoints **will** emit have **no catalog entry today** (v
 
 | File | Test | Proves |
 |------|------|--------|
-| `src/security/crypto.rs` | `auth_provider_secret_round_trip_binds_aad` | module 4 encryption binds |
-| | `auth_provider_secret_aad_differs_from_credential_aad` | the two AAD schemes cannot be confused |
-| | `auth_provider_secret_fails_to_decrypt_after_client_id_change` | the rebind constraint is real, not theoretical |
 | `src/security/auth.rs` | `admin_identity_grant_unions_and_dedups_scopes` | module 7a union semantics |
 | | `actor_without_a_grant_is_byte_identical_to_pre_change` | backward compatibility |
 | | `setup_token_actor_is_denied_admin_implication` | module 7c |
@@ -895,16 +889,18 @@ Two codes this plan's endpoints **will** emit have **no catalog entry today** (v
 | | `system_key_credential_grants_no_policy_exemption_on_a_fresh_deployment` | the explicit "no first-claim exemption / no bootstrap bypass" assertion: zero prior grants + unconfigured allow-list + valid system key ⇒ 403 `admin_claim_domain_not_allowed` |
 | | `domain_match_is_case_insensitive_and_not_subdomain_wildcarded` | policy step 5 |
 | | `claim_rejects_an_issuer_with_no_active_trusted_issuer_row` | module 5 `resolve_active_issuer` |
-| `src/domain/identity.rs` | `claim_request_requires_email_and_email_verified` | deserializing a body omitting either field **fails** — pins decision 4 at the DTO level, where 08/09's generated clients bind |
+| `src/domain/identity.rs` | `claim_request_requires_email_and_email_verified` | deserializing a body omitting either field **fails** — pins decision **D5** at the DTO level, where 08/09's generated clients bind |
 | `src/http/identity.rs` | `claim_body_rejection_maps_to_the_invalid_request_code` | a `JsonRejection` becomes `AppError::coded(_, "invalid_request", _)`, preserving axum's status and yielding `moira.error.invalid_request` |
-| `src/application/auth_settings.rs` | `jwks_method_rejects_a_client_secret` | method-shape validation |
-| | `oauth_method_requires_a_client_secret_before_enabling` | deny-by-default enablement |
-| | `patch_rejects_issuer_change_while_a_secret_exists` | module 4's AAD consequence |
+| `src/application/auth_settings.rs` | `jwks_method_requires_a_jwks_url_and_rejects_a_client_id` | method-shape validation (non-secret) |
+| | `oidc_method_requires_an_issuer_or_discovery_url_before_enabling` | deny-by-default enablement on **non-secret** completeness — Moira has no secret to check (**D7**) |
+| | `patch_allows_changing_issuer_and_client_id` | **D7**: with no AAD-bound secret, these are ordinary mutable config; the deleted `auth_provider_secret_rebind_required` path must not come back |
 | | `console_issuer_with_a_scopes_claim_is_rejected` | **CONVENTIONS §7.5** |
-| `src/domain/auth_settings.rs` | `auth_provider_settings_record_never_serializes_the_envelope` | secret-leak guard on the DTO |
-| | `public_auth_method_never_exposes_secret_fields` | projection guard |
+| `src/domain/auth_settings.rs` | `auth_provider_dtos_have_no_client_secret_field` | **D7** structural guard: neither create nor patch deserializes a `client_secret`, and `deny_unknown_fields` makes sending one an error rather than a silent drop |
+| | `public_auth_method_never_exposes_secret_fields` | projection guard (now a forward guard against reintroduction — no secret field exists to redact) |
+| | `public_auth_method_exposes_client_id` | **D7 drift-protection contract**: `client_id` is present on the read projection plan 08 fingerprints, so 08 can bind to it |
 | `src/infra/repositories/identity.rs` | `fake_admin_identity_repository_supports_claim_unit_tests` | the trait exists from day one (no P2-3 retrofit needed) |
-| `src/i18n/catalog/mod.rs` | `identity_error_keys_exist_in_the_catalog`, `identity_notice_keys_exist_in_the_catalog` | **CONVENTIONS §4.5** — all 18 error keys and 2 notice keys present |
+| `src/i18n/catalog/mod.rs` | `identity_error_keys_exist_in_the_catalog`, `identity_notice_keys_exist_in_the_catalog` | **CONVENTIONS §4.5** — all 16 error keys and 2 notice keys present |
+| | `no_auth_provider_client_secret_keys_exist_in_the_catalog` | **D7** regression guard: `moira.error.auth_provider_secret_required`, `…_secret_not_supported`, and `…_secret_rebind_required` are absent from the catalog and from `docs/i18n-response-catalog.json` |
 | `src/error.rs` | `identity_error_codes_derive_their_documented_message_keys` | the `AppError::coded` vs `AppError::Forbidden` trap is closed |
 
 All service-layer unit tests run against the module-5/6 repository fakes — **no Postgres required**.
@@ -937,7 +933,7 @@ Following `tests/support/mod.rs` and the in-process-router pattern of `tests/adm
 | `claim_is_denied_when_no_auth_provider_configuration_exists_at_all` | the stricter sibling: **zero** `auth_provider_settings` rows, fresh database, valid system key, `claimed: false` ⇒ still 403, same code. **This is the "no bootstrap bypass" test** — it must be impossible to make it pass by adding a first-claim exemption |
 | `system_key_path_is_not_exempt_from_the_domain_policy` | the same disallowed-domain body denied on the system-key path exactly as on the setup-token path — the withdrawn carve-out cannot come back |
 | `claim_succeeds_once_the_operator_configures_and_enables_the_allowed_domain` | the positive counterpart: the denial is *configuration*, not breakage — configure + enable, then the identical claim returns 201. Without this, the deny tests could be satisfied by an endpoint that never works |
-| `claim_without_an_email_is_rejected_with_a_catalogued_error` | decision 4 at HTTP level: a body omitting `email` returns axum's schema-violation status with the full `ErrorResponse` envelope, `error.code == "invalid_request"`, and a non-empty `message_key`/`message` — **not** axum's bare plain-text rejection |
+| `claim_without_an_email_is_rejected_with_a_catalogued_error` | decision **D5** at HTTP level: a body omitting `email` returns axum's schema-violation status with the full `ErrorResponse` envelope, `error.code == "invalid_request"`, and a non-empty `message_key`/`message` — **not** axum's bare plain-text rejection |
 | `claim_without_email_verified_is_rejected_with_a_catalogued_error` | same, for the field that lost `#[serde(default)]` — proves an omitted flag is a schema error, not a silent `false` |
 | `system_key_claim_without_an_email_is_rejected` | the system-key path gets no email exemption either |
 | `every_granted_admin_identity_row_carries_a_non_null_email` | audit-attribute guarantee: after every successful claim in this suite, `admin_identities.email` is non-null (the application invariant behind the deliberately-nullable column) |
@@ -950,20 +946,21 @@ Following `tests/support/mod.rs` and the in-process-router pattern of `tests/adm
 
 | Test | Proves |
 |---|---|
-| `create_google_oauth_provider_stores_the_client_secret_encrypted` | ciphertext ≠ plaintext in the DB |
-| `client_secret_is_never_returned_in_any_response_body` | **secret-leak, CONVENTIONS §8** |
-| `client_secret_never_appears_in_the_openapi_document` | ditto |
-| `client_secret_never_appears_in_an_audit_log_metadata_row` | ditto |
-| `rotate_secret_requires_if_match_and_replaces_the_envelope` | mirrors `credential_rotation_enforces_if_match_atomically` |
+| `create_google_oauth_provider_stores_only_non_secret_configuration` | **D7**: the created row's columns are exactly the non-secret set; a direct DB inspection finds no envelope column, because none exists on the table |
+| `auth_provider_requests_reject_a_client_secret_field` | **D7**: a create or patch body carrying `client_secret` is rejected by `deny_unknown_fields` with a catalogued `ErrorResponse` — never silently accepted, never silently dropped |
+| `no_auth_provider_response_contains_secret_material` | **secret-leak, CONVENTIONS §8** — no response body from any of the seven provider operations or from `…/setup/auth-methods` contains `client_secret`, `secret_fingerprint`, `masked_secret`, or any envelope field |
+| `openapi_document_has_no_rotate_secret_operation_and_no_secret_schema_fields` | **D7 at the contract level**: `POST /api/v1/admin/auth/providers/{id}/rotate-secret` is absent from the generated spec, as are `client_secret`/`secret_fingerprint`/`masked_secret` on every auth-settings schema. This is the test 08/09 bind against |
+| `rotate_secret_path_returns_404_because_it_does_not_exist` | **D7**: the removed route is genuinely unrouted, not merely undocumented |
 | `patch_requires_if_match_and_conflicts_on_a_stale_version` | optimistic concurrency |
-| `patching_the_issuer_while_a_secret_exists_returns_409` | AAD rebind constraint at HTTP level |
-| `jwks_method_rejects_a_client_secret_with_400` | method-shape validation |
-| `enabling_an_incomplete_oauth_provider_returns_400` | deny-by-default enablement |
+| `patching_the_issuer_and_client_id_succeeds_with_a_valid_if_match` | **D7**: the former AAD-rebind 409 is gone; these are ordinary configuration fields now |
+| `client_id_is_returned_by_the_read_endpoints_for_drift_comparison` | **D7 drift-protection contract at HTTP level**: `GET …/auth/providers/{id}` and `GET …/setup/auth-methods` both return `client_id`, and it reflects the value most recently written — the exact guarantee plan 08's fingerprint comparison binds to |
+| `jwks_method_without_a_jwks_url_returns_400` | method-shape validation (non-secret) |
+| `enabling_a_provider_with_incomplete_non_secret_config_returns_400` | deny-by-default enablement, `auth_provider_method_config_incomplete` |
 | `a_second_provider_for_the_same_method_and_issuer_returns_409` | unique index |
 | `create_is_idempotent_under_an_idempotency_key` | shared envelope |
-| `auth_settings_endpoints_require_their_scopes` | authz gating on all eight routes |
+| `auth_settings_endpoints_require_their_scopes` | authz gating on all seven provider routes |
 | `setup_auth_methods_requires_a_setup_actor_and_rejects_anonymous` | the endpoint is authenticated on purpose |
-| `setup_auth_methods_rejects_an_unauthenticated_call_with_401` | **decision 3, asserted exactly**: `GET /api/v1/admin/setup/auth-methods` with **no** `X-Moira-System-Key` and **no** `Authorization` header returns **401** with a coded `ErrorResponse` and a non-empty `message_key`. Assert the body contains no `methods` array, no issuer, no client id, and no domain policy — the point is that anonymous reconnaissance yields nothing |
+| `setup_auth_methods_rejects_an_unauthenticated_call_with_401` | **decision D4, asserted exactly**: `GET /api/v1/admin/setup/auth-methods` with **no** `X-Moira-System-Key` and **no** `Authorization` header returns **401** with a coded `ErrorResponse` and a non-empty `message_key`. Assert the body contains no `methods` array, no issuer, no client id, and no domain policy — the point is that anonymous reconnaissance yields nothing |
 | `setup_auth_methods_rejects_a_setup_actor_missing_the_setup_read_scope` | the scope half of the gate, not just the actor-type half |
 | `setup_auth_methods_succeeds_for_a_system_key_actor` | the server-side call 08's BFF makes actually works — the decision does not break the wizard |
 | `claim_status_is_anonymous_while_auth_methods_is_not` | pins the deliberate asymmetry in one place: the same unauthenticated client gets **200 `{"claimed": …}`** from `…/setup/claim-status` and **401** from `…/setup/auth-methods`. If a future change makes these agree, this test fails and forces the reasoning to be revisited |
@@ -976,8 +973,8 @@ Following `tests/support/mod.rs` and the in-process-router pattern of `tests/adm
 ### Other verification
 
 - **Migration:** both new migrations apply cleanly to a fresh database via `sqlx::migrate!` (`src/infra/db.rs:36-41`); `tests/security_foundation.rs`'s migration-contract job passes with them included, confirming append-only compliance (no edit to 0001-0008).
-- **OpenAPI:** `src/http/mod.rs`'s 8 spec tests are **extended** to cover all eleven new operations — presence, status codes, schemas, security annotations, and the documented-and-commented exemption for `get_setup_claim_status` being unauthenticated. If plan 05's drift gate has landed, the committed snapshot is regenerated in this PR.
-- **Secret-leak:** in addition to the DTO/OpenAPI/audit tests above, a test asserts `admin_setup_tokens.token_hash` is an Argon2id hash — not plaintext and not a reversible encoding — and that the minted token appears in exactly one response body (the mint response) and nowhere else, mirroring the existing `system_api_keys` handling and `src/security/masking::tests`.
+- **OpenAPI:** `src/http/mod.rs`'s 8 spec tests are **extended** to cover all **ten** new operations — presence, status codes, schemas, security annotations, and the documented-and-commented exemption for `get_setup_claim_status` being unauthenticated. They must also assert the **absence** of `POST /api/v1/admin/auth/providers/{id}/rotate-secret` (**D7**). If plan 05's drift gate has landed, the committed snapshot is regenerated in this PR.
+- **Secret-leak:** the setup token is the only secret this plan writes. A test asserts `admin_setup_tokens.token_hash` is an Argon2id hash — not plaintext and not a reversible encoding — and that the minted token appears in exactly one response body (the mint response) and nowhere else, mirroring the existing `system_api_keys` handling and `src/security/masking::tests`. **The OAuth client secret needs no leak test in Moira, because Moira never receives one (D7)**; the corresponding secret-leak coverage for it is plan 08's, against the console's own store and bundle.
 - **Required gates (CONVENTIONS §2, verbatim):**
   ```bash
   cargo fmt --check
@@ -997,8 +994,10 @@ Following `tests/support/mod.rs` and the in-process-router pattern of `tests/adm
 - [ ] `GET /api/v1/admin/setup/claim-status` is unauthenticated, returns **only** `{ "claimed": bool }`, and is verified by passing tests to return `false` on a fresh database and `true` after any successful claim.
 - [ ] `POST /api/v1/admin/setup/claim` is verified by passing tests to: reject a bare trusted-JWT bearer token unconditionally (401); accept a valid system-key claim; accept a valid one-time setup-token claim and reject a reused/expired/wrong-target one; enforce verified-email and the **deny-by-default** domain policy; be idempotent under `Idempotency-Key` and conflict safely (409, never duplicate) without one.
 - [ ] A granted `(issuer, subject)`'s next trusted-JWT request resolves to an `Actor` carrying the granted scopes, verified by a test that performs a real `authenticate_trusted_jwt` before and after a grant and diffs `Actor.scopes`; and an ungranted actor's `Actor` is byte-identical to pre-change.
-- [ ] All eight `/api/v1/admin/auth/providers…` operations plus `GET /api/v1/admin/setup/auth-methods` exist, are scope-gated, require `If-Match` on every mutation (checked **inside** the transaction), support `Idempotency-Key` on create, and are covered by passing e2e tests.
-- [ ] **The client secret is stored encrypted via `SecretCipher` (AES-256-GCM + a purpose-built AAD) and never appears in any response body, OpenAPI document, log line, or audit-metadata field — proven by tests, not asserted.**
+- [ ] All **seven** `/api/v1/admin/auth/providers…` operations plus `GET /api/v1/admin/setup/auth-methods` exist, are scope-gated, require `If-Match` on every mutation (checked **inside** the transaction), support `Idempotency-Key` on create, and are covered by passing e2e tests. **The frozen contract totals 10 operations.**
+- [ ] **RESOLVED DECISION — no OAuth client secret in Moira (product owner `D7`, 2026-07-25).** `auth_provider_settings` has **no** `encrypted_payload` / `encryption_algorithm` / `encryption_version` / `encrypted_data_key` / `nonce` / `secret_fingerprint` / `masked_secret` column and no envelope-completeness CHECK; no request DTO has a `client_secret` field; no response contains secret material; `POST /api/v1/admin/auth/providers/{id}/rotate-secret` does not exist and is absent from the generated OpenAPI document; `src/security/crypto.rs` is **unmodified** (no `auth_provider_secret_aad`); and `auth_provider_secret_rebind_required` exists nowhere in code or catalog. Proven by `create_google_oauth_provider_stores_only_non_secret_configuration`, `auth_provider_requests_reject_a_client_secret_field`, `no_auth_provider_response_contains_secret_material`, `openapi_document_has_no_rotate_secret_operation_and_no_secret_schema_fields`, `rotate_secret_path_returns_404_because_it_does_not_exist`, and `no_auth_provider_client_secret_keys_exist_in_the_catalog`. **This preserves Moira's invariant that a decrypted secret never crosses a network boundary.**
+- [ ] **D7 drift protection — Moira's obligation is met and stated.** `client_id` is returned as a non-secret field by `GET /api/v1/admin/auth/providers`, `GET …/{id}`, and `GET /api/v1/admin/setup/auth-methods`, and the plan records **explicitly** that this is sufficient for the console's fingerprint comparison so plan 08 can bind to it with no additional Moira surface. Proven by `public_auth_method_exposes_client_id` and `client_id_is_returned_by_the_read_endpoints_for_drift_comparison`.
+- [ ] **Provider credentials are untouched.** `provider_credentials`, `CredentialRecord`'s `#[serde(skip_serializing)]` + `#[schema(ignore)]` envelope hiding, `SecretCipher`, and `credential_aad`/`CredentialAadParts` are **unmodified** by this plan and their existing tests still pass. D7 applies to the OAuth client secret only.
 - [ ] **An auth-settings write invalidates the runtime cache on every instance through the existing Postgres `LISTEN/NOTIFY` path — proven by a test, not asserted** (CONVENTIONS §7.2).
 - [ ] All three CONVENTIONS §7.3 modes are reachable from settings: `google_oauth` and `generic_oidc` via `auth_provider_settings`; `jwks` via `auth_provider_settings` linked to the **pre-existing** `trusted_jwt_issuers` surface, with **no new trust mechanism invented**.
 - [ ] Any `trusted_jwt_issuers` row linked as a console issuer has `scopes_claim IS NULL`, enforced on write and asserted by a test (CONVENTIONS §7.5 — no self-asserted scopes).
@@ -1006,11 +1005,11 @@ Following `tests/support/mod.rs` and the in-process-router pattern of `tests/adm
 - [ ] The existing `GET /api/v1/admin/setup/status` endpoint, `SetupStatusResponse`, `SetupChecks`/`SetupCheckName`, `SETUP_READINESS_SQL`, and the secret-column guard test at `src/infra/repositories/setup.rs:164-179` are **unmodified** and their tests still pass.
 - [ ] The existing `bootstrap-system-key` CLI is **unmodified** and documented as the break-glass root that the claim flow's system-key path depends on.
 - [ ] **No Next.js / OAuth-client / session / cookie code exists in this diff** — a reviewer grep for `next`, `oauth` (outside config field names and doc text), `session`, `cookie` returns nothing new. Moira runs no OAuth flow.
-- [ ] **RESOLVED DECISION — email required on both paths (product owner, 2026-07-25).** `ClaimAdminIdentityRequest.email` is `String` and `email_verified` is a `bool` with no serde default; both are marked `required` in the generated OpenAPI schema; `AdminIdentityRecord.email` is `String`. A claim omitting either field returns the full `ErrorResponse` envelope with `code: "invalid_request"` and `message_key: "moira.error.invalid_request"` (existing catalog key, verified present at `src/i18n/catalog/errors.rs:35`) — **never** axum's bare plain-text rejection. Proven by `claim_request_requires_email_and_email_verified`, `claim_body_rejection_maps_to_the_invalid_request_code`, `claim_without_an_email_is_rejected_with_a_catalogued_error`, `claim_without_email_verified_is_rejected_with_a_catalogued_error`, and `system_key_claim_without_an_email_is_rejected`. Every grant row carries a non-null email, proven by `every_granted_admin_identity_row_carries_a_non_null_email`.
-- [ ] **RESOLVED DECISION — domain allow-list is deny-by-default with NO exemptions (product owner, 2026-07-25).** An unconfigured or empty `allowed_email_domains` denies every claim, on the system-key path and the setup-token path alike; the refusal is `403` with code `admin_claim_domain_not_allowed` and key `moira.error.admin_claim_domain_not_allowed`. **There is no first-claim exemption and no bootstrap bypass in the diff** — a reviewer confirms no `ClaimCredential::SystemKey` short-circuit, no "first grant" special case, no env-var or build-flag escape hatch. Proven by `claim_is_denied_by_default_when_no_domain_allow_list_is_configured`, `claim_is_denied_when_no_auth_provider_configuration_exists_at_all`, `system_key_path_is_not_exempt_from_the_domain_policy`, `system_key_credential_grants_no_policy_exemption_on_a_fresh_deployment`, and `domain_policy_is_enforced_identically_on_the_system_key_path`; and shown to be configuration rather than breakage by `claim_succeeds_once_the_operator_configures_and_enables_the_allowed_domain`.
+- [ ] **RESOLVED DECISION — email required on both paths (product owner `D5`, 2026-07-25).** `ClaimAdminIdentityRequest.email` is `String` and `email_verified` is a `bool` with no serde default; both are marked `required` in the generated OpenAPI schema; `AdminIdentityRecord.email` is `String`. A claim omitting either field returns the full `ErrorResponse` envelope with `code: "invalid_request"` and `message_key: "moira.error.invalid_request"` (existing catalog key, verified present at `src/i18n/catalog/errors.rs:35`) — **never** axum's bare plain-text rejection. Proven by `claim_request_requires_email_and_email_verified`, `claim_body_rejection_maps_to_the_invalid_request_code`, `claim_without_an_email_is_rejected_with_a_catalogued_error`, `claim_without_email_verified_is_rejected_with_a_catalogued_error`, and `system_key_claim_without_an_email_is_rejected`. Every grant row carries a non-null email, proven by `every_granted_admin_identity_row_carries_a_non_null_email`.
+- [ ] **RESOLVED DECISION — domain allow-list is deny-by-default with NO exemptions (product owner `D3`, 2026-07-25).** An unconfigured or empty `allowed_email_domains` denies every claim, on the system-key path and the setup-token path alike; the refusal is `403` with code `admin_claim_domain_not_allowed` and key `moira.error.admin_claim_domain_not_allowed`. **There is no first-claim exemption and no bootstrap bypass in the diff** — a reviewer confirms no `ClaimCredential::SystemKey` short-circuit, no "first grant" special case, no env-var or build-flag escape hatch. Proven by `claim_is_denied_by_default_when_no_domain_allow_list_is_configured`, `claim_is_denied_when_no_auth_provider_configuration_exists_at_all`, `system_key_path_is_not_exempt_from_the_domain_policy`, `system_key_credential_grants_no_policy_exemption_on_a_fresh_deployment`, and `domain_policy_is_enforced_identically_on_the_system_key_path`; and shown to be configuration rather than breakage by `claim_succeeds_once_the_operator_configures_and_enables_the_allowed_domain`.
 - [ ] **Operator-facing copy exists so the deny-by-default 403 does not read as a bug** (module 10): the `POST …/setup/claim` OpenAPI description states the policy and names the endpoints that configure it; `moira.error.admin_claim_domain_not_allowed`'s catalog `description` carries the actionable setup guidance; and the `docs/` setup runbook documents the required ordering (bootstrap key → trusted issuer → auth-provider row **with** `allowed_email_domains` → enable → claim). All three land in this PR.
-- [ ] **RESOLVED DECISION — `GET /api/v1/admin/setup/auth-methods` stays authenticated (product owner, 2026-07-25).** It requires `ActorType::SystemKey | TrustedJwt` **plus** `moira:setup:read`; an unauthenticated call returns **401** carrying a coded `ErrorResponse` and leaking no configuration; no anonymous variant, anonymous fallback, or `Option<Actor>` overload exists anywhere in the diff. The console's server-side system-key call still works, so the setup wizard functions. Proven by `setup_auth_methods_rejects_an_unauthenticated_call_with_401`, `setup_auth_methods_rejects_a_setup_actor_missing_the_setup_read_scope`, `setup_auth_methods_succeeds_for_a_system_key_actor`, and `claim_status_is_anonymous_while_auth_methods_is_not` (which pins the deliberate contrast with the anonymous `claim-status`).
-- [ ] **The frozen-contract change is propagated.** This PR's description reproduces the ⚠️ callout from Interfaces & Contracts (`ClaimAdminIdentityRequest.email`: `Option<String>` → `String`; `email_verified` loses its serde default; `AdminIdentityRecord.email` → `String`) and the coordinator has confirmed plans 08 and 09 are updated to match. No path, method name (`google_oauth|generic_oidc|jwks`), or scope name (`moira:auth-settings:{read,write,delete}`) changed.
+- [ ] **RESOLVED DECISION — `GET /api/v1/admin/setup/auth-methods` stays authenticated (product owner `D4`, 2026-07-25).** It requires `ActorType::SystemKey | TrustedJwt` **plus** `moira:setup:read`; an unauthenticated call returns **401** carrying a coded `ErrorResponse` and leaking no configuration; no anonymous variant, anonymous fallback, or `Option<Actor>` overload exists anywhere in the diff. The console's server-side system-key call still works, so the setup wizard functions. Proven by `setup_auth_methods_rejects_an_unauthenticated_call_with_401`, `setup_auth_methods_rejects_a_setup_actor_missing_the_setup_read_scope`, `setup_auth_methods_succeeds_for_a_system_key_actor`, and `claim_status_is_anonymous_while_auth_methods_is_not` (which pins the deliberate contrast with the anonymous `claim-status`).
+- [ ] **Both frozen-contract changes are propagated.** This PR's description reproduces **both** ⚠️ callouts from Interfaces & Contracts — (i) **D7**: the client secret is gone from Moira, `rotate-secret` is removed, the count is **10 operations not 11**, and plan 08 owns the secret plus the `client_id`-fingerprint drift check; (ii) **D5**: `ClaimAdminIdentityRequest.email` `Option<String>` → `String`, `email_verified` loses its serde default, `AdminIdentityRecord.email` → `String` — and the coordinator has confirmed plans 08 and 09 are updated to match. Method names (`google_oauth|generic_oidc|jwks`), scope names (`moira:auth-settings:{read,write,delete}`), and every surviving path are **unchanged**.
 - [ ] *(Previously-open item, resolved earlier and recorded here for continuity: whether setup-token minting is HTTP-exposed — it stays an internal service method in this plan, reachable only from a CLI-style path, mirroring `bootstrap-system-key`. A `POST /api/v1/admin/setup/claim-tokens` endpoint can be added later with no migration change, since the table already supports it.)*
 
 **CONVENTIONS §8 compliance checklist**
@@ -1021,25 +1020,26 @@ Following `tests/support/mod.rs` and the in-process-router pattern of `tests/adm
 - [ ] **E2E tests** delivered and passing at the HTTP level against a real PostgreSQL 16 + pgvector (`tests/identity_claim.rs`, `tests/auth_provider_settings.rs`).
 - [ ] Every new error and notice string has an i18n **key + English default** in the Rust catalog, mirrored into `docs/i18n-response-catalog.json`, with tests asserting presence **and** asserting the key actually reaches the client (the `AppError::coded` requirement).
 - [ ] Frontend items — **not applicable** (no console code; 08 owns Next.js 16.2.11 / Node 24 / Bun 1.3.14 / Atomic Design).
-- [ ] **Auth-touching:** config is runtime/DB-backed (§7.2); secrets encrypted (§7.2); no scope claim on console-issuer JWTs (§7.5); domain policy is deny-by-default (§7.5); identity binds to `(issuer, subject)`, never email (§7.5).
-- [ ] No secret-leak: verified by test — client secret, setup token, and system key absent from every response body, OpenAPI document, audit metadata, and log line.
+- [ ] **Auth-touching:** config is runtime/DB-backed (§7.2); the OAuth client secret is **not stored in Moira at all** and lives encrypted in the console's own `console_auth` DB (§7.2 as amended by **D7**), while provider credentials remain encrypted in Moira with `SecretCipher` + AAD; no scope claim on console-issuer JWTs (§7.5); domain policy is deny-by-default (§7.5); identity binds to `(issuer, subject)`, never email (§7.5).
+- [ ] No secret-leak: verified by test — setup token and system key absent from every response body, OpenAPI document, audit metadata, and log line. (No client-secret leak test is needed or possible in Moira: **D7** means Moira never receives one; that coverage belongs to plan 08 against the console's own store and bundle.)
 - [ ] PR **merged** with all gates green — not merely opened.
 
 ---
 
 ## Risks & Rollback
 
-**Security.** This is the highest-risk plan in the roadmap after 03 — it is the one place Moira grants standing admin authority to a human-controlled identity, and it now also custodies OAuth client secrets. Risks and mitigations:
+**Security.** This is the highest-risk plan in the roadmap after 03 — it is the one place Moira grants standing admin authority to a human-controlled identity. **Decision `D7` materially reduces its blast radius**: Moira custodies no OAuth client secret, so an entire class of risk (envelope leakage, AAD misbinding, a read-back path being added under pressure, a rotation endpoint mishandling plaintext) simply does not exist here. Remaining risks and mitigations:
 
 1. *The `auth.rs` extension becomes reachable from a non-trusted-JWT path.* Mitigated by module 7's explicit scoping and the dedicated reviewer pass (Multi-Agent Workflow), which checks reachability from all five `ActorType` branches explicitly.
 2. *The claim endpoint accepts a bare JWT through a credential-resolution bug.* Mitigated by `resolve_claim_credential`'s narrow explicit allow-list — it never falls through to `authenticate_admin` — plus `bare_trusted_jwt_cannot_claim_regardless_of_its_scopes`.
 3. *A setup token is replayable.* Mitigated by the `and consumed_at is null` guard at the **database** level, so even an application-logic bug cannot make it replay-safe by accident.
 4. *A console issuer self-asserts scopes and bypasses the grant table.* Mitigated by module 7d's `scopes_claim IS NULL` enforcement and its test — this is CONVENTIONS §7.5's central rule, and it is enforced in Moira rather than trusted to 08.
-5. *The client secret leaks.* Mitigated by never persisting plaintext, never exposing a read-back path, the `#[serde(skip_serializing)]`/`#[schema(ignore)]` DTO pattern copied from `CredentialRecord`, and four separate leak tests (body, OpenAPI, audit, log).
-6. *A new error condition ships with an unresolvable `message_key`.* Mitigated by the `AppError::coded` requirement, the catalog-presence tests, and `identity_error_codes_derive_their_documented_message_keys`. This is a real trap — `AppError::Forbidden` derives `forbidden`, not the specific code — and it is exactly the failure mode the audit found eight instances of already.
-7. *The unauthenticated `claim-status` route is swallowed or exempted incorrectly by plan 03's middleware.* Mitigated by Wave 0's blocking check, with an explicit instruction to stop and re-scope rather than improvise.
-8. *A deny-by-default bypass is reintroduced as a "usability fix".* The most likely regression in this plan, because the symptom (a fresh deployment's first claim returning 403) genuinely looks like a bug to someone who has not read module 10. Mitigated by three things acting together: the operator-facing copy on all three surfaces required by module 10, so the 403 is self-explaining; the explicit "no first-claim exemption / no bootstrap bypass" prohibition recorded in module 10, module 8 step 7's consequence note, the frozen contract, and the Definition of Done; and the tests `claim_is_denied_when_no_auth_provider_configuration_exists_at_all` and `system_key_credential_grants_no_policy_exemption_on_a_fresh_deployment`, which cannot be made to pass by any exemption. A bypass would exist exactly during the setup window — the moment the deployment is least defended — and would be externally indistinguishable from the first-login-wins land-grab this plan exists to prevent.
-9. *`GET …/setup/auth-methods` is relaxed to anonymous so the browser can call it directly.* Mitigated by the decision record in Security boundaries (the dividing line is information content: one bit of "is setup done" is free, the identity configuration is not), by `setup_auth_methods_succeeds_for_a_system_key_actor` proving the server-side path works so the wizard has no reason to reach for anonymity, and by `claim_status_is_anonymous_while_auth_methods_is_not`, which fails the moment the two endpoints' auth postures converge.
+5. *The OAuth client secret is reintroduced into Moira "for convenience".* This is the most likely regression against **D7**, because a single configuration store genuinely looks tidier to someone who has not read the rationale — and because the codebase already contains a working secret-envelope pattern next door in `provider_credentials`, which makes copying it feel like consistency rather than a decision reversal. Mitigated by: the migration comment that names D7 in the DDL itself; the structural tests `auth_provider_requests_reject_a_client_secret_field`, `openapi_document_has_no_rotate_secret_operation_and_no_secret_schema_fields`, `rotate_secret_path_returns_404_because_it_does_not_exist`, and `no_auth_provider_client_secret_keys_exist_in_the_catalog`, none of which can be made to pass while a secret path exists; and the recorded reason — **Better Auth needs the plaintext in process, and Moira's envelope is write-only, so a single store would require a read-back endpoint that breaks the "a decrypted secret never crosses a network boundary" invariant.** Anyone proposing to re-add it must first explain how the console obtains the plaintext without that read-back.
+6. *The two configuration stores drift* — Moira's `client_id` changes while the console still holds the previous client's secret, producing an opaque provider error at code-exchange time. Mitigated on Moira's side by exposing `client_id` on every read path as a stable, non-secret comparison anchor (Security boundaries), and on the console's side by plan 08's mandatory fingerprint comparison, same-step wizard write, and mismatch e2e test. **Moira must not "help" by storing the console's fingerprint** — that would put a secret-derived artifact back on the wrong side of the boundary.
+7. *A new error condition ships with an unresolvable `message_key`.* Mitigated by the `AppError::coded` requirement, the catalog-presence tests, and `identity_error_codes_derive_their_documented_message_keys`. This is a real trap — `AppError::Forbidden` derives `forbidden`, not the specific code — and it is exactly the failure mode the audit found eight instances of already.
+8. *The unauthenticated `claim-status` route is swallowed or exempted incorrectly by plan 03's middleware.* Mitigated by Wave 0's blocking check, with an explicit instruction to stop and re-scope rather than improvise.
+9. *A deny-by-default bypass is reintroduced as a "usability fix".* The most likely regression in this plan, because the symptom (a fresh deployment's first claim returning 403) genuinely looks like a bug to someone who has not read module 10. Mitigated by three things acting together: the operator-facing copy on all three surfaces required by module 10, so the 403 is self-explaining; the explicit "no first-claim exemption / no bootstrap bypass" prohibition recorded in module 10, module 8 step 7's consequence note, the frozen contract, and the Definition of Done; and the tests `claim_is_denied_when_no_auth_provider_configuration_exists_at_all` and `system_key_credential_grants_no_policy_exemption_on_a_fresh_deployment`, which cannot be made to pass by any exemption. A bypass would exist exactly during the setup window — the moment the deployment is least defended — and would be externally indistinguishable from the first-login-wins land-grab this plan exists to prevent.
+10. *`GET …/setup/auth-methods` is relaxed to anonymous so the browser can call it directly.* Mitigated by the decision record in Security boundaries (the dividing line is information content: one bit of "is setup done" is free, the identity configuration is not), by `setup_auth_methods_succeeds_for_a_system_key_actor` proving the server-side path works so the wizard has no reason to reach for anonymity, and by `claim_status_is_anonymous_while_auth_methods_is_not`, which fails the moment the two endpoints' auth postures converge.
 
 **Data-migration.** New tables only; no transformation of existing tables; no risk to existing rows. Migration rollback, if ever needed, is a new `0011_drop_identity_and_auth_settings.sql` — **never edit `0009`/`0010` in place once merged.**
 
@@ -1048,9 +1048,9 @@ Following `tests/support/mod.rs` and the in-process-router pattern of `tests/adm
 **Deployment.** Standard migrate-then-serve. The first deploy after this ships must be smoke-checked (per Deployment implications) to confirm `claimed: false` on an empty DB and a rejected bare-JWT claim attempt — proving the "no land-grab window" property holds from the first moment the code is live.
 
 **Rollback procedure.** Layered, least-destructive first:
-- (a) Remove the eleven routes from `documented_router()` and redeploy — immediately closes the new HTTP attack surface with no migration rollback, leaving `admin_identities`/`auth_provider_settings` data intact for forensics.
+- (a) Remove the ten routes from `documented_router()` and redeploy — immediately closes the new HTTP attack surface with no migration rollback, leaving `admin_identities`/`auth_provider_settings` data intact for forensics. Note that `auth_provider_settings` contains **no secret material** (**D7**), so leaving it in place for forensics carries no secret-exposure cost.
 - (b) Revert the `src/security/auth.rs` grant-lookup independently (it is one function call) to restore pre-07 JWT-actor resolution even if the tables remain.
 - (c) Disable all auth providers via `POST …/disable` — a data-level kill switch requiring no deploy.
 - (d) Full rollback (migration `0011` dropping the tables) is available but should be a last resort, since (a)-(c) already neutralize the risk without destroying audit data.
 
-**Deferred follow-ups (explicitly out of scope, not forgotten).** A dedicated `PATCH`/`DELETE` revoke-grant endpoint (the `status`/`revoked_at` columns exist but no route sets them; an operator uses direct DB access until then). Invitation and additional-admin flows (09). Ownership transfer (09). GitHub provider (09). Minting setup tokens over HTTP rather than only via the internal service method. Key-id-based envelope rotation for `auth_provider_settings` **and** `provider_credentials` together (neither table has a `key_id` column today, and fixing one alone would fork the pattern). Wildcard/subdomain matching in the email-domain allow-list. Applying module 11's `JsonRejection` → `invalid_request` mapping to the ~20 pre-existing admin handlers that take a bare `Json<T>` (`src/http/admin.rs:112,188,333,…`) and therefore still emit axum's uncatalogued plain-text rejection in violation of CONVENTIONS §4 — a pre-existing, repo-wide gap this plan closes only for its own new endpoint, since fixing it everywhere would violate the "pure iteration" constraint. Fixing the pre-existing read-then-compare TOCTOU in the trusted-JWT-issuer handlers (`src/http/admin.rs:1449-1452,1480-1483,1532-1535,1563-1566`), which this plan deliberately does **not** copy but also does not fix.
+**Deferred follow-ups (explicitly out of scope, not forgotten).** A dedicated `PATCH`/`DELETE` revoke-grant endpoint (the `status`/`revoked_at` columns exist but no route sets them; an operator uses direct DB access until then). Invitation and additional-admin flows (09). Ownership transfer (09). GitHub provider (09). Minting setup tokens over HTTP rather than only via the internal service method. Key-id-based envelope rotation for `provider_credentials` (no `key_id` column today; `auth_provider_settings` is **not** part of this follow-up, since **D7** leaves it with no envelope to rotate). Wildcard/subdomain matching in the email-domain allow-list. Applying module 11's `JsonRejection` → `invalid_request` mapping to the ~20 pre-existing admin handlers that take a bare `Json<T>` (`src/http/admin.rs:112,188,333,…`) and therefore still emit axum's uncatalogued plain-text rejection in violation of CONVENTIONS §4 — a pre-existing, repo-wide gap this plan closes only for its own new endpoint, since fixing it everywhere would violate the "pure iteration" constraint. Fixing the pre-existing read-then-compare TOCTOU in the trusted-JWT-issuer handlers (`src/http/admin.rs:1449-1452,1480-1483,1532-1535,1563-1566`), which this plan deliberately does **not** copy but also does not fix.
