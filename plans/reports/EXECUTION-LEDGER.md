@@ -212,6 +212,36 @@ This is a new flake introduced while fixing the old one, which is worth stating 
 counting module 13 as done. Its owner must widen or serialise that wait. **Do not treat plan 06 as
 green until a full-workspace run passes twice consecutively from cold.**
 
+### F6 — OTel exports every recorded span, so `env_filter` is the only thing holding prompts back
+
+Plan 05 wired a ~590-line OTel pipeline that bridges **every recorded span** to OTLP. Rig emits spans
+carrying `gen_ai.system_instructions` and related fields. So with `otel_enabled=true`, the log filter
+is the sole barrier between prompt content and a remote collector: a bare `debug` or `trace` level —
+rather than target-scoped `moira=debug` — would start exporting Rig's spans, prompts included.
+
+**Not currently a leak.** The shipped default is `otel_enabled=false`, and plan 05's live capture
+reviewed every exported attribute against a denylist and found nothing (prompt text, credentials,
+response bodies — zero hits). This is a *configuration* hazard, not a present defect: it needs an
+operator to enable OTel and widen the filter.
+
+Mitigated for agents in `c546f08` — the errors-testing skill now documents target-scoped `moira=debug`
+as the way to get spans and keeps bare levels forbidden, so an agent chasing an empty trace stream
+does not reach for the dangerous knob. **Worth considering for a later plan:** a filter guard that
+refuses to export third-party spans regardless of level, so the safety does not rest on operator
+discipline.
+
+### F7 — the "no `rig_core` under `src/domain/`" rule has no automated gate
+
+Plan 06 Module 7 verified it by a one-off `grep`, and the coordinator subsequently described it as
+enforced by a test. **It is not.** There is no source-scanning test for it — the only source-scanning
+tests are `supply_chain_policy.rs`, `security_foundation.rs` and `openapi_drift.rs`, none of which
+check imports. The rule currently holds by absence alone, so a future edit reintroduces the leak
+silently.
+
+`c546f08` writes it into the skills as a checkable invariant (`grep -rl rig_core src` must return
+exactly two paths) rather than claiming a gate that does not exist. **Cheap to close properly:** one
+test in the `supply_chain_policy.rs` style. Recommended for plan 07.
+
 ---
 
 ## Plan order (forced)
