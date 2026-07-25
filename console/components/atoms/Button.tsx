@@ -4,8 +4,7 @@ import styles from "./Button.module.css";
 export type ButtonVariant = "primary" | "secondary" | "danger" | "ghost";
 export type ButtonSize = "sm" | "md";
 
-export interface ButtonProps
-  extends Omit<ButtonHTMLAttributes<HTMLButtonElement>, "type"> {
+export interface ButtonProps extends Omit<ButtonHTMLAttributes<HTMLButtonElement>, "type"> {
   /** Visual style. Defaults to "primary". */
   variant?: ButtonVariant;
   /** Sizing. Defaults to "md". */

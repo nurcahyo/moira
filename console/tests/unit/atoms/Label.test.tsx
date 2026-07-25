@@ -14,7 +14,11 @@ describe("Label", () => {
   });
 
   it("renders a visible '*' plus a screen-reader-only '(required)' when required", () => {
-    render(<Label htmlFor="name-field" required>Name</Label>);
+    render(
+      <Label htmlFor="name-field" required>
+        Name
+      </Label>,
+    );
     const label = screen.getByText("Name", { exact: false }).closest("label");
     expect(label).not.toBeNull();
     expect(label).toHaveTextContent("*");

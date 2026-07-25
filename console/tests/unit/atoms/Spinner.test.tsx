@@ -10,17 +10,12 @@ describe("Spinner", () => {
 
   it("is a polite live region, not assertive, so it doesn't interrupt", () => {
     render(<Spinner />);
-    expect(screen.getByRole("status")).toHaveAttribute(
-      "aria-live",
-      "polite",
-    );
+    expect(screen.getByRole("status")).toHaveAttribute("aria-live", "polite");
   });
 
   it("uses a custom accessible label when provided", () => {
     render(<Spinner label="Saving changes" />);
-    expect(screen.getByRole("status")).toHaveAccessibleName(
-      "Saving changes",
-    );
+    expect(screen.getByRole("status")).toHaveAccessibleName("Saving changes");
   });
 
   it("hides the decorative animated element from assistive tech", () => {

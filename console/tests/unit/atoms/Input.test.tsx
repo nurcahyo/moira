@@ -28,17 +28,12 @@ describe("Input", () => {
 
   it("sets aria-invalid when invalid=true", () => {
     render(<Input aria-label="Email" invalid />);
-    expect(screen.getByRole("textbox", { name: "Email" })).toHaveAttribute(
-      "aria-invalid",
-      "true",
-    );
+    expect(screen.getByRole("textbox", { name: "Email" })).toHaveAttribute("aria-invalid", "true");
   });
 
   it("does not set aria-invalid when invalid is omitted", () => {
     render(<Input aria-label="Email" />);
-    expect(
-      screen.getByRole("textbox", { name: "Email" }),
-    ).not.toHaveAttribute("aria-invalid");
+    expect(screen.getByRole("textbox", { name: "Email" })).not.toHaveAttribute("aria-invalid");
   });
 
   it("is disabled and unfocusable when disabled=true", () => {
@@ -53,8 +48,8 @@ describe("Input", () => {
         <p id="email-hint">We never share this.</p>
       </>,
     );
-    expect(
-      screen.getByRole("textbox", { name: "Email" }),
-    ).toHaveAccessibleDescription("We never share this.");
+    expect(screen.getByRole("textbox", { name: "Email" })).toHaveAccessibleDescription(
+      "We never share this.",
+    );
   });
 });

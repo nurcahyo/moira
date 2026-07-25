@@ -27,16 +27,10 @@ export function Badge({
   children,
   ...rest
 }: BadgeProps) {
-  const classes = [styles.badge, styles[tone], className]
-    .filter(Boolean)
-    .join(" ");
+  const classes = [styles.badge, styles[tone], className].filter(Boolean).join(" ");
 
   return (
-    <span
-      className={classes}
-      role={live ? "status" : undefined}
-      {...rest}
-    >
+    <span className={classes} role={live ? "status" : undefined} {...rest}>
       {children}
     </span>
   );

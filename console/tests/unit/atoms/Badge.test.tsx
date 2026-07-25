@@ -24,9 +24,6 @@ describe("Badge", () => {
         Gold
       </Badge>,
     );
-    expect(screen.getByTestId("tier-badge")).toHaveAttribute(
-      "title",
-      "Tier: gold",
-    );
+    expect(screen.getByTestId("tier-badge")).toHaveAttribute("title", "Tier: gold");
   });
 });

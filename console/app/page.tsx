@@ -13,11 +13,10 @@ export default function HomePage() {
         Moira Console <Badge tone="info">Scaffold</Badge>
       </h1>
       <p className={styles.body}>
-        This workspace is scaffolded: toolchain, Atomic Design layers, and
-        test harnesses are in place. Sign-in, the setup wizard, and every
-        other feature arrive in{" "}
-        <code>plans/08-nextjs-console-google-oauth.md</code>, once plan 07
-        lands Moira&apos;s identity contract.
+        This workspace is scaffolded: toolchain, Atomic Design layers, and test harnesses are in
+        place. Sign-in, the setup wizard, and every other feature arrive in{" "}
+        <code>plans/08-nextjs-console-google-oauth.md</code>, once plan 07 lands Moira&apos;s
+        identity contract.
       </p>
     </main>
   );

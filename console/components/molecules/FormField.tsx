@@ -14,10 +14,7 @@ export interface FormFieldProps {
    * `role="alert"`. */
   error?: string;
   required?: boolean;
-  inputProps?: Omit<
-    InputProps,
-    "id" | "required" | "invalid" | "aria-describedby"
-  >;
+  inputProps?: Omit<InputProps, "id" | "required" | "invalid" | "aria-describedby">;
 }
 
 /**

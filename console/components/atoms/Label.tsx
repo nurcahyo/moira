@@ -17,13 +17,7 @@ export interface LabelProps extends LabelHTMLAttributes<HTMLLabelElement> {
  * Primitive, feature-agnostic form label. Always a native `<label>`
  * associated to its control via `htmlFor`, never a styled `<span>`.
  */
-export function Label({
-  htmlFor,
-  required = false,
-  className,
-  children,
-  ...rest
-}: LabelProps) {
+export function Label({ htmlFor, required = false, className, children, ...rest }: LabelProps) {
   const classes = [styles.label, className].filter(Boolean).join(" ");
 
   return (

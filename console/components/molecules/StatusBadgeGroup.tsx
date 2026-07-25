@@ -20,10 +20,7 @@ export interface StatusBadgeGroupProps {
  * the caller supplies the items and their tones; renders nothing (rather
  * than an empty list landmark) when there are none.
  */
-export function StatusBadgeGroup({
-  items,
-  "aria-label": ariaLabel,
-}: StatusBadgeGroupProps) {
+export function StatusBadgeGroup({ items, "aria-label": ariaLabel }: StatusBadgeGroupProps) {
   if (items.length === 0) {
     return null;
   }
@@ -32,7 +29,7 @@ export function StatusBadgeGroup({
     <ul className={styles.list} aria-label={ariaLabel}>
       {items.map((item) => (
         <li key={item.key} className={styles.item}>
-          <Badge tone={item.tone}>{item.label}</Badge>
+          <Badge tone={item.tone ?? "neutral"}>{item.label}</Badge>
         </li>
       ))}
     </ul>

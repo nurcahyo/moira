@@ -6,12 +6,10 @@ import { Button } from "@/components/atoms/Button";
 describe("Button", () => {
   it("renders its children as the accessible name", () => {
     render(<Button>Save changes</Button>);
-    expect(
-      screen.getByRole("button", { name: "Save changes" }),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeInTheDocument();
   });
 
-  it("defaults to type=\"button\" so it never submits a surrounding form", () => {
+  it('defaults to type="button" so it never submits a surrounding form', () => {
     render(<Button>Click me</Button>);
     expect(screen.getByRole("button")).toHaveAttribute("type", "button");
   });
@@ -58,9 +56,6 @@ describe("Button", () => {
         Submit
       </Button>,
     );
-    expect(screen.getByTestId("submit-btn")).toHaveAttribute(
-      "type",
-      "submit",
-    );
+    expect(screen.getByTestId("submit-btn")).toHaveAttribute("type", "submit");
   });
 });

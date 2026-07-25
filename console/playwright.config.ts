@@ -18,7 +18,11 @@ import { SENTINEL_ENV } from "./e2e/support/secrets";
  * suites disjoint without needing a bunfig root override.
  */
 
-const port = Number(process.env.CONSOLE_E2E_PORT ?? 3100);
+/**
+ * Deliberately not 3000 (a dev `next dev` would clash) and not 3100 (commonly
+ * taken by local Docker port mappings). Override with CONSOLE_E2E_PORT.
+ */
+const port = Number(process.env.CONSOLE_E2E_PORT ?? 3210);
 
 /** Set CONSOLE_E2E_BASE_URL to test an already-running console (no webServer). */
 const externalBaseURL = process.env.CONSOLE_E2E_BASE_URL;
@@ -27,13 +31,29 @@ const baseURL = externalBaseURL ?? `http://127.0.0.1:${port}`;
 const isCI = process.env.CI === "true" || process.env.CI === "1";
 
 /**
- * The suite runs against a *production* build by default, because that is the
- * artifact the Dockerfile ships and the only one whose client bundles are
- * representative for the secret-leak scan. `E2E_SKIP_BUILD=1` reuses an
- * existing `.next` for fast local iteration.
+ * The suite runs against a *production* build, served by the **standalone**
+ * server — i.e. exactly the artifact `Dockerfile` ships. `next start` is not
+ * used: Next.js warns that it "does not work with output: standalone", and a
+ * secret-leak gate that scans a differently-assembled server is a weaker gate
+ * than one that scans the real one.
+ *
+ * Assembling standalone means copying the two directories Next deliberately
+ * leaves out of `.next/standalone` (the client assets in `.next/static` and
+ * `public/`), which is the same copy the Dockerfile's runtime stage performs.
+ * The `rm -rf` avoids the `static/static` nesting you get from re-copying onto
+ * an existing directory.
+ *
+ * `E2E_SKIP_BUILD=1` reuses an existing `.next` for fast local iteration.
  */
+const assembleAndStart = [
+  "rm -rf .next/standalone/.next/static .next/standalone/public",
+  "cp -R .next/static .next/standalone/.next/static",
+  "(cp -R public .next/standalone/public || true)",
+  "node .next/standalone/server.js",
+].join(" && ");
+
 const startCommand =
-  process.env.E2E_SKIP_BUILD === "1" ? "bun run start" : "bun run build && bun run start";
+  process.env.E2E_SKIP_BUILD === "1" ? assembleAndStart : `bun run build && ${assembleAndStart}`;
 
 export default defineConfig({
   testDir: "./e2e",

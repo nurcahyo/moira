@@ -22,9 +22,7 @@ describe("StatusBadgeGroup", () => {
 
   it("renders nothing (no empty list landmark) when there are no items", () => {
     render(<StatusBadgeGroup aria-label="Provider status" items={[]} />);
-    expect(
-      screen.queryByRole("list", { name: "Provider status" }),
-    ).not.toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "Provider status" })).not.toBeInTheDocument();
   });
 
   it("preserves item order", () => {
