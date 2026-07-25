@@ -28,7 +28,7 @@ use crate::{
         create_rag_collection_with_connection, create_rag_document_with_connection,
         ingest_rag_document_with_connection,
     },
-    security::{Actor, ActorType, request_hash},
+    security::{Actor, ActorType},
 };
 
 #[derive(Debug, Clone)]
@@ -70,6 +70,12 @@ impl ConversationService {
             repo: PgConversationRepository::new(pool.clone()),
             admin_repo: PgAdminRepository::new(pool),
         })
+    }
+
+    /// The keyed hasher every conversation/RAG ledger and content hash goes through
+    /// (plan 03, P1-1).
+    fn command_hasher(&self) -> crate::security::IdempotencyHasher {
+        self.state.idempotency_hasher.clone()
     }
 
     pub async fn create_conversation(
@@ -290,7 +296,10 @@ impl ConversationService {
         }
         validate_metadata(&request.metadata)?;
         validate_content(&request.content)?;
-        let content_hash = request_hash(request.content.as_bytes());
+        let content_hash = self
+            .state
+            .idempotency_hasher
+            .hash(request.content.as_bytes());
         let record = self
             .repo
             .add_message(&ConversationMessageInsert {
@@ -357,7 +366,7 @@ impl ConversationService {
         }
         let content = user_text_from_public_input(messages);
         validate_content(&content)?;
-        let content_hash = request_hash(content.as_bytes());
+        let content_hash = self.state.idempotency_hasher.hash(content.as_bytes());
         let message = self
             .repo
             .add_message(&ConversationMessageInsert {
@@ -400,7 +409,7 @@ impl ConversationService {
         let Some(output) = output_text else {
             return Ok(None);
         };
-        let content_hash = request_hash(output.as_bytes());
+        let content_hash = self.state.idempotency_hasher.hash(output.as_bytes());
         let message = self
             .repo
             .add_message(&ConversationMessageInsert {
@@ -460,7 +469,10 @@ impl ConversationService {
         let public_id = format!("mem_{id}");
         let external_tenant_id = effective_tenant(actor);
         let external_user_id = effective_user(actor);
-        let content_hash = request_hash(request.content.as_bytes());
+        let content_hash = self
+            .state
+            .idempotency_hasher
+            .hash(request.content.as_bytes());
         let record = self
             .repo
             .create_memory(&MemoryInsert {
@@ -551,7 +563,7 @@ impl ConversationService {
         let hash = request
             .content
             .as_ref()
-            .map(|content| request_hash(content.as_bytes()));
+            .map(|content| self.state.idempotency_hasher.hash(content.as_bytes()));
         let record = self
             .repo
             .patch_memory(memory_id, &request, hash.as_deref())
@@ -775,7 +787,7 @@ impl ConversationService {
         )?;
         let actor = actor.clone();
         let ctx = ctx.clone();
-        let outcome = AdminCommandRunner::new(self.admin_repo.clone())
+        let outcome = AdminCommandRunner::new(self.admin_repo.clone(), self.command_hasher())
             .execute(spec, |transaction| {
                 Box::pin(async move {
                     // Inside the closure so a replayed request never burns an identifier.
@@ -913,7 +925,10 @@ impl ConversationService {
         let actor = actor.clone();
         let ctx = ctx.clone();
         let collection_id = collection_id.to_string();
-        let outcome = AdminCommandRunner::new(self.admin_repo.clone())
+        // Moved out of the closure only because `self` cannot cross the `move` boundary;
+        // the hash itself is still computed inside the transaction, as the comment below says.
+        let content_hasher = self.command_hasher();
+        let outcome = AdminCommandRunner::new(self.admin_repo.clone(), self.command_hasher())
             .execute(spec, |transaction| {
                 Box::pin(async move {
                     // The content hash is an input to the mutation, not to the idempotency
@@ -921,7 +936,7 @@ impl ConversationService {
                     let content_hash = request
                         .content
                         .as_ref()
-                        .map(|content| request_hash(content.as_bytes()));
+                        .map(|content| content_hasher.hash(content.as_bytes()));
                     // Inside the closure so a replayed request never burns an identifier.
                     let id = Uuid::now_v7();
                     let record = create_rag_document_with_connection(
@@ -1030,14 +1045,17 @@ impl ConversationService {
         let actor = actor.clone();
         let ctx = ctx.clone();
         let document_id = document_id.to_string();
-        let outcome = AdminCommandRunner::new(self.admin_repo.clone())
+        // Moved out of the closure only because `self` cannot cross the `move` boundary;
+        // the hash itself is still computed inside the transaction, as the comment below says.
+        let content_hasher = self.command_hasher();
+        let outcome = AdminCommandRunner::new(self.admin_repo.clone(), self.command_hasher())
             .execute(spec, |transaction| {
                 Box::pin(async move {
                     // The content hash is an input to the mutation, not to the idempotency
                     // envelope, so it is computed inside the transaction. `content` is
                     // known to be present: the check above already ran.
                     let content = request.content.as_deref().unwrap_or_default();
-                    let content_hash = request_hash(content.as_bytes());
+                    let content_hash = content_hasher.hash(content.as_bytes());
                     let record = ingest_rag_document_with_connection(
                         transaction.connection(),
                         &document_id,
@@ -1412,6 +1430,10 @@ mod tests {
         assert!(!can_read_all(&trusted_jwt, "moira:memories:read", &state));
     }
 
+    fn command_hasher() -> crate::security::IdempotencyHasher {
+        crate::security::IdempotencyHasher::new(b"conversation-pepper".to_vec(), "v1")
+    }
+
     fn test_context(idempotency_key: Option<String>) -> RequestContext {
         RequestContext {
             request_id: "req-test".to_string(),
@@ -1442,7 +1464,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(left.request_hash().unwrap(), right.request_hash().unwrap());
+        let hasher = command_hasher();
+        assert_eq!(
+            left.request_hash(&hasher).unwrap(),
+            right.request_hash(&hasher).unwrap()
+        );
     }
 
     #[test]
@@ -1467,9 +1493,10 @@ mod tests {
             &body,
         )
         .unwrap();
+        let hasher = command_hasher();
         assert_ne!(
-            document_a.request_hash().unwrap(),
-            document_b.request_hash().unwrap(),
+            document_a.request_hash(&hasher).unwrap(),
+            document_b.request_hash(&hasher).unwrap(),
             "the document id must be inside the hash envelope"
         );
 
@@ -1490,8 +1517,8 @@ mod tests {
         )
         .unwrap();
         assert_ne!(
-            collection_create.request_hash().unwrap(),
-            document_create.request_hash().unwrap(),
+            collection_create.request_hash(&hasher).unwrap(),
+            document_create.request_hash(&hasher).unwrap(),
             "the operation identity must be inside the hash envelope"
         );
     }
@@ -1530,9 +1557,10 @@ mod tests {
             conversation_command_spec(&ctx, &actor, RAG_DOCUMENT_INGEST_OPERATION, path, &body)
                 .unwrap();
 
+        let hasher = command_hasher();
         assert_eq!(
-            ingest_spec.request_hash().unwrap(),
-            reindex_spec.request_hash().unwrap()
+            ingest_spec.request_hash(&hasher).unwrap(),
+            reindex_spec.request_hash(&hasher).unwrap()
         );
     }
 

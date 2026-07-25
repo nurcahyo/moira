@@ -94,4 +94,28 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn middleware_error_keys_are_catalogued() {
+        for key in [
+            "moira.error.request_timeout",
+            "moira.error.payload_too_large",
+            "moira.error.jwks_url_rejected",
+            "moira.error.internal_error",
+            "moira.error.unauthorized",
+        ] {
+            assert!(is_known_key(key), "{key} must be a known catalog key");
+            let entry = all_entries()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("{key} must be catalogued"));
+            assert!(
+                !entry.default_message.is_empty(),
+                "{key} default_message must be non-empty"
+            );
+            assert!(
+                !entry.description.is_empty(),
+                "{key} description must be non-empty"
+            );
+        }
+    }
 }

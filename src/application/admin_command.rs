@@ -10,7 +10,7 @@ use crate::{
         AdminIdempotencyClaim, AdminIdempotencyClaimOutcome, PgAdminCommandTransaction,
         PgAdminRepository,
     },
-    security::request_hash,
+    security::{IdempotencyHasher, request_hash},
 };
 
 const ADMIN_COMMAND_VERSION: u16 = 1;
@@ -50,6 +50,16 @@ pub struct AdminCommandOutcome<T> {
 #[derive(Debug, Clone)]
 pub struct AdminCommandRunner {
     repository: PgAdminRepository,
+    /// Keyed hasher for every ledger value this runner writes (plan 03, P1-1). Admin
+    /// command bodies carry provider API keys and credential material, so their digests
+    /// must not be offline-attackable from the database alone.
+    hasher: IdempotencyHasher,
+    /// Whether pre-switch, unkeyed ledger values are still honoured on read — the
+    /// migration window from `idempotency.accept_legacy_hashes` (plan 03 finding F4).
+    ///
+    /// `true` reproduces the behaviour shipped with the HMAC switch. `false` stops
+    /// accepting unkeyed digests **and** drops the extra legacy lookup per claim.
+    accept_legacy_hashes: bool,
 }
 
 #[derive(Debug, Serialize, serde::Deserialize)]
@@ -93,7 +103,21 @@ impl AdminCommandSpec {
         self
     }
 
-    pub fn request_hash(&self) -> Result<String, AppError> {
+    /// The keyed, versioned hash of the canonical command envelope — the value written to
+    /// `idempotency_records.request_hash` for every new claim.
+    pub fn request_hash(&self, hasher: &IdempotencyHasher) -> Result<String, AppError> {
+        self.envelope_bytes().map(|bytes| hasher.hash(&bytes))
+    }
+
+    /// The legacy unkeyed hash of the same envelope.
+    ///
+    /// Only used to compare against rows written before the HMAC switch (plan 03, P1-1);
+    /// never written. Legacy rows expire within `IDEMPOTENCY_RETENTION_HOURS`.
+    pub fn legacy_request_hash(&self) -> Result<String, AppError> {
+        self.envelope_bytes().map(|bytes| request_hash(&bytes))
+    }
+
+    fn envelope_bytes(&self) -> Result<Vec<u8>, AppError> {
         let envelope = json!({
             "version": ADMIN_COMMAND_VERSION,
             "operation": self.operation,
@@ -101,9 +125,7 @@ impl AdminCommandSpec {
             "request": self.request,
             "expected_version": self.expected_version,
         });
-        serde_json::to_vec(&canonicalize(envelope))
-            .map(|bytes| request_hash(&bytes))
-            .map_err(invalid_command)
+        serde_json::to_vec(&canonicalize(envelope)).map_err(invalid_command)
     }
 }
 
@@ -141,8 +163,26 @@ where
 }
 
 impl AdminCommandRunner {
-    pub fn new(repository: PgAdminRepository) -> Self {
-        Self { repository }
+    /// Builds a runner with the dual-read window **open**, which is the behaviour the HMAC
+    /// switch shipped with. Callers that have a `Settings` in hand should immediately chain
+    /// [`Self::accepting_legacy_hashes`].
+    pub fn new(repository: PgAdminRepository, hasher: IdempotencyHasher) -> Self {
+        Self {
+            repository,
+            hasher,
+            accept_legacy_hashes: true,
+        }
+    }
+
+    /// Wires `idempotency.accept_legacy_hashes` (plan 03 finding F4).
+    ///
+    /// A builder rather than a `new` parameter so the twelve existing construction sites in
+    /// `application/admin.rs` and `application/conversation.rs` keep compiling and keep
+    /// their current behaviour until each is opted in.
+    #[must_use]
+    pub fn accepting_legacy_hashes(mut self, accept_legacy_hashes: bool) -> Self {
+        self.accept_legacy_hashes = accept_legacy_hashes;
+        self
     }
 
     pub async fn execute<T, F>(
@@ -157,22 +197,56 @@ impl AdminCommandRunner {
         ) -> BoxFuture<'a, Result<AdminCommandMutation<T>, AppError>>,
     {
         let mut transaction = self.repository.begin_admin_command().await?;
-        let claim = spec.idempotency.as_ref().map(|idempotency| {
-            Ok::<_, AppError>(AdminIdempotencyClaim {
+        // The canonical envelope is needed twice — once to derive the digest a fresh claim
+        // writes, and once to *verify* a stored digest in constant time on replay — so it
+        // is computed once here rather than re-serialized per use.
+        let envelope = match spec.idempotency {
+            Some(_) => Some(spec.envelope_bytes()?),
+            None => None,
+        };
+        let claim = match (spec.idempotency.as_ref(), envelope.as_deref()) {
+            (Some(idempotency), Some(envelope)) => Some(AdminIdempotencyClaim {
                 record_id: Uuid::now_v7(),
-                key_hash: request_hash(idempotency.key.as_bytes()),
+                key_hash: self.hasher.hash(idempotency.key.as_bytes()),
+                // The key hash is an index key under the unique index on
+                // (idempotency_key_hash, actor_fingerprint, operation), so a legacy row
+                // is unreachable by the versioned hash alone. Carrying the legacy value
+                // keeps pre-deploy claims replayable until they expire — and dropping it
+                // once the window is closed removes the extra SELECT it costs on every
+                // idempotent admin write (plan 03 finding F4).
+                legacy_key_hash: self
+                    .accept_legacy_hashes
+                    .then(|| self.hasher.legacy_hash(idempotency.key.as_bytes())),
                 actor_fingerprint: idempotency.actor_fingerprint.clone(),
                 operation: spec.operation.clone(),
-                request_hash: spec.request_hash()?,
+                request_hash: self.hasher.hash(envelope),
                 expires_at: Utc::now() + Duration::hours(IDEMPOTENCY_RETENTION_HOURS),
-            })
-        });
-        let claim = claim.transpose()?;
+            }),
+            _ => None,
+        };
 
         if let Some(claim) = &claim {
             match transaction.claim_idempotency(claim).await? {
                 AdminIdempotencyClaimOutcome::Acquired => {}
-                AdminIdempotencyClaimOutcome::Replay(record) => {
+                AdminIdempotencyClaimOutcome::Existing(record) => {
+                    let envelope = envelope
+                        .as_deref()
+                        .expect("an idempotent claim always carries its envelope");
+                    // Returning `Err` here drops `transaction`, which rolls back — the same
+                    // outcome the repository produced when it raised these two conflicts
+                    // itself.
+                    verify_stored_request_hash(
+                        &self.hasher,
+                        self.accept_legacy_hashes,
+                        envelope,
+                        &record.request_hash,
+                    )?;
+                    if record.response_status.is_none() || record.response_body.is_none() {
+                        return Err(AppError::conflict(
+                            "idempotency_in_progress",
+                            "another request with this Idempotency-Key is still in progress",
+                        ));
+                    }
                     transaction.commit().await?;
                     return replay_record(record);
                 }
@@ -239,6 +313,36 @@ impl AdminCommandRunner {
                 Err(error)
             }
         }
+    }
+}
+
+/// Checks that a *stored* body digest describes the request being executed.
+///
+/// Runs through [`IdempotencyHasher::verify`], i.e. through `Mac::verify_slice`, which is
+/// constant-time and length-checked. It replaces the byte-wise, early-exit `String`
+/// equality the repository used to perform (plan 03 finding F3) — the path that carries
+/// `POST /api/v1/admin/provider-credentials`, `.../system-keys` and `.../consumer-keys`
+/// bodies, and therefore the one place the plan's stated constant-time property matters
+/// most.
+///
+/// A stored value with no `':'` separator is a pre-switch, unkeyed SHA-256. Once the
+/// operator closes the dual-read window (`idempotency.accept_legacy_hashes = false`) it is
+/// rejected outright instead of being handed to `verify`'s legacy arm (finding F4).
+fn verify_stored_request_hash(
+    hasher: &IdempotencyHasher,
+    accept_legacy_hashes: bool,
+    envelope: &[u8],
+    stored: &str,
+) -> Result<(), AppError> {
+    let is_legacy_format = !stored.contains(':');
+    let matches = (accept_legacy_hashes || !is_legacy_format) && hasher.verify(envelope, stored);
+    if matches {
+        Ok(())
+    } else {
+        Err(AppError::conflict(
+            "idempotency_conflict",
+            "same Idempotency-Key was used with a different request",
+        ))
     }
 }
 
@@ -323,6 +427,30 @@ fn invalid_command(error: serde_json::Error) -> AppError {
 mod tests {
     use super::*;
 
+    fn hasher() -> IdempotencyHasher {
+        IdempotencyHasher::new(b"command-pepper".to_vec(), "v1")
+    }
+
+    #[test]
+    fn command_hash_is_keyed_and_versioned() {
+        let spec = AdminCommandSpec::new(
+            "credential.create",
+            json!({}),
+            json!({"secret": "sk-live-not-recoverable"}),
+        )
+        .unwrap();
+
+        let hashed = spec.request_hash(&hasher()).unwrap();
+        assert!(hashed.starts_with("v1:"));
+        assert_ne!(hashed, spec.legacy_request_hash().unwrap());
+        assert_ne!(
+            hashed,
+            spec.request_hash(&IdempotencyHasher::new(b"other".to_vec(), "v1"))
+                .unwrap(),
+            "the pepper must actually key the command envelope digest"
+        );
+    }
+
     #[test]
     fn command_hash_is_stable_across_object_key_order() {
         let left = AdminCommandSpec::new(
@@ -338,7 +466,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(left.request_hash().unwrap(), right.request_hash().unwrap());
+        let hasher = hasher();
+        assert_eq!(
+            left.request_hash(&hasher).unwrap(),
+            right.request_hash(&hasher).unwrap()
+        );
     }
 
     #[test]
@@ -357,13 +489,87 @@ mod tests {
         .unwrap();
         let versioned = base.clone().with_expected_version(Some(4));
 
+        let hasher = hasher();
         assert_ne!(
-            base.request_hash().unwrap(),
-            other_path.request_hash().unwrap()
+            base.request_hash(&hasher).unwrap(),
+            other_path.request_hash(&hasher).unwrap()
         );
         assert_ne!(
-            base.request_hash().unwrap(),
-            versioned.request_hash().unwrap()
+            base.request_hash(&hasher).unwrap(),
+            versioned.request_hash(&hasher).unwrap()
+        );
+    }
+
+    /// Plan 03 finding F3: the stored-vs-live comparison must go through
+    /// `IdempotencyHasher::verify`, and it must still accept both formats while the
+    /// dual-read window is open.
+    #[test]
+    fn stored_request_hash_verification_accepts_both_formats_while_the_window_is_open() {
+        let hasher = hasher();
+        let spec = AdminCommandSpec::new(
+            "credential.create",
+            json!({}),
+            json!({"secret": "sk-live-not-recoverable"}),
+        )
+        .unwrap();
+        let envelope = spec.envelope_bytes().unwrap();
+
+        verify_stored_request_hash(
+            &hasher,
+            true,
+            &envelope,
+            &spec.request_hash(&hasher).unwrap(),
+        )
+        .expect("the versioned digest must verify");
+        verify_stored_request_hash(
+            &hasher,
+            true,
+            &envelope,
+            &spec.legacy_request_hash().unwrap(),
+        )
+        .expect("the pre-switch unkeyed digest must still verify while the window is open");
+
+        let other = AdminCommandSpec::new("credential.create", json!({}), json!({"secret": "no"}))
+            .unwrap()
+            .request_hash(&hasher)
+            .unwrap();
+        let error = verify_stored_request_hash(&hasher, true, &envelope, &other).unwrap_err();
+        assert!(
+            error.to_string().contains("different request"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Plan 03 finding F4: closing the window must actually stop the unkeyed arm from
+    /// matching, without disturbing the keyed one.
+    #[test]
+    fn closing_the_legacy_window_rejects_unkeyed_stored_digests() {
+        let hasher = hasher();
+        let spec =
+            AdminCommandSpec::new("system_key.create", json!({}), json!({"label": "ops"})).unwrap();
+        let envelope = spec.envelope_bytes().unwrap();
+
+        verify_stored_request_hash(
+            &hasher,
+            false,
+            &envelope,
+            &spec.request_hash(&hasher).unwrap(),
+        )
+        .expect("the versioned digest must keep verifying after the window closes");
+
+        let legacy = spec.legacy_request_hash().unwrap();
+        assert!(
+            !legacy.contains(':'),
+            "the pre-switch format carries no version prefix"
+        );
+        assert!(
+            verify_stored_request_hash(&hasher, false, &envelope, &legacy).is_err(),
+            "an unkeyed digest must not match once accept_legacy_hashes is false"
+        );
+        assert!(
+            hasher.verify(&envelope, &legacy),
+            "the hasher itself still accepts it — the gate is the runner's, which is what \
+             makes the setting the thing that closes the window"
         );
     }
 

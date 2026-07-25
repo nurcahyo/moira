@@ -15,7 +15,7 @@ use crate::{
     },
     error::AppError,
     infra::repositories::{AdminRepository, PgAdminRepository, PgRuntimeRepository},
-    security::{Actor, request_hash, secret_fingerprint},
+    security::{Actor, secret_fingerprint},
 };
 
 pub struct RuntimeAdminService<'a> {
@@ -633,16 +633,28 @@ impl<'a> RuntimeAdminService<'a> {
             return Ok(None);
         };
         let actor_fingerprint = actor_fingerprint(actor);
-        let key_hash = request_hash(key.as_bytes());
-        let request_hash = normalized_request_hash(request)?;
-        let Some(record) = self
+        let hasher = &self.state.idempotency_hasher;
+        let request_bytes = normalized_request_bytes(request)?;
+        // Dual lookup: the key hash is the index key, so a row written before the switch to
+        // keyed hashing (plan 03, P1-1) is unreachable by the versioned hash alone.
+        let mut record = self
             .admin_repo
-            .get_idempotency_record(&key_hash, &actor_fingerprint, operation)
-            .await?
-        else {
+            .get_idempotency_record(&hasher.hash(key.as_bytes()), &actor_fingerprint, operation)
+            .await?;
+        if record.is_none() {
+            record = self
+                .admin_repo
+                .get_idempotency_record(
+                    &hasher.legacy_hash(key.as_bytes()),
+                    &actor_fingerprint,
+                    operation,
+                )
+                .await?;
+        }
+        let Some(record) = record else {
             return Ok(None);
         };
-        if record.request_hash != request_hash {
+        if !hasher.verify(&request_bytes, &record.request_hash) {
             return Err(AppError::conflict(
                 "idempotency_conflict",
                 "same Idempotency-Key was used with a different request",
@@ -677,12 +689,13 @@ impl<'a> RuntimeAdminService<'a> {
             .and_then(|value| value.get("id"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
+        let hasher = &self.state.idempotency_hasher;
         let record = IdempotencyRecord {
             id: Uuid::now_v7(),
-            idempotency_key_hash: request_hash(key.as_bytes()),
+            idempotency_key_hash: hasher.hash(key.as_bytes()),
             actor_fingerprint: actor_fingerprint(actor),
             operation: operation.to_string(),
-            request_hash: normalized_request_hash(request)?,
+            request_hash: hasher.hash(&normalized_request_bytes(request)?),
             response_status: Some(200),
             response_body,
             resource_id,
@@ -714,9 +727,13 @@ fn actor_fingerprint(actor: &Actor) -> String {
     )
 }
 
-fn normalized_request_hash<T: Serialize>(request: &T) -> Result<String, AppError> {
+/// The canonical bytes an idempotent runtime-admin request hashes to.
+///
+/// Returns bytes rather than a digest so the read path can run them through
+/// `IdempotencyHasher::verify`, which accepts both the current keyed digest and the
+/// pre-switch unkeyed one.
+fn normalized_request_bytes<T: Serialize>(request: &T) -> Result<Vec<u8>, AppError> {
     serde_json::to_vec(request)
-        .map(|bytes| request_hash(&bytes))
         .map_err(|err| AppError::BadRequest(format!("invalid idempotent request: {err}")))
 }
 

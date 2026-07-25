@@ -47,9 +47,19 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         description: "Used when a requested resource does not exist or is not visible to the caller.",
     },
     I18nEntry {
+        key: "moira.error.payload_too_large",
+        default_message: "The request body exceeds the maximum allowed size.",
+        description: "Used when a request body exceeds the configured per-route body limit.",
+    },
+    I18nEntry {
         key: "moira.error.rate_limited",
         default_message: "Too many requests were sent in a short period of time.",
         description: "Used when a caller must back off and retry later.",
+    },
+    I18nEntry {
+        key: "moira.error.request_timeout",
+        default_message: "The request timed out before it could be completed.",
+        description: "Used when the server-side request timeout elapses before the handler produces a response.",
     },
     I18nEntry {
         key: "moira.error.stream_interrupted",
@@ -155,6 +165,11 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         key: "moira.error.invalid_metadata",
         default_message: "The metadata is invalid.",
         description: "Used when metadata fails validation.",
+    },
+    I18nEntry {
+        key: "moira.error.jwks_url_rejected",
+        default_message: "The JWKS URL was rejected by the server's security policy.",
+        description: "Used when a configured JWKS URL fails scheme, address-range, size, content-type, or timeout validation.",
     },
     I18nEntry {
         key: "moira.error.max_output_tokens_exceeded",

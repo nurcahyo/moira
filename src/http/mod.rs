@@ -5,28 +5,346 @@ mod observability;
 mod openapi;
 mod public;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
-use axum::{Extension, Router};
+use axum::{Extension, Router, extract::DefaultBodyLimit, http::StatusCode};
+use tower_http::timeout::{RequestBodyTimeoutLayer, TimeoutLayer};
 use utoipa::OpenApi;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-use crate::app::AppState;
+use crate::{app::AppState, config::Settings};
 
-pub fn router() -> Router<AppState> {
-    let (router, openapi) = documented_router().split_for_parts();
+// `test-routes` adds two unauthenticated probe routes (`/internal/test/panic`,
+// `/internal/test/slow`) whose entire purpose is to panic on demand and to park a
+// connection. They must never exist in a shipped binary.
+//
+// The Cargo feature alone does not guarantee that: `--all-features` is a different
+// feature set from the default one, and this repository's own CI already uses
+// `--all-features` (clippy and test). `cargo build --release --all-features` would
+// therefore have produced a binary containing both probes plus the panic payload
+// string. Refusing to compile is the only guarantee that holds regardless of which
+// feature flags a build uses, so the gate is `debug_assertions`, not the feature.
+//
+// CI is unaffected: `cargo clippy --all-targets --all-features` and
+// `cargo test --all-features` both build with `debug_assertions` on. A *release* build
+// that adds `--all-features` will now fail to compile — that is the point.
+//
+// Regular comments, not doc comments: rustc emits `unused doc comment` for a doc comment
+// attached to a macro invocation.
+#[cfg(all(feature = "test-routes", not(debug_assertions)))]
+compile_error!(
+    "the `test-routes` feature exposes unauthenticated panic and connection-parking \
+     probe routes and cannot be compiled with `debug_assertions` off. Drop \
+     `--all-features`/`--features test-routes` from optimized builds, or build the \
+     probes under the dev profile."
+);
+
+/// Fixed body limit for the conversation / memory / RAG surface.
+///
+/// Plan 03 (P1-3) deliberately does **not** introduce a new configuration field for
+/// this surface: the value simply matches the effective default these routes already
+/// had (`PublicApiSettings.maximum_request_bytes`'s 1 MiB default), so no legitimate
+/// payload that works today can start failing. Making it configurable is an explicit
+/// deferred follow-up.
+pub const CONVERSATION_BODY_LIMIT_BYTES: usize = 1024 * 1024;
+
+/// Body limit for the `/api/v1/admin/*` surface.
+///
+/// Admin payloads are structurally larger than public ones — routing policies, agent
+/// profile prompts, provider runtime policies and RAG document bodies are all
+/// operator-authored JSON documents rather than a single prompt — so the admin cap is
+/// set above the public one. 2 MiB matches Axum's own built-in default body limit, so
+/// this is a ceiling that already applied to every unlayered Axum route, not a novel
+/// number. The largest admin request body in the existing test corpus is well under
+/// 1 KiB (the largest generated payload anywhere in `tests/` is a 128-character
+/// repeat), so this cannot regress a known-legitimate payload.
+///
+/// The rationale above is only true if every `/api/v1/admin/*` path actually receives
+/// this limit. `RagDocumentCreateRequest`/`RagDocumentIngestRequest` carry the document
+/// text inline (`content: Option<String>`), and those routes used to sit in
+/// [`conversation_routes`], which meant the RAG document bodies the rationale names
+/// were in fact capped at [`CONVERSATION_BODY_LIMIT_BYTES`]. They now live in
+/// [`admin_conversation_routes`], which is layered with this constant — see that
+/// function for the full reasoning.
+///
+/// **Needs ops sign-off**: 2 MiB is a judgement call, not a measured requirement.
+pub const ADMIN_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+
+/// Hard ceiling on `PublicApiSettings.maximum_request_bytes`.
+///
+/// `maximum_request_bytes` is an `i64` and `Settings::validate` places no upper bound on
+/// it, so `MOIRA_PUBLIC_API__MAXIMUM_REQUEST_BYTES=9223372036854775807` used to pass
+/// straight into `DefaultBodyLimit::max` and yield an effectively unlimited public body
+/// limit — every accepted byte is buffered in memory by the `Json` extractor, so an
+/// unbounded limit is a memory-exhaustion switch disguised as a tuning knob.
+///
+/// 16 MiB is 16x the 1 MiB default and 8x the admin cap: far above any legitimate
+/// prompt payload, far below "unbounded". Exceeding it is clamped, not rejected, and is
+/// reported through a `warn`-level log at router-construction time so an operator who
+/// genuinely wants more sees why they did not get it.
+///
+/// **Needs ops sign-off**: 16 MiB is a judgement call, not a measured requirement. The
+/// real fix is a bound inside `Settings::validate` (`src/config/settings.rs`), which is
+/// outside this module's ownership; this clamp is the enforcement-side backstop.
+pub const MAX_PUBLIC_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Inactivity ceiling applied to **request body ingestion** on every route group.
+///
+/// `TimeoutLayer` bounds the response-head future, which for a body-consuming handler
+/// includes body ingestion — but the SSE group cannot carry a tight head timeout, and
+/// even the non-SSE ceiling (`maximum_execution_timeout_seconds + 30`, ≥ 630 s by
+/// default) is far too generous to be the only bound on how long a client may take to
+/// send its body. Without an ingestion bound, a client that writes request headers with
+/// a `Content-Length` and then never sends the body pins a connection task and a file
+/// descriptor for that entire window, before any authentication runs.
+///
+/// `RequestBodyTimeoutLayer` bounds the gap *between* body frames and resets on every
+/// frame, so it never penalises a slow-but-progressing upload and never touches the
+/// response body (which is what would break SSE). 30 s of complete silence mid-body is
+/// already far outside normal client behaviour.
+///
+/// Residual, accepted: because the timer resets per frame, a client that drips one byte
+/// every 29 s still holds a connection, bounded by `DefaultBodyLimit` in bytes but not
+/// in time. Closing that fully needs a total-ingestion budget, which tower-http does not
+/// provide; it is recorded as a deferred follow-up rather than hand-rolled here.
+pub const REQUEST_BODY_IDLE_TIMEOUT_SECONDS: u64 = 30;
+
+/// Headroom added on top of `RuntimeSettings.maximum_execution_timeout_seconds` when
+/// sizing the HTTP-level timeout, so the HTTP deadline always sits *above* the
+/// execution deadline and an execution timeout surfaces as its own specific error
+/// rather than as a generic transport timeout.
+///
+/// **Needs product/ops sign-off**: 30 s is the plan's proposed buffer, not a derived
+/// value.
+pub const NON_STREAMING_TIMEOUT_BUFFER_SECONDS: u64 = 30;
+
+/// Per-route-group request policy (plan 03 / P1-3).
+///
+/// Replaces the single global `DefaultBodyLimit::max(512 * 1024)` that used to be
+/// applied in `build_router` and that was disconnected from
+/// `PublicApiSettings.maximum_request_bytes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouterPolicy {
+    /// Applied to `/api/v1/responses*` and `/v1/responses`; sourced from
+    /// `PublicApiSettings.maximum_request_bytes`.
+    pub public_body_limit_bytes: usize,
+    /// Applied to the conversation / memory / RAG surface.
+    pub conversation_body_limit_bytes: usize,
+    /// Applied to `/api/v1/admin/*`.
+    pub admin_body_limit_bytes: usize,
+    /// Applied to every route group that can only ever return a buffered response.
+    pub non_streaming_timeout: Duration,
+    /// Applied to the group that *may* return `text/event-stream`.
+    ///
+    /// This bounds the response-**head** future only. `tower_http`'s `Timeout` drops its
+    /// sleep as soon as the inner service resolves to a `Response`, so an SSE body that
+    /// has already been handed back streams for as long as it likes (asserted by
+    /// `a_timeout_layer_never_caps_an_already_returned_streaming_body` in `src/lib.rs`).
+    /// Kept as a distinct field from [`Self::non_streaming_timeout`] precisely so a test
+    /// can drive the non-streaming ceiling down to prove the exemption without also
+    /// capping the stream's setup phase.
+    pub streaming_head_timeout: Duration,
+    /// Applied to every route group as a `RequestBodyTimeoutLayer`: the maximum gap
+    /// between two request-body frames. See [`REQUEST_BODY_IDLE_TIMEOUT_SECONDS`].
+    pub request_body_idle_timeout: Duration,
+}
+
+impl RouterPolicy {
+    pub fn from_settings(settings: &Settings) -> Self {
+        let non_streaming_timeout = Duration::from_secs(
+            settings
+                .runtime
+                .maximum_execution_timeout_seconds
+                .saturating_add(NON_STREAMING_TIMEOUT_BUFFER_SECONDS),
+        );
+        Self {
+            public_body_limit_bytes: public_body_limit_bytes(
+                settings.public_api.maximum_request_bytes,
+            ),
+            conversation_body_limit_bytes: CONVERSATION_BODY_LIMIT_BYTES,
+            admin_body_limit_bytes: ADMIN_BODY_LIMIT_BYTES,
+            non_streaming_timeout,
+            // The SSE group's head phase (auth, policy, ledger writes, opening the
+            // upstream stream) is itself bounded by the execution deadline, so the same
+            // ceiling is the right one; only the *body* must escape it.
+            streaming_head_timeout: non_streaming_timeout,
+            request_body_idle_timeout: Duration::from_secs(REQUEST_BODY_IDLE_TIMEOUT_SECONDS),
+        }
+    }
+}
+
+/// Resolves the configured public body limit into an enforceable one.
+///
+/// `maximum_request_bytes` is an unbounded `i64`, so three cases have to be handled:
+/// non-positive, larger than `usize`, and merely absurd. All three are clamped rather
+/// than rejected — refusing to build the router over a tuning knob would turn a
+/// misconfiguration into an outage — and all three warn.
+fn public_body_limit_bytes(configured: i64) -> usize {
+    let Some(bytes) = usize::try_from(configured).ok().filter(|bytes| *bytes > 0) else {
+        tracing::warn!(
+            configured,
+            applied = CONVERSATION_BODY_LIMIT_BYTES,
+            "public_api.maximum_request_bytes is not a usable positive byte count; \
+             applying the default public body limit"
+        );
+        return CONVERSATION_BODY_LIMIT_BYTES;
+    };
+
+    if bytes > MAX_PUBLIC_BODY_LIMIT_BYTES {
+        tracing::warn!(
+            configured = bytes,
+            applied = MAX_PUBLIC_BODY_LIMIT_BYTES,
+            "public_api.maximum_request_bytes exceeds the enforceable ceiling; clamping. \
+             Request bodies are buffered in memory, so an unbounded limit is a \
+             memory-exhaustion vector"
+        );
+        return MAX_PUBLIC_BODY_LIMIT_BYTES;
+    }
+
+    bytes
+}
+
+impl Default for RouterPolicy {
+    fn default() -> Self {
+        Self::from_settings(&Settings::default())
+    }
+}
+
+pub fn router(policy: RouterPolicy) -> Router<AppState> {
+    let (router, openapi) = documented_router(policy).split_for_parts();
+    #[cfg(feature = "test-routes")]
+    let router = router.merge(middleware_probe_routes());
     router.layer(Extension(Arc::new(openapi)))
 }
 
-fn documented_router() -> OpenApiRouter<AppState> {
+/// The timeout applied to the `test-routes` slow probe.
+///
+/// Deliberately tiny and deliberately *not* [`RouterPolicy::non_streaming_timeout`]: the
+/// production value is `maximum_execution_timeout_seconds + 30`, i.e. never below 30 s,
+/// and it always sits above every execution deadline by construction — so no production
+/// route can be made to reach it inside a test. The production value and its placement
+/// are asserted by `the_non_streaming_timeout_sits_above_the_execution_deadline`
+/// (`src/lib.rs`); this probe exists only so an integration test can observe what the
+/// *envelope mapper* does to a real `TimeoutLayer` rejection over a real socket.
+#[cfg(feature = "test-routes")]
+const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Undocumented probe routes, compiled only under the off-by-default `test-routes`
+/// feature (plan 03 / P1-3, Wave 3).
+///
+/// They are merged **after** `split_for_parts`, so they contribute nothing to the
+/// OpenAPI document and cannot perturb the zero-diff spec requirement. `cargo build
+/// --release --locked` does not enable the feature, so they cannot exist in a shipped
+/// binary.
+///
+/// Why they are needed: `tests/*.rs` links `moira` compiled *without* `cfg(test)`, so a
+/// `#[cfg(test)]` route is unreachable from an integration test, and neither
+/// `CatchPanicLayer` nor the 504 branch of `normalize_infrastructure_error` is
+/// reachable from any production route inside a test (nothing panics on demand, and the
+/// production HTTP timeout is always above the execution deadline).
+#[cfg(feature = "test-routes")]
+fn middleware_probe_routes() -> Router<AppState> {
+    use axum::routing::get;
+
+    Router::new()
+        .route("/internal/test/panic", get(probe_panic))
+        .merge(
+            Router::new()
+                .route("/internal/test/slow", get(probe_slow))
+                .layer(TimeoutLayer::with_status_code(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    PROBE_TIMEOUT,
+                )),
+        )
+}
+
+/// Panics with a payload built from fragments the test asserts never reach the client.
+#[cfg(feature = "test-routes")]
+async fn probe_panic() -> StatusCode {
+    panic!("moira probe panic: credential row 42 pepper v1 unwrap on None");
+}
+
+/// Never completes, so the probe timeout above always wins. No `sleep`.
+#[cfg(feature = "test-routes")]
+async fn probe_slow() -> StatusCode {
+    std::future::pending::<()>().await;
+    StatusCode::OK
+}
+
+fn documented_router(policy: RouterPolicy) -> OpenApiRouter<AppState> {
+    // `TimeoutLayer` bounds the time taken to *produce a response head*. `tower_http`'s
+    // `Timeout::ResponseFuture` drops its sleep the moment the inner service resolves to
+    // a `Response`, so a streaming body that has already been handed back is never
+    // capped by it — which is exactly why the SSE group can carry one too.
+    //
+    // The SSE group used to be left entirely unlayered on the reasoning that "the SSE
+    // group must not be capped". That reasoning conflated two different bounds: leaving
+    // the group unlayered removed the bound on *request ingestion* as well, so a client
+    // could write `POST /api/v1/responses/stream` headers with a `Content-Length` and
+    // never send the body, pinning a connection task and a file descriptor forever —
+    // before `public_actor` (which runs inside the handler, after `Json` extraction) ever
+    // asks for a credential. It also left `/v1/responses` with `stream: false`, a fully
+    // non-streaming JSON route that happens to share a path with the streaming one,
+    // without any timeout at all.
+    //
+    // Two bounds now cover the group, neither of which can touch a response body:
+    //   * `streaming_head_timeout` — head production only (see `RouterPolicy`).
+    //   * `RequestBodyTimeoutLayer` — the gap between request-body frames.
+    let timeout =
+        TimeoutLayer::with_status_code(StatusCode::GATEWAY_TIMEOUT, policy.non_streaming_timeout);
+    let streaming_timeout =
+        TimeoutLayer::with_status_code(StatusCode::GATEWAY_TIMEOUT, policy.streaming_head_timeout);
+    // Applied to every group: a stalled request body must never be able to park a
+    // connection, whichever route it was addressed to.
+    let body_timeout = RequestBodyTimeoutLayer::new(policy.request_body_idle_timeout);
+
     let mut router = OpenApiRouter::with_openapi(openapi::MoiraApiDoc::openapi())
+        .merge(
+            operational_routes()
+                .layer(timeout)
+                .layer(body_timeout.clone()),
+        )
+        .merge(
+            public_execution_routes()
+                .layer(DefaultBodyLimit::max(policy.public_body_limit_bytes))
+                .layer(timeout)
+                .layer(body_timeout.clone()),
+        )
+        .merge(
+            streaming_routes()
+                .layer(DefaultBodyLimit::max(policy.public_body_limit_bytes))
+                .layer(streaming_timeout)
+                .layer(body_timeout.clone()),
+        )
+        .merge(
+            conversation_routes()
+                .layer(DefaultBodyLimit::max(policy.conversation_body_limit_bytes))
+                .layer(timeout)
+                .layer(body_timeout.clone()),
+        )
+        .merge(
+            admin_routes()
+                .merge(admin_conversation_routes())
+                .layer(DefaultBodyLimit::max(policy.admin_body_limit_bytes))
+                .layer(timeout)
+                .layer(body_timeout),
+        );
+    openapi::finalize_document(router.get_openapi_mut());
+    router
+}
+
+fn operational_routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
         .routes(routes!(health::healthz))
         .routes(routes!(health::readyz))
         .routes(routes!(observability::metrics))
         .routes(routes!(openapi::openapi_json))
         .routes(routes!(openapi::docs))
+}
+
+fn public_execution_routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
         .routes(routes!(public::create_response))
-        .routes(routes!(public::stream_response))
         .routes(routes!(public::get_response))
         .routes(routes!(public::list_executions))
         .routes(routes!(public::get_execution))
@@ -34,6 +352,23 @@ fn documented_router() -> OpenApiRouter<AppState> {
         .routes(routes!(public::list_models))
         .routes(routes!(public::list_routes))
         .routes(routes!(public::capabilities))
+}
+
+/// Every route that can emit `text/event-stream`.
+///
+/// `/api/v1/responses/stream` always streams; `/v1/responses` streams whenever the
+/// caller sets `stream: true` (`src/http/public.rs` — the OpenAI compatibility route
+/// documents both `application/json` and `text/event-stream` for its 200 response).
+fn streaming_routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(public::stream_response))
+        .routes(routes!(public::openai_responses_compat))
+}
+
+/// The caller-facing conversation / memory surface (`/api/v1/conversations*`,
+/// `/api/v1/memories*`), layered with [`CONVERSATION_BODY_LIMIT_BYTES`].
+fn conversation_routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
         .routes(routes!(
             conversation::list_conversations,
             conversation::create_conversation
@@ -58,20 +393,37 @@ fn documented_router() -> OpenApiRouter<AppState> {
             conversation::patch_memory,
             conversation::delete_memory
         ))
-        .routes(routes!(public::openai_responses_compat))
-        .routes(routes!(admin::get_setup_status))
-        .routes(routes!(admin::list_applications, admin::create_application))
-        .routes(routes!(
-            admin::get_application,
-            admin::patch_application,
-            admin::delete_application
-        ))
-        .routes(routes!(admin::enable_application))
-        .routes(routes!(admin::disable_application))
-        .routes(routes!(
-            admin::get_application_execution_policy,
-            admin::put_application_execution_policy
-        ))
+}
+
+/// The `/api/v1/admin/*` routes that happen to be *implemented* in `http::conversation`.
+///
+/// They are split out of [`conversation_routes`] so that the layering invariant is
+/// simply stated and holds without exception: **every `/api/v1/admin/*` path is layered
+/// with [`ADMIN_BODY_LIMIT_BYTES`]**. Previously these paths inherited
+/// [`CONVERSATION_BODY_LIMIT_BYTES`] purely because of which Rust module their handlers
+/// lived in, which contradicted `ADMIN_BODY_LIMIT_BYTES`'s own stated rationale — that
+/// rationale cites "RAG document bodies" as a reason for the larger cap, while the RAG
+/// document routes were the ones getting the smaller one. Measured before the move: a
+/// 1536 KiB body got 400 on `/api/v1/admin/applications` (admitted) but 413 on
+/// `/api/v1/admin/rag-collections`, `.../rag-collections/{id}/documents` and
+/// `.../rag-documents/{id}/ingest`.
+///
+/// Moving rather than rewriting the rationale is the deliberate choice, because the
+/// rationale is correct: `RagDocumentCreateRequest` and `RagDocumentIngestRequest` carry
+/// the document text inline as `content: Option<String>` (`src/domain/conversation.rs`),
+/// so these are the only Moira routes whose body size is bounded by a *document* rather
+/// than by a prompt or a policy object. Capping an operator-supplied document at half
+/// the cap granted to an application-create payload is not defensible. The four
+/// application-scoped `*-policy` routes move with them only because they share the
+/// `/api/v1/admin/` prefix and a one-sentence invariant is worth more than a 1 MiB
+/// distinction on fixed-shape policy objects that are three orders of magnitude smaller.
+///
+/// This is a layering change only: no path, method, operation id, schema or security
+/// requirement moves with it, so the OpenAPI document is unchanged (utoipa's `PathsMap`
+/// is a `BTreeMap` — `preserve_path_order` is not enabled — so even serialisation order
+/// is unaffected by which group registered a path).
+fn admin_conversation_routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
         .routes(routes!(
             conversation::get_conversation_policy,
             conversation::put_conversation_policy
@@ -87,6 +439,44 @@ fn documented_router() -> OpenApiRouter<AppState> {
         .routes(routes!(
             conversation::get_embedding_policy,
             conversation::put_embedding_policy
+        ))
+        .routes(routes!(
+            conversation::list_rag_collections,
+            conversation::create_rag_collection
+        ))
+        .routes(routes!(
+            conversation::get_rag_collection,
+            conversation::patch_rag_collection,
+            conversation::delete_rag_collection
+        ))
+        .routes(routes!(conversation::enable_rag_collection))
+        .routes(routes!(conversation::disable_rag_collection))
+        .routes(routes!(
+            conversation::list_rag_documents,
+            conversation::create_rag_document
+        ))
+        .routes(routes!(
+            conversation::get_rag_document,
+            conversation::delete_rag_document
+        ))
+        .routes(routes!(conversation::ingest_rag_document))
+        .routes(routes!(conversation::reindex_rag_document))
+}
+
+fn admin_routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(admin::get_setup_status))
+        .routes(routes!(admin::list_applications, admin::create_application))
+        .routes(routes!(
+            admin::get_application,
+            admin::patch_application,
+            admin::delete_application
+        ))
+        .routes(routes!(admin::enable_application))
+        .routes(routes!(admin::disable_application))
+        .routes(routes!(
+            admin::get_application_execution_policy,
+            admin::put_application_execution_policy
         ))
         .routes(routes!(admin::list_providers, admin::create_provider))
         .routes(routes!(
@@ -139,27 +529,6 @@ fn documented_router() -> OpenApiRouter<AppState> {
         .routes(routes!(admin::disable_agent_profile))
         .routes(routes!(admin::diagnose_runtime))
         .routes(routes!(
-            conversation::list_rag_collections,
-            conversation::create_rag_collection
-        ))
-        .routes(routes!(
-            conversation::get_rag_collection,
-            conversation::patch_rag_collection,
-            conversation::delete_rag_collection
-        ))
-        .routes(routes!(conversation::enable_rag_collection))
-        .routes(routes!(conversation::disable_rag_collection))
-        .routes(routes!(
-            conversation::list_rag_documents,
-            conversation::create_rag_document
-        ))
-        .routes(routes!(
-            conversation::get_rag_document,
-            conversation::delete_rag_document
-        ))
-        .routes(routes!(conversation::ingest_rag_document))
-        .routes(routes!(conversation::reindex_rag_document))
-        .routes(routes!(
             admin::get_provider_model,
             admin::patch_provider_model,
             admin::delete_provider_model
@@ -204,9 +573,7 @@ fn documented_router() -> OpenApiRouter<AppState> {
         .routes(routes!(admin::enable_trusted_jwt_issuer))
         .routes(routes!(admin::disable_trusted_jwt_issuer))
         .routes(routes!(admin::list_audit_events))
-        .routes(routes!(admin::get_audit_event));
-    openapi::finalize_document(router.get_openapi_mut());
-    router
+        .routes(routes!(admin::get_audit_event))
 }
 
 #[cfg(test)]
@@ -223,7 +590,8 @@ mod tests {
 
     #[test]
     fn generated_openapi_covers_every_registered_route() {
-        let value = serde_json::to_value(documented_router().into_openapi()).unwrap();
+        let value = serde_json::to_value(documented_router(RouterPolicy::default()).into_openapi())
+            .unwrap();
         let paths = value["paths"].as_object().expect("OpenAPI paths");
         let expected: BTreeSet<_> = [
             "/health/live",
@@ -336,7 +704,8 @@ mod tests {
 
     #[test]
     fn public_document_filters_admin_paths_and_keeps_operational_paths() {
-        let document = openapi::public_document(documented_router().into_openapi());
+        let document =
+            openapi::public_document(documented_router(RouterPolicy::default()).into_openapi());
         assert!(
             document
                 .paths
@@ -360,7 +729,8 @@ mod tests {
 
     #[test]
     fn generated_openapi_contains_security_content_types_and_parameters() {
-        let value = serde_json::to_value(documented_router().into_openapi()).unwrap();
+        let value = serde_json::to_value(documented_router(RouterPolicy::default()).into_openapi())
+            .unwrap();
         assert_eq!(value["openapi"], "3.1.0");
 
         let schemes = value["components"]["securitySchemes"]
@@ -419,7 +789,8 @@ mod tests {
 
     #[test]
     fn every_operation_documents_request_ids_and_protected_operations_document_auth() {
-        let value = serde_json::to_value(documented_router().into_openapi()).unwrap();
+        let value = serde_json::to_value(documented_router(RouterPolicy::default()).into_openapi())
+            .unwrap();
         let paths = value["paths"].as_object().expect("OpenAPI paths");
         let public_operations = [
             ("/health/live", "get"),
@@ -477,7 +848,8 @@ mod tests {
 
     #[test]
     fn setup_status_contract_is_typed_and_exact() {
-        let value = serde_json::to_value(documented_router().into_openapi()).unwrap();
+        let value = serde_json::to_value(documented_router(RouterPolicy::default()).into_openapi())
+            .unwrap();
         let operation = &value["paths"]["/api/v1/admin/setup/status"]["get"];
         assert_eq!(operation["operationId"], "get_setup_status");
         let responses = operation["responses"].as_object().unwrap();
@@ -510,7 +882,8 @@ mod tests {
 
     #[test]
     fn once_only_key_responses_use_the_secret_envelope() {
-        let value = serde_json::to_value(documented_router().into_openapi()).unwrap();
+        let value = serde_json::to_value(documented_router(RouterPolicy::default()).into_openapi())
+            .unwrap();
         for (path, method, status) in [
             ("/api/v1/admin/system-keys", "post", "201"),
             ("/api/v1/admin/system-keys/{id}/rotate", "post", "200"),
@@ -532,7 +905,8 @@ mod tests {
 
     #[test]
     fn atomic_admin_idempotency_contract_is_explicit() {
-        let value = serde_json::to_value(documented_router().into_openapi()).unwrap();
+        let value = serde_json::to_value(documented_router(RouterPolicy::default()).into_openapi())
+            .unwrap();
         let operations = [
             ("/api/v1/admin/applications", "post", "201", false, false),
             ("/api/v1/admin/providers", "post", "201", false, false),
@@ -643,7 +1017,8 @@ mod tests {
 
     #[test]
     fn every_local_schema_reference_resolves() {
-        let value = serde_json::to_value(documented_router().into_openapi()).unwrap();
+        let value = serde_json::to_value(documented_router(RouterPolicy::default()).into_openapi())
+            .unwrap();
         let schemas = value["components"]["schemas"]
             .as_object()
             .expect("component schemas");
@@ -700,7 +1075,8 @@ mod tests {
         // Guard against a stale "remove the parameter" instinct: CONVENTIONS.md §0
         // decision D1 settled that P0-2 is fixed by implementing real replay (02b),
         // not by removing Idempotency-Key from these routes.
-        let value = serde_json::to_value(documented_router().into_openapi()).unwrap();
+        let value = serde_json::to_value(documented_router(RouterPolicy::default()).into_openapi())
+            .unwrap();
         for (path, method) in RAG_WRITE_OPERATIONS {
             let operation = &value["paths"][path][method];
             assert!(
@@ -720,7 +1096,8 @@ mod tests {
         // A sibling to `atomic_admin_idempotency_contract_is_explicit`, kept separate
         // because these four routes are not admin-command routes in the operations
         // list that test enumerates.
-        let value = serde_json::to_value(documented_router().into_openapi()).unwrap();
+        let value = serde_json::to_value(documented_router(RouterPolicy::default()).into_openapi())
+            .unwrap();
         for (path, method) in RAG_WRITE_OPERATIONS {
             let operation = &value["paths"][path][method];
             assert!(
@@ -755,7 +1132,8 @@ mod tests {
     fn rag_write_route_descriptions_no_longer_disclaim_idempotency() {
         // The paired half of 02a's `rag_write_routes_carry_the_interim_idempotency_disclaimer`,
         // which 02b deletes: Sentence B is gone, Sentence A survives verbatim.
-        let value = serde_json::to_value(documented_router().into_openapi()).unwrap();
+        let value = serde_json::to_value(documented_router(RouterPolicy::default()).into_openapi())
+            .unwrap();
         for (path, method) in RAG_WRITE_OPERATIONS {
             let operation = &value["paths"][path][method];
             let description = operation["description"]
@@ -774,7 +1152,8 @@ mod tests {
 
     #[test]
     fn rag_collection_document_route_keeps_its_collection_id_path_parameter() {
-        let value = serde_json::to_value(documented_router().into_openapi()).unwrap();
+        let value = serde_json::to_value(documented_router(RouterPolicy::default()).into_openapi())
+            .unwrap();
         let operation =
             &value["paths"]["/api/v1/admin/rag-collections/{collection_id}/documents"]["post"];
         let parameter = operation["parameters"]
@@ -792,7 +1171,8 @@ mod tests {
     fn conversation_memory_rag_operations_document_the_mvp_preview_boundary() {
         // Assert Sentence A only (the permanent boundary text). Sentence B is
         // deliberately checked by a separate test that plan 02b deletes.
-        let value = serde_json::to_value(documented_router().into_openapi()).unwrap();
+        let value = serde_json::to_value(documented_router(RouterPolicy::default()).into_openapi())
+            .unwrap();
         for (path, method) in RAG_WRITE_OPERATIONS {
             let operation = &value["paths"][path][method];
             let description = operation["description"]
@@ -833,7 +1213,8 @@ mod tests {
 
     #[test]
     fn rag_document_record_schema_exposes_ingestion_status() {
-        let value = serde_json::to_value(documented_router().into_openapi()).unwrap();
+        let value = serde_json::to_value(documented_router(RouterPolicy::default()).into_openapi())
+            .unwrap();
         let property =
             &value["components"]["schemas"]["RagDocumentRecord"]["properties"]["ingestion_status"];
         assert!(
@@ -880,7 +1261,8 @@ mod tests {
 
     #[test]
     fn public_response_schema_documents_always_empty_citations() {
-        let value = serde_json::to_value(documented_router().into_openapi()).unwrap();
+        let value = serde_json::to_value(documented_router(RouterPolicy::default()).into_openapi())
+            .unwrap();
         let description = value["components"]["schemas"]["PublicResponse"]["properties"]
             ["citations"]["description"]
             .as_str()

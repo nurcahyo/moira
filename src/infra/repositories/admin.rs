@@ -35,20 +35,41 @@ pub struct PgAdminCommandTransaction {
     transaction: Transaction<'static, Postgres>,
 }
 
+/// A claim on the idempotency ledger.
+///
+/// Every hash it carries is precomputed by the application layer; this repository never
+/// learns how any of them is derived, and — since plan 03 finding F3 — it no longer
+/// *compares* them either. It looks a claim up, sweeps expired rows, and either inserts or
+/// hands the existing row back for the application layer to verify, which is what plan 03's
+/// Detailed Implementation item 6 asks for ("prefer verifying in the application layer").
+///
+/// `legacy_key_hash` exists because the switch to keyed hashing (P1-1) changed the index
+/// key as well as the compared digest, so a row written before the switch is unreachable by
+/// the new key hash alone. It is `None` once the operator closes the dual-read window
+/// (`idempotency.accept_legacy_hashes = false`), which also removes the extra lookup it
+/// costs on every claim.
 #[derive(Debug, Clone)]
 pub struct AdminIdempotencyClaim {
     pub record_id: Uuid,
+    /// The key hash written for a fresh claim and tried first on lookup.
     pub key_hash: String,
+    /// The pre-switch key hash, tried only when `key_hash` misses. Never written.
+    pub legacy_key_hash: Option<String>,
     pub actor_fingerprint: String,
     pub operation: String,
+    /// The body digest written for a fresh claim.
     pub request_hash: String,
     pub expires_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
 pub enum AdminIdempotencyClaimOutcome {
+    /// No row existed; this claim now owns the ledger entry.
     Acquired,
-    Replay(IdempotencyRecord),
+    /// A row already exists for this key. Whether it is a legitimate replay or a
+    /// same-key-different-body conflict is the application layer's call, because deciding
+    /// it requires recomputing a keyed digest.
+    Existing(IdempotencyRecord),
 }
 
 #[derive(Debug, Clone)]
@@ -580,38 +601,48 @@ impl PgAdminCommandTransaction {
             sleep(Duration::from_millis(20)).await;
         }
 
+        // Every key hash this claim can reach is swept: an expired pre-switch row must not
+        // be resurrected as a replay by the legacy lookup below.
+        let mut sweep_key_hashes = vec![claim.key_hash.clone()];
+        sweep_key_hashes.extend(claim.legacy_key_hash.clone());
         sqlx::query(
             r#"
             delete from idempotency_records
-            where idempotency_key_hash = $1
+            where idempotency_key_hash = any($1)
               and actor_fingerprint = $2
               and operation = $3
               and expires_at <= now()
             "#,
         )
-        .bind(&claim.key_hash)
+        .bind(sweep_key_hashes)
         .bind(&claim.actor_fingerprint)
         .bind(&claim.operation)
         .execute(self.connection())
         .await?;
 
-        if let Some(record) = self
+        // Dual lookup: the current key hash first, then the pre-switch one — the latter
+        // only while the dual-read window is open, so closing it removes the extra query
+        // (plan 03 finding F4). The advisory lock above is keyed on `claim.key_hash`, which
+        // is identical for every concurrent request carrying the same Idempotency-Key, so
+        // both branches stay serialized.
+        let mut existing = self
             .load_idempotency(&claim.key_hash, &claim.actor_fingerprint, &claim.operation)
-            .await?
+            .await?;
+        if existing.is_none()
+            && let Some(legacy_key_hash) = &claim.legacy_key_hash
         {
-            if record.request_hash != claim.request_hash {
-                return Err(AppError::conflict(
-                    "idempotency_conflict",
-                    "same Idempotency-Key was used with a different request",
-                ));
-            }
-            if record.response_status.is_none() || record.response_body.is_none() {
-                return Err(AppError::conflict(
-                    "idempotency_in_progress",
-                    "another request with this Idempotency-Key is still in progress",
-                ));
-            }
-            return Ok(AdminIdempotencyClaimOutcome::Replay(record));
+            existing = self
+                .load_idempotency(legacy_key_hash, &claim.actor_fingerprint, &claim.operation)
+                .await?;
+        }
+
+        if let Some(record) = existing {
+            // Deliberately no digest comparison here. Deciding whether this row describes
+            // the same request means recomputing a keyed HMAC and comparing it in constant
+            // time, which is hashing policy and belongs to the application layer
+            // (plan 03 finding F3). Returning the row leaves this transaction open, so a
+            // conflict raised upstream still rolls the sweep above back, exactly as before.
+            return Ok(AdminIdempotencyClaimOutcome::Existing(record));
         }
 
         sqlx::query(
