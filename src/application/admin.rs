@@ -1,5 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 
+use secrecy::ExposeSecret;
 use serde::Serialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -1051,7 +1052,7 @@ impl<'a> AdminService<'a> {
                         .await?;
                     let response = ApiKeySecretResponse {
                         resource: record.clone(),
-                        secret: Some(generated.raw_key),
+                        secret: Some(generated.raw_key.expose_secret().to_string()),
                         secret_retrievable: true,
                     };
                     AdminCommandMutation::with_replay_response(
@@ -1158,7 +1159,7 @@ impl<'a> AdminService<'a> {
                         .await?;
                     let response = ApiKeySecretResponse {
                         resource: record.clone(),
-                        secret: Some(generated.raw_key),
+                        secret: Some(generated.raw_key.expose_secret().to_string()),
                         secret_retrievable: true,
                     };
                     AdminCommandMutation::with_replay_response(
@@ -1262,7 +1263,7 @@ impl<'a> AdminService<'a> {
                         .await?;
                     let response = ApiKeySecretResponse {
                         resource: record.clone(),
-                        secret: Some(generated.raw_key),
+                        secret: Some(generated.raw_key.expose_secret().to_string()),
                         secret_retrievable: true,
                     };
                     AdminCommandMutation::with_replay_response(
