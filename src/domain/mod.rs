@@ -44,9 +44,9 @@ pub use ids::{
 };
 pub use message::{DomainMessage, DomainMessageContent, DomainMessageRole};
 pub use models::{
-    AuditEvent, ChatCompletionRequest, ChatMessage, CreateProviderRequest, CredentialSummary,
-    HealthResponse, OwnerScope, ProviderConfig, ProviderKind, SetRoutingDefaultRequest,
-    UpdateProviderRequest, UpsertCredentialRequest,
+    AuditEvent, CreateProviderRequest, CredentialSummary, HealthResponse, OwnerScope,
+    ProviderConfig, ProviderKind, SetRoutingDefaultRequest, UpdateProviderRequest,
+    UpsertCredentialRequest,
 };
 pub use pagination::{CursorScope, ListCursor, SeqCursor};
 pub use public::{

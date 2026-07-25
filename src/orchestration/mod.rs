@@ -1,17 +1,14 @@
 mod controls;
-mod executor;
-mod resolver;
+mod provider_url;
+mod runtime_cache;
 mod runtime_factory;
 
 pub use controls::{
     CircuitBreakerRegistry, CircuitState, ConcurrencyController, ExecutionPermits,
     InMemoryRateLimiter, ProviderRuntimeCache, RuntimeCacheKey, is_fallback_eligible, is_retryable,
 };
-pub use executor::{execute_chat, stream_chat};
-pub use resolver::{
-    CredentialCandidate, ResolvedProvider, RuntimeConfigCache, credential_aad, credential_priority,
-    get_provider, normalize_openai_base_url, resolve_provider,
-};
+pub use provider_url::normalize_openai_base_url;
+pub use runtime_cache::RuntimeConfigCache;
 pub use runtime_factory::{
     RigRuntimeFactory, RuntimeCompletionOutput, RuntimeEventSeed, RuntimeFactory,
     RuntimeItemStream, RuntimeModelHandle, RuntimeStreamItem, RuntimeStreamOutput,
