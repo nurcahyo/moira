@@ -36,6 +36,20 @@
 //! scoped to their own provider and model ids, so under the fix they cannot touch the
 //! circuits these tests own — and under the bug they could, which is one more way for
 //! a regression to show up here.
+//!
+//! Where a bounded poll is unavoidable it paces itself with a `tokio::time::interval`
+//! rather than a `sleep`, matching `tests/retention_worker.rs::poll_until`: the first
+//! tick completes immediately, so a working system satisfies the condition on the first
+//! iteration and only a genuine failure pays the deadline.
+//!
+//! # The second path into the same registry
+//!
+//! `RuntimeAdminService::invalidate_runtime` clears the caches and the breakers directly,
+//! in the process that served the admin request, alongside the notification the same write
+//! emits. It called `reset_all()` too, so the fix above was only half of one — the
+//! service-side half is covered by
+//! [`every_runtime_admin_mutation_leaves_provider_circuits_intact`], which needs no
+//! barrier at all because that reset happens inside the awaited call.
 
 mod support;
 
@@ -43,15 +57,18 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use moira::{
+    application::RuntimeAdminService,
     domain::{
-        ExecutionFailureClass, ProviderConfig, ProviderKind, ProviderRuntimePolicyRecord,
-        RuntimePolicyStatus,
+        AgentProfileCreateRequest, AgentProfilePatchRequest, ExecutionFailureClass, ProviderConfig,
+        ProviderKind, ProviderRuntimePolicyPutRequest, ProviderRuntimePolicyRecord,
+        RouteDefinitionCreateRequest, RouteDefinitionPatchRequest, RouteSelectionStrategy,
+        RoutingPolicyCreateRequest, RoutingPolicyPatchRequest, RuntimePolicyStatus,
     },
     orchestration::{CircuitBreakerRegistry, RuntimeConfigCache},
 };
 use serde_json::json;
 use sqlx::PgPool;
-use support::{LifecycleFixture, RuntimePolicy};
+use support::{LifecycleFixture, RuntimePolicy, request_context};
 use uuid::Uuid;
 
 /// How long a notification is given to travel from `COMMIT` to the listener task.
@@ -143,6 +160,7 @@ async fn drain_listener(pool: &PgPool, circuits: &CircuitBreakerRegistry) {
     open_circuit(circuits, probe_provider, probe_model).await;
 
     let payload = change_payload("provider_models", probe_model);
+    let mut ticker = tokio::time::interval(POLL_INTERVAL);
     let deadline = Instant::now() + BARRIER_TIMEOUT;
     loop {
         notify(pool, &payload).await;
@@ -151,7 +169,7 @@ async fn drain_listener(pool: &PgPool, circuits: &CircuitBreakerRegistry) {
             if !is_open(circuits, probe_provider, probe_model).await {
                 return;
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
+            ticker.tick().await;
         }
         assert!(
             Instant::now() < deadline,
@@ -164,12 +182,13 @@ async fn wait_until<F>(mut condition: F, message: &str)
 where
     F: AsyncFnMut() -> bool,
 {
+    let mut ticker = tokio::time::interval(POLL_INTERVAL);
     let deadline = Instant::now() + BARRIER_TIMEOUT;
     while Instant::now() < deadline {
         if condition().await {
             return;
         }
-        tokio::time::sleep(POLL_INTERVAL).await;
+        ticker.tick().await;
     }
     panic!("{message}");
 }
@@ -351,6 +370,268 @@ async fn runtime_cache_still_invalidates_on_every_notify() {
         "the runtime config cache survived a NOTIFY; scoping the breaker reset must not \
          have narrowed the caches"
     );
+}
+
+/// Asserts that one runtime-admin mutation left both breakers where it found them.
+///
+/// Two circuits, because the two ways of getting this wrong look different: `owned`
+/// belongs to the provider whose rows the mutation actually touches, and `unrelated`
+/// belongs to a provider no row in this database names at all. `reset_all()` clears
+/// both; a mapping that guessed `Provider(id)` from the method name would clear only
+/// the first.
+async fn assert_circuits_survived(
+    circuits: &CircuitBreakerRegistry,
+    owned: (Uuid, Uuid),
+    unrelated: (Uuid, Uuid),
+    mutation: &str,
+) {
+    assert!(
+        is_open(circuits, owned.0, owned.1).await,
+        "{mutation} cleared the breaker of the provider whose rows it touched; none of \
+         the four tables this service writes can change whether that provider answers"
+    );
+    assert!(
+        is_open(circuits, unrelated.0, unrelated.1).await,
+        "{mutation} cleared a breaker belonging to a provider it never named; \
+         invalidate_runtime is still calling reset_all()"
+    );
+}
+
+/// The service-side half of the finding at the top of this file, driven through all
+/// thirteen call sites of `RuntimeAdminService::invalidate_runtime`.
+///
+/// Fixing the notification path alone fixed nothing an operator would notice: the admin
+/// request that caused the notification also runs `invalidate_runtime` in-process, and
+/// that called `reset_all()`, so every runtime-admin mutation still discarded the health
+/// of every provider in the process — the exact defect, on the exact registry, one layer
+/// up. Disabling one agent profile was enough to re-close a circuit opened by a
+/// still-failing provider on a completely unrelated route.
+///
+/// Every caller is driven rather than one per table, because the scope is now an argument
+/// each call site passes for itself: a wrong argument at, say, `delete_agent_profile`
+/// would be invisible to a test that only exercised `create_agent_profile`.
+///
+/// No barrier machinery is used and none is needed. `LifecycleFixture` does not spawn
+/// `spawn_runtime_config_listener` and this test does not start a `Listener`, so the only
+/// thing that can reach this registry is the service calls below — and their reset runs
+/// inside the awaited call, so each assertion reads a settled state the instant the call
+/// returns.
+///
+/// Under the pre-fix `reset_all()` it fails on the first assertion, at
+/// `create_route_definition`.
+#[tokio::test]
+async fn every_runtime_admin_mutation_leaves_provider_circuits_intact() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let circuits = fixture.state.circuits.clone();
+    let runtime = RuntimeAdminService::new(&fixture.state).expect("runtime admin service");
+    let suffix = Uuid::now_v7().simple().to_string();
+
+    // Created first: `add_provider` is itself a run of these mutations, so opening the
+    // circuits before it would only prove that it clears them.
+    let provider = fixture
+        .add_provider(
+            "http://127.0.0.1:9/v1".to_string(),
+            100,
+            RuntimePolicy::default(),
+        )
+        .await;
+    let policy_version = runtime
+        .get_provider_runtime_policy(&fixture.actor, provider.provider_id)
+        .await
+        .expect("read the provider runtime policy written by add_provider")
+        .version;
+
+    let owned = (provider.provider_id, provider.model_id);
+    let unrelated = (Uuid::now_v7(), Uuid::now_v7());
+    open_circuit(&circuits, owned.0, owned.1).await;
+    open_circuit(&circuits, unrelated.0, unrelated.1).await;
+
+    // --- route_definitions -------------------------------------------------------
+    let route = runtime
+        .create_route_definition(
+            &fixture.actor,
+            &request_context(),
+            RouteDefinitionCreateRequest {
+                route_key: format!("scoped_{suffix}"),
+                display_name: format!("Scoped route {suffix}"),
+                description: None,
+                selection_strategy: RouteSelectionStrategy::Default,
+                agent_profile_id: None,
+                metadata: json!({ "test_fixture": true }),
+            },
+        )
+        .await
+        .expect("create route definition");
+    assert_circuits_survived(&circuits, owned, unrelated, "create_route_definition").await;
+
+    runtime
+        .patch_route_definition(
+            &fixture.actor,
+            &request_context(),
+            route.id,
+            RouteDefinitionPatchRequest {
+                display_name: Some(format!("Scoped route {suffix} renamed")),
+                ..RouteDefinitionPatchRequest::default()
+            },
+        )
+        .await
+        .expect("patch route definition");
+    assert_circuits_survived(&circuits, owned, unrelated, "patch_route_definition").await;
+
+    runtime
+        .set_route_definition_enabled(&fixture.actor, &request_context(), route.id, false)
+        .await
+        .expect("disable route definition");
+    assert_circuits_survived(&circuits, owned, unrelated, "set_route_definition_enabled").await;
+
+    // --- routing_policies --------------------------------------------------------
+    // Bound to the fixture's own route rather than the one above, which is about to be
+    // deleted. This is the family whose rows carry a `(provider_id, provider_model_id)`
+    // pair, so it is the one most likely to be mis-scoped to `Provider(id)`.
+    let routing_policy = runtime
+        .create_routing_policy(
+            &fixture.actor,
+            &request_context(),
+            RoutingPolicyCreateRequest {
+                application_id: Some(fixture.application_id),
+                external_tenant_id: None,
+                route_id: fixture.route_id,
+                provider_id: provider.provider_id,
+                provider_model_id: provider.model_id,
+                priority: 50,
+                weight: 1,
+                cost_weight: 0.0,
+                latency_weight: 0.0,
+                quality_weight: 0.0,
+                privacy_class: None,
+                required_capabilities: Vec::new(),
+                maximum_cost_per_request: None,
+                maximum_input_tokens: None,
+                maximum_output_tokens: None,
+                timeout_ms: Some(2_000),
+                retry_policy: json!({}),
+                metadata: json!({ "test_fixture": true }),
+            },
+        )
+        .await
+        .expect("create routing policy");
+    assert_circuits_survived(&circuits, owned, unrelated, "create_routing_policy").await;
+
+    runtime
+        .patch_routing_policy(
+            &fixture.actor,
+            &request_context(),
+            routing_policy.id,
+            RoutingPolicyPatchRequest {
+                priority: Some(60),
+                ..RoutingPolicyPatchRequest::default()
+            },
+        )
+        .await
+        .expect("patch routing policy");
+    assert_circuits_survived(&circuits, owned, unrelated, "patch_routing_policy").await;
+
+    runtime
+        .set_routing_policy_enabled(&fixture.actor, &request_context(), routing_policy.id, false)
+        .await
+        .expect("disable routing policy");
+    assert_circuits_survived(&circuits, owned, unrelated, "set_routing_policy_enabled").await;
+
+    runtime
+        .delete_routing_policy(&fixture.actor, &request_context(), routing_policy.id)
+        .await
+        .expect("delete routing policy");
+    assert_circuits_survived(&circuits, owned, unrelated, "delete_routing_policy").await;
+
+    // --- agent_profiles ----------------------------------------------------------
+    let profile = runtime
+        .create_agent_profile(
+            &fixture.actor,
+            &request_context(),
+            AgentProfileCreateRequest {
+                profile_key: format!("scoped_{suffix}"),
+                display_name: format!("Scoped profile {suffix}"),
+                preamble: None,
+                temperature: Some(0.2),
+                max_tokens: Some(64),
+                tool_policy: json!({}),
+                context_policy: json!({}),
+                memory_policy: json!({}),
+                metadata: json!({ "test_fixture": true }),
+            },
+        )
+        .await
+        .expect("create agent profile");
+    assert_circuits_survived(&circuits, owned, unrelated, "create_agent_profile").await;
+
+    runtime
+        .patch_agent_profile(
+            &fixture.actor,
+            &request_context(),
+            profile.id,
+            AgentProfilePatchRequest {
+                display_name: Some(format!("Scoped profile {suffix} renamed")),
+                ..AgentProfilePatchRequest::default()
+            },
+        )
+        .await
+        .expect("patch agent profile");
+    assert_circuits_survived(&circuits, owned, unrelated, "patch_agent_profile").await;
+
+    runtime
+        .set_agent_profile_enabled(&fixture.actor, &request_context(), profile.id, false)
+        .await
+        .expect("disable agent profile");
+    assert_circuits_survived(&circuits, owned, unrelated, "set_agent_profile_enabled").await;
+
+    runtime
+        .delete_agent_profile(&fixture.actor, &request_context(), profile.id)
+        .await
+        .expect("delete agent profile");
+    assert_circuits_survived(&circuits, owned, unrelated, "delete_agent_profile").await;
+
+    // --- provider_runtime_policies -----------------------------------------------
+    // The only caller holding a `provider_id`, and the one place `Provider(id)` would
+    // have been expressible. It must still leave `owned` alone: `before_call` resets an
+    // entry whose stored `policy_version` no longer matches, so a policy edit self-heals
+    // where it is consulted, and clearing here would discard a provider's whole breaker
+    // set on an edit to an unrelated field.
+    //
+    // The breaker below is unaffected by that self-heal because `open_circuit` and
+    // `is_open` both use the pinned `breaker_policy()`; the registry never reads this row.
+    runtime
+        .put_provider_runtime_policy(
+            &fixture.actor,
+            &request_context(),
+            provider.provider_id,
+            Some(policy_version),
+            ProviderRuntimePolicyPutRequest {
+                connect_timeout_ms: Some(2_000),
+                request_timeout_ms: Some(2_000),
+                stream_idle_timeout_ms: Some(2_000),
+                max_concurrent_requests: Some(8),
+                max_concurrent_streams: Some(4),
+                retry_limit: Some(0),
+                retry_base_delay_ms: Some(0),
+                retry_max_delay_ms: Some(0),
+                circuit_failure_threshold: Some(5),
+                circuit_open_duration_ms: Some(30_000),
+                status: Some(RuntimePolicyStatus::Active),
+            },
+        )
+        .await
+        .expect("put provider runtime policy");
+    assert_circuits_survived(&circuits, owned, unrelated, "put_provider_runtime_policy").await;
+
+    // Deleted last so the route family's fourth caller runs after everything that needed
+    // a live route, and the count of exercised call sites reaches thirteen.
+    runtime
+        .delete_route_definition(&fixture.actor, &request_context(), route.id)
+        .await
+        .expect("delete route definition");
+    assert_circuits_survived(&circuits, owned, unrelated, "delete_route_definition").await;
 }
 
 /// The fail-safe. A payload the listener cannot understand must behave exactly as the

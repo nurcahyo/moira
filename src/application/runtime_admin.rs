@@ -22,6 +22,7 @@ use crate::{
     infra::repositories::{
         AdminRepository, PgAdminRepository, PgRuntimeRepository, RuntimeRepository,
     },
+    orchestration::CircuitResetScope,
     security::{Actor, secret_fingerprint},
 };
 
@@ -78,7 +79,7 @@ impl<'a> RuntimeAdminService<'a> {
             .runtime_repo
             .create_route_definition(Uuid::now_v7(), &request)
             .await?;
-        self.invalidate_runtime().await;
+        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
             ctx,
@@ -140,7 +141,7 @@ impl<'a> RuntimeAdminService<'a> {
             .runtime_repo
             .patch_route_definition(id, &request)
             .await?;
-        self.invalidate_runtime().await;
+        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
             ctx,
@@ -161,7 +162,7 @@ impl<'a> RuntimeAdminService<'a> {
     ) -> Result<(), AppError> {
         self.state.authz.require(actor, "moira:routes:delete")?;
         self.runtime_repo.soft_delete_route_definition(id).await?;
-        self.invalidate_runtime().await;
+        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
             ctx,
@@ -185,7 +186,7 @@ impl<'a> RuntimeAdminService<'a> {
             .runtime_repo
             .set_route_definition_status(id, if enabled { "active" } else { "disabled" })
             .await?;
-        self.invalidate_runtime().await;
+        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
             ctx,
@@ -227,7 +228,7 @@ impl<'a> RuntimeAdminService<'a> {
             .runtime_repo
             .create_routing_policy(Uuid::now_v7(), &request)
             .await?;
-        self.invalidate_runtime().await;
+        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
             ctx,
@@ -295,7 +296,7 @@ impl<'a> RuntimeAdminService<'a> {
         self.ensure_provider_model_belongs_to_provider(provider_id, provider_model_id)
             .await?;
         let record = self.runtime_repo.patch_routing_policy(id, &request).await?;
-        self.invalidate_runtime().await;
+        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
             ctx,
@@ -336,7 +337,7 @@ impl<'a> RuntimeAdminService<'a> {
             .authz
             .require(actor, "moira:routing-policies:delete")?;
         self.runtime_repo.soft_delete_routing_policy(id).await?;
-        self.invalidate_runtime().await;
+        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
             ctx,
@@ -362,7 +363,7 @@ impl<'a> RuntimeAdminService<'a> {
             .runtime_repo
             .set_routing_policy_status(id, if enabled { "active" } else { "disabled" })
             .await?;
-        self.invalidate_runtime().await;
+        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
             ctx,
@@ -408,7 +409,7 @@ impl<'a> RuntimeAdminService<'a> {
             .runtime_repo
             .create_agent_profile(Uuid::now_v7(), &request)
             .await?;
-        self.invalidate_runtime().await;
+        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
             ctx,
@@ -475,7 +476,7 @@ impl<'a> RuntimeAdminService<'a> {
             request.metadata.as_ref().unwrap_or(&Value::Null),
         )?;
         let record = self.runtime_repo.patch_agent_profile(id, &request).await?;
-        self.invalidate_runtime().await;
+        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
             ctx,
@@ -498,7 +499,7 @@ impl<'a> RuntimeAdminService<'a> {
             .authz
             .require(actor, "moira:agent-profiles:delete")?;
         self.runtime_repo.soft_delete_agent_profile(id).await?;
-        self.invalidate_runtime().await;
+        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
             ctx,
@@ -524,7 +525,7 @@ impl<'a> RuntimeAdminService<'a> {
             .runtime_repo
             .set_agent_profile_status(id, if enabled { "active" } else { "disabled" })
             .await?;
-        self.invalidate_runtime().await;
+        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
             ctx,
@@ -607,7 +608,7 @@ impl<'a> RuntimeAdminService<'a> {
             .runtime_repo
             .put_provider_runtime_policy(provider_id, &request)
             .await?;
-        self.invalidate_runtime().await;
+        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
             ctx,
@@ -628,10 +629,61 @@ impl<'a> RuntimeAdminService<'a> {
         Ok(record)
     }
 
-    async fn invalidate_runtime(&self) {
+    /// Drops both runtime caches, and clears exactly the breaker entries the write that
+    /// just happened can plausibly have invalidated.
+    ///
+    /// This called `CircuitBreakerRegistry::reset_all` until plan 06 Module 14, so every
+    /// runtime-admin mutation discarded the health of *every* provider in the process:
+    /// renaming a route re-closed a circuit that was open because some unrelated provider
+    /// was still timing out, and the next request went straight back at it. Module 14
+    /// fixed the same defect on the `LISTEN`/`NOTIFY` side (`src/infra/db.rs`) but could
+    /// not reach this file; this is the service-side half of it.
+    ///
+    /// The scope is a parameter rather than a constant so the compiler puts the question
+    /// to every future caller. Deriving it here from the method name would be a guess,
+    /// and a guess is wrong in both directions — too narrow leaves a breaker stale, too
+    /// wide is the bug above.
+    ///
+    /// Every call site today passes [`CircuitResetScope::Unaffected`], which is a
+    /// property of this service's *write set* rather than a coincidence. A breaker entry
+    /// is keyed on `(provider_id, model_id)` and earned by observing a provider actually
+    /// fail; this service writes four tables, and none of them can change whether a
+    /// provider is answering:
+    ///
+    /// * `route_definitions` — the four route-definition mutations. A route is a named
+    ///   entry point and the row carries neither a provider nor a model, so no breaker
+    ///   entry can name it.
+    /// * `routing_policies` — the four routing-policy mutations. These rows *do* carry a
+    ///   `(provider_id, provider_model_id)` pair, which makes them look scopeable, but
+    ///   the pair says where traffic should be sent, not whether the provider is up.
+    ///   Binding a route to a provider does not make a failing provider healthy, and
+    ///   clearing its breaker on that write is precisely how traffic gets sent back at it.
+    /// * `agent_profiles` — the four agent-profile mutations. Temperature, token limits
+    ///   and tool/context/memory policy; the row carries no provider identity at all.
+    /// * `provider_runtime_policies` — `put_provider_runtime_policy`, the only caller
+    ///   holding a `provider_id` and therefore the only one where `Provider(id)` is even
+    ///   expressible. It is still `Unaffected`, for the reason recorded at
+    ///   `CIRCUIT_UNAFFECTED_RESOURCE_TYPES` in `src/infra/db.rs`: [`before_call`] already
+    ///   resets any entry whose stored `policy_version` disagrees with the policy it is
+    ///   handed, so a policy edit self-heals exactly where the breaker is consulted.
+    ///   Resetting here as well would throw away every breaker for that provider on an
+    ///   edit to, say, `max_concurrent_streams`.
+    ///
+    /// What makes those four answers more than opinion: each of these writes also fires
+    /// the `moira_runtime_config` trigger, and `circuit_reset_scope` in `src/infra/db.rs`
+    /// independently classifies all four tables as `Unaffected`. The two paths have to
+    /// agree — the notification reaches every process, this call only the process that
+    /// served the request — so a disagreement would leave the writing node's breaker
+    /// state diverging from every other node's for the very same row.
+    ///
+    /// [`before_call`]: crate::orchestration::CircuitBreakerRegistry::before_call
+    async fn invalidate_runtime(&self, circuits: CircuitResetScope) {
+        // Both caches stay unconditional, as they are on the NOTIFY path: they are keyed
+        // by row version and rebuild from a query, so re-reading them costs one. Breaker
+        // state cannot be rebuilt, which is why it is the only thing scoped.
         self.state.runtime_cache.invalidate_all().await;
         self.state.runtime_handles.invalidate_all().await;
-        self.state.circuits.reset_all().await;
+        self.state.circuits.reset_for_resource(circuits).await;
     }
 
     async fn audit_success(
