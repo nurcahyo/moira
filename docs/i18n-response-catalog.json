@@ -34,6 +34,11 @@
       "description": "Used for unclassified server-side failures."
     },
     {
+      "key": "moira.error.invalid_cursor",
+      "default_message": "The pagination cursor is invalid.",
+      "description": "Used when a list cursor is malformed, tampered with, wrongly formatted, or reused across a different list endpoint."
+    },
+    {
       "key": "moira.error.invalid_request",
       "default_message": "The request is invalid.",
       "description": "Used when the request cannot be parsed or violates a basic contract rule."
@@ -134,14 +139,14 @@
       "description": "Used when a conflicting execution is already running."
     },
     {
-      "key": "moira.error.idempotency_conflict",
-      "default_message": "The idempotent request conflicts with a previous request.",
-      "description": "Used when the same idempotency key is reused for a different request."
-    },
-    {
       "key": "moira.error.idempotency_not_supported_for_stream",
       "default_message": "Idempotency keys are not supported for response streams.",
       "description": "Used when streaming rejects idempotent replay headers."
+    },
+    {
+      "key": "moira.error.if_match_required",
+      "default_message": "The If-Match header is required for this request.",
+      "description": "Used when a versioned mutation is called without the If-Match precondition header."
     },
     {
       "key": "moira.error.image_too_large",
@@ -242,11 +247,6 @@
       "key": "moira.error.rag_document_type_unsupported",
       "default_message": "The RAG document type is not supported.",
       "description": "Used when a document type is outside the supported set."
-    },
-    {
-      "key": "moira.error.rate_limited",
-      "default_message": "Too many requests were sent in a short period of time.",
-      "description": "Used when a caller must back off and retry later."
     },
     {
       "key": "moira.error.resource_version_conflict",

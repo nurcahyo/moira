@@ -25,6 +25,9 @@ struct MetricsInner {
     public_responses_created_total: AtomicU64,
     public_streams_started_total: AtomicU64,
     worker_ticks_total: AtomicU64,
+    retention_runs_total: AtomicU64,
+    retention_idempotency_records_deleted_total: AtomicU64,
+    retention_responses_deleted_total: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +41,9 @@ pub struct MetricsSnapshot {
     pub public_responses_created_total: u64,
     pub public_streams_started_total: u64,
     pub worker_ticks_total: u64,
+    pub retention_runs_total: u64,
+    pub retention_idempotency_records_deleted_total: u64,
+    pub retention_responses_deleted_total: u64,
 }
 
 impl MetricsRegistry {
@@ -91,6 +97,34 @@ impl MetricsRegistry {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Counts one completed retention sweep, successful or not — the sweep-rate
+    /// signal is what tells an operator the worker is alive at all.
+    pub fn record_retention_run(&self) {
+        self.inner
+            .retention_runs_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts rows deleted by the retention worker, per table.
+    ///
+    /// Deliberately a plain counter keyed on a closed set of table names, not a
+    /// general labelled metric: plan 05 replaces the whole registry with the
+    /// `metrics` facade and can upgrade this into a labelled counter/histogram
+    /// without changing this call site's shape. An unrecognised table is dropped
+    /// rather than silently folded into another table's total.
+    pub fn record_retention_deleted(&self, table: &str, count: u64) {
+        let counter = match table {
+            crate::infra::workers::retention::TABLE_IDEMPOTENCY_RECORDS => {
+                &self.inner.retention_idempotency_records_deleted_total
+            }
+            crate::infra::workers::retention::TABLE_RESPONSES => {
+                &self.inner.retention_responses_deleted_total
+            }
+            _ => return,
+        };
+        counter.fetch_add(count, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
             http_requests_total: self.inner.http_requests_total.load(Ordering::Relaxed),
@@ -108,6 +142,15 @@ impl MetricsRegistry {
                 .public_streams_started_total
                 .load(Ordering::Relaxed),
             worker_ticks_total: self.inner.worker_ticks_total.load(Ordering::Relaxed),
+            retention_runs_total: self.inner.retention_runs_total.load(Ordering::Relaxed),
+            retention_idempotency_records_deleted_total: self
+                .inner
+                .retention_idempotency_records_deleted_total
+                .load(Ordering::Relaxed),
+            retention_responses_deleted_total: self
+                .inner
+                .retention_responses_deleted_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -212,6 +255,36 @@ impl MetricsRegistry {
         );
         write_metric_header(
             &mut output,
+            "moira_retention_runs_total",
+            "Total retention cleanup sweeps completed by this process.",
+            "counter",
+        );
+        write_labeled_metric(
+            &mut output,
+            "moira_retention_runs_total",
+            &service_name,
+            snapshot.retention_runs_total,
+        );
+        write_metric_header(
+            &mut output,
+            "moira_retention_rows_deleted_total",
+            "Total expired rows deleted by the retention cleanup worker, by table.",
+            "counter",
+        );
+        write_retention_metric(
+            &mut output,
+            &service_name,
+            crate::infra::workers::retention::TABLE_IDEMPOTENCY_RECORDS,
+            snapshot.retention_idempotency_records_deleted_total,
+        );
+        write_retention_metric(
+            &mut output,
+            &service_name,
+            crate::infra::workers::retention::TABLE_RESPONSES,
+            snapshot.retention_responses_deleted_total,
+        );
+        write_metric_header(
+            &mut output,
             "moira_redis_enabled",
             "Whether Redis coordination is enabled for this process.",
             "gauge",
@@ -251,6 +324,15 @@ fn write_status_metric(output: &mut String, service_name: &str, status_class: &s
     let _ = writeln!(
         output,
         "moira_http_response_status_class_total{{service=\"{service_name}\",status_class=\"{status_class}\"}} {value}"
+    );
+}
+
+/// `table` is always one of the two `&'static str` constants in
+/// `crate::infra::workers::retention`, so the label set stays at cardinality 2.
+fn write_retention_metric(output: &mut String, service_name: &str, table: &str, value: u64) {
+    let _ = writeln!(
+        output,
+        "moira_retention_rows_deleted_total{{service=\"{service_name}\",table=\"{table}\"}} {value}"
     );
 }
 

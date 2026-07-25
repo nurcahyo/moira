@@ -66,7 +66,13 @@ fn etag_headers(version: i64) -> HeaderMap {
 fn require_if_match(headers: &HeaderMap) -> Result<i64, AppError> {
     let value = headers
         .get(header::IF_MATCH)
-        .ok_or_else(|| AppError::BadRequest("If-Match header is required".to_string()))?
+        .ok_or_else(|| {
+            AppError::coded(
+                StatusCode::BAD_REQUEST,
+                "if_match_required",
+                "If-Match header is required",
+            )
+        })?
         .to_str()
         .map_err(|_| AppError::BadRequest("If-Match header is invalid".to_string()))?;
     value
@@ -140,7 +146,7 @@ pub async fn list_applications(
 ) -> Result<Json<ListResponse<ApplicationRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     AdminService::new(&state)?
-        .list_applications(&actor, query.limit())
+        .list_applications(&actor, &query)
         .await
         .map(Json)
 }
@@ -316,7 +322,7 @@ pub async fn get_application_execution_policy(
     request_body = ApplicationExecutionPolicyPutRequest,
     params(
         ("id" = Uuid, Path, description = "Application identifier"),
-        ("If-Match" = Option<i64>, Header, description = "Optional current resource version"),
+        ("If-Match" = i64, Header, description = "Required current resource version"),
         ("Idempotency-Key" = Option<String>, Header, description = "Optional replay key")
     ),
     responses(
@@ -335,7 +341,13 @@ pub async fn put_application_execution_policy(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let record = PublicExecutionService::new(&state)?
-        .put_application_execution_policy(&actor, &ctx, id, optional_if_match(&headers)?, request)
+        .put_application_execution_policy(
+            &actor,
+            &ctx,
+            id,
+            Some(require_if_match(&headers)?),
+            request,
+        )
         .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
@@ -386,7 +398,7 @@ pub async fn list_providers(
 ) -> Result<Json<ListResponse<ProviderRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     AdminService::new(&state)?
-        .list_providers(&actor, query.limit())
+        .list_providers(&actor, &query)
         .await
         .map(Json)
 }
@@ -585,7 +597,7 @@ pub async fn list_provider_models(
 ) -> Result<Json<ListResponse<ProviderModelRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     AdminService::new(&state)?
-        .list_provider_models(&actor, provider_id, query.limit())
+        .list_provider_models(&actor, provider_id, &query)
         .await
         .map(Json)
 }
@@ -784,7 +796,7 @@ pub async fn list_credentials(
 ) -> Result<Json<ListResponse<CredentialRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     AdminService::new(&state)?
-        .list_credentials(&actor, query.limit())
+        .list_credentials(&actor, &query)
         .await
         .map(Json)
 }
@@ -1015,7 +1027,7 @@ pub async fn list_user_credentials(
 ) -> Result<Json<ListResponse<CredentialRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     AdminService::new(&state)?
-        .list_user_credentials(&actor, &external_user_id, query.limit())
+        .list_user_credentials(&actor, &external_user_id, &query)
         .await
         .map(Json)
 }
@@ -1094,7 +1106,7 @@ pub async fn list_system_keys(
 ) -> Result<Json<ListResponse<ApiKeyRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     AdminService::new(&state)?
-        .list_system_keys(&actor, query.limit())
+        .list_system_keys(&actor, &query)
         .await
         .map(Json)
 }
@@ -1243,7 +1255,7 @@ pub async fn list_consumer_keys(
 ) -> Result<Json<ListResponse<ApiKeyRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     AdminService::new(&state)?
-        .list_consumer_keys(&actor, query.limit())
+        .list_consumer_keys(&actor, &query)
         .await
         .map(Json)
 }
@@ -1396,7 +1408,7 @@ pub async fn list_trusted_jwt_issuers(
 ) -> Result<Json<ListResponse<TrustedJwtIssuerRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     AdminService::new(&state)?
-        .list_trusted_jwt_issuers(&actor, query.limit())
+        .list_trusted_jwt_issuers(&actor, &query)
         .await
         .map(Json)
 }
@@ -1587,7 +1599,7 @@ pub async fn list_audit_events(
 ) -> Result<Json<ListResponse<AuditLogRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     AdminService::new(&state)?
-        .list_audit_logs(&actor, query.limit())
+        .list_audit_logs(&actor, &query)
         .await
         .map(Json)
 }
@@ -1659,7 +1671,7 @@ pub async fn list_route_definitions(
 ) -> Result<Json<ListResponse<RouteDefinitionRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     RuntimeAdminService::new(&state)?
-        .list_route_definitions(&actor, query.limit())
+        .list_route_definitions(&actor, query.cursor.as_deref(), query.limit())
         .await
         .map(Json)
 }
@@ -1855,7 +1867,7 @@ pub async fn list_routing_policies(
 ) -> Result<Json<ListResponse<RoutingPolicyRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     RuntimeAdminService::new(&state)?
-        .list_routing_policies(&actor, query.limit())
+        .list_routing_policies(&actor, query.cursor.as_deref(), query.limit())
         .await
         .map(Json)
 }
@@ -2051,7 +2063,7 @@ pub async fn list_agent_profiles(
 ) -> Result<Json<ListResponse<AgentProfileRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     RuntimeAdminService::new(&state)?
-        .list_agent_profiles(&actor, query.limit())
+        .list_agent_profiles(&actor, query.cursor.as_deref(), query.limit())
         .await
         .map(Json)
 }

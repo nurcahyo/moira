@@ -114,6 +114,22 @@ pub enum ProviderScript {
         first_delta: Option<String>,
         gate: Arc<ScriptGate>,
     },
+    /// Emits `first_delta`, signals arrival, waits for the test's release, then emits
+    /// `flood_delta` in an unbounded loop until the consumer drops the connection.
+    ///
+    /// Distinct from [`ProviderScript::HeldStream`], whose `remaining_deltas` are a fixed
+    /// list. A fixed list cannot *guarantee* server-side send backpressure: the number of
+    /// events needed to fill Moira's two internal `mpsc` channels **plus** hyper's write
+    /// buffer **plus** the kernel socket buffers on both ends is platform-dependent, so
+    /// any fixed count is either a guess that may be too small or a large magic number.
+    /// Flooding until the connection closes makes the backpressure deterministic with no
+    /// `sleep` and no buffer-size arithmetic. The loop is naturally throttled: it only
+    /// advances when hyper can write, so it cannot busy-spin.
+    FloodingStream {
+        first_delta: String,
+        flood_delta: String,
+        gate: Arc<ScriptGate>,
+    },
 }
 
 #[derive(Debug)]
@@ -252,6 +268,11 @@ async fn handle_completion(
         ProviderScript::StalledStream { first_delta, gate } => {
             streaming_response(stalled_stream_body(first_delta, gate))
         }
+        ProviderScript::FloodingStream {
+            first_delta,
+            flood_delta,
+            gate,
+        } => streaming_response(flooding_stream_body(first_delta, flood_delta, gate)),
     }
 }
 
@@ -384,6 +405,20 @@ fn stalled_stream_body(first_delta: Option<String>, gate: Arc<ScriptGate>) -> Bo
         }
         gate.arrived.add_permits(1);
         gate.wait_for_release().await;
+    };
+    Body::from_stream(stream)
+}
+
+fn flooding_stream_body(first_delta: String, flood_delta: String, gate: Arc<ScriptGate>) -> Body {
+    let stream = async_stream::stream! {
+        let _guard = ConnectionGuard::new(gate.clone());
+        yield Ok::<_, Infallible>(Bytes::from(sse_delta(&first_delta)));
+        gate.arrived.add_permits(1);
+        gate.wait_for_release().await;
+        let chunk = Bytes::from(sse_delta(&flood_delta));
+        loop {
+            yield Ok(chunk.clone());
+        }
     };
     Body::from_stream(stream)
 }

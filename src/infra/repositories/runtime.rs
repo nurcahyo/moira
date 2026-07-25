@@ -7,7 +7,7 @@ use crate::{
     domain::{
         AgentProfileCreateRequest, AgentProfilePatchRequest, AgentProfileRecord, AttemptStatus,
         CredentialDecisionSource, CredentialRecord, CredentialType, ExecutionFailureClass,
-        ModelCandidate, ProviderRuntimePolicyPutRequest, ProviderRuntimePolicyRecord,
+        ListCursor, ModelCandidate, ProviderRuntimePolicyPutRequest, ProviderRuntimePolicyRecord,
         RouteDefinitionCreateRequest, RouteDefinitionPatchRequest, RouteDefinitionRecord,
         RoutingPolicyCreateRequest, RoutingPolicyPatchRequest, RoutingPolicyRecord, UsageSummary,
     },
@@ -107,23 +107,27 @@ impl PgRuntimeRepository {
         route_definition_record_from_row(&row)
     }
 
+    /// Lists route definitions newest-first, keyset-paginated on `(created_at, id)`.
+    ///
+    /// `cursor` bounds the page to rows strictly *after* the previously returned last row
+    /// (i.e. strictly less than the cursor under `created_at desc, id desc` ordering); `None`
+    /// returns the first page. Returns up to `limit + 1` rows so the caller (application
+    /// layer) can detect `has_more` without a second `count(*)` query and must trim the
+    /// over-fetched row itself before returning it to a client. `cursor.ts`/`cursor.id` are
+    /// always bound as parameters, never interpolated into the query text — see
+    /// `keyset_predicate_binds_parameters_and_never_interpolates_values` below, which pins
+    /// the query text used here.
     pub async fn list_route_definitions(
         &self,
+        cursor: Option<ListCursor>,
         limit: i64,
     ) -> Result<Vec<RouteDefinitionRecord>, AppError> {
-        let rows = sqlx::query(
-            r#"
-            select id, route_key, display_name, description, status, selection_strategy,
-                   agent_profile_id, metadata, created_at, updated_at, deleted_at, version
-            from route_definitions
-            where deleted_at is null
-            order by created_at desc, id desc
-            limit $1
-            "#,
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query(LIST_ROUTE_DEFINITIONS_SQL)
+            .bind(cursor.map(|c| c.ts))
+            .bind(cursor.map(|c| c.id))
+            .bind(over_fetch_limit(limit))
+            .fetch_all(&self.pool)
+            .await?;
         rows.iter().map(route_definition_record_from_row).collect()
     }
 
@@ -263,27 +267,18 @@ impl PgRuntimeRepository {
         routing_policy_record_from_row(&row)
     }
 
+    /// See [`Self::list_route_definitions`] for the keyset-pagination contract this shares.
     pub async fn list_routing_policies(
         &self,
+        cursor: Option<ListCursor>,
         limit: i64,
     ) -> Result<Vec<RoutingPolicyRecord>, AppError> {
-        let rows = sqlx::query(
-            r#"
-            select id, application_id, external_tenant_id, route_id, provider_id,
-                   provider_model_id, priority, weight, cost_weight, latency_weight,
-                   quality_weight, privacy_class, required_capabilities,
-                   maximum_cost_per_request, maximum_input_tokens, maximum_output_tokens,
-                   timeout_ms, retry_policy, status, metadata, created_at, updated_at,
-                   deleted_at, version
-            from routing_policies
-            where deleted_at is null
-            order by created_at desc, id desc
-            limit $1
-            "#,
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query(LIST_ROUTING_POLICIES_SQL)
+            .bind(cursor.map(|c| c.ts))
+            .bind(cursor.map(|c| c.id))
+            .bind(over_fetch_limit(limit))
+            .fetch_all(&self.pool)
+            .await?;
         rows.iter().map(routing_policy_record_from_row).collect()
     }
 
@@ -443,24 +438,18 @@ impl PgRuntimeRepository {
         agent_profile_record_from_row(&row)
     }
 
+    /// See [`Self::list_route_definitions`] for the keyset-pagination contract this shares.
     pub async fn list_agent_profiles(
         &self,
+        cursor: Option<ListCursor>,
         limit: i64,
     ) -> Result<Vec<AgentProfileRecord>, AppError> {
-        let rows = sqlx::query(
-            r#"
-            select id, profile_key, display_name, preamble, temperature, max_tokens,
-                   tool_policy, context_policy, memory_policy, status, metadata,
-                   created_at, updated_at, deleted_at, version
-            from agent_profiles
-            where deleted_at is null
-            order by created_at desc, id desc
-            limit $1
-            "#,
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query(LIST_AGENT_PROFILES_SQL)
+            .bind(cursor.map(|c| c.ts))
+            .bind(cursor.map(|c| c.id))
+            .bind(over_fetch_limit(limit))
+            .fetch_all(&self.pool)
+            .await?;
         rows.iter().map(agent_profile_record_from_row).collect()
     }
 
@@ -993,6 +982,50 @@ impl PgRuntimeRepository {
     }
 }
 
+/// Keyset predicate shared by every `list_*` query in this file: `$1`/`$2` are the cursor's
+/// `(ts, id)` bound as parameters (both `NULL` for the first page, which short-circuits the
+/// `is null` branch and matches every row), and the strict `<` under `created_at desc, id
+/// desc` ordering returns exactly the rows after the previously returned last row.
+const LIST_ROUTE_DEFINITIONS_SQL: &str = r#"
+    select id, route_key, display_name, description, status, selection_strategy,
+           agent_profile_id, metadata, created_at, updated_at, deleted_at, version
+    from route_definitions
+    where deleted_at is null
+      and ($1::timestamptz is null or (created_at, id) < ($1::timestamptz, $2::uuid))
+    order by created_at desc, id desc
+    limit $3
+    "#;
+
+const LIST_ROUTING_POLICIES_SQL: &str = r#"
+    select id, application_id, external_tenant_id, route_id, provider_id,
+           provider_model_id, priority, weight, cost_weight, latency_weight,
+           quality_weight, privacy_class, required_capabilities,
+           maximum_cost_per_request, maximum_input_tokens, maximum_output_tokens,
+           timeout_ms, retry_policy, status, metadata, created_at, updated_at,
+           deleted_at, version
+    from routing_policies
+    where deleted_at is null
+      and ($1::timestamptz is null or (created_at, id) < ($1::timestamptz, $2::uuid))
+    order by created_at desc, id desc
+    limit $3
+    "#;
+
+const LIST_AGENT_PROFILES_SQL: &str = r#"
+    select id, profile_key, display_name, preamble, temperature, max_tokens,
+           tool_policy, context_policy, memory_policy, status, metadata,
+           created_at, updated_at, deleted_at, version
+    from agent_profiles
+    where deleted_at is null
+      and ($1::timestamptz is null or (created_at, id) < ($1::timestamptz, $2::uuid))
+    order by created_at desc, id desc
+    limit $3
+    "#;
+
+/// Over-fetches by one row so the caller can compute `has_more` without a second query.
+fn over_fetch_limit(limit: i64) -> i64 {
+    limit.saturating_add(1)
+}
+
 fn route_definition_select(suffix: &str) -> String {
     format!(
         r#"
@@ -1202,5 +1235,65 @@ mod tests {
             credential_source_from_record(&record),
             CredentialDecisionSource::UserApplicationTenant
         );
+    }
+
+    #[test]
+    fn over_fetch_limit_is_limit_plus_one() {
+        assert_eq!(over_fetch_limit(1), 2);
+        assert_eq!(over_fetch_limit(50), 51);
+        assert_eq!(over_fetch_limit(200), 201);
+    }
+
+    #[test]
+    fn over_fetch_limit_saturates_instead_of_overflowing() {
+        assert_eq!(over_fetch_limit(i64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn keyset_predicate_uses_strict_less_than_for_descending_lists() {
+        for sql in [
+            LIST_ROUTE_DEFINITIONS_SQL,
+            LIST_ROUTING_POLICIES_SQL,
+            LIST_AGENT_PROFILES_SQL,
+        ] {
+            assert!(
+                sql.contains("(created_at, id) < ($1::timestamptz, $2::uuid)"),
+                "missing strict keyset predicate in {sql}"
+            );
+            assert!(
+                sql.contains("order by created_at desc, id desc"),
+                "missing the existing (created_at desc, id desc) tiebreaker in {sql}"
+            );
+            assert!(
+                sql.contains("limit $3"),
+                "over-fetch bind must be the third parameter in {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn keyset_predicate_binds_parameters_and_never_interpolates_values() {
+        // Every cursor-derived value must reach the query as a bound `$N` placeholder, never
+        // as a literal spliced into the SQL text. These are `&'static str` literals (not
+        // built with `format!`/string concatenation of caller input), so this is a structural
+        // guard against a future edit accidentally interpolating a value: only `$1`, `$2`,
+        // `$3` may appear as parameter markers, and no other `$`-prefixed token should.
+        for sql in [
+            LIST_ROUTE_DEFINITIONS_SQL,
+            LIST_ROUTING_POLICIES_SQL,
+            LIST_AGENT_PROFILES_SQL,
+        ] {
+            let placeholders: Vec<&str> = sql.match_indices('$').map(|(i, _)| &sql[i..]).collect();
+            for placeholder in placeholders {
+                let marker: String = placeholder
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '$')
+                    .collect();
+                assert!(
+                    marker == "$1" || marker == "$2" || marker == "$3",
+                    "unexpected placeholder {marker:?} in {sql}"
+                );
+            }
+        }
     }
 }

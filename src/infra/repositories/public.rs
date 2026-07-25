@@ -114,49 +114,64 @@ impl PgPublicRepository {
         application_execution_policy_record_from_row(&row)
     }
 
+    /// Upserts the policy under a SQL-level optimistic-concurrency check.
+    ///
+    /// The version comparison **must** live in the same transaction as the write. The previous
+    /// shape read the current version on one pooled connection, compared it in Rust, and then
+    /// issued an unconditional `on conflict do update` on a possibly different connection:
+    /// two writers holding the same currently-valid `If-Match` both passed the comparison and
+    /// both wrote, so one update was silently lost and neither caller saw a conflict.
+    ///
+    /// This follows the pattern already established by
+    /// `PgAdminRepository`'s `rotate_credential`: `select … for update` inside a transaction to
+    /// serialise the writers, and — belt and braces, because the row lock alone is easy to
+    /// regress — the `update` itself carries `and version = $22`, with zero affected rows
+    /// mapped onto the same `409 resource_version_conflict` envelope every other versioned
+    /// endpoint already returns.
     pub async fn put_application_execution_policy(
         &self,
         application_id: Uuid,
+        expected_version: Option<i64>,
         request: &ApplicationExecutionPolicyPutRequest,
     ) -> Result<ApplicationExecutionPolicyRecord, AppError> {
         let persistence_mode = request
             .persistence_mode
             .map(response_persistence_mode_to_db);
+
+        let mut tx = self.pool.begin().await?;
+
+        // Materialise the defaulted row if this application has never had a policy, so the
+        // first write is still an upsert and `select … for update` below always has a row to
+        // lock. The column defaults are identical to the literals the old insert branch
+        // coalesced against, so a first write lands on exactly the same values.
+        sqlx::query(
+            r#"
+            insert into application_execution_policies (application_id)
+            values ($1)
+            on conflict (application_id) do nothing
+            "#,
+        )
+        .bind(application_id)
+        .execute(&mut *tx)
+        .await?;
+
+        let current_version = sqlx::query_scalar::<_, i64>(
+            "select version from application_execution_policies where application_id = $1 for update",
+        )
+        .bind(application_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        if expected_version.is_some_and(|expected| expected != current_version) {
+            return Err(AppError::conflict(
+                "resource_version_conflict",
+                "resource version does not match If-Match",
+            ));
+        }
+
         let row = sqlx::query(
             r#"
-            insert into application_execution_policies (
-                application_id, responses_enabled, streaming_enabled, tools_enabled,
-                vision_enabled, structured_output_enabled, caller_system_instructions_allowed,
-                model_overrides_allowed, route_overrides_allowed, provider_overrides_allowed,
-                credential_overrides_allowed, timeout_overrides_allowed, persistence_mode,
-                response_retention_seconds, maximum_request_bytes, maximum_input_items,
-                maximum_output_tokens, maximum_timeout_ms, rate_limit_requests_per_minute,
-                rate_limit_streams_per_minute, metadata
-            )
-            values (
-                $1,
-                coalesce($2, true),
-                coalesce($3, true),
-                coalesce($4, false),
-                coalesce($5, true),
-                coalesce($6, true),
-                coalesce($7, false),
-                coalesce($8, false),
-                coalesce($9, false),
-                coalesce($10, false),
-                coalesce($11, false),
-                coalesce($12, false),
-                coalesce($13, 'metadata_only'),
-                coalesce($14, 2592000),
-                coalesce($15, 1048576),
-                coalesce($16, 128),
-                coalesce($17, 8192),
-                coalesce($18, 600000),
-                coalesce($19, 120),
-                coalesce($20, 60),
-                coalesce($21, '{}'::jsonb)
-            )
-            on conflict (application_id) do update set
+            update application_execution_policies set
                 responses_enabled = coalesce($2, application_execution_policies.responses_enabled),
                 streaming_enabled = coalesce($3, application_execution_policies.streaming_enabled),
                 tools_enabled = coalesce($4, application_execution_policies.tools_enabled),
@@ -178,6 +193,7 @@ impl PgPublicRepository {
                 rate_limit_streams_per_minute = coalesce($20, application_execution_policies.rate_limit_streams_per_minute),
                 metadata = coalesce($21, application_execution_policies.metadata),
                 updated_at = now()
+            where application_id = $1 and version = $22
             returning id, application_id, responses_enabled, streaming_enabled, tools_enabled,
                       vision_enabled, structured_output_enabled,
                       caller_system_instructions_allowed, model_overrides_allowed,
@@ -210,9 +226,18 @@ impl PgPublicRepository {
         .bind(request.rate_limit_requests_per_minute)
         .bind(request.rate_limit_streams_per_minute)
         .bind(&request.metadata)
-        .fetch_one(&self.pool)
-        .await?;
-        application_execution_policy_record_from_row(&row)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            AppError::conflict(
+                "resource_version_conflict",
+                "resource version does not match If-Match",
+            )
+        })?;
+        let record = application_execution_policy_record_from_row(&row)?;
+        tx.commit().await?;
+        Ok(record)
     }
 
     pub async fn claim_idempotency(

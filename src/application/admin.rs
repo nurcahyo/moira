@@ -14,9 +14,9 @@ use crate::{
         ApiKeyRecord, ApiKeyRotateRequest, ApiKeySecretResponse, ApplicationCreateRequest,
         ApplicationPatchRequest, ApplicationRecord, ApplicationSlug, AuditLogInsert,
         AuditLogRecord, AuditResult, ConsumerKeyCreateRequest, CredentialCreateRequest,
-        CredentialPatchRequest, CredentialRecord, CredentialScope, CredentialSecret,
-        ExternalApplicationId, ExternalTenantId, ExternalUserId, ListResponse,
-        ProviderCreateRequest, ProviderModelCreateRequest, ProviderModelPatchRequest,
+        CredentialPatchRequest, CredentialRecord, CredentialScope, CredentialSecret, CursorScope,
+        ExternalApplicationId, ExternalTenantId, ExternalUserId, ListCursor, ListResponse,
+        PageQuery, ProviderCreateRequest, ProviderModelCreateRequest, ProviderModelPatchRequest,
         ProviderModelRecord, ProviderPatchRequest, ProviderRecord, RotateCredentialRequest,
         SystemKeyCreateRequest, TrustedJwtIssuerCreateRequest, TrustedJwtIssuerPatchRequest,
         TrustedJwtIssuerRecord,
@@ -33,6 +33,119 @@ use crate::{
         SecretCipher, credential_aad, secret_fingerprint, validate_jwks_url,
     },
 };
+
+/// Cursor scopes for the nine admin lists (plan 04, P1-4).
+///
+/// Each label is mixed into the cursor's integrity tag but never stored inside it, so a
+/// cursor minted by one list fails closed with `400 invalid_cursor` on another rather than
+/// paging through an unrelated table's key space. Encode and decode must be given the same
+/// const, which is why each list below names exactly one and uses it for both.
+///
+/// Two of these lists are additionally narrowed by a path/query parameter
+/// (`list_provider_models` by `provider_id`, `list_user_credentials` by
+/// `external_user_id`), and the scope label does not capture that parameter. Reusing one
+/// user's cursor on another user's list therefore decodes successfully — and is harmless:
+/// the `where` clause still restricts the query to the rows that caller is authorised to
+/// see, so the cursor can only seek to an offset inside that same authorised set. It is a
+/// position, not a capability.
+const APPLICATIONS_CURSOR: CursorScope = CursorScope::new("admin.applications");
+const PROVIDERS_CURSOR: CursorScope = CursorScope::new("admin.providers");
+const PROVIDER_MODELS_CURSOR: CursorScope = CursorScope::new("admin.provider_models");
+const CREDENTIALS_CURSOR: CursorScope = CursorScope::new("admin.credentials");
+const USER_CREDENTIALS_CURSOR: CursorScope = CursorScope::new("admin.user_credentials");
+const SYSTEM_KEYS_CURSOR: CursorScope = CursorScope::new("admin.system_keys");
+const CONSUMER_KEYS_CURSOR: CursorScope = CursorScope::new("admin.consumer_keys");
+const TRUSTED_JWT_ISSUERS_CURSOR: CursorScope = CursorScope::new("admin.trusted_jwt_issuers");
+const AUDIT_LOGS_CURSOR: CursorScope = CursorScope::new("admin.audit_logs");
+
+/// What a paginated admin list needs from its caller: how many rows, and where to resume.
+///
+/// # There is exactly one way to build one, deliberately
+///
+/// [`From<&PageQuery>`] is the only constructor. It carries both the `limit` *and* the
+/// `cursor` query parameter through to the service, so a handler cannot obtain a
+/// `PageRequest` without having decided what to do about the cursor.
+///
+/// An earlier revision also had a `From<i64>` bridge that hardcoded `cursor: None`, so a
+/// handler passing a bare `query.limit()` still type-checked while silently dropping the
+/// caller's cursor. All nine admin lists shipped that way and compiled cleanly. The bridge
+/// is gone: passing a limit alone is now a compile error, which is the only mechanism that
+/// actually keeps the cursor wired end-to-end.
+///
+/// Decoding lives here rather than in the HTTP layer deliberately: the handlers stay thin,
+/// and there is exactly one place that knows which [`CursorScope`] belongs to which list.
+#[derive(Debug, Clone)]
+pub struct PageRequest {
+    limit: i64,
+    cursor: Option<String>,
+}
+
+impl PageRequest {
+    /// Rows the caller asked for, clamped. The repository fetches one more than this.
+    pub fn limit(&self) -> i64 {
+        self.limit
+    }
+
+    /// The raw, still-encoded cursor exactly as the client sent it.
+    pub fn cursor(&self) -> Option<&str> {
+        self.cursor.as_deref()
+    }
+
+    /// Decodes the cursor for `scope`, or `Ok(None)` for a first page.
+    ///
+    /// Returns `400 invalid_cursor` for anything malformed, tampered with, or issued for a
+    /// different list. Callers run this *after* the authorization check and *before*
+    /// touching the database, so an unauthorized caller learns nothing about cursor
+    /// validity and a bad cursor never reaches Postgres.
+    fn decode(&self, scope: CursorScope) -> Result<Option<ListCursor>, AppError> {
+        ListCursor::decode_optional(self.cursor(), scope)
+    }
+}
+
+impl From<&PageQuery> for PageRequest {
+    fn from(query: &PageQuery) -> Self {
+        Self {
+            limit: query.limit(),
+            cursor: query.cursor.clone(),
+        }
+    }
+}
+
+/// Turns the repository's over-fetched rows into a real [`ListResponse`].
+///
+/// The repository returns up to `limit + 1` rows; that extra row exists only to answer
+/// "is there another page?" without a second `count(*)`. Here it is counted, then dropped.
+///
+/// `key` extracts the sort key of a row — whichever timestamp column that list orders by,
+/// paired with `id`. It is passed in rather than derived because the nine lists do not
+/// share a record type and `audit_logs` does not even sort on the same column.
+fn paginate<T>(
+    mut rows: Vec<T>,
+    page: &PageRequest,
+    scope: CursorScope,
+    key: impl Fn(&T) -> ListCursor,
+) -> ListResponse<T> {
+    let limit = usize::try_from(page.limit()).unwrap_or(0);
+    let has_more = rows.len() > limit;
+    rows.truncate(limit);
+
+    // `next_cursor` encodes the last row *actually returned*, never the over-fetched one.
+    // Encoding the extra row would start the next page one record too far along and drop
+    // exactly one row at every page boundary.
+    let next_cursor = rows
+        .last()
+        .filter(|_| has_more)
+        .map(|row| key(row).encode(scope));
+
+    // Built through `ListResponse::new` and then filled in, rather than as a struct
+    // literal: `Pagination` lives in a private `domain` submodule and is not re-exported,
+    // so its name is not reachable from here. Adding a `ListResponse::paginated`
+    // constructor belongs to whoever owns `src/domain/`, not to this file.
+    let mut response = ListResponse::new(rows);
+    response.pagination.has_more = has_more;
+    response.pagination.next_cursor = next_cursor;
+    response
+}
 
 pub struct AdminService<'a> {
     state: &'a AppState,
@@ -147,13 +260,17 @@ impl<'a> AdminService<'a> {
     pub async fn list_applications(
         &self,
         actor: &Actor,
-        limit: i64,
+        page: impl Into<PageRequest>,
     ) -> Result<ListResponse<ApplicationRecord>, AppError> {
         self.state.authz.require(actor, "moira:applications:read")?;
-        self.repo
-            .list_applications(limit)
-            .await
-            .map(ListResponse::new)
+        let page = page.into();
+        let rows = self
+            .repo
+            .list_applications(page.decode(APPLICATIONS_CURSOR)?, page.limit())
+            .await?;
+        Ok(paginate(rows, &page, APPLICATIONS_CURSOR, |row| {
+            ListCursor::new(row.created_at, row.id)
+        }))
     }
 
     pub async fn get_application(
@@ -307,10 +424,17 @@ impl<'a> AdminService<'a> {
     pub async fn list_providers(
         &self,
         actor: &Actor,
-        limit: i64,
+        page: impl Into<PageRequest>,
     ) -> Result<ListResponse<ProviderRecord>, AppError> {
         self.state.authz.require(actor, "moira:providers:read")?;
-        self.repo.list_providers(limit).await.map(ListResponse::new)
+        let page = page.into();
+        let rows = self
+            .repo
+            .list_providers(page.decode(PROVIDERS_CURSOR)?, page.limit())
+            .await?;
+        Ok(paginate(rows, &page, PROVIDERS_CURSOR, |row| {
+            ListCursor::new(row.created_at, row.id)
+        }))
     }
 
     pub async fn get_provider(&self, actor: &Actor, id: Uuid) -> Result<ProviderRecord, AppError> {
@@ -445,13 +569,21 @@ impl<'a> AdminService<'a> {
         &self,
         actor: &Actor,
         provider_id: Uuid,
-        limit: i64,
+        page: impl Into<PageRequest>,
     ) -> Result<ListResponse<ProviderModelRecord>, AppError> {
         self.state.authz.require(actor, "moira:providers:read")?;
-        self.repo
-            .list_provider_models(provider_id, limit)
-            .await
-            .map(ListResponse::new)
+        let page = page.into();
+        let rows = self
+            .repo
+            .list_provider_models(
+                provider_id,
+                page.decode(PROVIDER_MODELS_CURSOR)?,
+                page.limit(),
+            )
+            .await?;
+        Ok(paginate(rows, &page, PROVIDER_MODELS_CURSOR, |row| {
+            ListCursor::new(row.created_at, row.id)
+        }))
     }
 
     pub async fn patch_provider_model(
@@ -600,27 +732,39 @@ impl<'a> AdminService<'a> {
     pub async fn list_credentials(
         &self,
         actor: &Actor,
-        limit: i64,
+        page: impl Into<PageRequest>,
     ) -> Result<ListResponse<CredentialRecord>, AppError> {
         self.state.authz.require(actor, "moira:credentials:read")?;
-        self.repo
-            .list_credentials(limit)
-            .await
-            .map(ListResponse::new)
+        let page = page.into();
+        let rows = self
+            .repo
+            .list_credentials(page.decode(CREDENTIALS_CURSOR)?, page.limit())
+            .await?;
+        Ok(paginate(rows, &page, CREDENTIALS_CURSOR, |row| {
+            ListCursor::new(row.created_at, row.id)
+        }))
     }
 
     pub async fn list_user_credentials(
         &self,
         actor: &Actor,
         external_user_id: &str,
-        limit: i64,
+        page: impl Into<PageRequest>,
     ) -> Result<ListResponse<CredentialRecord>, AppError> {
         self.state.authz.require(actor, "moira:credentials:read")?;
         ExternalUserId::parse(external_user_id.to_string())?;
-        self.repo
-            .list_user_credentials(external_user_id, limit)
-            .await
-            .map(ListResponse::new)
+        let page = page.into();
+        let rows = self
+            .repo
+            .list_user_credentials(
+                external_user_id,
+                page.decode(USER_CREDENTIALS_CURSOR)?,
+                page.limit(),
+            )
+            .await?;
+        Ok(paginate(rows, &page, USER_CREDENTIALS_CURSOR, |row| {
+            ListCursor::new(row.created_at, row.id)
+        }))
     }
 
     pub async fn get_credential(
@@ -925,13 +1069,17 @@ impl<'a> AdminService<'a> {
     pub async fn list_system_keys(
         &self,
         actor: &Actor,
-        limit: i64,
+        page: impl Into<PageRequest>,
     ) -> Result<ListResponse<ApiKeyRecord>, AppError> {
         self.state.authz.require(actor, "moira:system-keys:read")?;
-        self.repo
-            .list_system_keys(limit)
-            .await
-            .map(ListResponse::new)
+        let page = page.into();
+        let rows = self
+            .repo
+            .list_system_keys(page.decode(SYSTEM_KEYS_CURSOR)?, page.limit())
+            .await?;
+        Ok(paginate(rows, &page, SYSTEM_KEYS_CURSOR, |row| {
+            ListCursor::new(row.created_at, row.id)
+        }))
     }
 
     pub async fn get_system_key(&self, actor: &Actor, id: Uuid) -> Result<ApiKeyRecord, AppError> {
@@ -1028,15 +1176,19 @@ impl<'a> AdminService<'a> {
     pub async fn list_consumer_keys(
         &self,
         actor: &Actor,
-        limit: i64,
+        page: impl Into<PageRequest>,
     ) -> Result<ListResponse<ApiKeyRecord>, AppError> {
         self.state
             .authz
             .require(actor, "moira:consumer-keys:read")?;
-        self.repo
-            .list_consumer_keys(limit)
-            .await
-            .map(ListResponse::new)
+        let page = page.into();
+        let rows = self
+            .repo
+            .list_consumer_keys(page.decode(CONSUMER_KEYS_CURSOR)?, page.limit())
+            .await?;
+        Ok(paginate(rows, &page, CONSUMER_KEYS_CURSOR, |row| {
+            ListCursor::new(row.created_at, row.id)
+        }))
     }
 
     pub async fn get_consumer_key(
@@ -1218,13 +1370,17 @@ impl<'a> AdminService<'a> {
     pub async fn list_trusted_jwt_issuers(
         &self,
         actor: &Actor,
-        limit: i64,
+        page: impl Into<PageRequest>,
     ) -> Result<ListResponse<TrustedJwtIssuerRecord>, AppError> {
         self.state.authz.require(actor, "moira:jwt-issuers:read")?;
-        self.repo
-            .list_trusted_jwt_issuers(limit)
-            .await
-            .map(ListResponse::new)
+        let page = page.into();
+        let rows = self
+            .repo
+            .list_trusted_jwt_issuers(page.decode(TRUSTED_JWT_ISSUERS_CURSOR)?, page.limit())
+            .await?;
+        Ok(paginate(rows, &page, TRUSTED_JWT_ISSUERS_CURSOR, |row| {
+            ListCursor::new(row.created_at, row.id)
+        }))
     }
 
     pub async fn get_trusted_jwt_issuer(
@@ -1372,13 +1528,18 @@ impl<'a> AdminService<'a> {
     pub async fn list_audit_logs(
         &self,
         actor: &Actor,
-        limit: i64,
+        page: impl Into<PageRequest>,
     ) -> Result<ListResponse<AuditLogRecord>, AppError> {
         self.state.authz.require(actor, "moira:audit:read")?;
-        self.repo
-            .list_audit_logs(limit)
-            .await
-            .map(ListResponse::new)
+        let page = page.into();
+        let rows = self
+            .repo
+            .list_audit_logs(page.decode(AUDIT_LOGS_CURSOR)?, page.limit())
+            .await?;
+        // The one admin list keyed on `occurred_at` rather than `created_at`.
+        Ok(paginate(rows, &page, AUDIT_LOGS_CURSOR, |row| {
+            ListCursor::new(row.occurred_at, row.id)
+        }))
     }
 
     pub async fn get_audit_log(&self, actor: &Actor, id: Uuid) -> Result<AuditLogRecord, AppError> {
@@ -1960,6 +2121,224 @@ fn is_ipv6_unicast_link_local(ip: Ipv6Addr) -> bool {
 mod tests {
     use super::*;
     use crate::domain::{CredentialScope, CredentialType};
+
+    /// A stand-in row: the page-assembly logic only ever touches a row's sort key, so the
+    /// tests do not need any of the nine real record types.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Row {
+        created_at: chrono::DateTime<chrono::Utc>,
+        id: Uuid,
+    }
+
+    const TEST_SCOPE: CursorScope = CursorScope::new("test.rows");
+    const OTHER_SCOPE: CursorScope = CursorScope::new("test.other");
+
+    /// Largest page any admin list will return.
+    ///
+    /// The clamp itself lives in `PageQuery::limit` (`src/domain/admin.rs`) and there is
+    /// only one of it: since `From<&PageQuery>` is the sole way to build a [`PageRequest`],
+    /// no limit can reach the repository without passing through that clamp. This constant
+    /// is the *test's* expectation of that value, not a second implementation of it, and
+    /// `page_request_limit_matches_page_query_clamp` fails if the domain clamp moves.
+    const MAX_PAGE_LIMIT: i64 = 200;
+
+    /// `count` rows in the descending order a list query would return them.
+    fn rows(count: usize) -> Vec<Row> {
+        (0..count)
+            .map(|index| Row {
+                created_at: chrono::DateTime::from_timestamp_micros(
+                    1_753_401_600_000_000 - (index as i64 * 1_000_000),
+                )
+                .expect("in-range timestamp"),
+                id: Uuid::from_u128(1_000 - index as u128),
+            })
+            .collect()
+    }
+
+    /// A first page of `limit` rows, built the only way a `PageRequest` can be built:
+    /// through a `PageQuery`, exactly as an HTTP handler does.
+    fn page_of(rows: Vec<Row>, limit: i64) -> ListResponse<Row> {
+        let page = PageRequest::from(&PageQuery {
+            limit: Some(limit),
+            ..PageQuery::default()
+        });
+        paginate(rows, &page, TEST_SCOPE, |row| {
+            ListCursor::new(row.created_at, row.id)
+        })
+    }
+
+    #[test]
+    fn has_more_is_false_when_exactly_limit_rows_are_available() {
+        // The repository over-fetches by one, so "exactly a full page" means it returned
+        // `limit` rows, not `limit + 1`. That is the end of the data.
+        let response = page_of(rows(10), 10);
+
+        assert_eq!(response.data.len(), 10);
+        assert!(!response.pagination.has_more);
+        assert_eq!(response.pagination.next_cursor, None);
+    }
+
+    #[test]
+    fn has_more_is_true_and_page_is_trimmed_when_limit_plus_one_rows_are_fetched() {
+        let fetched = rows(11);
+        let response = page_of(fetched.clone(), 10);
+
+        assert!(response.pagination.has_more);
+        assert_eq!(
+            response.data.len(),
+            10,
+            "the over-fetched row must not be served"
+        );
+        assert_eq!(response.data, fetched[..10]);
+        assert!(response.pagination.next_cursor.is_some());
+    }
+
+    #[test]
+    fn next_cursor_encodes_the_last_returned_row_not_the_over_fetched_row() {
+        // The classic off-by-one: resuming from the over-fetched row would skip exactly one
+        // record at every page boundary, and the loss would be invisible in any single
+        // response.
+        let fetched = rows(11);
+        let response = page_of(fetched.clone(), 10);
+
+        let encoded = response
+            .pagination
+            .next_cursor
+            .as_deref()
+            .expect("has_more is true");
+        let decoded = ListCursor::decode(encoded, TEST_SCOPE).expect("our own cursor");
+
+        let last_returned = &fetched[9];
+        assert_eq!(decoded.id, last_returned.id);
+        assert_eq!(decoded.ts, last_returned.created_at);
+        assert_ne!(
+            decoded.id, fetched[10].id,
+            "cursor points past the served page"
+        );
+    }
+
+    #[test]
+    fn next_cursor_is_none_when_has_more_is_false() {
+        for available in 0..=10 {
+            let response = page_of(rows(available), 10);
+            assert!(!response.pagination.has_more, "{available} rows");
+            assert_eq!(response.pagination.next_cursor, None, "{available} rows");
+        }
+    }
+
+    #[test]
+    fn an_empty_final_page_is_not_an_error() {
+        // What a caller sees when the rows their cursor pointed at were deleted between
+        // pages: a clean empty page, not a 500 and not a phantom cursor.
+        let response = page_of(Vec::new(), 10);
+
+        assert!(response.data.is_empty());
+        assert!(!response.pagination.has_more);
+        assert_eq!(response.pagination.next_cursor, None);
+    }
+
+    #[test]
+    fn next_cursor_is_scoped_to_its_own_endpoint() {
+        let response = page_of(rows(11), 10);
+        let encoded = response.pagination.next_cursor.expect("has_more is true");
+
+        assert!(ListCursor::decode(&encoded, TEST_SCOPE).is_ok());
+        assert!(
+            ListCursor::decode(&encoded, OTHER_SCOPE).is_err(),
+            "a cursor must not page through a different list"
+        );
+    }
+
+    #[test]
+    fn page_request_carries_the_cursor_from_the_query_string() {
+        let cursor = ListCursor::new(
+            chrono::DateTime::from_timestamp_micros(1_753_401_600_000_000).expect("in range"),
+            Uuid::from_u128(7),
+        );
+        let encoded = cursor.encode(TEST_SCOPE);
+
+        let query = PageQuery {
+            limit: Some(25),
+            cursor: Some(encoded.clone()),
+            ..PageQuery::default()
+        };
+        let page = PageRequest::from(&query);
+
+        assert_eq!(page.limit(), 25);
+        assert_eq!(page.cursor(), Some(encoded.as_str()));
+        assert_eq!(page.decode(TEST_SCOPE).unwrap(), Some(cursor));
+        // Wrong endpoint, and garbage, both fail closed rather than paging wrongly.
+        assert!(page.decode(OTHER_SCOPE).is_err());
+
+        let absent = PageRequest::from(&PageQuery::default());
+        assert_eq!(absent.cursor(), None);
+        assert_eq!(absent.decode(TEST_SCOPE).unwrap(), None);
+    }
+
+    #[test]
+    fn a_malformed_cursor_is_rejected_with_the_invalid_cursor_code() {
+        let query = PageQuery {
+            cursor: Some("not-a-cursor".to_string()),
+            ..PageQuery::default()
+        };
+
+        let error = PageRequest::from(&query)
+            .decode(TEST_SCOPE)
+            .expect_err("must reject");
+        let response = error.error_response(Some("req-test".to_string()));
+
+        assert_eq!(response.error.code, "invalid_cursor");
+        assert_eq!(response.error.message_key, "moira.error.invalid_cursor");
+        assert!(!response.error.message.is_empty());
+    }
+
+    #[test]
+    fn page_request_limit_matches_page_query_clamp() {
+        // `MAX_PAGE_LIMIT` is restated from `PageQuery::limit`; this is what stops the two
+        // drifting apart. If the domain clamp changes, this fails rather than silently
+        // letting one path over-fetch.
+        let huge = PageQuery {
+            limit: Some(i64::MAX),
+            ..PageQuery::default()
+        };
+        assert_eq!(huge.limit(), MAX_PAGE_LIMIT);
+        assert_eq!(PageRequest::from(&huge).limit(), MAX_PAGE_LIMIT);
+
+        // And the floor: a non-positive limit can never reach the repository, where it
+        // would become a negative `LIMIT` and a database error.
+        for absurd in [0, -1, i64::MIN] {
+            let query = PageQuery {
+                limit: Some(absurd),
+                ..PageQuery::default()
+            };
+            assert_eq!(query.limit(), 1);
+            assert_eq!(PageRequest::from(&query).limit(), 1);
+        }
+    }
+
+    #[test]
+    fn every_admin_list_uses_a_distinct_cursor_scope() {
+        // Two lists sharing a label would let a cursor from one silently page the other,
+        // which is precisely what the scope exists to prevent.
+        let scopes = [
+            APPLICATIONS_CURSOR,
+            PROVIDERS_CURSOR,
+            PROVIDER_MODELS_CURSOR,
+            CREDENTIALS_CURSOR,
+            USER_CREDENTIALS_CURSOR,
+            SYSTEM_KEYS_CURSOR,
+            CONSUMER_KEYS_CURSOR,
+            TRUSTED_JWT_ISSUERS_CURSOR,
+            AUDIT_LOGS_CURSOR,
+        ];
+        let mut labels: Vec<&str> = scopes.iter().map(|scope| scope.label()).collect();
+        labels.sort_unstable();
+        let total = labels.len();
+        labels.dedup();
+
+        assert_eq!(total, 9, "all nine admin lists must declare a scope");
+        assert_eq!(labels.len(), total, "duplicate cursor scope: {labels:?}");
+    }
 
     #[test]
     fn credential_scope_validation_matches_contract() {

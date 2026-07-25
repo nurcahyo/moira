@@ -14,7 +14,7 @@ use crate::{
         ConversationPolicyRecord, ConversationQuery, ConversationRecord, ConversationStatus,
         EmbeddingPolicyPutRequest, EmbeddingPolicyRecord, ListResponse, MemoryCreateRequest,
         MemoryPatchRequest, MemoryPolicyPutRequest, MemoryPolicyRecord, MemoryQuery, MemoryRecord,
-        RagCollectionCreateRequest, RagCollectionPatchRequest, RagCollectionQuery,
+        PageQuery, RagCollectionCreateRequest, RagCollectionPatchRequest, RagCollectionQuery,
         RagCollectionRecord, RagCollectionStatus, RagDocumentCreateRequest,
         RagDocumentIngestRequest, RagDocumentRecord, RetrievalPolicyPutRequest,
         RetrievalPolicyRecord,
@@ -882,13 +882,28 @@ pub async fn create_rag_document(
     ))
 }
 
+/// Lists a collection's documents.
+///
+/// `cursor` and `limit` are declared inline rather than as `params(PageQuery)` because
+/// [`PageQuery`] is the shared admin-list extractor and carries two dozen filter fields —
+/// audit-log actors, credential types, expiry windows — none of which this route honours.
+/// Declaring the whole struct would advertise twenty-four parameters that do nothing, which
+/// is the same class of lie as the one this handler used to tell in the other direction: it
+/// previously took no query parameters at all, hard-coded `limit = 50`, and still returned a
+/// real `next_cursor` with `has_more: true` that no caller had any way to send back. Document
+/// 51 of a collection was unreachable over HTTP.
 #[utoipa::path(
     get,
     path = "/api/v1/admin/rag-collections/{collection_id}/documents",
     tag = "admin-rag",
-    params(("collection_id" = String, Path, description = "RAG collection identifier")),
+    params(
+        ("collection_id" = String, Path, description = "RAG collection identifier"),
+        ("cursor" = Option<String>, Query, description = "Opaque `next_cursor` from a previous response for this same list. Rejected with 400 invalid_cursor if malformed, tampered with, or minted by a different list."),
+        ("limit" = Option<i64>, Query, description = "Rows per page, clamped to 1..=200. Defaults to 50.")
+    ),
     responses(
-        (status = 200, description = "RAG documents", body = ListResponse<RagDocumentRecord>),
+        (status = 200, description = "Paginated RAG documents", body = ListResponse<RagDocumentRecord>),
+        (status = 400, description = "invalid_cursor", body = ErrorResponse),
         (status = "4XX", description = "Authentication, authorization, or not-found error", body = ErrorResponse),
         (status = "5XX", description = "Infrastructure or internal error", body = ErrorResponse)
     ),
@@ -898,10 +913,16 @@ pub async fn list_rag_documents(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(collection_id): Path<String>,
+    Query(query): Query<PageQuery>,
 ) -> Result<Json<ListResponse<RagDocumentRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     ConversationService::new(&state)?
-        .list_rag_documents(&actor, &collection_id, 50)
+        .list_rag_documents_page(
+            &actor,
+            &collection_id,
+            query.cursor.as_deref(),
+            query.limit(),
+        )
         .await
         .map(Json)
 }
