@@ -6,6 +6,33 @@ Implementation-ready audit and iteration plans for taking Moira to a controlled 
 - **Verified gates at audit time:** `cargo fmt --check` ✅ · `cargo clippy --all-targets -- -D warnings` ✅ · `cargo test --workspace --all-features` ✅ **120/120** (real pgvector PG16 + Redis 7).
 - **Method:** 8 parallel read-only specialist audits → reconciled into `00` → roadmap `01` → 10 iteration plans written by 5 parallel writers with disjoint file ownership.
 
+## Execution status
+
+Updated as each plan merges. A plan is **Complete** only when its PR is merged with all
+`CONVENTIONS.md` §2 gates green and every Definition of Done box verified by a named, passing test
+(§1 rule 5) — "implemented" is not "done".
+
+| Plan | Status | PR | Merge commit |
+|------|--------|----|--------------|
+| `02a` | ✅ **Complete** | [#10](https://github.com/nurcahyo/moira/pull/10) | `36b05ee` |
+| `02b` | ⏳ In progress | — | — |
+| `03` | ⬜ Not started | — | — |
+| `04` | ⬜ Not started | — | — |
+| `05` | ⬜ Not started | — | — |
+| `06` | ⬜ Not started | — | — |
+| `07` | ⬜ Not started | — | — |
+| `08` | ⬜ Not started | — | — |
+| `09` | ⬜ Not started | — | — |
+| `10` | ⬜ Not started | — | — |
+| `11` | ⬜ Not started | — | — |
+
+**Login milestone:** an operator can sign in once `07` (Moira-side identity claiming) and `08`
+(Next.js console + Google OAuth) are both complete. `02b`–`05` are the backend MVP gates that
+precede them; `06` is recommended before `07`.
+
+Open decisions carried out of executed plans live in [`../NEED_CONFIRMATION.md`](../NEED_CONFIRMATION.md);
+deferred hardening lives in [`../TODO.md`](../TODO.md).
+
 ## Index
 
 | File | Purpose |

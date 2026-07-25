@@ -6,6 +6,21 @@ unilaterally, and conflicts auto-resolved by a runner.
 
 Ongoing work items live in [`TODO.md`](./TODO.md).
 
+## Recommended answers (proceeding on these unless overridden)
+
+Each open question below has a recommendation. Execution continues on these defaults rather than
+blocking; overturning any of them is cheap and localised, and the reversal cost is noted.
+
+| # | Question | Recommendation | If you disagree |
+|---|----------|----------------|-----------------|
+| 1 | Backfill migration shipped under a plan advertising none | **Keep it.** The audit's position is that `'indexed'` was never true, so there is no legitimate prior state; without it the API keeps serving the exact false value P0-1 targets. | Revert `0009` alone; no schema change to undo. |
+| 2 | Verified on PostgreSQL 18.3, not the pinned 16 | **Accept, with CI on PG16 as the authoritative gate.** No version-specific SQL is introduced; only long-settled DML/CHECK/PK-join/trigger behaviour is exercised. | Install Docker and re-run; the suite is unchanged. |
+| 3 | `ETag`/`version` now `2` on inline-content create | **Keep it.** The old `"1"` was stale against the committed row — an immediate `If-Match` round-trip would have spuriously conflicted. It is a correction, now pinned by test. | Re-select before the trigger fires; loses `ingestion_status` in the create response. |
+| 4 | Plan 02a's Wave 4 grep guard is unsatisfiable | **Fix the plan text** to `grep -c '("Idempotency-Key"'`. Plan 02b's Wave 5 repeats the same broken command and will fail a compliant tree. | None — the current text cannot be satisfied by any implementation. |
+
+Question 4 is the only one with a live downstream effect: it is corrected in plan 02b's execution
+rather than left to fail that plan's reviewer.
+
 ---
 
 ## Plan 02a shipped a migration, though the plan advertises "no migrations"
