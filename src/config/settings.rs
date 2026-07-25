@@ -290,7 +290,14 @@ pub struct RedisSettings {
     pub invalidation_channel: String,
 }
 
+/// Background-worker tuning.
+///
+/// `#[serde(default)]` sits on the container (same convention as
+/// [`JwksFetchSettings`]) so an operator may override a single knob — e.g.
+/// `MOIRA_WORKERS__RETENTION_BATCH_SIZE` — without restating the others, and so
+/// config files written before the retention knobs existed still deserialize.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct WorkerSettings {
     pub enabled: bool,
     pub shutdown_grace_seconds: u64,
@@ -298,6 +305,17 @@ pub struct WorkerSettings {
     pub retry_base_delay_seconds: u64,
     pub retry_max_delay_seconds: u64,
     pub dead_letter_retention_hours: u64,
+    /// Rows deleted per batch by the retention worker
+    /// (`src/infra/workers/retention.rs`). Small enough that a single batch
+    /// holds row locks only briefly, large enough that a busy deployment drains
+    /// its expired backlog. Clamped at runtime to
+    /// `1..=RetentionPlan::MAX_BATCH_SIZE`.
+    pub retention_batch_size: usize,
+    /// Seconds between retention sweeps. Deliberately independent of
+    /// `retry_base_delay_seconds`, which drives the base supervisor tick — a
+    /// retention sweep is far more expensive than a tick and must not run at
+    /// tick cadence. `0` is treated as `1` at runtime.
+    pub retention_interval_seconds: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -875,6 +893,17 @@ impl Default for WorkerSettings {
             retry_base_delay_seconds: 5,
             retry_max_delay_seconds: 300,
             dead_letter_retention_hours: 168,
+            // 500 rows/batch: a single-statement delete of 500 rows against an
+            // index scan finishes in low milliseconds, so the row locks it takes
+            // on `idempotency_records` are held far too briefly to stall a
+            // concurrent idempotency claim (which additionally skips them via
+            // `for update skip locked`).
+            retention_batch_size: 500,
+            // 5 minutes. With the default per-tick cap (batch_size * 20 = 10_000
+            // rows per table per sweep) that sustains ~33 expired rows/second per
+            // table, comfortably above any plausible steady-state mint rate, while
+            // leaving the database idle between sweeps.
+            retention_interval_seconds: 300,
         }
     }
 }

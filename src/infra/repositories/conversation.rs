@@ -1,3 +1,40 @@
+//! Conversation-, memory- and RAG-domain persistence.
+//!
+//! # Keyset pagination contract (plan 04, finding P1-4)
+//!
+//! The five `list_*` methods below take an optional cursor and return each record paired
+//! with **the cursor for its own row**, in the query's existing sort order. Three rules hold
+//! across all five and must not be relaxed:
+//!
+//! 1. **The sort key is not uniform, and no query's sort key may be changed to make it so.**
+//!    Conversations and memories order by `(updated_at desc, id desc)`; RAG collections and
+//!    documents by `(created_at desc, id desc)`; messages by `sequence_number asc`. The
+//!    keyset predicate is therefore `<` for the four descending lists and `>` for the one
+//!    ascending list. Changing a sort key to unify them would silently reorder every
+//!    existing caller's results.
+//! 2. **Cursor values are bound parameters, never interpolated.** They arrive here already
+//!    parsed into `DateTime<Utc>`/`Uuid`/`i64` by [`crate::domain::ListCursor`], so a
+//!    client-supplied cursor can never reach the query text.
+//! 3. **`limit` is the exact row count to fetch**, including the caller's over-fetch row.
+//!    The repository neither adds one nor clamps; `crate::application::conversation` owns
+//!    both, so the trim/`has_more` arithmetic lives in exactly one place.
+//!
+//! The pairing exists because the public DTOs expose `id` as the caller-facing `public_id`
+//! string (`"conv_…"`), never the table's `uuid` primary key that the sort key and the
+//! cursor are built from. Re-deriving the uuid by parsing the public id would work today and
+//! break silently the day a public id stops being `prefix_{uuid}`. The repository owns the
+//! sort key, so it also mints the cursor; the application layer only trims, counts and
+//! encodes.
+//!
+//! ## Consequence of keying conversations and memories on `updated_at`
+//!
+//! Those two lists sort by a **mutable** column. A row updated part-way through a pagination
+//! sweep moves to the front of the ordering, so it can be returned twice (if it had already
+//! been passed) or missed entirely (if it had not been reached yet and moves behind the
+//! cursor). That is standard keyset behaviour for a mutable sort key and is accepted
+//! deliberately — the alternative is changing the sort key, which rule 1 forbids. Callers
+//! that need an exactly-once sweep must reconcile by `id`, not assume the pages are disjoint.
+
 use chrono::{Duration, Utc};
 use serde_json::Value;
 use sqlx::{PgConnection, PgPool, Row};
@@ -9,11 +46,11 @@ use crate::{
         ConversationMessageRole, ConversationMessageType, ConversationPatchRequest,
         ConversationPolicyPutRequest, ConversationPolicyRecord, ConversationQuery,
         ConversationRecord, ConversationStatus, EmbeddingPolicyPutRequest, EmbeddingPolicyRecord,
-        MemoryCreateRequest, MemoryPatchRequest, MemoryPolicyPutRequest, MemoryPolicyRecord,
-        MemoryQuery, MemoryRecord, MemoryScope, RagCollectionCreateRequest,
+        ListCursor, MemoryCreateRequest, MemoryPatchRequest, MemoryPolicyPutRequest,
+        MemoryPolicyRecord, MemoryQuery, MemoryRecord, MemoryScope, RagCollectionCreateRequest,
         RagCollectionPatchRequest, RagCollectionQuery, RagCollectionRecord, RagCollectionStatus,
         RagDocumentCreateRequest, RagDocumentIngestRequest, RagDocumentRecord, RagIngestionStatus,
-        RetrievalPolicyPutRequest, RetrievalPolicyRecord,
+        RetrievalPolicyPutRequest, RetrievalPolicyRecord, SeqCursor,
     },
     error::AppError,
     infra::pg_rows::{
@@ -78,6 +115,126 @@ pub struct MemoryInsert<'a> {
     pub request: &'a MemoryCreateRequest,
     pub content_hash: &'a str,
 }
+
+// ---------------------------------------------------------------------------
+// Keyset list queries.
+//
+// These five live as `const`s rather than inline literals for one reason: being compile-time
+// constants is itself the proof that no cursor value can ever reach the query text. A `const`
+// cannot be built by `format!`, so the SQL-injection question is settled by the type system
+// rather than by review, and the unit tests below can assert the shape of each predicate
+// (`<` for the four descending lists, `>` for the one ascending list, `$N` placeholders only)
+// without a database.
+// ---------------------------------------------------------------------------
+
+const LIST_CONVERSATIONS_SQL: &str = r#"
+            select c.*
+            from conversations c
+            where c.deleted_at is null
+              and ($1::boolean
+                   or (c.application_id = $2
+                       and ($3::text is null or c.external_tenant_id = $3)
+                       and ($4::text is null or c.external_user_id = $4)))
+              and ($5::text is null or c.status = $5)
+              and ($6::timestamptz is null or c.created_at < $6)
+              and ($7::timestamptz is null or c.created_at >= $7)
+              and ($8::timestamptz is null or c.updated_at < $8)
+              and ($9::timestamptz is null or c.updated_at >= $9)
+              and ($10::text is null or c.title ilike '%' || $10 || '%')
+              and ($11::timestamptz is null or (c.updated_at, c.id) < ($11, $12::uuid))
+            order by c.updated_at desc, c.id desc
+            limit $13
+            "#;
+
+// The conversation is resolved by a scalar subquery rather than a join, and that is a
+// performance decision, not a style one. Measured on PostgreSQL 18.3 against 60k messages in
+// one conversation, paging from sequence 30000 with `limit 51`:
+//
+//   join form:     Hash Join over a Seq Scan of conversation_messages, keyset applied as a
+//                  post-fetch Filter (30,000 rows discarded), top-N heapsort,
+//                  1,468 buffers, 28.5 ms
+//   subquery form: InitPlan on conversations_public_id_key, then a plain Index Scan on
+//                  conversation_messages_sequence_unique with the whole predicate as an
+//                  Index Cond and NO sort node, 10 buffers, 0.10 ms
+//
+// The join form cannot be fixed with an index. `conversation_id` arrives from the join, so it
+// is not available as an index-scan constant; forcing a nested loop (`enable_hashjoin=off`)
+// still produced a full bitmap scan and a sort. The subquery makes it an InitPlan constant,
+// which is what lets the existing `(conversation_id, sequence_number)` unique index supply
+// both the filter and the ordering. Reverting this to a join silently reintroduces a scan
+// that grows with the conversation and gets *slower* the deeper the caller pages — the exact
+// failure keyset pagination exists to avoid.
+//
+// Semantics are unchanged: `conversation_messages.conversation_id` is `not null` with an FK to
+// `conversations(id)`, and `public_id` is unique, so the subquery yields exactly the row the
+// join matched — and yields no rows (not an error) for an unknown `public_id`, as before.
+const LIST_MESSAGES_SQL: &str = r#"
+            select m.*
+            from conversation_messages m
+            where m.conversation_id = (
+                    select c.id from conversations c where c.public_id = $1
+                  )
+              and m.deleted_at is null
+              and ($2::bigint is null or m.sequence_number < $2)
+              and ($3::bigint is null or m.sequence_number > $3)
+              and ($4::bigint is null or m.sequence_number > $4)
+            order by m.sequence_number asc
+            limit $5
+            "#;
+
+const LIST_MEMORIES_SQL: &str = r#"
+            select m.*
+            from memory_records m
+            where m.deleted_at is null
+              and ($1::boolean
+                   or (m.application_id = $2
+                       and ($3::text is null or m.external_tenant_id = $3)
+                       and ($4::text is null or m.external_user_id = $4)))
+              and ($5::text is null or m.memory_type = $5)
+              and ($6::text is null or m.status = $6)
+              and ($7::timestamptz is null or (m.updated_at, m.id) < ($7, $8::uuid))
+            order by m.updated_at desc, m.id desc
+            limit $9
+            "#;
+
+const LIST_RAG_COLLECTIONS_SQL: &str = r#"
+            select *
+            from rag_collections
+            where deleted_at is null
+              and ($1::uuid is null or application_id = $1)
+              and ($2::text is null or external_tenant_id = $2)
+              and ($3::text is null or status = $3)
+              and ($4::timestamptz is null or (created_at, id) < ($4, $5::uuid))
+            order by created_at desc, id desc
+            limit $6
+            "#;
+
+// Same scalar-subquery rewrite as `LIST_MESSAGES_SQL`, for the same measured reason, and here
+// it is only half the fix. Against 60k documents in one collection, paging from the midpoint
+// with `limit 51`:
+//
+//   join, no index:       Seq Scan + top-N heapsort, 2,900 buffers, 21.4 ms
+//   join, WITH the index: still Seq Scan + top-N heapsort, 2,906 buffers, 31.4 ms
+//   subquery, no index:   still Seq Scan + top-N heapsort, 2,900 buffers, 11.7 ms
+//   subquery + index:     Index Scan, whole keyset as an Index Cond, no sort,
+//                         36 buffers, 0.07 ms
+//
+// So neither change works alone: the index is unusable while `collection_id` comes from a
+// join, and the subquery alone leaves the planner with no ordered index to walk. The index is
+// `rag_documents_collection_created_cursor_idx` in `migrations/0010_list_cursor_indexes.sql`;
+// it exists because the pre-existing `rag_documents_collection_cursor_idx` puts `status`
+// between `collection_id` and `created_at`, and this query does not constrain `status`.
+const LIST_RAG_DOCUMENTS_SQL: &str = r#"
+            select d.*
+            from rag_documents d
+            where d.collection_id = (
+                    select c.id from rag_collections c where c.public_id = $1
+                  )
+              and d.deleted_at is null
+              and ($2::timestamptz is null or (d.created_at, d.id) < ($2, $3::uuid))
+            order by d.created_at desc, d.id desc
+            limit $4
+            "#;
 
 impl PgConversationRepository {
     pub fn new(pool: PgPool) -> Self {
@@ -515,44 +672,41 @@ impl PgConversationRepository {
         conversation_record_from_row(&row)
     }
 
+    /// Lists conversations newest-updated-first, resuming after `cursor` when supplied.
+    ///
+    /// See the module docs for the keyset contract. The sort key here is
+    /// `(updated_at, id)` — a **mutable** timestamp, with the re-seen/skipped-row
+    /// consequence documented there.
     pub async fn list_conversations_authorized(
         &self,
         access: &ConversationAccess,
         query: &ConversationQuery,
-    ) -> Result<Vec<ConversationRecord>, AppError> {
-        let rows = sqlx::query(&conversation_select(
-            r#"
-            select c.*
-            from conversations c
-            where c.deleted_at is null
-              and ($1::boolean
-                   or (c.application_id = $2
-                       and ($3::text is null or c.external_tenant_id = $3)
-                       and ($4::text is null or c.external_user_id = $4)))
-              and ($5::text is null or c.status = $5)
-              and ($6::timestamptz is null or c.created_at < $6)
-              and ($7::timestamptz is null or c.created_at >= $7)
-              and ($8::timestamptz is null or c.updated_at < $8)
-              and ($9::timestamptz is null or c.updated_at >= $9)
-              and ($10::text is null or c.title ilike '%' || $10 || '%')
-            order by c.updated_at desc, c.id desc
-            limit $11
-            "#,
-        ))
-        .bind(access.privileged)
-        .bind(access.application_id)
-        .bind(&access.external_tenant_id)
-        .bind(&access.external_user_id)
-        .bind(query.status.map(conversation_status_to_db))
-        .bind(query.created_before)
-        .bind(query.created_after)
-        .bind(query.updated_before)
-        .bind(query.updated_after)
-        .bind(&query.search)
-        .bind(query.limit())
-        .fetch_all(&self.pool)
-        .await?;
-        rows.iter().map(conversation_record_from_row).collect()
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<(ConversationRecord, ListCursor)>, AppError> {
+        let rows = sqlx::query(&conversation_select(LIST_CONVERSATIONS_SQL))
+            .bind(access.privileged)
+            .bind(access.application_id)
+            .bind(&access.external_tenant_id)
+            .bind(&access.external_user_id)
+            .bind(query.status.map(conversation_status_to_db))
+            .bind(query.created_before)
+            .bind(query.created_after)
+            .bind(query.updated_before)
+            .bind(query.updated_after)
+            .bind(&query.search)
+            .bind(cursor.map(|cursor| cursor.ts))
+            .bind(cursor.map(|cursor| cursor.id))
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|row| {
+                let record = conversation_record_from_row(row)?;
+                let key = ListCursor::new(record.updated_at, row.try_get("id")?);
+                Ok((record, key))
+            })
+            .collect()
     }
 
     pub async fn patch_conversation(
@@ -696,32 +850,37 @@ impl PgConversationRepository {
         conversation_message_record_from_row(&row)
     }
 
+    /// Lists a conversation's messages in ascending sequence order, resuming after `cursor`.
+    ///
+    /// The only **ascending** list in this file, so its keyset predicate is
+    /// `sequence_number > $n`, not `<`. `sequence_number` is unique per conversation
+    /// (`conversation_messages_sequence_unique`, `migrations/0007_*.sql`), so the ordering is
+    /// already total and no `id` tiebreaker is needed — hence a bare [`SeqCursor`] rather
+    /// than a `(timestamp, id)` pair.
+    ///
+    /// The cursor composes with, and does not replace, the pre-existing `before`/`after`
+    /// filters: all three are separate `and`-ed predicates over the same column.
     pub async fn list_messages(
         &self,
         conversation_public_id: &str,
         query: &ConversationMessageQuery,
-    ) -> Result<Vec<ConversationMessageRecord>, AppError> {
-        let rows = sqlx::query(&conversation_message_select(
-            r#"
-            select m.*
-            from conversation_messages m
-            join conversations c on c.id = m.conversation_id
-            where c.public_id = $1
-              and m.deleted_at is null
-              and ($2::bigint is null or m.sequence_number < $2)
-              and ($3::bigint is null or m.sequence_number > $3)
-            order by m.sequence_number asc
-            limit $4
-            "#,
-        ))
-        .bind(conversation_public_id)
-        .bind(message_sequence(query.before.as_deref()))
-        .bind(message_sequence(query.after.as_deref()))
-        .bind(query.limit())
-        .fetch_all(&self.pool)
-        .await?;
+        cursor: Option<SeqCursor>,
+        limit: i64,
+    ) -> Result<Vec<(ConversationMessageRecord, SeqCursor)>, AppError> {
+        let rows = sqlx::query(&conversation_message_select(LIST_MESSAGES_SQL))
+            .bind(conversation_public_id)
+            .bind(message_sequence(query.before.as_deref()))
+            .bind(message_sequence(query.after.as_deref()))
+            .bind(cursor.map(SeqCursor::sequence_number))
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
         rows.iter()
-            .map(conversation_message_record_from_row)
+            .map(|row| {
+                let record = conversation_message_record_from_row(row)?;
+                let key = SeqCursor::new(record.sequence_number);
+                Ok((record, key))
+            })
             .collect()
     }
 
@@ -792,36 +951,37 @@ impl PgConversationRepository {
         memory_record_from_row(&row)
     }
 
+    /// Lists memories newest-updated-first, resuming after `cursor` when supplied.
+    ///
+    /// Same `(updated_at, id)` mutable sort key as
+    /// [`Self::list_conversations_authorized`], with the same re-seen/skipped-row
+    /// consequence documented in the module docs.
     pub async fn list_memories_authorized(
         &self,
         access: &ConversationAccess,
         query: &MemoryQuery,
-    ) -> Result<Vec<MemoryRecord>, AppError> {
-        let rows = sqlx::query(&memory_select(
-            r#"
-            select m.*
-            from memory_records m
-            where m.deleted_at is null
-              and ($1::boolean
-                   or (m.application_id = $2
-                       and ($3::text is null or m.external_tenant_id = $3)
-                       and ($4::text is null or m.external_user_id = $4)))
-              and ($5::text is null or m.memory_type = $5)
-              and ($6::text is null or m.status = $6)
-            order by m.updated_at desc, m.id desc
-            limit $7
-            "#,
-        ))
-        .bind(access.privileged)
-        .bind(access.application_id)
-        .bind(&access.external_tenant_id)
-        .bind(&access.external_user_id)
-        .bind(query.memory_type.map(memory_type_to_db))
-        .bind(query.status.map(memory_status_to_db))
-        .bind(query.limit())
-        .fetch_all(&self.pool)
-        .await?;
-        rows.iter().map(memory_record_from_row).collect()
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<(MemoryRecord, ListCursor)>, AppError> {
+        let rows = sqlx::query(&memory_select(LIST_MEMORIES_SQL))
+            .bind(access.privileged)
+            .bind(access.application_id)
+            .bind(&access.external_tenant_id)
+            .bind(&access.external_user_id)
+            .bind(query.memory_type.map(memory_type_to_db))
+            .bind(query.status.map(memory_status_to_db))
+            .bind(cursor.map(|cursor| cursor.ts))
+            .bind(cursor.map(|cursor| cursor.id))
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|row| {
+                let record = memory_record_from_row(row)?;
+                let key = ListCursor::new(record.updated_at, row.try_get("id")?);
+                Ok((record, key))
+            })
+            .collect()
     }
 
     pub async fn patch_memory(
@@ -893,29 +1053,32 @@ impl PgConversationRepository {
         Ok(record)
     }
 
+    /// Lists RAG collections newest-created-first, resuming after `cursor` when supplied.
+    ///
+    /// Unlike conversations and memories the sort key here is `(created_at, id)` — immutable
+    /// once written, so a sweep over it is exactly-once even under concurrent updates.
     pub async fn list_rag_collections(
         &self,
         query: &RagCollectionQuery,
-    ) -> Result<Vec<RagCollectionRecord>, AppError> {
-        let rows = sqlx::query(
-            r#"
-            select *
-            from rag_collections
-            where deleted_at is null
-              and ($1::uuid is null or application_id = $1)
-              and ($2::text is null or external_tenant_id = $2)
-              and ($3::text is null or status = $3)
-            order by created_at desc, id desc
-            limit $4
-            "#,
-        )
-        .bind(query.application_id)
-        .bind(&query.external_tenant_id)
-        .bind(query.status.map(rag_collection_status_to_db))
-        .bind(query.limit())
-        .fetch_all(&self.pool)
-        .await?;
-        rows.iter().map(rag_collection_record_from_row).collect()
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<(RagCollectionRecord, ListCursor)>, AppError> {
+        let rows = sqlx::query(LIST_RAG_COLLECTIONS_SQL)
+            .bind(query.application_id)
+            .bind(&query.external_tenant_id)
+            .bind(query.status.map(rag_collection_status_to_db))
+            .bind(cursor.map(|cursor| cursor.ts))
+            .bind(cursor.map(|cursor| cursor.id))
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|row| {
+                let record = rag_collection_record_from_row(row)?;
+                let key = ListCursor::new(record.created_at, row.try_get("id")?);
+                Ok((record, key))
+            })
+            .collect()
     }
 
     pub async fn get_rag_collection(
@@ -1024,26 +1187,35 @@ impl PgConversationRepository {
         Ok(record)
     }
 
+    /// Lists a collection's documents newest-created-first, resuming after `cursor`.
+    ///
+    /// The keyset predicate goes **inside** the CTE, where the `limit` is: it selects which
+    /// rows survive into the page. The newest-first ordering of the emitted page is a
+    /// property of [`rag_document_select`]'s outer `order by`, which must not be removed —
+    /// see the comment there and the unit test that guards it.
+    ///
+    /// `limit` is no longer clamped here; `crate::application::conversation` clamps it, so
+    /// the over-fetch row cannot be silently eaten by a repository-side ceiling.
     pub async fn list_rag_documents(
         &self,
         collection_public_id: &str,
+        cursor: Option<ListCursor>,
         limit: i64,
-    ) -> Result<Vec<RagDocumentRecord>, AppError> {
-        let rows = sqlx::query(&rag_document_select(
-            r#"
-            select d.*
-            from rag_documents d
-            join rag_collections c on c.id = d.collection_id
-            where c.public_id = $1 and d.deleted_at is null
-            order by d.created_at desc, d.id desc
-            limit $2
-            "#,
-        ))
-        .bind(collection_public_id)
-        .bind(limit.clamp(1, 200))
-        .fetch_all(&self.pool)
-        .await?;
-        rows.iter().map(rag_document_record_from_row).collect()
+    ) -> Result<Vec<(RagDocumentRecord, ListCursor)>, AppError> {
+        let rows = sqlx::query(&rag_document_select(LIST_RAG_DOCUMENTS_SQL))
+            .bind(collection_public_id)
+            .bind(cursor.map(|cursor| cursor.ts))
+            .bind(cursor.map(|cursor| cursor.id))
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|row| {
+                let record = rag_document_record_from_row(row)?;
+                let key = ListCursor::new(record.created_at, row.try_get("id")?);
+                Ok((record, key))
+            })
+            .collect()
     }
 
     pub async fn get_rag_document(&self, public_id: &str) -> Result<RagDocumentRecord, AppError> {
@@ -1307,6 +1479,17 @@ pub(crate) async fn ingest_rag_document_with_connection(
     rag_document_record_from_row(&row)
 }
 
+// The outer `order by` in each of the three helpers below is load-bearing, for the reason
+// already recorded on `rag_document_select`: an inner query's own `order by` decides only
+// which rows the CTE keeps under its `limit`, and does not survive into the outer result once
+// a join is present — the planner may drive the outer result from the joined table and emit
+// rows in that table's heap order. Restating the sort key here is what makes the emitted page
+// match the order the keyset cursor was computed against; without it `next_cursor` could name
+// a row that is not the page's true boundary and the following page would skip rows.
+//
+// Each helper restates the sort key of the *list* query that uses it. Single-row call sites
+// (find/patch/insert … returning) are unaffected by an `order by` over one row.
+
 fn conversation_select(inner: &str) -> String {
     format!(
         r#"
@@ -1320,6 +1503,7 @@ fn conversation_select(inner: &str) -> String {
                coalesce(mp.consent_mode, 'explicit_only') as memory_behavior
         from conversation_rows
         left join application_memory_policies mp on mp.application_id = conversation_rows.application_id
+        order by conversation_rows.updated_at desc, conversation_rows.id desc
         "#
     )
 }
@@ -1331,6 +1515,7 @@ fn conversation_message_select(inner: &str) -> String {
         select message_rows.*, c.public_id as conversation_public_id
         from message_rows
         join conversations c on c.id = message_rows.conversation_id
+        order by message_rows.sequence_number asc
         "#
     )
 }
@@ -1342,6 +1527,7 @@ fn memory_select(inner: &str) -> String {
         select memory_rows.*, c.public_id as conversation_public_id
         from memory_rows
         left join conversations c on c.id = memory_rows.conversation_id
+        order by memory_rows.updated_at desc, memory_rows.id desc
         "#
     )
 }
@@ -1373,7 +1559,11 @@ fn message_sequence(value: Option<&str>) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::rag_document_select;
+    use super::{
+        LIST_CONVERSATIONS_SQL, LIST_MEMORIES_SQL, LIST_MESSAGES_SQL, LIST_RAG_COLLECTIONS_SQL,
+        LIST_RAG_DOCUMENTS_SQL, conversation_message_select, conversation_select, memory_select,
+        rag_document_select,
+    };
 
     /// The list endpoint's ordering is a property of the OUTER select, and is asserted here at the
     /// SQL level rather than through a query.
@@ -1407,5 +1597,195 @@ mod tests {
             sql.contains("v.ingestion_status as ingestion_status"),
             "every read path must project the current version's ingestion_status:\n{sql}"
         );
+    }
+
+    /// The other three CTE wrappers carry the same hazard `rag_document_select` was fixed for.
+    ///
+    /// Each joins another table onto the CTE, so the inner `order by` — which only decides
+    /// which rows survive the `limit` — does not survive into the outer result. Without the
+    /// outer `order by` the emitted page can be in a different order from the one the keyset
+    /// cursor was computed against, which makes `next_cursor` name a row that is not the
+    /// page's true boundary and silently skips rows on the following page.
+    ///
+    /// Asserted at the SQL level for the reason given on the test above: at fixture scale the
+    /// planner keeps a nested loop and the CTE order survives by accident, so a behavioural
+    /// test passes even with the clause deleted.
+    #[test]
+    fn every_joined_select_orders_the_outer_result() {
+        for (label, sql, join, order_by) in [
+            (
+                "conversation_select",
+                conversation_select("select c.* from conversations c"),
+                "left join application_memory_policies",
+                "order by conversation_rows.updated_at desc, conversation_rows.id desc",
+            ),
+            (
+                "conversation_message_select",
+                conversation_message_select("select m.* from conversation_messages m"),
+                "join conversations c",
+                "order by message_rows.sequence_number asc",
+            ),
+            (
+                "memory_select",
+                memory_select("select m.* from memory_records m"),
+                "left join conversations c",
+                "order by memory_rows.updated_at desc, memory_rows.id desc",
+            ),
+        ] {
+            let join_at = sql
+                .find(join)
+                .unwrap_or_else(|| panic!("{label} must still join the table it projects:\n{sql}"));
+            let order_at = sql.find(order_by).unwrap_or_else(|| {
+                panic!("{label} must restate its list query's sort key on the outer select:\n{sql}")
+            });
+
+            assert!(
+                order_at > join_at,
+                "{label}'s ordering must apply to the joined outer result, not inside the CTE:\n{sql}"
+            );
+        }
+    }
+
+    /// Each helper's outer sort key must match the list query that flows through it.
+    ///
+    /// A mismatch would be the worst kind of failure: rows come back ordered, so nothing looks
+    /// broken, but `next_cursor` is minted from a key that does not correspond to the emitted
+    /// order and pagination quietly loses rows.
+    #[test]
+    fn outer_ordering_matches_the_list_query_it_wraps() {
+        for (label, outer, inner) in [
+            (
+                "conversations",
+                conversation_select(LIST_CONVERSATIONS_SQL),
+                "order by c.updated_at desc, c.id desc",
+            ),
+            (
+                "messages",
+                conversation_message_select(LIST_MESSAGES_SQL),
+                "order by m.sequence_number asc",
+            ),
+            (
+                "memories",
+                memory_select(LIST_MEMORIES_SQL),
+                "order by m.updated_at desc, m.id desc",
+            ),
+            (
+                "rag documents",
+                rag_document_select(LIST_RAG_DOCUMENTS_SQL),
+                "order by d.created_at desc, d.id desc",
+            ),
+        ] {
+            assert!(
+                outer.contains(inner),
+                "{label}: the inner query must keep its own sort key:\n{outer}"
+            );
+            // The outer clause is the last `order by` in the emitted statement.
+            let last = outer
+                .rfind("order by")
+                .unwrap_or_else(|| panic!("{label}: no outer ordering at all:\n{outer}"));
+            let inner_at = outer.find(inner).expect("checked above");
+            assert!(
+                last > inner_at,
+                "{label}: the outer ordering must come after the CTE's own:\n{outer}"
+            );
+        }
+    }
+
+    #[test]
+    fn keyset_predicate_uses_strict_less_than_for_descending_lists() {
+        for (label, sql, predicate) in [
+            (
+                "conversations",
+                LIST_CONVERSATIONS_SQL,
+                "(c.updated_at, c.id) < ($11, $12::uuid)",
+            ),
+            (
+                "memories",
+                LIST_MEMORIES_SQL,
+                "(m.updated_at, m.id) < ($7, $8::uuid)",
+            ),
+            (
+                "rag collections",
+                LIST_RAG_COLLECTIONS_SQL,
+                "(created_at, id) < ($4, $5::uuid)",
+            ),
+            (
+                "rag documents",
+                LIST_RAG_DOCUMENTS_SQL,
+                "(d.created_at, d.id) < ($2, $3::uuid)",
+            ),
+        ] {
+            assert!(
+                sql.contains(predicate),
+                "{label}: a `desc` ordering needs a strictly-less-than row comparison against \
+                 the SAME key it orders by, or the page boundary drifts:\n{sql}"
+            );
+        }
+    }
+
+    /// Conversations and memories key on `updated_at`, **not** `created_at`.
+    ///
+    /// Both tables carry both columns, and both are `timestamptz`, so keying the cursor on the
+    /// wrong one compiles, runs, and returns plausible-looking pages that skip rows. Pinning
+    /// the column name is the only cheap guard.
+    #[test]
+    fn conversation_and_memory_cursors_key_on_updated_at_not_created_at() {
+        assert!(LIST_CONVERSATIONS_SQL.contains("(c.updated_at, c.id) <"));
+        assert!(!LIST_CONVERSATIONS_SQL.contains("(c.created_at, c.id) <"));
+        assert!(LIST_MEMORIES_SQL.contains("(m.updated_at, m.id) <"));
+        assert!(!LIST_MEMORIES_SQL.contains("(m.created_at, m.id) <"));
+    }
+
+    #[test]
+    fn keyset_predicate_uses_strict_greater_than_for_the_ascending_sequence_list() {
+        assert!(
+            LIST_MESSAGES_SQL.contains("($4::bigint is null or m.sequence_number > $4)"),
+            "messages order ascending, so resuming means `>`, not `<`:\n{LIST_MESSAGES_SQL}"
+        );
+        assert!(
+            LIST_MESSAGES_SQL.contains("order by m.sequence_number asc"),
+            "the predicate direction only makes sense against an ascending sort"
+        );
+    }
+
+    /// The SQL-injection guard, made mechanical.
+    ///
+    /// Every one of these queries is a `const`, so it is a compile-time constant that no
+    /// runtime value can enter — that alone settles it. This test additionally pins the
+    /// weaker property a reader can check by eye: every cursor comparison is written against
+    /// `$N` placeholders, so no future edit can start splicing a value in without failing
+    /// here first.
+    #[test]
+    fn keyset_predicates_bind_parameters_and_never_interpolate_values() {
+        for (label, sql) in [
+            ("conversations", LIST_CONVERSATIONS_SQL),
+            ("messages", LIST_MESSAGES_SQL),
+            ("memories", LIST_MEMORIES_SQL),
+            ("rag collections", LIST_RAG_COLLECTIONS_SQL),
+            ("rag documents", LIST_RAG_DOCUMENTS_SQL),
+        ] {
+            assert!(
+                !sql.contains('{') && !sql.contains('}'),
+                "{label}: a `format!` placeholder in a list query means a value can reach the \
+                 query text:\n{sql}"
+            );
+            for comparison in sql.match_indices("<").chain(sql.match_indices(">")) {
+                let tail = &sql[comparison.0 + 1..];
+                let operand = tail.trim_start();
+                assert!(
+                    operand.starts_with('$')
+                        || operand.starts_with("($")
+                        || operand.starts_with('=')
+                        || operand.starts_with("all")
+                        || operand.starts_with("any"),
+                    "{label}: comparison operand must be a bound parameter, found {:?}:\n{sql}",
+                    &operand[..operand.len().min(24)]
+                );
+            }
+            assert!(
+                sql.contains("limit $"),
+                "{label}: the row limit must be bound too:\n{sql}"
+            );
+        }
     }
 }

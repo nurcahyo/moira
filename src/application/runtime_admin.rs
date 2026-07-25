@@ -1,4 +1,4 @@
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -8,15 +8,23 @@ use crate::{
     application::RequestContext,
     domain::{
         AgentProfileCreateRequest, AgentProfilePatchRequest, AgentProfileRecord, AuditLogInsert,
-        AuditResult, IdempotencyRecord, ListResponse, ProviderRuntimePolicyPutRequest,
-        ProviderRuntimePolicyRecord, RouteDefinitionCreateRequest, RouteDefinitionPatchRequest,
-        RouteDefinitionRecord, RoutingPolicyCreateRequest, RoutingPolicyPatchRequest,
-        RoutingPolicyRecord,
+        AuditResult, CursorScope, IdempotencyRecord, ListCursor, ListResponse, Pagination,
+        ProviderRuntimePolicyPutRequest, ProviderRuntimePolicyRecord, RouteDefinitionCreateRequest,
+        RouteDefinitionPatchRequest, RouteDefinitionRecord, RoutingPolicyCreateRequest,
+        RoutingPolicyPatchRequest, RoutingPolicyRecord,
     },
     error::AppError,
     infra::repositories::{AdminRepository, PgAdminRepository, PgRuntimeRepository},
     security::{Actor, secret_fingerprint},
 };
+
+/// Per-endpoint cursor scopes (plan 04, Module 3). Declared once and reused for both encode
+/// (building `next_cursor`) and decode (validating a client-supplied `cursor`), so a cursor
+/// minted for one of these lists can never be replayed against another list — see
+/// `domain::pagination`'s module docs for why that matters.
+const ROUTE_DEFINITIONS_SCOPE: CursorScope = CursorScope::new("admin.route_definitions");
+const ROUTING_POLICIES_SCOPE: CursorScope = CursorScope::new("admin.routing_policies");
+const AGENT_PROFILES_SCOPE: CursorScope = CursorScope::new("admin.agent_profiles");
 
 pub struct RuntimeAdminService<'a> {
     state: &'a AppState,
@@ -72,13 +80,21 @@ impl<'a> RuntimeAdminService<'a> {
     pub async fn list_route_definitions(
         &self,
         actor: &Actor,
+        cursor: Option<&str>,
         limit: i64,
     ) -> Result<ListResponse<RouteDefinitionRecord>, AppError> {
         self.state.authz.require(actor, "moira:routes:read")?;
-        self.runtime_repo
-            .list_route_definitions(limit)
-            .await
-            .map(ListResponse::new)
+        let cursor = ListCursor::decode_optional(cursor, ROUTE_DEFINITIONS_SCOPE)?;
+        let rows = self
+            .runtime_repo
+            .list_route_definitions(cursor, limit)
+            .await?;
+        Ok(paginate_by_created_at(
+            rows,
+            limit,
+            ROUTE_DEFINITIONS_SCOPE,
+            |record| (record.created_at, record.id),
+        ))
     }
 
     pub async fn get_route_definition(
@@ -213,15 +229,23 @@ impl<'a> RuntimeAdminService<'a> {
     pub async fn list_routing_policies(
         &self,
         actor: &Actor,
+        cursor: Option<&str>,
         limit: i64,
     ) -> Result<ListResponse<RoutingPolicyRecord>, AppError> {
         self.state
             .authz
             .require(actor, "moira:routing-policies:read")?;
-        self.runtime_repo
-            .list_routing_policies(limit)
-            .await
-            .map(ListResponse::new)
+        let cursor = ListCursor::decode_optional(cursor, ROUTING_POLICIES_SCOPE)?;
+        let rows = self
+            .runtime_repo
+            .list_routing_policies(cursor, limit)
+            .await?;
+        Ok(paginate_by_created_at(
+            rows,
+            limit,
+            ROUTING_POLICIES_SCOPE,
+            |record| (record.created_at, record.id),
+        ))
     }
 
     pub async fn get_routing_policy(
@@ -386,15 +410,20 @@ impl<'a> RuntimeAdminService<'a> {
     pub async fn list_agent_profiles(
         &self,
         actor: &Actor,
+        cursor: Option<&str>,
         limit: i64,
     ) -> Result<ListResponse<AgentProfileRecord>, AppError> {
         self.state
             .authz
             .require(actor, "moira:agent-profiles:read")?;
-        self.runtime_repo
-            .list_agent_profiles(limit)
-            .await
-            .map(ListResponse::new)
+        let cursor = ListCursor::decode_optional(cursor, AGENT_PROFILES_SCOPE)?;
+        let rows = self.runtime_repo.list_agent_profiles(cursor, limit).await?;
+        Ok(paginate_by_created_at(
+            rows,
+            limit,
+            AGENT_PROFILES_SCOPE,
+            |record| (record.created_at, record.id),
+        ))
     }
 
     pub async fn get_agent_profile(
@@ -737,6 +766,37 @@ fn normalized_request_bytes<T: Serialize>(request: &T) -> Result<Vec<u8>, AppErr
         .map_err(|err| AppError::BadRequest(format!("invalid idempotent request: {err}")))
 }
 
+/// Trims a `limit + 1`-row over-fetch (see `PgRuntimeRepository::list_route_definitions`)
+/// down to `limit`, computes `has_more`, and encodes `next_cursor` from the last row that is
+/// actually returned — never from the discarded over-fetched row, which would silently skip
+/// a row on the following page.
+fn paginate_by_created_at<T>(
+    mut rows: Vec<T>,
+    limit: i64,
+    scope: CursorScope,
+    key: impl Fn(&T) -> (DateTime<Utc>, Uuid),
+) -> ListResponse<T> {
+    let has_more = (rows.len() as i64) > limit;
+    if has_more {
+        rows.truncate(limit.max(0) as usize);
+    }
+    let next_cursor = if has_more {
+        rows.last().map(|record| {
+            let (ts, id) = key(record);
+            ListCursor::new(ts, id).encode(scope)
+        })
+    } else {
+        None
+    };
+    ListResponse {
+        data: rows,
+        pagination: Pagination {
+            next_cursor,
+            has_more,
+        },
+    }
+}
+
 fn validate_key(label: &str, value: &str) -> Result<(), AppError> {
     if value.is_empty() || value.len() > 128 {
         return Err(AppError::BadRequest(format!(
@@ -898,6 +958,64 @@ fn validate_runtime_policy(request: &ProviderRuntimePolicyPutRequest) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_SCOPE: CursorScope = CursorScope::new("test.paginate_by_created_at");
+
+    fn sample_rows(count: usize) -> Vec<(DateTime<Utc>, Uuid)> {
+        let base = Utc::now();
+        (0..count)
+            .map(|i| (base - Duration::seconds(i as i64), Uuid::now_v7()))
+            .collect()
+    }
+
+    #[test]
+    fn has_more_is_false_when_exactly_limit_rows_are_available() {
+        let rows = sample_rows(5);
+        let page = paginate_by_created_at(rows.clone(), 5, TEST_SCOPE, |row| *row);
+        assert!(!page.pagination.has_more);
+        assert_eq!(page.pagination.next_cursor, None);
+        assert_eq!(page.data.len(), 5);
+        assert_eq!(page.data, rows);
+    }
+
+    #[test]
+    fn has_more_is_true_and_page_is_trimmed_when_limit_plus_one_rows_are_fetched() {
+        let rows = sample_rows(6);
+        let page = paginate_by_created_at(rows.clone(), 5, TEST_SCOPE, |row| *row);
+        assert!(page.pagination.has_more);
+        assert_eq!(page.data.len(), 5);
+        assert_eq!(page.data, &rows[..5]);
+    }
+
+    #[test]
+    fn next_cursor_encodes_the_last_returned_row_not_the_over_fetched_row() {
+        let rows = sample_rows(6);
+        let page = paginate_by_created_at(rows.clone(), 5, TEST_SCOPE, |row| *row);
+        let (expected_ts, expected_id) = rows[4];
+        let expected = ListCursor::new(expected_ts, expected_id).encode(TEST_SCOPE);
+        assert_eq!(page.pagination.next_cursor, Some(expected));
+        // The 6th (over-fetched, trimmed) row must not be what next_cursor points at.
+        let (sixth_ts, sixth_id) = rows[5];
+        let sixth_encoded = ListCursor::new(sixth_ts, sixth_id).encode(TEST_SCOPE);
+        assert_ne!(page.pagination.next_cursor, Some(sixth_encoded));
+    }
+
+    #[test]
+    fn next_cursor_is_none_when_has_more_is_false() {
+        let rows = sample_rows(3);
+        let page = paginate_by_created_at(rows, 5, TEST_SCOPE, |row| *row);
+        assert!(!page.pagination.has_more);
+        assert_eq!(page.pagination.next_cursor, None);
+    }
+
+    #[test]
+    fn empty_result_set_is_not_has_more() {
+        let page: ListResponse<(DateTime<Utc>, Uuid)> =
+            paginate_by_created_at(Vec::new(), 5, TEST_SCOPE, |row| *row);
+        assert!(!page.pagination.has_more);
+        assert_eq!(page.pagination.next_cursor, None);
+        assert!(page.data.is_empty());
+    }
 
     #[test]
     fn route_keys_are_slug_like() {

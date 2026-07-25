@@ -13,13 +13,13 @@ use crate::{
         ConversationMessageQuery, ConversationMessageRecord, ConversationMessageRole,
         ConversationMessageType, ConversationPatchRequest, ConversationPolicyPutRequest,
         ConversationPolicyRecord, ConversationQuery, ConversationRecord, ConversationStatus,
-        EmbeddingPolicyPutRequest, EmbeddingPolicyRecord, ListResponse, MemoryConsentMode,
-        MemoryCreateRequest, MemoryPatchRequest, MemoryPolicyPutRequest, MemoryPolicyRecord,
-        MemoryQuery, MemoryRecord, MemoryScope, MemoryStatus, PublicContentPart,
-        PublicInputMessage, RagCollectionCreateRequest, RagCollectionPatchRequest,
-        RagCollectionQuery, RagCollectionRecord, RagCollectionStatus, RagDocumentCreateRequest,
-        RagDocumentIngestRequest, RagDocumentRecord, ResponseConversationInput,
-        RetrievalPolicyPutRequest, RetrievalPolicyRecord,
+        CursorScope, EmbeddingPolicyPutRequest, EmbeddingPolicyRecord, ListCursor, ListResponse,
+        MemoryConsentMode, MemoryCreateRequest, MemoryPatchRequest, MemoryPolicyPutRequest,
+        MemoryPolicyRecord, MemoryQuery, MemoryRecord, MemoryScope, MemoryStatus, Pagination,
+        PublicContentPart, PublicInputMessage, RagCollectionCreateRequest,
+        RagCollectionPatchRequest, RagCollectionQuery, RagCollectionRecord, RagCollectionStatus,
+        RagDocumentCreateRequest, RagDocumentIngestRequest, RagDocumentRecord,
+        ResponseConversationInput, RetrievalPolicyPutRequest, RetrievalPolicyRecord, SeqCursor,
     },
     error::AppError,
     infra::repositories::{
@@ -35,6 +35,87 @@ use crate::{
 pub struct ConversationExecutionLink {
     pub conversation_id: String,
     pub user_message_id: String,
+}
+
+// ---------------------------------------------------------------------------
+// Keyset pagination (plan 04, finding P1-4).
+//
+// One scope per list endpoint, used for BOTH encode and decode. A cursor minted for one list
+// therefore fails closed with `400 invalid_cursor` if replayed against another, instead of
+// paging through an unrelated table's key space — see `crate::domain::pagination`.
+//
+// The labels are wire-visible only through the opaque tag, never as text, so they are free to
+// be descriptive. They must not be edited casually: changing one invalidates every
+// outstanding cursor for that endpoint.
+// ---------------------------------------------------------------------------
+
+const CONVERSATIONS_CURSOR: CursorScope = CursorScope::new("conversations.list");
+const CONVERSATION_MESSAGES_CURSOR: CursorScope = CursorScope::new("conversations.messages");
+const MEMORIES_CURSOR: CursorScope = CursorScope::new("memories.list");
+const RAG_COLLECTIONS_CURSOR: CursorScope = CursorScope::new("rag.collections");
+const RAG_DOCUMENTS_CURSOR: CursorScope = CursorScope::new("rag.documents");
+
+/// The keyset key a listed row is paginated by.
+///
+/// Exists so [`paginate`] can serve both cursor shapes — `(timestamp, id)` for the four
+/// timestamp-ordered lists and a bare sequence number for the message list — without the
+/// page-assembly arithmetic being written out twice and drifting.
+trait PageKey: Copy {
+    fn encode_for(self, scope: CursorScope) -> String;
+}
+
+impl PageKey for ListCursor {
+    fn encode_for(self, scope: CursorScope) -> String {
+        self.encode(scope)
+    }
+}
+
+impl PageKey for SeqCursor {
+    fn encode_for(self, scope: CursorScope) -> String {
+        self.encode(scope)
+    }
+}
+
+/// Rows to ask the repository for when the caller wants `limit` of them.
+///
+/// Exactly one extra row, which is the cheapest way to learn `has_more` — a second
+/// `count(*)` over the same predicate would double the work and still be racy. The extra row
+/// is discarded by [`paginate`] and never reaches the caller.
+///
+/// `saturating_add` rather than `+`: `limit` is clamped to `1..=200` by every caller's
+/// `limit()` helper, but an overflow panic here would be a silly way to find out that
+/// stopped being true.
+fn over_fetch(limit: i64) -> i64 {
+    limit.saturating_add(1)
+}
+
+/// Trims an over-fetched page, computes `has_more`, and encodes `next_cursor`.
+///
+/// `next_cursor` is the key of the **last row actually returned**, not of the over-fetched
+/// row that proved there is more. Encoding the over-fetched row's key instead is the classic
+/// off-by-one that silently drops exactly one row per page boundary.
+fn paginate<T, K: PageKey>(
+    mut rows: Vec<(T, K)>,
+    limit: i64,
+    scope: CursorScope,
+) -> ListResponse<T> {
+    let limit = usize::try_from(limit).unwrap_or(0);
+    let has_more = rows.len() > limit;
+    rows.truncate(limit);
+
+    let next_cursor = if has_more {
+        rows.last().map(|(_, key)| key.encode_for(scope))
+    } else {
+        None
+    };
+
+    ListResponse {
+        data: rows.into_iter().map(|(record, _)| record).collect(),
+        pagination: Pagination {
+            next_cursor,
+            has_more,
+        },
+    }
 }
 
 // NOTE: this ordering is a design placeholder for the future context-assembly pipeline (plans/11-rag-memory-intelligence.md). It is not currently consumed by prepare_response_conversation and does not affect what is sent to the provider.
@@ -129,6 +210,14 @@ impl ConversationService {
         Ok(record)
     }
 
+    /// Lists conversations, paging by `(updated_at, id)`.
+    ///
+    /// The cursor is decoded **before** the query runs, so a tampered or foreign cursor costs
+    /// a `400 invalid_cursor` and no database round trip.
+    ///
+    /// Because the sort key is the mutable `updated_at`, a conversation touched mid-sweep can
+    /// be re-seen on a later page or missed entirely — accepted keyset semantics, documented
+    /// in full on `crate::infra::repositories::conversation`.
     pub async fn list_conversations(
         &self,
         actor: &Actor,
@@ -137,16 +226,21 @@ impl ConversationService {
         self.state
             .authz
             .require(actor, "moira:conversations:read")?;
-        self.repo
+        let cursor = ListCursor::decode_optional(query.cursor.as_deref(), CONVERSATIONS_CURSOR)?;
+        let limit = query.limit();
+        let rows = self
+            .repo
             .list_conversations_authorized(
                 &conversation_access(
                     actor,
                     can_read_all(actor, "moira:conversations:read", &self.state),
                 )?,
                 query,
+                cursor,
+                over_fetch(limit),
             )
-            .await
-            .map(ListResponse::new)
+            .await?;
+        Ok(paginate(rows, limit, CONVERSATIONS_CURSOR))
     }
 
     pub async fn get_conversation(
@@ -248,6 +342,11 @@ impl ConversationService {
         Ok(record)
     }
 
+    /// Lists a conversation's messages, paging by ascending `sequence_number`.
+    ///
+    /// The one ascending list on this surface, so it uses [`SeqCursor`] and a `>` predicate.
+    /// Unlike the four timestamp-ordered lists this sweep is exactly-once: `sequence_number`
+    /// is assigned once at insert and never changes.
     pub async fn list_messages(
         &self,
         actor: &Actor,
@@ -257,6 +356,9 @@ impl ConversationService {
         self.state
             .authz
             .require(actor, "moira:conversations:read")?;
+        let cursor =
+            SeqCursor::decode_optional(query.cursor.as_deref(), CONVERSATION_MESSAGES_CURSOR)?;
+        let limit = query.limit();
         self.repo
             .find_conversation_authorized(
                 conversation_id,
@@ -266,10 +368,11 @@ impl ConversationService {
                 )?,
             )
             .await?;
-        self.repo
-            .list_messages(conversation_id, query)
-            .await
-            .map(ListResponse::new)
+        let rows = self
+            .repo
+            .list_messages(conversation_id, query, cursor, over_fetch(limit))
+            .await?;
+        Ok(paginate(rows, limit, CONVERSATION_MESSAGES_CURSOR))
     }
 
     pub async fn create_message(
@@ -498,6 +601,10 @@ impl ConversationService {
         Ok(record)
     }
 
+    /// Lists memories, paging by `(updated_at, id)`.
+    ///
+    /// Same mutable-sort-key caveat as [`Self::list_conversations`]: a memory whose
+    /// `updated_at` moves during a sweep can be re-seen or missed.
     pub async fn list_memories(
         &self,
         actor: &Actor,
@@ -516,16 +623,21 @@ impl ConversationService {
                 "memory listing is disabled",
             ));
         }
-        self.repo
+        let cursor = ListCursor::decode_optional(query.cursor.as_deref(), MEMORIES_CURSOR)?;
+        let limit = query.limit();
+        let rows = self
+            .repo
             .list_memories_authorized(
                 &conversation_access(
                     actor,
                     can_read_all(actor, "moira:memories:read", &self.state),
                 )?,
                 query,
+                cursor,
+                over_fetch(limit),
             )
-            .await
-            .map(ListResponse::new)
+            .await?;
+        Ok(paginate(rows, limit, MEMORIES_CURSOR))
     }
 
     pub async fn get_memory(
@@ -816,6 +928,10 @@ impl ConversationService {
         Ok(outcome.response)
     }
 
+    /// Lists RAG collections, paging by `(created_at, id)`.
+    ///
+    /// Immutable sort key, so unlike the conversation and memory lists this sweep is
+    /// exactly-once under concurrent updates.
     pub async fn list_rag_collections(
         &self,
         actor: &Actor,
@@ -824,10 +940,13 @@ impl ConversationService {
         self.state
             .authz
             .require(actor, "moira:rag-collections:read")?;
-        self.repo
-            .list_rag_collections(query)
-            .await
-            .map(ListResponse::new)
+        let cursor = ListCursor::decode_optional(query.cursor.as_deref(), RAG_COLLECTIONS_CURSOR)?;
+        let limit = query.limit();
+        let rows = self
+            .repo
+            .list_rag_collections(query, cursor, over_fetch(limit))
+            .await?;
+        Ok(paginate(rows, limit, RAG_COLLECTIONS_CURSOR))
     }
 
     pub async fn get_rag_collection(
@@ -968,19 +1087,53 @@ impl ConversationService {
         Ok(outcome.response)
     }
 
+    /// Lists a collection's documents, paging by `(created_at, id)`.
+    ///
+    /// # Why this one has no `cursor` argument
+    ///
+    /// `GET /api/v1/admin/rag-collections/{collection_id}/documents`
+    /// (`src/http/conversation.rs`) is the only list route on this surface that declares
+    /// **no query parameters at all** — not `cursor`, not even `limit`; its handler passes a
+    /// hard-coded `50`. There is consequently no cursor for this signature to accept yet.
+    ///
+    /// What this method does still deliver is a correct `has_more`/`next_cursor` on the first
+    /// page, so a caller can already tell that a collection has more than `limit` documents.
+    /// Consuming that cursor requires adding a query extractor and an OpenAPI `params(..)`
+    /// entry to the handler; until then use [`Self::list_rag_documents_page`], which is the
+    /// real implementation and is fully wired.
     pub async fn list_rag_documents(
         &self,
         actor: &Actor,
         collection_id: &str,
         limit: i64,
     ) -> Result<ListResponse<RagDocumentRecord>, AppError> {
+        self.list_rag_documents_page(actor, collection_id, None, limit)
+            .await
+    }
+
+    /// Cursor-aware RAG document listing — see [`Self::list_rag_documents`] for why the two
+    /// exist.
+    ///
+    /// `limit` is clamped here rather than in the repository, so the over-fetch row cannot be
+    /// eaten by a repository-side ceiling at `limit == 200`. The bounds match every other
+    /// `limit()` helper on this surface.
+    pub async fn list_rag_documents_page(
+        &self,
+        actor: &Actor,
+        collection_id: &str,
+        cursor: Option<&str>,
+        limit: i64,
+    ) -> Result<ListResponse<RagDocumentRecord>, AppError> {
         self.state
             .authz
             .require(actor, "moira:rag-documents:read")?;
-        self.repo
-            .list_rag_documents(collection_id, limit)
-            .await
-            .map(ListResponse::new)
+        let cursor = ListCursor::decode_optional(cursor, RAG_DOCUMENTS_CURSOR)?;
+        let limit = limit.clamp(1, 200);
+        let rows = self
+            .repo
+            .list_rag_documents(collection_id, cursor, over_fetch(limit))
+            .await?;
+        Ok(paginate(rows, limit, RAG_DOCUMENTS_CURSOR))
     }
 
     pub async fn get_rag_document(
@@ -1386,6 +1539,181 @@ fn contains_secret_like_text(content: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_SCOPE: CursorScope = CursorScope::new("test.pagination");
+
+    fn list_keys(count: usize) -> Vec<(String, ListCursor)> {
+        (0..count)
+            .map(|index| {
+                let ts =
+                    chrono::DateTime::from_timestamp_micros(1_700_000_000_000_000 - index as i64)
+                        .expect("in-range timestamp");
+                let id = Uuid::from_u128(index as u128 + 1);
+                (format!("row-{index}"), ListCursor::new(ts, id))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn over_fetch_asks_for_exactly_one_extra_row() {
+        assert_eq!(over_fetch(1), 2);
+        assert_eq!(over_fetch(50), 51);
+        assert_eq!(over_fetch(200), 201);
+        // Saturating rather than panicking, even though no caller can reach this.
+        assert_eq!(over_fetch(i64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn has_more_is_false_when_exactly_limit_rows_are_available() {
+        let page = paginate(list_keys(5), 5, TEST_SCOPE);
+
+        assert_eq!(page.data.len(), 5);
+        assert!(!page.pagination.has_more);
+        assert_eq!(page.pagination.next_cursor, None);
+    }
+
+    #[test]
+    fn has_more_is_false_for_a_short_page() {
+        let page = paginate(list_keys(2), 5, TEST_SCOPE);
+
+        assert_eq!(page.data.len(), 2);
+        assert!(!page.pagination.has_more);
+        assert_eq!(page.pagination.next_cursor, None);
+    }
+
+    #[test]
+    fn has_more_is_true_and_the_page_is_trimmed_when_limit_plus_one_rows_are_fetched() {
+        let page = paginate(list_keys(6), 5, TEST_SCOPE);
+
+        assert_eq!(
+            page.data.len(),
+            5,
+            "the over-fetched row must not be served"
+        );
+        assert_eq!(page.data.last().unwrap(), "row-4");
+        assert!(page.pagination.has_more);
+        assert!(page.pagination.next_cursor.is_some());
+    }
+
+    #[test]
+    fn next_cursor_encodes_the_last_returned_row_not_the_over_fetched_row() {
+        let rows = list_keys(6);
+        let last_returned = rows[4].1;
+        let over_fetched = rows[5].1;
+
+        let page = paginate(rows, 5, TEST_SCOPE);
+        let next_cursor = page
+            .pagination
+            .next_cursor
+            .expect("has_more implies a cursor");
+
+        assert_eq!(
+            next_cursor,
+            last_returned.encode(TEST_SCOPE),
+            "next_cursor must resume from the last row the caller SAW; using the over-fetched \
+             row's key silently drops exactly one row per page boundary"
+        );
+        assert_ne!(next_cursor, over_fetched.encode(TEST_SCOPE));
+    }
+
+    #[test]
+    fn next_cursor_round_trips_under_the_scope_it_was_minted_for() {
+        let page = paginate(list_keys(6), 5, TEST_SCOPE);
+        let encoded = page
+            .pagination
+            .next_cursor
+            .expect("has_more implies a cursor");
+
+        assert!(ListCursor::decode(&encoded, TEST_SCOPE).is_ok());
+        assert!(
+            ListCursor::decode(&encoded, CursorScope::new("test.other")).is_err(),
+            "a cursor must not page through another endpoint's key space"
+        );
+    }
+
+    #[test]
+    fn an_empty_result_reports_no_further_pages() {
+        let page = paginate(Vec::<(String, ListCursor)>::new(), 50, TEST_SCOPE);
+
+        assert!(page.data.is_empty());
+        assert!(!page.pagination.has_more);
+        assert_eq!(page.pagination.next_cursor, None);
+    }
+
+    #[test]
+    fn sequence_keyed_pages_use_the_sequence_cursor_shape() {
+        let rows: Vec<(String, SeqCursor)> = (1..=4)
+            .map(|sequence| (format!("msg-{sequence}"), SeqCursor::new(sequence)))
+            .collect();
+
+        let page = paginate(rows, 3, TEST_SCOPE);
+        let encoded = page
+            .pagination
+            .next_cursor
+            .expect("has_more implies a cursor");
+
+        assert_eq!(page.data, vec!["msg-1", "msg-2", "msg-3"]);
+        assert!(page.pagination.has_more);
+        assert_eq!(
+            SeqCursor::decode(&encoded, TEST_SCOPE).unwrap(),
+            SeqCursor::new(3),
+            "the message list resumes from the last sequence number returned"
+        );
+        assert!(
+            ListCursor::decode(&encoded, TEST_SCOPE).is_err(),
+            "a sequence cursor must not decode as a (timestamp, id) cursor"
+        );
+    }
+
+    /// Every list endpoint on this surface must use a distinct scope.
+    ///
+    /// Two endpoints sharing a scope is invisible in normal use — both cursors decode — and
+    /// only shows up as one list silently paging through another's key space.
+    #[test]
+    fn every_list_endpoint_has_its_own_cursor_scope() {
+        let scopes = [
+            CONVERSATIONS_CURSOR,
+            CONVERSATION_MESSAGES_CURSOR,
+            MEMORIES_CURSOR,
+            RAG_COLLECTIONS_CURSOR,
+            RAG_DOCUMENTS_CURSOR,
+        ];
+        let mut labels: Vec<&str> = scopes.iter().map(|scope| scope.label()).collect();
+        labels.sort_unstable();
+        let unique = labels.len();
+        labels.dedup();
+
+        assert_eq!(
+            labels.len(),
+            unique,
+            "cursor scopes must be distinct: {labels:?}"
+        );
+        assert!(labels.iter().all(|label| !label.is_empty()));
+    }
+
+    #[test]
+    fn a_malformed_cursor_is_rejected_before_any_query_runs() {
+        let error = ListCursor::decode_optional(Some("not-a-cursor"), CONVERSATIONS_CURSOR)
+            .expect_err("a garbage cursor must not reach the database");
+        let response = error.error_response(Some("req_test".to_string()));
+
+        assert_eq!(error.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response.error.code, "invalid_cursor");
+        assert_eq!(response.error.message_key, "moira.error.invalid_cursor");
+        assert!(!response.error.message.is_empty());
+
+        // Absent and empty both mean "first page", not "malformed".
+        assert!(
+            ListCursor::decode_optional(None, CONVERSATIONS_CURSOR)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            ListCursor::decode_optional(Some(""), CONVERSATIONS_CURSOR)
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn context_planner_order_keeps_required_content_first() {

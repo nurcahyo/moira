@@ -96,6 +96,26 @@ mod tests {
     }
 
     #[test]
+    fn every_catalog_key_appears_exactly_once() {
+        // Drift guard: with the docs mirror's duplicate `idempotency_conflict` /
+        // `rate_limited` objects removed (plan 04), every key in the combined
+        // error + notice catalog must now be unique with no per-key carve-out.
+        let mut seen = std::collections::HashMap::new();
+        for entry in all_entries() {
+            *seen.entry(entry.key).or_insert(0) += 1;
+        }
+        let duplicates: Vec<_> = seen
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .map(|(key, count)| format!("{key} ({count}x)"))
+            .collect();
+        assert!(
+            duplicates.is_empty(),
+            "catalog keys must be unique, found duplicates: {duplicates:?}"
+        );
+    }
+
+    #[test]
     fn middleware_error_keys_are_catalogued() {
         for key in [
             "moira.error.request_timeout",
@@ -105,6 +125,41 @@ mod tests {
             "moira.error.unauthorized",
         ] {
             assert!(is_known_key(key), "{key} must be a known catalog key");
+            let entry = all_entries()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("{key} must be catalogued"));
+            assert!(
+                !entry.default_message.is_empty(),
+                "{key} default_message must be non-empty"
+            );
+            assert!(
+                !entry.description.is_empty(),
+                "{key} description must be non-empty"
+            );
+        }
+    }
+
+    #[test]
+    fn pagination_and_precondition_error_keys_are_present_in_the_catalog() {
+        assert!(is_known_key("moira.error.invalid_cursor"));
+        assert!(is_known_key("moira.error.if_match_required"));
+    }
+
+    #[test]
+    fn new_catalog_entries_have_non_empty_default_messages_and_descriptions() {
+        for key in [
+            "moira.error.invalid_cursor",
+            "moira.error.if_match_required",
+        ] {
+            assert_eq!(
+                default_message_for_key(key),
+                Some(match key {
+                    "moira.error.invalid_cursor" => "The pagination cursor is invalid.",
+                    "moira.error.if_match_required" =>
+                        "The If-Match header is required for this request.",
+                    _ => unreachable!(),
+                })
+            );
             let entry = all_entries()
                 .find(|entry| entry.key == key)
                 .unwrap_or_else(|| panic!("{key} must be catalogued"));

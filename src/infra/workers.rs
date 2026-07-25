@@ -1,10 +1,16 @@
+pub mod retention;
+
 use std::{sync::Arc, time::Duration};
 
 use serde::Serialize;
 use tokio::{sync::watch, task::JoinHandle};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{app::AppState, config::WorkerSettings};
+
+/// Spec name of the retention/cleanup worker. Referenced rather than typed as a
+/// literal at the call site so the spec table stays the single source of truth.
+pub const RETENTION_CLEANUP_WORKER: &str = "retention-cleanup";
 
 #[derive(Debug, Clone)]
 pub struct WorkerRegistry {
@@ -79,7 +85,7 @@ impl WorkerRegistry {
                     enabled_by_default: true,
                 },
                 WorkerSpec {
-                    name: "retention-cleanup",
+                    name: RETENTION_CLEANUP_WORKER,
                     description: "Expires responses, idempotency records, vectors, and tombstones.",
                     enabled_by_default: true,
                 },
@@ -96,6 +102,21 @@ impl WorkerRegistry {
         self.settings.enabled
     }
 
+    /// The single definition of "this worker will actually run": workers are on
+    /// for the process **and** this spec is on by default. `snapshot()` and the
+    /// supervisor's dispatch both go through here so a status report can never
+    /// disagree with what the tick loop does.
+    fn spec_configured(&self, spec: &WorkerSpec) -> bool {
+        self.settings.enabled && spec.enabled_by_default
+    }
+
+    pub fn is_configured(&self, name: &str) -> bool {
+        self.specs
+            .iter()
+            .find(|spec| spec.name == name)
+            .is_some_and(|spec| self.spec_configured(spec))
+    }
+
     pub fn snapshot(&self) -> WorkerSnapshot {
         WorkerSnapshot {
             enabled: self.settings.enabled,
@@ -110,7 +131,7 @@ impl WorkerRegistry {
                 .map(|spec| WorkerStatus {
                     name: spec.name,
                     description: spec.description,
-                    configured: self.settings.enabled && spec.enabled_by_default,
+                    configured: self.spec_configured(spec),
                 })
                 .collect(),
         }
@@ -132,8 +153,23 @@ impl WorkerRegistry {
         let mut interval = tokio::time::interval(Duration::from_secs(
             self.settings.retry_base_delay_seconds.max(1),
         ));
+
+        // A retention sweep is orders of magnitude more expensive than a base
+        // tick, so it gets its own cadence rather than riding the tick interval.
+        let retention_configured = self.is_configured(RETENTION_CLEANUP_WORKER);
+        let retention_period =
+            Duration::from_secs(retention::RetentionPlan::interval_seconds(&self.settings));
+        let mut retention_interval = tokio::time::interval(retention_period);
+        // `Delay` rather than the default `Burst`: if a sweep overruns its period
+        // we want the next one deferred, not a backlog of ticks fired
+        // back-to-back against a database that is evidently already busy.
+        retention_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         info!(
             max_concurrent_jobs = self.settings.max_concurrent_jobs,
+            retention_configured,
+            retention_interval_seconds = retention_period.as_secs(),
+            retention_batch_size = self.settings.retention_batch_size,
             "moira worker supervisor started"
         );
 
@@ -148,7 +184,37 @@ impl WorkerRegistry {
                 _ = interval.tick() => {
                     state.metrics.record_worker_tick();
                 }
+                _ = retention_interval.tick(), if retention_configured => {
+                    self.run_retention_cleanup(&state).await;
+                }
             }
+        }
+    }
+
+    /// One retention sweep. Never propagates: a failing sweep must not take the
+    /// supervisor — and with it every other worker — down. The next tick retries,
+    /// and the deletes are idempotent, so a lost sweep costs only latency.
+    async fn run_retention_cleanup(&self, state: &AppState) {
+        let Some(pool) = state.pool.as_ref() else {
+            debug!("retention cleanup skipped: no database configured");
+            return;
+        };
+
+        match retention::run_once(pool, &self.settings, &state.metrics).await {
+            Ok(outcome) if outcome.total_deleted() > 0 => info!(
+                idempotency_records_deleted = outcome.idempotency_records_deleted,
+                responses_deleted = outcome.responses_deleted,
+                batches_run = outcome.batches_run,
+                hit_per_tick_cap = outcome.hit_per_tick_cap,
+                "retention cleanup deleted expired rows"
+            ),
+            Ok(outcome) => debug!(
+                batches_run = outcome.batches_run,
+                "retention cleanup found nothing to delete"
+            ),
+            // The message is a sanitised `AppError` display; `AppError::Sqlx`
+            // renders as a constant string, so no database detail leaks here.
+            Err(error) => warn!(%error, "retention cleanup failed; retrying on the next tick"),
         }
     }
 }

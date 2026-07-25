@@ -37,6 +37,11 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         description: "Used for unclassified server-side failures.",
     },
     I18nEntry {
+        key: "moira.error.invalid_cursor",
+        default_message: "The pagination cursor is invalid.",
+        description: "Used when a list cursor is malformed, tampered with, wrongly formatted, or reused across a different list endpoint.",
+    },
+    I18nEntry {
         key: "moira.error.invalid_request",
         default_message: "The request is invalid.",
         description: "Used when the request cannot be parsed or violates a basic contract rule.",
@@ -140,6 +145,11 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         key: "moira.error.idempotency_not_supported_for_stream",
         default_message: "Idempotency keys are not supported for response streams.",
         description: "Used when streaming rejects idempotent replay headers.",
+    },
+    I18nEntry {
+        key: "moira.error.if_match_required",
+        default_message: "The If-Match header is required for this request.",
+        description: "Used when a versioned mutation is called without the If-Match precondition header.",
     },
     I18nEntry {
         key: "moira.error.image_too_large",

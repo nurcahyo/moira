@@ -1,6 +1,6 @@
 mod support;
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use axum::http::StatusCode;
 use futures_util::StreamExt;
@@ -869,6 +869,212 @@ async fn public_sse_disconnect_persists_cancellation_and_reuses_capacity() {
         .expect("reused public-disconnect outcome");
     assert_eq!(outcome.status, ExecutionStatus::Succeeded);
     drop(reused);
+    moira.shutdown().await;
+    provider.shutdown().await;
+}
+
+/// P1-7: a client that stays **connected** but stops reading.
+///
+/// The sibling test above (`public_sse_disconnect_persists_cancellation_and_reuses_capacity`)
+/// `drop`s the body, which closes the TCP socket and drives
+/// `supervise_public_stream`'s `public_tx.closed()` branch. That branch is easy: the
+/// receiver is gone, so the send fails immediately.
+///
+/// This test drives the *other* branch — the one that had no DB-backed proof. The client
+/// holds the `reqwest::Response` body open and simply stops polling it, so:
+///
+///   * the socket is never closed, therefore `public_rx` is never dropped, therefore
+///     `public_tx.closed()` can never resolve;
+///   * hyper stops accepting body frames once its write buffer and the kernel socket
+///     buffers fill, so `public_rx` stops being drained;
+///   * the bounded `public_tx` fills, and `send_public_event`'s
+///     `tokio::time::timeout(send_timeout, tx.send(event))` arm is the *only* thing that
+///     can terminate the stream.
+///
+/// The assertions then have to prove the cancellation actually released resources:
+/// row states alone would miss a leaked concurrency permit, so the last step re-runs an
+/// execution against `max_concurrent_streams: 1` capacity.
+#[tokio::test]
+async fn public_sse_stalled_reader_without_disconnect_releases_permit_and_terminates_response() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    // Every fixture-owned identifier is suffixed so concurrently running test binaries
+    // cannot collide, and so an assertion can never be satisfied by a row left behind by
+    // a previous run.
+    let test_id = Uuid::now_v7().simple().to_string();
+    let gate = ScriptGate::new();
+    let first_delta = format!("public-stalled-{test_id}");
+    let after_stall_delta = format!("after-stall-{test_id}");
+    let provider = MockOpenAiServer::start([
+        ProviderScript::FloodingStream {
+            first_delta: first_delta.clone(),
+            // Large enough that a few hundred frames saturate every buffer between the
+            // supervisor and the stalled client; the flood is unbounded, so the exact
+            // size is a throughput choice, not a correctness dependency.
+            flood_delta: "s".repeat(4096),
+            gate: gate.clone(),
+        },
+        ProviderScript::Stream {
+            deltas: vec![after_stall_delta.clone()],
+        },
+    ])
+    .await;
+    fixture
+        .add_provider(
+            provider.base_url(),
+            10,
+            RuntimePolicy {
+                // Deliberately far above the 1 s send timeout configured below, so the
+                // only clock that can fire is `send_public_event`'s. If the provider
+                // request timeout or the stream idle timeout could win, the test would
+                // pass for the wrong reason.
+                request_timeout_ms: 10_000,
+                stream_idle_timeout_ms: 10_000,
+                max_concurrent_requests: 1,
+                max_concurrent_streams: 1,
+                ..RuntimePolicy::default()
+            },
+        )
+        .await;
+    let consumer_key = fixture.enable_public_streaming().await;
+
+    // `send_public_event`'s bounded-send arm takes its `send_timeout` from
+    // `public_api.heartbeat_seconds.max(1)` (`src/application/public.rs`). The fixture
+    // leaves that at the 15 s production default, which would make this test wait 15 s of
+    // real time; 1 s is the smallest value the production code accepts. Only `settings`
+    // is replaced: the cloned `AppState` keeps the fixture's `ConcurrencyController`,
+    // `ProviderRuntimeCache` and `CircuitBreakerRegistry` (all `Arc`-backed), so the
+    // permit released here is the same permit `fixture.execution_service()` competes for
+    // at the end of the test.
+    let mut tuned_state = fixture.state.clone();
+    let mut tuned_settings = (*fixture.state.settings).clone();
+    tuned_settings.public_api.heartbeat_seconds = 1;
+    tuned_state.settings = Arc::new(tuned_settings);
+    let moira = MoiraHttpServer::start(tuned_state).await;
+
+    let client = reqwest::Client::new();
+    let mut public_request = public_response_request(&fixture.route_key);
+    public_request.conversation = Some(moira::domain::ResponseConversationInput {
+        id: None,
+        create: true,
+        title: Some(format!("Stalled reader {test_id}")),
+        metadata: serde_json::json!({ "test_fixture": true }),
+    });
+    let response = client
+        .post(format!("{}/api/v1/responses/stream", moira.base_url))
+        .header("x-consumer-key", consumer_key)
+        .header("x-request-id", format!("public-stalled-{test_id}"))
+        .json(&public_request)
+        .send()
+        .await
+        .expect("open public SSE response");
+    if response.status() != StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.expect("public SSE error body");
+        panic!("public SSE returned {status}: {body}");
+    }
+
+    // Read exactly one delta: proof the stream really started and the permit is held.
+    let mut body = response.bytes_stream();
+    let envelope = timeout(Duration::from_secs(10), async {
+        let mut buffer = String::new();
+        loop {
+            let chunk = body
+                .next()
+                .await
+                .expect("public SSE ended before delta")
+                .expect("read public SSE chunk");
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            if let Some(envelope) = find_sse_envelope(&buffer, "response.output_text.delta") {
+                return envelope;
+            }
+        }
+    })
+    .await
+    .expect("public first delta timed out");
+    assert_eq!(envelope["payload"]["text"], first_delta);
+    let execution_id = parse_prefixed_uuid(
+        envelope["execution_id"]
+            .as_str()
+            .expect("public execution id"),
+        "exec_",
+    );
+
+    // From here the client stalls: `body` stays alive (socket open, `public_rx` alive)
+    // and is never polled again until the cancellation has already been observed.
+    // `drop(body)` — the disconnect test's move — is deliberately NOT performed.
+    gate.wait_arrived().await;
+    gate.release();
+
+    wait_for_public_cancellation(&fixture, execution_id).await;
+    // Moira let go of the upstream connection as part of the same cancellation.
+    gate.wait_connection_closed().await;
+
+    assert_eq!(
+        fixture
+            .scalar_i64(
+                "select count(*) from responses where execution_id = $1 and status = 'in_progress'",
+                execution_id,
+            )
+            .await,
+        0
+    );
+    assert_eq!(
+        fixture
+            .scalar_i64(
+                "select count(*) from execution_attempts where execution_id = $1 and status = 'started'",
+                execution_id,
+            )
+            .await,
+        0
+    );
+    assert_eq!(
+        fixture
+            .scalar_i64(
+                "select count(*) from execution_attempts where execution_id = $1 and status = 'cancelled'",
+                execution_id,
+            )
+            .await,
+        1
+    );
+    assert_eq!(
+        fixture
+            .scalar_i64(
+                "select count(*) from conversation_messages where execution_id = $1 and role = 'assistant'",
+                execution_id,
+            )
+            .await,
+        0
+    );
+
+    // The client socket was never closed by us: the bytes the server pushed while we
+    // stalled are still queued for a reader. This is what separates this test from the
+    // disconnect test — had the socket closed, there would be nothing left to read.
+    let queued = timeout(Duration::from_secs(5), body.next())
+        .await
+        .expect("stalled body read timed out")
+        .expect("stalled body ended with no queued bytes")
+        .expect("read queued public SSE chunk");
+    assert!(!queued.is_empty());
+
+    // The actual failure mode being hunted: a leaked permit. `max_concurrent_streams` is
+    // 1, so this execution can only start if the stalled stream's permit came back.
+    let mut reused = fixture
+        .execution_service()
+        .execute_stream(fixture.command(true))
+        .await
+        .expect("stream after stalled reader");
+    wait_for_delta(&mut reused, &after_stall_delta).await;
+    drain_stream(&mut reused).await;
+    let outcome = (&mut reused.outcome)
+        .await
+        .expect("reused stalled-reader outcome sender")
+        .expect("reused stalled-reader outcome");
+    assert_eq!(outcome.status, ExecutionStatus::Succeeded);
+    drop(reused);
+
+    drop(body);
     moira.shutdown().await;
     provider.shutdown().await;
 }

@@ -3,7 +3,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
-use sqlx::{PgConnection, PgPool, Postgres, Row, Transaction};
+use sqlx::{PgConnection, PgPool, Postgres, Row, Transaction, postgres::PgArguments, query::Query};
 use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
@@ -11,10 +11,10 @@ use crate::{
     domain::{
         ApiKeyRecord, ApplicationCreateRequest, ApplicationPatchRequest, ApplicationRecord,
         AuditLogInsert, AuditLogRecord, CredentialCreateRequest, CredentialPatchRequest,
-        CredentialRecord, IdempotencyRecord, ProviderCreateRequest, ProviderModelCreateRequest,
-        ProviderModelPatchRequest, ProviderModelRecord, ProviderPatchRequest, ProviderRecord,
-        SystemKeyCreateRequest, TrustedJwtIssuerCreateRequest, TrustedJwtIssuerPatchRequest,
-        TrustedJwtIssuerRecord,
+        CredentialRecord, IdempotencyRecord, ListCursor, ProviderCreateRequest,
+        ProviderModelCreateRequest, ProviderModelPatchRequest, ProviderModelRecord,
+        ProviderPatchRequest, ProviderRecord, SystemKeyCreateRequest,
+        TrustedJwtIssuerCreateRequest, TrustedJwtIssuerPatchRequest, TrustedJwtIssuerRecord,
     },
     error::AppError,
     infra::pg_rows::{
@@ -78,6 +78,17 @@ pub struct StoredCredentialSecret {
     pub encrypted: EncryptedSecret,
 }
 
+/// # Pagination contract for every `list_*` method below (plan 04, P1-4)
+///
+/// Each takes the already-decoded keyset `cursor` for *its own* sort key plus the caller's
+/// page `limit`, and returns **up to `limit + 1`** rows in that query's existing sort
+/// order. The extra row is deliberate — see [`over_fetch_limit`]. Trimming it off,
+/// computing `has_more` and encoding `next_cursor` belong to the application layer
+/// (`src/application/admin.rs`), which is what keeps this SQL simple and keeps one
+/// convention across all nine lists.
+///
+/// A repository method therefore never returns `has_more` and never encodes a cursor; it
+/// only knows how to seek and how to over-fetch by one.
 #[async_trait]
 pub trait AdminRepository {
     async fn create_application(
@@ -85,7 +96,11 @@ pub trait AdminRepository {
         id: Uuid,
         request: &ApplicationCreateRequest,
     ) -> Result<ApplicationRecord, AppError>;
-    async fn list_applications(&self, limit: i64) -> Result<Vec<ApplicationRecord>, AppError>;
+    async fn list_applications(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<ApplicationRecord>, AppError>;
     async fn get_application(&self, id: Uuid) -> Result<ApplicationRecord, AppError>;
     async fn patch_application(
         &self,
@@ -105,7 +120,11 @@ pub trait AdminRepository {
         request: &ProviderCreateRequest,
         normalized_base_url: Option<String>,
     ) -> Result<ProviderRecord, AppError>;
-    async fn list_providers(&self, limit: i64) -> Result<Vec<ProviderRecord>, AppError>;
+    async fn list_providers(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<ProviderRecord>, AppError>;
     async fn get_provider(&self, id: Uuid) -> Result<ProviderRecord, AppError>;
     async fn patch_provider(
         &self,
@@ -126,6 +145,7 @@ pub trait AdminRepository {
     async fn list_provider_models(
         &self,
         provider_id: Uuid,
+        cursor: Option<ListCursor>,
         limit: i64,
     ) -> Result<Vec<ProviderModelRecord>, AppError>;
     async fn patch_provider_model(
@@ -149,10 +169,15 @@ pub trait AdminRepository {
         fingerprint: &str,
         masked: &str,
     ) -> Result<CredentialRecord, AppError>;
-    async fn list_credentials(&self, limit: i64) -> Result<Vec<CredentialRecord>, AppError>;
+    async fn list_credentials(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<CredentialRecord>, AppError>;
     async fn list_user_credentials(
         &self,
         external_user_id: &str,
+        cursor: Option<ListCursor>,
         limit: i64,
     ) -> Result<Vec<CredentialRecord>, AppError>;
     async fn get_credential(&self, id: Uuid) -> Result<CredentialRecord, AppError>;
@@ -200,8 +225,16 @@ pub trait AdminRepository {
         expires_at: Option<DateTime<Utc>>,
         material: KeyMaterial<'_>,
     ) -> Result<ApiKeyRecord, AppError>;
-    async fn list_system_keys(&self, limit: i64) -> Result<Vec<ApiKeyRecord>, AppError>;
-    async fn list_consumer_keys(&self, limit: i64) -> Result<Vec<ApiKeyRecord>, AppError>;
+    async fn list_system_keys(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<ApiKeyRecord>, AppError>;
+    async fn list_consumer_keys(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<ApiKeyRecord>, AppError>;
     async fn get_system_key(&self, id: Uuid) -> Result<ApiKeyRecord, AppError>;
     async fn get_consumer_key(&self, id: Uuid) -> Result<ApiKeyRecord, AppError>;
     async fn rotate_key(
@@ -223,6 +256,7 @@ pub trait AdminRepository {
     ) -> Result<TrustedJwtIssuerRecord, AppError>;
     async fn list_trusted_jwt_issuers(
         &self,
+        cursor: Option<ListCursor>,
         limit: i64,
     ) -> Result<Vec<TrustedJwtIssuerRecord>, AppError>;
     async fn get_trusted_jwt_issuer(&self, id: Uuid) -> Result<TrustedJwtIssuerRecord, AppError>;
@@ -240,7 +274,13 @@ pub trait AdminRepository {
     async fn soft_delete_trusted_jwt_issuer(&self, id: Uuid) -> Result<(), AppError>;
 
     async fn insert_audit(&self, insert: AuditLogInsert) -> Result<(), AppError>;
-    async fn list_audit_logs(&self, limit: i64) -> Result<Vec<AuditLogRecord>, AppError>;
+    /// Note the sort key: `audit_logs` orders by `occurred_at`, not `created_at` (it has
+    /// no `created_at` column). Same cursor shape, different column.
+    async fn list_audit_logs(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<AuditLogRecord>, AppError>;
     async fn get_audit_log(&self, id: Uuid) -> Result<AuditLogRecord, AppError>;
     async fn get_idempotency_record(
         &self,
@@ -782,20 +822,28 @@ impl AdminRepository for PgAdminRepository {
         application_record_from_row(&row)
     }
 
-    async fn list_applications(&self, limit: i64) -> Result<Vec<ApplicationRecord>, AppError> {
-        let rows = sqlx::query(
+    async fn list_applications(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<ApplicationRecord>, AppError> {
+        let tail = KeysetTail::new("created_at", cursor.as_ref(), 1);
+        let sql = format!(
             r#"
             select id, external_application_id, application_slug, display_name, status,
                    metadata, created_at, updated_at, deleted_at, version
             from applications
             where deleted_at is null
-            order by created_at desc
-            limit $1
+            {}
+            {}
             "#,
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+            tail.and_clause(),
+            tail.order_and_limit,
+        );
+        let rows = bind_cursor(sqlx::query(&sql), cursor.as_ref())
+            .bind(over_fetch_limit(limit))
+            .fetch_all(&self.pool)
+            .await?;
         rows.iter().map(application_record_from_row).collect()
     }
 
@@ -903,20 +951,28 @@ impl AdminRepository for PgAdminRepository {
         provider_record_from_row(&row)
     }
 
-    async fn list_providers(&self, limit: i64) -> Result<Vec<ProviderRecord>, AppError> {
-        let rows = sqlx::query(
+    async fn list_providers(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<ProviderRecord>, AppError> {
+        let tail = KeysetTail::new("created_at", cursor.as_ref(), 1);
+        let sql = format!(
             r#"
             select id, provider_type, display_name, base_url, status, metadata,
                    created_at, updated_at, deleted_at, version
             from providers
             where deleted_at is null
-            order by created_at desc
-            limit $1
+            {}
+            {}
             "#,
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+            tail.and_clause(),
+            tail.order_and_limit,
+        );
+        let rows = bind_cursor(sqlx::query(&sql), cursor.as_ref())
+            .bind(over_fetch_limit(limit))
+            .fetch_all(&self.pool)
+            .await?;
         rows.iter().map(provider_record_from_row).collect()
     }
 
@@ -1029,22 +1085,27 @@ impl AdminRepository for PgAdminRepository {
     async fn list_provider_models(
         &self,
         provider_id: Uuid,
+        cursor: Option<ListCursor>,
         limit: i64,
     ) -> Result<Vec<ProviderModelRecord>, AppError> {
-        let rows = sqlx::query(
+        // `$1` is `provider_id`, so the cursor (if any) starts at `$2`.
+        let tail = KeysetTail::new("created_at", cursor.as_ref(), 2);
+        let sql = format!(
             r#"
             select id, provider_id, model_key, display_name, capabilities, status,
                    created_at, updated_at, deleted_at, version
             from provider_models
             where provider_id = $1 and deleted_at is null
-            order by created_at desc
-            limit $2
+            {}
+            {}
             "#,
-        )
-        .bind(provider_id)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+            tail.and_clause(),
+            tail.order_and_limit,
+        );
+        let rows = bind_cursor(sqlx::query(&sql).bind(provider_id), cursor.as_ref())
+            .bind(over_fetch_limit(limit))
+            .fetch_all(&self.pool)
+            .await?;
         rows.iter().map(provider_model_record_from_row).collect()
     }
 
@@ -1169,22 +1230,36 @@ impl AdminRepository for PgAdminRepository {
         credential_record_from_row(&row)
     }
 
-    async fn list_credentials(&self, limit: i64) -> Result<Vec<CredentialRecord>, AppError> {
-        let sql = credential_select_sql("order by created_at desc limit $1");
-        let rows = sqlx::query(&sql).bind(limit).fetch_all(&self.pool).await?;
+    async fn list_credentials(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<CredentialRecord>, AppError> {
+        let tail = KeysetTail::new("created_at", cursor.as_ref(), 1);
+        // `credential_select_sql` already emits `where deleted_at is null`.
+        let sql = credential_select_sql(&format!("{} {}", tail.and_clause(), tail.order_and_limit));
+        let rows = bind_cursor(sqlx::query(&sql), cursor.as_ref())
+            .bind(over_fetch_limit(limit))
+            .fetch_all(&self.pool)
+            .await?;
         rows.iter().map(credential_record_from_row).collect()
     }
 
     async fn list_user_credentials(
         &self,
         external_user_id: &str,
+        cursor: Option<ListCursor>,
         limit: i64,
     ) -> Result<Vec<CredentialRecord>, AppError> {
-        let sql =
-            credential_select_sql("and external_user_id = $1 order by created_at desc limit $2");
-        let rows = sqlx::query(&sql)
-            .bind(external_user_id)
-            .bind(limit)
+        // `$1` is `external_user_id`, so the cursor (if any) starts at `$2`.
+        let tail = KeysetTail::new("created_at", cursor.as_ref(), 2);
+        let sql = credential_select_sql(&format!(
+            "and external_user_id = $1 {} {}",
+            tail.and_clause(),
+            tail.order_and_limit
+        ));
+        let rows = bind_cursor(sqlx::query(&sql).bind(external_user_id), cursor.as_ref())
+            .bind(over_fetch_limit(limit))
             .fetch_all(&self.pool)
             .await?;
         rows.iter().map(credential_record_from_row).collect()
@@ -1441,12 +1516,20 @@ impl AdminRepository for PgAdminRepository {
         api_key_record_from_row(&row)
     }
 
-    async fn list_system_keys(&self, limit: i64) -> Result<Vec<ApiKeyRecord>, AppError> {
-        list_keys(&self.pool, "system_api_keys", false, limit).await
+    async fn list_system_keys(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<ApiKeyRecord>, AppError> {
+        list_keys(&self.pool, "system_api_keys", false, cursor, limit).await
     }
 
-    async fn list_consumer_keys(&self, limit: i64) -> Result<Vec<ApiKeyRecord>, AppError> {
-        list_keys(&self.pool, "consumer_api_keys", true, limit).await
+    async fn list_consumer_keys(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<ApiKeyRecord>, AppError> {
+        list_keys(&self.pool, "consumer_api_keys", true, cursor, limit).await
     }
 
     async fn get_system_key(&self, id: Uuid) -> Result<ApiKeyRecord, AppError> {
@@ -1594,11 +1677,20 @@ impl AdminRepository for PgAdminRepository {
 
     async fn list_trusted_jwt_issuers(
         &self,
+        cursor: Option<ListCursor>,
         limit: i64,
     ) -> Result<Vec<TrustedJwtIssuerRecord>, AppError> {
-        let sql =
-            trusted_issuer_select_sql("where deleted_at is null order by created_at desc limit $1");
-        let rows = sqlx::query(&sql).bind(limit).fetch_all(&self.pool).await?;
+        let tail = KeysetTail::new("created_at", cursor.as_ref(), 1);
+        // `trusted_issuer_select_sql` emits no `where`, so this call site owns it.
+        let sql = trusted_issuer_select_sql(&format!(
+            "where deleted_at is null {} {}",
+            tail.and_clause(),
+            tail.order_and_limit
+        ));
+        let rows = bind_cursor(sqlx::query(&sql), cursor.as_ref())
+            .bind(over_fetch_limit(limit))
+            .fetch_all(&self.pool)
+            .await?;
         rows.iter()
             .map(crate::infra::pg_rows::trusted_jwt_issuer_record_from_row)
             .collect()
@@ -1726,20 +1818,30 @@ impl AdminRepository for PgAdminRepository {
         insert_audit_with_connection(&mut connection, insert).await
     }
 
-    async fn list_audit_logs(&self, limit: i64) -> Result<Vec<AuditLogRecord>, AppError> {
-        let rows = sqlx::query(
+    async fn list_audit_logs(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<AuditLogRecord>, AppError> {
+        // The one admin list whose sort key is not `created_at`, and the one with no
+        // `where` clause of its own — so the keyset predicate has to introduce it.
+        let tail = KeysetTail::new("occurred_at", cursor.as_ref(), 1);
+        let sql = format!(
             r#"
             select id, occurred_at, request_id, actor_type, actor_subject, delegated_subject,
                    external_user_id, external_tenant_id, application_id, resource_type,
                    resource_id, action, result, source_ip::text as source_ip, user_agent, metadata
             from audit_logs
-            order by occurred_at desc
-            limit $1
+            {}
+            {}
             "#,
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+            tail.where_clause(),
+            tail.order_and_limit,
+        );
+        let rows = bind_cursor(sqlx::query(&sql), cursor.as_ref())
+            .bind(over_fetch_limit(limit))
+            .fetch_all(&self.pool)
+            .await?;
         rows.iter().map(audit_log_record_from_row).collect()
     }
 
@@ -1911,6 +2013,92 @@ async fn insert_audit_with_connection(
     Ok(())
 }
 
+/// How many rows a list query actually asks Postgres for.
+///
+/// One more than the caller wants. That extra row is the existence proof for `has_more`:
+/// the application layer trims it off and reports `has_more = true` if it was there. It is
+/// what keeps `has_more` from costing a second `count(*)` over the whole table on every
+/// single page.
+fn over_fetch_limit(limit: i64) -> i64 {
+    limit.saturating_add(1)
+}
+
+/// The `order by` / `limit` tail shared by every admin list query, plus the optional
+/// keyset predicate that makes the advertised `cursor` parameter real.
+///
+/// Two things here are load-bearing:
+///
+/// * **Strictly less-than.** Every admin list is ordered descending, so "the page after
+///   this cursor" is the rows whose sort key is strictly *below* it. `<=` would re-emit
+///   the cursor row itself at the top of every page.
+/// * **The `id` tiebreaker.** The comparison is on the row constructor
+///   `(sort_column, id)`, not on `sort_column` alone. Without the `id` leg, rows sharing a
+///   timestamp come back in an unspecified order, and a page boundary landing inside such
+///   a group silently skips or repeats rows — the exact defect P1-4 describes. None of the
+///   nine admin lists had this tiebreaker before plan 04.
+///
+/// `sort_column` is always a literal chosen by the call sites in this file and is never
+/// caller input. The cursor's *values* never reach the SQL text at all: they are bound as
+/// parameters by [`bind_cursor`].
+struct KeysetTail {
+    /// The bare keyset condition, or `None` when the caller asked for the first page.
+    condition: Option<String>,
+    order_and_limit: String,
+}
+
+impl KeysetTail {
+    /// `first_param` is the next unused `$n` after the query's own fixed parameters, so
+    /// the numbering stays correct whether or not a cursor is present.
+    fn new(sort_column: &str, cursor: Option<&ListCursor>, first_param: usize) -> Self {
+        let (condition, limit_param) = match cursor {
+            Some(_) => (
+                Some(format!(
+                    "({sort_column}, id) < (${first_param}::timestamptz, ${}::uuid)",
+                    first_param + 1
+                )),
+                first_param + 2,
+            ),
+            None => (None, first_param),
+        };
+
+        Self {
+            condition,
+            order_and_limit: format!("order by {sort_column} desc, id desc limit ${limit_param}"),
+        }
+    }
+
+    /// The condition as an `and …` clause, for a query that already has a `where`.
+    fn and_clause(&self) -> String {
+        match &self.condition {
+            Some(condition) => format!("and {condition}"),
+            None => String::new(),
+        }
+    }
+
+    /// The condition as a `where …` clause, for a query that has none (`audit_logs`).
+    fn where_clause(&self) -> String {
+        match &self.condition {
+            Some(condition) => format!("where {condition}"),
+            None => String::new(),
+        }
+    }
+}
+
+/// Binds the cursor's two values, in the order [`KeysetTail`] numbered them.
+///
+/// This is the only place a cursor value meets a query, and it is a bind every time. A
+/// forged or malformed cursor has already been rejected by `ListCursor::decode`, and even
+/// a valid one is a typed `DateTime<Utc>` / `Uuid` that cannot reach the SQL text.
+fn bind_cursor<'q>(
+    query: Query<'q, Postgres, PgArguments>,
+    cursor: Option<&ListCursor>,
+) -> Query<'q, Postgres, PgArguments> {
+    match cursor {
+        Some(cursor) => query.bind(cursor.ts).bind(cursor.id),
+        None => query,
+    }
+}
+
 fn credential_select_sql(suffix: &str) -> String {
     format!(
         r#"
@@ -1944,34 +2132,35 @@ async fn list_keys(
     pool: &PgPool,
     table: &str,
     has_application: bool,
+    cursor: Option<ListCursor>,
     limit: i64,
 ) -> Result<Vec<ApiKeyRecord>, AppError> {
-    let sql = match (table, has_application) {
-        ("system_api_keys", false) => {
-            r#"
-            select id, null::uuid as application_id, display_name, key_prefix, fingerprint,
-                   pepper_version, scopes, status, expires_at, last_used_at, created_at,
-                   updated_at, revoked_at
-            from system_api_keys
-            where deleted_at is null
-            order by created_at desc
-            limit $1
-            "#
-        }
-        ("consumer_api_keys", true) => {
-            r#"
-            select id, application_id, display_name, key_prefix, fingerprint,
-                   pepper_version, scopes, status, expires_at, last_used_at, created_at,
-                   updated_at, revoked_at
-            from consumer_api_keys
-            where deleted_at is null
-            order by created_at desc
-            limit $1
-            "#
-        }
+    // The `(table, has_application)` match is what keeps the interpolated table name a
+    // closed set of literals rather than caller input.
+    let projection = match (table, has_application) {
+        ("system_api_keys", false) => "null::uuid as application_id",
+        ("consumer_api_keys", true) => "application_id",
         _ => return Err(AppError::Internal("unsupported api key table".to_string())),
     };
-    let rows = sqlx::query(sql).bind(limit).fetch_all(pool).await?;
+
+    let tail = KeysetTail::new("created_at", cursor.as_ref(), 1);
+    let sql = format!(
+        r#"
+        select id, {projection}, display_name, key_prefix, fingerprint,
+               pepper_version, scopes, status, expires_at, last_used_at, created_at,
+               updated_at, revoked_at
+        from {table}
+        where deleted_at is null
+        {}
+        {}
+        "#,
+        tail.and_clause(),
+        tail.order_and_limit,
+    );
+    let rows = bind_cursor(sqlx::query(&sql), cursor.as_ref())
+        .bind(over_fetch_limit(limit))
+        .fetch_all(pool)
+        .await?;
     rows.iter().map(api_key_record_from_row).collect()
 }
 
@@ -2015,5 +2204,140 @@ fn ensure_affected(rows_affected: u64, resource: String) -> Result<(), AppError>
         Err(AppError::NotFound(resource))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cursor() -> ListCursor {
+        ListCursor::new(
+            DateTime::from_timestamp_micros(1_753_401_600_123_456).expect("in-range timestamp"),
+            Uuid::parse_str("018f3a7c-1c2d-7e4f-8a9b-0c1d2e3f4a5b").expect("valid uuid"),
+        )
+    }
+
+    #[test]
+    fn keyset_predicate_is_omitted_when_no_cursor_is_supplied() {
+        let tail = KeysetTail::new("created_at", None, 1);
+
+        assert_eq!(tail.and_clause(), "");
+        assert_eq!(tail.where_clause(), "");
+        // With no cursor, the limit takes the first free parameter slot.
+        assert_eq!(
+            tail.order_and_limit,
+            "order by created_at desc, id desc limit $1"
+        );
+    }
+
+    #[test]
+    fn keyset_predicate_uses_strict_less_than_for_descending_lists() {
+        let tail = KeysetTail::new("created_at", Some(&cursor()), 1);
+
+        assert_eq!(
+            tail.and_clause(),
+            "and (created_at, id) < ($1::timestamptz, $2::uuid)"
+        );
+        // `<=` would re-emit the cursor row at the top of every page.
+        assert!(!tail.and_clause().contains("<="));
+        assert!(!tail.and_clause().contains('>'));
+    }
+
+    #[test]
+    fn keyset_predicate_uses_the_occurred_at_column_for_audit_logs() {
+        // The one admin list whose sort key is not `created_at`, and the one that has to
+        // introduce its own `where`.
+        let tail = KeysetTail::new("occurred_at", Some(&cursor()), 1);
+
+        assert_eq!(
+            tail.where_clause(),
+            "where (occurred_at, id) < ($1::timestamptz, $2::uuid)"
+        );
+        assert_eq!(
+            tail.order_and_limit,
+            "order by occurred_at desc, id desc limit $3"
+        );
+        assert!(!tail.where_clause().contains("created_at"));
+    }
+
+    #[test]
+    fn every_keyset_ordering_carries_the_id_tiebreaker() {
+        // Without `id desc`, rows sharing a timestamp come back in an unspecified order and
+        // a page boundary inside such a group silently skips or repeats them. All nine
+        // admin lists lacked this before plan 04.
+        for column in ["created_at", "occurred_at"] {
+            for cursor in [None, Some(&cursor())] {
+                let tail = KeysetTail::new(column, cursor, 1);
+                assert!(
+                    tail.order_and_limit
+                        .starts_with(&format!("order by {column} desc, id desc limit $")),
+                    "missing id tiebreaker for {column}: {}",
+                    tail.order_and_limit
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn keyset_parameter_numbering_follows_the_querys_own_fixed_parameters() {
+        // `list_provider_models` and `list_user_credentials` each bind one fixed parameter
+        // before the cursor, so the cursor starts at `$2` and the limit lands at `$4`.
+        let tail = KeysetTail::new("created_at", Some(&cursor()), 2);
+        assert_eq!(
+            tail.and_clause(),
+            "and (created_at, id) < ($2::timestamptz, $3::uuid)"
+        );
+        assert_eq!(
+            tail.order_and_limit,
+            "order by created_at desc, id desc limit $4"
+        );
+
+        // …and without a cursor the limit moves up to the slot the cursor would have used.
+        let first_page = KeysetTail::new("created_at", None, 2);
+        assert_eq!(
+            first_page.order_and_limit,
+            "order by created_at desc, id desc limit $2"
+        );
+    }
+
+    #[test]
+    fn keyset_predicate_binds_parameters_and_never_interpolates_values() {
+        // The strongest form of this assertion: two cursors that share no bytes must
+        // produce byte-identical SQL. If any cursor-derived value ever reached the query
+        // text, these would differ.
+        let one = ListCursor::new(
+            DateTime::from_timestamp_micros(1).expect("in-range timestamp"),
+            Uuid::parse_str("ffffffff-ffff-4fff-bfff-ffffffffffff").expect("valid uuid"),
+        );
+        let two = cursor();
+
+        for column in ["created_at", "occurred_at"] {
+            let a = KeysetTail::new(column, Some(&one), 1);
+            let b = KeysetTail::new(column, Some(&two), 1);
+
+            assert_eq!(a.and_clause(), b.and_clause());
+            assert_eq!(a.where_clause(), b.where_clause());
+            assert_eq!(a.order_and_limit, b.order_and_limit);
+
+            // And nothing that looks like a value is present at all — only `$n` holes.
+            let fragment = format!("{} {}", a.where_clause(), a.order_and_limit);
+            for forbidden in ["ffffffff", "018f3a7c", "1753401600", "'", "1970"] {
+                assert!(
+                    !fragment.contains(forbidden),
+                    "cursor-derived literal {forbidden:?} leaked into SQL: {fragment}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn over_fetch_limit_is_limit_plus_one() {
+        assert_eq!(over_fetch_limit(1), 2);
+        assert_eq!(over_fetch_limit(50), 51);
+        assert_eq!(over_fetch_limit(200), 201);
+        // Never panics on a hostile value, and never wraps to a negative limit — Postgres
+        // rejects a negative `LIMIT`, so wrapping would turn a bad input into a 500.
+        assert_eq!(over_fetch_limit(i64::MAX), i64::MAX);
     }
 }
