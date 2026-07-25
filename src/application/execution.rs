@@ -31,7 +31,7 @@ use crate::{
         pg_rows::{credential_type_to_db, scope_type_to_db},
         repositories::{
             AdminRepository, ExecutionAttemptInsert, ExecutionAttemptUpdate, PgAdminRepository,
-            PgRuntimeRepository, UsageRecordInsert,
+            PgRuntimeRepository, RuntimeRepository, UsageRecordInsert,
         },
     },
     orchestration::{

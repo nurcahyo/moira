@@ -28,8 +28,8 @@ use crate::{
     error::AppError,
     infra::repositories::{
         AdminRepository, IdempotencyClaim, PgAdminRepository, PgPublicRepository, PublicAccess,
-        ResponseStartedInsert, ResponseTerminalUpdate, default_application_execution_policy,
-        idempotency_record,
+        PublicRepository, ResponseStartedInsert, ResponseTerminalUpdate,
+        default_application_execution_policy, idempotency_record,
     },
     security::{Actor, ActorType, IdempotencyHasher, secret_fingerprint},
 };

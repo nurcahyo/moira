@@ -24,7 +24,7 @@ use crate::{
     error::AppError,
     infra::repositories::{
         AdminRepository, ConversationAccess, ConversationInsert, ConversationMessageInsert,
-        MemoryInsert, PgAdminRepository, PgConversationRepository,
+        ConversationRepository, MemoryInsert, PgAdminRepository, PgConversationRepository,
         create_rag_collection_with_connection, create_rag_document_with_connection,
         ingest_rag_document_with_connection,
     },

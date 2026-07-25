@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use chrono::{DateTime, Duration, Utc};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -14,7 +16,9 @@ use crate::{
         RoutingPolicyPatchRequest, RoutingPolicyRecord,
     },
     error::AppError,
-    infra::repositories::{AdminRepository, PgAdminRepository, PgRuntimeRepository},
+    infra::repositories::{
+        AdminRepository, PgAdminRepository, PgRuntimeRepository, RuntimeRepository,
+    },
     security::{Actor, secret_fingerprint},
 };
 
@@ -28,7 +32,16 @@ const AGENT_PROFILES_SCOPE: CursorScope = CursorScope::new("admin.agent_profiles
 
 pub struct RuntimeAdminService<'a> {
     state: &'a AppState,
-    runtime_repo: PgRuntimeRepository,
+    /// Held as `dyn RuntimeRepository` (plan 06, Module 8 / P2-3) rather than as a concrete
+    /// `PgRuntimeRepository`, so the runtime read/write surface can be swapped for a fake.
+    ///
+    /// Note for whoever writes the first Postgres-free `RuntimeAdminService` unit test: this
+    /// field alone is not enough. `audit_success` and `idempotency_replay` go through
+    /// `admin_repo`, whose only implementation is `PgAdminRepository` — and *that* requires a
+    /// live `PgPool` at construction. Making this service fully Postgres-free therefore also
+    /// needs an `AdminRepository` fake (60+ methods), which is outside Module 8's four-trait
+    /// scope. Until then this seam is real but not yet exercised.
+    runtime_repo: Arc<dyn RuntimeRepository>,
     admin_repo: PgAdminRepository,
 }
 
@@ -37,7 +50,7 @@ impl<'a> RuntimeAdminService<'a> {
         let pool = state.pool()?.clone();
         Ok(Self {
             state,
-            runtime_repo: PgRuntimeRepository::new(pool.clone()),
+            runtime_repo: Arc::new(PgRuntimeRepository::new(pool.clone())),
             admin_repo: PgAdminRepository::new(pool),
         })
     }
