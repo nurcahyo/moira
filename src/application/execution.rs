@@ -13,6 +13,7 @@ use tokio::{
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::{
@@ -29,7 +30,7 @@ use crate::{
     },
     error::AppError,
     infra::{
-        metrics::MetricsRegistry,
+        metrics::{MetricsRegistry, provider_type_label},
         pg_rows::{credential_type_to_db, scope_type_to_db},
         repositories::{
             AdminRepository, ExecutionAttemptInsert, ExecutionAttemptUpdate, PgAdminRepository,
@@ -492,6 +493,27 @@ impl MoiraExecutionService {
                 };
 
                 let cancellation = events.cancellation();
+                // Execution-attempt span (plan 05, Module 2). Attached with `Instrument`
+                // rather than an `enter()` guard because the attempt body awaits: a guard
+                // held across an await point would re-parent whatever else the runtime
+                // schedules onto this thread.
+                //
+                // Attributes are an explicit whitelist of identifiers and closed-set enum
+                // labels — no prompt text, no request or response body, no credential
+                // material, and nothing `Debug`-formatted. `provider_type` reuses
+                // `provider_type_label` so the span attribute and the metric label cannot
+                // drift apart.
+                let attempt_span = tracing::debug_span!(
+                    "execution_attempt",
+                    attempt_id = %attempt_id,
+                    attempt_number,
+                    execution_id = %command.execution_id,
+                    provider_id = %candidate.provider_id,
+                    provider_model_id = %candidate.provider_model_id,
+                    provider_type = provider_type_label(candidate.provider_type),
+                    model_key = %candidate.model_key,
+                    stream = command.options.stream,
+                );
                 let execution = async {
                     if command.options.stream {
                         execute_rig_stream(
@@ -511,7 +533,8 @@ impl MoiraExecutionService {
                     } else {
                         execute_rig_completion(handle.clone(), request).await
                     }
-                };
+                }
+                .instrument(attempt_span);
                 let attempt_timeout =
                     phase_budget(remaining, Duration::from_millis(runtime_policy.timeout_ms));
                 let bounded_by_total_deadline =

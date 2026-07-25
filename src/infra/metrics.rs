@@ -485,7 +485,11 @@ fn method_label(method: &Method) -> &'static str {
 }
 
 /// Exhaustive so a new [`ProviderType`] variant cannot silently ship without a label.
-fn provider_type_label(provider_type: ProviderType) -> &'static str {
+///
+/// Shared with the execution-attempt span in `src/application/execution.rs` so the
+/// metric label and the span attribute cannot drift into two taxonomies for the
+/// same value.
+pub(crate) fn provider_type_label(provider_type: ProviderType) -> &'static str {
     match provider_type {
         ProviderType::OpenAiCompatible => "openai_compatible",
         ProviderType::OpenAi => "openai",

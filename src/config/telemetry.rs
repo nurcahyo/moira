@@ -35,16 +35,16 @@
 //! # Known gap: span coverage under the shipped `env_filter`
 //!
 //! `tracing-opentelemetry` bridges every span the subscriber records, so no
-//! redundant instrumentation is added here. As of this change the *only* span
-//! constructed anywhere in `src/` is `redacted_request_span` in `src/lib.rs`,
-//! and it is a `debug_span!` on target `moira`. The shipped default
-//! `env_filter` is `moira=info,tower_http=info`, which disables `DEBUG`, so a
-//! stock deployment that merely flips `MOIRA_TELEMETRY__OTEL_ENABLED=true`
-//! exports an empty trace stream. Enabling OTel today therefore also requires
-//! widening the filter, e.g.
-//! `MOIRA_TELEMETRY__ENV_FILTER=moira=debug,tower_http=debug`. Promoting that
-//! span to `info_span!` (in `src/lib.rs`, owned elsewhere) or adding a dedicated
-//! OTel filter setting would remove the footgun; both are out of scope for this
+//! redundant instrumentation is added here. The two spans constructed in `src/`
+//! are `redacted_request_span` (`http_request`, in `src/lib.rs`) and
+//! `execution_attempt` (in `src/application/execution.rs`); both are
+//! `debug_span!` on target `moira`. The shipped default `env_filter` is
+//! `moira=info,tower_http=info`, which disables `DEBUG`, so a stock deployment
+//! that merely flips `MOIRA_TELEMETRY__OTEL_ENABLED=true` exports an empty trace
+//! stream. Enabling OTel today therefore also requires widening the filter, e.g.
+//! `MOIRA_TELEMETRY__ENV_FILTER=moira=debug,tower_http=debug`. Promoting those
+//! spans to `info_span!` (owned by their own modules) or adding a dedicated OTel
+//! filter setting would remove the footgun; both are out of scope for this
 //! module.
 
 use std::{fmt::Display, time::Duration};
