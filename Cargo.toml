@@ -3,6 +3,11 @@ name = "moira"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
+# Moira is a deployed service, not a library, so it must never be `cargo publish`-able.
+# This also satisfies `[licenses.private] ignore = true` in `deny.toml`: that setting only
+# suppresses `error[unlicensed]` for workspace members actually marked unpublishable, so
+# without this line `cargo deny check` fails on a crate that has no `license` field by design.
+publish = false
 
 [features]
 default = []

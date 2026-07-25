@@ -146,18 +146,13 @@ exceptions = []
 # crate), which cargo-deny reports as `error[unlicensed]: moira = 0.1.0 is unlicensed`.
 # This setting suppresses that for workspace members marked `publish = false`.
 #
-# NOTE FOR THE COORDINATOR — REQUIRED ONE-LINE FOLLOW-UP IN `Cargo.toml`:
-# `ignore = true` only suppresses the error for workspace members that are actually marked
-# unpublishable. `Cargo.toml` has no `publish` key today, so cargo-deny still treats `moira`
-# as publishable and the check FAILS with:
+# `ignore = true` only suppresses the error for workspace members actually marked
+# unpublishable, so this setting is load-bearing together with `publish = false` in
+# `Cargo.toml`. That line has landed. Removing either one turns this gate red again with:
 #     error[unlicensed]: moira = 0.1.0 is unlicensed
 #     advisories ok, bans ok, licenses FAILED, sources ok   (exit 4)
-# Measured fix — adding `publish = false` under `[package]` and changing nothing else:
-#     advisories ok, bans ok, licenses ok, sources ok       (exit 0)
-# `Cargo.toml` is outside this module's assigned file scope, so the line is NOT added here.
-# It is correct on its own merits (a deployed service should never be `cargo publish`-able)
-# and is strictly preferable to asserting a license Moira does not have via a
-# `[[licenses.clarify]]` entry. Until it lands, this gate stays red on one diagnostic.
+# This pairing is deliberately preferred over asserting a license Moira does not have via a
+# `[[licenses.clarify]]` entry.
 ignore = true
 registries = []
 
