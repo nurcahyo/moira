@@ -17,8 +17,8 @@ Updated as each plan merges. A plan is **Complete** only when its PR is merged w
 | `02a` | ✅ **Complete** | [#10](https://github.com/nurcahyo/moira/pull/10) | `36b05ee` |
 | `02b` | ✅ **Complete** | [#24](https://github.com/nurcahyo/moira/pull/24) | `e1c2658` |
 | `03` | ✅ **Complete** | [#25](https://github.com/nurcahyo/moira/pull/25) | `19b98ae` |
-| `04` | ⏳ In progress | — | — |
-| `05` | ⬜ Not started | — | — |
+| `04` | ✅ **Complete** | [#26](https://github.com/nurcahyo/moira/pull/26) | `400ad70` |
+| `05` | ⏳ In progress | — | — |
 | `06` | ⬜ Not started | — | — |
 | `07` | ⬜ Not started | — | — |
 | `08` | ⬜ Not started | — | — |
