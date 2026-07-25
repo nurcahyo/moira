@@ -1,1 +1,13 @@
 /target
+
+# console/ (Next.js workspace)
+node_modules/
+.next/
+playwright-report/
+test-results/
+console/out/
+console/build/
+console/dist/
+console/coverage/
+console/*.tsbuildinfo
+console/next-env.d.ts
