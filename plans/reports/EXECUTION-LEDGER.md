@@ -93,7 +93,32 @@ exist, found only by checking **all 49** DoD-named tests instead of a sample.
 
 ## Plan 06 — architecture & test hygiene
 
-**Status: re-audited, NOT started. Needs a Wave 0 plan rewrite before any code.**
+**Status: IN PROGRESS on `plan/06-architecture-test-hygiene`. Wave 0 and Module 0 landed.**
+
+- `01107bb` — Wave 0: plan rewritten against the real tree. §0 of the plan document carries a
+  14-item drift table. Two corrections were load-bearing: Module 9 as written **did not compile**
+  (it deleted `resolver.rs`, which defines the load-bearing `RuntimeConfigCache`), and Modules 7/9
+  targeted `executor.rs` as the Rig boundary when that file is dead code and the boundary is
+  `runtime_factory.rs`. Two omitted items written in as Modules 16 (`actor_fingerprint`) and 17
+  (If-Match inventory).
+- `6b335a9` — **Module 0**, the gating commit: `GeneratedApiKey.raw_key` is `SecretString`, so
+  `json!({"raw": ...})` is a compile error. Proven, not asserted: re-introducing the exact leak line
+  from `9531b90` fails with `Secret<String>: serde::Serialize is not satisfied`. The guarantee rests
+  on the `SerializableSecret` marker, which `String` never implements — so it survives feature
+  unification, which is stronger than the "no serde feature" reasoning first assumed.
+
+**Decision taken: If-Match TOCTOU splits into plan 06b, sequenced `06 → 06b → 07`.** It cannot land
+in 06 because Module 6's DoD requires `AdminService`'s 46 signatures provably unchanged while the fix
+adds `expected_version` to 21 of them — both claims cannot stand. It must precede 07 or
+`AdminIdentityService` inherits the pattern. Module 17 therefore delivers inventory + recipe +
+an `#[ignore]`d failing harness only.
+
+**Wave 1 in flight** (3 agents, disjoint files; Modules 8 and 14 deliberately held back because all
+agents share one `./target` lock and extra parallelism buys queueing, not speed):
+- A — Modules 1–6, the `admin.rs` split. Long pole. Guarded by a before/after signature snapshot.
+- B — Module 7, `DomainMessage` + Rig boundary, retargeted to `runtime_factory.rs`.
+- E — Modules 10–11, i18n residual + per-endpoint unknown-query-field, with a mandatory
+  injected-failure proof (the new gates would otherwise pass on first run and prove nothing).
 
 Full findings in `HANDOFF-PROMPT.md` §5.1. Headlines:
 
@@ -112,6 +137,80 @@ Full findings in `HANDOFF-PROMPT.md` §5.1. Headlines:
 
 **First commit when work starts:** `SecretString` on `GeneratedApiKey.raw_key`
 (`src/security/api_keys.rs:20-26`) — ~6 lines, 3 files, must land *before* the `admin.rs` split.
+
+---
+
+## OPEN FINDINGS — need a decision, not a mechanical fix
+
+### F1 — 23 uncatalogued error codes reach the wire (pre-existing, NOT fixed)
+
+`failure_code()` (`src/application/public.rs:2009`) returns 28 codes that flow into
+`AppError::coded(status, failure_code(class), …)`. `AppError::message_key()` renders any code as
+`moira.error.<code>`, so all 28 ship to clients as message keys — and **23 have no catalog entry**:
+`provider_unavailable`, `provider_timeout`, `credential_expired`, `circuit_open`, `route_not_found`,
+`deadline_exceeded`, `capacity_exhausted`, and 16 more. These are the *most common* public execution
+failures, so this is the i18n contract failing exactly where it matters most.
+
+The Module 10 walker cannot catch them: the code argument is a runtime expression, not a literal.
+Instead the count is pinned — the test asserts exactly 2 runtime-computed code sites exist and names
+the gap — so the number cannot grow silently.
+
+**Why it is not fixed:** closing it needs 23 reviewed, operator-safe English strings. That is a
+product-copy decision, not a refactor, and inventing them unreviewed would be worse than the gap.
+**Decide:** write them in plan 06, or schedule a dedicated i18n pass.
+
+### F2 — unknown query fields are rejected before authentication, and the 400 enumerates field names
+
+Rejection of an unknown query parameter is axum's `QueryRejection`: `400 text/plain`, with no `code`,
+no `message_key`, and no `request_id` — `normalize_infrastructure_error` (`src/lib.rs:165`) only
+rewrites 413 and 504. Because `Query` is the last extractor and `admin_actor` runs *inside* the
+handler, **the rejection precedes authentication**, and axum's message enumerates all 26 `PageQuery`
+field names to an anonymous caller.
+
+Low severity — field *names*, no data, no credentials, and the endpoints are already known from the
+public OpenAPI document. But it is an unauthenticated response shape that bypasses the error
+envelope, and it means **Module 11's DoD item cannot honestly be ticked**.
+
+Not fixed here because the fix lives in `src/lib.rs` and changes an observable wire response, which
+plan 06 excludes by premise. `unknown_query_field_rejection_is_plain_text_and_precedes_authentication`
+pins the shipped shape and goes red the day someone fixes it.
+**Decide:** fold the envelope fix into plan 06b (which already carries wire changes), or accept it.
+
+### F3 — the skill files still describe deleted code, and agents are briefed from them
+
+Module 9 deleted `resolver.rs`, `executor.rs` and `src/http/chat.rs`. Several skill files still
+describe them as present, and one asserts the Rig boundary lives in `executor.rs` — the exact
+anti-pattern module 7 removed. **These are not documentation; they are the instructions subagents are
+given.** A stale skill actively steers the next agent into reintroducing deleted structure, which is
+strictly worse than a stale doc a human might skim past.
+
+Module 7's agent corrected `moira-rig-integration` and `moira-rig-completions`. Still stale:
+`moira-rig-providers/SKILL.md:312,330,524-525`, `moira-rig-tools/SKILL.md:608`,
+`moira-rig-streaming/SKILL.md:12`, `moira-rig-errors-testing/SKILL.md:148,441`, and
+`skills/moira-project-structure/SKILL.md` (which also omits `src/application` and `src/i18n`, and
+still says orchestration owns credential selection). **Duplicated under both `.claude/skills/` and
+`.agents/skills/` — fix both copies.**
+
+### F4 — `invalidate_runtime()` reproduces the over-broad circuit reset from the service side
+
+Module 14 narrowed the LISTEN/NOTIFY path, but `src/application/runtime_admin.rs:634`
+(`async fn invalidate_runtime`, declared `:631`) still calls the unconditional reset, and it has
+**14 callers** (`:81,143,164,188,230,298,339,365,411,478,501,527,610`) — so every runtime-admin
+mutation still discards health state for providers that never changed. The service knows which
+resource it just changed, so the mapping to `CircuitResetScope` is direct.
+
+Not fixed in module 14 because module 16 holds that file. **Follow-up commit once module 16 lands.**
+
+### F5 — module 13's new template-database fixture has cross-process contention
+
+`every_non_sse_route_group_is_governed_by_the_non_streaming_timeout`
+(`tests/http_middleware_contract.rs`) failed once on a full-workspace run at `tests/support/mod.rs:789`
+— `connections to moira_test_template were never released` after a 10s wait. Cargo runs test binaries
+concurrently, so the new fixture waits on a *different process*. Passes in isolation and on re-run.
+
+This is a new flake introduced while fixing the old one, which is worth stating plainly rather than
+counting module 13 as done. Its owner must widen or serialise that wait. **Do not treat plan 06 as
+green until a full-workspace run passes twice consecutively from cold.**
 
 ---
 
