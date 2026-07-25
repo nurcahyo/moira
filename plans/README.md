@@ -15,7 +15,8 @@ Updated as each plan merges. A plan is **Complete** only when its PR is merged w
 | Plan | Status | PR | Merge commit |
 |------|--------|----|--------------|
 | `02a` | ✅ **Complete** | [#10](https://github.com/nurcahyo/moira/pull/10) | `36b05ee` |
-| `02b` | ⏳ In progress | — | — |
+| `02b` | ✅ **Complete** | [#24](https://github.com/nurcahyo/moira/pull/24) | `e1c2658` |
+| `03` | ⏳ In progress | — | — |
 | `03` | ⬜ Not started | — | — |
 | `04` | ⬜ Not started | — | — |
 | `05` | ⬜ Not started | — | — |
