@@ -2071,6 +2071,11 @@ mod tests {
     use crate::domain::ExecutionOptions;
     use crate::{app::AppState, config::Settings, security::ActorType};
 
+    /// Guard for assertions whose only failure mode would otherwise be an infinite await.
+    /// Generous enough never to fire on a loaded machine, short enough that a regression
+    /// surfaces as a test failure rather than as a CI job timeout.
+    const UNBOUNDED_PHASE_GUARD: Duration = Duration::from_secs(5);
+
     #[test]
     fn cancellation_uses_terminal_cancelled_states() {
         assert_eq!(
@@ -2257,10 +2262,19 @@ mod tests {
         let expired = Instant::now() - Duration::from_secs(1);
 
         // A pre-attempt phase with no budget left fails closed instead of running unbounded.
+        //
+        // The assertion is itself bounded. Without the guard the only symptom of a
+        // regression here is `bounded_phase` awaiting `pending` forever, which in CI reads
+        // as a job timeout — infrastructure flakiness — rather than as a caught regression.
+        // The guard turns that into a fast, legible test failure.
         let never_completes = std::future::pending::<Result<(), ExecutionFailure>>();
-        let failure = bounded_phase(expired, never_completes)
-            .await
-            .expect_err("an expired deadline must not admit a new phase");
+        let failure = tokio::time::timeout(
+            UNBOUNDED_PHASE_GUARD,
+            bounded_phase(expired, never_completes),
+        )
+        .await
+        .expect("bounded_phase must fail closed on an expired deadline, not await the phase")
+        .expect_err("an expired deadline must not admit a new phase");
         assert_eq!(failure.class, ExecutionFailureClass::DeadlineExceeded);
 
         // Terminal persistence is floored, so it is bounded and non-zero, never "no limit".

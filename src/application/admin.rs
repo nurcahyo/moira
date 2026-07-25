@@ -58,28 +58,19 @@ const CONSUMER_KEYS_CURSOR: CursorScope = CursorScope::new("admin.consumer_keys"
 const TRUSTED_JWT_ISSUERS_CURSOR: CursorScope = CursorScope::new("admin.trusted_jwt_issuers");
 const AUDIT_LOGS_CURSOR: CursorScope = CursorScope::new("admin.audit_logs");
 
-/// Largest page any admin list will return.
-///
-/// Mirrors the clamp in `PageQuery::limit` (`src/domain/admin.rs`). It is restated here
-/// rather than shared because [`PageRequest`] is reachable from callers that never went
-/// through a `PageQuery`, and an unclamped limit would let a single request over-fetch an
-/// entire table. `page_request_limit_matches_page_query_clamp` pins the two values
-/// together so they cannot drift apart silently.
-const MAX_PAGE_LIMIT: i64 = 200;
-
 /// What a paginated admin list needs from its caller: how many rows, and where to resume.
 ///
-/// # Why there are two `From` impls, and why one of them is temporary
+/// # There is exactly one way to build one, deliberately
 ///
-/// * [`From<&PageQuery>`] is the real one. It carries the `cursor` query parameter through
-///   to the service so it can be decoded into a keyset predicate.
-/// * [`From<i64>`] is a **migration bridge**, and it is the reason the `cursor` parameter
-///   is still inert end-to-end. Every HTTP handler currently calls
-///   `list_*(&actor, query.limit())` (`src/http/admin.rs`), which cannot carry a cursor;
-///   those nine call sites each need to become `list_*(&actor, &query)`. That file is
-///   owned by another change in this plan, so the bridge keeps the two edits independent
-///   and keeps the tree compiling in between. **Delete `From<i64>` once the last call site
-///   has flipped** — the compiler will then point at any that were missed.
+/// [`From<&PageQuery>`] is the only constructor. It carries both the `limit` *and* the
+/// `cursor` query parameter through to the service, so a handler cannot obtain a
+/// `PageRequest` without having decided what to do about the cursor.
+///
+/// An earlier revision also had a `From<i64>` bridge that hardcoded `cursor: None`, so a
+/// handler passing a bare `query.limit()` still type-checked while silently dropping the
+/// caller's cursor. All nine admin lists shipped that way and compiled cleanly. The bridge
+/// is gone: passing a limit alone is now a compile error, which is the only mechanism that
+/// actually keeps the cursor wired end-to-end.
 ///
 /// Decoding lives here rather than in the HTTP layer deliberately: the handlers stay thin,
 /// and there is exactly one place that knows which [`CursorScope`] belongs to which list.
@@ -116,15 +107,6 @@ impl From<&PageQuery> for PageRequest {
         Self {
             limit: query.limit(),
             cursor: query.cursor.clone(),
-        }
-    }
-}
-
-impl From<i64> for PageRequest {
-    fn from(limit: i64) -> Self {
-        Self {
-            limit: limit.clamp(1, MAX_PAGE_LIMIT),
-            cursor: None,
         }
     }
 }
@@ -2151,6 +2133,15 @@ mod tests {
     const TEST_SCOPE: CursorScope = CursorScope::new("test.rows");
     const OTHER_SCOPE: CursorScope = CursorScope::new("test.other");
 
+    /// Largest page any admin list will return.
+    ///
+    /// The clamp itself lives in `PageQuery::limit` (`src/domain/admin.rs`) and there is
+    /// only one of it: since `From<&PageQuery>` is the sole way to build a [`PageRequest`],
+    /// no limit can reach the repository without passing through that clamp. This constant
+    /// is the *test's* expectation of that value, not a second implementation of it, and
+    /// `page_request_limit_matches_page_query_clamp` fails if the domain clamp moves.
+    const MAX_PAGE_LIMIT: i64 = 200;
+
     /// `count` rows in the descending order a list query would return them.
     fn rows(count: usize) -> Vec<Row> {
         (0..count)
@@ -2164,8 +2155,13 @@ mod tests {
             .collect()
     }
 
+    /// A first page of `limit` rows, built the only way a `PageRequest` can be built:
+    /// through a `PageQuery`, exactly as an HTTP handler does.
     fn page_of(rows: Vec<Row>, limit: i64) -> ListResponse<Row> {
-        let page = PageRequest::from(limit);
+        let page = PageRequest::from(&PageQuery {
+            limit: Some(limit),
+            ..PageQuery::default()
+        });
         paginate(rows, &page, TEST_SCOPE, |row| {
             ListCursor::new(row.created_at, row.id)
         })
@@ -2307,16 +2303,15 @@ mod tests {
         };
         assert_eq!(huge.limit(), MAX_PAGE_LIMIT);
         assert_eq!(PageRequest::from(&huge).limit(), MAX_PAGE_LIMIT);
-        assert_eq!(PageRequest::from(i64::MAX).limit(), MAX_PAGE_LIMIT);
 
         // And the floor: a non-positive limit can never reach the repository, where it
         // would become a negative `LIMIT` and a database error.
         for absurd in [0, -1, i64::MIN] {
-            assert_eq!(PageRequest::from(absurd).limit(), 1);
             let query = PageQuery {
                 limit: Some(absurd),
                 ..PageQuery::default()
             };
+            assert_eq!(query.limit(), 1);
             assert_eq!(PageRequest::from(&query).limit(), 1);
         }
     }

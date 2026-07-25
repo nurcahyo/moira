@@ -5,6 +5,11 @@
 //! is the database, so that is what these tests exercise: real tables, real
 //! `expires_at` semantics, real row locks.
 //!
+//! One test, [`a_running_supervisor_dispatches_a_retention_sweep`], deliberately
+//! does *not* call `run_once`: it starts the real supervisor and watches a row
+//! disappear. Without it the whole dispatch path is untested and the sweep could
+//! be correct but never invoked.
+//!
 //! **Shared-database discipline.** These tests run against the same database as
 //! every other suite, and the sweep is global by construction — it deletes every
 //! expired row it can claim, not only this test's. So each test seeds rows carrying
@@ -15,17 +20,27 @@
 //! no marker can stop a sibling sweep from deleting this test's rows and counting
 //! them as its own.
 
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
 use moira::{
-    config::WorkerSettings,
-    infra::{metrics::MetricsRegistry, workers::retention},
+    app::AppState,
+    config::{Settings, WorkerSettings},
+    infra::{
+        metrics::MetricsRegistry,
+        workers::{self, retention},
+    },
 };
 use sqlx::{PgPool, Postgres, Transaction, postgres::PgPoolOptions};
 use tokio::{sync::oneshot, time::timeout};
 use uuid::Uuid;
 
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long [`a_running_supervisor_dispatches_a_retention_sweep`] waits to observe
+/// a sweep before declaring the dispatch wiring dead. Generous relative to what a
+/// working supervisor needs (its first retention tick fires immediately), so the
+/// budget is only ever spent by an actual failure.
+const SUPERVISOR_OBSERVATION_BUDGET: Duration = Duration::from_secs(15);
 
 /// Advisory-lock key serialising every retention sweep in the test suite.
 const RETENTION_SWEEP_LOCK: i64 = 0x4D4F_4952_4152_4554;
@@ -153,6 +168,33 @@ async fn row_exists(pool: &PgPool, table: &str, id: Uuid) -> bool {
         .fetch_one(pool)
         .await
         .expect("existence check")
+}
+
+/// Bounded polling. Returns `true` as soon as `condition` holds, `false` once
+/// `budget` is spent.
+///
+/// Deliberately not a sleep-then-assert: the assertion downstream is gated on an
+/// *observed* state change, so a working supervisor satisfies it on the first or
+/// second iteration and the test costs milliseconds. Only a genuine failure pays
+/// the full budget. The paced tick exists solely so the loop does not spin the
+/// four-connection pool that the supervisor itself must acquire from — the first
+/// `interval` tick completes immediately, so it adds no latency to the happy path.
+async fn poll_until<F, Fut>(budget: Duration, mut condition: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let mut ticker = tokio::time::interval(Duration::from_millis(20));
+    timeout(budget, async move {
+        loop {
+            ticker.tick().await;
+            if condition().await {
+                return;
+            }
+        }
+    })
+    .await
+    .is_ok()
 }
 
 async fn surviving(pool: &PgPool, table: &str, ids: &[Uuid]) -> usize {
@@ -409,4 +451,93 @@ async fn retention_run_records_deleted_counts_for_observability() {
     assert!(rendered.contains("moira_retention_runs_total"));
     assert!(rendered.contains("table=\"idempotency_records\""));
     assert!(rendered.contains("table=\"responses\""));
+}
+
+/// The only test here that exercises the **dispatch wiring** rather than the sweep.
+///
+/// Every other test in this file calls [`retention::run_once`] directly. That
+/// covers the sweep thoroughly and covers the supervisor not at all: deleting the
+/// retention branch from `WorkerRegistry::run_supervisor`
+/// (`src/infra/workers.rs`) — e.g. by gating its tick on `if false &&
+/// retention_configured` — left the entire suite green, because nothing in
+/// `tests/` so much as named `spawn_supervisor`. The definition of done says a
+/// *running* retention worker deletes expired rows, so this test starts a real
+/// `WorkerSupervisor` over a real [`AppState`] and never calls `run_once` at all.
+/// If the supervisor stops dispatching sweeps, this is the test that notices.
+///
+/// It takes [`sweep_guard`] like its siblings, and for a stronger reason: unlike
+/// a direct `run_once` call, the supervisor keeps sweeping on a timer until it is
+/// shut down, so it would happily delete rows a sibling test seeded. It is shut
+/// down the instant the observation lands, before any assertion can panic out of
+/// the test and strand it.
+#[tokio::test]
+async fn a_running_supervisor_dispatches_a_retention_sweep() {
+    let Some(pool) = test_pool().await else {
+        return;
+    };
+    let _sweep_guard = sweep_guard(&pool).await;
+    let marker = format!("ret-{}", Uuid::now_v7());
+
+    // Seeded before the supervisor starts, so the very first tick can claim it.
+    // Backdated a century for the usual reason: `order by expires_at` reaches this
+    // row in the first batch whatever else this shared database has left expired.
+    let expired = insert_idempotency_record(&pool, &marker, 1, 3_153_600_000).await;
+    // A live row, so a passing test means "the worker ran and swept correctly",
+    // not merely "something deleted rows".
+    let live = insert_idempotency_record(&pool, &marker, 2, -3_600).await;
+
+    let mut settings = Settings::default();
+    settings.workers.enabled = true;
+    settings.workers.retention_batch_size = 500;
+    // The floor accepted by `RetentionPlan::interval_seconds`. It costs the test
+    // nothing: `tokio::time::interval` yields its first tick immediately, so this
+    // bounds a *retry*, not the first sweep.
+    settings.workers.retention_interval_seconds = 1;
+
+    let state = AppState::new(settings, Some(pool.clone())).expect("supervisor app state");
+    // Guards against the test silently arming nothing: if the retention spec ever
+    // stops being configured by default, the assertions below would pass or fail
+    // for reasons unrelated to dispatch.
+    assert!(
+        state
+            .workers
+            .is_configured(workers::RETENTION_CLEANUP_WORKER),
+        "the retention worker must be configured, or this test proves nothing"
+    );
+
+    let supervisor = state
+        .workers
+        .spawn_supervisor(state.clone())
+        .expect("workers are enabled, so a supervisor must be spawned");
+
+    let swept = poll_until(SUPERVISOR_OBSERVATION_BUDGET, || async {
+        !row_exists(&pool, "idempotency_records", expired).await
+    })
+    .await;
+
+    // Before the assertions, so a failure cannot leave a live sweeper running
+    // against the shared database while the guard unwinds.
+    supervisor.shutdown().await;
+
+    assert!(
+        swept,
+        "a running supervisor must dispatch a retention sweep and delete the expired row \
+         within {SUPERVISOR_OBSERVATION_BUDGET:?}; it did not, so the dispatch wiring is dead"
+    );
+    // `AppState::new` mints a fresh registry, so this counter observes only sweeps
+    // this supervisor dispatched — no other suite can inflate it.
+    assert!(
+        state.metrics.snapshot().retention_runs_total >= 1,
+        "the supervisor's sweep must be counted, so an operator can see the worker is alive"
+    );
+    assert!(
+        row_exists(&pool, "idempotency_records", live).await,
+        "the supervisor's sweep must spare an unexpired row"
+    );
+
+    sqlx::query("delete from idempotency_records where id = $1")
+        .bind(live)
+        .execute(&pool)
+        .await
+        .expect("cleanup");
 }

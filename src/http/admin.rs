@@ -146,7 +146,7 @@ pub async fn list_applications(
 ) -> Result<Json<ListResponse<ApplicationRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     AdminService::new(&state)?
-        .list_applications(&actor, query.limit())
+        .list_applications(&actor, &query)
         .await
         .map(Json)
 }
@@ -398,7 +398,7 @@ pub async fn list_providers(
 ) -> Result<Json<ListResponse<ProviderRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     AdminService::new(&state)?
-        .list_providers(&actor, query.limit())
+        .list_providers(&actor, &query)
         .await
         .map(Json)
 }
@@ -597,7 +597,7 @@ pub async fn list_provider_models(
 ) -> Result<Json<ListResponse<ProviderModelRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     AdminService::new(&state)?
-        .list_provider_models(&actor, provider_id, query.limit())
+        .list_provider_models(&actor, provider_id, &query)
         .await
         .map(Json)
 }
@@ -796,7 +796,7 @@ pub async fn list_credentials(
 ) -> Result<Json<ListResponse<CredentialRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     AdminService::new(&state)?
-        .list_credentials(&actor, query.limit())
+        .list_credentials(&actor, &query)
         .await
         .map(Json)
 }
@@ -1027,7 +1027,7 @@ pub async fn list_user_credentials(
 ) -> Result<Json<ListResponse<CredentialRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     AdminService::new(&state)?
-        .list_user_credentials(&actor, &external_user_id, query.limit())
+        .list_user_credentials(&actor, &external_user_id, &query)
         .await
         .map(Json)
 }
@@ -1106,7 +1106,7 @@ pub async fn list_system_keys(
 ) -> Result<Json<ListResponse<ApiKeyRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     AdminService::new(&state)?
-        .list_system_keys(&actor, query.limit())
+        .list_system_keys(&actor, &query)
         .await
         .map(Json)
 }
@@ -1255,7 +1255,7 @@ pub async fn list_consumer_keys(
 ) -> Result<Json<ListResponse<ApiKeyRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     AdminService::new(&state)?
-        .list_consumer_keys(&actor, query.limit())
+        .list_consumer_keys(&actor, &query)
         .await
         .map(Json)
 }
@@ -1408,7 +1408,7 @@ pub async fn list_trusted_jwt_issuers(
 ) -> Result<Json<ListResponse<TrustedJwtIssuerRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     AdminService::new(&state)?
-        .list_trusted_jwt_issuers(&actor, query.limit())
+        .list_trusted_jwt_issuers(&actor, &query)
         .await
         .map(Json)
 }
@@ -1599,7 +1599,7 @@ pub async fn list_audit_events(
 ) -> Result<Json<ListResponse<AuditLogRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     AdminService::new(&state)?
-        .list_audit_logs(&actor, query.limit())
+        .list_audit_logs(&actor, &query)
         .await
         .map(Json)
 }

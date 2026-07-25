@@ -851,21 +851,16 @@ impl PublicExecutionService {
             .authz
             .require(actor, "moira:execution-policies:write")?;
         validate_policy_request(&request)?;
-        if let Some(expected) = expected_version {
-            let current = self
-                .public_repo
-                .get_or_create_application_execution_policy(application_id)
-                .await?;
-            if current.version != expected {
-                return Err(AppError::conflict(
-                    "resource_version_conflict",
-                    "resource version does not match If-Match",
-                ));
-            }
-        }
+        // The `If-Match` comparison is deliberately *not* done here. Reading the current
+        // version on one pooled connection and writing on another is check-then-act: two
+        // writers holding the same currently-valid version both passed and both wrote, losing
+        // one update with no conflict reported to either caller. The repository now performs
+        // the comparison and the write in one transaction, under a row lock, with the version
+        // predicate in the `update` itself, and raises the same
+        // `409 resource_version_conflict` this function used to raise.
         let record = self
             .public_repo
-            .put_application_execution_policy(application_id, &request)
+            .put_application_execution_policy(application_id, expected_version, &request)
             .await?;
         self.state.runtime_cache.invalidate_all().await;
         self.audit(

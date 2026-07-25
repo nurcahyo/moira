@@ -28,12 +28,39 @@
 //!
 //! ## Consequence of keying conversations and memories on `updated_at`
 //!
-//! Those two lists sort by a **mutable** column. A row updated part-way through a pagination
-//! sweep moves to the front of the ordering, so it can be returned twice (if it had already
-//! been passed) or missed entirely (if it had not been reached yet and moves behind the
-//! cursor). That is standard keyset behaviour for a mutable sort key and is accepted
-//! deliberately — the alternative is changing the sort key, which rule 1 forbids. Callers
-//! that need an exactly-once sweep must reconcile by `id`, not assume the pages are disjoint.
+//! Those two lists sort by a **mutable** column, so a row updated part-way through a
+//! pagination sweep changes position mid-sweep. The direction of that failure is not
+//! symmetric, and getting it backwards sends a caller's reconciliation logic the wrong way:
+//!
+//! `updated_at` is set by the `moira_bump_resource_version` trigger
+//! (`migrations/0004_admin_api_contract.sql`) to `now()` on every update, so it only ever
+//! moves **forward**. Under `order by updated_at desc, id desc` with the keyset predicate
+//! `(updated_at, id) < cursor`, "forward in time" means "further above the cursor":
+//!
+//! * A row that has **already been returned** sits above the cursor. Bumping it pushes it
+//!   further above, where the predicate still excludes it. It cannot come back.
+//!   **Duplicates do not happen.**
+//! * A row that has **not been reached yet** sits below the cursor. Bumping it lifts it
+//!   above, where the predicate now excludes it. The sweep never sees it.
+//!   **Rows are silently skipped.**
+//!
+//! Measured on Postgres with four rows and `limit 2`: after bumping an unreached row, page 2
+//! returned one row instead of two and the whole sweep saw three of the four; after bumping
+//! an already-returned row, page 2 was byte-identical and contained no duplicate.
+//!
+//! So the pages of a sweep **are disjoint**, and de-duplicating by `id` protects against
+//! nothing. What a caller who needs an exactly-once sweep actually needs is a
+//! **completeness** check — a total count, a follow-up pass, or a sweep keyed on an
+//! immutable column — because the rows it is missing are the ones that were busiest.
+//!
+//! The one way a row can move *backwards* is a transaction that started before the previous
+//! page was served and commits after it: `now()` is transaction-start time, so its
+//! `updated_at` can land below the cursor and the row can be returned a second time. That
+//! window is bounded by the length of the overlapping write transaction, not by the length
+//! of the sweep, and it is the only source of duplicates here.
+//!
+//! All of this is standard keyset behaviour for a mutable sort key and is accepted
+//! deliberately — the alternative is changing the sort key, which rule 1 forbids.
 
 use chrono::{Duration, Utc};
 use serde_json::Value;
@@ -675,8 +702,9 @@ impl PgConversationRepository {
     /// Lists conversations newest-updated-first, resuming after `cursor` when supplied.
     ///
     /// See the module docs for the keyset contract. The sort key here is
-    /// `(updated_at, id)` — a **mutable** timestamp, with the re-seen/skipped-row
-    /// consequence documented there.
+    /// `(updated_at, id)` — a **mutable** timestamp that the version trigger only ever moves
+    /// forward, so a conversation updated mid-sweep is **skipped**, not duplicated. The full
+    /// argument, and what callers must check instead of de-duplicating, is in the module docs.
     pub async fn list_conversations_authorized(
         &self,
         access: &ConversationAccess,
@@ -954,8 +982,8 @@ impl PgConversationRepository {
     /// Lists memories newest-updated-first, resuming after `cursor` when supplied.
     ///
     /// Same `(updated_at, id)` mutable sort key as
-    /// [`Self::list_conversations_authorized`], with the same re-seen/skipped-row
-    /// consequence documented in the module docs.
+    /// [`Self::list_conversations_authorized`], so a memory updated mid-sweep is **skipped**
+    /// rather than re-seen, for the reason set out in the module docs.
     pub async fn list_memories_authorized(
         &self,
         access: &ConversationAccess,

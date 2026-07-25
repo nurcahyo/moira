@@ -32,7 +32,32 @@
 //!    timestamp and the walk stops as soon as all of them have been seen; foreign rows are
 //!    ignored for ordering but still counted for duplicate detection.
 //!
-//! Seeded rows are deleted at the end of each test rather than left to accumulate.
+//! ## What gets deleted, stated exactly
+//!
+//! Every test ends in [`PaginationFixture::cleanup`], which deletes **by id**: the rows the
+//! test seeded, and the `LifecycleFixture` application and route the fixture itself created.
+//! Deleting the application cascades to the conversations, messages, consumer key and policy
+//! rows underneath it, and the audit rows are removed first because their `application_id` FK
+//! is `on delete set null` and would otherwise survive detached.
+//!
+//! This file previously claimed seeded rows were "deleted at the end of each test", and the
+//! claim was false. Measured across one green run against the shared test database, the tables
+//! moved by `applications +20, route_definitions +20, conversations +22, conversation_messages
+//! +7, audit_logs +187` — every run, forever; the database had reached ~51 000 audit rows.
+//! Only the *admin-list* rows were ever deleted; the fixture's own application, its consumer
+//! keys, every conversation and message written through the public API, and the entire audit
+//! trail of all of it were not.
+//!
+//! The same measurement after this change is `+0` on all five tables. Re-run it whenever this
+//! file grows a new seeder — the counts are the only thing that can tell you the sentence
+//! above is still true.
+//!
+//! A test that **panics** still skips its own cleanup, so [`PaginationFixture::purge_stale_runs`]
+//! runs at fixture setup as the backstop. Every predicate there is bounded to rows untouched
+//! for ten minutes, so it can only ever reclaim a *previous* run's wreckage — a second copy of
+//! this binary running concurrently against the same database has rows seconds old and is
+//! never touched. An unbounded purge would make two concurrent copies delete each other's
+//! fixtures, which is a self-inflicted flake rather than a bug worth finding.
 //!
 //! # No `sleep()`
 //!
@@ -46,6 +71,7 @@
 mod support;
 
 use std::collections::{BTreeSet, HashSet};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use axum::{
@@ -328,6 +354,18 @@ fn assert_seeded_order(walk: &Walk, expected: &[String], what: &str) {
 // Fixture
 // ---------------------------------------------------------------------------
 
+/// Every row this fixture wrote, by primary key.
+///
+/// Tracked as ids rather than re-derived from a `like` pattern at teardown so that cleanup is
+/// exact: it cannot match a row belonging to another run, and it cannot miss one whose slug
+/// convention later changes.
+#[derive(Default)]
+struct Seeded {
+    applications: Vec<Uuid>,
+    route_definitions: Vec<Uuid>,
+    audit_events: Vec<Uuid>,
+}
+
 struct PaginationFixture {
     inner: LifecycleFixture,
     router: Router,
@@ -335,6 +373,7 @@ struct PaginationFixture {
     /// assertion can be satisfied by a row an earlier run left behind.
     suffix: String,
     consumer_key: String,
+    seeded: Mutex<Seeded>,
 }
 
 impl PaginationFixture {
@@ -389,33 +428,139 @@ impl PaginationFixture {
             router,
             suffix,
             consumer_key,
+            seeded: Mutex::new(Seeded::default()),
         };
-        fixture.purge_previous_runs().await;
+        fixture.purge_stale_runs().await;
         Some(fixture)
     }
 
-    /// Deletes anything this file seeded on a previous run.
+    /// Deletes what a *previous*, panicking run of this file left behind.
     ///
-    /// The admin lists are global and this file deliberately dates its rows into the future
-    /// so they sort first — which means a test that panics before its own cleanup would park
-    /// permanent junk at the head of `/api/v1/admin/applications` for every later suite, and
-    /// would eventually let a walk assertion be satisfied by leftovers instead of by the rows
-    /// the test just wrote. Purging on setup makes that self-healing.
+    /// The admin lists are global and this file deliberately dates its rows into the future so
+    /// they sort first — which means a test that panics before [`Self::cleanup`] parks junk at
+    /// the head of `/api/v1/admin/applications` for every later suite, and would eventually let
+    /// a walk assertion be satisfied by leftovers instead of by the rows the test just wrote.
     ///
-    /// Safe to run unconditionally: every predicate below is this file's own prefix, and the
-    /// `LifecycleFixture` mutex means no other test in this binary is mid-flight. It installs
-    /// no schema and no triggers — it is three ordinary `delete` statements.
-    async fn purge_previous_runs(&self) {
+    /// # Why every predicate carries a ten-minute floor
+    ///
+    /// The obvious version of this purge — "delete everything matching this file's prefix" —
+    /// is unsafe the moment two copies of this binary run against one database, because each
+    /// would delete the other's live fixtures at setup and both would fail on rows that
+    /// vanished mid-test. `cargo test` never launches the same binary twice, but running it
+    /// twice by hand is exactly what one does to hunt a flake, and a suite that breaks under
+    /// that is a suite whose flakes cannot be investigated.
+    ///
+    /// So each predicate is bounded to rows nothing has touched for ten minutes. A concurrent
+    /// run's rows are seconds old and are never matched; a crashed run's are reclaimed on the
+    /// next invocation. `updated_at` is the right column for the bound because the version
+    /// trigger stamps it with `now()` on the seed-time `update`, whereas `created_at` is
+    /// deliberately dated 3 650 days into the future by the seeders and says nothing about age.
+    /// Audit probes have no `updated_at`, so [`Self::seed_audit_events`] records the real wall
+    /// clock in `metadata.seeded_at` for this predicate to read.
+    ///
+    /// It installs no schema and no triggers — these are four ordinary `delete` statements.
+    async fn purge_stale_runs(&self) {
         for statement in [
-            "delete from audit_logs where resource_type = 'pagination_probe'",
-            "delete from route_definitions where route_key like 'pag\\_%'",
-            "delete from applications where application_slug like 'pag-%'",
+            "delete from audit_logs where resource_type = 'pagination_probe' \
+             and (metadata->>'seeded_at')::timestamptz < now() - interval '10 minutes'",
+            "delete from conversations where metadata->>'suite' = 'list_pagination' \
+             and updated_at < now() - interval '10 minutes'",
+            "delete from route_definitions where route_key like 'pag\\_%' \
+             and updated_at < now() - interval '10 minutes'",
+            "delete from applications where application_slug like 'pag-%' \
+             and updated_at < now() - interval '10 minutes'",
         ] {
             sqlx::query(statement)
                 .execute(self.pool())
                 .await
                 .unwrap_or_else(|error| panic!("purge `{statement}` failed: {error}"));
         }
+    }
+
+    /// Deletes every row this fixture caused to exist, by id.
+    ///
+    /// Consumes the fixture so the `LifecycleFixture` serialisation guard is released only
+    /// after the database is clean, and so a test cannot keep using a fixture whose rows are
+    /// gone.
+    ///
+    /// Order is load-bearing. `audit_logs.application_id` is `on delete set null`, so audit
+    /// rows have to go **before** the application they belong to or they survive as orphans
+    /// with a null owner and nothing left to identify them by. The application goes last
+    /// because deleting it cascades to the conversations, messages, consumer keys and policy
+    /// rows this file created underneath it — which is why there is no separate statement for
+    /// any of those.
+    async fn cleanup(self) {
+        let seeded = self
+            .seeded
+            .into_inner()
+            .expect("no test holds the seeded lock across an await");
+
+        let application_ids: Vec<Uuid> = seeded
+            .applications
+            .iter()
+            .copied()
+            .chain(std::iter::once(self.inner.application_id))
+            .collect();
+        let route_ids: Vec<Uuid> = seeded
+            .route_definitions
+            .iter()
+            .copied()
+            .chain(std::iter::once(self.inner.route_id))
+            .collect();
+        // `resource_id` is text and holds the uuid of whatever the audited action touched.
+        let audited_resources: Vec<String> = application_ids
+            .iter()
+            .chain(route_ids.iter())
+            .map(Uuid::to_string)
+            .collect();
+
+        let pool = self.inner.pool.clone();
+
+        sqlx::query("delete from audit_logs where id = any($1)")
+            .bind(&seeded.audit_events)
+            .execute(&pool)
+            .await
+            .expect("clean up seeded audit events");
+        // Everything this file wrote over HTTP: `get`/`post` stamp `x-request-id` with this
+        // prefix, and no other suite uses it.
+        sqlx::query("delete from audit_logs where request_id like 'pagination-%'")
+            .execute(&pool)
+            .await
+            .expect("clean up audit rows from this file's HTTP requests");
+        sqlx::query("delete from audit_logs where application_id = any($1)")
+            .bind(&application_ids)
+            .execute(&pool)
+            .await
+            .expect("clean up audit rows owned by this fixture's applications");
+        sqlx::query("delete from audit_logs where resource_id = any($1)")
+            .bind(&audited_resources)
+            .execute(&pool)
+            .await
+            .expect("clean up audit rows naming this fixture's rows");
+        // `consumer_key.create` audits name the key, not the application, and the keys
+        // themselves are about to disappear with the application below — so they are resolved
+        // here, while the join still exists. Two per test (the fixture mints one, and
+        // `enable_public_streaming` mints another); without this they were the entire residue.
+        sqlx::query(
+            "delete from audit_logs where resource_type = 'consumer_api_key' \
+             and resource_id in (select id::text from consumer_api_keys \
+             where application_id = any($1))",
+        )
+        .bind(&application_ids)
+        .execute(&pool)
+        .await
+        .expect("clean up audit rows for this fixture's consumer keys");
+
+        sqlx::query("delete from route_definitions where id = any($1)")
+            .bind(&route_ids)
+            .execute(&pool)
+            .await
+            .expect("clean up seeded route definitions");
+        sqlx::query("delete from applications where id = any($1)")
+            .bind(&application_ids)
+            .execute(&pool)
+            .await
+            .expect("clean up seeded applications");
     }
 
     fn pool(&self) -> &PgPool {
@@ -469,6 +614,11 @@ impl PaginationFixture {
                 .await
                 .expect("pin application created_at");
         }
+        self.seeded
+            .lock()
+            .expect("seeded lock")
+            .applications
+            .extend(ids.iter().copied());
         ids
     }
 
@@ -484,14 +634,6 @@ impl PaginationFixture {
         .into_iter()
         .map(|id| id.to_string())
         .collect()
-    }
-
-    async fn delete_applications(&self, ids: &[Uuid]) {
-        sqlx::query("delete from applications where id = any($1)")
-            .bind(ids)
-            .execute(self.pool())
-            .await
-            .expect("clean up seeded applications");
     }
 
     // -- route definitions --------------------------------------------------
@@ -532,6 +674,11 @@ impl PaginationFixture {
                 .await
                 .expect("pin route definition created_at");
         }
+        self.seeded
+            .lock()
+            .expect("seeded lock")
+            .route_definitions
+            .extend(ids.iter().copied());
         ids
     }
 
@@ -549,19 +696,16 @@ impl PaginationFixture {
         .collect()
     }
 
-    async fn delete_route_definitions(&self, ids: &[Uuid]) {
-        sqlx::query("delete from route_definitions where id = any($1)")
-            .bind(ids)
-            .execute(self.pool())
-            .await
-            .expect("clean up seeded route definitions");
-    }
-
     // -- audit events -------------------------------------------------------
 
     /// Audit rows are inserted directly: they are append-only by design and there is no write
     /// API for them. The read path — which is what pagination is about — is still driven over
     /// real HTTP.
+    ///
+    /// `metadata.seeded_at` carries the real wall clock. `occurred_at` is dated 3 650 days
+    /// forward so these rows lead the global `occurred_at desc` ordering, which leaves the row
+    /// with no column that says how old it actually is — and [`Self::purge_stale_runs`] needs
+    /// one to tell a previous run's leftovers from a concurrent run's live data.
     async fn seed_audit_events(&self, count: usize) -> Vec<Uuid> {
         let base = Utc::now() + ChronoDuration::days(3_650);
         let mut ids = Vec::with_capacity(count);
@@ -572,7 +716,8 @@ impl PaginationFixture {
                     (occurred_at, request_id, actor_type, resource_type, resource_id, action,
                      result, metadata)
                 values ($1, $2, 'dev_admin', 'pagination_probe', $3, 'pagination.probe',
-                        'success', '{"suite":"list_pagination"}'::jsonb)
+                        'success',
+                        jsonb_build_object('suite', 'list_pagination', 'seeded_at', now()))
                 returning id
                 "#,
             )
@@ -584,6 +729,11 @@ impl PaginationFixture {
             .expect("insert pagination audit event");
             ids.push(id);
         }
+        self.seeded
+            .lock()
+            .expect("seeded lock")
+            .audit_events
+            .extend(ids.iter().copied());
         ids
     }
 
@@ -598,14 +748,6 @@ impl PaginationFixture {
         .into_iter()
         .map(|id| id.to_string())
         .collect()
-    }
-
-    async fn delete_audit_events(&self, ids: &[Uuid]) {
-        sqlx::query("delete from audit_logs where id = any($1)")
-            .bind(ids)
-            .execute(self.pool())
-            .await
-            .expect("clean up seeded audit events");
     }
 
     // -- conversations ------------------------------------------------------
@@ -711,6 +853,81 @@ impl PaginationFixture {
         }
         ids
     }
+
+    // -- RAG documents ------------------------------------------------------
+
+    /// Creates a collection and `count` documents in it, all over the admin HTTP surface.
+    ///
+    /// Both live under this fixture's application, so [`Self::cleanup`] reclaims them by
+    /// cascade with no statement of their own.
+    async fn seed_rag_documents(&self, count: usize) -> (String, Vec<String>) {
+        let collection = post(
+            &self.router,
+            "/api/v1/admin/rag-collections",
+            None,
+            json!({
+                "application_id": self.inner.application_id,
+                "collection_key": format!("pag-rag-{}", self.suffix),
+                "display_name": format!("Pagination RAG {}", self.suffix),
+                "visibility": "application",
+                "metadata": {"suite": "list_pagination"}
+            }),
+        )
+        .await;
+        assert_eq!(
+            collection.status,
+            StatusCode::CREATED,
+            "create RAG collection failed: {}",
+            collection.body
+        );
+        let collection_id = collection.body["id"]
+            .as_str()
+            .expect("collection id")
+            .to_string();
+
+        let mut ids = Vec::with_capacity(count);
+        for nth in 0..count {
+            let created = post(
+                &self.router,
+                &format!("/api/v1/admin/rag-collections/{collection_id}/documents"),
+                None,
+                json!({
+                    "title": format!("Pagination document {} #{nth}", self.suffix),
+                    "source_type": "direct_text",
+                    "mime_type": "text/plain",
+                    "content": format!("pagination rag body {nth}"),
+                    "metadata": {"suite": "list_pagination"}
+                }),
+            )
+            .await;
+            assert_eq!(
+                created.status,
+                StatusCode::CREATED,
+                "create RAG document failed: {}",
+                created.body
+            );
+            ids.push(
+                created.body["id"]
+                    .as_str()
+                    .expect("document id")
+                    .to_string(),
+            );
+        }
+        (collection_id, ids)
+    }
+
+    async fn expected_rag_document_order(&self, collection_id: &str) -> Vec<String> {
+        sqlx::query_scalar::<_, String>(
+            "select d.public_id from rag_documents d \
+             join rag_collections c on c.id = d.collection_id \
+             where c.public_id = $1 and d.deleted_at is null \
+             order by d.created_at desc, d.id desc",
+        )
+        .bind(collection_id)
+        .fetch_all(self.pool())
+        .await
+        .expect("read documented RAG document order")
+    }
 }
 
 /// Flips one character of a cursor to a different character from the same base64url
@@ -791,7 +1008,7 @@ async fn admin_application_list_pages_through_without_duplicates_or_gaps() {
     );
     assert_seeded_order(&walk, &expected, "admin applications");
 
-    fixture.delete_applications(&ids).await;
+    fixture.cleanup().await;
 }
 
 #[tokio::test]
@@ -843,7 +1060,7 @@ async fn rows_tied_on_the_sort_timestamp_are_ordered_deterministically_by_id() {
     .await;
     assert_seeded_order(&second, &expected, "tied admin applications, second walk");
 
-    fixture.delete_applications(&ids).await;
+    fixture.cleanup().await;
 }
 
 /// Localises the two failing HTTP admin walks above — it is a diagnostic, not a substitute.
@@ -919,7 +1136,7 @@ async fn admin_application_pagination_is_correct_below_the_http_handler() {
         "the service layer paged the tied rows in the wrong order or skipped some"
     );
 
-    fixture.delete_applications(&ids).await;
+    fixture.cleanup().await;
 }
 
 #[tokio::test]
@@ -947,7 +1164,7 @@ async fn admin_audit_event_list_pages_through_by_occurred_at() {
     assert!(walk.pages > 1, "7 rows at limit=2 must span pages");
     assert_seeded_order(&walk, &expected, "admin audit events");
 
-    fixture.delete_audit_events(&ids).await;
+    fixture.cleanup().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -970,7 +1187,7 @@ async fn route_definition_list_pages_through_without_duplicates_or_gaps() {
     assert!(walk.pages > 1, "7 rows at limit=2 must span pages");
     assert_seeded_order(&walk, &expected, "route definitions");
 
-    fixture.delete_route_definitions(&ids).await;
+    fixture.cleanup().await;
 }
 
 #[tokio::test]
@@ -1000,7 +1217,7 @@ async fn route_definitions_tied_on_created_at_are_ordered_deterministically_by_i
     assert!(walk.pages > 1, "6 tied rows at limit=2 must span pages");
     assert_seeded_order(&walk, &expected, "tied route definitions");
 
-    fixture.delete_route_definitions(&ids).await;
+    fixture.cleanup().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1054,6 +1271,85 @@ async fn conversation_list_pages_through_by_updated_at_with_id_tiebreaker() {
         6,
         "the scoped walk must return exactly the seeded rows and nothing else"
     );
+
+    fixture.cleanup().await;
+}
+
+/// The tenth list endpoint: `GET /admin/rag-collections/{id}/documents`.
+///
+/// This route used to take **no query parameters at all**. Its handler passed a hard-coded
+/// `limit = 50` and its `params(..)` declared only `collection_id` — yet the response ran the
+/// same `paginate` as every other list, so a collection with more than fifty documents came
+/// back with `has_more: true` and a real `next_cursor` that the route had no parameter to
+/// accept. Document fifty-one was unreachable over HTTP, and the response said otherwise.
+///
+/// The walk below is the assertion that closes it: `limit=2` forces several page boundaries,
+/// and reaching the end proves the `cursor` the response advertises is one the route will
+/// actually take back. Before the fix this test cannot pass — page two is page one again, and
+/// `walk_all` fails on the first repeated id.
+#[tokio::test]
+async fn rag_document_list_pages_through_the_cursor_it_advertises() {
+    let Some(fixture) = PaginationFixture::new().await else {
+        return;
+    };
+
+    let (collection_id, ids) = fixture.seed_rag_documents(7).await;
+    let expected = fixture.expected_rag_document_order(&collection_id).await;
+    assert_eq!(
+        expected.len(),
+        7,
+        "all seeded documents must be listable, got {expected:?}"
+    );
+    assert_eq!(
+        expected.iter().collect::<HashSet<_>>(),
+        ids.iter().collect::<HashSet<_>>(),
+        "the database order must contain exactly the seeded documents"
+    );
+
+    let stop: BTreeSet<String> = expected.iter().cloned().collect();
+    let walk = walk_all(
+        &fixture.router,
+        &format!("/api/v1/admin/rag-collections/{collection_id}/documents"),
+        None,
+        2,
+        &stop,
+    )
+    .await;
+
+    assert!(walk.pages > 1, "7 documents at limit=2 must span pages");
+    assert!(
+        walk.exhausted,
+        "the list is scoped to one collection and must run out of rows rather than page forever"
+    );
+    assert_seeded_order(&walk, &expected, "RAG documents");
+
+    // The `limit` parameter has to be honoured too: the old handler ignored whatever the
+    // caller asked for and always used 50, which a walk alone would not notice.
+    let single = get(
+        &fixture.router,
+        &format!("/api/v1/admin/rag-collections/{collection_id}/documents?limit=3"),
+        None,
+    )
+    .await;
+    assert_eq!(single.status, StatusCode::OK, "{}", single.body);
+    assert_eq!(
+        single.rows().len(),
+        3,
+        "the route must honour `limit`, not its old hard-coded 50: {}",
+        single.body
+    );
+    assert!(single.has_more());
+
+    // And a bad cursor on this route must fail closed like every other list.
+    let rejected = get(
+        &fixture.router,
+        &format!("/api/v1/admin/rag-collections/{collection_id}/documents?cursor=not-a-cursor"),
+        None,
+    )
+    .await;
+    assert_invalid_cursor(&rejected);
+
+    fixture.cleanup().await;
 }
 
 #[tokio::test]
@@ -1098,6 +1394,8 @@ async fn conversation_message_list_pages_through_by_ascending_sequence_number() 
         sequences.iter().collect::<HashSet<_>>().len(),
         "sequence numbers must be unique within a conversation"
     );
+
+    fixture.cleanup().await;
 }
 
 #[tokio::test]
@@ -1136,6 +1434,8 @@ async fn last_page_reports_has_more_false_and_null_next_cursor() {
     assert_eq!(single.rows().len(), 5);
     assert!(!single.has_more());
     assert_eq!(single.next_cursor(), None);
+
+    fixture.cleanup().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1193,6 +1493,8 @@ async fn tampered_cursor_returns_400_invalid_cursor_with_i18n_keys() {
     )
     .await;
     assert_invalid_cursor(&garbage);
+
+    fixture.cleanup().await;
 }
 
 #[tokio::test]
@@ -1225,7 +1527,7 @@ async fn cursor_from_a_different_list_endpoint_is_rejected_with_400_invalid_curs
 
     // The same property on the admin surface, where two lists share both the key shape and
     // the record type's `id` column.
-    let route_ids = fixture.seed_route_definitions(2, false).await;
+    fixture.seed_route_definitions(2, false).await;
     let routes = get(&fixture.router, "/api/v1/admin/routes?limit=1", None).await;
     assert_eq!(routes.status, StatusCode::OK, "{}", routes.body);
     let route_cursor = routes.next_cursor().expect("route cursor");
@@ -1238,7 +1540,7 @@ async fn cursor_from_a_different_list_endpoint_is_rejected_with_400_invalid_curs
     .await;
     assert_invalid_cursor(&crossed_admin);
 
-    fixture.delete_route_definitions(&route_ids).await;
+    fixture.cleanup().await;
 }
 
 #[tokio::test]
@@ -1294,4 +1596,6 @@ async fn cursor_pointing_past_deleted_rows_returns_an_empty_final_page() {
     );
     assert!(!second.has_more());
     assert_eq!(second.next_cursor(), None);
+
+    fixture.cleanup().await;
 }

@@ -215,9 +215,12 @@ impl ConversationService {
     /// The cursor is decoded **before** the query runs, so a tampered or foreign cursor costs
     /// a `400 invalid_cursor` and no database round trip.
     ///
-    /// Because the sort key is the mutable `updated_at`, a conversation touched mid-sweep can
-    /// be re-seen on a later page or missed entirely — accepted keyset semantics, documented
-    /// in full on `crate::infra::repositories::conversation`.
+    /// Because the sort key is the mutable `updated_at`, and the version trigger only ever
+    /// moves it forward, a conversation touched mid-sweep is lifted **above** the cursor: an
+    /// unreached row is silently skipped, and an already-returned row cannot come back. Pages
+    /// are disjoint; callers needing an exactly-once sweep need a completeness check, not a
+    /// de-duplication pass. Documented in full on
+    /// `crate::infra::repositories::conversation`.
     pub async fn list_conversations(
         &self,
         actor: &Actor,
@@ -604,7 +607,8 @@ impl ConversationService {
     /// Lists memories, paging by `(updated_at, id)`.
     ///
     /// Same mutable-sort-key caveat as [`Self::list_conversations`]: a memory whose
-    /// `updated_at` moves during a sweep can be re-seen or missed.
+    /// `updated_at` moves during a sweep is lifted above the cursor, so it is **missed**, not
+    /// re-seen.
     pub async fn list_memories(
         &self,
         actor: &Actor,
@@ -1089,30 +1093,13 @@ impl ConversationService {
 
     /// Lists a collection's documents, paging by `(created_at, id)`.
     ///
-    /// # Why this one has no `cursor` argument
-    ///
-    /// `GET /api/v1/admin/rag-collections/{collection_id}/documents`
-    /// (`src/http/conversation.rs`) is the only list route on this surface that declares
-    /// **no query parameters at all** — not `cursor`, not even `limit`; its handler passes a
-    /// hard-coded `50`. There is consequently no cursor for this signature to accept yet.
-    ///
-    /// What this method does still deliver is a correct `has_more`/`next_cursor` on the first
-    /// page, so a caller can already tell that a collection has more than `limit` documents.
-    /// Consuming that cursor requires adding a query extractor and an OpenAPI `params(..)`
-    /// entry to the handler; until then use [`Self::list_rag_documents_page`], which is the
-    /// real implementation and is fully wired.
-    pub async fn list_rag_documents(
-        &self,
-        actor: &Actor,
-        collection_id: &str,
-        limit: i64,
-    ) -> Result<ListResponse<RagDocumentRecord>, AppError> {
-        self.list_rag_documents_page(actor, collection_id, None, limit)
-            .await
-    }
-
-    /// Cursor-aware RAG document listing — see [`Self::list_rag_documents`] for why the two
-    /// exist.
+    /// This is the **only** entry point, deliberately. It used to have a `list_rag_documents`
+    /// sibling that took a bare `limit` and passed `None` for the cursor, and the handler
+    /// called that one: the route advertised no `cursor` parameter, hard-coded `limit = 50`,
+    /// and still returned a genuine `next_cursor` with `has_more: true` that had nowhere to go.
+    /// Every document past the fiftieth was unreachable over HTTP. Deleting the convenience
+    /// overload is what stops that from being re-introduced — a caller must now decide what to
+    /// do about the cursor in order to compile.
     ///
     /// `limit` is clamped here rather than in the repository, so the over-fetch row cannot be
     /// eaten by a repository-side ceiling at `limit == 200`. The bounds match every other

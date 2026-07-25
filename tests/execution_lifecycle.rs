@@ -1,12 +1,17 @@
 mod support;
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::http::StatusCode;
 use futures_util::StreamExt;
 use moira::{
     application::{AdminService, ExecutionService},
-    domain::{ExecutionFailureClass, ExecutionStatus, RuntimeEventType},
+    domain::{AttemptStatus, ExecutionFailureClass, ExecutionStatus, RuntimeEventType},
+    error::AppError,
+    orchestration::{RuntimeCacheKey, RuntimeModelHandle},
 };
 use serde_json::Value;
 use sqlx::Row;
@@ -14,8 +19,31 @@ use support::mock_openai::{MockOpenAiServer, ProviderScript, ScriptGate};
 use support::{
     LifecycleFixture, MoiraHttpServer, RuntimePolicy, public_response_request, request_context,
 };
-use tokio::time::{sleep, timeout};
+use tokio::{
+    sync::oneshot,
+    time::{sleep, timeout},
+};
 use uuid::Uuid;
+
+/// Total execution budget the three deadline-enforcement tests give an execution.
+///
+/// Large enough that fixture setup (a handful of local round-trips) cannot plausibly
+/// consume it — which would make the phase fail *before* entering the wrapped call site
+/// and turn the test into a false pass — and small enough to keep each test around two
+/// seconds.
+const DEADLINE_TEST_BUDGET: Duration = Duration::from_millis(2_000);
+
+/// Lower bound on the observed wall clock of a bounded-phase breach.
+///
+/// A phase that is genuinely blocked burns the whole budget. Anything materially faster
+/// means the execution failed for some *other* reason and the test is not measuring the
+/// deadline at all.
+const DEADLINE_TEST_MINIMUM_ELAPSED: Duration = Duration::from_millis(1_200);
+
+/// Outer guard so a regression that removes the bound fails the test instead of hanging
+/// the CI job. Every gate this file installs is released before the guard's result is
+/// unwrapped, so a breach of the guard cannot wedge the shared test database either.
+const DEADLINE_TEST_GUARD: Duration = Duration::from_secs(20);
 
 #[tokio::test]
 async fn completion_uses_real_rig_protocol_and_encrypted_credential() {
@@ -1123,6 +1151,393 @@ async fn public_provider_failure_retains_keyed_i18n_error_contract() {
     assert_eq!(error["request_id"], request_id);
     assert!(error["details"].is_null());
     moira.shutdown().await;
+    provider.shutdown().await;
+}
+
+/// P1-6 enforcement point 1: `bounded_phase(execution_deadline, self.resolve_credential(..))`.
+///
+/// The gate is a Postgres `ACCESS EXCLUSIVE` lock on `provider_credentials`. Credential
+/// resolution issues a plain `SELECT`, and `ACCESS EXCLUSIVE` is the only lock level that
+/// blocks a plain `SELECT` — a row lock would not. Acquiring the lock *is* the
+/// acknowledgement: the execution is only started once the lock statement has returned, so
+/// there is no sleep and no timing race.
+///
+/// Nothing earlier in `execute_inner` reads `provider_credentials` — command validation
+/// reads `applications`, routing reads `route_definitions`/`routing_policies`/`providers`/
+/// `provider_models`/`provider_runtime_policies`, and audit writes go to `audit_logs` — so
+/// the lock can only bite inside the wrapped phase. If the wrapper stops bounding the
+/// phase, the `SELECT` waits for the lock indefinitely and this test trips
+/// `DEADLINE_TEST_GUARD` instead of returning a failure.
+#[tokio::test]
+async fn slow_credential_resolution_is_bounded_by_the_total_execution_deadline() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let provider = MockOpenAiServer::start([ProviderScript::Completion {
+        text: "must-not-be-reached".to_string(),
+    }])
+    .await;
+    fixture
+        .add_provider(provider.base_url(), 10, RuntimePolicy::default())
+        .await;
+
+    let mut lock_tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin credential-lock transaction");
+    sqlx::query("set local lock_timeout = '5s'")
+        .execute(&mut *lock_tx)
+        .await
+        .expect("bound the credential-lock acquisition itself");
+    sqlx::query("lock table provider_credentials in access exclusive mode")
+        .execute(&mut *lock_tx)
+        .await
+        .expect("acquire the credential-lock gate");
+
+    let mut command = fixture.command(false);
+    command.options.timeout_ms = Some(DEADLINE_TEST_BUDGET.as_millis() as u64);
+    let execution_id = command.execution_id;
+    let started = Instant::now();
+    let guarded = timeout(
+        DEADLINE_TEST_GUARD,
+        fixture.execution_service().execute(command),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    lock_tx
+        .rollback()
+        .await
+        .expect("release the credential-lock gate");
+
+    let outcome = guarded
+        .expect("credential resolution was not bounded by the total execution deadline")
+        .expect("execution returned a transport error instead of a bounded failure");
+
+    assert_eq!(outcome.status, ExecutionStatus::Failed);
+    let failure = outcome
+        .failure
+        .expect("a bounded credential phase must report a failure");
+    assert_eq!(failure.class, ExecutionFailureClass::DeadlineExceeded);
+    assert!(
+        elapsed >= DEADLINE_TEST_MINIMUM_ELAPSED,
+        "the phase returned in {elapsed:?}, which is too fast to have been blocked on the credential lock"
+    );
+    assert!(
+        elapsed < DEADLINE_TEST_GUARD / 2,
+        "the phase took {elapsed:?}; the total deadline, not the guard, must be what ended it"
+    );
+    assert_eq!(
+        provider.call_count().await,
+        0,
+        "the breach happens before any provider call"
+    );
+    assert!(
+        outcome.attempts.is_empty(),
+        "the breach happens before any attempt row exists"
+    );
+    let persisted_attempts: i64 =
+        sqlx::query_scalar("select count(*) from execution_attempts where execution_id = $1")
+            .bind(execution_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("count execution attempts");
+    assert_eq!(
+        persisted_attempts, 0,
+        "a pre-attempt phase breach must leave no attempt row behind"
+    );
+    provider.shutdown().await;
+}
+
+/// P1-6 enforcement point 2: `bounded_phase(execution_deadline, self.runtime_handle(..))`.
+///
+/// The gate is the per-key build lock inside `ProviderRuntimeCache::get_or_insert_with`.
+/// A helper task claims that lock for the exact `RuntimeCacheKey` the execution will
+/// compute and parks inside the builder; the execution then blocks on `build_lock.lock()`
+/// inside the wrapped phase. The helper signalling that it entered the builder is the
+/// acknowledgement, so again no sleep is involved.
+///
+/// `provider_credentials` is *not* locked here, so phase 1 completes in a single fast
+/// round-trip; the only thing in the path that can consume the whole budget is the build
+/// lock. If the cache key were reconstructed wrongly the execution would sail past the
+/// contended entry, call the provider and succeed — the assertions below fail loudly
+/// rather than passing vacuously.
+#[tokio::test]
+async fn slow_runtime_handle_construction_is_bounded_by_the_total_execution_deadline() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let provider = MockOpenAiServer::start([ProviderScript::Completion {
+        text: "must-not-be-reached".to_string(),
+    }])
+    .await;
+    let provider_fixture = fixture
+        .add_provider(provider.base_url(), 10, RuntimePolicy::default())
+        .await;
+
+    let versions = sqlx::query(
+        r#"
+        select p.version as provider_version,
+               pm.version as model_version,
+               c.version as credential_version,
+               coalesce(prp.version, 1::bigint) as runtime_policy_version
+        from providers p
+        join provider_models pm on pm.id = $2
+        join provider_credentials c on c.id = $3
+        left join provider_runtime_policies prp on prp.provider_id = p.id
+        where p.id = $1
+        limit 1
+        "#,
+    )
+    .bind(provider_fixture.provider_id)
+    .bind(provider_fixture.model_id)
+    .bind(provider_fixture.credential_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read the runtime cache key versions");
+    let key = RuntimeCacheKey {
+        provider_id: provider_fixture.provider_id,
+        provider_version: versions
+            .try_get("provider_version")
+            .expect("provider version"),
+        model_id: provider_fixture.model_id,
+        model_version: versions.try_get("model_version").expect("model version"),
+        credential_id: provider_fixture.credential_id,
+        credential_version: versions
+            .try_get("credential_version")
+            .expect("credential version"),
+        runtime_policy_version: versions
+            .try_get("runtime_policy_version")
+            .expect("runtime policy version"),
+    };
+
+    let (entered_tx, entered_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let cache = fixture.state.runtime_handles.clone();
+    let holder = tokio::spawn(async move {
+        let _ = cache
+            .get_or_insert_with(key, || async move {
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+                Err::<RuntimeModelHandle, AppError>(AppError::Internal(
+                    "test-owned runtime build-lock holder".to_string(),
+                ))
+            })
+            .await;
+    });
+    timeout(DEADLINE_TEST_GUARD, entered_rx)
+        .await
+        .expect("the build-lock holder never entered the builder")
+        .expect("the build-lock holder was dropped before it signalled");
+
+    let mut command = fixture.command(false);
+    command.options.timeout_ms = Some(DEADLINE_TEST_BUDGET.as_millis() as u64);
+    let execution_id = command.execution_id;
+    let started = Instant::now();
+    let guarded = timeout(
+        DEADLINE_TEST_GUARD,
+        fixture.execution_service().execute(command),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    let _ = release_tx.send(());
+    holder.await.expect("build-lock holder task panicked");
+
+    let outcome = guarded
+        .expect("runtime handle construction was not bounded by the total execution deadline")
+        .expect("execution returned a transport error instead of a bounded failure");
+
+    assert_eq!(outcome.status, ExecutionStatus::Failed);
+    let failure = outcome
+        .failure
+        .expect("a bounded runtime-handle phase must report a failure");
+    assert_eq!(failure.class, ExecutionFailureClass::DeadlineExceeded);
+    assert!(
+        elapsed >= DEADLINE_TEST_MINIMUM_ELAPSED,
+        "the phase returned in {elapsed:?}, which is too fast to have been blocked on the build lock"
+    );
+    assert!(
+        elapsed < DEADLINE_TEST_GUARD / 2,
+        "the phase took {elapsed:?}; the total deadline, not the guard, must be what ended it"
+    );
+    assert_eq!(
+        provider.call_count().await,
+        0,
+        "the breach happens before any provider call"
+    );
+    assert!(
+        outcome.attempts.is_empty(),
+        "the breach happens before any attempt row exists"
+    );
+    let persisted_attempts: i64 =
+        sqlx::query_scalar("select count(*) from execution_attempts where execution_id = $1")
+            .bind(execution_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("count execution attempts");
+    assert_eq!(
+        persisted_attempts, 0,
+        "a pre-attempt phase breach must leave no attempt row behind"
+    );
+    provider.shutdown().await;
+}
+
+/// P1-6 enforcement point 3: the bound around the three terminal writes.
+///
+/// This one is not a `bounded_phase` call. By the time it fires the provider call has
+/// **already succeeded** and the output is committed, so the breach must not be flattened
+/// into a plain deadline failure — it must carry the existing
+/// `attempt_timeout_failure(bounded_by_total_deadline, output_committed)` clamp so nothing
+/// downstream retries or falls back onto a second provider and bills the caller twice.
+///
+/// The gate is a `SELECT ... FOR UPDATE` row lock on the attempt row, taken after the mock
+/// provider reports the request arrived (which is itself proof the attempt row exists,
+/// because `insert_attempt_started` runs before the provider call) and before the provider
+/// response is released. That blocks `update_attempt` — the first of the three terminal
+/// writes — and nothing else in the database.
+#[tokio::test]
+async fn terminal_persistence_timeout_is_recorded_as_output_committed_not_as_a_plain_failure() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let gate = ScriptGate::new();
+    let provider = MockOpenAiServer::start([ProviderScript::HeldCompletion {
+        text: "committed-output".to_string(),
+        gate: gate.clone(),
+    }])
+    .await;
+    fixture
+        .add_provider(provider.base_url(), 10, RuntimePolicy::default())
+        .await;
+
+    let mut command = fixture.command(false);
+    command.options.timeout_ms = Some(DEADLINE_TEST_BUDGET.as_millis() as u64);
+    let execution_id = command.execution_id;
+    let request_id = command.request_id.clone();
+    let service = fixture.execution_service();
+    let execution = tokio::spawn(async move { service.execute_with_events(command).await });
+
+    gate.wait_arrived().await;
+    let attempt_id: Uuid =
+        sqlx::query_scalar("select id from execution_attempts where execution_id = $1")
+            .bind(execution_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("the attempt row must exist before the provider call");
+
+    let mut lock_tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin terminal-persistence lock transaction");
+    sqlx::query("set local lock_timeout = '5s'")
+        .execute(&mut *lock_tx)
+        .await
+        .expect("bound the attempt-row lock acquisition itself");
+    sqlx::query("select id from execution_attempts where id = $1 for update")
+        .bind(attempt_id)
+        .fetch_one(&mut *lock_tx)
+        .await
+        .expect("acquire the attempt-row gate");
+
+    let started = Instant::now();
+    gate.release();
+    gate.wait_completed().await;
+    let guarded = timeout(DEADLINE_TEST_GUARD, execution).await;
+    let elapsed = started.elapsed();
+    lock_tx
+        .rollback()
+        .await
+        .expect("release the attempt-row gate");
+
+    let (outcome, events) = guarded
+        .expect("terminal persistence was not bounded by the total execution deadline")
+        .expect("execution task panicked")
+        .expect("execution returned a transport error instead of a bounded failure");
+
+    assert_eq!(outcome.status, ExecutionStatus::Failed);
+    let failure = outcome
+        .failure
+        .expect("a bounded terminal-persistence phase must report a failure");
+
+    // The point of the test: this is the output-committed failure class, not a plain
+    // deadline failure. Both use `DeadlineExceeded`, so the class alone proves nothing —
+    // the clamp and the distinguishing message are what matter.
+    assert_eq!(failure.class, ExecutionFailureClass::DeadlineExceeded);
+    assert!(
+        !failure.retryable,
+        "committed output must never be re-executed"
+    );
+    assert!(
+        !failure.fallback_eligible,
+        "committed output must never be sent to a fallback provider"
+    );
+    assert_eq!(
+        failure.message, "execution exceeded its total deadline while persisting terminal state",
+        "a terminal-persistence breach must stay distinguishable from a plain deadline failure"
+    );
+    assert!(
+        elapsed >= DEADLINE_TEST_MINIMUM_ELAPSED,
+        "terminal persistence returned in {elapsed:?}, too fast to have been blocked on the attempt row"
+    );
+    assert!(
+        elapsed < DEADLINE_TEST_GUARD / 2,
+        "terminal persistence took {elapsed:?}; the bound, not the guard, must be what ended it"
+    );
+
+    let attempt = outcome
+        .attempts
+        .last()
+        .expect("the successful provider attempt must still be reported");
+    assert_eq!(attempt.attempt_id, attempt_id);
+    assert_eq!(attempt.status, AttemptStatus::Failed);
+    assert_eq!(
+        attempt.failure_class,
+        Some(ExecutionFailureClass::DeadlineExceeded)
+    );
+
+    let failed_event = events
+        .iter()
+        .find(|event| event.event_type == RuntimeEventType::ExecutionFailed)
+        .expect("a terminal-persistence breach must emit ExecutionFailed");
+    assert_eq!(failed_event.payload["phase"], "terminal_persistence");
+    assert_eq!(failed_event.payload["output_committed"], true);
+
+    // The provider really did answer, and the terminal write group really was cut off.
+    //
+    // Deliberately *not* asserted: the final state of `execution_attempts.status`. Dropping
+    // the timed-out future cancels the await, but the `update attempt` statement is already
+    // in flight on the server and Postgres runs it to completion once the row lock is
+    // released. Asserting on that would be asserting sqlx's cancellation semantics rather
+    // than Moira's bound. The second write of the group is the honest evidence: it is only
+    // issued after the first one returns, so its absence proves the group was cut off.
+    assert_eq!(provider.call_count().await, 1);
+    let usage_rows: i64 =
+        sqlx::query_scalar("select count(*) from usage_records where execution_id = $1")
+            .bind(execution_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("count usage records");
+    assert_eq!(
+        usage_rows, 0,
+        "the usage write is part of the same bounded group and must not have landed"
+    );
+
+    // The condition is audited under its own action, on the bounded best-effort path.
+    let audit: Value = sqlx::query_scalar(
+        "select metadata from audit_logs
+         where resource_id = $1
+           and request_id = $2
+           and action = 'execution.terminal_persistence_deadline_exceeded'",
+    )
+    .bind(execution_id.to_string())
+    .bind(&request_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("the terminal-persistence breach must be audited under its own action");
+    assert_eq!(audit["output_committed"], true);
+    assert_eq!(audit["attempt_id"], attempt_id.to_string());
+
     provider.shutdown().await;
 }
 

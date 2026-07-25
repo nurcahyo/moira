@@ -3,14 +3,15 @@
 //!
 //! `PUT /api/v1/admin/applications/{id}/execution-policy` used to be the one versioned
 //! mutation where `If-Match` was optional, so two concurrent writers could silently clobber
-//! each other with no conflict signal. This file drives the real HTTP surface and pins the
-//! three observable outcomes:
+//! each other with no conflict signal. This file drives the real HTTP surface and pins every
+//! observable outcome:
 //!
 //! * missing header  → `400` coded `if_match_required` (a **new** code — every sibling
 //!   endpoint calling `require_if_match` now emits it too, in place of `bad_request`);
 //! * malformed header → `400` still coded `bad_request`, deliberately unchanged;
 //! * stale version   → the pre-existing `409 resource_version_conflict` envelope;
-//! * current version → `200` with the version bumped and a matching `ETag`.
+//! * current version → `200` with the version bumped and a matching `ETag`;
+//! * two writers racing on the *same* current version → exactly one `200` and one `409`.
 //!
 //! Both message keys are checked against the response catalog itself
 //! (`moira::i18n::is_known_key`) rather than against a literal repeated in the test, so a key
@@ -21,8 +22,16 @@
 //! own application, so nothing in this file can be satisfied by a row an earlier run left in
 //! the shared database.
 //!
-//! There is no `sleep()` and no concurrency: each test is an ordered sequence of request /
-//! response round trips.
+//! The last test is the one that matters most:
+//! `concurrent_execution_policy_puts_with_the_same_version_yield_exactly_one_success_and_one_409`
+//! releases two writers holding the *same currently-valid* `If-Match` through a
+//! [`tokio::sync::Barrier`]. Before the repository moved the version comparison into the same
+//! transaction as the write, that scenario produced two `200`s and a silently lost update:
+//! `If-Match` was validated on one pooled connection and the write issued unconditionally on
+//! another, so it rejected only *stale* versions — never a genuine race. The sequential tests
+//! above cannot see that; only this one proves the SQL-level version check closed the TOCTOU.
+//! It is an acknowledgement gate, not a timing guess: there is no `sleep()` anywhere in this
+//! file.
 //!
 //! Fail-closed behaviour is inherited verbatim from `tests/support/mod.rs` (`panic!` when
 //! `CI=true` and `MOIRA_TEST_DATABASE_URL` is absent, matched on the **value** of `CI` per
@@ -30,15 +39,15 @@
 
 mod support;
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     Router,
     body::{Body, to_bytes},
-    http::{Request, StatusCode},
+    http::{Request, Response, StatusCode},
 };
 use serde_json::{Value, json};
-use tokio::time::timeout;
+use tokio::{sync::Barrier, time::timeout};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -124,40 +133,54 @@ impl Fixture {
         if_match: Option<&str>,
         body: Option<Value>,
     ) -> HttpResult {
-        let mut builder = Request::builder()
-            .method(method)
-            .uri(path)
-            .header("x-request-id", format!("if-match-{}", Uuid::now_v7()));
-        if body.is_some() {
-            builder = builder.header("content-type", "application/json");
-        }
-        if let Some(value) = if_match {
-            builder = builder.header("if-match", value);
-        }
-        let request = builder
-            .body(body.map_or_else(Body::empty, |value| Body::from(value.to_string())))
-            .expect("HTTP request");
-
+        let request = build_request(method, path, if_match, body);
         let response = timeout(WAIT, self.router.clone().oneshot(request))
             .await
             .expect("HTTP request timed out")
             .expect("HTTP response");
-        let status = response.status();
-        let etag = response
-            .headers()
-            .get("etag")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        let bytes = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("response body");
-        let body = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes).expect("JSON response body")
-        };
-        HttpResult { status, body, etag }
+        read_result(response).await
     }
+}
+
+/// Builds a request without sending it, so a concurrency test can do all of the setup work
+/// *before* the barrier releases and leave only the HTTP call inside the raced window.
+fn build_request(
+    method: &str,
+    path: &str,
+    if_match: Option<&str>,
+    body: Option<Value>,
+) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("x-request-id", format!("if-match-{}", Uuid::now_v7()));
+    if body.is_some() {
+        builder = builder.header("content-type", "application/json");
+    }
+    if let Some(value) = if_match {
+        builder = builder.header("if-match", value);
+    }
+    builder
+        .body(body.map_or_else(Body::empty, |value| Body::from(value.to_string())))
+        .expect("HTTP request")
+}
+
+async fn read_result(response: Response<Body>) -> HttpResult {
+    let status = response.status();
+    let etag = response
+        .headers()
+        .get("etag")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body");
+    let body = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).expect("JSON response body")
+    };
+    HttpResult { status, body, etag }
 }
 
 /// Asserts the full i18n contract on an error envelope: the code, the derived key, that the
@@ -295,8 +318,12 @@ async fn execution_policy_put_with_current_if_match_succeeds_and_bumps_the_versi
         "the response ETag must carry the new version so the caller can chain writes"
     );
 
-    // The version the caller just used is now stale, which is what makes If-Match a real
-    // optimistic-concurrency control rather than a formality.
+    // The version the caller just used is now stale. Sequentially that is all this proves —
+    // a *stale* version is refused. It says nothing about two writers arriving with the same
+    // still-valid version, which is the case that actually loses updates; see
+    // `concurrent_execution_policy_puts_with_the_same_version_yield_exactly_one_success_and_one_409`
+    // for the property that makes If-Match a real optimistic-concurrency control rather than a
+    // formality.
     let replayed = fixture
         .put_policy(Some(&version.to_string()), fixture.body(19))
         .await;
@@ -313,4 +340,112 @@ async fn execution_policy_put_with_current_if_match_succeeds_and_bumps_the_versi
         chained.body
     );
     assert!(chained.version() > accepted.version());
+}
+
+/// The test named by plan 04's DoD: the one that proves the SQL-level version check actually
+/// closed the TOCTOU between reading the current version and writing.
+///
+/// Two writers read the *same* current version — both `If-Match` values are valid at the moment
+/// they are formed — and are then released simultaneously through a [`Barrier`]. Exactly one
+/// may win.
+///
+/// Against the pre-fix code (`get_or_create…` on one pooled connection, compare in Rust, then an
+/// unconditional `insert … on conflict do update` on another) this reproduced 2 successes and 0
+/// conflicts: the second write silently clobbered the first, and the version advanced twice
+/// with only one writer's values surviving.
+///
+/// The barrier is an acknowledgement gate, not a delay: `Barrier::wait` returns only once every
+/// writer has arrived, so the race window is opened deterministically with no `sleep()`. A
+/// multi-threaded runtime is required so the two requests occupy two pool connections at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_execution_policy_puts_with_the_same_version_yield_exactly_one_success_and_one_409()
+ {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+
+    let current = fixture.get_policy().await;
+    assert_eq!(current.status, StatusCode::OK, "{}", current.body);
+    let version = current.version();
+
+    // Distinguishable payloads, so the surviving row identifies which writer actually won and a
+    // "last write silently wins" outcome cannot masquerade as a correct one.
+    let writers = [31_i32, 97_i32];
+    let barrier = Arc::new(Barrier::new(writers.len()));
+
+    let mut handles = Vec::with_capacity(writers.len());
+    for rpm in writers {
+        let router = fixture.router.clone();
+        let path = fixture.path();
+        let body = fixture.body(rpm);
+        let if_match = version.to_string();
+        let barrier = Arc::clone(&barrier);
+        handles.push(tokio::spawn(async move {
+            // Everything that can be done ahead of the race is done ahead of the race.
+            let request = build_request("PUT", &path, Some(&if_match), Some(body));
+            barrier.wait().await;
+            let response = timeout(WAIT, router.oneshot(request))
+                .await
+                .expect("concurrent HTTP request timed out")
+                .expect("concurrent HTTP response");
+            (rpm, read_result(response).await)
+        }));
+    }
+
+    let mut results = Vec::with_capacity(writers.len());
+    for handle in handles {
+        results.push(handle.await.expect("concurrent writer task"));
+    }
+
+    let successes: Vec<_> = results
+        .iter()
+        .filter(|(_, result)| result.status == StatusCode::OK)
+        .collect();
+    let conflicts: Vec<_> = results
+        .iter()
+        .filter(|(_, result)| result.status == StatusCode::CONFLICT)
+        .collect();
+
+    let observed: Vec<_> = results
+        .iter()
+        .map(|(rpm, result)| format!("rpm={rpm} status={} body={}", result.status, result.body))
+        .collect();
+    assert_eq!(
+        (successes.len(), conflicts.len()),
+        (1, 1),
+        "two writers holding the same valid If-Match must resolve to exactly one success and \
+         one conflict; observed: {observed:#?}"
+    );
+
+    let (winning_rpm, winner) = successes[0];
+    assert_eq!(
+        winner.version(),
+        version + 1,
+        "the single winning write must advance the version exactly once: {}",
+        winner.body
+    );
+
+    // The loser must be the ordinary 409 envelope every other versioned endpoint produces, so
+    // a client needs no new code path to handle it.
+    assert_coded_error(
+        &conflicts[0].1,
+        StatusCode::CONFLICT,
+        "resource_version_conflict",
+    );
+
+    // And the durable state must be the winner's, at the winner's version: neither a blend of the
+    // two writes nor the loser's values applied on top.
+    let settled = fixture.get_policy().await;
+    assert_eq!(settled.status, StatusCode::OK, "{}", settled.body);
+    assert_eq!(
+        settled.version(),
+        version + 1,
+        "a refused write must not have advanced the version a second time: {}",
+        settled.body
+    );
+    assert_eq!(
+        settled.body["rate_limit_requests_per_minute"], *winning_rpm,
+        "the persisted policy must be the one the successful writer sent: {}",
+        settled.body
+    );
 }

@@ -26,13 +26,59 @@
 //! another replica already removed simply is not there to remove again — and each
 //! batch selects its victims with `for update skip locked`, so two concurrent
 //! sweeps partition the expired rows between themselves instead of contending for
-//! them, and neither one blocks (nor is blocked by) the row locks taken by a
-//! concurrent idempotency claim. No double-delete corruption, no lock convoy, no
-//! wrong counts beyond each replica reporting only the rows it personally deleted.
+//! them. No double-delete corruption, no wrong counts beyond each replica
+//! reporting only the rows it personally deleted.
 //!
 //! Both halves are true at once. A comment claiming only the first would suggest
 //! this worker is unsafe to run today; a comment claiming only the second would
 //! suggest leader election is unnecessary. Neither is right.
+//!
+//! # Lock interaction with the idempotency claim path — one direction only
+//!
+//! `skip locked` protects exactly one direction, and it is worth being precise
+//! about which, because an earlier version of this comment claimed both.
+//!
+//! **Protected: a claim's locks never block the sweep.** A batch's `for update
+//! skip locked` sub-select steps over any row an in-flight
+//! `claim_idempotency` transaction has locked and picks it up on a later tick.
+//! Covered by `retention_run_does_not_block_a_concurrent_idempotency_claim` in
+//! `tests/retention_worker.rs`.
+//!
+//! **Not protected: the sweep's locks *can* block a claim.** The claim path's
+//! own opportunistic prune (`src/infra/repositories/admin.rs`,
+//! `claim_idempotency`) is a plain `delete ... where idempotency_key_hash =
+//! any($1) and ...` with no `skip locked` and no `nowait`. If a retention batch
+//! reached one of those rows first, the claim's delete waits for the batch's
+//! transaction to commit. That is a user-facing admin request parked behind a
+//! background sweep.
+//!
+//! The wait is bounded by one batch, not by the whole sweep, since every batch
+//! is its own transaction (see [`run_once`]). It is *not* bounded by the claim's
+//! five-second deadline — that deadline only governs the
+//! `pg_try_advisory_xact_lock` retry loop above the delete, and once the advisory
+//! lock is held the delete blocks for however long the batch holding the row
+//! takes. So the practical bound is "how long one `idempotency_records` batch
+//! statement runs", which makes `retention_batch_size` a latency knob and not
+//! only a throughput knob: [`RetentionPlan::MAX_BATCH_SIZE`] permits 10_000 rows
+//! in one statement.
+//!
+//! Two things keep that bound small in practice, and both are properties of this
+//! table rather than of the worker, so neither should be assumed to hold
+//! elsewhere. `idempotency_records` is the target of no foreign key, so a batch
+//! fires no referential-integrity cascade — unlike `responses`, where
+//! `migrations/0011_retention_indexes.sql` measured a single 500-row batch at
+//! 12,735 ms purely in RI triggers before that migration's indexes existed. And
+//! `idempotency_records_expires_at_idx` (same migration) makes victim selection
+//! an index scan. A `responses` batch cannot block a claim — different table,
+//! different rows — so the pathological number is not the number at risk here;
+//! it is cited only as evidence that "one batch" is not a synonym for "fast".
+//!
+//! The collision window is also narrow: the claim's prune targets one key hash
+//! for one actor and one operation, so it collides only on the handful of rows
+//! the sweep happens to hold at that instant. That is why this is documented
+//! rather than fixed. Making it symmetric would mean adding `skip locked` to the
+//! claim's prune, which changes admin-command semantics and belongs to whoever
+//! owns that file.
 
 use serde::Serialize;
 use sqlx::PgPool;
@@ -216,10 +262,17 @@ async fn sweep_table(
 /// PostgreSQL has no `DELETE ... LIMIT`, so the victims are chosen by a bounded
 /// sub-select. `for update skip locked` is load-bearing, not decoration: the
 /// idempotency claim path deletes expired rows for the key it is claiming while
-/// holding an advisory transaction lock, so without `skip locked` a retention
-/// batch that reached those rows first would block that claim — a user-facing
-/// request — behind a background sweep. With it, the sweep steps over any locked
+/// holding an advisory transaction lock, so without `skip locked` a batch that
+/// reached a row *the claim already holds* would park this background sweep
+/// behind a user-facing request, and behind every other row that claim's
+/// transaction locks before it commits. With it, the sweep steps over the locked
 /// row and picks it up on a later tick.
+///
+/// Note the direction. `skip locked` here makes the sweep tolerant of the
+/// claim's locks; it does nothing about the reverse, where a claim's plain
+/// `delete` waits on rows *this* batch has locked. See this module's
+/// "Lock interaction with the idempotency claim path" section — that asymmetry
+/// is real, bounded by one batch, and deliberately not fixed here.
 ///
 /// The table name is chosen from a closed set of `&'static str` constants in this
 /// module, never from caller input; the bound is a bind parameter.
@@ -448,8 +501,10 @@ mod tests {
                 sql.contains("limit $1"),
                 "{table} batch is not parameterised"
             );
-            // `skip locked` is what keeps a sweep from blocking a concurrent
-            // idempotency claim; losing it would be a silent regression.
+            // `skip locked` is what keeps a sweep from *being blocked by* a
+            // concurrent idempotency claim's row locks. (It does not protect the
+            // other direction — see the module docs.) Losing it would be a
+            // silent regression.
             assert!(
                 sql.contains("for update skip locked"),
                 "{table} batch lost skip locked"

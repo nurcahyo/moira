@@ -1015,6 +1015,167 @@ mod tests {
         );
     }
 
+    /// Every operation in the generated document that declares an `If-Match` header, with the
+    /// required-ness the API contract promises. This is a closed inventory: the test below
+    /// asserts both directions, so adding, removing, or flipping an `If-Match` annotation
+    /// anywhere in `http::admin` fails here until this table is updated deliberately.
+    ///
+    /// `atomic_admin_idempotency_contract_is_explicit` only ever looked at a hand-picked list
+    /// of `POST` operations, which meant the `PUT` preconditions — including the
+    /// execution-policy one that plan 04 made mandatory — could be downgraded to
+    /// `Option<i64>` / "Optional…" with the entire suite still green. Plan 05 freezes
+    /// `docs/openapi.json` from this generator, so a silently wrong precondition here would be
+    /// baked into the published contract.
+    ///
+    /// `false` is reserved for preconditions that are genuinely advisory: the provider
+    /// runtime-policy `PUT` reads the header through `optional_if_match`.
+    const IF_MATCH_OPERATIONS: [(&str, &str, bool); 36] = [
+        ("/api/v1/admin/agent-profiles/{id}", "delete", true),
+        ("/api/v1/admin/agent-profiles/{id}", "patch", true),
+        ("/api/v1/admin/agent-profiles/{id}/disable", "post", true),
+        ("/api/v1/admin/agent-profiles/{id}/enable", "post", true),
+        ("/api/v1/admin/applications/{id}", "delete", true),
+        ("/api/v1/admin/applications/{id}", "patch", true),
+        ("/api/v1/admin/applications/{id}/disable", "post", true),
+        ("/api/v1/admin/applications/{id}/enable", "post", true),
+        (
+            "/api/v1/admin/applications/{id}/execution-policy",
+            "put",
+            true,
+        ),
+        ("/api/v1/admin/jwt-issuers/{id}", "delete", true),
+        ("/api/v1/admin/jwt-issuers/{id}", "patch", true),
+        ("/api/v1/admin/jwt-issuers/{id}/disable", "post", true),
+        ("/api/v1/admin/jwt-issuers/{id}/enable", "post", true),
+        ("/api/v1/admin/provider-credentials/{id}", "delete", true),
+        ("/api/v1/admin/provider-credentials/{id}", "patch", true),
+        (
+            "/api/v1/admin/provider-credentials/{id}/disable",
+            "post",
+            true,
+        ),
+        (
+            "/api/v1/admin/provider-credentials/{id}/enable",
+            "post",
+            true,
+        ),
+        (
+            "/api/v1/admin/provider-credentials/{id}/rotate",
+            "post",
+            true,
+        ),
+        ("/api/v1/admin/provider-models/{id}", "delete", true),
+        ("/api/v1/admin/provider-models/{id}", "patch", true),
+        ("/api/v1/admin/provider-models/{id}/disable", "post", true),
+        ("/api/v1/admin/provider-models/{id}/enable", "post", true),
+        ("/api/v1/admin/providers/{id}", "delete", true),
+        ("/api/v1/admin/providers/{id}", "patch", true),
+        ("/api/v1/admin/providers/{id}/disable", "post", true),
+        ("/api/v1/admin/providers/{id}/enable", "post", true),
+        (
+            "/api/v1/admin/providers/{provider_id}/runtime-policy",
+            "put",
+            false,
+        ),
+        ("/api/v1/admin/routes/{id}", "delete", true),
+        ("/api/v1/admin/routes/{id}", "patch", true),
+        ("/api/v1/admin/routes/{id}/disable", "post", true),
+        ("/api/v1/admin/routes/{id}/enable", "post", true),
+        ("/api/v1/admin/routing-policies/{id}", "delete", true),
+        ("/api/v1/admin/routing-policies/{id}", "patch", true),
+        ("/api/v1/admin/routing-policies/{id}/disable", "post", true),
+        ("/api/v1/admin/routing-policies/{id}/enable", "post", true),
+        (
+            "/api/v1/admin/users/{external_user_id}/provider-credentials/{id}",
+            "delete",
+            true,
+        ),
+    ];
+
+    /// Collects `(path, method, if_match_required)` for every operation that declares an
+    /// `If-Match` header, so the assertion can be made in both directions.
+    fn if_match_inventory(value: &Value) -> Vec<(String, String, bool)> {
+        let mut found: Vec<(String, String, bool)> = value["paths"]
+            .as_object()
+            .expect("paths")
+            .iter()
+            .flat_map(|(path, item)| {
+                item.as_object()
+                    .expect("path item")
+                    .iter()
+                    .filter(|(_, operation)| parameter_named(operation, "If-Match"))
+                    .map(|(method, operation)| {
+                        (
+                            path.clone(),
+                            method.clone(),
+                            parameter_required(operation, "If-Match"),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn every_if_match_operation_declares_the_documented_precondition() {
+        let value = serde_json::to_value(documented_router(RouterPolicy::default()).into_openapi())
+            .unwrap();
+        let found = if_match_inventory(&value);
+
+        let mut expected: Vec<(String, String, bool)> = IF_MATCH_OPERATIONS
+            .iter()
+            .map(|(path, method, required)| ((*path).to_string(), (*method).to_string(), *required))
+            .collect();
+        expected.sort();
+
+        assert_eq!(
+            found, expected,
+            "the generated If-Match contract drifted from the documented inventory; \
+             a required precondition must never silently become optional (plan 05 freezes \
+             docs/openapi.json from this generator)"
+        );
+
+        // Required-ness alone is not the whole contract: an `If-Match` documented as a string
+        // would still typecheck as "required" while telling clients the wrong thing.
+        for (path, method, required) in &found {
+            let operation = &value["paths"][path][method];
+            let parameter = operation["parameters"]
+                .as_array()
+                .expect("operation parameters")
+                .iter()
+                .find(|parameter| parameter["name"] == "If-Match")
+                .expect("If-Match parameter");
+            assert_eq!(
+                parameter["in"], "header",
+                "{method} {path} must declare If-Match as a header"
+            );
+            let description = parameter["description"].as_str().unwrap_or_default();
+            let expected_word = if *required { "Required" } else { "Optional" };
+            assert!(
+                description.starts_with(expected_word),
+                "{method} {path} declares If-Match required={required} but describes it as \
+                 {description:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn execution_policy_put_declares_if_match_as_required() {
+        // Plan 04 made this precondition mandatory (`require_if_match`, not
+        // `optional_if_match`). Pinned on its own as well as in the inventory above, because a
+        // reviewer demonstrated that reverting only this annotation to `Option<i64>` left the
+        // whole suite green.
+        let value = serde_json::to_value(documented_router(RouterPolicy::default()).into_openapi())
+            .unwrap();
+        let operation = &value["paths"]["/api/v1/admin/applications/{id}/execution-policy"]["put"];
+        assert!(
+            parameter_required(operation, "If-Match"),
+            "PUT execution-policy must document If-Match as required"
+        );
+    }
+
     #[test]
     fn every_local_schema_reference_resolves() {
         let value = serde_json::to_value(documented_router(RouterPolicy::default()).into_openapi())
