@@ -743,12 +743,18 @@ async fn disabled_credential_fails_without_calling_provider_or_leaking_secret() 
     let configured = fixture
         .add_provider(provider.base_url(), 10, RuntimePolicy::default())
         .await;
-    AdminService::new(&fixture.state)
-        .expect("admin service")
+    let admin = AdminService::new(&fixture.state).expect("admin service");
+    let credential_version = admin
+        .get_credential(&fixture.actor, configured.credential_id)
+        .await
+        .expect("read credential")
+        .version;
+    admin
         .set_credential_enabled(
             &fixture.actor,
             &request_context(),
             configured.credential_id,
+            credential_version,
             false,
         )
         .await

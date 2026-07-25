@@ -466,11 +466,15 @@ async fn every_runtime_admin_mutation_leaves_provider_circuits_intact() {
         .expect("create route definition");
     assert_circuits_survived(&circuits, owned, unrelated, "create_route_definition").await;
 
-    runtime
+    // Each mutation is rebound from the record it returns: `If-Match` is now enforced inside
+    // the write's own transaction, so every call has to carry the version its predecessor
+    // produced rather than the one the create returned.
+    let route = runtime
         .patch_route_definition(
             &fixture.actor,
             &request_context(),
             route.id,
+            route.version,
             RouteDefinitionPatchRequest {
                 display_name: Some(format!("Scoped route {suffix} renamed")),
                 ..RouteDefinitionPatchRequest::default()
@@ -480,8 +484,14 @@ async fn every_runtime_admin_mutation_leaves_provider_circuits_intact() {
         .expect("patch route definition");
     assert_circuits_survived(&circuits, owned, unrelated, "patch_route_definition").await;
 
-    runtime
-        .set_route_definition_enabled(&fixture.actor, &request_context(), route.id, false)
+    let route = runtime
+        .set_route_definition_enabled(
+            &fixture.actor,
+            &request_context(),
+            route.id,
+            route.version,
+            false,
+        )
         .await
         .expect("disable route definition");
     assert_circuits_survived(&circuits, owned, unrelated, "set_route_definition_enabled").await;
@@ -519,11 +529,12 @@ async fn every_runtime_admin_mutation_leaves_provider_circuits_intact() {
         .expect("create routing policy");
     assert_circuits_survived(&circuits, owned, unrelated, "create_routing_policy").await;
 
-    runtime
+    let routing_policy = runtime
         .patch_routing_policy(
             &fixture.actor,
             &request_context(),
             routing_policy.id,
+            routing_policy.version,
             RoutingPolicyPatchRequest {
                 priority: Some(60),
                 ..RoutingPolicyPatchRequest::default()
@@ -533,14 +544,25 @@ async fn every_runtime_admin_mutation_leaves_provider_circuits_intact() {
         .expect("patch routing policy");
     assert_circuits_survived(&circuits, owned, unrelated, "patch_routing_policy").await;
 
-    runtime
-        .set_routing_policy_enabled(&fixture.actor, &request_context(), routing_policy.id, false)
+    let routing_policy = runtime
+        .set_routing_policy_enabled(
+            &fixture.actor,
+            &request_context(),
+            routing_policy.id,
+            routing_policy.version,
+            false,
+        )
         .await
         .expect("disable routing policy");
     assert_circuits_survived(&circuits, owned, unrelated, "set_routing_policy_enabled").await;
 
     runtime
-        .delete_routing_policy(&fixture.actor, &request_context(), routing_policy.id)
+        .delete_routing_policy(
+            &fixture.actor,
+            &request_context(),
+            routing_policy.id,
+            routing_policy.version,
+        )
         .await
         .expect("delete routing policy");
     assert_circuits_survived(&circuits, owned, unrelated, "delete_routing_policy").await;
@@ -566,11 +588,12 @@ async fn every_runtime_admin_mutation_leaves_provider_circuits_intact() {
         .expect("create agent profile");
     assert_circuits_survived(&circuits, owned, unrelated, "create_agent_profile").await;
 
-    runtime
+    let profile = runtime
         .patch_agent_profile(
             &fixture.actor,
             &request_context(),
             profile.id,
+            profile.version,
             AgentProfilePatchRequest {
                 display_name: Some(format!("Scoped profile {suffix} renamed")),
                 ..AgentProfilePatchRequest::default()
@@ -580,14 +603,25 @@ async fn every_runtime_admin_mutation_leaves_provider_circuits_intact() {
         .expect("patch agent profile");
     assert_circuits_survived(&circuits, owned, unrelated, "patch_agent_profile").await;
 
-    runtime
-        .set_agent_profile_enabled(&fixture.actor, &request_context(), profile.id, false)
+    let profile = runtime
+        .set_agent_profile_enabled(
+            &fixture.actor,
+            &request_context(),
+            profile.id,
+            profile.version,
+            false,
+        )
         .await
         .expect("disable agent profile");
     assert_circuits_survived(&circuits, owned, unrelated, "set_agent_profile_enabled").await;
 
     runtime
-        .delete_agent_profile(&fixture.actor, &request_context(), profile.id)
+        .delete_agent_profile(
+            &fixture.actor,
+            &request_context(),
+            profile.id,
+            profile.version,
+        )
         .await
         .expect("delete agent profile");
     assert_circuits_survived(&circuits, owned, unrelated, "delete_agent_profile").await;
@@ -628,7 +662,7 @@ async fn every_runtime_admin_mutation_leaves_provider_circuits_intact() {
     // Deleted last so the route family's fourth caller runs after everything that needed
     // a live route, and the count of exercised call sites reaches thirteen.
     runtime
-        .delete_route_definition(&fixture.actor, &request_context(), route.id)
+        .delete_route_definition(&fixture.actor, &request_context(), route.id, route.version)
         .await
         .expect("delete route definition");
     assert_circuits_survived(&circuits, owned, unrelated, "delete_route_definition").await;

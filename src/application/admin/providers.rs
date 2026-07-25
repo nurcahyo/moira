@@ -125,6 +125,7 @@ impl<'a> ProviderAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         request: ProviderPatchRequest,
     ) -> Result<ProviderRecord, AppError> {
         self.state.authz.require(actor, "moira:providers:write")?;
@@ -137,7 +138,10 @@ impl<'a> ProviderAdminService<'a> {
             )?)),
             None => None,
         };
-        let record = self.repo.patch_provider(id, &request, base_url).await?;
+        let record = self
+            .repo
+            .patch_provider(id, expected_version, &request, base_url)
+            .await?;
         self.state.runtime_cache.invalidate_all().await;
         audit_success(
             &self.repo,
@@ -157,9 +161,10 @@ impl<'a> ProviderAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
     ) -> Result<(), AppError> {
         self.state.authz.require(actor, "moira:providers:delete")?;
-        self.repo.soft_delete_provider(id).await?;
+        self.repo.soft_delete_provider(id, expected_version).await?;
         self.state.runtime_cache.invalidate_all().await;
         audit_success(
             &self.repo,
@@ -178,12 +183,17 @@ impl<'a> ProviderAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         enabled: bool,
     ) -> Result<ProviderRecord, AppError> {
         self.state.authz.require(actor, "moira:providers:write")?;
         let record = self
             .repo
-            .set_provider_status(id, if enabled { "active" } else { "disabled" })
+            .set_provider_status(
+                id,
+                expected_version,
+                if enabled { "active" } else { "disabled" },
+            )
             .await?;
         self.state.runtime_cache.invalidate_all().await;
         audit_success(
@@ -274,10 +284,14 @@ impl<'a> ProviderAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         model_id: Uuid,
+        expected_version: i64,
         request: ProviderModelPatchRequest,
     ) -> Result<ProviderModelRecord, AppError> {
         self.state.authz.require(actor, "moira:models:write")?;
-        let record = self.repo.patch_provider_model(model_id, &request).await?;
+        let record = self
+            .repo
+            .patch_provider_model(model_id, expected_version, &request)
+            .await?;
         self.state.runtime_cache.invalidate_all().await;
         audit_success(
             &self.repo,
@@ -306,9 +320,12 @@ impl<'a> ProviderAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         model_id: Uuid,
+        expected_version: i64,
     ) -> Result<(), AppError> {
         self.state.authz.require(actor, "moira:models:delete")?;
-        self.repo.soft_delete_provider_model(model_id).await?;
+        self.repo
+            .soft_delete_provider_model(model_id, expected_version)
+            .await?;
         self.state.runtime_cache.invalidate_all().await;
         audit_success(
             &self.repo,
@@ -327,12 +344,17 @@ impl<'a> ProviderAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         model_id: Uuid,
+        expected_version: i64,
         enabled: bool,
     ) -> Result<ProviderModelRecord, AppError> {
         self.state.authz.require(actor, "moira:models:write")?;
         let record = self
             .repo
-            .set_provider_model_status(model_id, if enabled { "active" } else { "disabled" })
+            .set_provider_model_status(
+                model_id,
+                expected_version,
+                if enabled { "active" } else { "disabled" },
+            )
             .await?;
         self.state.runtime_cache.invalidate_all().await;
         audit_success(
