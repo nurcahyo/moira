@@ -94,14 +94,15 @@ This list tracks what is still left to harden or complete after the current Phas
 - TODO: Persist provider health rolling windows for latency, error rate, timeout rate, rate-limit rate, throughput, token/sec, and circuit state.
 - TODO: Add `GET /api/v1/admin/providers/{provider}/health` backed by persisted health windows and guarded by runtime diagnostic scopes.
 - TODO: Feed provider health, cost, saturation, and recent failures into deterministic adaptive routing.
-- TODO: Add full OpenTelemetry SDK/exporter wiring for HTTP, SQL, Redis, Rig execution, routing, retrieval, embedding, streaming, and workers.
-- TODO: Replace aggregate-only in-process metrics with full Prometheus histograms/summaries for latency, TTFT, TPS, provider health, DB pool utilization, Redis latency, worker queues, and vector search latency.
+- PARTIAL (plan 05, P1-9a): OpenTelemetry SDK/exporter wiring exists and is off by default (`MOIRA_TELEMETRY__OTEL_ENABLED`, OTLP/http-proto). Spans cover HTTP requests and execution attempts. TODO: extend to SQL, Redis, Rig-internal execution, routing, retrieval, embedding, streaming, and workers.
+- PARTIAL (plan 05, P1-9b): aggregate-only counters replaced by real Prometheus histograms via `metrics` + `metrics-exporter-prometheus`, covering HTTP latency, execution latency, TTFT, provider-outcome counters, and DB-pool gauges. TODO: TPS, provider health windows, Redis latency, worker queues, and vector-search latency.
 - TODO: Add Grafana dashboard JSON and Alertmanager alert rules for the documented SLOs.
 - TODO: Add production structured-log redaction tests and trace/log correlation tests for request, execution, application, provider, and route identifiers.
 - TODO: Add Vault, AWS Secrets Manager, GCP Secret Manager, Azure Key Vault, and Kubernetes Secret loaders behind the existing secret configuration boundary.
 - TODO: Add automated PostgreSQL/pgvector backup, restore, and migration rollback drills with documented RPO/RTO evidence.
 - TODO: Add reproducible load-test scripts for 1k, 5k, 10k, and 50k concurrent users covering streaming and non-streaming flows.
 - TODO: Add chaos-test automation for Redis, PostgreSQL, provider, network, high-latency, stream-interruption, and worker-crash scenarios.
+- DONE (plan 05, P0-4): `cargo deny` supply-chain gate given a real `deny.toml` with populated `[advisories]`, `[licenses]`, `[bans]`, and `[sources]` derived from Moira's actual dependency graph, enforced in CI against the final `Cargo.lock`. Previously the gate ran with no config and could not fail.
 - TODO: Add SBOM generation to the Docker build/publish pipeline and store artifacts in CI.
 - TODO: Add SAST, DAST, secret scanning, container scanning, OWASP ASVS evidence, and penetration-test reporting gates.
 - TODO: Validate Helm and Kubernetes artifacts in CI against target cluster versions, including ServiceMonitor CRDs where installed.
@@ -109,9 +110,9 @@ This list tracks what is still left to harden or complete after the current Phas
 
 ## Cross-Phase Verification
 
-- TODO: Add OpenAPI generation validation in CI.
-- TODO: Add secret-leak snapshot tests for HTTP responses, OpenAPI schemas, audit metadata, and logs.
-- TODO: Add prompt/content-leak snapshot tests for conversation messages, memories, RAG documents, vector records, retrieval diagnostics, HTTP responses, audit metadata, and logs.
+- DONE (plan 05, P1-10a): OpenAPI generation validation in CI. `docs/openapi.json` is committed and a drift gate fails the build when the served document diverges, naming the regeneration command.
+- DONE (plan 05, P1-10b): secret-leak snapshot tests for HTTP responses, OpenAPI schemas, audit metadata, and logs — `tests/secret_leak_snapshots.rs`.
+- DONE (plan 05, P1-10b): prompt/content-leak snapshot tests for conversation messages, memories, RAG documents, retrieval diagnostics, HTTP responses, audit metadata, and logs — `tests/content_leak_snapshots.rs`. TODO: vector-record coverage, deferred to plan 11 where the vector write path lands.
 - TODO: Add concurrency tests for simultaneous credential rotations, key rotations, idempotent creates, public response creation, conversation message appends, memory updates, and RAG ingestion.
 - TODO: Add documented manual smoke tests for bootstrap system key, admin setup, route/model configuration, credential setup, internal execution, public response creation, streaming, conversation attach, explicit memory, and direct-text RAG ingestion.
 - TODO: Isolate database-backed integration test binaries or add deterministic teardown so repeated local runs cannot accumulate routing, issuer, credential, or application fixtures.

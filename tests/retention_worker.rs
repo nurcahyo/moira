@@ -220,9 +220,13 @@ async fn retention_run_deletes_expired_idempotency_records_and_keeps_live_rows()
     // Expires in an hour (negative age => future).
     let live = insert_idempotency_record(&pool, &marker, 2, -3_600).await;
 
-    let outcome = retention::run_once(&pool, &settings(500), &MetricsRegistry::new())
-        .await
-        .expect("retention sweep");
+    let outcome = retention::run_once(
+        &pool,
+        &settings(500),
+        &MetricsRegistry::new("moira-retention-test", None),
+    )
+    .await
+    .expect("retention sweep");
 
     assert!(
         !row_exists(&pool, "idempotency_records", expired).await,
@@ -258,9 +262,13 @@ async fn retention_run_deletes_expired_responses_and_keeps_rows_with_null_or_fut
     // A NULL must never be treated as "expired long ago".
     let never = insert_response(&pool, &marker, 3, "null").await;
 
-    let outcome = retention::run_once(&pool, &settings(500), &MetricsRegistry::new())
-        .await
-        .expect("retention sweep");
+    let outcome = retention::run_once(
+        &pool,
+        &settings(500),
+        &MetricsRegistry::new("moira-retention-test", None),
+    )
+    .await
+    .expect("retention sweep");
 
     assert!(
         !row_exists(&pool, "responses", expired).await,
@@ -306,9 +314,13 @@ async fn retention_run_respects_the_configured_batch_size() {
         ids.push(insert_idempotency_record(&pool, &marker, nth, 3_153_600_000).await);
     }
 
-    let first = retention::run_once(&pool, &settings(1), &MetricsRegistry::new())
-        .await
-        .expect("first sweep");
+    let first = retention::run_once(
+        &pool,
+        &settings(1),
+        &MetricsRegistry::new("moira-retention-test", None),
+    )
+    .await
+    .expect("first sweep");
     assert!(
         first.hit_per_tick_cap,
         "a backlog larger than the per-tick cap must be reported as capped, got {first:?}"
@@ -325,9 +337,13 @@ async fn retention_run_respects_the_configured_batch_size() {
 
     // Repeated ticks drain the backlog rather than stalling on it.
     for _ in 0..4 {
-        retention::run_once(&pool, &settings(1), &MetricsRegistry::new())
-            .await
-            .expect("drain sweep");
+        retention::run_once(
+            &pool,
+            &settings(1),
+            &MetricsRegistry::new("moira-retention-test", None),
+        )
+        .await
+        .expect("drain sweep");
     }
     assert_eq!(
         surviving(&pool, "idempotency_records", &ids).await,
@@ -376,7 +392,11 @@ async fn retention_run_does_not_block_a_concurrent_idempotency_claim() {
     // until the holder released, and the bounded timeout would fire.
     let outcome = timeout(
         Duration::from_secs(5),
-        retention::run_once(&pool, &settings(500), &MetricsRegistry::new()),
+        retention::run_once(
+            &pool,
+            &settings(500),
+            &MetricsRegistry::new("moira-retention-test", None),
+        ),
     )
     .await
     .expect("retention sweep blocked behind a concurrent row lock")
@@ -397,9 +417,13 @@ async fn retention_run_does_not_block_a_concurrent_idempotency_claim() {
 
     // Once the lock is gone the skipped row is picked up on the next tick — the
     // skip defers work, it does not drop it.
-    retention::run_once(&pool, &settings(500), &MetricsRegistry::new())
-        .await
-        .expect("follow-up sweep");
+    retention::run_once(
+        &pool,
+        &settings(500),
+        &MetricsRegistry::new("moira-retention-test", None),
+    )
+    .await
+    .expect("follow-up sweep");
     assert!(
         !row_exists(&pool, "idempotency_records", locked).await,
         "a previously locked row must be swept on a later tick"
@@ -417,27 +441,26 @@ async fn retention_run_records_deleted_counts_for_observability() {
     insert_idempotency_record(&pool, &marker, 1, 3_600).await;
     insert_response(&pool, &marker, 1, "now() - interval '1 hour'").await;
 
-    let metrics = MetricsRegistry::new();
-    let before = metrics.snapshot();
+    let metrics = MetricsRegistry::new("moira-retention-test", None);
+    let before = counters(&metrics);
 
     let outcome = retention::run_once(&pool, &settings(500), &metrics)
         .await
         .expect("retention sweep");
 
-    let after = metrics.snapshot();
+    let after = counters(&metrics);
     assert_eq!(
-        after.retention_runs_total,
-        before.retention_runs_total + 1,
+        after.runs,
+        before.runs + 1,
         "every sweep must be counted, so an operator can see the worker is alive"
     );
     assert_eq!(
-        after.retention_idempotency_records_deleted_total
-            - before.retention_idempotency_records_deleted_total,
+        after.idempotency_deleted - before.idempotency_deleted,
         outcome.idempotency_records_deleted,
         "the idempotency_records counter must match what the sweep reported"
     );
     assert_eq!(
-        after.retention_responses_deleted_total - before.retention_responses_deleted_total,
+        after.responses_deleted - before.responses_deleted,
         outcome.responses_deleted,
         "the responses counter must match what the sweep reported"
     );
@@ -445,12 +468,54 @@ async fn retention_run_records_deleted_counts_for_observability() {
         outcome.total_deleted() >= 2,
         "both seeded rows should have been swept, got {outcome:?}"
     );
+}
 
-    // The counters are also exported, so plan 05 has a real call site to upgrade.
+/// The retention counters as an operator would actually read them.
+///
+/// Plan 05 deleted `MetricsRegistry::snapshot()` along with the hand-rolled renderer, so the
+/// exported text is now the single source of truth — a struct read-back would be a second one,
+/// free to drift from what `/metrics` really serves. Parsing the exposition here keeps these
+/// assertions testing the thing an operator sees rather than an internal field.
+#[derive(Debug, Clone, Copy)]
+struct RetentionCounters {
+    runs: u64,
+    idempotency_deleted: u64,
+    responses_deleted: u64,
+}
+
+fn counters(metrics: &MetricsRegistry) -> RetentionCounters {
     let rendered = metrics.render_prometheus("moira-retention-test", false, true);
-    assert!(rendered.contains("moira_retention_runs_total"));
-    assert!(rendered.contains("table=\"idempotency_records\""));
-    assert!(rendered.contains("table=\"responses\""));
+    RetentionCounters {
+        runs: counter_value(&rendered, "moira_retention_runs_total", None),
+        idempotency_deleted: counter_value(
+            &rendered,
+            "moira_retention_rows_deleted_total",
+            Some("table=\"idempotency_records\""),
+        ),
+        responses_deleted: counter_value(
+            &rendered,
+            "moira_retention_rows_deleted_total",
+            Some("table=\"responses\""),
+        ),
+    }
+}
+
+/// Reads one counter out of the Prometheus exposition.
+///
+/// Returns 0 when the series is absent: a counter that has never been incremented is genuinely
+/// zero, and the callers here compare deltas, so treating "absent" as 0 is correct rather than a
+/// silent failure. `label` selects one series within a labelled family.
+fn counter_value(rendered: &str, metric: &str, label: Option<&str>) -> u64 {
+    rendered
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter(|line| line.starts_with(metric))
+        .filter(|line| label.is_none_or(|needle| line.contains(needle)))
+        .filter_map(|line| line.rsplit_once(' '))
+        .filter_map(|(_, value)| value.trim().parse::<f64>().ok())
+        .map(|value| value as u64)
+        .next()
+        .unwrap_or(0)
 }
 
 /// The only test here that exercises the **dispatch wiring** rather than the sweep.
@@ -527,7 +592,7 @@ async fn a_running_supervisor_dispatches_a_retention_sweep() {
     // `AppState::new` mints a fresh registry, so this counter observes only sweeps
     // this supervisor dispatched — no other suite can inflate it.
     assert!(
-        state.metrics.snapshot().retention_runs_total >= 1,
+        counters(&state.metrics).runs >= 1,
         "the supervisor's sweep must be counted, so an operator can see the worker is alive"
     );
     assert!(

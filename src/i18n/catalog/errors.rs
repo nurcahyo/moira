@@ -12,14 +12,34 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         description: "Generic client-side request validation or shape errors.",
     },
     I18nEntry {
+        key: "moira.error.configuration_error",
+        default_message: "The service configuration is invalid.",
+        description: "Used when Moira cannot start or serve a request because a configuration value is missing or invalid (for example, telemetry export enabled without an endpoint).",
+    },
+    I18nEntry {
         key: "moira.error.conflict",
         default_message: "The request could not be completed because it conflicts with existing state.",
         description: "Used when a resource or operation cannot proceed because of a state conflict.",
     },
     I18nEntry {
+        key: "moira.error.database_error",
+        default_message: "A database error occurred.",
+        description: "Used when a database operation fails unexpectedly while serving a request.",
+    },
+    I18nEntry {
+        key: "moira.error.database_unavailable",
+        default_message: "The database is temporarily unavailable.",
+        description: "Used when Moira cannot reach or use its database, for example when a required database connection is not configured.",
+    },
+    I18nEntry {
         key: "moira.error.forbidden",
         default_message: "You do not have permission to perform this action.",
         description: "Used when the caller is authenticated but not authorized.",
+    },
+    I18nEntry {
+        key: "moira.error.http_client_error",
+        default_message: "An outbound HTTP request failed.",
+        description: "Used when Moira's own HTTP client fails to complete a request to a dependency, distinct from the more specific upstream provider conditions.",
     },
     I18nEntry {
         key: "moira.error.idempotency_conflict",
@@ -62,6 +82,11 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         description: "Used when a caller must back off and retry later.",
     },
     I18nEntry {
+        key: "moira.error.redis_error",
+        default_message: "A cache service error occurred.",
+        description: "Used when a Redis operation fails unexpectedly while serving a request.",
+    },
+    I18nEntry {
         key: "moira.error.request_timeout",
         default_message: "The request timed out before it could be completed.",
         description: "Used when the server-side request timeout elapses before the handler produces a response.",
@@ -80,6 +105,11 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         key: "moira.error.upstream_bad_response",
         default_message: "The upstream service returned an invalid response.",
         description: "Used when a dependency responds with an unexpected payload or status.",
+    },
+    I18nEntry {
+        key: "moira.error.upstream_error",
+        default_message: "The upstream provider request failed.",
+        description: "Used when a call to an upstream provider fails in a way not covered by the more specific upstream_bad_response, upstream_timeout, or upstream_unavailable conditions.",
     },
     I18nEntry {
         key: "moira.error.upstream_timeout",

@@ -2,7 +2,11 @@
 
 pub mod mock_openai;
 
-use std::{env, sync::LazyLock, time::Duration};
+use std::{
+    env,
+    sync::{Arc, LazyLock, Mutex as StdMutex, Once},
+    time::Duration,
+};
 
 use moira::{
     app::AppState,
@@ -485,6 +489,125 @@ async fn test_pool() -> Option<PgPool> {
         .expect("lifecycle fixture database connection timed out")
         .expect("connect lifecycle fixture database"),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Log capture (added by plan 05, Module 5 — the leak snapshot suites)
+// ---------------------------------------------------------------------------
+//
+// There was no log-capture precedent anywhere under `tests/` before this: nothing
+// in the repository installed a `tracing` subscriber from a test, so "does a
+// secret reach the logs?" was an unasked question. This is the one shared piece
+// the two leak suites need, so it lives here rather than being duplicated.
+//
+// It installs a **process-global** subscriber, deliberately. The thread-local
+// alternative (`tracing::subscriber::with_default`) sees nothing emitted from a
+// `tokio::spawn`ed task, which is where a large share of Moira's logging happens
+// (the worker supervisor, the JWKS refresher, the streaming supervisor) — a leak
+// suite that silently cannot observe those paths is worse than none. A global
+// default may only be installed once per process; `Once` plus the ignored
+// `set_global_default` error makes a second call a no-op instead of a panic, and
+// each `tests/*.rs` file is its own process.
+//
+// The buffer is cumulative and shared by every test in the binary. That is the
+// intended behaviour for an *absence* assertion: a canary must appear in no
+// event emitted by any test, not merely in the ones a given test triggered.
+
+static LOG_BUFFER: LazyLock<Arc<StdMutex<Vec<u8>>>> =
+    LazyLock::new(|| Arc::new(StdMutex::new(Vec::new())));
+static LOG_CAPTURE_INIT: Once = Once::new();
+
+/// A handle onto the process-global captured `tracing` output.
+#[derive(Clone)]
+pub struct CapturedLogs {
+    buffer: Arc<StdMutex<Vec<u8>>>,
+}
+
+impl CapturedLogs {
+    /// Everything formatted by the subscriber so far, as text.
+    pub fn contents(&self) -> String {
+        let guard = self.buffer.lock().expect("captured log buffer poisoned");
+        String::from_utf8_lossy(guard.as_slice()).into_owned()
+    }
+
+    /// Byte length of the capture buffer.
+    ///
+    /// Used by the suites to assert the capture is **non-empty** before asserting
+    /// a canary is absent from it. An empty buffer makes every absence assertion
+    /// pass vacuously, which is exactly the failure mode a leak suite must not
+    /// have.
+    pub fn len(&self) -> usize {
+        self.buffer
+            .lock()
+            .expect("captured log buffer poisoned")
+            .len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Emits a marker event so a suite can prove the capture pipeline is live
+    /// even if the flows it drives happen to log nothing.
+    pub fn emit_probe(&self, marker: &str) {
+        tracing::info!(probe = %marker, "leak-suite log capture probe");
+    }
+}
+
+struct BufferWriter {
+    buffer: Arc<StdMutex<Vec<u8>>>,
+}
+
+impl std::io::Write for BufferWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut guard = self.buffer.lock().expect("captured log buffer poisoned");
+        guard.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct BufferMakeWriter {
+    buffer: Arc<StdMutex<Vec<u8>>>,
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufferMakeWriter {
+    type Writer = BufferWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        BufferWriter {
+            buffer: self.buffer.clone(),
+        }
+    }
+}
+
+/// Installs (once per process) a `tracing` subscriber that appends every
+/// formatted event to a shared buffer, and returns a handle onto that buffer.
+///
+/// Call this at the top of a test, before any flow is driven. `TRACE` is the
+/// level on purpose — `tower_http`'s `TraceLayer` logs its request/response
+/// events at `DEBUG`, and a leak that only shows up under a verbose operator
+/// filter is still a leak.
+pub fn install_log_capture() -> CapturedLogs {
+    LOG_CAPTURE_INIT.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(BufferMakeWriter {
+                buffer: LOG_BUFFER.clone(),
+            })
+            .with_ansi(false)
+            .with_target(true)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        // A second install in the same process is a no-op, not a failure.
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    });
+    CapturedLogs {
+        buffer: LOG_BUFFER.clone(),
+    }
 }
 
 pub fn public_response_request(route: &str) -> moira::domain::PublicResponseRequest {

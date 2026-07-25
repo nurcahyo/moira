@@ -13,6 +13,7 @@ use tokio::{
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::{
@@ -29,6 +30,7 @@ use crate::{
     },
     error::AppError,
     infra::{
+        metrics::{MetricsRegistry, provider_type_label},
         pg_rows::{credential_type_to_db, scope_type_to_db},
         repositories::{
             AdminRepository, ExecutionAttemptInsert, ExecutionAttemptUpdate, PgAdminRepository,
@@ -491,6 +493,27 @@ impl MoiraExecutionService {
                 };
 
                 let cancellation = events.cancellation();
+                // Execution-attempt span (plan 05, Module 2). Attached with `Instrument`
+                // rather than an `enter()` guard because the attempt body awaits: a guard
+                // held across an await point would re-parent whatever else the runtime
+                // schedules onto this thread.
+                //
+                // Attributes are an explicit whitelist of identifiers and closed-set enum
+                // labels — no prompt text, no request or response body, no credential
+                // material, and nothing `Debug`-formatted. `provider_type` reuses
+                // `provider_type_label` so the span attribute and the metric label cannot
+                // drift apart.
+                let attempt_span = tracing::debug_span!(
+                    "execution_attempt",
+                    attempt_id = %attempt_id,
+                    attempt_number,
+                    execution_id = %command.execution_id,
+                    provider_id = %candidate.provider_id,
+                    provider_model_id = %candidate.provider_model_id,
+                    provider_type = provider_type_label(candidate.provider_type),
+                    model_key = %candidate.model_key,
+                    stream = command.options.stream,
+                );
                 let execution = async {
                     if command.options.stream {
                         execute_rig_stream(
@@ -500,12 +523,18 @@ impl MoiraExecutionService {
                             Duration::from_millis(
                                 candidate.runtime_policy.stream_idle_timeout_ms.max(1) as u64,
                             ),
+                            StreamMetricsContext {
+                                metrics: &self.state.metrics,
+                                provider_type: candidate.provider_type,
+                                attempt_started: started,
+                            },
                         )
                         .await
                     } else {
                         execute_rig_completion(handle.clone(), request).await
                     }
-                };
+                }
+                .instrument(attempt_span);
                 let attempt_timeout =
                     phase_budget(remaining, Duration::from_millis(runtime_policy.timeout_ms));
                 let bounded_by_total_deadline =
@@ -519,6 +548,10 @@ impl MoiraExecutionService {
                 match result {
                     Ok(Ok(output)) => {
                         let latency_ms = elapsed_ms(started);
+                        // Captured on the same basis as `latency_ms` — i.e. the provider call
+                        // itself — so the histogram is not inflated by the terminal
+                        // persistence writes that follow.
+                        let attempt_latency = started.elapsed();
                         // Phase bound: terminal persistence. Unlike the two phases above, an
                         // attempt row already exists in `started` AND the provider call has
                         // already succeeded, so the three writes are bounded as one logical
@@ -637,6 +670,20 @@ impl MoiraExecutionService {
                             .circuits
                             .on_success(candidate.provider_id, candidate.provider_model_id)
                             .await;
+                        // Additive side-effect recording, in the same position and spirit as
+                        // the circuit-breaker call above: no control flow depends on it.
+                        self.state.metrics.record_execution_latency(
+                            candidate.provider_type,
+                            ExecutionStatus::Succeeded,
+                            None,
+                            attempt_latency,
+                        );
+                        self.state.metrics.record_provider_outcome(
+                            candidate.provider_type,
+                            &candidate.model_key,
+                            ExecutionStatus::Succeeded,
+                            None,
+                        );
                         self.audit_runtime_event(
                             &command,
                             "provider.attempt.completed",
@@ -684,6 +731,18 @@ impl MoiraExecutionService {
                                 failure.class,
                             )
                             .await;
+                        self.state.metrics.record_execution_latency(
+                            candidate.provider_type,
+                            execution_status_for_failure(failure.class),
+                            Some(failure.class),
+                            started.elapsed(),
+                        );
+                        self.state.metrics.record_provider_outcome(
+                            candidate.provider_type,
+                            &candidate.model_key,
+                            execution_status_for_failure(failure.class),
+                            Some(failure.class),
+                        );
                         self.complete_failed_attempt(
                             attempt_id,
                             started,
@@ -746,6 +805,18 @@ impl MoiraExecutionService {
                                 failure.class,
                             )
                             .await;
+                        self.state.metrics.record_execution_latency(
+                            candidate.provider_type,
+                            execution_status_for_failure(failure.class),
+                            Some(failure.class),
+                            started.elapsed(),
+                        );
+                        self.state.metrics.record_provider_outcome(
+                            candidate.provider_type,
+                            &candidate.model_key,
+                            execution_status_for_failure(failure.class),
+                            Some(failure.class),
+                        );
                         self.complete_failed_attempt(
                             attempt_id,
                             started,
@@ -1548,11 +1619,34 @@ async fn execute_rig_completion(
     })
 }
 
+/// Everything the streaming path needs to record time-to-first-token, grouped so the
+/// function signature does not grow a three-argument metrics tail.
+struct StreamMetricsContext<'a> {
+    metrics: &'a MetricsRegistry,
+    provider_type: ProviderType,
+    /// The same `Instant` the attempt's `latency_ms` is measured from, so TTFT is always
+    /// less than or equal to the attempt latency recorded for the same attempt.
+    attempt_started: Instant,
+}
+
+/// Records TTFT exactly once per attempt, on the first output-bearing chunk.
+fn record_first_token(recorded: &mut bool, stream_metrics: &StreamMetricsContext<'_>) {
+    if *recorded {
+        return;
+    }
+    *recorded = true;
+    stream_metrics.metrics.record_ttft(
+        stream_metrics.provider_type,
+        stream_metrics.attempt_started.elapsed(),
+    );
+}
+
 async fn execute_rig_stream(
     handle: Arc<RuntimeModelHandle>,
     request: CompletionRequest,
     events: &mut EventCollector,
     idle_timeout: Duration,
+    stream_metrics: StreamMetricsContext<'_>,
 ) -> Result<ExecutionRunOutput, ExecutionFailure> {
     if let Some(failure) = events.delivery_failure() {
         return Err(failure);
@@ -1566,6 +1660,10 @@ async fn execute_rig_stream(
     let mut usage = UsageSummary::default();
     let mut provider_request_id = None;
     let mut committed = false;
+    // TTFT is recorded on the first *output-bearing* chunk, which is exactly the point
+    // `committed` first flips. Usage and final-metadata chunks are not output and must not
+    // count as a first token.
+    let mut ttft_recorded = false;
 
     loop {
         let item = tokio::select! {
@@ -1612,6 +1710,7 @@ async fn execute_rig_stream(
                     .await?;
                 text.push_str(&delta);
                 committed = true;
+                record_first_token(&mut ttft_recorded, &stream_metrics);
                 events.mark_output_committed();
             }
             RuntimeStreamItem::ToolCallStarted {
@@ -1631,6 +1730,7 @@ async fn execute_rig_stream(
                     )
                     .await?;
                 committed = true;
+                record_first_token(&mut ttft_recorded, &stream_metrics);
                 events.mark_output_committed();
             }
             RuntimeStreamItem::ToolCallDelta {
@@ -1650,6 +1750,7 @@ async fn execute_rig_stream(
                     )
                     .await?;
                 committed = true;
+                record_first_token(&mut ttft_recorded, &stream_metrics);
                 events.mark_output_committed();
             }
             RuntimeStreamItem::UsageUpdated {
