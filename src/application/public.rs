@@ -3,10 +3,6 @@ use std::{pin::Pin, time::Duration};
 use async_stream::stream;
 use chrono::Utc;
 use futures_util::Stream;
-use rig_core::{
-    OneOrMany,
-    completion::{Message, message::UserContent},
-};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -19,15 +15,15 @@ use crate::{
     },
     domain::{
         ApplicationExecutionPolicyPutRequest, ApplicationExecutionPolicyRecord, AuditLogInsert,
-        AuditResult, CallerRuntimeIdentity, ExecutionCommand, ExecutionFailure,
-        ExecutionFailureClass, ExecutionOptions, ExecutionOutcome, ExecutionQuery, ExecutionStatus,
-        IdempotencyRecord, ListResponse, OpenAiResponseCompatRequest, PublicCapabilities,
-        PublicContentPart, PublicConversationRef, PublicExecutionSummary, PublicInputMessage,
-        PublicMessageRole, PublicModelRef, PublicModelResource, PublicOutputContentPart,
-        PublicOutputItem, PublicResponse, PublicResponseFormat, PublicResponseRecord,
-        PublicResponseRequest, PublicResponseStatus, PublicRouteRef, PublicRouteResource,
-        PublicSseEnvelope, PublicUsageRecord, PublicUsageSummary, RuntimeEventEnvelope,
-        RuntimeEventType, UsageQuery,
+        AuditResult, CallerRuntimeIdentity, DomainMessage, DomainMessageContent, DomainMessageRole,
+        ExecutionCommand, ExecutionFailure, ExecutionFailureClass, ExecutionOptions,
+        ExecutionOutcome, ExecutionQuery, ExecutionStatus, IdempotencyRecord, ListResponse,
+        OpenAiResponseCompatRequest, PublicCapabilities, PublicContentPart, PublicConversationRef,
+        PublicExecutionSummary, PublicInputMessage, PublicMessageRole, PublicModelRef,
+        PublicModelResource, PublicOutputContentPart, PublicOutputItem, PublicResponse,
+        PublicResponseFormat, PublicResponseRecord, PublicResponseRequest, PublicResponseStatus,
+        PublicRouteRef, PublicRouteResource, PublicSseEnvelope, PublicUsageRecord,
+        PublicUsageSummary, RuntimeEventEnvelope, RuntimeEventType, UsageQuery,
     },
     error::AppError,
     infra::repositories::{
@@ -1544,7 +1540,7 @@ fn validate_image_url(value: &str) -> Result<(), AppError> {
 fn map_public_messages(
     request: &PublicResponseRequest,
     policy: &ApplicationExecutionPolicyRecord,
-) -> Result<Vec<Message>, AppError> {
+) -> Result<Vec<DomainMessage>, AppError> {
     request
         .input
         .iter()
@@ -1555,7 +1551,7 @@ fn map_public_messages(
 fn map_public_message(
     message: &PublicInputMessage,
     policy: &ApplicationExecutionPolicyRecord,
-) -> Result<Message, AppError> {
+) -> Result<DomainMessage, AppError> {
     match message.role {
         PublicMessageRole::System | PublicMessageRole::Developer => {
             if !policy.caller_system_instructions_allowed {
@@ -1564,26 +1560,30 @@ fn map_public_message(
                     "system and developer roles are not allowed",
                 ));
             }
-            Ok(Message::system(text_only_content(message)?))
+            Ok(DomainMessage::system(text_only_content(message)?))
         }
         PublicMessageRole::User => {
-            let parts = message
+            let content = message
                 .content
                 .iter()
                 .map(|part| match part {
-                    PublicContentPart::InputText { text } => Ok(UserContent::text(text.clone())),
-                    PublicContentPart::InputImage { image_url } => {
-                        Ok(UserContent::image_url(image_url.clone(), None, None))
+                    PublicContentPart::InputText { text } => {
+                        DomainMessageContent::Text { text: text.clone() }
                     }
+                    PublicContentPart::InputImage { image_url } => DomainMessageContent::ImageUrl {
+                        url: image_url.clone(),
+                    },
                 })
-                .collect::<Result<Vec<_>, AppError>>()?;
-            Ok(Message::User {
-                content: OneOrMany::many(parts).map_err(|_| {
-                    AppError::unprocessable("invalid_execution_request", "user message is empty")
-                })?,
-            })
+                .collect::<Vec<_>>();
+            if content.is_empty() {
+                return Err(AppError::unprocessable(
+                    "invalid_execution_request",
+                    "user message is empty",
+                ));
+            }
+            Ok(DomainMessage::new(DomainMessageRole::User, content))
         }
-        PublicMessageRole::Assistant => Ok(Message::assistant(text_only_content(message)?)),
+        PublicMessageRole::Assistant => Ok(DomainMessage::assistant(text_only_content(message)?)),
         PublicMessageRole::Tool => Err(AppError::unprocessable(
             "unsupported_message_role",
             "tool messages require an approved tool registry",
