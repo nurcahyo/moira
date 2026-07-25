@@ -123,11 +123,18 @@ impl<'a> RuntimeAdminService<'a> {
         self.runtime_repo.get_route_definition(id).await
     }
 
+    /// `expected_version` is the caller's `If-Match`, handed to the repository untouched.
+    ///
+    /// There is deliberately no comparison here (plan 06b): the only place the expectation can
+    /// be evaluated safely is under the row lock, in the same transaction as the write. A check
+    /// at this layer would read on a different pooled connection and re-open the window it is
+    /// supposed to close. The same holds for every method below taking `expected_version`.
     pub async fn patch_route_definition(
         &self,
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         request: RouteDefinitionPatchRequest,
     ) -> Result<RouteDefinitionRecord, AppError> {
         self.state.authz.require(actor, "moira:routes:write")?;
@@ -139,7 +146,7 @@ impl<'a> RuntimeAdminService<'a> {
         }
         let record = self
             .runtime_repo
-            .patch_route_definition(id, &request)
+            .patch_route_definition(id, expected_version, &request)
             .await?;
         self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
@@ -159,9 +166,12 @@ impl<'a> RuntimeAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
     ) -> Result<(), AppError> {
         self.state.authz.require(actor, "moira:routes:delete")?;
-        self.runtime_repo.soft_delete_route_definition(id).await?;
+        self.runtime_repo
+            .soft_delete_route_definition(id, expected_version)
+            .await?;
         self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
@@ -179,12 +189,17 @@ impl<'a> RuntimeAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         enabled: bool,
     ) -> Result<RouteDefinitionRecord, AppError> {
         self.state.authz.require(actor, "moira:routes:write")?;
         let record = self
             .runtime_repo
-            .set_route_definition_status(id, if enabled { "active" } else { "disabled" })
+            .set_route_definition_status(
+                id,
+                expected_version,
+                if enabled { "active" } else { "disabled" },
+            )
             .await?;
         self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
@@ -281,6 +296,7 @@ impl<'a> RuntimeAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         request: RoutingPolicyPatchRequest,
     ) -> Result<RoutingPolicyRecord, AppError> {
         self.state
@@ -295,7 +311,10 @@ impl<'a> RuntimeAdminService<'a> {
         );
         self.ensure_provider_model_belongs_to_provider(provider_id, provider_model_id)
             .await?;
-        let record = self.runtime_repo.patch_routing_policy(id, &request).await?;
+        let record = self
+            .runtime_repo
+            .patch_routing_policy(id, expected_version, &request)
+            .await?;
         self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
@@ -332,11 +351,14 @@ impl<'a> RuntimeAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
     ) -> Result<(), AppError> {
         self.state
             .authz
             .require(actor, "moira:routing-policies:delete")?;
-        self.runtime_repo.soft_delete_routing_policy(id).await?;
+        self.runtime_repo
+            .soft_delete_routing_policy(id, expected_version)
+            .await?;
         self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
@@ -354,6 +376,7 @@ impl<'a> RuntimeAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         enabled: bool,
     ) -> Result<RoutingPolicyRecord, AppError> {
         self.state
@@ -361,7 +384,11 @@ impl<'a> RuntimeAdminService<'a> {
             .require(actor, "moira:routing-policies:write")?;
         let record = self
             .runtime_repo
-            .set_routing_policy_status(id, if enabled { "active" } else { "disabled" })
+            .set_routing_policy_status(
+                id,
+                expected_version,
+                if enabled { "active" } else { "disabled" },
+            )
             .await?;
         self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
@@ -459,6 +486,7 @@ impl<'a> RuntimeAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         request: AgentProfilePatchRequest,
     ) -> Result<AgentProfileRecord, AppError> {
         self.state
@@ -475,7 +503,10 @@ impl<'a> RuntimeAdminService<'a> {
             request.memory_policy.as_ref().unwrap_or(&Value::Null),
             request.metadata.as_ref().unwrap_or(&Value::Null),
         )?;
-        let record = self.runtime_repo.patch_agent_profile(id, &request).await?;
+        let record = self
+            .runtime_repo
+            .patch_agent_profile(id, expected_version, &request)
+            .await?;
         self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
@@ -494,11 +525,14 @@ impl<'a> RuntimeAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
     ) -> Result<(), AppError> {
         self.state
             .authz
             .require(actor, "moira:agent-profiles:delete")?;
-        self.runtime_repo.soft_delete_agent_profile(id).await?;
+        self.runtime_repo
+            .soft_delete_agent_profile(id, expected_version)
+            .await?;
         self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
@@ -516,6 +550,7 @@ impl<'a> RuntimeAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         enabled: bool,
     ) -> Result<AgentProfileRecord, AppError> {
         self.state
@@ -523,7 +558,11 @@ impl<'a> RuntimeAdminService<'a> {
             .require(actor, "moira:agent-profiles:write")?;
         let record = self
             .runtime_repo
-            .set_agent_profile_status(id, if enabled { "active" } else { "disabled" })
+            .set_agent_profile_status(
+                id,
+                expected_version,
+                if enabled { "active" } else { "disabled" },
+            )
             .await?;
         self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(

@@ -104,6 +104,7 @@ impl<'a> JwtIssuerAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         request: TrustedJwtIssuerPatchRequest,
     ) -> Result<TrustedJwtIssuerRecord, AppError> {
         self.state.authz.require(actor, "moira:jwt-issuers:write")?;
@@ -113,7 +114,10 @@ impl<'a> JwtIssuerAdminService<'a> {
         if let Some(allowed) = &request.allowed_algorithms {
             validate_jwt_algorithm_list(allowed)?;
         }
-        let record = self.repo.patch_trusted_jwt_issuer(id, &request).await?;
+        let record = self
+            .repo
+            .patch_trusted_jwt_issuer(id, expected_version, &request)
+            .await?;
         audit_success(
             &self.repo,
             actor,
@@ -132,13 +136,17 @@ impl<'a> JwtIssuerAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         enabled: bool,
     ) -> Result<TrustedJwtIssuerRecord, AppError> {
         self.state
             .authz
             .require(actor, "moira:jwt-issuers:delete")?;
         let status = if enabled { "active" } else { "disabled" };
-        let record = self.repo.set_trusted_jwt_issuer_status(id, status).await?;
+        let record = self
+            .repo
+            .set_trusted_jwt_issuer_status(id, expected_version, status)
+            .await?;
         audit_success(
             &self.repo,
             actor,
@@ -222,9 +230,12 @@ impl<'a> JwtIssuerAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
     ) -> Result<(), AppError> {
         self.state.authz.require(actor, "moira:jwt-issuers:write")?;
-        self.repo.soft_delete_trusted_jwt_issuer(id).await?;
+        self.repo
+            .soft_delete_trusted_jwt_issuer(id, expected_version)
+            .await?;
         audit_success(
             &self.repo,
             actor,

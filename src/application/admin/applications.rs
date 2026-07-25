@@ -107,6 +107,7 @@ impl<'a> ApplicationAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         request: ApplicationPatchRequest,
     ) -> Result<ApplicationRecord, AppError> {
         self.state
@@ -121,7 +122,10 @@ impl<'a> ApplicationAdminService<'a> {
         if let Some(display_name) = &request.display_name {
             require_non_empty("display_name", display_name)?;
         }
-        let record = self.repo.patch_application(id, &request).await?;
+        let record = self
+            .repo
+            .patch_application(id, expected_version, &request)
+            .await?;
         audit_success(
             &self.repo,
             actor,
@@ -140,11 +144,14 @@ impl<'a> ApplicationAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
     ) -> Result<(), AppError> {
         self.state
             .authz
             .require(actor, "moira:applications:delete")?;
-        self.repo.soft_delete_application(id).await?;
+        self.repo
+            .soft_delete_application(id, expected_version)
+            .await?;
         audit_success(
             &self.repo,
             actor,
@@ -162,6 +169,7 @@ impl<'a> ApplicationAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         enabled: bool,
     ) -> Result<ApplicationRecord, AppError> {
         self.state
@@ -169,7 +177,11 @@ impl<'a> ApplicationAdminService<'a> {
             .require(actor, "moira:applications:write")?;
         let record = self
             .repo
-            .set_application_status(id, if enabled { "active" } else { "disabled" })
+            .set_application_status(
+                id,
+                expected_version,
+                if enabled { "active" } else { "disabled" },
+            )
             .await?;
         self.state.runtime_cache.invalidate_all().await;
         audit_success(

@@ -122,10 +122,11 @@ impl<'a> AdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         request: ApplicationPatchRequest,
     ) -> Result<ApplicationRecord, AppError> {
         self.applications
-            .patch_application(actor, ctx, id, request)
+            .patch_application(actor, ctx, id, expected_version, request)
             .await
     }
 
@@ -134,8 +135,11 @@ impl<'a> AdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
     ) -> Result<(), AppError> {
-        self.applications.delete_application(actor, ctx, id).await
+        self.applications
+            .delete_application(actor, ctx, id, expected_version)
+            .await
     }
 
     pub async fn set_application_enabled(
@@ -143,10 +147,11 @@ impl<'a> AdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         enabled: bool,
     ) -> Result<ApplicationRecord, AppError> {
         self.applications
-            .set_application_enabled(actor, ctx, id, enabled)
+            .set_application_enabled(actor, ctx, id, expected_version, enabled)
             .await
     }
 
@@ -176,9 +181,12 @@ impl<'a> AdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         request: ProviderPatchRequest,
     ) -> Result<ProviderRecord, AppError> {
-        self.providers.patch_provider(actor, ctx, id, request).await
+        self.providers
+            .patch_provider(actor, ctx, id, expected_version, request)
+            .await
     }
 
     pub async fn delete_provider(
@@ -186,8 +194,11 @@ impl<'a> AdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
     ) -> Result<(), AppError> {
-        self.providers.delete_provider(actor, ctx, id).await
+        self.providers
+            .delete_provider(actor, ctx, id, expected_version)
+            .await
     }
 
     pub async fn set_provider_enabled(
@@ -195,10 +206,11 @@ impl<'a> AdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         enabled: bool,
     ) -> Result<ProviderRecord, AppError> {
         self.providers
-            .set_provider_enabled(actor, ctx, id, enabled)
+            .set_provider_enabled(actor, ctx, id, expected_version, enabled)
             .await
     }
 
@@ -230,10 +242,11 @@ impl<'a> AdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         model_id: Uuid,
+        expected_version: i64,
         request: ProviderModelPatchRequest,
     ) -> Result<ProviderModelRecord, AppError> {
         self.providers
-            .patch_provider_model(actor, ctx, model_id, request)
+            .patch_provider_model(actor, ctx, model_id, expected_version, request)
             .await
     }
 
@@ -250,9 +263,10 @@ impl<'a> AdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         model_id: Uuid,
+        expected_version: i64,
     ) -> Result<(), AppError> {
         self.providers
-            .delete_provider_model(actor, ctx, model_id)
+            .delete_provider_model(actor, ctx, model_id, expected_version)
             .await
     }
 
@@ -261,10 +275,11 @@ impl<'a> AdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         model_id: Uuid,
+        expected_version: i64,
         enabled: bool,
     ) -> Result<ProviderModelRecord, AppError> {
         self.providers
-            .set_provider_model_enabled(actor, ctx, model_id, enabled)
+            .set_provider_model_enabled(actor, ctx, model_id, expected_version, enabled)
             .await
     }
 
@@ -311,10 +326,11 @@ impl<'a> AdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         request: CredentialPatchRequest,
     ) -> Result<CredentialRecord, AppError> {
         self.credentials
-            .patch_credential(actor, ctx, id, request)
+            .patch_credential(actor, ctx, id, expected_version, request)
             .await
     }
 
@@ -345,10 +361,11 @@ impl<'a> AdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         enabled: bool,
     ) -> Result<CredentialRecord, AppError> {
         self.credentials
-            .set_credential_enabled(actor, ctx, id, enabled)
+            .set_credential_enabled(actor, ctx, id, expected_version, enabled)
             .await
     }
 
@@ -357,8 +374,11 @@ impl<'a> AdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
     ) -> Result<(), AppError> {
-        self.credentials.delete_credential(actor, ctx, id).await
+        self.credentials
+            .delete_credential(actor, ctx, id, expected_version)
+            .await
     }
 
     pub async fn delete_user_credential(
@@ -367,9 +387,10 @@ impl<'a> AdminService<'a> {
         ctx: &RequestContext,
         external_user_id: &str,
         id: Uuid,
+        expected_version: i64,
     ) -> Result<(), AppError> {
         self.credentials
-            .delete_user_credential(actor, ctx, external_user_id, id)
+            .delete_user_credential(actor, ctx, external_user_id, id, expected_version)
             .await
     }
 
@@ -485,10 +506,11 @@ impl<'a> AdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         request: TrustedJwtIssuerPatchRequest,
     ) -> Result<TrustedJwtIssuerRecord, AppError> {
         self.jwt_issuers
-            .patch_trusted_jwt_issuer(actor, ctx, id, request)
+            .patch_trusted_jwt_issuer(actor, ctx, id, expected_version, request)
             .await
     }
 
@@ -497,10 +519,11 @@ impl<'a> AdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         enabled: bool,
     ) -> Result<TrustedJwtIssuerRecord, AppError> {
         self.jwt_issuers
-            .set_trusted_jwt_issuer_enabled(actor, ctx, id, enabled)
+            .set_trusted_jwt_issuer_enabled(actor, ctx, id, expected_version, enabled)
             .await
     }
 
@@ -520,9 +543,10 @@ impl<'a> AdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
     ) -> Result<(), AppError> {
         self.jwt_issuers
-            .delete_trusted_jwt_issuer(actor, ctx, id)
+            .delete_trusted_jwt_issuer(actor, ctx, id, expected_version)
             .await
     }
 

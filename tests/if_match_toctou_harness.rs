@@ -1,6 +1,7 @@
-//! Failing-first evidence for the `If-Match` TOCTOU (plan 06 module 17 → plan **06b**).
+//! Failing-first evidence for the `If-Match` TOCTOU (plan 06 module 17 → plan **06b**),
+//! kept as the regression guard now that plan 06b has closed it.
 //!
-//! Every versioned admin mutation except two validates `If-Match` like this
+//! Every versioned admin mutation except two used to validate `If-Match` like this
 //! (`src/http/admin.rs`, 33 sites):
 //!
 //! ```text
@@ -38,23 +39,30 @@
 //! | `src/http/admin.rs:199` | `patch_application` | `AdminService` | `PgAdminRepository::patch_application` |
 //! | `src/http/admin.rs:1724` | `patch_route_definition` | `RuntimeAdminService` | `PgRuntimeRepository::patch_route_definition` |
 //!
-//! # These tests are `#[ignore]`d, and they are supposed to fail
+//! # These tests were `#[ignore]`d, and they were supposed to fail
 //!
-//! They are not aspirational and they are not flaky. Run them today and each reports **two**
-//! `200`s where the contract allows one, with the losing writer's `display_name` gone from the
-//! database and the version advanced twice. That is the lost update, observed end to end
-//! through the real HTTP surface.
+//! They were never aspirational and never flaky. Run against any commit before plan 06b and
+//! each reports **two** `200`s where the contract allows one, with the losing writer's
+//! `display_name` gone from the database and the version advanced twice:
 //!
-//! They are `#[ignore]`d only so `cargo test` stays green while the fix is sequenced into
-//! plan 06b — module 17 deliberately delivers the evidence and not the fix, because adding
-//! `expected_version` to the service signatures contradicts plan 06 module 6's requirement
-//! that `AdminService`'s 46 signatures are provably unchanged. Plan 06b removes both
-//! `#[ignore]` attributes as its definition of done. Do not delete these tests, and do not
-//! relax the assertions to make them pass; the assertion *is* the specification.
+//! ```text
+//!   left: (2, 0)
+//!  right: (1, 1)
+//! ```
+//!
+//! That is the lost update, observed end to end through the real HTTP surface. They carried
+//! `#[ignore]` only so `cargo test` stayed green while the fix was sequenced into plan 06b —
+//! module 17 deliberately delivered the evidence and not the fix.
+//!
+//! **Plan 06b landed the fix and removed both `#[ignore]` attributes with the assertions
+//! untouched.** The comparison now happens inside the write's own transaction, against a row
+//! held by `select … for update`, in `PgAdminRepository` and `PgRuntimeRepository` alike. Do
+//! not delete these tests, and do not relax the assertions; the assertion *is* the
+//! specification, and it is now a regression guard rather than a bug report.
 //!
 //! ```bash
 //! export MOIRA_TEST_DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/moira'
-//! cargo test --test if_match_toctou_harness -- --ignored --nocapture
+//! cargo test --test if_match_toctou_harness
 //! ```
 //!
 //! # How the race is opened
@@ -281,15 +289,14 @@ async fn assert_exactly_one_writer_wins(
 
 /// `AdminService` representative — 21 of the 33 sites reach the database this way.
 ///
-/// `patch_application` (`src/http/admin.rs:190`) reads the version through
-/// `AdminService::get_application`, compares it in `ensure_version`, then calls
-/// `AdminService::patch_application` → `PgAdminRepository::patch_application`
-/// (`src/infra/repositories/admin.rs:866`), whose `UPDATE` has no `version` predicate and runs
-/// on a connection the read never touched.
+/// `patch_application` used to read the version through `AdminService::get_application`,
+/// compare it in a since-deleted `ensure_version` helper, then call
+/// `AdminService::patch_application` → `PgAdminRepository::patch_application`, whose `UPDATE`
+/// had no `version` predicate and ran on a connection the read never touched.
 ///
-/// Expected failure today: `(successes, conflicts)` is `(2, 0)`.
+/// It now passes `expected_version` straight down, and the repository locks the row and
+/// compares inside the same transaction as the write.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "plan 06b closes the If-Match TOCTOU; see plans/06b-if-match-toctou.md"]
 async fn concurrent_application_patches_with_the_same_version_must_yield_one_success_and_one_409() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -314,14 +321,10 @@ async fn concurrent_application_patches_with_the_same_version_must_yield_one_suc
 /// `RuntimeAdminService` representative — the other 12 sites.
 ///
 /// Same defect, different service, different repository, and — per plan 06 module 17 §17.2 —
-/// a different idempotency scheme, which is why plan 06b must convert this family separately
-/// and only after module 16 unifies `actor_fingerprint`.
-/// `patch_route_definition` (`src/http/admin.rs:1715`) reaches
-/// `PgRuntimeRepository::patch_route_definition` (`src/infra/repositories/runtime.rs:338`).
-///
-/// Expected failure today: `(successes, conflicts)` is `(2, 0)`.
+/// a different idempotency scheme, which is why plan 06b converted this family separately.
+/// `patch_route_definition` reaches `PgRuntimeRepository::patch_route_definition`, which now
+/// takes the same row lock and carries the same `and version = $N` predicate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "plan 06b closes the If-Match TOCTOU; see plans/06b-if-match-toctou.md"]
 async fn concurrent_route_patches_with_the_same_version_must_yield_one_success_and_one_409() {
     let Some(fixture) = Fixture::new().await else {
         return;

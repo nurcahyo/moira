@@ -102,17 +102,27 @@ pub trait AdminRepository {
         limit: i64,
     ) -> Result<Vec<ApplicationRecord>, AppError>;
     async fn get_application(&self, id: Uuid) -> Result<ApplicationRecord, AppError>;
+    /// `expected_version` is the caller's `If-Match`. Implementations must compare it against a
+    /// row locked inside the same transaction as the write — never against a version read on a
+    /// separate connection, which is the lost update this parameter exists to close. A mismatch
+    /// is `409 resource_version_conflict`; an absent row stays `404`.
     async fn patch_application(
         &self,
         id: Uuid,
+        expected_version: i64,
         request: &ApplicationPatchRequest,
     ) -> Result<ApplicationRecord, AppError>;
     async fn set_application_status(
         &self,
         id: Uuid,
+        expected_version: i64,
         status: &str,
     ) -> Result<ApplicationRecord, AppError>;
-    async fn soft_delete_application(&self, id: Uuid) -> Result<(), AppError>;
+    async fn soft_delete_application(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+    ) -> Result<(), AppError>;
 
     async fn create_provider(
         &self,
@@ -129,12 +139,17 @@ pub trait AdminRepository {
     async fn patch_provider(
         &self,
         id: Uuid,
+        expected_version: i64,
         request: &ProviderPatchRequest,
         normalized_base_url: Option<Option<String>>,
     ) -> Result<ProviderRecord, AppError>;
-    async fn set_provider_status(&self, id: Uuid, status: &str)
-    -> Result<ProviderRecord, AppError>;
-    async fn soft_delete_provider(&self, id: Uuid) -> Result<(), AppError>;
+    async fn set_provider_status(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+        status: &str,
+    ) -> Result<ProviderRecord, AppError>;
+    async fn soft_delete_provider(&self, id: Uuid, expected_version: i64) -> Result<(), AppError>;
 
     async fn create_provider_model(
         &self,
@@ -151,15 +166,21 @@ pub trait AdminRepository {
     async fn patch_provider_model(
         &self,
         id: Uuid,
+        expected_version: i64,
         request: &ProviderModelPatchRequest,
     ) -> Result<ProviderModelRecord, AppError>;
     async fn get_provider_model(&self, id: Uuid) -> Result<ProviderModelRecord, AppError>;
     async fn set_provider_model_status(
         &self,
         id: Uuid,
+        expected_version: i64,
         status: &str,
     ) -> Result<ProviderModelRecord, AppError>;
-    async fn soft_delete_provider_model(&self, id: Uuid) -> Result<(), AppError>;
+    async fn soft_delete_provider_model(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+    ) -> Result<(), AppError>;
 
     async fn create_credential(
         &self,
@@ -185,6 +206,7 @@ pub trait AdminRepository {
     async fn patch_credential(
         &self,
         id: Uuid,
+        expected_version: i64,
         request: &CredentialPatchRequest,
     ) -> Result<CredentialRecord, AppError>;
     async fn rotate_credential(
@@ -197,14 +219,17 @@ pub trait AdminRepository {
     async fn set_credential_status(
         &self,
         id: Uuid,
+        expected_version: i64,
         status: &str,
     ) -> Result<CredentialRecord, AppError>;
     async fn mark_credential_validated(&self, id: Uuid) -> Result<CredentialRecord, AppError>;
-    async fn soft_delete_credential(&self, id: Uuid) -> Result<(), AppError>;
+    async fn soft_delete_credential(&self, id: Uuid, expected_version: i64)
+    -> Result<(), AppError>;
     async fn soft_delete_user_credential(
         &self,
         external_user_id: &str,
         id: Uuid,
+        expected_version: i64,
     ) -> Result<(), AppError>;
 
     async fn create_system_key(
@@ -263,15 +288,21 @@ pub trait AdminRepository {
     async fn patch_trusted_jwt_issuer(
         &self,
         id: Uuid,
+        expected_version: i64,
         request: &TrustedJwtIssuerPatchRequest,
     ) -> Result<TrustedJwtIssuerRecord, AppError>;
     async fn set_trusted_jwt_issuer_status(
         &self,
         id: Uuid,
+        expected_version: i64,
         status: &str,
     ) -> Result<TrustedJwtIssuerRecord, AppError>;
     async fn touch_trusted_jwt_issuer(&self, id: Uuid) -> Result<TrustedJwtIssuerRecord, AppError>;
-    async fn soft_delete_trusted_jwt_issuer(&self, id: Uuid) -> Result<(), AppError>;
+    async fn soft_delete_trusted_jwt_issuer(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+    ) -> Result<(), AppError>;
 
     async fn insert_audit(&self, insert: AuditLogInsert) -> Result<(), AppError>;
     /// Note the sort key: `audit_logs` orders by `occurred_at`, not `created_at` (it has
@@ -866,8 +897,18 @@ impl AdminRepository for PgAdminRepository {
     async fn patch_application(
         &self,
         id: Uuid,
+        expected_version: i64,
         request: &ApplicationPatchRequest,
     ) -> Result<ApplicationRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            APPLICATION_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("application {id}"),
+        )
+        .await?;
         let row = sqlx::query(
             r#"
             update applications
@@ -876,7 +917,7 @@ impl AdminRepository for PgAdminRepository {
                 display_name = coalesce($4, display_name),
                 updated_at = now()
                 , metadata = coalesce($5, metadata)
-            where id = $1 and deleted_at is null
+            where id = $1 and deleted_at is null and version = $6
             returning id, external_application_id, application_slug, display_name, status,
                       metadata, created_at, updated_at, deleted_at, version
             "#,
@@ -886,44 +927,78 @@ impl AdminRepository for PgAdminRepository {
         .bind(&request.application_slug)
         .bind(&request.display_name)
         .bind(&request.metadata)
-        .fetch_optional(&self.pool)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("application {id}")))?;
-        application_record_from_row(&row)
+        .ok_or_else(version_conflict)?;
+        let record = application_record_from_row(&row)?;
+        tx.commit().await?;
+        Ok(record)
     }
 
     async fn set_application_status(
         &self,
         id: Uuid,
+        expected_version: i64,
         status: &str,
     ) -> Result<ApplicationRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            APPLICATION_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("application {id}"),
+        )
+        .await?;
         let row = sqlx::query(
             r#"
             update applications
             set status = $2,
                 deleted_at = case when $2 = 'deleted' then coalesce(deleted_at, now()) else deleted_at end,
                 updated_at = now()
-            where id = $1 and deleted_at is null
+            where id = $1 and deleted_at is null and version = $3
             returning id, external_application_id, application_slug, display_name, status,
                       metadata, created_at, updated_at, deleted_at, version
             "#,
         )
         .bind(id)
         .bind(status)
-        .fetch_optional(&self.pool)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("application {id}")))?;
-        application_record_from_row(&row)
+        .ok_or_else(version_conflict)?;
+        let record = application_record_from_row(&row)?;
+        tx.commit().await?;
+        Ok(record)
     }
 
-    async fn soft_delete_application(&self, id: Uuid) -> Result<(), AppError> {
+    async fn soft_delete_application(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+    ) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            APPLICATION_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("application {id}"),
+        )
+        .await?;
         let result = sqlx::query(
-            "update applications set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null",
+            "update applications set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null and version = $2",
         )
         .bind(id)
-        .execute(&self.pool)
+        .bind(current_version)
+        .execute(&mut *tx)
         .await?;
-        ensure_affected(result.rows_affected(), format!("application {id}"))
+        if result.rows_affected() == 0 {
+            return Err(version_conflict());
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn create_provider(
@@ -995,11 +1070,21 @@ impl AdminRepository for PgAdminRepository {
     async fn patch_provider(
         &self,
         id: Uuid,
+        expected_version: i64,
         request: &ProviderPatchRequest,
         normalized_base_url: Option<Option<String>>,
     ) -> Result<ProviderRecord, AppError> {
         let update_base_url = normalized_base_url.is_some();
         let base_url = normalized_base_url.flatten();
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            PROVIDER_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("provider {id}"),
+        )
+        .await?;
         let row = sqlx::query(
             r#"
             update providers
@@ -1007,7 +1092,7 @@ impl AdminRepository for PgAdminRepository {
                 base_url = case when $3 then $4 else base_url end,
                 metadata = coalesce($5, metadata),
                 updated_at = now()
-            where id = $1 and deleted_at is null
+            where id = $1 and deleted_at is null and version = $6
             returning id, provider_type, display_name, base_url, status, metadata,
                       created_at, updated_at, deleted_at, version
             "#,
@@ -1017,44 +1102,74 @@ impl AdminRepository for PgAdminRepository {
         .bind(update_base_url)
         .bind(&base_url)
         .bind(&request.metadata)
-        .fetch_optional(&self.pool)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("provider {id}")))?;
-        provider_record_from_row(&row)
+        .ok_or_else(version_conflict)?;
+        let record = provider_record_from_row(&row)?;
+        tx.commit().await?;
+        Ok(record)
     }
 
     async fn set_provider_status(
         &self,
         id: Uuid,
+        expected_version: i64,
         status: &str,
     ) -> Result<ProviderRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            PROVIDER_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("provider {id}"),
+        )
+        .await?;
         let row = sqlx::query(
             r#"
             update providers
             set status = $2,
                 deleted_at = case when $2 = 'deleted' then coalesce(deleted_at, now()) else deleted_at end,
                 updated_at = now()
-            where id = $1 and deleted_at is null
+            where id = $1 and deleted_at is null and version = $3
             returning id, provider_type, display_name, base_url, status, metadata,
                       created_at, updated_at, deleted_at, version
             "#,
         )
         .bind(id)
         .bind(status)
-        .fetch_optional(&self.pool)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("provider {id}")))?;
-        provider_record_from_row(&row)
+        .ok_or_else(version_conflict)?;
+        let record = provider_record_from_row(&row)?;
+        tx.commit().await?;
+        Ok(record)
     }
 
-    async fn soft_delete_provider(&self, id: Uuid) -> Result<(), AppError> {
+    async fn soft_delete_provider(&self, id: Uuid, expected_version: i64) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            PROVIDER_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("provider {id}"),
+        )
+        .await?;
         let result = sqlx::query(
-            "update providers set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null",
+            "update providers set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null and version = $2",
         )
         .bind(id)
-        .execute(&self.pool)
+        .bind(current_version)
+        .execute(&mut *tx)
         .await?;
-        ensure_affected(result.rows_affected(), format!("provider {id}"))
+        if result.rows_affected() == 0 {
+            return Err(version_conflict());
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn create_provider_model(
@@ -1112,15 +1227,25 @@ impl AdminRepository for PgAdminRepository {
     async fn patch_provider_model(
         &self,
         id: Uuid,
+        expected_version: i64,
         request: &ProviderModelPatchRequest,
     ) -> Result<ProviderModelRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            PROVIDER_MODEL_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("provider model {id}"),
+        )
+        .await?;
         let row = sqlx::query(
             r#"
             update provider_models
             set display_name = coalesce($2, display_name),
                 capabilities = coalesce($3, capabilities),
                 updated_at = now()
-            where id = $1 and deleted_at is null
+            where id = $1 and deleted_at is null and version = $4
             returning id, provider_id, model_key, display_name, capabilities, status,
                       created_at, updated_at, deleted_at, version
             "#,
@@ -1128,10 +1253,13 @@ impl AdminRepository for PgAdminRepository {
         .bind(id)
         .bind(&request.display_name)
         .bind(&request.capabilities)
-        .fetch_optional(&self.pool)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("provider model {id}")))?;
-        provider_model_record_from_row(&row)
+        .ok_or_else(version_conflict)?;
+        let record = provider_model_record_from_row(&row)?;
+        tx.commit().await?;
+        Ok(record)
     }
 
     async fn get_provider_model(&self, id: Uuid) -> Result<ProviderModelRecord, AppError> {
@@ -1153,35 +1281,66 @@ impl AdminRepository for PgAdminRepository {
     async fn set_provider_model_status(
         &self,
         id: Uuid,
+        expected_version: i64,
         status: &str,
     ) -> Result<ProviderModelRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            PROVIDER_MODEL_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("provider model {id}"),
+        )
+        .await?;
         let row = sqlx::query(
             r#"
             update provider_models
             set status = $2,
                 deleted_at = case when $2 = 'deleted' then coalesce(deleted_at, now()) else deleted_at end,
                 updated_at = now()
-            where id = $1 and deleted_at is null
+            where id = $1 and deleted_at is null and version = $3
             returning id, provider_id, model_key, display_name, capabilities, status,
                       created_at, updated_at, deleted_at, version
             "#,
         )
         .bind(id)
         .bind(status)
-        .fetch_optional(&self.pool)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("provider model {id}")))?;
-        provider_model_record_from_row(&row)
+        .ok_or_else(version_conflict)?;
+        let record = provider_model_record_from_row(&row)?;
+        tx.commit().await?;
+        Ok(record)
     }
 
-    async fn soft_delete_provider_model(&self, id: Uuid) -> Result<(), AppError> {
+    async fn soft_delete_provider_model(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+    ) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            PROVIDER_MODEL_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("provider model {id}"),
+        )
+        .await?;
         let result = sqlx::query(
-            "update provider_models set status = 'disabled', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null",
+            "update provider_models set status = 'disabled', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null and version = $2",
         )
         .bind(id)
-        .execute(&self.pool)
+        .bind(current_version)
+        .execute(&mut *tx)
         .await?;
-        ensure_affected(result.rows_affected(), format!("provider model {id}"))
+        if result.rows_affected() == 0 {
+            return Err(version_conflict());
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn create_credential(
@@ -1309,8 +1468,18 @@ impl AdminRepository for PgAdminRepository {
     async fn patch_credential(
         &self,
         id: Uuid,
+        expected_version: i64,
         request: &CredentialPatchRequest,
     ) -> Result<CredentialRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            CREDENTIAL_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("provider credential {id}"),
+        )
+        .await?;
         let row = sqlx::query(
             r#"
             update provider_credentials
@@ -1319,7 +1488,7 @@ impl AdminRepository for PgAdminRepository {
                 expires_at = coalesce($4, expires_at),
                 metadata = coalesce($5, metadata),
                 updated_at = now()
-            where id = $1 and deleted_at is null
+            where id = $1 and deleted_at is null and version = $6
             returning id, provider_id, credential_type, scope_type, external_tenant_id,
                       application_id, external_user_id, encryption_algorithm,
                       encryption_version, secret_fingerprint, masked_secret, status,
@@ -1332,10 +1501,13 @@ impl AdminRepository for PgAdminRepository {
         .bind(request.priority)
         .bind(request.expires_at)
         .bind(&request.metadata)
-        .fetch_optional(&self.pool)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("provider credential {id}")))?;
-        credential_record_from_row(&row)
+        .ok_or_else(version_conflict)?;
+        let record = credential_record_from_row(&row)?;
+        tx.commit().await?;
+        Ok(record)
     }
 
     async fn rotate_credential(
@@ -1382,15 +1554,25 @@ impl AdminRepository for PgAdminRepository {
     async fn set_credential_status(
         &self,
         id: Uuid,
+        expected_version: i64,
         status: &str,
     ) -> Result<CredentialRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            CREDENTIAL_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("provider credential {id}"),
+        )
+        .await?;
         let row = sqlx::query(
             r#"
             update provider_credentials
             set status = $2,
                 deleted_at = case when $2 = 'deleted' then coalesce(deleted_at, now()) else deleted_at end,
                 updated_at = now()
-            where id = $1 and deleted_at is null
+            where id = $1 and deleted_at is null and version = $3
             returning id, provider_id, credential_type, scope_type, external_tenant_id,
                       application_id, external_user_id, encryption_algorithm,
                       encryption_version, secret_fingerprint, masked_secret, status,
@@ -1400,10 +1582,13 @@ impl AdminRepository for PgAdminRepository {
         )
         .bind(id)
         .bind(status)
-        .fetch_optional(&self.pool)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("provider credential {id}")))?;
-        credential_record_from_row(&row)
+        .ok_or_else(version_conflict)?;
+        let record = credential_record_from_row(&row)?;
+        tx.commit().await?;
+        Ok(record)
     }
 
     async fn mark_credential_validated(&self, id: Uuid) -> Result<CredentialRecord, AppError> {
@@ -1426,29 +1611,68 @@ impl AdminRepository for PgAdminRepository {
         credential_record_from_row(&row)
     }
 
-    async fn soft_delete_credential(&self, id: Uuid) -> Result<(), AppError> {
+    async fn soft_delete_credential(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+    ) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            CREDENTIAL_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("provider credential {id}"),
+        )
+        .await?;
         let result = sqlx::query(
-            "update provider_credentials set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null",
+            "update provider_credentials set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null and version = $2",
         )
         .bind(id)
-        .execute(&self.pool)
+        .bind(current_version)
+        .execute(&mut *tx)
         .await?;
-        ensure_affected(result.rows_affected(), format!("provider credential {id}"))
+        if result.rows_affected() == 0 {
+            return Err(version_conflict());
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn soft_delete_user_credential(
         &self,
         external_user_id: &str,
         id: Uuid,
+        expected_version: i64,
     ) -> Result<(), AppError> {
-        let result = sqlx::query(
-            "update provider_credentials set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and external_user_id = $2 and deleted_at is null",
+        let mut tx = self.pool.begin().await?;
+        // Scoped by `external_user_id` as well as `id`: a credential owned by a different user
+        // must stay a 404 here, exactly as it was before the lock was introduced, rather than
+        // becoming a version conflict that confirms the row exists.
+        let current_version = sqlx::query_scalar::<_, i64>(
+            "select version from provider_credentials where id = $1 and external_user_id = $2 and deleted_at is null for update",
         )
         .bind(id)
         .bind(external_user_id)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("provider credential {id}")))?;
+        if current_version != expected_version {
+            return Err(version_conflict());
+        }
+        let result = sqlx::query(
+            "update provider_credentials set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and external_user_id = $2 and deleted_at is null and version = $3",
+        )
+        .bind(id)
+        .bind(external_user_id)
+        .bind(current_version)
+        .execute(&mut *tx)
         .await?;
-        ensure_affected(result.rows_affected(), format!("provider credential {id}"))
+        if result.rows_affected() == 0 {
+            return Err(version_conflict());
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn create_system_key(
@@ -1709,8 +1933,18 @@ impl AdminRepository for PgAdminRepository {
     async fn patch_trusted_jwt_issuer(
         &self,
         id: Uuid,
+        expected_version: i64,
         request: &TrustedJwtIssuerPatchRequest,
     ) -> Result<TrustedJwtIssuerRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            TRUSTED_JWT_ISSUER_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("trusted JWT issuer {id}"),
+        )
+        .await?;
         let row = sqlx::query(
             r#"
             update trusted_jwt_issuers
@@ -1728,7 +1962,7 @@ impl AdminRepository for PgAdminRepository {
                 clock_skew_seconds = coalesce($13, clock_skew_seconds),
                 allow_delegation = coalesce($14, allow_delegation),
                 updated_at = now()
-            where id = $1 and deleted_at is null
+            where id = $1 and deleted_at is null and version = $15
             returning id, issuer, jwks_url, expected_audiences, allowed_algorithms,
                       subject_claim, user_id_claim, tenant_id_claim, application_id_claim,
                       roles_claim, scopes_claim, delegated_user_claim, delegated_tenant_claim,
@@ -1750,24 +1984,37 @@ impl AdminRepository for PgAdminRepository {
         .bind(&request.delegated_tenant_claim)
         .bind(request.clock_skew_seconds)
         .bind(request.allow_delegation)
-        .fetch_optional(&self.pool)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("trusted JWT issuer {id}")))?;
-        crate::infra::pg_rows::trusted_jwt_issuer_record_from_row(&row)
+        .ok_or_else(version_conflict)?;
+        let record = crate::infra::pg_rows::trusted_jwt_issuer_record_from_row(&row)?;
+        tx.commit().await?;
+        Ok(record)
     }
 
     async fn set_trusted_jwt_issuer_status(
         &self,
         id: Uuid,
+        expected_version: i64,
         status: &str,
     ) -> Result<TrustedJwtIssuerRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            TRUSTED_JWT_ISSUER_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("trusted JWT issuer {id}"),
+        )
+        .await?;
         let row = sqlx::query(
             r#"
             update trusted_jwt_issuers
             set status = $2,
                 deleted_at = case when $2 = 'deleted' then coalesce(deleted_at, now()) else deleted_at end,
                 updated_at = now()
-            where id = $1 and deleted_at is null
+            where id = $1 and deleted_at is null and version = $3
             returning id, issuer, jwks_url, expected_audiences, allowed_algorithms,
                       subject_claim, user_id_claim, tenant_id_claim, application_id_claim,
                       roles_claim, scopes_claim, delegated_user_claim, delegated_tenant_claim,
@@ -1777,10 +2024,13 @@ impl AdminRepository for PgAdminRepository {
         )
         .bind(id)
         .bind(status)
-        .fetch_optional(&self.pool)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("trusted JWT issuer {id}")))?;
-        crate::infra::pg_rows::trusted_jwt_issuer_record_from_row(&row)
+        .ok_or_else(version_conflict)?;
+        let record = crate::infra::pg_rows::trusted_jwt_issuer_record_from_row(&row)?;
+        tx.commit().await?;
+        Ok(record)
     }
 
     async fn touch_trusted_jwt_issuer(&self, id: Uuid) -> Result<TrustedJwtIssuerRecord, AppError> {
@@ -1803,14 +2053,32 @@ impl AdminRepository for PgAdminRepository {
         crate::infra::pg_rows::trusted_jwt_issuer_record_from_row(&row)
     }
 
-    async fn soft_delete_trusted_jwt_issuer(&self, id: Uuid) -> Result<(), AppError> {
+    async fn soft_delete_trusted_jwt_issuer(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+    ) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            TRUSTED_JWT_ISSUER_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("trusted JWT issuer {id}"),
+        )
+        .await?;
         let result = sqlx::query(
-            "update trusted_jwt_issuers set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null",
+            "update trusted_jwt_issuers set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null and version = $2",
         )
         .bind(id)
-        .execute(&self.pool)
+        .bind(current_version)
+        .execute(&mut *tx)
         .await?;
-        ensure_affected(result.rows_affected(), format!("trusted JWT issuer {id}"))
+        if result.rows_affected() == 0 {
+            return Err(version_conflict());
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn insert_audit(&self, insert: AuditLogInsert) -> Result<(), AppError> {
@@ -2205,6 +2473,58 @@ fn ensure_affected(rows_affected: u64, resource: String) -> Result<(), AppError>
     } else {
         Ok(())
     }
+}
+
+/// The `409` a stale `If-Match` produces. Identical code and message to the ones the HTTP
+/// layer used to emit from its own pre-read comparison, so moving the check down here is
+/// invisible on the wire.
+fn version_conflict() -> AppError {
+    AppError::conflict(
+        "resource_version_conflict",
+        "resource version does not match If-Match",
+    )
+}
+
+/// The row-lock statements paired with `lock_and_match_version`, one per versioned admin
+/// entity. Each takes the row's id as `$1` and every one of them ends in `for update`; a
+/// variant that does not is a silent reopening of the write window.
+const APPLICATION_VERSION_FOR_UPDATE: &str =
+    "select version from applications where id = $1 and deleted_at is null for update";
+const PROVIDER_VERSION_FOR_UPDATE: &str =
+    "select version from providers where id = $1 and deleted_at is null for update";
+const PROVIDER_MODEL_VERSION_FOR_UPDATE: &str =
+    "select version from provider_models where id = $1 and deleted_at is null for update";
+const CREDENTIAL_VERSION_FOR_UPDATE: &str =
+    "select version from provider_credentials where id = $1 and deleted_at is null for update";
+const TRUSTED_JWT_ISSUER_VERSION_FOR_UPDATE: &str =
+    "select version from trusted_jwt_issuers where id = $1 and deleted_at is null for update";
+
+/// Evaluate the caller's `If-Match` expectation where it is actually safe: on a row already
+/// locked by `select … for update`, inside the same transaction as the write that follows.
+///
+/// `select_version_sql` must select `version` for the target row and end in `for update`, with
+/// `$1` bound to `id`. Returns the locked version so the caller can carry `and version = $N`
+/// on the write itself.
+///
+/// The absent-row branch stays `NotFound` and only a genuine mismatch becomes `409`. Folding
+/// the predicate into the existing `UPDATE` without this pre-read would collapse both onto the
+/// update's own zero-row branch and turn a stale `If-Match` into a `404`.
+async fn lock_and_match_version(
+    conn: &mut sqlx::PgConnection,
+    select_version_sql: &str,
+    id: Uuid,
+    expected_version: i64,
+    resource: String,
+) -> Result<i64, AppError> {
+    let current_version = sqlx::query_scalar::<_, i64>(select_version_sql)
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(|| AppError::NotFound(resource))?;
+    if current_version != expected_version {
+        return Err(version_conflict());
+    }
+    Ok(current_version)
 }
 
 #[cfg(test)]

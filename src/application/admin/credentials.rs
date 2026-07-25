@@ -164,6 +164,7 @@ impl<'a> CredentialAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         request: CredentialPatchRequest,
     ) -> Result<CredentialRecord, AppError> {
         self.state.authz.require(actor, "moira:credentials:write")?;
@@ -176,7 +177,10 @@ impl<'a> CredentialAdminService<'a> {
                 "credential priority must be non-negative".to_string(),
             ));
         }
-        let record = self.repo.patch_credential(id, &request).await?;
+        let record = self
+            .repo
+            .patch_credential(id, expected_version, &request)
+            .await?;
         self.state.runtime_cache.invalidate_all().await;
         audit_success(
             &self.repo,
@@ -305,6 +309,7 @@ impl<'a> CredentialAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         enabled: bool,
     ) -> Result<CredentialRecord, AppError> {
         self.state
@@ -313,7 +318,10 @@ impl<'a> CredentialAdminService<'a> {
         let existing = self.repo.get_credential(id).await?;
         authorize_credential_record(actor, &existing)?;
         let status = if enabled { "active" } else { "disabled" };
-        let record = self.repo.set_credential_status(id, status).await?;
+        let record = self
+            .repo
+            .set_credential_status(id, expected_version, status)
+            .await?;
         self.state.runtime_cache.invalidate_all().await;
         audit_success(
             &self.repo,
@@ -337,13 +345,16 @@ impl<'a> CredentialAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
     ) -> Result<(), AppError> {
         self.state
             .authz
             .require(actor, "moira:credentials:delete")?;
         let existing = self.repo.get_credential(id).await?;
         authorize_credential_record(actor, &existing)?;
-        self.repo.soft_delete_credential(id).await?;
+        self.repo
+            .soft_delete_credential(id, expected_version)
+            .await?;
         self.state.runtime_cache.invalidate_all().await;
         audit_success(
             &self.repo,
@@ -363,13 +374,14 @@ impl<'a> CredentialAdminService<'a> {
         ctx: &RequestContext,
         external_user_id: &str,
         id: Uuid,
+        expected_version: i64,
     ) -> Result<(), AppError> {
         self.state
             .authz
             .require(actor, "moira:credentials:delete")?;
         ExternalUserId::parse(external_user_id.to_string())?;
         self.repo
-            .soft_delete_user_credential(external_user_id, id)
+            .soft_delete_user_credential(external_user_id, id, expected_version)
             .await?;
         self.state.runtime_cache.invalidate_all().await;
         audit_success(
