@@ -322,31 +322,47 @@ pub(crate) fn validate_application_identifiers(
     Ok(())
 }
 
-/// The single definition of the actor fingerprint used by the **admin-command envelope**
-/// (`AdminCommandRunner` / `AdminCommandSpec`), covering the ten admin commands and the RAG
-/// write commands in `crate::application::conversation`.
+/// **The** actor fingerprint. One formula, crate-wide, for every writer of
+/// `idempotency_records` (plan 06, Module 16 / P2-15).
 ///
-/// It is part of the `idempotency_records` unique index and of the advisory-lock key, so a
-/// second, divergent copy would silently break cross-actor replay isolation. `pub(crate)`
-/// exists so `crate::application::conversation` can reuse this exact formula
-/// (`plans/02b-idempotency-replay.md` §5); do not copy the body anywhere.
+/// The fingerprint is the actor half of the unique index
+/// `(idempotency_key_hash, actor_fingerprint, operation)`
+/// (`migrations/0003_security_foundation.sql:360-361`) and an input to
+/// `advisory_lock_key` (`src/infra/repositories/admin.rs`). It is what makes an
+/// `Idempotency-Key` scoped to the caller who issued it: two actors that hash to the same
+/// value can replay each other's stored responses. Every identity field omitted from it is
+/// therefore a cross-actor replay hole, not a missed optimisation.
 ///
-/// **Warning — this is not the only fingerprint formula writing to `idempotency_records`.**
-/// `crate::application::runtime_admin` holds a separate, *weaker* private copy (its own
-/// `actor_fingerprint`, `src/application/runtime_admin.rs`) which hashes only
-/// `{actor_type, subject, api_key_id}`. It omits the seven identity fields this function
-/// includes — `trusted_jwt_issuer_id`, `internal_application_id`, `application_id`,
-/// `tenant_id`, `external_user_id`, `external_tenant_id`, `delegated_subject` — yet it
-/// feeds the **same** ledger table for the runtime-policy routes (`route.create`,
-/// `routing_policy.create`, `agent_profile.create`, `provider_runtime_policy.*`).
-/// Consequence, measured: two actors differing only in trusted-JWT issuer or in tenant
-/// produce *different* fingerprints here but *identical* fingerprints there, so those
-/// routes do not isolate replay across issuers or tenants.
+/// Until plan 06 there were three formulas writing that one index — this 10-field one, a
+/// 3-field one in `crate::application::runtime_admin`, and a 4-field one in
+/// `crate::application::public`. The two weaker copies made `route.create`,
+/// `routing_policy.create`, `agent_profile.create`, `provider_runtime_policy.*` and
+/// `response.create` blind to the caller's issuer and tenant. They are gone; what survives
+/// of them is a **read-only** legacy value in each of those two modules
+/// (`legacy_actor_fingerprint`, `legacy_public_actor_fingerprint`), used solely to keep
+/// pre-deploy ledger rows replayable, never written. See `plans/06-…` §16.3.
 ///
-/// That is known, pre-existing debt, deliberately out of scope for plan 02b ("No change to
-/// `runtime_admin.rs`'s idempotency scheme") and deferred to
-/// `plans/06-architecture-test-hygiene.md`, which owns unifying the two schemes. Do not
-/// assume a fingerprint found in `idempotency_records` was produced by this function.
+/// ## Why each field is in it
+///
+/// | Field | Why it must discriminate |
+/// |---|---|
+/// | `actor_type` | A system key, a consumer key, a trusted JWT and a dev admin are different principals even when every other field coincides. |
+/// | `subject` | The caller's own identity inside its authentication scheme. |
+/// | `api_key_id` | *Which* credential authenticated. A revoked-and-reissued key must not inherit the old key's ledger. |
+/// | `trusted_jwt_issuer_id` | Two issuers can mint the same `sub`. Without this, one tenant's IdP replays another's responses — the headline P2-15 hole. |
+/// | `internal_application_id` | Moira's own `applications` row; the authorization boundary most resources hang off. |
+/// | `application_id` | The caller-**asserted** application claim (a string), distinct from the resolved internal UUID above. An unresolved claim must not collide with a resolved one. |
+/// | `tenant_id` | The tenant claim as presented. |
+/// | `external_tenant_id` | The second, independently-populated tenant channel; multi-tenant isolation is exactly what replay scoping is for. |
+/// | `external_user_id` | The end user the call is made for. |
+/// | `delegated_subject` | On-behalf-of delegation: the delegate and the delegator are different actors for replay purposes. |
+///
+/// Serialised as a `serde_json` tuple rather than a `format!` string so no field can be
+/// made ambiguous by a separator character appearing inside another field's value, then
+/// reduced by `secret_fingerprint` so the ledger stores no caller identity in the clear.
+///
+/// `pub(crate)` exists so `crate::application::{conversation, runtime_admin, public}` reuse
+/// this exact formula; do not copy the body anywhere.
 pub(crate) fn actor_fingerprint(actor: &Actor) -> String {
     let identity = serde_json::to_vec(&(
         actor.actor_type,
@@ -1107,5 +1123,229 @@ mod tests {
             "conversation_command_spec must embed the exact fingerprint produced by \
              admin::actor_fingerprint, not a divergent copy"
         );
+    }
+
+    /// A trusted-JWT actor whose only distinguishing field is set by the caller.
+    fn trusted_actor() -> Actor {
+        use crate::security::ActorType;
+
+        Actor {
+            actor_type: ActorType::TrustedJwt,
+            subject: Some("shared-subject".to_string()),
+            trusted_jwt_issuer_id: Some(Uuid::nil()),
+            api_key_id: None,
+            ..Actor::default()
+        }
+    }
+
+    // The three tests below are the unit-level statement of the property Module 16 exists
+    // to restore. Each varies exactly one identity field and requires the fingerprint to
+    // move. Run against the pre-unification 3-field runtime-admin formula
+    // (`{actor_type, subject, api_key_id}`) all three fail, because none of the fields they
+    // vary is an input to it; that is the bug, reproduced. The permanent, mechanical
+    // version of that proof lives next to each surviving legacy formula —
+    // `runtime_admin::tests::the_legacy_runtime_admin_fingerprint_collided_across_issuer_tenant_and_delegation`
+    // and `public::tests::the_legacy_public_fingerprint_collided_across_tenant_and_delegation`
+    // assert the old formulas collide *and* that the unified one does not, in one test.
+
+    #[test]
+    fn actor_fingerprint_distinguishes_actors_differing_only_by_trusted_jwt_issuer() {
+        // Two IdPs can mint the same `sub`. If the issuer does not reach the fingerprint,
+        // issuer A's Idempotency-Key replays issuer B's stored response.
+        let first = trusted_actor();
+        let second = Actor {
+            trusted_jwt_issuer_id: Some(Uuid::now_v7()),
+            ..first.clone()
+        };
+
+        assert_ne!(
+            actor_fingerprint(&first),
+            actor_fingerprint(&second),
+            "trusted_jwt_issuer_id must partition the replay ledger"
+        );
+    }
+
+    #[test]
+    fn actor_fingerprint_distinguishes_actors_differing_only_by_tenant() {
+        // Both tenant channels are checked: `tenant_id` (the claim as presented) and
+        // `external_tenant_id` (the resolved one). They are populated independently, so a
+        // formula covering only one of them still leaks across tenants on the other.
+        let base = trusted_actor();
+
+        let tenant_claim = Actor {
+            tenant_id: Some("tenant-a".to_string()),
+            ..base.clone()
+        };
+        let other_tenant_claim = Actor {
+            tenant_id: Some("tenant-b".to_string()),
+            ..base.clone()
+        };
+        assert_ne!(
+            actor_fingerprint(&tenant_claim),
+            actor_fingerprint(&other_tenant_claim),
+            "tenant_id must partition the replay ledger"
+        );
+
+        let external_tenant = Actor {
+            external_tenant_id: Some("tenant-a".to_string()),
+            ..base.clone()
+        };
+        let other_external_tenant = Actor {
+            external_tenant_id: Some("tenant-b".to_string()),
+            ..base
+        };
+        assert_ne!(
+            actor_fingerprint(&external_tenant),
+            actor_fingerprint(&other_external_tenant),
+            "external_tenant_id must partition the replay ledger"
+        );
+    }
+
+    #[test]
+    fn actor_fingerprint_distinguishes_actors_differing_only_by_delegated_subject() {
+        // On-behalf-of: the same authenticated caller acting for two different end users
+        // must not share one replay ledger entry.
+        let first = Actor {
+            delegated_subject: Some("user-a".to_string()),
+            ..trusted_actor()
+        };
+        let second = Actor {
+            delegated_subject: Some("user-b".to_string()),
+            ..first.clone()
+        };
+
+        assert_ne!(
+            actor_fingerprint(&first),
+            actor_fingerprint(&second),
+            "delegated_subject must partition the replay ledger"
+        );
+    }
+
+    #[test]
+    fn every_identity_field_on_the_actor_moves_the_fingerprint() {
+        // The generalisation of the three tests above, and the guard against the next
+        // identity field being added to `Actor` without being added here. Each mutation
+        // varies exactly one field away from a fully-populated baseline; every one must
+        // produce a distinct fingerprint, and all ten must be distinct from each other.
+        use crate::security::ActorType;
+
+        let base = Actor {
+            actor_type: ActorType::TrustedJwt,
+            subject: Some("subject".to_string()),
+            tenant_id: Some("tenant".to_string()),
+            application_id: Some("app-claim".to_string()),
+            external_user_id: Some("external-user".to_string()),
+            external_tenant_id: Some("external-tenant".to_string()),
+            internal_application_id: Some(Uuid::nil()),
+            delegated_subject: Some("delegate".to_string()),
+            roles: vec!["role".to_string()],
+            scopes: vec!["moira:admin".to_string()],
+            trusted_jwt_issuer_id: Some(Uuid::nil()),
+            api_key_id: Some(Uuid::nil()),
+        };
+        let other_uuid = Uuid::now_v7();
+
+        let mutations: Vec<(&str, Actor)> = vec![
+            (
+                "actor_type",
+                Actor {
+                    actor_type: ActorType::ConsumerKey,
+                    ..base.clone()
+                },
+            ),
+            (
+                "subject",
+                Actor {
+                    subject: Some("other".to_string()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "api_key_id",
+                Actor {
+                    api_key_id: Some(other_uuid),
+                    ..base.clone()
+                },
+            ),
+            (
+                "trusted_jwt_issuer_id",
+                Actor {
+                    trusted_jwt_issuer_id: Some(other_uuid),
+                    ..base.clone()
+                },
+            ),
+            (
+                "internal_application_id",
+                Actor {
+                    internal_application_id: Some(other_uuid),
+                    ..base.clone()
+                },
+            ),
+            (
+                "application_id",
+                Actor {
+                    application_id: Some("other".to_string()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "tenant_id",
+                Actor {
+                    tenant_id: Some("other".to_string()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "external_user_id",
+                Actor {
+                    external_user_id: Some("other".to_string()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "external_tenant_id",
+                Actor {
+                    external_tenant_id: Some("other".to_string()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "delegated_subject",
+                Actor {
+                    delegated_subject: Some("other".to_string()),
+                    ..base.clone()
+                },
+            ),
+        ];
+
+        let baseline = actor_fingerprint(&base);
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(baseline.clone());
+        for (field, mutated) in mutations {
+            let fingerprint = actor_fingerprint(&mutated);
+            assert_ne!(
+                fingerprint, baseline,
+                "changing `{field}` alone must change the fingerprint"
+            );
+            assert!(
+                seen.insert(fingerprint),
+                "`{field}` collided with another field's mutation — the tuple encoding is \
+                 ambiguous"
+            );
+        }
+    }
+
+    #[test]
+    fn roles_and_scopes_are_deliberately_outside_the_fingerprint() {
+        // Authorization state is not identity. Granting a caller a new scope mid-window
+        // must not orphan its in-flight Idempotency-Keys and silently re-execute them.
+        let base = trusted_actor();
+        let re_scoped = Actor {
+            roles: vec!["new-role".to_string()],
+            scopes: vec!["moira:admin".to_string()],
+            ..base.clone()
+        };
+
+        assert_eq!(actor_fingerprint(&base), actor_fingerprint(&re_scoped));
     }
 }

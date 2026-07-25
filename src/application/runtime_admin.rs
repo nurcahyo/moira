@@ -7,7 +7,10 @@ use uuid::Uuid;
 
 use crate::{
     app::AppState,
-    application::RequestContext,
+    // The one crate-wide fingerprint formula (plan 06, Module 16). This module previously
+    // had its own 3-field copy writing the same `idempotency_records` unique index; what
+    // remains of it is `legacy_actor_fingerprint`, which is read-only.
+    application::{RequestContext, admin::actor_fingerprint},
     domain::{
         AgentProfileCreateRequest, AgentProfilePatchRequest, AgentProfileRecord, AuditLogInsert,
         AuditResult, CursorScope, IdempotencyRecord, ListCursor, ListResponse, Pagination,
@@ -674,25 +677,52 @@ impl<'a> RuntimeAdminService<'a> {
         let Some(key) = &ctx.idempotency_key else {
             return Ok(None);
         };
-        let actor_fingerprint = actor_fingerprint(actor);
         let hasher = &self.state.idempotency_hasher;
         let request_bytes = normalized_request_bytes(request)?;
-        // Dual lookup: the key hash is the index key, so a row written before the switch to
-        // keyed hashing (plan 03, P1-1) is unreachable by the versioned hash alone.
-        let mut record = self
-            .admin_repo
-            .get_idempotency_record(&hasher.hash(key.as_bytes()), &actor_fingerprint, operation)
-            .await?;
-        if record.is_none() {
-            record = self
-                .admin_repo
-                .get_idempotency_record(
-                    &hasher.legacy_hash(key.as_bytes()),
-                    &actor_fingerprint,
-                    operation,
-                )
-                .await?;
+
+        // Two independent dimensions of the unique index have changed under deployed rows,
+        // so the read path sweeps both and the write path emits only the current pair:
+        //
+        //   * `idempotency_key_hash` — unkeyed SHA-256 → keyed HMAC (plan 03, P1-1);
+        //   * `actor_fingerprint`    — this module's 3-field formula → the crate-wide
+        //     10-field one (plan 06, Module 16 / P2-15).
+        //
+        // Three of the four combinations are reachable in a live ledger. The fourth
+        // (current fingerprint + legacy key hash) is not — a row carrying the pre-plan-03
+        // key hash necessarily predates plan 06 too, so it also carries the legacy
+        // fingerprint — but it is still probed, because it costs one indexed lookup on a
+        // path that has already missed twice and dropping it would narrow replay coverage
+        // on an argument about deploy ordering rather than about the data.
+        //
+        // Order is load-bearing: the current fingerprint is tried first so a post-deploy
+        // row always wins, and a legacy hit is only ever *read*. `record_idempotency`
+        // writes `actor_fingerprint(actor)` unconditionally, so the legacy value can never
+        // re-enter the ledger and the fallback drains as rows expire.
+        //
+        // TODO(plan-07): delete `legacy_actor_fingerprint` and the second half of this
+        // sweep once every ledger row written before plan 06 shipped has expired.
+        // `idempotency_records.expires_at` is set 24h ahead (`record_idempotency` below),
+        // so the window closes 24h after the deploy that carries Module 16; the earliest
+        // safe removal date is therefore deploy-date + 1 day.
+        let actor_fingerprint = actor_fingerprint(actor);
+        let legacy_actor_fingerprint = legacy_actor_fingerprint(actor);
+        let key_hashes = [
+            hasher.hash(key.as_bytes()),
+            hasher.legacy_hash(key.as_bytes()),
+        ];
+        let mut record = None;
+        'sweep: for fingerprint in [&actor_fingerprint, &legacy_actor_fingerprint] {
+            for key_hash in &key_hashes {
+                record = self
+                    .admin_repo
+                    .get_idempotency_record(key_hash, fingerprint, operation)
+                    .await?;
+                if record.is_some() {
+                    break 'sweep;
+                }
+            }
         }
+
         let Some(record) = record else {
             return Ok(None);
         };
@@ -754,7 +784,20 @@ struct ProviderRuntimePolicyIdempotencyRequest<'a> {
     request: &'a ProviderRuntimePolicyPutRequest,
 }
 
-fn actor_fingerprint(actor: &Actor) -> String {
+/// The fingerprint this module wrote **before** plan 06 unified the three formulas.
+///
+/// Read-only, and deliberately not `pub`: `idempotency_replay` consults it so a ledger row
+/// written by the previous release still replays, and nothing else may call it. It hashes
+/// only `{actor_type, subject, api_key_id}`, which is why two actors differing solely by
+/// trusted-JWT issuer, tenant, application or delegated subject used to collide here — the
+/// P2-15 hole. `tests::the_legacy_runtime_admin_fingerprint_collided_across_issuer_tenant_and_delegation`
+/// pins that collision so this stays a documented historical value rather than something a
+/// later reader mistakes for a second live formula.
+///
+/// TODO(plan-07): delete together with the legacy half of `idempotency_replay`'s sweep,
+/// once 24h (the `expires_at` window set in `record_idempotency`) have elapsed since the
+/// deploy carrying plan 06 Module 16.
+fn legacy_actor_fingerprint(actor: &Actor) -> String {
     secret_fingerprint(
         format!(
             "{:?}:{}:{}",
@@ -1078,5 +1121,102 @@ mod tests {
             ),
             (current_provider_id, replacement_provider_model_id)
         );
+    }
+
+    /// The bug Module 16 fixes, pinned in one test so it cannot be re-argued.
+    ///
+    /// Plan 06 §16.4 asks for the unified formula's isolation tests to be "observed failing
+    /// against the old 3-field formula before that formula was deleted". A transcript of a
+    /// deleted test proves that once, to whoever read it. This proves it on every `cargo
+    /// test` run, for as long as the legacy value survives, and it proves the *pair* of
+    /// claims that matter together: the old formula collided, and the one now writing the
+    /// ledger does not.
+    ///
+    /// Each case varies exactly one identity field. All four were invisible to
+    /// `{actor_type, subject, api_key_id}`, so on the pre-plan-06 code every
+    /// `create_route_definition`, `create_routing_policy`, `create_agent_profile` and
+    /// `put_provider_runtime_policy` call by actor A could replay actor B's stored
+    /// response given the same `Idempotency-Key`.
+    #[test]
+    fn the_legacy_runtime_admin_fingerprint_collided_across_issuer_tenant_and_delegation() {
+        use crate::security::ActorType;
+
+        let base = Actor {
+            actor_type: ActorType::TrustedJwt,
+            subject: Some("shared-subject".to_string()),
+            api_key_id: None,
+            trusted_jwt_issuer_id: Some(Uuid::nil()),
+            ..Actor::default()
+        };
+
+        let variants: [(&str, Actor); 5] = [
+            (
+                "trusted_jwt_issuer_id",
+                Actor {
+                    trusted_jwt_issuer_id: Some(Uuid::now_v7()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "tenant_id",
+                Actor {
+                    tenant_id: Some("other-tenant".to_string()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "external_tenant_id",
+                Actor {
+                    external_tenant_id: Some("other-tenant".to_string()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "internal_application_id",
+                Actor {
+                    internal_application_id: Some(Uuid::now_v7()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "delegated_subject",
+                Actor {
+                    delegated_subject: Some("other-user".to_string()),
+                    ..base.clone()
+                },
+            ),
+        ];
+
+        for (field, variant) in variants {
+            assert_eq!(
+                legacy_actor_fingerprint(&base),
+                legacy_actor_fingerprint(&variant),
+                "the pre-plan-06 formula is supposed to be blind to `{field}` — if this \
+                 stops holding, the legacy fallback is reading a value production never \
+                 wrote and pre-deploy rows will not replay"
+            );
+            assert_ne!(
+                actor_fingerprint(&base),
+                actor_fingerprint(&variant),
+                "the unified formula must isolate replay across `{field}`"
+            );
+        }
+    }
+
+    /// The fallback is a *read* concession, not a second write format. If the two formulas
+    /// ever agreed, `idempotency_replay`'s second sweep pass would be redundant; if
+    /// `record_idempotency` ever emitted the legacy value, the hole would be back.
+    #[test]
+    fn the_legacy_and_unified_fingerprints_are_distinct_values() {
+        use crate::security::ActorType;
+
+        let actor = Actor {
+            actor_type: ActorType::SystemKey,
+            subject: Some("system".to_string()),
+            api_key_id: Some(Uuid::now_v7()),
+            ..Actor::default()
+        };
+
+        assert_ne!(actor_fingerprint(&actor), legacy_actor_fingerprint(&actor));
     }
 }
