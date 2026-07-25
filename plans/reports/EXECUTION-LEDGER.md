@@ -9,9 +9,22 @@ Console draft PR **#23 stays HELD**. Security findings escalate to the user imme
 
 ---
 
-## BLOCKER — GitHub Actions is failing repo-wide, and it is not ours
+## STANDING RISK — GitHub Actions is failing repo-wide
 
-**Status: needs the user. Nothing in the codebase can fix it.**
+**Status: unresolved. Merging proceeds under an explicit user-granted override; see below.**
+
+**`main` currently has no working CI.** Every plan merged until the Actions billing state is fixed
+lands verified by local gates only. That risk accumulates silently with each merge — the longer it
+runs, the more likely it hides a real regression that CI would have caught on a different platform,
+a clean checkout, or a fresh database. Worth resolving before it does.
+
+The user authorised merging past this red on 2026-07-26. The override and its four required
+conditions are specified in `HANDOFF-PROMPT.md` §6.5 — **read them before using it**. The load-bearing
+distinction: a job that *ran and failed* is real and blocks the merge; a job that never started
+(`steps: 0`) tells you nothing. If you cannot tell which you are looking at, treat it as real.
+
+Each use of the override must be recorded in the cycle log with its run ID and zero-step evidence,
+and stated on the PR, so no reader mistakes these merges for CI-verified ones.
 
 Every workflow run on this repository fails **2 seconds after start with 0 steps executed**:
 
@@ -38,9 +51,15 @@ until CI is restored, or the user explicitly authorises merging on local-gate ev
 
 ## Plan 05 — observability & CI/supply-chain gates
 
-**Status: complete, PR open, blocked on CI infrastructure (above).**
+**Status: MERGED to `main` as `3ea8037` (2026-07-26).**
 
-- PR: **#27** — https://github.com/nurcahyo/moira/pull/27 (open, MERGEABLE, mergeStateStatus UNSTABLE)
+Merged under the infrastructure override, **not CI-verified** — run `30167563082` showed all three
+jobs failing with `steps: 0` in three seconds, the same failure present on `main` and
+`plan/04-durability-correctness`. All five gates were re-run and verified green on the exact merge
+commit `5e7335a`, with DB-backed suites confirmed running rather than skipping (`retention_worker`:
+6 passed, 0 skips). Disclosed in a PR comment.
+
+- PR: **#27** — https://github.com/nurcahyo/moira/pull/27 (MERGED)
 - Branch: `plan/05-observability-ci-gates`, pushed, 6 commits
   `9531b90` impl · `cb41b6a` E2E layer · `0b79502` leak revert · `370c94b` mask fix ·
   `895c463` execution span · `c40af24` missing DoD tests
@@ -118,3 +137,13 @@ Plan 05 froze the OpenAPI spec: any later route/DTO change must regenerate `docs
   fix the Module 9 build break, cut the satisfied i18n scope, and add the two omitted items). This
   needs no CI, so it proceeds while PR #27 waits.
 - **Blocked on user:** GitHub Actions billing/runner state.
+
+### Cycle 2 — 2026-07-26
+- User granted the infrastructure-failure merge override; encoded in `HANDOFF-PROMPT.md` §6.5 with
+  four required conditions, deliberately narrow so it can never cover a job that actually ran.
+- Verified all four conditions on PR #27, including re-running all five gates on the exact merge
+  commit `5e7335a` rather than reusing the earlier `c40af24` results.
+- **Merged plan 05** → `main` at `3ea8037`. Verified the artifacts landed and the `mask_plain_secret`
+  fix is present on `main`.
+- `cargo clean` after merge, per the standing rule: reclaimed 15.9 GiB, 148 Gi free.
+- **Next action:** plan 06 Wave 0 plan rewrite, then the `SecretString` commit, then the exec waves.
