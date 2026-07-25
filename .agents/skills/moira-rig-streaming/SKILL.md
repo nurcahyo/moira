@@ -9,7 +9,9 @@ description: Bridge rig-core 0.40 streaming completions to Moira's runtime event
 
 Rig owns SSE transport, frame parsing, and the chunk taxonomy. Moira owns event envelopes, sequencing, idle timeouts, cancellation, backpressure, failure classification, and the public SSE contract.
 
-There is exactly **one** Rig-stream-to-Moira adapter: `start_stream_with_model` in `src/orchestration/runtime_factory.rs`. Extend it. Never add a second adapter, never re-parse provider SSE bytes, and never build a parallel LLM streaming abstraction. `src/orchestration/executor.rs::stream_chat` uses Rig only to compute a base URL, then raw-`reqwest` POSTs `/chat/completions` and forwards `response.bytes_stream()` as opaque `provider_chunk` events — no chunk parsing, no usage capture, no cancellation, and only a whole-request `reqwest` `.timeout()` rather than a per-chunk idle bound. That file is legacy and is the anti-pattern; do not extend it.
+There is exactly **one** Rig-stream-to-Moira adapter: `start_stream_with_model` in `src/orchestration/runtime_factory.rs`. Extend it. Never add a second adapter, never re-parse provider SSE bytes, and never build a parallel LLM streaming abstraction.
+
+The anti-pattern has a name and a corpse. The deleted `src/orchestration/executor.rs::stream_chat` (removed in plan 06, along with `src/http/chat.rs` and the `ChatCompletionRequest` / `ChatMessage` DTOs) used Rig only to compute a base URL, then raw-`reqwest` POSTed `/chat/completions` and forwarded `response.bytes_stream()` as opaque `provider_chunk` events — no chunk parsing, no usage capture, no cancellation, and only a whole-request `reqwest` `.timeout()` rather than a per-chunk idle bound. If a change starts to look like that, it is wrong; do not reintroduce it under a new name.
 
 Read `.agents/skills/moira-rig-integration/SKILL.md` before touching the seam, and `.agents/skills/moira-rig-completions/SKILL.md` for the non-streaming twin of this path.
 
@@ -210,7 +212,7 @@ Required scope for the snippet, matching the real imports at the top of `runtime
 
 ## Mid-Stream Errors, Cancellation, Timeouts
 
-**Error classification.** `classify_completion_error` (`runtime_factory.rs:464-488`) is the single `CompletionError -> ExecutionFailure` conversion point. `CompletionError` is `#[non_exhaustive]`; never match it directly. It prefers `provider_response_status()` and only falls back to lowercased substring matching, which is brittle — `"response"` routes many errors to `ProviderInvalidResponse`, which trips the circuit breaker but is neither retryable nor fallback-eligible. Never widen the public message: `safe_provider_error_message` emits class plus status only, and `tests/execution_lifecycle.rs:905-918` pins the literal string as public API.
+**Error classification.** `classify_completion_error` (`runtime_factory.rs:530`) is the single `CompletionError -> ExecutionFailure` conversion point. `CompletionError` is `#[non_exhaustive]`; never match it directly. It prefers `provider_response_status()` and only falls back to lowercased substring matching, which is brittle — `"response"` routes many errors to `ProviderInvalidResponse`, which trips the circuit breaker but is neither retryable nor fallback-eligible. Never widen the public message: `safe_provider_error_message` emits class plus status only, and `public_provider_failure_retains_keyed_i18n_error_contract` (`tests/execution_lifecycle.rs`) pins the literal string as public API.
 
 **Committed-output rule.** Once any `OutputTextDelta`, `ToolCallStarted`, or `ToolCallDelta` event has been delivered, later failures must be forced terminal:
 
@@ -221,7 +223,7 @@ if committed {
 }
 ```
 
-This applies to in-band item errors, idle-timeout expiry, and the attempt deadline (`attempt_timeout_failure(bounded_by_total_deadline, output_committed)`, `execution.rs:1876`). Retrying or failing over after bytes have reached the client would duplicate output. The classes that skip retry and fallback but still trip the breaker are enumerated by `is_retryable` / `is_fallback_eligible` / `is_circuit_failure` in `src/orchestration/controls.rs` — `ProviderInvalidResponse` is in the third list only.
+This applies to in-band item errors, idle-timeout expiry, and the attempt deadline (`attempt_timeout_failure(bounded_by_total_deadline, output_committed)`, `execution.rs:2114`). Retrying or failing over after bytes have reached the client would duplicate output. The classes that skip retry and fallback but still trip the breaker are enumerated by `is_retryable` / `is_fallback_eligible` / `is_circuit_failure` in `src/orchestration/controls.rs` — `ProviderInvalidResponse` is in the third list only.
 
 **Cancellation.** Rig masks abort as EOF: `StreamingCompletionResponse::cancel()` aborts, and the resulting `ProviderError` whose message contains `"aborted"` is converted to `Poll::Ready(None)` (`src/streaming.rs:459-465`). That is a **string match**, so a genuine provider error containing the word "aborted" is silently swallowed as a clean end-of-stream. Consequences:
 
@@ -233,7 +235,7 @@ This applies to in-band item errors, idle-timeout expiry, and the attempt deadli
 
 **Backpressure.** The provider stream is a lazy `async_stream::stream!` polling a `GenericEventSource` (`src/providers/internal/openai_chat_completions_compatible.rs:229`) with no channel and no unbounded buffer, so consumer backpressure propagates to the HTTP body for free. Just poll slower. Moira's bounded `mpsc` is the only queue; a full or late consumer yields `ExecutionFailureClass::StreamBackpressureExceeded`.
 
-**Timeouts.** Wrap each `stream.next()` in `tokio::time::timeout(idle_timeout, ...)`, never the whole stream — `idle_timeout` is `Duration::from_millis(candidate.runtime_policy.stream_idle_timeout_ms.max(1) as u64)` (`execution.rs:487-489`) and is a per-chunk liveness bound. The same value is the `push_stream` send deadline. `ProviderRuntimePolicyRecord` is **not** applied to Rig's HTTP client — `RigRuntimeFactory::build_completion_model` takes it as `_policy` and ignores it (`runtime_factory.rs:90`) — so these `tokio` deadlines are the only timeout enforcement in the streaming path.
+**Timeouts.** Wrap each `stream.next()` in `tokio::time::timeout(idle_timeout, ...)`, never the whole stream — `idle_timeout` is `Duration::from_millis(candidate.runtime_policy.stream_idle_timeout_ms.max(1) as u64)` (`execution.rs:522`) and is a per-chunk liveness bound. The same value is the `push_stream` send deadline. `ProviderRuntimePolicyRecord` is **not** applied to Rig's HTTP client — `RigRuntimeFactory::build_completion_model` takes it as `_policy` and ignores it (`runtime_factory.rs:90`) — so these `tokio` deadlines are the only timeout enforcement in the streaming path.
 
 ## Ordering and Flush Guarantees
 
@@ -259,7 +261,7 @@ This applies to in-band item errors, idle-timeout expiry, and the attempt deadli
 
 Three levels, cheapest first. Moira has **no** `[dev-dependencies]` section; tests use the main dependency set (`tokio`, `futures-util`, `async-stream`, `axum`, `serde_json`).
 
-**Level 1 — item-stream unit test, no Rig types.** Build a `RuntimeItemStream` from `futures_util::stream::iter` and assert order plus in-band failure. This is the pattern of `semantic_stream_preserves_item_order_and_in_band_failures` (`runtime_factory.rs:549-583`):
+**Level 1 — item-stream unit test, no Rig types.** Build a `RuntimeItemStream` from `futures_util::stream::iter` and assert order plus in-band failure. This is the pattern of `semantic_stream_preserves_item_order_and_in_band_failures` (`runtime_factory.rs:729`):
 
 ```rust
 let mut items: RuntimeItemStream = Box::pin(stream::iter(vec![

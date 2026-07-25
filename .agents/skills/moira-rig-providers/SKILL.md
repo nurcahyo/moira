@@ -309,7 +309,7 @@ there is no cheap health probe.
 | `provider.base_url` is `None` | omit the call entirely; rig's `BASE_URL` default applies |
 | New provider with its own path convention | pass raw unless you can prove the provider's path shape matches OpenAI's `/v1` convention |
 
-`normalize_openai_base_url` (`src/orchestration/resolver.rs`) is the only URL rewriting Moira does:
+`normalize_openai_base_url` (`src/orchestration/provider_url.rs`, re-exported from `src/orchestration/mod.rs`) is the only URL rewriting Moira does:
 
 ```rust
 pub fn normalize_openai_base_url(base_url: &str) -> Result<String, AppError> {
@@ -327,8 +327,9 @@ pub fn normalize_openai_base_url(base_url: &str) -> Result<String, AppError> {
 It validates the URL (bad input → `AppError::BadRequest`) and force-appends `/v1` when absent.
 Known limitation to state rather than paper over: a gateway that serves `/chat/completions` at the
 root cannot be configured. If a tenant needs that, change `normalize_openai_base_url` behind an
-explicit provider setting and add regression coverage next to the existing test in `resolver.rs` —
-do not special-case it inside `build_completion_model`.
+explicit provider setting and add regression coverage next to the existing
+`normalizes_vllm_base_url_to_openai_v1` test in `provider_url.rs` — do not special-case it inside
+`build_completion_model`.
 
 ## Credential Injection and Redaction
 
@@ -394,10 +395,11 @@ Three redaction layers already exist and must be preserved:
 `build_completion_model` accepts `ProviderRuntimePolicyRecord` and ignores it (`_policy`). Nothing
 in the transport is policy-derived today:
 
-- `request_timeout_ms` is clamped into the effective attempt timeout
-  (`src/application/execution.rs:1692`) and enforced by `tokio::time::timeout` around the whole
-  attempt (`:502`), not by the HTTP client.
-- `stream_idle_timeout_ms` is enforced per streamed item, also by `tokio::time::timeout` (`:1479`).
+- `request_timeout_ms` is clamped into the effective attempt timeout (`effective_runtime_policy` in
+  `src/application/execution.rs`) and enforced by `tokio::time::timeout` around the whole attempt,
+  not by the HTTP client.
+- `stream_idle_timeout_ms` is enforced per streamed item, also by `tokio::time::timeout`, in
+  `execute_rig_stream` (`src/application/execution.rs`).
 - `connect_timeout_ms` is **not enforced anywhere** — it is stored, versioned, and read only by
   test fixtures. Do not claim otherwise; wiring it is the open work described below.
 
@@ -521,10 +523,11 @@ places, so `cargo build` enumerates the remaining work after step 2.
   and exhaustive) — keep it manual so that stays true.
 - `ProviderType::Custom` returning `AppError::Config` is intentional, not a gap to fill with a
   hand-rolled client.
-- `src/orchestration/executor.rs` builds an `openai::CompletionsClient` only to read `base_url()`
-  (`executor.rs:21`, `:46`, `:81`) and then issues raw `reqwest` calls with `bearer_auth` over a
-  plaintext key. It is legacy V1: its only consumer, `src/http/chat.rs`, is not declared in
-  `src/http/mod.rs`, so it is not even compiled. Never extend it and never copy its pattern.
+- Re-creating the deleted V1 path. `src/orchestration/executor.rs` used to build an
+  `openai::CompletionsClient` only to read `base_url()` and then issue raw `reqwest` calls with
+  `bearer_auth` over a plaintext key; plan 06 deleted it together with `src/http/chat.rs` and the
+  `ChatCompletionRequest` / `ChatMessage` DTOs. Recognise that shape and refuse it — a provider that
+  Rig 0.40 does not support is `AppError::Config`, not a hand-rolled client.
 
 ## Validation
 
