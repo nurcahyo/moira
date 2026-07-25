@@ -81,6 +81,71 @@ fn deny_toml_denies_unknown_registries_and_git_sources() {
     );
 }
 
+/// An undocumented `[advisories].ignore` entry is the other half of P0-4: the gate stays green
+/// while an advisory is waived for a reason nobody recorded and nobody can re-evaluate. Every
+/// entry must therefore carry an adjacent explanatory comment. An empty `ignore` list passes
+/// trivially — the point is to document waivers, not to require one.
+#[test]
+fn deny_toml_advisories_ignore_entries_are_documented() {
+    // Scoped to `[advisories]`: `[licenses.private]` also carries an `ignore` key.
+    let advisories: Vec<&str> = DENY_TOML
+        .lines()
+        .skip_while(|line| line.trim() != "[advisories]")
+        .skip(1)
+        .take_while(|line| !line.trim_start().starts_with('['))
+        .collect();
+    assert!(
+        !advisories.is_empty(),
+        "deny.toml must declare an [advisories] section with a body"
+    );
+
+    let Some(start) = advisories
+        .iter()
+        .position(|line| line.trim_start().starts_with("ignore"))
+    else {
+        return; // No `ignore` key at all: nothing to document.
+    };
+
+    // `ignore = []` written on one line is the empty list; anything inline is not reviewable.
+    if let Some((_, after_open)) = advisories[start].split_once('[')
+        && let Some((inline, _)) = after_open.split_once(']')
+    {
+        assert!(
+            inline.trim().is_empty(),
+            "an inline [advisories].ignore entry has nowhere to carry its rationale; write the \
+             list across multiple lines with a comment above each entry, found: {:?}",
+            advisories[start]
+        );
+        return;
+    }
+
+    let mut documented = false;
+    for line in advisories[start + 1..]
+        .iter()
+        .take_while(|l| l.trim() != "]")
+    {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            documented = true;
+            continue;
+        }
+        // Only `{ ... }` tables and bare `"RUSTSEC-…"` strings start an entry; anything else is
+        // a continuation of the entry above and must not reset the rationale it already has.
+        if !(trimmed.starts_with('{') || trimmed.starts_with('"')) {
+            continue;
+        }
+        assert!(
+            documented,
+            "every [advisories].ignore entry needs an adjacent explanatory comment; {trimmed:?} \
+             has none, and an undocumented waiver is exactly how a supply-chain gate rots"
+        );
+        documented = false;
+    }
+}
+
 /// `deny.toml`'s `[licenses.private] ignore = true` only suppresses `error[unlicensed]` for
 /// workspace members actually marked unpublishable. Moira declares no `license` field by design
 /// (it is a deployed service, not a published crate), so dropping `publish = false` turns the

@@ -217,6 +217,48 @@ mod tests {
         }
     }
 
+    /// Plan 05's binding name for the property over the entries plan 05 itself
+    /// added. It is deliberately a separate test from
+    /// `new_catalog_entries_have_non_empty_default_messages_and_descriptions`
+    /// (which pins plan 04's two pagination/precondition keys) and asserts more
+    /// than `every_infrastructure_catalog_entry_has_a_non_empty_default_message_and_description`:
+    /// the text must survive trimming, must resolve through the public
+    /// `default_message_for_key` lookup, and the description must not be a copy
+    /// of the message — a whitespace-only or duplicated string is non-empty but
+    /// is not a usable catalog entry.
+    #[test]
+    fn every_new_catalog_entry_has_a_non_empty_default_message_and_description() {
+        for key in [
+            "moira.error.configuration_error",
+            "moira.error.database_error",
+            "moira.error.database_unavailable",
+            "moira.error.http_client_error",
+            "moira.error.redis_error",
+            "moira.error.upstream_error",
+        ] {
+            let entry = all_entries()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("{key} must be catalogued"));
+            assert!(
+                !entry.default_message.trim().is_empty(),
+                "{key} default_message must be non-empty"
+            );
+            assert!(
+                !entry.description.trim().is_empty(),
+                "{key} description must be non-empty"
+            );
+            assert_ne!(
+                entry.default_message, entry.description,
+                "{key} description must explain when the key is used, not repeat the message"
+            );
+            assert_eq!(
+                default_message_for_key(key),
+                Some(entry.default_message),
+                "{key} must resolve through the public lookup"
+            );
+        }
+    }
+
     /// `moira.error.upstream_error` is the code for `AppError::Upstream` and
     /// must stay distinct from the three `AppError::coded` upstream
     /// *condition* keys (`upstream_bad_response` / `upstream_timeout` /
