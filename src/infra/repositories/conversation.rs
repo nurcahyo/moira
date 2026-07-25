@@ -1,6 +1,6 @@
 use chrono::{Duration, Utc};
 use serde_json::Value;
-use sqlx::{PgPool, Row};
+use sqlx::{PgConnection, PgPool, Row};
 use uuid::Uuid;
 
 use crate::{
@@ -876,34 +876,21 @@ impl PgConversationRepository {
         Ok(())
     }
 
+    /// Pooled wrapper over [`create_rag_collection_with_connection`].
+    ///
+    /// The SQL body lives in the free function so it can also run inside a caller-supplied
+    /// transaction (the `AdminCommandRunner` idempotency envelope). This method owns the
+    /// transaction lifecycle; the free function must never open one.
     pub async fn create_rag_collection(
         &self,
         id: Uuid,
         public_id: &str,
         request: &RagCollectionCreateRequest,
     ) -> Result<RagCollectionRecord, AppError> {
-        let row = sqlx::query(
-            r#"
-            insert into rag_collections (
-                id, public_id, application_id, external_tenant_id, collection_key,
-                display_name, description, visibility, metadata
-            )
-            values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            returning *
-            "#,
-        )
-        .bind(id)
-        .bind(public_id)
-        .bind(request.application_id)
-        .bind(&request.external_tenant_id)
-        .bind(&request.collection_key)
-        .bind(&request.display_name)
-        .bind(&request.description)
-        .bind(rag_collection_visibility_to_db(request.visibility))
-        .bind(&request.metadata)
-        .fetch_one(&self.pool)
-        .await?;
-        rag_collection_record_from_row(&row)
+        let mut tx = self.pool.begin().await?;
+        let record = create_rag_collection_with_connection(&mut tx, id, public_id, request).await?;
+        tx.commit().await?;
+        Ok(record)
     }
 
     pub async fn list_rag_collections(
@@ -1010,6 +997,11 @@ impl PgConversationRepository {
         rag_collection_record_from_row(&row)
     }
 
+    /// Pooled wrapper over [`create_rag_document_with_connection`].
+    ///
+    /// The SQL body lives in the free function so it can also run inside a caller-supplied
+    /// transaction (the `AdminCommandRunner` idempotency envelope). This method owns the
+    /// transaction lifecycle; the free function must never open one.
     pub async fn create_rag_document(
         &self,
         id: Uuid,
@@ -1019,79 +1011,17 @@ impl PgConversationRepository {
         content_hash: Option<&str>,
     ) -> Result<RagDocumentRecord, AppError> {
         let mut tx = self.pool.begin().await?;
-        let collection_id: Uuid = sqlx::query_scalar(
-            "select id from rag_collections where public_id = $1 and deleted_at is null",
+        let record = create_rag_document_with_connection(
+            &mut tx,
+            id,
+            public_id,
+            collection_public_id,
+            request,
+            content_hash,
         )
-        .bind(collection_public_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| {
-            AppError::coded(
-                axum::http::StatusCode::NOT_FOUND,
-                "rag_collection_not_found",
-                "RAG collection not found",
-            )
-        })?;
-        let mut row = sqlx::query(&rag_document_select(
-            r#"
-            insert into rag_documents (
-                id, public_id, collection_id, external_document_id, title,
-                source_type, source_uri, mime_type, metadata
-            )
-            values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            returning *
-            "#,
-        ))
-        .bind(id)
-        .bind(public_id)
-        .bind(collection_id)
-        .bind(&request.external_document_id)
-        .bind(&request.title)
-        .bind(&request.source_type)
-        .bind(&request.source_uri)
-        .bind(&request.mime_type)
-        .bind(&request.metadata)
-        .fetch_one(&mut *tx)
         .await?;
-        if let (Some(content), Some(hash)) = (&request.content, content_hash) {
-            let version_id = Uuid::now_v7();
-            // Honest status: no chunking/embedding pipeline exists yet (see plans/11-rag-memory-intelligence.md). Content is stored verbatim; ingestion_status reflects "not yet processed", not "indexed for retrieval".
-            sqlx::query(
-                r#"
-                insert into rag_document_versions (
-                    id, document_id, version_number, content_plain, content_hash,
-                    content_size_bytes, ingestion_status, metadata
-                )
-                values ($1, $2, 1, $3, $4, $5, $6, $7)
-                "#,
-            )
-            .bind(version_id)
-            .bind(id)
-            .bind(content)
-            .bind(hash)
-            .bind(content.len() as i64)
-            .bind(rag_ingestion_status_to_db(RagIngestionStatus::Pending))
-            .bind(&request.metadata)
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query("update rag_documents set current_version_id = $2 where id = $1")
-                .bind(id)
-                .bind(version_id)
-                .execute(&mut *tx)
-                .await?;
-            // The row returned by the insert above predates the version insert, so it would
-            // report a null ingestion_status. Re-select it so the response reflects the
-            // version that was just created. Skipped entirely when no version exists, which
-            // keeps `ingestion_status: null` honest for a create without inline content.
-            row = sqlx::query(&rag_document_select(
-                "select d.* from rag_documents d where d.id = $1",
-            ))
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?;
-        }
         tx.commit().await?;
-        rag_document_record_from_row(&row)
+        Ok(record)
     }
 
     pub async fn list_rag_documents(
@@ -1147,6 +1077,13 @@ impl PgConversationRepository {
         Ok(())
     }
 
+    /// Pooled wrapper over [`ingest_rag_document_with_connection`].
+    ///
+    /// The SQL body lives in the free function so it can also run inside a caller-supplied
+    /// transaction (the `AdminCommandRunner` idempotency envelope). This method owns the
+    /// transaction lifecycle; the free function must never open one — the `for update` row
+    /// lock and the version supersession must belong to whatever transaction the caller
+    /// already holds.
     pub async fn ingest_rag_document(
         &self,
         public_id: &str,
@@ -1154,41 +1091,182 @@ impl PgConversationRepository {
         content_hash: &str,
     ) -> Result<RagDocumentRecord, AppError> {
         let mut tx = self.pool.begin().await?;
-        let document_id: Uuid = sqlx::query_scalar(
-            "select id from rag_documents where public_id = $1 and deleted_at is null for update",
-        )
-        .bind(public_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| {
-            AppError::coded(
-                axum::http::StatusCode::NOT_FOUND,
-                "rag_document_not_found",
-                "RAG document not found",
+        let record =
+            ingest_rag_document_with_connection(&mut tx, public_id, request, content_hash).await?;
+        tx.commit().await?;
+        Ok(record)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connection-taking RAG write bodies.
+//
+// These mirror the `insert_audit_with_connection` precedent in
+// `src/infra/repositories/admin.rs`: the SQL lives in a free function that takes a
+// `&mut PgConnection`, so the same body can run either on a pooled connection (through the
+// `PgConversationRepository` wrappers above) or inside a caller-supplied transaction — in
+// particular `PgAdminCommandTransaction::connection()`, which is how the idempotency
+// envelope in `plans/02b-idempotency-replay.md` reaches them.
+//
+// INVARIANT: none of these functions may call `begin()`, `commit()`, or `rollback()`.
+// The caller owns the transaction. An inner `begin()` here would nest a transaction inside
+// the admin command runner's `savepoint admin_command_mutation` and silently break the
+// rollback semantics that `begin_command_savepoint`/`rollback_command_savepoint` depend on.
+// ---------------------------------------------------------------------------
+
+pub async fn create_rag_collection_with_connection(
+    connection: &mut PgConnection,
+    id: Uuid,
+    public_id: &str,
+    request: &RagCollectionCreateRequest,
+) -> Result<RagCollectionRecord, AppError> {
+    let row = sqlx::query(
+        r#"
+            insert into rag_collections (
+                id, public_id, application_id, external_tenant_id, collection_key,
+                display_name, description, visibility, metadata
             )
-        })?;
-        let version_number: i32 = sqlx::query_scalar(
-            "select coalesce(max(version_number), 0) + 1 from rag_document_versions where document_id = $1",
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            returning *
+            "#,
+    )
+    .bind(id)
+    .bind(public_id)
+    .bind(request.application_id)
+    .bind(&request.external_tenant_id)
+    .bind(&request.collection_key)
+    .bind(&request.display_name)
+    .bind(&request.description)
+    .bind(rag_collection_visibility_to_db(request.visibility))
+    .bind(&request.metadata)
+    .fetch_one(connection)
+    .await?;
+    rag_collection_record_from_row(&row)
+}
+
+pub async fn create_rag_document_with_connection(
+    connection: &mut PgConnection,
+    id: Uuid,
+    public_id: &str,
+    collection_public_id: &str,
+    request: &RagDocumentCreateRequest,
+    content_hash: Option<&str>,
+) -> Result<RagDocumentRecord, AppError> {
+    let collection_id: Uuid = sqlx::query_scalar(
+        "select id from rag_collections where public_id = $1 and deleted_at is null",
+    )
+    .bind(collection_public_id)
+    .fetch_optional(&mut *connection)
+    .await?
+    .ok_or_else(|| {
+        AppError::coded(
+            axum::http::StatusCode::NOT_FOUND,
+            "rag_collection_not_found",
+            "RAG collection not found",
         )
-        .bind(document_id)
-        .fetch_one(&mut *tx)
-        .await?;
+    })?;
+    let mut row = sqlx::query(&rag_document_select(
+        r#"
+            insert into rag_documents (
+                id, public_id, collection_id, external_document_id, title,
+                source_type, source_uri, mime_type, metadata
+            )
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            returning *
+            "#,
+    ))
+    .bind(id)
+    .bind(public_id)
+    .bind(collection_id)
+    .bind(&request.external_document_id)
+    .bind(&request.title)
+    .bind(&request.source_type)
+    .bind(&request.source_uri)
+    .bind(&request.mime_type)
+    .bind(&request.metadata)
+    .fetch_one(&mut *connection)
+    .await?;
+    if let (Some(content), Some(hash)) = (&request.content, content_hash) {
         let version_id = Uuid::now_v7();
-        let content = request.content.as_deref().unwrap_or("");
+        // Honest status: no chunking/embedding pipeline exists yet (see plans/11-rag-memory-intelligence.md). Content is stored verbatim; ingestion_status reflects "not yet processed", not "indexed for retrieval".
         sqlx::query(
             r#"
+                insert into rag_document_versions (
+                    id, document_id, version_number, content_plain, content_hash,
+                    content_size_bytes, ingestion_status, metadata
+                )
+                values ($1, $2, 1, $3, $4, $5, $6, $7)
+                "#,
+        )
+        .bind(version_id)
+        .bind(id)
+        .bind(content)
+        .bind(hash)
+        .bind(content.len() as i64)
+        .bind(rag_ingestion_status_to_db(RagIngestionStatus::Pending))
+        .bind(&request.metadata)
+        .execute(&mut *connection)
+        .await?;
+        sqlx::query("update rag_documents set current_version_id = $2 where id = $1")
+            .bind(id)
+            .bind(version_id)
+            .execute(&mut *connection)
+            .await?;
+        // The row returned by the insert above predates the version insert, so it would
+        // report a null ingestion_status. Re-select it so the response reflects the
+        // version that was just created. Skipped entirely when no version exists, which
+        // keeps `ingestion_status: null` honest for a create without inline content.
+        row = sqlx::query(&rag_document_select(
+            "select d.* from rag_documents d where d.id = $1",
+        ))
+        .bind(id)
+        .fetch_one(&mut *connection)
+        .await?;
+    }
+    rag_document_record_from_row(&row)
+}
+
+pub async fn ingest_rag_document_with_connection(
+    connection: &mut PgConnection,
+    public_id: &str,
+    request: &RagDocumentIngestRequest,
+    content_hash: &str,
+) -> Result<RagDocumentRecord, AppError> {
+    let document_id: Uuid = sqlx::query_scalar(
+        "select id from rag_documents where public_id = $1 and deleted_at is null for update",
+    )
+    .bind(public_id)
+    .fetch_optional(&mut *connection)
+    .await?
+    .ok_or_else(|| {
+        AppError::coded(
+            axum::http::StatusCode::NOT_FOUND,
+            "rag_document_not_found",
+            "RAG document not found",
+        )
+    })?;
+    let version_number: i32 = sqlx::query_scalar(
+        "select coalesce(max(version_number), 0) + 1 from rag_document_versions where document_id = $1",
+    )
+    .bind(document_id)
+    .fetch_one(&mut *connection)
+    .await?;
+    let version_id = Uuid::now_v7();
+    let content = request.content.as_deref().unwrap_or("");
+    sqlx::query(
+        r#"
             update rag_document_versions
             set superseded_at = coalesce(superseded_at, now()),
                 ingestion_status = case when ingestion_status = 'indexed' then 'superseded' else ingestion_status end
             where document_id = $1 and superseded_at is null
             "#,
-        )
-        .bind(document_id)
-        .execute(&mut *tx)
-        .await?;
-        // Honest status: no chunking/embedding pipeline exists yet (see plans/11-rag-memory-intelligence.md). Content is stored verbatim; ingestion_status reflects "not yet processed", not "indexed for retrieval".
-        sqlx::query(
-            r#"
+    )
+    .bind(document_id)
+    .execute(&mut *connection)
+    .await?;
+    // Honest status: no chunking/embedding pipeline exists yet (see plans/11-rag-memory-intelligence.md). Content is stored verbatim; ingestion_status reflects "not yet processed", not "indexed for retrieval".
+    sqlx::query(
+        r#"
             insert into rag_document_versions (
                 id, document_id, version_number, content_plain, content_hash,
                 content_size_bytes, source_etag, source_last_modified,
@@ -1196,33 +1274,31 @@ impl PgConversationRepository {
             )
             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             "#,
-        )
+    )
+    .bind(version_id)
+    .bind(document_id)
+    .bind(version_number)
+    .bind(content)
+    .bind(content_hash)
+    .bind(content.len() as i64)
+    .bind(&request.source_etag)
+    .bind(request.source_last_modified)
+    .bind(rag_ingestion_status_to_db(RagIngestionStatus::Pending))
+    .bind(&request.metadata)
+    .execute(&mut *connection)
+    .await?;
+    sqlx::query("update rag_documents set current_version_id = $2 where id = $1")
+        .bind(document_id)
         .bind(version_id)
-        .bind(document_id)
-        .bind(version_number)
-        .bind(content)
-        .bind(content_hash)
-        .bind(content.len() as i64)
-        .bind(&request.source_etag)
-        .bind(request.source_last_modified)
-        .bind(rag_ingestion_status_to_db(RagIngestionStatus::Pending))
-        .bind(&request.metadata)
-        .execute(&mut *tx)
+        .execute(&mut *connection)
         .await?;
-        sqlx::query("update rag_documents set current_version_id = $2 where id = $1")
-            .bind(document_id)
-            .bind(version_id)
-            .execute(&mut *tx)
-            .await?;
-        let row = sqlx::query(&rag_document_select(
-            "select d.* from rag_documents d where d.id = $1",
-        ))
-        .bind(document_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        rag_document_record_from_row(&row)
-    }
+    let row = sqlx::query(&rag_document_select(
+        "select d.* from rag_documents d where d.id = $1",
+    ))
+    .bind(document_id)
+    .fetch_one(&mut *connection)
+    .await?;
+    rag_document_record_from_row(&row)
 }
 
 fn conversation_select(inner: &str) -> String {

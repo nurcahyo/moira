@@ -10,7 +10,8 @@ pub use admin::{
 };
 pub use conversation::{
     ConversationAccess, ConversationInsert, ConversationMessageInsert, MemoryInsert,
-    PgConversationRepository,
+    PgConversationRepository, create_rag_collection_with_connection,
+    create_rag_document_with_connection, ingest_rag_document_with_connection,
 };
 pub use public::{
     IdempotencyClaim, PgPublicRepository, PublicAccess, ResponseStartedInsert,

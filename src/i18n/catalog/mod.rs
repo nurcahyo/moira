@@ -61,4 +61,37 @@ mod tests {
         );
         assert_eq!(default_message_for_key("moira.error.unknown"), None);
     }
+
+    #[test]
+    fn idempotency_in_progress_key_is_catalogued() {
+        assert!(is_known_key("moira.error.idempotency_in_progress"));
+        let entry = all_entries()
+            .find(|entry| entry.key == "moira.error.idempotency_in_progress")
+            .expect("moira.error.idempotency_in_progress must be catalogued");
+        assert!(
+            !entry.default_message.is_empty(),
+            "default_message must be non-empty"
+        );
+        assert!(
+            !entry.description.is_empty(),
+            "description must be non-empty"
+        );
+    }
+
+    #[test]
+    fn idempotency_keys_are_catalogued_exactly_once() {
+        for key in [
+            "moira.error.idempotency_conflict",
+            "moira.error.idempotency_in_progress",
+        ] {
+            let count = RESPONSE_ERROR_CATALOG
+                .iter()
+                .filter(|entry| entry.key == key)
+                .count();
+            assert_eq!(
+                count, 1,
+                "{key} must appear exactly once in RESPONSE_ERROR_CATALOG"
+            );
+        }
+    }
 }

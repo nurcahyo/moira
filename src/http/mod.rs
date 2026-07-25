@@ -650,8 +650,9 @@ mod tests {
         assert_refs_resolve(&value, schemas);
     }
 
-    /// The four RAG write operations that carry `Idempotency-Key` and the interim
-    /// disclaimer (Sentence B) per `plans/02a-mvp-boundary-honesty.md` §5.
+    /// The four RAG write operations that carry `Idempotency-Key` and now implement
+    /// real replay (`plans/02b-idempotency-replay.md`). 02a's interim disclaimer
+    /// (Sentence B) used to live on these operations too; it is gone as of 02b.
     const RAG_WRITE_OPERATIONS: [(&str, &str); 4] = [
         ("/api/v1/admin/rag-collections", "post"),
         (
@@ -689,7 +690,10 @@ mod tests {
     const SENTENCE_A_RAG_WRITE: &str = "Persistence primitive: no retrieval, chunking, or embedding pipeline runs, and stored content is not used to influence model responses. See docs/conversation-memory-rag-api.md.";
     const SENTENCE_A_SHORT: &str = "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.";
     const SENTENCE_B_INTERIM_IDEMPOTENCY: &str = "Idempotency-Key is accepted but replay is not implemented yet; retrying can duplicate side effects.";
-    const IDEMPOTENCY_KEY_PARAMETER_DESCRIPTION: &str = "Optional replay key. Replay is not yet implemented on this route; see plans/02b-idempotency-replay.md.";
+    /// The truthful `Idempotency-Key` parameter description 02b installs on all four
+    /// RAG write operations, replacing 02a's "not implemented yet" text
+    /// (`plans/02b-idempotency-replay.md`, Architecture -> "API & OpenAPI changes").
+    const IDEMPOTENCY_KEY_PARAMETER_DESCRIPTION: &str = "Optional replay key. A repeated request with the same key and body replays the original response; the same key with a different body returns 409.";
 
     #[test]
     fn rag_write_routes_still_declare_the_idempotency_key_parameter() {
@@ -707,6 +711,63 @@ mod tests {
                 parameter_description(operation, "Idempotency-Key"),
                 Some(IDEMPOTENCY_KEY_PARAMETER_DESCRIPTION),
                 "{method} {path} Idempotency-Key description drifted"
+            );
+        }
+    }
+
+    #[test]
+    fn rag_write_routes_declare_the_idempotency_replay_contract() {
+        // A sibling to `atomic_admin_idempotency_contract_is_explicit`, kept separate
+        // because these four routes are not admin-command routes in the operations
+        // list that test enumerates.
+        let value = serde_json::to_value(documented_router().into_openapi()).unwrap();
+        for (path, method) in RAG_WRITE_OPERATIONS {
+            let operation = &value["paths"][path][method];
+            assert!(
+                parameter_named(operation, "Idempotency-Key"),
+                "{method} {path} must declare Idempotency-Key"
+            );
+            let description =
+                parameter_description(operation, "Idempotency-Key").unwrap_or_else(|| {
+                    panic!("{method} {path} is missing the Idempotency-Key parameter")
+                });
+            assert!(
+                !description.to_lowercase().contains("not implemented"),
+                "{method} {path} Idempotency-Key description still disclaims replay: {description}"
+            );
+
+            let responses = operation["responses"]
+                .as_object()
+                .expect("operation responses");
+            assert!(
+                responses.contains_key("409"),
+                "{method} {path} must explicitly document a 409 idempotency response"
+            );
+            assert_eq!(
+                responses["409"]["content"]["application/json"]["schema"]["$ref"],
+                "#/components/schemas/ErrorResponse",
+                "{method} {path} must use ErrorResponse for its 409 response"
+            );
+        }
+    }
+
+    #[test]
+    fn rag_write_route_descriptions_no_longer_disclaim_idempotency() {
+        // The paired half of 02a's `rag_write_routes_carry_the_interim_idempotency_disclaimer`,
+        // which 02b deletes: Sentence B is gone, Sentence A survives verbatim.
+        let value = serde_json::to_value(documented_router().into_openapi()).unwrap();
+        for (path, method) in RAG_WRITE_OPERATIONS {
+            let operation = &value["paths"][path][method];
+            let description = operation["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{method} {path} is missing an operation description"));
+            assert!(
+                !description.contains(SENTENCE_B_INTERIM_IDEMPOTENCY),
+                "{method} {path} still carries 02a's interim idempotency disclaimer"
+            );
+            assert!(
+                description.contains(SENTENCE_A_RAG_WRITE),
+                "{method} {path} must still carry Sentence A verbatim"
             );
         }
     }
@@ -766,32 +827,6 @@ mod tests {
             assert!(
                 description.contains(SENTENCE_A_SHORT),
                 "{method} {path} description is missing the short Sentence A verbatim"
-            );
-        }
-    }
-
-    #[test]
-    fn rag_write_routes_carry_the_interim_idempotency_disclaimer() {
-        // THIS IS THE TEST PLAN 02b DELETES: once real replay is implemented,
-        // Sentence B ("retrying can duplicate side effects") and the
-        // plans/02b-idempotency-replay.md pointer both become false.
-        let value = serde_json::to_value(documented_router().into_openapi()).unwrap();
-        for (path, method) in RAG_WRITE_OPERATIONS {
-            let operation = &value["paths"][path][method];
-            let description = operation["description"]
-                .as_str()
-                .unwrap_or_else(|| panic!("{method} {path} is missing an operation description"));
-            assert!(
-                description.contains(SENTENCE_B_INTERIM_IDEMPOTENCY),
-                "{method} {path} description is missing Sentence B verbatim"
-            );
-            let parameter_description = parameter_description(operation, "Idempotency-Key")
-                .unwrap_or_else(|| {
-                    panic!("{method} {path} is missing the Idempotency-Key parameter")
-                });
-            assert!(
-                parameter_description.contains("plans/02b-idempotency-replay.md"),
-                "{method} {path} Idempotency-Key description must name plans/02b-idempotency-replay.md"
             );
         }
     }

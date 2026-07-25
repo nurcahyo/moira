@@ -1366,7 +1366,13 @@ fn validate_application_identifiers(
     Ok(())
 }
 
-fn actor_fingerprint(actor: &Actor) -> String {
+/// The single definition of the admin actor fingerprint in the crate.
+///
+/// It is part of the `idempotency_records` unique index and of the advisory-lock key, so a
+/// second, divergent copy would silently break cross-actor replay isolation. `pub(crate)`
+/// exists solely so `crate::application::conversation` can reuse this exact formula
+/// (`plans/02b-idempotency-replay.md` §5); do not copy the body anywhere.
+pub(crate) fn actor_fingerprint(actor: &Actor) -> String {
     let identity = serde_json::to_vec(&(
         actor.actor_type,
         &actor.subject,
@@ -1869,5 +1875,39 @@ mod tests {
         assert!(validate_provider_base_url("http://api.example.com", false, false).is_err());
         assert!(validate_provider_base_url("http://127.0.0.1:8000", false, true).is_err());
         assert!(validate_provider_base_url("http://127.0.0.1:8000", true, true).is_ok());
+    }
+
+    #[test]
+    fn actor_fingerprint_is_shared_by_admin_and_conversation_commands() {
+        // Guards against a divergent second copy of the fingerprint formula being
+        // introduced in `conversation.rs` (plans/02b-idempotency-replay.md §5): the
+        // fingerprint that `conversation_command_spec` embeds in its idempotency
+        // envelope must be byte-identical to calling this module's `actor_fingerprint`
+        // directly, because both are, and must remain, the exact same function.
+        use crate::{application::conversation::conversation_command_spec, security::ActorType};
+
+        let actor = Actor {
+            actor_type: ActorType::SystemKey,
+            subject: Some("system-actor".to_string()),
+            ..Actor::default()
+        };
+        let ctx = RequestContext {
+            request_id: "req-test".to_string(),
+            source_ip: None,
+            user_agent: None,
+            idempotency_key: Some("replay-key".to_string()),
+        };
+
+        let direct = actor_fingerprint(&actor);
+
+        let spec =
+            conversation_command_spec(&ctx, &actor, "rag.collection.create", json!({}), &json!({}))
+                .unwrap();
+
+        assert!(
+            format!("{spec:?}").contains(&format!("actor_fingerprint: {direct:?}")),
+            "conversation_command_spec must embed the exact fingerprint produced by \
+             admin::actor_fingerprint, not a divergent copy"
+        );
     }
 }

@@ -30,10 +30,12 @@ durably and enforce policy, but:
 - Conversation history, explicit memories, and RAG documents are not loaded into the
   prompt sent to a provider. `POST /v1/responses` always returns `citations: []`.
 - No summarization runs; `conversation_summaries` is never populated.
-- `Idempotency-Key` is advertised on the RAG create/ingest/reindex routes but its
-  replay implementation has not shipped yet: until it does, retrying a create can
-  duplicate side effects. Real replay exists today only for `/v1/responses` and the
-  admin command routes documented in `docs/idempotency.md`.
+
+The RAG create/ingest/reindex routes under `/api/v1/admin/rag-collections` and
+`/api/v1/admin/rag-documents` now replay under `Idempotency-Key`, on the same
+atomic admin-command machinery as `/v1/responses` and the admin command routes; see
+`docs/idempotency.md`. Conversation and memory create routes do not declare
+`Idempotency-Key` and do not replay.
 
 Full retrieval/memory intelligence is tracked separately and is not part of this MVP.
 

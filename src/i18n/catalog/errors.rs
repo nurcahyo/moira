@@ -27,6 +27,11 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         description: "Used when the same idempotency key is reused with incompatible request data.",
     },
     I18nEntry {
+        key: "moira.error.idempotency_in_progress",
+        default_message: "An identical request with this Idempotency-Key is already being processed. Retry shortly.",
+        description: "Used when a concurrent request holding the same idempotency key has claimed the ledger record but has not finished, or when the advisory lock could not be acquired within the deadline.",
+    },
+    I18nEntry {
         key: "moira.error.internal_error",
         default_message: "An unexpected error occurred.",
         description: "Used for unclassified server-side failures.",

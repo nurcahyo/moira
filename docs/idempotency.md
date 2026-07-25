@@ -1,6 +1,6 @@
 # Idempotency
 
-Moira supports `Idempotency-Key` on non-streaming public response creation and selected admin create and rotate commands. Keys are hashed before storage and scoped by actor fingerprint plus operation name.
+Moira supports `Idempotency-Key` on non-streaming public response creation, selected admin create and rotate commands, and the RAG collection/document create and ingest routes. Keys are hashed before storage and scoped by actor fingerprint plus operation name.
 
 Moira stores:
 
@@ -35,7 +35,27 @@ Only the winning system-key or consumer-key command receives the raw secret. Its
 
 Streaming does not support idempotency because replaying a partially delivered SSE stream is unsafe.
 
-Conversation, memory, and RAG endpoints do **not** replay today. `Idempotency-Key`
-is advertised on the RAG create/ingest/reindex routes and is accepted, but no replay
-is performed yet, so retrying a create can duplicate side effects. Implementing real
-replay for those routes is the next change to this document.
+The RAG collection/document create and ingest routes are also routed through the same
+atomic admin-command machinery, so their replay guarantees are identical to the core
+admin operations above:
+
+| Operation | Endpoint |
+| --- | --- |
+| `rag.collection.create` | `POST /api/v1/admin/rag-collections` |
+| `rag.document.create` | `POST /api/v1/admin/rag-collections/{collection_id}/documents` |
+| `rag.document.ingest` | `POST /api/v1/admin/rag-documents/{id}/ingest` |
+
+`POST /api/v1/admin/rag-documents/{id}/reindex` is a direct call-through to the same
+handler as `.../ingest` and therefore shares the `rag.document.ingest` operation
+identity and request-hash envelope. A consequence worth calling out explicitly: an
+`Idempotency-Key` already used on `/ingest` for a document, sent again with the same
+body to `/reindex` for that same document, replays the original `/ingest` response
+instead of creating a new version. Using a different key on `/reindex` creates a new
+version as usual. Retention is the same 24-hour window as the core admin operations.
+
+Conversation and memory create routes (`POST /api/v1/conversations`,
+`POST /api/v1/conversations/{id}/messages`, `POST /api/v1/memories`) do **not**
+declare or accept `Idempotency-Key` today and do not replay. Retrying one of those
+requests can duplicate side effects. Extending replay to those routes is tracked in
+`docs/todo.md` as a follow-up, since it is new API surface rather than a fix to an
+already-advertised header.
