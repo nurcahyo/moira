@@ -1,6 +1,7 @@
 mod support;
 
 use std::{
+    future::Future,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -19,10 +20,7 @@ use support::mock_openai::{MockOpenAiServer, ProviderScript, ScriptGate};
 use support::{
     LifecycleFixture, MoiraHttpServer, RuntimePolicy, public_response_request, request_context,
 };
-use tokio::{
-    sync::oneshot,
-    time::{sleep, timeout},
-};
+use tokio::{sync::oneshot, time::timeout};
 use uuid::Uuid;
 
 /// Total execution budget the three deadline-enforcement tests give an execution.
@@ -42,7 +40,8 @@ const DEADLINE_TEST_MINIMUM_ELAPSED: Duration = Duration::from_millis(1_200);
 
 /// Outer guard so a regression that removes the bound fails the test instead of hanging
 /// the CI job. Every gate this file installs is released before the guard's result is
-/// unwrapped, so a breach of the guard cannot wedge the shared test database either.
+/// unwrapped, so a breach of the guard leaves no mock provider parked on a connection
+/// the fixture still has to tear down.
 const DEADLINE_TEST_GUARD: Duration = Duration::from_secs(20);
 
 #[tokio::test]
@@ -557,8 +556,10 @@ async fn post_delta_stream_failure_cannot_retry_or_fallback() {
     let Some(fixture) = LifecycleFixture::new().await else {
         return;
     };
+    let failure_gate = ScriptGate::new();
     let primary = MockOpenAiServer::start([ProviderScript::StreamErrorAfterDelta {
         delta: "committed".to_string(),
+        gate: failure_gate.clone(),
     }])
     .await;
     let fallback = MockOpenAiServer::start([ProviderScript::Stream {
@@ -585,6 +586,10 @@ async fn post_delta_stream_failure_cannot_retry_or_fallback() {
         .await
         .expect("start post-delta failure stream");
     wait_for_delta(&mut handle, "committed").await;
+    // P2-12. The delta has now been emitted by the provider, translated by the runtime,
+    // and observed here, so "output was committed before the failure" is established
+    // rather than assumed. Only then is the scripted body failure released.
+    failure_gate.release();
     drain_stream(&mut handle).await;
     let outcome = (&mut handle.outcome)
         .await
@@ -612,8 +617,10 @@ async fn post_tool_output_stream_failure_cannot_retry_or_fallback() {
     let Some(fixture) = LifecycleFixture::new().await else {
         return;
     };
+    let failure_gate = ScriptGate::new();
     let primary = MockOpenAiServer::start([ProviderScript::StreamErrorAfterToolCall {
         name: "lookup".to_string(),
+        gate: failure_gate.clone(),
     }])
     .await;
     let fallback = MockOpenAiServer::start([ProviderScript::Stream {
@@ -655,6 +662,9 @@ async fn post_tool_output_stream_failure_cannot_retry_or_fallback() {
     })
     .await
     .expect("tool output timed out");
+    // P2-12, as above: the tool call is the committed output here, so the failure is
+    // released only once this test has seen it.
+    failure_gate.release();
     drain_stream(&mut handle).await;
     let outcome = (&mut handle.outcome)
         .await
@@ -1585,23 +1595,55 @@ fn parse_prefixed_uuid(value: &str, prefix: &str) -> Uuid {
     .expect("prefixed UUID")
 }
 
-async fn wait_for_public_cancellation(fixture: &LifecycleFixture, execution_id: Uuid) {
-    timeout(Duration::from_secs(5), async {
+/// How long the two status waits below give a background writer before failing.
+const OBSERVATION_BUDGET: Duration = Duration::from_secs(5);
+
+/// Polls `condition` on a fixed tick until it holds or `budget` expires.
+///
+/// The two waits below are for a row a *background* task writes: no signal crosses back
+/// into the test, so there is nothing to await on and polling is the correct shape (see
+/// `tests/retention_worker.rs::poll_until`, which this mirrors, and P2-12 —
+/// substituting a hand-rolled `Notify` here would be a racier construction, not a safer
+/// one). What matters is that the wait is bounded: a status that never arrives fails the
+/// test with a message naming what it was waiting for, rather than hanging or passing by
+/// accident. The previous form used `sleep` for its tick, which read as the
+/// `sleep()`-based interleaving `plans/CONVENTIONS.md` §3 forbids even though it was
+/// already bounded; an `interval` tick also does not accumulate drift across iterations.
+async fn poll_until<F, Fut>(budget: Duration, mut condition: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let mut ticker = tokio::time::interval(Duration::from_millis(20));
+    timeout(budget, async move {
         loop {
-            let status = sqlx::query("select status from responses where execution_id = $1")
-                .bind(execution_id)
-                .fetch_optional(&fixture.pool)
-                .await
-                .expect("query public response status")
-                .and_then(|row| row.try_get::<String, _>("status").ok());
-            if status.as_deref() == Some("cancelled") {
+            ticker.tick().await;
+            if condition().await {
                 return;
             }
-            sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("public response was not cancelled");
+    .is_ok()
+}
+
+async fn wait_for_public_cancellation(fixture: &LifecycleFixture, execution_id: Uuid) {
+    let cancelled = poll_until(OBSERVATION_BUDGET, || async {
+        sqlx::query("select status from responses where execution_id = $1")
+            .bind(execution_id)
+            .fetch_optional(&fixture.pool)
+            .await
+            .expect("query public response status")
+            .and_then(|row| row.try_get::<String, _>("status").ok())
+            .as_deref()
+            == Some("cancelled")
+    })
+    .await;
+    assert!(
+        cancelled,
+        "public response for execution {execution_id} was not cancelled within \
+         {OBSERVATION_BUDGET:?}"
+    );
 }
 
 async fn wait_for_attempt_status(
@@ -1609,22 +1651,23 @@ async fn wait_for_attempt_status(
     execution_id: Uuid,
     expected_status: &str,
 ) {
-    timeout(Duration::from_secs(5), async {
-        loop {
-            let status = sqlx::query("select status from execution_attempts where execution_id = $1 order by attempt_number desc limit 1")
-                .bind(execution_id)
-                .fetch_optional(&fixture.pool)
-                .await
-                .expect("query execution attempt status")
-                .and_then(|row| row.try_get::<String, _>("status").ok());
-            if status.as_deref() == Some(expected_status) {
-                return;
-            }
-            sleep(Duration::from_millis(20)).await;
-        }
+    let reached = poll_until(OBSERVATION_BUDGET, || async {
+        sqlx::query(
+            "select status from execution_attempts where execution_id = $1 \
+             order by attempt_number desc limit 1",
+        )
+        .bind(execution_id)
+        .fetch_optional(&fixture.pool)
+        .await
+        .expect("query execution attempt status")
+        .and_then(|row| row.try_get::<String, _>("status").ok())
+        .as_deref()
+            == Some(expected_status)
     })
-    .await
-    .unwrap_or_else(|_| {
-        panic!("execution {execution_id} did not reach attempt status {expected_status}")
-    });
+    .await;
+    assert!(
+        reached,
+        "execution {execution_id} did not reach attempt status {expected_status} within \
+         {OBSERVATION_BUDGET:?}"
+    );
 }

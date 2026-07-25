@@ -19,8 +19,22 @@
 //! string in a translated console — still fails.
 //!
 //! Every identifier written here carries a per-fixture `Uuid`, and the fixture creates its
-//! own application, so nothing in this file can be satisfied by a row an earlier run left in
-//! the shared database.
+//! own application, so nothing in this file can be satisfied by a row an earlier run left
+//! behind.
+//!
+//! # Database isolation (plan 06 module 13, P2-13)
+//!
+//! The plan lists this file's `Fixture` as the third of three independent fixtures needing
+//! schema isolation. It is not independent: it *wraps* [`support::LifecycleFixture`] and adds
+//! only a router and a suffix, so it inherits that fixture's private database — and its
+//! guaranteed teardown — without a line of its own. That is the justification module 13 item 3
+//! asks for, recorded here rather than left as a silent omission. The two genuinely separate
+//! harnesses were `tests/support/mod.rs` and `tests/admin_idempotency.rs`, and both now own a
+//! database per fixture.
+//!
+//! One consequence is worth naming for the concurrency test at the end: PostgreSQL advisory
+//! locks are scoped to a database, so the raced writers below contend only with each other.
+//! Before isolation they shared a lock namespace with every other suite running at the time.
 //!
 //! The last test is the one that matters most:
 //! `concurrent_execution_policy_puts_with_the_same_version_yield_exactly_one_success_and_one_409`
