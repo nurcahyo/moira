@@ -62,6 +62,7 @@
 //! All of this is standard keyset behaviour for a mutable sort key and is accepted
 //! deliberately — the alternative is changing the sort key, which rule 1 forbids.
 
+use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use serde_json::Value;
 use sqlx::{PgConnection, PgPool, Row};
@@ -263,12 +264,250 @@ const LIST_RAG_DOCUMENTS_SQL: &str = r#"
             limit $4
             "#;
 
+/// The conversation/memory/RAG persistence surface: the four per-application policy documents,
+/// conversation and message rows, extracted memories, and the RAG collection/document tables.
+///
+/// Extracted as a trait (plan 06, Module 8 / P2-3) so `ConversationService` can be unit-tested
+/// against a fake instead of a live Postgres. Mirrors [`AdminRepository`](super::AdminRepository):
+/// the trait carries the documentation, the `#[async_trait] impl` below carries only SQL.
+///
+/// The `*_authorized` methods apply the caller's [`ConversationAccess`] scoping **in SQL**, not in
+/// the application layer. An implementation that returned rows outside the supplied access scope
+/// would be a cross-tenant disclosure, so that filtering is part of this contract, not an
+/// optimisation. The three `*_with_connection` free functions below are deliberately **not** on
+/// this trait: they run inside the admin-command transaction and carry no authorization of their
+/// own — see the `pub(crate)` note in `repositories/mod.rs`.
+#[async_trait]
+pub trait ConversationRepository: Send + Sync {
+    async fn get_or_create_conversation_policy(
+        &self,
+        application_id: Uuid,
+    ) -> Result<ConversationPolicyRecord, AppError>;
+
+    async fn put_conversation_policy(
+        &self,
+        application_id: Uuid,
+        request: &ConversationPolicyPutRequest,
+    ) -> Result<ConversationPolicyRecord, AppError>;
+
+    async fn get_or_create_memory_policy(
+        &self,
+        application_id: Uuid,
+    ) -> Result<MemoryPolicyRecord, AppError>;
+
+    async fn put_memory_policy(
+        &self,
+        application_id: Uuid,
+        request: &MemoryPolicyPutRequest,
+    ) -> Result<MemoryPolicyRecord, AppError>;
+
+    async fn get_or_create_retrieval_policy(
+        &self,
+        application_id: Uuid,
+    ) -> Result<RetrievalPolicyRecord, AppError>;
+
+    async fn put_retrieval_policy(
+        &self,
+        application_id: Uuid,
+        request: &RetrievalPolicyPutRequest,
+    ) -> Result<RetrievalPolicyRecord, AppError>;
+
+    async fn get_or_create_embedding_policy(
+        &self,
+        application_id: Uuid,
+    ) -> Result<EmbeddingPolicyRecord, AppError>;
+
+    async fn put_embedding_policy(
+        &self,
+        application_id: Uuid,
+        request: &EmbeddingPolicyPutRequest,
+    ) -> Result<EmbeddingPolicyRecord, AppError>;
+
+    async fn create_conversation(
+        &self,
+        insert: &ConversationInsert<'_>,
+    ) -> Result<ConversationRecord, AppError>;
+
+    async fn find_conversation_authorized(
+        &self,
+        public_id: &str,
+        access: &ConversationAccess,
+    ) -> Result<ConversationRecord, AppError>;
+
+    /// Lists conversations newest-updated-first, resuming after `cursor` when supplied.
+    ///
+    /// See the module docs for the keyset contract. The sort key here is
+    /// `(updated_at, id)` — a **mutable** timestamp that the version trigger only ever moves
+    /// forward, so a conversation updated mid-sweep is **skipped**, not duplicated. The full
+    /// argument, and what callers must check instead of de-duplicating, is in the module docs.
+    async fn list_conversations_authorized(
+        &self,
+        access: &ConversationAccess,
+        query: &ConversationQuery,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<(ConversationRecord, ListCursor)>, AppError>;
+
+    async fn patch_conversation(
+        &self,
+        public_id: &str,
+        request: &ConversationPatchRequest,
+    ) -> Result<ConversationRecord, AppError>;
+
+    async fn set_conversation_status(
+        &self,
+        public_id: &str,
+        status: ConversationStatus,
+    ) -> Result<ConversationRecord, AppError>;
+
+    async fn add_message(
+        &self,
+        insert: &ConversationMessageInsert,
+    ) -> Result<ConversationMessageRecord, AppError>;
+
+    /// Lists a conversation's messages in ascending sequence order, resuming after `cursor`.
+    ///
+    /// The only **ascending** list in this file, so its keyset predicate is
+    /// `sequence_number > $n`, not `<`. `sequence_number` is unique per conversation
+    /// (`conversation_messages_sequence_unique`, `migrations/0007_*.sql`), so the ordering is
+    /// already total and no `id` tiebreaker is needed — hence a bare [`SeqCursor`] rather
+    /// than a `(timestamp, id)` pair.
+    ///
+    /// The cursor composes with, and does not replace, the pre-existing `before`/`after`
+    /// filters: all three are separate `and`-ed predicates over the same column.
+    async fn list_messages(
+        &self,
+        conversation_public_id: &str,
+        query: &ConversationMessageQuery,
+        cursor: Option<SeqCursor>,
+        limit: i64,
+    ) -> Result<Vec<(ConversationMessageRecord, SeqCursor)>, AppError>;
+
+    async fn create_memory(&self, insert: &MemoryInsert<'_>) -> Result<MemoryRecord, AppError>;
+
+    async fn find_memory_authorized(
+        &self,
+        public_id: &str,
+        access: &ConversationAccess,
+    ) -> Result<MemoryRecord, AppError>;
+
+    /// Lists memories newest-updated-first, resuming after `cursor` when supplied.
+    ///
+    /// Same `(updated_at, id)` mutable sort key as
+    /// [`Self::list_conversations_authorized`], so a memory updated mid-sweep is **skipped**
+    /// rather than re-seen, for the reason set out in the module docs.
+    async fn list_memories_authorized(
+        &self,
+        access: &ConversationAccess,
+        query: &MemoryQuery,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<(MemoryRecord, ListCursor)>, AppError>;
+
+    async fn patch_memory(
+        &self,
+        public_id: &str,
+        request: &MemoryPatchRequest,
+        content_hash: Option<&str>,
+    ) -> Result<MemoryRecord, AppError>;
+
+    async fn delete_memory(&self, public_id: &str) -> Result<(), AppError>;
+
+    /// Pooled wrapper over [`create_rag_collection_with_connection`].
+    ///
+    /// The SQL body lives in the free function so it can also run inside a caller-supplied
+    /// transaction (the `AdminCommandRunner` idempotency envelope). This method owns the
+    /// transaction lifecycle; the free function must never open one.
+    async fn create_rag_collection(
+        &self,
+        id: Uuid,
+        public_id: &str,
+        request: &RagCollectionCreateRequest,
+    ) -> Result<RagCollectionRecord, AppError>;
+
+    /// Lists RAG collections newest-created-first, resuming after `cursor` when supplied.
+    ///
+    /// Unlike conversations and memories the sort key here is `(created_at, id)` — immutable
+    /// once written, so a sweep over it is exactly-once even under concurrent updates.
+    async fn list_rag_collections(
+        &self,
+        query: &RagCollectionQuery,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<(RagCollectionRecord, ListCursor)>, AppError>;
+
+    async fn get_rag_collection(&self, public_id: &str) -> Result<RagCollectionRecord, AppError>;
+
+    async fn patch_rag_collection(
+        &self,
+        public_id: &str,
+        request: &RagCollectionPatchRequest,
+    ) -> Result<RagCollectionRecord, AppError>;
+
+    async fn set_rag_collection_status(
+        &self,
+        public_id: &str,
+        status: RagCollectionStatus,
+    ) -> Result<RagCollectionRecord, AppError>;
+
+    /// Pooled wrapper over [`create_rag_document_with_connection`].
+    ///
+    /// The SQL body lives in the free function so it can also run inside a caller-supplied
+    /// transaction (the `AdminCommandRunner` idempotency envelope). This method owns the
+    /// transaction lifecycle; the free function must never open one.
+    async fn create_rag_document(
+        &self,
+        id: Uuid,
+        public_id: &str,
+        collection_public_id: &str,
+        request: &RagDocumentCreateRequest,
+        content_hash: Option<&str>,
+    ) -> Result<RagDocumentRecord, AppError>;
+
+    /// Lists a collection's documents newest-created-first, resuming after `cursor`.
+    ///
+    /// The keyset predicate goes **inside** the CTE, where the `limit` is: it selects which
+    /// rows survive into the page. The newest-first ordering of the emitted page is a
+    /// property of [`rag_document_select`]'s outer `order by`, which must not be removed —
+    /// see the comment there and the unit test that guards it.
+    ///
+    /// `limit` is no longer clamped here; `crate::application::conversation` clamps it, so
+    /// the over-fetch row cannot be silently eaten by a repository-side ceiling.
+    async fn list_rag_documents(
+        &self,
+        collection_public_id: &str,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<(RagDocumentRecord, ListCursor)>, AppError>;
+
+    async fn get_rag_document(&self, public_id: &str) -> Result<RagDocumentRecord, AppError>;
+
+    async fn delete_rag_document(&self, public_id: &str) -> Result<(), AppError>;
+
+    /// Pooled wrapper over [`ingest_rag_document_with_connection`].
+    ///
+    /// The SQL body lives in the free function so it can also run inside a caller-supplied
+    /// transaction (the `AdminCommandRunner` idempotency envelope). This method owns the
+    /// transaction lifecycle; the free function must never open one — the `for update` row
+    /// lock and the version supersession must belong to whatever transaction the caller
+    /// already holds.
+    async fn ingest_rag_document(
+        &self,
+        public_id: &str,
+        request: &RagDocumentIngestRequest,
+        content_hash: &str,
+    ) -> Result<RagDocumentRecord, AppError>;
+}
+
 impl PgConversationRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+}
 
-    pub async fn get_or_create_conversation_policy(
+#[async_trait]
+impl ConversationRepository for PgConversationRepository {
+    async fn get_or_create_conversation_policy(
         &self,
         application_id: Uuid,
     ) -> Result<ConversationPolicyRecord, AppError> {
@@ -286,7 +525,7 @@ impl PgConversationRepository {
         conversation_policy_record_from_row(&row)
     }
 
-    pub async fn put_conversation_policy(
+    async fn put_conversation_policy(
         &self,
         application_id: Uuid,
         request: &ConversationPolicyPutRequest,
@@ -372,7 +611,7 @@ impl PgConversationRepository {
         conversation_policy_record_from_row(&row)
     }
 
-    pub async fn get_or_create_memory_policy(
+    async fn get_or_create_memory_policy(
         &self,
         application_id: Uuid,
     ) -> Result<MemoryPolicyRecord, AppError> {
@@ -390,7 +629,7 @@ impl PgConversationRepository {
         memory_policy_record_from_row(&row)
     }
 
-    pub async fn put_memory_policy(
+    async fn put_memory_policy(
         &self,
         application_id: Uuid,
         request: &MemoryPolicyPutRequest,
@@ -479,7 +718,7 @@ impl PgConversationRepository {
         memory_policy_record_from_row(&row)
     }
 
-    pub async fn get_or_create_retrieval_policy(
+    async fn get_or_create_retrieval_policy(
         &self,
         application_id: Uuid,
     ) -> Result<RetrievalPolicyRecord, AppError> {
@@ -497,7 +736,7 @@ impl PgConversationRepository {
         retrieval_policy_record_from_row(&row)
     }
 
-    pub async fn put_retrieval_policy(
+    async fn put_retrieval_policy(
         &self,
         application_id: Uuid,
         request: &RetrievalPolicyPutRequest,
@@ -567,7 +806,7 @@ impl PgConversationRepository {
         retrieval_policy_record_from_row(&row)
     }
 
-    pub async fn get_or_create_embedding_policy(
+    async fn get_or_create_embedding_policy(
         &self,
         application_id: Uuid,
     ) -> Result<EmbeddingPolicyRecord, AppError> {
@@ -585,7 +824,7 @@ impl PgConversationRepository {
         embedding_policy_record_from_row(&row)
     }
 
-    pub async fn put_embedding_policy(
+    async fn put_embedding_policy(
         &self,
         application_id: Uuid,
         request: &EmbeddingPolicyPutRequest,
@@ -633,7 +872,7 @@ impl PgConversationRepository {
         embedding_policy_record_from_row(&row)
     }
 
-    pub async fn create_conversation(
+    async fn create_conversation(
         &self,
         insert: &ConversationInsert<'_>,
     ) -> Result<ConversationRecord, AppError> {
@@ -665,7 +904,7 @@ impl PgConversationRepository {
         conversation_record_from_row(&row)
     }
 
-    pub async fn find_conversation_authorized(
+    async fn find_conversation_authorized(
         &self,
         public_id: &str,
         access: &ConversationAccess,
@@ -699,13 +938,7 @@ impl PgConversationRepository {
         conversation_record_from_row(&row)
     }
 
-    /// Lists conversations newest-updated-first, resuming after `cursor` when supplied.
-    ///
-    /// See the module docs for the keyset contract. The sort key here is
-    /// `(updated_at, id)` — a **mutable** timestamp that the version trigger only ever moves
-    /// forward, so a conversation updated mid-sweep is **skipped**, not duplicated. The full
-    /// argument, and what callers must check instead of de-duplicating, is in the module docs.
-    pub async fn list_conversations_authorized(
+    async fn list_conversations_authorized(
         &self,
         access: &ConversationAccess,
         query: &ConversationQuery,
@@ -737,7 +970,7 @@ impl PgConversationRepository {
             .collect()
     }
 
-    pub async fn patch_conversation(
+    async fn patch_conversation(
         &self,
         public_id: &str,
         request: &ConversationPatchRequest,
@@ -766,7 +999,7 @@ impl PgConversationRepository {
         conversation_record_from_row(&row)
     }
 
-    pub async fn set_conversation_status(
+    async fn set_conversation_status(
         &self,
         public_id: &str,
         status: ConversationStatus,
@@ -801,7 +1034,7 @@ impl PgConversationRepository {
         conversation_record_from_row(&row)
     }
 
-    pub async fn add_message(
+    async fn add_message(
         &self,
         insert: &ConversationMessageInsert,
     ) -> Result<ConversationMessageRecord, AppError> {
@@ -878,17 +1111,7 @@ impl PgConversationRepository {
         conversation_message_record_from_row(&row)
     }
 
-    /// Lists a conversation's messages in ascending sequence order, resuming after `cursor`.
-    ///
-    /// The only **ascending** list in this file, so its keyset predicate is
-    /// `sequence_number > $n`, not `<`. `sequence_number` is unique per conversation
-    /// (`conversation_messages_sequence_unique`, `migrations/0007_*.sql`), so the ordering is
-    /// already total and no `id` tiebreaker is needed — hence a bare [`SeqCursor`] rather
-    /// than a `(timestamp, id)` pair.
-    ///
-    /// The cursor composes with, and does not replace, the pre-existing `before`/`after`
-    /// filters: all three are separate `and`-ed predicates over the same column.
-    pub async fn list_messages(
+    async fn list_messages(
         &self,
         conversation_public_id: &str,
         query: &ConversationMessageQuery,
@@ -912,7 +1135,7 @@ impl PgConversationRepository {
             .collect()
     }
 
-    pub async fn create_memory(&self, insert: &MemoryInsert<'_>) -> Result<MemoryRecord, AppError> {
+    async fn create_memory(&self, insert: &MemoryInsert<'_>) -> Result<MemoryRecord, AppError> {
         let row = sqlx::query(&memory_select(
             r#"
             insert into memory_records (
@@ -945,7 +1168,7 @@ impl PgConversationRepository {
         memory_record_from_row(&row)
     }
 
-    pub async fn find_memory_authorized(
+    async fn find_memory_authorized(
         &self,
         public_id: &str,
         access: &ConversationAccess,
@@ -979,12 +1202,7 @@ impl PgConversationRepository {
         memory_record_from_row(&row)
     }
 
-    /// Lists memories newest-updated-first, resuming after `cursor` when supplied.
-    ///
-    /// Same `(updated_at, id)` mutable sort key as
-    /// [`Self::list_conversations_authorized`], so a memory updated mid-sweep is **skipped**
-    /// rather than re-seen, for the reason set out in the module docs.
-    pub async fn list_memories_authorized(
+    async fn list_memories_authorized(
         &self,
         access: &ConversationAccess,
         query: &MemoryQuery,
@@ -1012,7 +1230,7 @@ impl PgConversationRepository {
             .collect()
     }
 
-    pub async fn patch_memory(
+    async fn patch_memory(
         &self,
         public_id: &str,
         request: &MemoryPatchRequest,
@@ -1050,7 +1268,7 @@ impl PgConversationRepository {
         memory_record_from_row(&row)
     }
 
-    pub async fn delete_memory(&self, public_id: &str) -> Result<(), AppError> {
+    async fn delete_memory(&self, public_id: &str) -> Result<(), AppError> {
         sqlx::query(
             r#"
             update memory_records
@@ -1064,12 +1282,7 @@ impl PgConversationRepository {
         Ok(())
     }
 
-    /// Pooled wrapper over [`create_rag_collection_with_connection`].
-    ///
-    /// The SQL body lives in the free function so it can also run inside a caller-supplied
-    /// transaction (the `AdminCommandRunner` idempotency envelope). This method owns the
-    /// transaction lifecycle; the free function must never open one.
-    pub async fn create_rag_collection(
+    async fn create_rag_collection(
         &self,
         id: Uuid,
         public_id: &str,
@@ -1081,11 +1294,7 @@ impl PgConversationRepository {
         Ok(record)
     }
 
-    /// Lists RAG collections newest-created-first, resuming after `cursor` when supplied.
-    ///
-    /// Unlike conversations and memories the sort key here is `(created_at, id)` — immutable
-    /// once written, so a sweep over it is exactly-once even under concurrent updates.
-    pub async fn list_rag_collections(
+    async fn list_rag_collections(
         &self,
         query: &RagCollectionQuery,
         cursor: Option<ListCursor>,
@@ -1109,10 +1318,7 @@ impl PgConversationRepository {
             .collect()
     }
 
-    pub async fn get_rag_collection(
-        &self,
-        public_id: &str,
-    ) -> Result<RagCollectionRecord, AppError> {
+    async fn get_rag_collection(&self, public_id: &str) -> Result<RagCollectionRecord, AppError> {
         let row = sqlx::query(
             r#"
             select *
@@ -1133,7 +1339,7 @@ impl PgConversationRepository {
         rag_collection_record_from_row(&row)
     }
 
-    pub async fn patch_rag_collection(
+    async fn patch_rag_collection(
         &self,
         public_id: &str,
         request: &RagCollectionPatchRequest,
@@ -1166,7 +1372,7 @@ impl PgConversationRepository {
         rag_collection_record_from_row(&row)
     }
 
-    pub async fn set_rag_collection_status(
+    async fn set_rag_collection_status(
         &self,
         public_id: &str,
         status: RagCollectionStatus,
@@ -1188,12 +1394,7 @@ impl PgConversationRepository {
         rag_collection_record_from_row(&row)
     }
 
-    /// Pooled wrapper over [`create_rag_document_with_connection`].
-    ///
-    /// The SQL body lives in the free function so it can also run inside a caller-supplied
-    /// transaction (the `AdminCommandRunner` idempotency envelope). This method owns the
-    /// transaction lifecycle; the free function must never open one.
-    pub async fn create_rag_document(
+    async fn create_rag_document(
         &self,
         id: Uuid,
         public_id: &str,
@@ -1215,16 +1416,7 @@ impl PgConversationRepository {
         Ok(record)
     }
 
-    /// Lists a collection's documents newest-created-first, resuming after `cursor`.
-    ///
-    /// The keyset predicate goes **inside** the CTE, where the `limit` is: it selects which
-    /// rows survive into the page. The newest-first ordering of the emitted page is a
-    /// property of [`rag_document_select`]'s outer `order by`, which must not be removed —
-    /// see the comment there and the unit test that guards it.
-    ///
-    /// `limit` is no longer clamped here; `crate::application::conversation` clamps it, so
-    /// the over-fetch row cannot be silently eaten by a repository-side ceiling.
-    pub async fn list_rag_documents(
+    async fn list_rag_documents(
         &self,
         collection_public_id: &str,
         cursor: Option<ListCursor>,
@@ -1246,7 +1438,7 @@ impl PgConversationRepository {
             .collect()
     }
 
-    pub async fn get_rag_document(&self, public_id: &str) -> Result<RagDocumentRecord, AppError> {
+    async fn get_rag_document(&self, public_id: &str) -> Result<RagDocumentRecord, AppError> {
         let row = sqlx::query(&rag_document_select(
             r#"
             select d.*
@@ -1267,7 +1459,7 @@ impl PgConversationRepository {
         rag_document_record_from_row(&row)
     }
 
-    pub async fn delete_rag_document(&self, public_id: &str) -> Result<(), AppError> {
+    async fn delete_rag_document(&self, public_id: &str) -> Result<(), AppError> {
         sqlx::query(
             "update rag_documents set status = 'deleted', deleted_at = coalesce(deleted_at, now()) where public_id = $1",
         )
@@ -1277,14 +1469,7 @@ impl PgConversationRepository {
         Ok(())
     }
 
-    /// Pooled wrapper over [`ingest_rag_document_with_connection`].
-    ///
-    /// The SQL body lives in the free function so it can also run inside a caller-supplied
-    /// transaction (the `AdminCommandRunner` idempotency envelope). This method owns the
-    /// transaction lifecycle; the free function must never open one — the `for update` row
-    /// lock and the version supersession must belong to whatever transaction the caller
-    /// already holds.
-    pub async fn ingest_rag_document(
+    async fn ingest_rag_document(
         &self,
         public_id: &str,
         request: &RagDocumentIngestRequest,
@@ -1815,5 +2000,408 @@ mod tests {
                 "{label}: the row limit must be bound too:\n{sql}"
             );
         }
+    }
+}
+
+/// In-memory [`ConversationRepository`] for unit tests (plan 06, Module 8 / P2-3).
+///
+/// Backs the **conversation-policy document** — the `get_or_create` / `put` pair that gates every
+/// conversation, memory and RAG feature — with real state, and returns an explicit `not_stubbed`
+/// error for every other method. A fake that answered unbacked reads with `Ok(default)` would let
+/// a test pass while exercising nothing, so unbacked methods fail loudly instead.
+///
+/// Carries no conversation content and no credential material: nothing is seeded that a leak test
+/// would have to recognise as synthetic.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct InMemoryConversationRepository {
+    policies: std::sync::Mutex<std::collections::HashMap<Uuid, ConversationPolicyRecord>>,
+}
+
+#[cfg(test)]
+fn not_stubbed(method: &str) -> AppError {
+    AppError::Internal(format!(
+        "InMemoryConversationRepository::{method} is not stubbed"
+    ))
+}
+
+#[cfg(test)]
+fn seed_conversation_policy(application_id: Uuid) -> ConversationPolicyRecord {
+    ConversationPolicyRecord {
+        id: application_id,
+        application_id,
+        conversations_enabled: false,
+        conversation_content_persistence: crate::domain::ConversationContentPersistence::None,
+        default_retention_days: 30,
+        maximum_retention_days: 365,
+        history_strategy: crate::domain::HistoryStrategy::RecentMessages,
+        maximum_recent_messages: 20,
+        maximum_history_tokens: 4096,
+        summarization_enabled: false,
+        summary_trigger_tokens: 3000,
+        summary_target_tokens: 512,
+        minimum_messages_since_summary: 10,
+        memory_enabled: false,
+        memory_extraction_enabled: false,
+        memory_retrieval_enabled: false,
+        memory_consent_mode: crate::domain::MemoryConsentMode::Disabled,
+        rag_enabled: false,
+        default_collection_ids: Vec::new(),
+        caller_can_create_conversations: false,
+        caller_can_delete_conversations: false,
+        caller_can_export_conversations: false,
+        protected_instruction_policy: "reject".to_string(),
+        metadata: Value::Object(serde_json::Map::new()),
+        updated_at: Utc::now(),
+        version: 1,
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl ConversationRepository for InMemoryConversationRepository {
+    async fn get_or_create_conversation_policy(
+        &self,
+        application_id: Uuid,
+    ) -> Result<ConversationPolicyRecord, AppError> {
+        Ok(self
+            .policies
+            .lock()
+            .unwrap()
+            .entry(application_id)
+            .or_insert_with(|| seed_conversation_policy(application_id))
+            .clone())
+    }
+
+    /// Mirrors the SQL's `coalesce($n, existing)` semantics: `None` leaves the stored value
+    /// alone, and every write bumps `version`. That is the part of the contract the application
+    /// layer actually depends on — a fake that overwrote absent fields with defaults would make
+    /// a partial-update bug invisible.
+    async fn put_conversation_policy(
+        &self,
+        application_id: Uuid,
+        request: &ConversationPolicyPutRequest,
+    ) -> Result<ConversationPolicyRecord, AppError> {
+        let mut guard = self.policies.lock().unwrap();
+        let policy = guard
+            .entry(application_id)
+            .or_insert_with(|| seed_conversation_policy(application_id));
+
+        macro_rules! apply {
+            ($($field:ident),* $(,)?) => {$(
+                if let Some(value) = request.$field.clone() {
+                    policy.$field = value;
+                }
+            )*};
+        }
+        apply!(
+            conversations_enabled,
+            conversation_content_persistence,
+            default_retention_days,
+            maximum_retention_days,
+            history_strategy,
+            maximum_recent_messages,
+            maximum_history_tokens,
+            summarization_enabled,
+            summary_trigger_tokens,
+            summary_target_tokens,
+            minimum_messages_since_summary,
+            memory_enabled,
+            memory_extraction_enabled,
+            memory_retrieval_enabled,
+            memory_consent_mode,
+            rag_enabled,
+            default_collection_ids,
+            caller_can_create_conversations,
+            caller_can_delete_conversations,
+            caller_can_export_conversations,
+            protected_instruction_policy,
+            metadata,
+        );
+        policy.updated_at = Utc::now();
+        policy.version += 1;
+        Ok(policy.clone())
+    }
+
+    async fn get_or_create_memory_policy(
+        &self,
+        _application_id: Uuid,
+    ) -> Result<MemoryPolicyRecord, AppError> {
+        Err(not_stubbed("get_or_create_memory_policy"))
+    }
+
+    async fn put_memory_policy(
+        &self,
+        _application_id: Uuid,
+        _request: &MemoryPolicyPutRequest,
+    ) -> Result<MemoryPolicyRecord, AppError> {
+        Err(not_stubbed("put_memory_policy"))
+    }
+
+    async fn get_or_create_retrieval_policy(
+        &self,
+        _application_id: Uuid,
+    ) -> Result<RetrievalPolicyRecord, AppError> {
+        Err(not_stubbed("get_or_create_retrieval_policy"))
+    }
+
+    async fn put_retrieval_policy(
+        &self,
+        _application_id: Uuid,
+        _request: &RetrievalPolicyPutRequest,
+    ) -> Result<RetrievalPolicyRecord, AppError> {
+        Err(not_stubbed("put_retrieval_policy"))
+    }
+
+    async fn get_or_create_embedding_policy(
+        &self,
+        _application_id: Uuid,
+    ) -> Result<EmbeddingPolicyRecord, AppError> {
+        Err(not_stubbed("get_or_create_embedding_policy"))
+    }
+
+    async fn put_embedding_policy(
+        &self,
+        _application_id: Uuid,
+        _request: &EmbeddingPolicyPutRequest,
+    ) -> Result<EmbeddingPolicyRecord, AppError> {
+        Err(not_stubbed("put_embedding_policy"))
+    }
+
+    async fn create_conversation(
+        &self,
+        _insert: &ConversationInsert<'_>,
+    ) -> Result<ConversationRecord, AppError> {
+        Err(not_stubbed("create_conversation"))
+    }
+
+    async fn find_conversation_authorized(
+        &self,
+        _public_id: &str,
+        _access: &ConversationAccess,
+    ) -> Result<ConversationRecord, AppError> {
+        Err(not_stubbed("find_conversation_authorized"))
+    }
+
+    async fn list_conversations_authorized(
+        &self,
+        _access: &ConversationAccess,
+        _query: &ConversationQuery,
+        _cursor: Option<ListCursor>,
+        _limit: i64,
+    ) -> Result<Vec<(ConversationRecord, ListCursor)>, AppError> {
+        Err(not_stubbed("list_conversations_authorized"))
+    }
+
+    async fn patch_conversation(
+        &self,
+        _public_id: &str,
+        _request: &ConversationPatchRequest,
+    ) -> Result<ConversationRecord, AppError> {
+        Err(not_stubbed("patch_conversation"))
+    }
+
+    async fn set_conversation_status(
+        &self,
+        _public_id: &str,
+        _status: ConversationStatus,
+    ) -> Result<ConversationRecord, AppError> {
+        Err(not_stubbed("set_conversation_status"))
+    }
+
+    async fn add_message(
+        &self,
+        _insert: &ConversationMessageInsert,
+    ) -> Result<ConversationMessageRecord, AppError> {
+        Err(not_stubbed("add_message"))
+    }
+
+    async fn list_messages(
+        &self,
+        _conversation_public_id: &str,
+        _query: &ConversationMessageQuery,
+        _cursor: Option<SeqCursor>,
+        _limit: i64,
+    ) -> Result<Vec<(ConversationMessageRecord, SeqCursor)>, AppError> {
+        Err(not_stubbed("list_messages"))
+    }
+
+    async fn create_memory(&self, _insert: &MemoryInsert<'_>) -> Result<MemoryRecord, AppError> {
+        Err(not_stubbed("create_memory"))
+    }
+
+    async fn find_memory_authorized(
+        &self,
+        _public_id: &str,
+        _access: &ConversationAccess,
+    ) -> Result<MemoryRecord, AppError> {
+        Err(not_stubbed("find_memory_authorized"))
+    }
+
+    async fn list_memories_authorized(
+        &self,
+        _access: &ConversationAccess,
+        _query: &MemoryQuery,
+        _cursor: Option<ListCursor>,
+        _limit: i64,
+    ) -> Result<Vec<(MemoryRecord, ListCursor)>, AppError> {
+        Err(not_stubbed("list_memories_authorized"))
+    }
+
+    async fn patch_memory(
+        &self,
+        _public_id: &str,
+        _request: &MemoryPatchRequest,
+        _content_hash: Option<&str>,
+    ) -> Result<MemoryRecord, AppError> {
+        Err(not_stubbed("patch_memory"))
+    }
+
+    async fn delete_memory(&self, _public_id: &str) -> Result<(), AppError> {
+        Err(not_stubbed("delete_memory"))
+    }
+
+    async fn create_rag_collection(
+        &self,
+        _id: Uuid,
+        _public_id: &str,
+        _request: &RagCollectionCreateRequest,
+    ) -> Result<RagCollectionRecord, AppError> {
+        Err(not_stubbed("create_rag_collection"))
+    }
+
+    async fn list_rag_collections(
+        &self,
+        _query: &RagCollectionQuery,
+        _cursor: Option<ListCursor>,
+        _limit: i64,
+    ) -> Result<Vec<(RagCollectionRecord, ListCursor)>, AppError> {
+        Err(not_stubbed("list_rag_collections"))
+    }
+
+    async fn get_rag_collection(&self, _public_id: &str) -> Result<RagCollectionRecord, AppError> {
+        Err(not_stubbed("get_rag_collection"))
+    }
+
+    async fn patch_rag_collection(
+        &self,
+        _public_id: &str,
+        _request: &RagCollectionPatchRequest,
+    ) -> Result<RagCollectionRecord, AppError> {
+        Err(not_stubbed("patch_rag_collection"))
+    }
+
+    async fn set_rag_collection_status(
+        &self,
+        _public_id: &str,
+        _status: RagCollectionStatus,
+    ) -> Result<RagCollectionRecord, AppError> {
+        Err(not_stubbed("set_rag_collection_status"))
+    }
+
+    async fn create_rag_document(
+        &self,
+        _id: Uuid,
+        _public_id: &str,
+        _collection_public_id: &str,
+        _request: &RagDocumentCreateRequest,
+        _content_hash: Option<&str>,
+    ) -> Result<RagDocumentRecord, AppError> {
+        Err(not_stubbed("create_rag_document"))
+    }
+
+    async fn list_rag_documents(
+        &self,
+        _collection_public_id: &str,
+        _cursor: Option<ListCursor>,
+        _limit: i64,
+    ) -> Result<Vec<(RagDocumentRecord, ListCursor)>, AppError> {
+        Err(not_stubbed("list_rag_documents"))
+    }
+
+    async fn get_rag_document(&self, _public_id: &str) -> Result<RagDocumentRecord, AppError> {
+        Err(not_stubbed("get_rag_document"))
+    }
+
+    async fn delete_rag_document(&self, _public_id: &str) -> Result<(), AppError> {
+        Err(not_stubbed("delete_rag_document"))
+    }
+
+    async fn ingest_rag_document(
+        &self,
+        _public_id: &str,
+        _request: &RagDocumentIngestRequest,
+        _content_hash: &str,
+    ) -> Result<RagDocumentRecord, AppError> {
+        Err(not_stubbed("ingest_rag_document"))
+    }
+}
+
+#[cfg(test)]
+mod repository_trait_tests {
+    use super::*;
+
+    /// P2-3: the conversation-policy document — the gate in front of every conversation, memory
+    /// and RAG feature — is now exercisable in a unit test without Postgres.
+    #[tokio::test]
+    async fn fake_conversation_repository_supports_policy_unit_test() {
+        let application_id = Uuid::now_v7();
+        let repo = InMemoryConversationRepository::default();
+
+        // `get_or_create` mints a closed-by-default policy.
+        let created = repo
+            .get_or_create_conversation_policy(application_id)
+            .await
+            .expect("policy");
+        assert!(!created.conversations_enabled);
+        assert!(!created.rag_enabled);
+        assert_eq!(created.version, 1);
+
+        // A partial `put` changes only the fields it names and bumps the version.
+        let updated = repo
+            .put_conversation_policy(
+                application_id,
+                &ConversationPolicyPutRequest {
+                    conversations_enabled: Some(true),
+                    maximum_recent_messages: Some(50),
+                    ..ConversationPolicyPutRequest::default()
+                },
+            )
+            .await
+            .expect("put policy");
+        assert!(updated.conversations_enabled);
+        assert_eq!(updated.maximum_recent_messages, 50);
+        assert_eq!(updated.version, 2);
+        // Untouched fields survive — `coalesce($n, existing)`, not overwrite-with-default.
+        assert_eq!(
+            updated.maximum_history_tokens,
+            created.maximum_history_tokens
+        );
+        assert!(!updated.rag_enabled);
+
+        // The store is the source of truth for the next read.
+        let reread = repo
+            .get_or_create_conversation_policy(application_id)
+            .await
+            .expect("policy");
+        assert!(reread.conversations_enabled);
+        assert_eq!(reread.version, 2);
+
+        // Policies are per application.
+        let other = repo
+            .get_or_create_conversation_policy(Uuid::now_v7())
+            .await
+            .expect("policy");
+        assert!(!other.conversations_enabled);
+    }
+
+    #[tokio::test]
+    async fn unbacked_fake_conversation_methods_fail_loudly() {
+        let repo = InMemoryConversationRepository::default();
+        let error = repo
+            .list_rag_collections(&RagCollectionQuery::default(), None, 10)
+            .await
+            .expect_err("unbacked method");
+        assert!(error.to_string().contains("not stubbed"));
     }
 }

@@ -1,11 +1,10 @@
 use chrono::{DateTime, Utc};
-use rig_core::completion::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::domain::{CredentialType, ProviderType, ResourceStatus};
+use crate::domain::{CredentialType, DomainMessage, ProviderType, ResourceStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RouteDefinitionRecord {
@@ -246,7 +245,7 @@ pub struct ExecutionCommand {
     pub application_id: Option<Uuid>,
     pub external_tenant_id: Option<String>,
     pub external_user_id: Option<String>,
-    pub messages: Vec<Message>,
+    pub messages: Vec<DomainMessage>,
     pub route_hint: Option<String>,
     pub provider_hint: Option<Uuid>,
     pub model_hint: Option<Uuid>,

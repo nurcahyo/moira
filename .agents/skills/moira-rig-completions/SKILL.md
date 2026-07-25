@@ -9,7 +9,7 @@ description: Expert guidance for non-streaming completion execution through Rig 
 
 Moira builds one `rig_core::completion::CompletionRequest` and hands it to one `RuntimeModelHandle`. Rig owns encoding, transport, and decoding. Moira owns what goes into the request and what is narrowed out of the response.
 
-There is exactly one request-construction site (`build_completion_request` in `src/application/execution.rs`), exactly one message-normalisation site (`map_public_message` in `src/application/public.rs`), and exactly one usage-conversion site (`usage_from_rig` in `src/orchestration/runtime_factory.rs`). Adding a second of any of these is a review-blocking defect.
+There is exactly one request-construction site (`build_completion_request` in `src/application/execution.rs`), exactly one caller-message-normalisation site (`map_public_message` in `src/application/public.rs`, which produces `DomainMessage`), exactly one `DomainMessage` → `Message` site (`impl TryFrom<&DomainMessage> for Message` / `rig_chat_history` in `src/orchestration/runtime_factory.rs`), and exactly one usage-conversion site (`usage_from_rig`, same file). Adding a second of any of these is a review-blocking defect.
 
 Read `.agents/skills/moira-rig-integration/SKILL.md` first — it owns the boundary, the enum-dispatch rationale, and the vendored-source verification rule. This skill assumes it.
 
@@ -17,7 +17,8 @@ Read `.agents/skills/moira-rig-integration/SKILL.md` first — it owns the bound
 
 | Concern | File |
 |---|---|
-| Public DTO → `Message` | `src/application/public.rs` (`map_public_messages`, `map_public_message`, `text_only_content`) |
+| Public DTO → `DomainMessage` | `src/application/public.rs` (`map_public_messages`, `map_public_message`, `text_only_content`) |
+| `DomainMessage` → `Message` | `src/orchestration/runtime_factory.rs` (`impl TryFrom<&DomainMessage> for Message`, `rig_chat_history`, `text_only_content`) |
 | `ExecutionCommand` + agent profile → `CompletionRequest` | `src/application/execution.rs` (`build_completion_request`) |
 | Non-streaming invocation | `src/application/execution.rs` (`execute_rig_completion`) → `RuntimeModelHandle::completion` |
 | Enum dispatch → generic call | `src/orchestration/runtime_factory.rs` (`completion_with_model<M>`) |
@@ -105,15 +106,24 @@ Never place internal prompts, routing rationale, credential context, or tenant i
 
 ### `chat_history`
 
-`OneOrMany<Message>` — the last element is always treated as the prompt. Built from `ExecutionCommand.messages`:
+`OneOrMany<Message>` — the last element is always treated as the prompt. Built from `ExecutionCommand.messages: Vec<DomainMessage>` through the boundary helper, which both converts each message and enforces non-emptiness:
 
 ```rust
-let chat_history = OneOrMany::many(command.messages.clone()).map_err(|_| {
-    ExecutionFailure::new(
-        ExecutionFailureClass::InvalidExecutionRequest,
-        "execution command must contain at least one message",
-    )
-})?;
+// src/application/execution.rs
+let chat_history = rig_chat_history(&command.messages)?;
+
+// src/orchestration/runtime_factory.rs
+pub fn rig_chat_history(
+    messages: &[DomainMessage],
+) -> Result<OneOrMany<Message>, ExecutionFailure> {
+    let converted = messages
+        .iter()
+        .map(Message::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    OneOrMany::many(converted).map_err(|_| {
+        invalid_execution_request("execution command must contain at least one message")
+    })
+}
 ```
 
 `OneOrMany::many` is fallible with `EmptyListError` (`one_or_many.rs:101-113`); there is no `From<Vec<T>>` and no `FromIterator`. `OneOrMany::is_empty()` always returns `false` (`one_or_many.rs:88-90`) — never use it as a guard. Every method requires `T: Clone` (`one_or_many.rs:27`).
@@ -220,15 +230,18 @@ Two more OpenAI subtleties: the schema is *withheld* on the first turn when tool
 
 ## Mapping Table: Moira Domain → Rig Type → Conversion Rule
 
+Caller input reaches Rig in two hops: `PublicInputMessage` → `DomainMessage` (in `public.rs`, failing as `AppError::unprocessable`, 422) → `Message` (in `runtime_factory.rs`, failing as `ExecutionFailure::InvalidExecutionRequest`). Validation that produces a *public* error code stays in the first hop; the second hop is a total function over the shapes the first hop can emit, and its error arms are defence in depth.
+
 | Moira type / field | Rig type | Conversion rule |
 |---|---|---|
-| `PublicMessageRole::System \| Developer` | `Message::System { content: String }` | `Message::system(text_only_content(msg)?)`; gated on `policy.caller_system_instructions_allowed`, else `AppError::unprocessable("unsupported_message_role", …)`. Image parts rejected as `"unsupported_input_type"`. |
-| `PublicMessageRole::User` | `Message::User { content: OneOrMany<UserContent> }` | Map every part, then `OneOrMany::many(parts)`; `EmptyListError` → `AppError::unprocessable("invalid_execution_request", "user message is empty")`. |
-| `PublicContentPart::InputText { text }` | `UserContent::Text(Text)` | `UserContent::text(text.clone())` (`message.rs:663-665`). `Text` carries an `additional_params` field, so it is never a bare `String`. |
-| `PublicContentPart::InputImage { image_url }` | `UserContent::Image(Image)` | `UserContent::image_url(url.clone(), None, None)` → `DocumentSourceKind::Url` (`message.rs:696-707`). No `ImageMediaType`, no `ImageDetail`; add them only if a provider requires them. Gated separately on `policy.vision_enabled` and pushes `"vision"` into `required_capabilities` (`src/application/public.rs:914`, `:1228-1231`). |
-| `PublicMessageRole::Assistant` | `Message::Assistant { id: None, content }` | `Message::assistant(text_only_content(msg)?)`. Note the variant has an `id: Option<String>` field — exhaustive matches and struct literals must account for it. |
-| `PublicMessageRole::Tool` | — | Rejected: `AppError::unprocessable("unsupported_message_role", "tool messages require an approved tool registry")`. Do not silently map to `Message::tool_result`. |
-| `ExecutionCommand.messages: Vec<Message>` | `CompletionRequest.chat_history: OneOrMany<Message>` | `OneOrMany::many(clone)` → `InvalidExecutionRequest` on empty. |
+| `PublicMessageRole::System \| Developer` | `DomainMessage::system` → `Message::System { content: String }` | `DomainMessage::system(text_only_content(msg)?)`; gated on `policy.caller_system_instructions_allowed`, else `AppError::unprocessable("unsupported_message_role", …)`. Image parts rejected as `"unsupported_input_type"`. |
+| `PublicMessageRole::User` | `DomainMessageRole::User` → `Message::User { content: OneOrMany<UserContent> }` | Map every part; empty content → `AppError::unprocessable("invalid_execution_request", "user message is empty")`. The boundary re-checks via `OneOrMany::many`. |
+| `PublicContentPart::InputText { text }` | `DomainMessageContent::Text` → `UserContent::Text(Text)` | `UserContent::text(text.clone())` (`message.rs:663-665`). `Text` carries an `additional_params` field, so it is never a bare `String`. |
+| `PublicContentPart::InputImage { image_url }` | `DomainMessageContent::ImageUrl` → `UserContent::Image(Image)` | `UserContent::image_url(url.clone(), None, None)` → `DocumentSourceKind::Url` (`message.rs:696-707`). No `ImageMediaType`, no `ImageDetail`; add them only if a provider requires them. Gated separately on `policy.vision_enabled` and pushes `"vision"` into `required_capabilities`. |
+| `PublicMessageRole::Assistant` | `DomainMessage::assistant` → `Message::Assistant { id: None, content }` | `DomainMessage::assistant(text_only_content(msg)?)`. Note the Rig variant has an `id: Option<String>` field — exhaustive matches and struct literals must account for it. |
+| `PublicMessageRole::Tool` | — | Rejected in `public.rs`: `AppError::unprocessable("unsupported_message_role", "tool messages require an approved tool registry")`. `DomainMessageRole::Tool` exists but has no producer; the boundary rejects it too. Do not silently map either to `Message::tool_result`. |
+| `DomainMessage` with several `Text` parts, system/assistant role | `Message::System \| Message::Assistant` | Joined with `\n`, matching `text_only_content` at the public boundary. An image part on these roles is `InvalidExecutionRequest`. |
+| `ExecutionCommand.messages: Vec<DomainMessage>` | `CompletionRequest.chat_history: OneOrMany<Message>` | `rig_chat_history(&command.messages)?` → `InvalidExecutionRequest` on empty. |
 | `AgentProfileRecord.preamble: Option<String>` | `CompletionRequest.preamble` | Direct. Always precedes caller system messages on every provider. |
 | `ExecutionOptions.temperature: Option<f64>` | `CompletionRequest.temperature` | `options.or(profile.temperature)`; no Moira default. |
 | `ExecutionOptions.max_tokens: Option<u64>` | `CompletionRequest.max_tokens` | `options.or(profile.max_tokens.map(\|v\| v as u64))`; profile field is `i64`. |
@@ -374,7 +387,7 @@ Rules:
    rg -n 'additional_params|preamble|temperature|max_tokens' "$RIG/src/providers/<provider>/completion.rs"
    ```
    If a signature is not in the vendored tree, the API does not exist in 0.40.0.
-3. Decide which of the three sites owns the change. New caller-visible input → `map_public_message` in `src/application/public.rs`. New request parameter or new provider-side encoding → `build_completion_request` in `src/application/execution.rs`. Response narrowing → `output_from_response` / `text_from_choice` / `usage_from_rig` in `src/orchestration/runtime_factory.rs`. Do not add a third.
+3. Decide which of the four sites owns the change. New caller-visible input → `map_public_message` in `src/application/public.rs` (plus `DomainMessage` in `src/domain/message.rs` if the shape is genuinely new). New Rig message shape → `impl TryFrom<&DomainMessage> for Message` in `src/orchestration/runtime_factory.rs`. New request parameter or new provider-side encoding → `build_completion_request` in `src/application/execution.rs`. Response narrowing → `output_from_response` / `text_from_choice` / `usage_from_rig` in `src/orchestration/runtime_factory.rs`. Do not add a fifth.
 4. For any request field you add or change, check its encoder in **every** provider Moira ships (`openai/completion/mod.rs`, `anthropic/completion.rs`, `gemini/completion.rs`, plus the `deepseek.rs` / `azure.rs` extension consts). Silent drops are the norm, not the exception — Gemini drops `temperature`/`max_tokens` without a `generationConfig`, DeepSeek drops `output_schema`, non-tool providers drop `tools`. Record what each provider does in the PR body.
 5. Keep `CompletionRequest` struct-literal construction with all ten fields named. No `..Default::default()`.
 6. Preserve redaction. Nothing from `additional_params`, `preamble`, `chat_history`, or `raw_response` may be logged, persisted as-is, or echoed into an error. Provider error text stays behind `safe_provider_error_message` (`src/orchestration/runtime_factory.rs:490`). `expose_secret()` stays at the provider builder only (`runtime_factory.rs:92`), and `RuntimeModelHandle`'s hand-written `Debug` must keep redacting every arm (`:52-62`, test at `:535`).

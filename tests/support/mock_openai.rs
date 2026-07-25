@@ -104,11 +104,26 @@ pub enum ProviderScript {
         remaining_deltas: Vec<String>,
         gate: Arc<ScriptGate>,
     },
+    /// Emits `delta`, signals arrival, then fails the response body once the test
+    /// releases the gate.
+    ///
+    /// The gate is what makes "the failure happened *after* committed output" a fact
+    /// rather than a hope (P2-12). Both of these scripts used to
+    /// `sleep(Duration::from_millis(50))` between the delta and the error, betting that
+    /// 50 ms was enough for the delta to be read before the body aborted. It usually
+    /// was; when it was not, the assertion under test — that a post-commit failure is
+    /// neither retryable nor fallback-eligible — inverted, because nothing had been
+    /// committed yet. The gate turns the bet into an ordering the test states
+    /// explicitly: release only after the delta has been observed.
     StreamErrorAfterDelta {
         delta: String,
+        gate: Arc<ScriptGate>,
     },
+    /// As [`ProviderScript::StreamErrorAfterDelta`], with a tool call as the committed
+    /// output instead of a text delta.
     StreamErrorAfterToolCall {
         name: String,
+        gate: Arc<ScriptGate>,
     },
     StalledStream {
         first_delta: Option<String>,
@@ -259,11 +274,11 @@ async fn handle_completion(
             remaining_deltas,
             gate,
         } => streaming_response(held_stream_body(first_delta, remaining_deltas, gate)),
-        ProviderScript::StreamErrorAfterDelta { delta } => {
-            streaming_response(error_after_delta_body(delta))
+        ProviderScript::StreamErrorAfterDelta { delta, gate } => {
+            streaming_response(error_after_delta_body(delta, gate))
         }
-        ProviderScript::StreamErrorAfterToolCall { name } => {
-            streaming_response(error_after_tool_call_body(name))
+        ProviderScript::StreamErrorAfterToolCall { name, gate } => {
+            streaming_response(error_after_tool_call_body(name, gate))
         }
         ProviderScript::StalledStream { first_delta, gate } => {
             streaming_response(stalled_stream_body(first_delta, gate))
@@ -345,16 +360,17 @@ fn held_stream_body(
     Body::from_stream(stream)
 }
 
-fn error_after_delta_body(delta: String) -> Body {
+fn error_after_delta_body(delta: String, gate: Arc<ScriptGate>) -> Body {
     let stream = async_stream::stream! {
         yield Ok::<_, io::Error>(Bytes::from(sse_delta(&delta)));
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        gate.arrived.add_permits(1);
+        gate.wait_for_release().await;
         yield Err(io::Error::other("scripted provider body failure"));
     };
     Body::from_stream(stream)
 }
 
-fn error_after_tool_call_body(name: String) -> Body {
+fn error_after_tool_call_body(name: String, gate: Arc<ScriptGate>) -> Body {
     let stream = async_stream::stream! {
         let chunk = format!(
             "data: {}\n\n",
@@ -391,7 +407,8 @@ fn error_after_tool_call_body(name: String) -> Body {
             })
         );
         yield Ok(Bytes::from(finish));
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        gate.arrived.add_permits(1);
+        gate.wait_for_release().await;
         yield Err(io::Error::other("scripted provider body failure after tool call"));
     };
     Body::from_stream(stream)

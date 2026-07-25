@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::{
     app::AppState,
     config::DeploymentEnvironment,
@@ -6,21 +8,28 @@ use crate::{
         SetupStatusResponse,
     },
     error::AppError,
-    infra::repositories::{PgSetupRepository, SetupReadinessSnapshot},
+    infra::repositories::{PgSetupRepository, SetupReadinessSnapshot, SetupRepository},
     security::{Actor, ActorType},
 };
 
 pub struct SetupService<'a> {
     state: &'a AppState,
-    repo: PgSetupRepository,
+    repo: Arc<dyn SetupRepository>,
 }
 
 impl<'a> SetupService<'a> {
     pub fn new(state: &'a AppState) -> Result<Self, AppError> {
         Ok(Self {
-            repo: PgSetupRepository::new(state.pool()?.clone()),
+            repo: Arc::new(PgSetupRepository::new(state.pool()?.clone())),
             state,
         })
+    }
+
+    /// Injects an arbitrary [`SetupRepository`], so the authorization and status-precedence logic
+    /// can be unit-tested without a database. `new` remains the only production constructor.
+    #[cfg(test)]
+    pub(crate) fn with_repository(state: &'a AppState, repo: Arc<dyn SetupRepository>) -> Self {
+        Self { state, repo }
     }
 
     pub async fn status(&self, actor: &Actor) -> Result<SetupStatusResponse, AppError> {
@@ -108,6 +117,14 @@ fn check(ready: bool) -> SetupCheckState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::LazyLock;
+
+    use crate::infra::repositories::InMemorySetupRepository;
+
+    /// Pool-less: `SetupService::with_repository` never calls `state.pool()`, which is exactly
+    /// what makes these tests Postgres-free.
+    static STATE: LazyLock<AppState> =
+        LazyLock::new(|| AppState::new(crate::config::Settings::default(), None).unwrap());
 
     fn actor(actor_type: ActorType, scopes: &[&str]) -> Actor {
         Actor {
@@ -175,5 +192,69 @@ mod tests {
         );
         assert_eq!(ready.status, SetupStatus::Ready);
         assert!(ready.missing.is_empty());
+    }
+
+    /// The payoff of P2-3 (plan 06, Module 8): the *whole* of `SetupService::status` — actor
+    /// gating, scope enforcement, the repository read and response assembly — now runs with no
+    /// Postgres connection at all. Before `SetupRepository` existed, `SetupService` held a
+    /// concrete `PgSetupRepository` and this path could only be reached against a live database,
+    /// so it had no unit coverage whatsoever.
+    #[tokio::test]
+    async fn status_is_setup_required_without_a_root_system_key() {
+        let service = SetupService::with_repository(
+            &STATE,
+            Arc::new(InMemorySetupRepository::new(
+                SetupReadinessSnapshot::default(),
+            )),
+        );
+
+        let response = service
+            .status(&actor(ActorType::SystemKey, &["moira:setup:read"]))
+            .await
+            .expect("setup status");
+        assert_eq!(response.status, SetupStatus::SetupRequired);
+        assert_eq!(response.missing[0], SetupCheckName::RootSystemKey);
+    }
+
+    #[tokio::test]
+    async fn status_is_ready_when_an_executable_path_exists() {
+        let service = SetupService::with_repository(
+            &STATE,
+            Arc::new(InMemorySetupRepository::new(SetupReadinessSnapshot {
+                root_system_key: true,
+                application: true,
+                route: true,
+                provider: true,
+                provider_model: true,
+                provider_credential: true,
+                routing_policy: true,
+                executable_path: true,
+            })),
+        );
+
+        let response = service
+            .status(&actor(ActorType::TrustedJwt, &["moira:setup:read"]))
+            .await
+            .expect("setup status");
+        assert_eq!(response.status, SetupStatus::Ready);
+        assert!(response.missing.is_empty());
+    }
+
+    /// The actor gate runs before the repository is touched, so a rejected caller learns nothing
+    /// about deployment readiness.
+    #[tokio::test]
+    async fn status_rejects_a_consumer_key_before_touching_the_repository() {
+        let service = SetupService::with_repository(
+            &STATE,
+            Arc::new(InMemorySetupRepository::new(
+                SetupReadinessSnapshot::default(),
+            )),
+        );
+
+        let error = service
+            .status(&actor(ActorType::ConsumerKey, &["moira:setup:read"]))
+            .await
+            .expect_err("consumer keys are not setup actors");
+        assert!(matches!(error, AppError::Forbidden(_)));
     }
 }

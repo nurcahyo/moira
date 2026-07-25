@@ -1,4 +1,6 @@
-use std::{env, sync::LazyLock, time::Duration};
+mod support;
+
+use std::{future::Future, time::Duration};
 
 use axum::{
     Router,
@@ -10,29 +12,28 @@ use moira::{
     application::{AdminService, RequestContext},
     config::Settings,
     domain::{ApplicationCreateRequest, ProviderCreateRequest, ProviderType},
-    infra::db,
     security::{Actor, ActorType},
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, postgres::PgPoolOptions};
-use tokio::{
-    sync::{Barrier, Mutex, MutexGuard},
-    task::JoinHandle,
-    time::{sleep, timeout},
-};
+use sqlx::PgPool;
+use tokio::{sync::Barrier, task::JoinHandle, time::timeout};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+use support::TestDatabase;
+
 const WAIT: Duration = Duration::from_secs(10);
-static SERIAL: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 struct Fixture {
-    _serial: MutexGuard<'static, ()>,
     pool: PgPool,
     state: AppState,
     router: Router,
     suffix: String,
+    /// Declared last so the database is dropped after everything still connected to
+    /// it. See [`support::TestDatabase`] for why this suite no longer needs the
+    /// `SERIAL` mutex it used to hold.
+    _database: TestDatabase,
 }
 
 struct HttpResult {
@@ -42,46 +43,37 @@ struct HttpResult {
 }
 
 impl Fixture {
+    /// A fixture on its own PostgreSQL database (plan 06 module 13, P2-13).
+    ///
+    /// This suite used to carry its own `SERIAL` mutex, its own pool against the shared
+    /// `moira` database, and its own `db::migrate` call — a second, independent copy of
+    /// the harness in `tests/support`. The mutex bought nothing across binaries, and it
+    /// could not isolate this suite's most dangerous fixtures at all: one test installs
+    /// a trigger that makes **every** `audit_logs` insert fail, and another blocks the
+    /// whole table with `access exclusive`, both of which were visible to any other
+    /// suite running at the same time.
+    ///
+    /// A private database also scopes what these tests actually assert on:
+    /// `idempotency_records` counts are now exact rather than "at least", and the
+    /// advisory locks under `advisory_lock_key` can no longer collide with another
+    /// suite's, because PostgreSQL advisory locks are per database.
+    ///
+    /// The pool stays at 16 connections — the barrier-released concurrency tests below
+    /// fire batches of simultaneous requests and will exhaust a smaller one.
     async fn new() -> Option<Self> {
-        let serial = SERIAL.lock().await;
-        let database_url = match env::var("MOIRA_TEST_DATABASE_URL") {
-            Ok(value) if !value.trim().is_empty() => value,
-            _ if env::var("CI").is_ok_and(|value| value.eq_ignore_ascii_case("true")) => {
-                panic!(
-                    "MOIRA_TEST_DATABASE_URL is required when CI=true for admin idempotency tests"
-                )
-            }
-            _ => {
-                eprintln!(
-                    "skipping admin idempotency tests: MOIRA_TEST_DATABASE_URL is not configured"
-                );
-                return None;
-            }
-        };
-        let pool = timeout(
-            WAIT,
-            PgPoolOptions::new()
-                .max_connections(16)
-                .connect(&database_url),
-        )
-        .await
-        .expect("database connection timed out")
-        .expect("connect admin idempotency database");
-        timeout(WAIT, db::migrate(&pool))
-            .await
-            .expect("migrations timed out")
-            .expect("run migrations");
+        let database = TestDatabase::create_with_max_connections(16).await?;
+        let pool = database.pool.clone();
         let mut settings = Settings::default();
         settings.provider_security.allow_http_provider_urls = true;
         settings.provider_security.allow_private_provider_urls = true;
         let state = AppState::new(settings, Some(pool.clone())).expect("test app state");
         let router = moira::build_router(state.clone()).expect("test router");
         Some(Self {
-            _serial: serial,
             pool,
             state,
             router,
             suffix: Uuid::now_v7().simple().to_string(),
+            _database: database,
         })
     }
 
@@ -984,25 +976,37 @@ async fn audit_failure_and_request_cancellation_roll_back_mutation_and_ledger() 
     task.abort();
     let _ = task.await;
     blocker.rollback().await.expect("release audit lock");
-    sleep(Duration::from_millis(50)).await;
-    assert_eq!(
+
+    // P2-12. Cancellation itself is already observed above — `task.abort()` plus
+    // `task.await`, then the blocker's `rollback()` — but the aborted request's own
+    // transaction unwinds on a pooled connection afterwards, so its rollback is not
+    // guaranteed visible the instant `rollback()` returns. This used to be a
+    // `sleep(50ms)`: a guess that passed by being generous and would have gone quietly
+    // green had the rollback stopped happening at all, because the counts it guarded
+    // are asserted to be *zero*. Polling the two counters instead is fail-loud — a row
+    // that is committed rather than rolled back keeps the condition false until the
+    // budget expires, and the assertion below reports the counts it actually saw.
+    let cancelled_slug_value = format!("cancelled-{}", fixture.suffix);
+    let cancelled_key_hash = fixture.key_hash(&cancelled_key);
+    let application_count = "select count(*) from applications where application_slug = $1";
+    let ledger_count = "select count(*) from idempotency_records \
+         where operation = 'application.create' and idempotency_key_hash = $1";
+    let rolled_back = poll_until(WAIT, || async {
         fixture
-            .count(
-                "select count(*) from applications where application_slug = $1",
-                &format!("cancelled-{}", fixture.suffix),
-            )
+            .count(application_count, &cancelled_slug_value)
+            .await
+            == 0
+            && fixture.count(ledger_count, &cancelled_key_hash).await == 0
+    })
+    .await;
+    assert!(
+        rolled_back,
+        "a cancelled command must leave neither an application row nor a ledger row; after \
+         {WAIT:?} there were {} application rows and {} ledger rows",
+        fixture
+            .count(application_count, &cancelled_slug_value)
             .await,
-        0
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "select count(*) from idempotency_records where operation = 'application.create' and idempotency_key_hash = $1",
-        )
-        .bind(fixture.key_hash(&cancelled_key))
-        .fetch_one(&fixture.pool)
-        .await
-        .expect("cancelled ledger count"),
-        0
+        fixture.count(ledger_count, &cancelled_key_hash).await,
     );
 }
 
@@ -1254,23 +1258,51 @@ async fn request_with_id(
     }
 }
 
-async fn wait_for_audit_lock(pool: &PgPool) {
-    timeout(WAIT, async {
+/// Polls `condition` on a fixed tick until it holds or `budget` expires.
+///
+/// The house pattern for waiting on something that has no signal to subscribe to —
+/// see `tests/retention_worker.rs::poll_until`, which this mirrors. It is *not* a
+/// `sleep`-based interleave (P2-12, `plans/CONVENTIONS.md` §3): every wait is bounded,
+/// so a condition that never holds fails the test loudly instead of a timing guess
+/// silently passing.
+async fn poll_until<F, Fut>(budget: Duration, mut condition: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let mut ticker = tokio::time::interval(Duration::from_millis(20));
+    timeout(budget, async move {
         loop {
-            let blocked = sqlx::query_scalar::<_, bool>(
-                "select exists(select 1 from pg_stat_activity where wait_event_type = 'Lock' and query ilike '%insert into audit_logs%')",
-            )
-            .fetch_one(pool)
-            .await
-            .expect("inspect blocked audit insert");
-            if blocked {
+            ticker.tick().await;
+            if condition().await {
                 return;
             }
-            sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("command never blocked on audit insert");
+    .is_ok()
+}
+
+/// Waits until the spawned request is parked on the `audit_logs` lock the test holds.
+///
+/// `datname = current_database()` matters now that every fixture owns its own database
+/// (module 13): without it this would happily match a *different* suite's blocked audit
+/// insert and return before this fixture's request had reached the lock at all.
+async fn wait_for_audit_lock(pool: &PgPool) {
+    let blocked = poll_until(WAIT, || async {
+        sqlx::query_scalar::<_, bool>(
+            "select exists(\
+                 select 1 from pg_stat_activity \
+                 where datname = current_database() \
+                   and wait_event_type = 'Lock' \
+                   and query ilike '%insert into audit_logs%')",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("inspect blocked audit insert")
+    })
+    .await;
+    assert!(blocked, "command never blocked on audit insert");
 }
 
 fn admin_actor(subject: &str) -> Actor {

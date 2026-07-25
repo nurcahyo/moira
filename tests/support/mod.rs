@@ -5,7 +5,7 @@ pub mod mock_openai;
 use std::{
     env,
     sync::{Arc, LazyLock, Mutex as StdMutex, Once},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use moira::{
@@ -26,23 +26,22 @@ use moira::{
     security::{Actor, ActorType},
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::{
-    PgPool,
+    Connection, PgConnection, PgPool,
     postgres::{PgPoolOptions, PgRow},
 };
 use tokio::{
     net::TcpListener,
-    sync::{Mutex, OnceCell, OwnedMutexGuard},
+    sync::{OnceCell, Semaphore, SemaphorePermit},
     task::JoinHandle,
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
+use url::Url;
 use uuid::Uuid;
 
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(10);
-static TEST_DATABASE_URL: OnceCell<Option<String>> = OnceCell::const_new();
-static TEST_SERIAL: LazyLock<std::sync::Arc<Mutex<()>>> =
-    LazyLock::new(|| std::sync::Arc::new(Mutex::new(())));
 
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimePolicy {
@@ -115,20 +114,29 @@ impl MoiraHttpServer {
     }
 }
 
+/// The shared fixture: an `AppState` on a private, migrated database, with one
+/// application and one route already created.
+///
+/// Since plan 06 module 13 every instance owns its own database (see
+/// [`TestDatabase`]), so two fixtures — in the same binary or in different ones —
+/// cannot see each other's rows. Tests that used to reason about "rows a neighbouring
+/// suite happened to leave behind" no longer have to.
 pub struct LifecycleFixture {
-    _serial: OwnedMutexGuard<()>,
     pub state: AppState,
     pub pool: PgPool,
     pub actor: Actor,
     pub application_id: Uuid,
     pub route_id: Uuid,
     pub route_key: String,
+    /// Declared last so it is dropped last: the database outlives every field that
+    /// still holds a connection to it.
+    database: TestDatabase,
 }
 
 impl LifecycleFixture {
     pub async fn new() -> Option<Self> {
-        let serial = TEST_SERIAL.clone().lock_owned().await;
-        let pool = test_pool().await?;
+        let database = TestDatabase::create().await?;
+        let pool = database.pool.clone();
         let mut settings = Settings::default();
         settings.provider_security.allow_http_provider_urls = true;
         settings.provider_security.allow_private_provider_urls = true;
@@ -180,14 +188,19 @@ impl LifecycleFixture {
             .expect("create lifecycle route");
 
         Some(Self {
-            _serial: serial,
             state,
             pool,
             actor,
             application_id: application.id,
             route_id: route.id,
             route_key,
+            database,
         })
+    }
+
+    /// The name of this fixture's private database (module 13, P2-13).
+    pub fn database_name(&self) -> &str {
+        self.database.name()
     }
 
     pub async fn add_provider(
@@ -445,50 +458,465 @@ pub fn admin_actor() -> Actor {
     }
 }
 
-async fn test_pool() -> Option<PgPool> {
-    let database_url = TEST_DATABASE_URL
+// ---------------------------------------------------------------------------
+// Per-fixture database isolation (plan 06, module 13 — P2-13)
+// ---------------------------------------------------------------------------
+//
+// Every DB-backed suite used to share one `moira` database, guarded only by a
+// process-global mutex. That mutex is per test *binary*, so it never constrained two
+// suites against each other at all, and even inside one binary it only ordered
+// fixtures — it could not stop a test from observing rows a neighbour had committed.
+// `tests/admin_query_contract.rs`'s
+// `defined_but_unsupported_page_query_field_is_accepted_and_ignored` failed under
+// `cargo test --workspace` and passed in isolation for exactly that reason, and said
+// so in its own comment.
+//
+// The fix is one database per fixture, so there is no shared mutable state left to
+// serialise.
+//
+// **Schema isolation — the cheaper, more obvious option — is not available here, and
+// this was verified rather than assumed.** `migrations/0003_security_foundation.sql`
+// hard-codes `public.` in eleven places (`to_regclass('public.…')`,
+// `table_schema = 'public'`) to detect and rename the legacy tables migration 0002
+// creates. Run under a non-`public` `search_path`, those guards inspect the wrong
+// schema, decline to rename, and the `create table if not exists` statements that
+// follow then bind to the un-renamed legacy tables; 0003 dies on
+// `column "deleted_at" does not exist`. Editing 0003 is not an option either — it is
+// already applied to every existing database and `sqlx` checksums migration files.
+//
+// So: one database per fixture, cloned from a migrated template with
+// `CREATE DATABASE … TEMPLATE …`. That is a file-level copy — measured at roughly
+// 50 ms for this 10 MB schema, an order of magnitude cheaper than replaying all eleven
+// migrations — which is what makes per-test databases affordable at all.
+// `tests/security_foundation.rs` already creates and force-drops a whole database per
+// run; this is the same strategy, made cheap enough to use per test rather than per
+// suite. It needs `CREATEDB` on the role in `MOIRA_TEST_DATABASE_URL`, which that
+// suite already required.
+//
+// Two properties come free with a private database, and tests now rely on both:
+// PostgreSQL advisory locks are database-scoped, so `tests/admin_idempotency.rs`'s
+// advisory-lock races can no longer collide with another suite's; and `LISTEN`/`NOTIFY`
+// channels are database-wide but not cluster-wide, so the `moira_runtime_config`
+// notifications the runtime-config triggers emit stay inside the fixture that caused
+// them (module 13 item 4 — no fixture spawns `spawn_runtime_config_listener` today,
+// and with per-fixture databases one that did would still only hear itself).
+//
+// What this does **not** cover: the four suites that build their own pool straight
+// against `MOIRA_TEST_DATABASE_URL` rather than through a fixture —
+// `tests/http_middleware_contract.rs`, `tests/jwks_hardening.rs`,
+// `tests/retention_worker.rs` and `tests/security_foundation.rs`. The last already
+// creates and force-drops its own database; the other three assert only on rows they
+// created, keyed by a per-run `Uuid`. They are left on the shared database
+// deliberately, and none of them mixes its own pool with a `LifecycleFixture` in the
+// same test.
+
+const MAINTENANCE_DATABASE: &str = "postgres";
+const TEMPLATE_PREFIX: &str = "moira_test_template_";
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
+
+/// Session advisory lock guarding the template database.
+///
+/// Held **exclusively** while the template is created or migrated, because an open
+/// connection to it makes another process's `CREATE DATABASE … TEMPLATE` fail with
+/// *"source database is being accessed by other users"*. Held **shared** while a
+/// fixture clones it, so clones run in parallel with each other but never during
+/// maintenance. Advisory locks are database-scoped, and this one is always taken on
+/// the maintenance database, so every test process agrees on it.
+const TEMPLATE_LOCK_KEY: i64 = i64::from_be_bytes(*b"moiratdb");
+
+/// A fixture database this old with no live connection is a leak from a killed test
+/// process. Sweeping is bounded by age *and* by connection count because a database
+/// is briefly connectionless between `CREATE DATABASE` and the fixture pool's first
+/// connection; an hour is several orders of magnitude beyond that window.
+const LEAKED_DATABASE_GRACE_SECONDS: u64 = 3_600;
+
+/// Concurrent fixtures per test binary.
+///
+/// This is **not** an isolation device — the database is. It exists only to bound
+/// PostgreSQL connections: the server ships with `max_connections = 100`, and each
+/// fixture pool may open eight. Raising it trades headroom on the server for test
+/// wall-clock; lowering it to 1 restores the old serialised behaviour without
+/// changing any assertion.
+const CONCURRENT_FIXTURES: usize = 4;
+
+static FIXTURE_BUDGET: Semaphore = Semaphore::const_new(CONCURRENT_FIXTURES);
+static DATABASE_ORIGIN: OnceCell<Option<DatabaseOrigin>> = OnceCell::const_new();
+
+/// The template's name, derived from the migration set it was built from.
+///
+/// Naming the template after a digest of every migration's version and checksum makes
+/// "is this template current?" answerable from `pg_database` alone, so a process that
+/// finds it present never has to **connect** to it. That matters: a connection to the
+/// template is the one thing that makes another process's
+/// `CREATE DATABASE … TEMPLATE` fail, and the first version of this harness opened one
+/// per test process purely to re-run an already-applied migration set. It also removes
+/// the failure mode where a template built from an older migration set is silently
+/// reused — adding a migration changes the digest, so a fresh template is built instead.
+fn template_database() -> String {
+    let mut digest = Sha256::new();
+    for migration in MIGRATOR.iter() {
+        digest.update(migration.version.to_be_bytes());
+        digest.update(migration.checksum.as_ref());
+    }
+    let digest = digest.finalize();
+    let mut name = String::from(TEMPLATE_PREFIX);
+    for byte in &digest[..8] {
+        name.push_str(&format!("{byte:02x}"));
+    }
+    name
+}
+
+/// `MOIRA_TEST_DATABASE_URL` with the database name factored out, so a URL can be
+/// built for the maintenance database, the template, or any fixture clone.
+#[derive(Clone, Debug)]
+struct DatabaseOrigin {
+    base: Url,
+    template: String,
+}
+
+impl DatabaseOrigin {
+    fn url_for(&self, database: &str) -> String {
+        let mut url = self.base.clone();
+        url.set_path(database);
+        url.to_string()
+    }
+}
+
+/// A private PostgreSQL database owned by exactly one fixture, dropped when the
+/// fixture is — including when the test panics.
+pub struct TestDatabase {
+    pub pool: PgPool,
+    name: String,
+    maintenance_url: String,
+    /// Released after [`Drop::drop`] has torn the database down, so the budget
+    /// reflects databases that actually exist.
+    _budget: SemaphorePermit<'static>,
+}
+
+impl TestDatabase {
+    /// A fixture database with the pool size `LifecycleFixture` needs.
+    pub async fn create() -> Option<Self> {
+        Self::create_with_max_connections(8).await
+    }
+
+    /// As [`TestDatabase::create`], for a suite whose concurrency needs a larger pool
+    /// (`tests/admin_idempotency.rs` fires barrier-released requests in batches).
+    pub async fn create_with_max_connections(max_connections: u32) -> Option<Self> {
+        // Taken before anything else so the budget covers the clone itself, not just
+        // the fixture's lifetime.
+        let budget = FIXTURE_BUDGET
+            .acquire()
+            .await
+            .expect("the fixture budget semaphore is never closed");
+        let origin = database_origin().await?;
+        let name = format!("moira_test_{}_{}", unix_seconds(), Uuid::now_v7().simple());
+        let maintenance_url = origin.url_for(MAINTENANCE_DATABASE);
+        let mut maintenance = connect_maintenance(&maintenance_url).await;
+        sqlx::query("select pg_advisory_lock_shared($1)")
+            .bind(TEMPLATE_LOCK_KEY)
+            .execute(&mut maintenance)
+            .await
+            .expect("take a shared lock on the template database");
+        sqlx::raw_sql(&format!(
+            "create database \"{name}\" template \"{}\"",
+            origin.template
+        ))
+        .execute(&mut maintenance)
+        .await
+        .expect("clone the migrated template database");
+        let pool = timeout(
+            DATABASE_TIMEOUT,
+            PgPoolOptions::new()
+                .max_connections(max_connections)
+                .connect(&origin.url_for(&name)),
+        )
+        .await
+        .expect("fixture database connection timed out")
+        .expect("connect the fixture database");
+        // Only now: closing the connection releases the shared lock, and holding it
+        // until the pool is live keeps the leak sweep from seeing a connectionless
+        // database that is about to be used.
+        let _ = maintenance.close().await;
+
+        Some(Self {
+            pool,
+            name,
+            maintenance_url,
+            _budget: budget,
+        })
+    }
+
+    /// The database's name, for diagnostics — a failing test that names its database
+    /// can be reproduced against the surviving copy if teardown is disabled.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl Drop for TestDatabase {
+    fn drop(&mut self) {
+        let maintenance_url = self.maintenance_url.clone();
+        let name = self.name.clone();
+        // `Drop` is synchronous and `#[tokio::test]` defaults to a current-thread
+        // runtime, which rules out `block_in_place`. A dedicated thread with its own
+        // runtime is therefore the only way to make teardown unconditional — and
+        // unconditional is the entire point: this must run when the test panics, which
+        // is precisely when a leaked database would otherwise be left behind.
+        //
+        // `with (force)` terminates the fixture pool's own sessions; the pool is never
+        // used again after this point.
+        let outcome = std::thread::spawn(move || -> Result<(), String> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|err| err.to_string())?;
+            runtime.block_on(async move {
+                let mut connection = PgConnection::connect(&maintenance_url)
+                    .await
+                    .map_err(|err| err.to_string())?;
+                sqlx::raw_sql(&format!("drop database if exists \"{name}\" with (force)"))
+                    .execute(&mut connection)
+                    .await
+                    .map_err(|err| err.to_string())?;
+                connection.close().await.map_err(|err| err.to_string())
+            })
+        })
+        .join();
+
+        let failure = match outcome {
+            Ok(Ok(())) => return,
+            Ok(Err(err)) => err,
+            Err(_) => "the teardown thread panicked".to_string(),
+        };
+        let message = format!(
+            "failed to drop fixture database {}: {failure}. It has leaked and will be \
+             swept on a later run once it is {LEAKED_DATABASE_GRACE_SECONDS}s old.",
+            self.name
+        );
+        eprintln!("{message}");
+        // Panicking while already unwinding aborts the process and would replace a
+        // real test failure with an unreadable abort, so fail loudly only when this is
+        // the sole problem.
+        if !std::thread::panicking() {
+            panic!("{message}");
+        }
+    }
+}
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the system clock is after the Unix epoch")
+        .as_secs()
+}
+
+/// The creation time encoded in a fixture database's name, if it has the shape this
+/// harness generates. Anything else is left alone by the sweep.
+fn fixture_database_age_seconds(name: &str) -> Option<u64> {
+    let created = name
+        .strip_prefix("moira_test_")?
+        .split('_')
+        .next()?
+        .parse::<u64>()
+        .ok()?;
+    Some(unix_seconds().saturating_sub(created))
+}
+
+async fn connect_maintenance(maintenance_url: &str) -> PgConnection {
+    timeout(DATABASE_TIMEOUT, PgConnection::connect(maintenance_url))
+        .await
+        .expect("maintenance database connection timed out")
+        .expect("connect the maintenance database")
+}
+
+/// Resolves `MOIRA_TEST_DATABASE_URL` and readies the template, once per process.
+///
+/// The skip/fail-closed behaviour is carried over verbatim, including the `CI`
+/// **value** check required by `plans/CONVENTIONS.md` §3: absent locally it skips,
+/// absent under `CI=true` it panics.
+async fn database_origin() -> Option<DatabaseOrigin> {
+    DATABASE_ORIGIN
         .get_or_init(|| async {
             let database_url = match env::var("MOIRA_TEST_DATABASE_URL") {
                 Ok(value) if !value.trim().is_empty() => value,
                 _ if env::var("CI").is_ok_and(|value| value.eq_ignore_ascii_case("true")) => {
-                    panic!("MOIRA_TEST_DATABASE_URL is required when CI=true for lifecycle tests")
+                    panic!(
+                        "MOIRA_TEST_DATABASE_URL is required when CI=true for database-backed tests"
+                    )
                 }
                 _ => {
-                    eprintln!(
-                        "skipping execution lifecycle tests: MOIRA_TEST_DATABASE_URL is not set"
-                    );
+                    eprintln!("skipping database-backed tests: MOIRA_TEST_DATABASE_URL is not set");
                     return None;
                 }
             };
-            let pool = timeout(
-                DATABASE_TIMEOUT,
-                PgPoolOptions::new()
-                    .max_connections(2)
-                    .connect(&database_url),
-            )
-            .await
-            .expect("lifecycle database connection timed out")
-            .expect("connect lifecycle test database");
-            timeout(DATABASE_TIMEOUT, sqlx::migrate!().run(&pool))
-                .await
-                .expect("lifecycle migrations timed out")
-                .expect("run lifecycle migrations");
-            pool.close().await;
-            Some(database_url)
+            let origin = DatabaseOrigin {
+                base: Url::parse(&database_url)
+                    .expect("MOIRA_TEST_DATABASE_URL must be a valid URL"),
+                template: template_database(),
+            };
+            prepare_template(&origin).await;
+            Some(origin)
         })
         .await
-        .clone()?;
-    Some(
-        timeout(
-            DATABASE_TIMEOUT,
-            PgPoolOptions::new()
-                .max_connections(8)
-                .connect(&database_url),
-        )
+        .clone()
+}
+
+/// Builds the template if this migration set has never been templated, and sweeps
+/// databases earlier runs leaked. Once per process, under the exclusive lock.
+///
+/// The common case is that the template already exists, and then this opens **no**
+/// connection to it at all — the digest in its name is the proof that it is current,
+/// so there is nothing to verify by connecting. That is deliberate: an open connection
+/// to the template is the one condition that makes another process's
+/// `CREATE DATABASE … TEMPLATE` fail, and a per-process re-migration created that
+/// window on every single test binary for no benefit.
+async fn prepare_template(origin: &DatabaseOrigin) {
+    let maintenance_url = origin.url_for(MAINTENANCE_DATABASE);
+    let mut maintenance = connect_maintenance(&maintenance_url).await;
+    sqlx::query("select pg_advisory_lock($1)")
+        .bind(TEMPLATE_LOCK_KEY)
+        .execute(&mut maintenance)
         .await
-        .expect("lifecycle fixture database connection timed out")
-        .expect("connect lifecycle fixture database"),
+        .expect("take the exclusive template maintenance lock");
+
+    sweep_leaked_databases(&mut maintenance, &origin.template).await;
+    build_template(&mut maintenance, origin).await;
+
+    sqlx::query("select pg_advisory_unlock($1)")
+        .bind(TEMPLATE_LOCK_KEY)
+        .execute(&mut maintenance)
+        .await
+        .expect("release the template maintenance lock");
+    let _ = maintenance.close().await;
+}
+
+async fn build_template(maintenance: &mut PgConnection, origin: &DatabaseOrigin) {
+    let template = &origin.template;
+    let present: Option<i32> = sqlx::query_scalar("select 1 from pg_database where datname = $1")
+        .bind(template)
+        .fetch_optional(&mut *maintenance)
+        .await
+        .expect("look up the template database");
+    if present.is_some() {
+        return;
+    }
+
+    // Built under a name nobody clones from, and renamed only once the migrations have
+    // succeeded and the connection is gone. A crash midway therefore leaves a partial
+    // database that no fixture can ever be cloned from, rather than a template that
+    // looks current and is missing tables.
+    let scratch = format!("moira_test_building_{}", Uuid::now_v7().simple());
+    sqlx::raw_sql(&format!("create database \"{scratch}\""))
+        .execute(&mut *maintenance)
+        .await
+        .expect("create the scratch database for the template");
+    let pool = timeout(
+        DATABASE_TIMEOUT,
+        PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&origin.url_for(&scratch)),
     )
+    .await
+    .expect("template database connection timed out")
+    .expect("connect the template database");
+    timeout(DATABASE_TIMEOUT, MIGRATOR.run(&pool))
+        .await
+        .expect("template migrations timed out")
+        .expect("migrate the template database");
+    pool.close().await;
+    // `Pool::close` returns once sqlx has sent `Terminate`; PostgreSQL reaps the backend
+    // a moment later, and `ALTER DATABASE … RENAME` refuses while any session remains.
+    // Wait for the observable condition rather than assuming the reap has happened.
+    wait_for_no_connections(&mut *maintenance, &scratch).await;
+    sqlx::raw_sql(&format!(
+        "alter database \"{scratch}\" rename to \"{template}\""
+    ))
+    .execute(&mut *maintenance)
+    .await
+    .expect("publish the migrated template database");
+}
+
+/// Waits until no session other than this one is attached to `database`.
+///
+/// `pg_backend_pid()` excludes the caller, and `backend_type` excludes autovacuum
+/// workers and background writers — neither is a client session, and neither blocks
+/// `CREATE DATABASE … TEMPLATE` or `ALTER DATABASE … RENAME`.
+async fn wait_for_no_connections(maintenance: &mut PgConnection, database: &str) {
+    const CONNECTIONS: &str = "select coalesce(string_agg(\
+             pid || ' ' || coalesce(state, '?') || ' ' || left(coalesce(query, '?'), 60), '; '\
+         ), '') \
+         from pg_stat_activity \
+         where datname = $1 and pid <> pg_backend_pid() and backend_type = 'client backend'";
+
+    let mut ticker = tokio::time::interval(Duration::from_millis(10));
+    let mut last = String::new();
+    let settled = timeout(DATABASE_TIMEOUT, async {
+        loop {
+            ticker.tick().await;
+            last = sqlx::query_scalar(CONNECTIONS)
+                .bind(database)
+                .fetch_one(&mut *maintenance)
+                .await
+                .expect("inspect connections to the template database");
+            if last.is_empty() {
+                return;
+            }
+        }
+    })
+    .await
+    .is_ok();
+    assert!(
+        settled,
+        "sessions on {database} were never released; still attached after \
+         {DATABASE_TIMEOUT:?}: {last}"
+    );
+}
+
+/// Drops databases left behind by a test process that died before `Drop` could run.
+///
+/// Runs under the exclusive template lock, so no other process can be mid-clone, and
+/// only ever considers databases with **no** session attached. Three shapes are swept:
+///
+/// * `moira_test_<epoch>_<uuid>` — a fixture database. Also required to be older than
+///   the grace period, because a fixture database is briefly connectionless between
+///   `CREATE DATABASE` and its pool's first connection.
+/// * `moira_test_building_<uuid>` — a template build that crashed before its rename.
+///   No grace period: nothing ever connects to one of these except the builder, which
+///   holds the same exclusive lock this does.
+/// * `moira_test_template_<digest>` — a template for a migration set that is no longer
+///   current, i.e. left over from before a migration was added.
+async fn sweep_leaked_databases(maintenance: &mut PgConnection, current_template: &str) {
+    let idle: Vec<String> = sqlx::query_scalar(
+        "select d.datname from pg_database d \
+         where d.datname like 'moira\\_test\\_%' \
+           and d.datname <> $1 \
+           and not exists (\
+                 select 1 from pg_stat_activity a \
+                 where a.datname = d.datname and a.backend_type = 'client backend')",
+    )
+    .bind(current_template)
+    .fetch_all(&mut *maintenance)
+    .await
+    .expect("list candidate fixture databases");
+
+    for name in idle {
+        let sweepable =
+            if name.starts_with(TEMPLATE_PREFIX) || name.starts_with("moira_test_building_") {
+                true
+            } else {
+                fixture_database_age_seconds(&name)
+                    .is_some_and(|age| age >= LEAKED_DATABASE_GRACE_SECONDS)
+            };
+        if !sweepable {
+            continue;
+        }
+        // Best effort: another process may have taken the database between the query
+        // and the drop, and a leaked database is not worth failing a test run over.
+        let _ = sqlx::raw_sql(&format!("drop database if exists \"{name}\" with (force)"))
+            .execute(&mut *maintenance)
+            .await;
+    }
 }
 
 // ---------------------------------------------------------------------------

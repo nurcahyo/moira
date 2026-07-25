@@ -2,6 +2,7 @@ mod admin;
 mod conversation;
 mod i18n;
 mod ids;
+mod message;
 mod models;
 mod pagination;
 mod public;
@@ -41,10 +42,11 @@ pub use ids::{
     ProviderId, ProviderModelId, RequestId, RouteId, RoutingPolicyId, SystemKeyId,
     TrustedJwtIssuerId,
 };
+pub use message::{DomainMessage, DomainMessageContent, DomainMessageRole};
 pub use models::{
-    AuditEvent, ChatCompletionRequest, ChatMessage, CreateProviderRequest, CredentialSummary,
-    HealthResponse, OwnerScope, ProviderConfig, ProviderKind, SetRoutingDefaultRequest,
-    UpdateProviderRequest, UpsertCredentialRequest,
+    AuditEvent, CreateProviderRequest, CredentialSummary, HealthResponse, OwnerScope,
+    ProviderConfig, ProviderKind, SetRoutingDefaultRequest, UpdateProviderRequest,
+    UpsertCredentialRequest,
 };
 pub use pagination::{CursorScope, ListCursor, SeqCursor};
 pub use public::{

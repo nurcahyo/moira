@@ -510,6 +510,25 @@ pub enum CircuitState {
     HalfOpen,
 }
 
+/// Which breaker entries a single `moira_runtime_config` notification may clear.
+///
+/// Breakers are keyed on `(provider_id, model_id)`, so a config change can only be
+/// narrowed to one of these shapes. The registry deliberately does not know about
+/// table names — `src/infra/db.rs` owns the payload-to-scope mapping, and this enum
+/// is the contract between the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitResetScope {
+    /// Clear every entry belonging to one provider, whatever model it names.
+    Provider(Uuid),
+    /// Clear every entry naming one provider model, whatever provider owns it.
+    Model(Uuid),
+    /// The change cannot have altered provider health; leave every entry alone.
+    Unaffected,
+    /// Fail-safe: clear everything, exactly as `reset_all` does. Used when a
+    /// notification cannot be understood well enough to narrow it.
+    All,
+}
+
 impl CircuitBreakerRegistry {
     pub fn new() -> Self {
         Self {
@@ -603,8 +622,34 @@ impl CircuitBreakerRegistry {
         }
     }
 
+    /// Clears every breaker entry. Kept for callers that genuinely mean "everything"
+    /// — process startup, and the fail-safe path in [`Self::reset_for_resource`].
     pub async fn reset_all(&self) {
         self.states.lock().await.clear();
+    }
+
+    /// Clears only the breaker entries a config change can plausibly have affected.
+    ///
+    /// The unconditional `reset_all` this replaces on the NOTIFY path discarded the
+    /// health of every provider in the process whenever any one row changed, so a
+    /// single unrelated write re-closed circuits that were open for good reason and
+    /// sent traffic back at providers still failing.
+    ///
+    /// Narrowing is deliberately one-directional: the worst case of an incomplete
+    /// mapping is a breaker that should have reset and did not, which self-heals on
+    /// the next relevant notification or on `circuit_open_duration_ms`.
+    pub async fn reset_for_resource(&self, scope: CircuitResetScope) {
+        let mut states = self.states.lock().await;
+        match scope {
+            CircuitResetScope::Provider(provider_id) => {
+                states.retain(|(entry_provider, _), _| *entry_provider != provider_id);
+            }
+            CircuitResetScope::Model(model_id) => {
+                states.retain(|(_, entry_model), _| *entry_model != model_id);
+            }
+            CircuitResetScope::Unaffected => {}
+            CircuitResetScope::All => states.clear(),
+        }
     }
 }
 
@@ -938,5 +983,134 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(failure.class, ExecutionFailureClass::CircuitOpen);
+    }
+
+    /// Three breakers across two providers, all open, so any leak between them is
+    /// visible. `states` is read directly rather than through `before_call`, which
+    /// re-inserts a `Closed` entry on a miss and would hide the difference between
+    /// "cleared" and "never there".
+    async fn three_open_circuits(
+        registry: &CircuitBreakerRegistry,
+        provider_a: Uuid,
+        model_a1: Uuid,
+        model_a2: Uuid,
+        provider_b: Uuid,
+        model_b: Uuid,
+    ) {
+        let policy = policy(1);
+        for (provider, model) in [
+            (provider_a, model_a1),
+            (provider_a, model_a2),
+            (provider_b, model_b),
+        ] {
+            registry
+                .on_failure(
+                    provider,
+                    model,
+                    &policy,
+                    ExecutionFailureClass::ProviderTimeout,
+                )
+                .await;
+        }
+        assert_eq!(registry.states.lock().await.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn reset_for_resource_clears_only_the_named_providers_entries() {
+        let registry = CircuitBreakerRegistry::new();
+        let (provider_a, model_a1, model_a2, provider_b, model_b) = (
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+        );
+        three_open_circuits(
+            &registry, provider_a, model_a1, model_a2, provider_b, model_b,
+        )
+        .await;
+
+        registry
+            .reset_for_resource(CircuitResetScope::Provider(provider_a))
+            .await;
+
+        let states = registry.states.lock().await;
+        assert_eq!(
+            states.keys().collect::<Vec<_>>(),
+            vec![&(provider_b, model_b)]
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_for_resource_clears_only_the_named_models_entries() {
+        let registry = CircuitBreakerRegistry::new();
+        let (provider_a, model_a1, model_a2, provider_b, model_b) = (
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+        );
+        three_open_circuits(
+            &registry, provider_a, model_a1, model_a2, provider_b, model_b,
+        )
+        .await;
+
+        registry
+            .reset_for_resource(CircuitResetScope::Model(model_a1))
+            .await;
+
+        let states = registry.states.lock().await;
+        assert!(!states.contains_key(&(provider_a, model_a1)));
+        assert!(states.contains_key(&(provider_a, model_a2)));
+        assert!(states.contains_key(&(provider_b, model_b)));
+    }
+
+    #[tokio::test]
+    async fn reset_for_resource_ignores_unrelated_resource_types() {
+        let registry = CircuitBreakerRegistry::new();
+        let (provider_a, model_a1, model_a2, provider_b, model_b) = (
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+        );
+        three_open_circuits(
+            &registry, provider_a, model_a1, model_a2, provider_b, model_b,
+        )
+        .await;
+
+        registry
+            .reset_for_resource(CircuitResetScope::Unaffected)
+            .await;
+
+        assert_eq!(registry.states.lock().await.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn reset_all_still_clears_everything() {
+        let registry = CircuitBreakerRegistry::new();
+        let (provider_a, model_a1, model_a2, provider_b, model_b) = (
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+        );
+        three_open_circuits(
+            &registry, provider_a, model_a1, model_a2, provider_b, model_b,
+        )
+        .await;
+
+        registry.reset_all().await;
+        assert!(registry.states.lock().await.is_empty());
+
+        three_open_circuits(
+            &registry, provider_a, model_a1, model_a2, provider_b, model_b,
+        )
+        .await;
+        registry.reset_for_resource(CircuitResetScope::All).await;
+        assert!(registry.states.lock().await.is_empty());
     }
 }

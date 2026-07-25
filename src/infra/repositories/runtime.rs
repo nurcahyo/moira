@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::Value;
 use sqlx::{PgPool, Row};
@@ -76,12 +77,188 @@ pub struct UsageRecordInsert {
     pub metadata: Value,
 }
 
+/// The runtime persistence surface: route definitions, routing policies, agent profiles and
+/// provider runtime policies (the runtime-admin write side), plus model-candidate resolution,
+/// credential resolution, execution-attempt rows and usage records (the execution read/write side).
+///
+/// Extracted as a trait (plan 06, Module 8 / P2-3) so `RuntimeAdminService` and the execution
+/// pipeline can be unit-tested against a fake instead of a live Postgres. Mirrors
+/// [`AdminRepository`](super::AdminRepository): the trait carries the documentation, the
+/// `#[async_trait] impl` below carries only SQL.
+///
+/// `resolve_runtime_credential` is the single live credential-precedence implementation in the
+/// process; it returns encrypted material only — decryption stays in `src/security/crypto.rs`, so
+/// an implementation of this trait never sees or produces plaintext secrets.
+#[async_trait]
+pub trait RuntimeRepository: Send + Sync {
+    async fn create_route_definition(
+        &self,
+        id: Uuid,
+        request: &RouteDefinitionCreateRequest,
+    ) -> Result<RouteDefinitionRecord, AppError>;
+
+    /// Lists route definitions newest-first, keyset-paginated on `(created_at, id)`.
+    ///
+    /// `cursor` bounds the page to rows strictly *after* the previously returned last row
+    /// (i.e. strictly less than the cursor under `created_at desc, id desc` ordering); `None`
+    /// returns the first page. Returns up to `limit + 1` rows so the caller (application
+    /// layer) can detect `has_more` without a second `count(*)` query and must trim the
+    /// over-fetched row itself before returning it to a client. `cursor.ts`/`cursor.id` are
+    /// always bound as parameters, never interpolated into the query text — see
+    /// `keyset_predicate_binds_parameters_and_never_interpolates_values` below, which pins
+    /// the query text used here.
+    async fn list_route_definitions(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<RouteDefinitionRecord>, AppError>;
+
+    async fn get_route_definition(&self, id: Uuid) -> Result<RouteDefinitionRecord, AppError>;
+
+    async fn get_active_route_by_key(
+        &self,
+        route_key: &str,
+    ) -> Result<Option<RouteDefinitionRecord>, AppError>;
+
+    async fn get_default_route(&self) -> Result<Option<RouteDefinitionRecord>, AppError>;
+
+    async fn patch_route_definition(
+        &self,
+        id: Uuid,
+        request: &RouteDefinitionPatchRequest,
+    ) -> Result<RouteDefinitionRecord, AppError>;
+
+    async fn set_route_definition_status(
+        &self,
+        id: Uuid,
+        status: &str,
+    ) -> Result<RouteDefinitionRecord, AppError>;
+
+    async fn soft_delete_route_definition(&self, id: Uuid) -> Result<(), AppError>;
+
+    async fn create_routing_policy(
+        &self,
+        id: Uuid,
+        request: &RoutingPolicyCreateRequest,
+    ) -> Result<RoutingPolicyRecord, AppError>;
+
+    /// See [`Self::list_route_definitions`] for the keyset-pagination contract this shares.
+    async fn list_routing_policies(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<RoutingPolicyRecord>, AppError>;
+
+    async fn get_routing_policy(&self, id: Uuid) -> Result<RoutingPolicyRecord, AppError>;
+
+    async fn provider_model_belongs_to_provider(
+        &self,
+        provider_id: Uuid,
+        provider_model_id: Uuid,
+    ) -> Result<bool, AppError>;
+
+    async fn patch_routing_policy(
+        &self,
+        id: Uuid,
+        request: &RoutingPolicyPatchRequest,
+    ) -> Result<RoutingPolicyRecord, AppError>;
+
+    async fn set_routing_policy_status(
+        &self,
+        id: Uuid,
+        status: &str,
+    ) -> Result<RoutingPolicyRecord, AppError>;
+
+    async fn soft_delete_routing_policy(&self, id: Uuid) -> Result<(), AppError>;
+
+    async fn create_agent_profile(
+        &self,
+        id: Uuid,
+        request: &AgentProfileCreateRequest,
+    ) -> Result<AgentProfileRecord, AppError>;
+
+    /// See [`Self::list_route_definitions`] for the keyset-pagination contract this shares.
+    async fn list_agent_profiles(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<AgentProfileRecord>, AppError>;
+
+    async fn get_agent_profile(&self, id: Uuid) -> Result<AgentProfileRecord, AppError>;
+
+    async fn get_active_agent_profile(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<AgentProfileRecord>, AppError>;
+
+    async fn patch_agent_profile(
+        &self,
+        id: Uuid,
+        request: &AgentProfilePatchRequest,
+    ) -> Result<AgentProfileRecord, AppError>;
+
+    async fn set_agent_profile_status(
+        &self,
+        id: Uuid,
+        status: &str,
+    ) -> Result<AgentProfileRecord, AppError>;
+
+    async fn soft_delete_agent_profile(&self, id: Uuid) -> Result<(), AppError>;
+
+    async fn get_provider_runtime_policy(
+        &self,
+        provider_id: Uuid,
+    ) -> Result<ProviderRuntimePolicyRecord, AppError>;
+
+    async fn put_provider_runtime_policy(
+        &self,
+        provider_id: Uuid,
+        request: &ProviderRuntimePolicyPutRequest,
+    ) -> Result<ProviderRuntimePolicyRecord, AppError>;
+
+    async fn ensure_application_active(&self, application_id: Uuid) -> Result<(), AppError>;
+
+    async fn list_model_candidates(
+        &self,
+        route_id: Uuid,
+        application_id: Option<Uuid>,
+        external_tenant_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<ModelCandidate>, AppError>;
+
+    async fn resolve_runtime_credential(
+        &self,
+        provider_id: Uuid,
+        credential_types: &[CredentialType],
+        application_id: Option<Uuid>,
+        external_tenant_id: Option<&str>,
+        external_user_id: Option<&str>,
+        explicit_credential_id: Option<Uuid>,
+    ) -> Result<Option<RuntimeCredentialCandidate>, AppError>;
+
+    async fn insert_attempt_started(&self, insert: &ExecutionAttemptInsert)
+    -> Result<(), AppError>;
+
+    async fn update_attempt(
+        &self,
+        attempt_id: Uuid,
+        update: &ExecutionAttemptUpdate,
+    ) -> Result<(), AppError>;
+
+    async fn insert_usage_record(&self, insert: &UsageRecordInsert) -> Result<(), AppError>;
+
+    async fn touch_credential_used(&self, credential_id: Uuid) -> Result<(), AppError>;
+}
+
 impl PgRuntimeRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+}
 
-    pub async fn create_route_definition(
+#[async_trait]
+impl RuntimeRepository for PgRuntimeRepository {
+    async fn create_route_definition(
         &self,
         id: Uuid,
         request: &RouteDefinitionCreateRequest,
@@ -107,17 +284,7 @@ impl PgRuntimeRepository {
         route_definition_record_from_row(&row)
     }
 
-    /// Lists route definitions newest-first, keyset-paginated on `(created_at, id)`.
-    ///
-    /// `cursor` bounds the page to rows strictly *after* the previously returned last row
-    /// (i.e. strictly less than the cursor under `created_at desc, id desc` ordering); `None`
-    /// returns the first page. Returns up to `limit + 1` rows so the caller (application
-    /// layer) can detect `has_more` without a second `count(*)` query and must trim the
-    /// over-fetched row itself before returning it to a client. `cursor.ts`/`cursor.id` are
-    /// always bound as parameters, never interpolated into the query text — see
-    /// `keyset_predicate_binds_parameters_and_never_interpolates_values` below, which pins
-    /// the query text used here.
-    pub async fn list_route_definitions(
+    async fn list_route_definitions(
         &self,
         cursor: Option<ListCursor>,
         limit: i64,
@@ -131,7 +298,7 @@ impl PgRuntimeRepository {
         rows.iter().map(route_definition_record_from_row).collect()
     }
 
-    pub async fn get_route_definition(&self, id: Uuid) -> Result<RouteDefinitionRecord, AppError> {
+    async fn get_route_definition(&self, id: Uuid) -> Result<RouteDefinitionRecord, AppError> {
         let row = sqlx::query(&route_definition_select(
             "where id = $1 and deleted_at is null",
         ))
@@ -142,7 +309,7 @@ impl PgRuntimeRepository {
         route_definition_record_from_row(&row)
     }
 
-    pub async fn get_active_route_by_key(
+    async fn get_active_route_by_key(
         &self,
         route_key: &str,
     ) -> Result<Option<RouteDefinitionRecord>, AppError> {
@@ -157,7 +324,7 @@ impl PgRuntimeRepository {
             .transpose()
     }
 
-    pub async fn get_default_route(&self) -> Result<Option<RouteDefinitionRecord>, AppError> {
+    async fn get_default_route(&self) -> Result<Option<RouteDefinitionRecord>, AppError> {
         let row = sqlx::query(&route_definition_select(
             "where status = 'active' and deleted_at is null order by case when route_key = 'general' then 0 else 1 end, created_at asc limit 1",
         ))
@@ -168,7 +335,7 @@ impl PgRuntimeRepository {
             .transpose()
     }
 
-    pub async fn patch_route_definition(
+    async fn patch_route_definition(
         &self,
         id: Uuid,
         request: &RouteDefinitionPatchRequest,
@@ -203,7 +370,7 @@ impl PgRuntimeRepository {
         route_definition_record_from_row(&row)
     }
 
-    pub async fn set_route_definition_status(
+    async fn set_route_definition_status(
         &self,
         id: Uuid,
         status: &str,
@@ -227,7 +394,7 @@ impl PgRuntimeRepository {
         route_definition_record_from_row(&row)
     }
 
-    pub async fn soft_delete_route_definition(&self, id: Uuid) -> Result<(), AppError> {
+    async fn soft_delete_route_definition(&self, id: Uuid) -> Result<(), AppError> {
         let result = sqlx::query(
             "update route_definitions set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null",
         )
@@ -237,7 +404,7 @@ impl PgRuntimeRepository {
         ensure_affected(result.rows_affected(), format!("route {id}"))
     }
 
-    pub async fn create_routing_policy(
+    async fn create_routing_policy(
         &self,
         id: Uuid,
         request: &RoutingPolicyCreateRequest,
@@ -267,8 +434,7 @@ impl PgRuntimeRepository {
         routing_policy_record_from_row(&row)
     }
 
-    /// See [`Self::list_route_definitions`] for the keyset-pagination contract this shares.
-    pub async fn list_routing_policies(
+    async fn list_routing_policies(
         &self,
         cursor: Option<ListCursor>,
         limit: i64,
@@ -282,7 +448,7 @@ impl PgRuntimeRepository {
         rows.iter().map(routing_policy_record_from_row).collect()
     }
 
-    pub async fn get_routing_policy(&self, id: Uuid) -> Result<RoutingPolicyRecord, AppError> {
+    async fn get_routing_policy(&self, id: Uuid) -> Result<RoutingPolicyRecord, AppError> {
         let row = sqlx::query(&routing_policy_select(
             "where id = $1 and deleted_at is null",
         ))
@@ -293,7 +459,7 @@ impl PgRuntimeRepository {
         routing_policy_record_from_row(&row)
     }
 
-    pub async fn provider_model_belongs_to_provider(
+    async fn provider_model_belongs_to_provider(
         &self,
         provider_id: Uuid,
         provider_model_id: Uuid,
@@ -308,7 +474,7 @@ impl PgRuntimeRepository {
         .map_err(AppError::from)
     }
 
-    pub async fn patch_routing_policy(
+    async fn patch_routing_policy(
         &self,
         id: Uuid,
         request: &RoutingPolicyPatchRequest,
@@ -369,7 +535,7 @@ impl PgRuntimeRepository {
         routing_policy_record_from_row(&row)
     }
 
-    pub async fn set_routing_policy_status(
+    async fn set_routing_policy_status(
         &self,
         id: Uuid,
         status: &str,
@@ -397,7 +563,7 @@ impl PgRuntimeRepository {
         routing_policy_record_from_row(&row)
     }
 
-    pub async fn soft_delete_routing_policy(&self, id: Uuid) -> Result<(), AppError> {
+    async fn soft_delete_routing_policy(&self, id: Uuid) -> Result<(), AppError> {
         let result = sqlx::query(
             "update routing_policies set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null",
         )
@@ -407,7 +573,7 @@ impl PgRuntimeRepository {
         ensure_affected(result.rows_affected(), format!("routing policy {id}"))
     }
 
-    pub async fn create_agent_profile(
+    async fn create_agent_profile(
         &self,
         id: Uuid,
         request: &AgentProfileCreateRequest,
@@ -438,8 +604,7 @@ impl PgRuntimeRepository {
         agent_profile_record_from_row(&row)
     }
 
-    /// See [`Self::list_route_definitions`] for the keyset-pagination contract this shares.
-    pub async fn list_agent_profiles(
+    async fn list_agent_profiles(
         &self,
         cursor: Option<ListCursor>,
         limit: i64,
@@ -453,7 +618,7 @@ impl PgRuntimeRepository {
         rows.iter().map(agent_profile_record_from_row).collect()
     }
 
-    pub async fn get_agent_profile(&self, id: Uuid) -> Result<AgentProfileRecord, AppError> {
+    async fn get_agent_profile(&self, id: Uuid) -> Result<AgentProfileRecord, AppError> {
         let row = sqlx::query(&agent_profile_select(
             "where id = $1 and deleted_at is null",
         ))
@@ -464,7 +629,7 @@ impl PgRuntimeRepository {
         agent_profile_record_from_row(&row)
     }
 
-    pub async fn get_active_agent_profile(
+    async fn get_active_agent_profile(
         &self,
         id: Uuid,
     ) -> Result<Option<AgentProfileRecord>, AppError> {
@@ -477,7 +642,7 @@ impl PgRuntimeRepository {
         row.as_ref().map(agent_profile_record_from_row).transpose()
     }
 
-    pub async fn patch_agent_profile(
+    async fn patch_agent_profile(
         &self,
         id: Uuid,
         request: &AgentProfilePatchRequest,
@@ -515,7 +680,7 @@ impl PgRuntimeRepository {
         agent_profile_record_from_row(&row)
     }
 
-    pub async fn set_agent_profile_status(
+    async fn set_agent_profile_status(
         &self,
         id: Uuid,
         status: &str,
@@ -540,7 +705,7 @@ impl PgRuntimeRepository {
         agent_profile_record_from_row(&row)
     }
 
-    pub async fn soft_delete_agent_profile(&self, id: Uuid) -> Result<(), AppError> {
+    async fn soft_delete_agent_profile(&self, id: Uuid) -> Result<(), AppError> {
         let result = sqlx::query(
             "update agent_profiles set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null",
         )
@@ -550,7 +715,7 @@ impl PgRuntimeRepository {
         ensure_affected(result.rows_affected(), format!("agent profile {id}"))
     }
 
-    pub async fn get_provider_runtime_policy(
+    async fn get_provider_runtime_policy(
         &self,
         provider_id: Uuid,
     ) -> Result<ProviderRuntimePolicyRecord, AppError> {
@@ -564,7 +729,7 @@ impl PgRuntimeRepository {
         }
     }
 
-    pub async fn put_provider_runtime_policy(
+    async fn put_provider_runtime_policy(
         &self,
         provider_id: Uuid,
         request: &ProviderRuntimePolicyPutRequest,
@@ -628,7 +793,7 @@ impl PgRuntimeRepository {
         provider_runtime_policy_record_from_row(&row)
     }
 
-    pub async fn ensure_application_active(&self, application_id: Uuid) -> Result<(), AppError> {
+    async fn ensure_application_active(&self, application_id: Uuid) -> Result<(), AppError> {
         let exists = sqlx::query_scalar::<_, bool>(
             "select exists(select 1 from applications where id = $1 and status = 'active' and deleted_at is null)",
         )
@@ -642,7 +807,7 @@ impl PgRuntimeRepository {
         }
     }
 
-    pub async fn list_model_candidates(
+    async fn list_model_candidates(
         &self,
         route_id: Uuid,
         application_id: Option<Uuid>,
@@ -761,7 +926,7 @@ impl PgRuntimeRepository {
             .collect()
     }
 
-    pub async fn resolve_runtime_credential(
+    async fn resolve_runtime_credential(
         &self,
         provider_id: Uuid,
         credential_types: &[CredentialType],
@@ -856,7 +1021,7 @@ impl PgRuntimeRepository {
         }))
     }
 
-    pub async fn insert_attempt_started(
+    async fn insert_attempt_started(
         &self,
         insert: &ExecutionAttemptInsert,
     ) -> Result<(), AppError> {
@@ -886,7 +1051,7 @@ impl PgRuntimeRepository {
         Ok(())
     }
 
-    pub async fn update_attempt(
+    async fn update_attempt(
         &self,
         attempt_id: Uuid,
         update: &ExecutionAttemptUpdate,
@@ -932,7 +1097,7 @@ impl PgRuntimeRepository {
         Ok(())
     }
 
-    pub async fn insert_usage_record(&self, insert: &UsageRecordInsert) -> Result<(), AppError> {
+    async fn insert_usage_record(&self, insert: &UsageRecordInsert) -> Result<(), AppError> {
         sqlx::query(
             r#"
             insert into usage_records
@@ -971,7 +1136,7 @@ impl PgRuntimeRepository {
         Ok(())
     }
 
-    pub async fn touch_credential_used(&self, credential_id: Uuid) -> Result<(), AppError> {
+    async fn touch_credential_used(&self, credential_id: Uuid) -> Result<(), AppError> {
         sqlx::query(
             "update provider_credentials set last_used_at = now(), updated_at = now() where id = $1",
         )
@@ -1295,5 +1460,418 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+/// In-memory [`RuntimeRepository`] for unit tests (plan 06, Module 8 / P2-3).
+///
+/// Backs the **route lookup and model-candidate** slice — the reads the execution pipeline makes
+/// before it ever talks to a provider — with real state, and returns an explicit `not_stubbed`
+/// error for every other method. A fake that answered unbacked reads with `Ok(vec![])` would let
+/// a test pass while exercising nothing, so unbacked methods fail loudly instead.
+///
+/// Holds **no credential material**: `resolve_runtime_credential` is deliberately left unbacked
+/// rather than seeded with a synthetic ciphertext, so no test can grow a dependency on fake
+/// encrypted bytes.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct InMemoryRuntimeRepository {
+    routes: Vec<RouteDefinitionRecord>,
+    /// Keyed by `route_id`, because that is the one scoping dimension a [`ModelCandidate`]
+    /// actually carries. The SQL additionally filters on `application_id` and
+    /// `external_tenant_id`, but `ModelCandidate` has no fields for either — a policy's scope is
+    /// dropped on the way out of the query — so a fake cannot reproduce that filter and this one
+    /// deliberately does not pretend to. Application/tenant scoping stays covered by the
+    /// Postgres-backed integration tests.
+    candidates: Vec<(Uuid, ModelCandidate)>,
+}
+
+#[cfg(test)]
+fn not_stubbed(method: &str) -> AppError {
+    AppError::Internal(format!(
+        "InMemoryRuntimeRepository::{method} is not stubbed"
+    ))
+}
+
+#[cfg(test)]
+impl InMemoryRuntimeRepository {
+    pub(crate) fn new(
+        routes: Vec<RouteDefinitionRecord>,
+        candidates: Vec<(Uuid, ModelCandidate)>,
+    ) -> Self {
+        Self { routes, candidates }
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl RuntimeRepository for InMemoryRuntimeRepository {
+    async fn get_active_route_by_key(
+        &self,
+        route_key: &str,
+    ) -> Result<Option<RouteDefinitionRecord>, AppError> {
+        Ok(self
+            .routes
+            .iter()
+            .find(|route| {
+                route.route_key == route_key
+                    && route.status == crate::domain::ResourceStatus::Active
+                    && route.deleted_at.is_none()
+            })
+            .cloned())
+    }
+
+    async fn get_default_route(&self) -> Result<Option<RouteDefinitionRecord>, AppError> {
+        Ok(self
+            .routes
+            .iter()
+            .find(|route| {
+                route.status == crate::domain::ResourceStatus::Active
+                    && route.deleted_at.is_none()
+                    && route
+                        .metadata
+                        .get("default")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+            })
+            .cloned())
+    }
+
+    /// Reproduces the two parts of the SQL contract that are observable from `ModelCandidate`:
+    /// candidates belong to one route, and they come back ordered by ascending `policy_priority`
+    /// then descending `weight`, over-fetched to `limit`. Application/tenant scoping is not
+    /// reproduced — see the `candidates` field.
+    async fn list_model_candidates(
+        &self,
+        route_id: Uuid,
+        _application_id: Option<Uuid>,
+        _external_tenant_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<ModelCandidate>, AppError> {
+        let mut out: Vec<ModelCandidate> = self
+            .candidates
+            .iter()
+            .filter(|(id, _)| *id == route_id)
+            .map(|(_, candidate)| candidate.clone())
+            .collect();
+        out.sort_by_key(|candidate| (candidate.policy_priority, -candidate.weight));
+        out.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        Ok(out)
+    }
+
+    async fn create_route_definition(
+        &self,
+        _id: Uuid,
+        _request: &RouteDefinitionCreateRequest,
+    ) -> Result<RouteDefinitionRecord, AppError> {
+        Err(not_stubbed("create_route_definition"))
+    }
+
+    async fn list_route_definitions(
+        &self,
+        _cursor: Option<ListCursor>,
+        _limit: i64,
+    ) -> Result<Vec<RouteDefinitionRecord>, AppError> {
+        Err(not_stubbed("list_route_definitions"))
+    }
+
+    async fn get_route_definition(&self, _id: Uuid) -> Result<RouteDefinitionRecord, AppError> {
+        Err(not_stubbed("get_route_definition"))
+    }
+
+    async fn patch_route_definition(
+        &self,
+        _id: Uuid,
+        _request: &RouteDefinitionPatchRequest,
+    ) -> Result<RouteDefinitionRecord, AppError> {
+        Err(not_stubbed("patch_route_definition"))
+    }
+
+    async fn set_route_definition_status(
+        &self,
+        _id: Uuid,
+        _status: &str,
+    ) -> Result<RouteDefinitionRecord, AppError> {
+        Err(not_stubbed("set_route_definition_status"))
+    }
+
+    async fn soft_delete_route_definition(&self, _id: Uuid) -> Result<(), AppError> {
+        Err(not_stubbed("soft_delete_route_definition"))
+    }
+
+    async fn create_routing_policy(
+        &self,
+        _id: Uuid,
+        _request: &RoutingPolicyCreateRequest,
+    ) -> Result<RoutingPolicyRecord, AppError> {
+        Err(not_stubbed("create_routing_policy"))
+    }
+
+    async fn list_routing_policies(
+        &self,
+        _cursor: Option<ListCursor>,
+        _limit: i64,
+    ) -> Result<Vec<RoutingPolicyRecord>, AppError> {
+        Err(not_stubbed("list_routing_policies"))
+    }
+
+    async fn get_routing_policy(&self, _id: Uuid) -> Result<RoutingPolicyRecord, AppError> {
+        Err(not_stubbed("get_routing_policy"))
+    }
+
+    async fn provider_model_belongs_to_provider(
+        &self,
+        _provider_id: Uuid,
+        _provider_model_id: Uuid,
+    ) -> Result<bool, AppError> {
+        Err(not_stubbed("provider_model_belongs_to_provider"))
+    }
+
+    async fn patch_routing_policy(
+        &self,
+        _id: Uuid,
+        _request: &RoutingPolicyPatchRequest,
+    ) -> Result<RoutingPolicyRecord, AppError> {
+        Err(not_stubbed("patch_routing_policy"))
+    }
+
+    async fn set_routing_policy_status(
+        &self,
+        _id: Uuid,
+        _status: &str,
+    ) -> Result<RoutingPolicyRecord, AppError> {
+        Err(not_stubbed("set_routing_policy_status"))
+    }
+
+    async fn soft_delete_routing_policy(&self, _id: Uuid) -> Result<(), AppError> {
+        Err(not_stubbed("soft_delete_routing_policy"))
+    }
+
+    async fn create_agent_profile(
+        &self,
+        _id: Uuid,
+        _request: &AgentProfileCreateRequest,
+    ) -> Result<AgentProfileRecord, AppError> {
+        Err(not_stubbed("create_agent_profile"))
+    }
+
+    async fn list_agent_profiles(
+        &self,
+        _cursor: Option<ListCursor>,
+        _limit: i64,
+    ) -> Result<Vec<AgentProfileRecord>, AppError> {
+        Err(not_stubbed("list_agent_profiles"))
+    }
+
+    async fn get_agent_profile(&self, _id: Uuid) -> Result<AgentProfileRecord, AppError> {
+        Err(not_stubbed("get_agent_profile"))
+    }
+
+    async fn get_active_agent_profile(
+        &self,
+        _id: Uuid,
+    ) -> Result<Option<AgentProfileRecord>, AppError> {
+        Err(not_stubbed("get_active_agent_profile"))
+    }
+
+    async fn patch_agent_profile(
+        &self,
+        _id: Uuid,
+        _request: &AgentProfilePatchRequest,
+    ) -> Result<AgentProfileRecord, AppError> {
+        Err(not_stubbed("patch_agent_profile"))
+    }
+
+    async fn set_agent_profile_status(
+        &self,
+        _id: Uuid,
+        _status: &str,
+    ) -> Result<AgentProfileRecord, AppError> {
+        Err(not_stubbed("set_agent_profile_status"))
+    }
+
+    async fn soft_delete_agent_profile(&self, _id: Uuid) -> Result<(), AppError> {
+        Err(not_stubbed("soft_delete_agent_profile"))
+    }
+
+    async fn get_provider_runtime_policy(
+        &self,
+        _provider_id: Uuid,
+    ) -> Result<ProviderRuntimePolicyRecord, AppError> {
+        Err(not_stubbed("get_provider_runtime_policy"))
+    }
+
+    async fn put_provider_runtime_policy(
+        &self,
+        _provider_id: Uuid,
+        _request: &ProviderRuntimePolicyPutRequest,
+    ) -> Result<ProviderRuntimePolicyRecord, AppError> {
+        Err(not_stubbed("put_provider_runtime_policy"))
+    }
+
+    async fn ensure_application_active(&self, _application_id: Uuid) -> Result<(), AppError> {
+        Err(not_stubbed("ensure_application_active"))
+    }
+
+    async fn resolve_runtime_credential(
+        &self,
+        _provider_id: Uuid,
+        _credential_types: &[CredentialType],
+        _application_id: Option<Uuid>,
+        _external_tenant_id: Option<&str>,
+        _external_user_id: Option<&str>,
+        _explicit_credential_id: Option<Uuid>,
+    ) -> Result<Option<RuntimeCredentialCandidate>, AppError> {
+        Err(not_stubbed("resolve_runtime_credential"))
+    }
+
+    async fn insert_attempt_started(
+        &self,
+        _insert: &ExecutionAttemptInsert,
+    ) -> Result<(), AppError> {
+        Err(not_stubbed("insert_attempt_started"))
+    }
+
+    async fn update_attempt(
+        &self,
+        _attempt_id: Uuid,
+        _update: &ExecutionAttemptUpdate,
+    ) -> Result<(), AppError> {
+        Err(not_stubbed("update_attempt"))
+    }
+
+    async fn insert_usage_record(&self, _insert: &UsageRecordInsert) -> Result<(), AppError> {
+        Err(not_stubbed("insert_usage_record"))
+    }
+
+    async fn touch_credential_used(&self, _credential_id: Uuid) -> Result<(), AppError> {
+        Err(not_stubbed("touch_credential_used"))
+    }
+}
+
+#[cfg(test)]
+mod repository_trait_tests {
+    use super::*;
+    use crate::domain::{ProviderType, ResourceStatus, RouteSelectionStrategy};
+
+    fn route(route_key: &str, default: bool) -> RouteDefinitionRecord {
+        RouteDefinitionRecord {
+            id: Uuid::now_v7(),
+            route_key: route_key.to_string(),
+            display_name: route_key.to_string(),
+            description: None,
+            status: ResourceStatus::Active,
+            selection_strategy: RouteSelectionStrategy::Default,
+            agent_profile_id: None,
+            metadata: serde_json::json!({ "default": default }),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            deleted_at: None,
+            version: 1,
+        }
+    }
+
+    fn candidate(model_key: &str, priority: i32) -> ModelCandidate {
+        ModelCandidate {
+            policy_id: Uuid::now_v7(),
+            provider_id: Uuid::now_v7(),
+            provider_version: 1,
+            provider_type: ProviderType::OpenAiCompatible,
+            provider_display_name: "fake provider".to_string(),
+            base_url: Some("https://provider.invalid/v1".to_string()),
+            provider_model_id: Uuid::now_v7(),
+            model_version: 1,
+            model_key: model_key.to_string(),
+            capabilities: serde_json::json!({}),
+            policy_priority: priority,
+            weight: 100,
+            timeout_ms: None,
+            retry_policy: serde_json::json!({}),
+            runtime_policy: default_provider_runtime_policy(Uuid::now_v7()),
+        }
+    }
+
+    /// P2-3: route resolution and candidate ordering — the reads the execution pipeline makes
+    /// before it selects a provider — are now exercisable without Postgres.
+    #[tokio::test]
+    async fn fake_runtime_repository_supports_candidate_selection_unit_test() {
+        let primary = route("primary", true);
+        let secondary = route("secondary", false);
+        let repo = InMemoryRuntimeRepository::new(
+            vec![primary.clone(), secondary.clone()],
+            vec![
+                (primary.id, candidate("slow-model", 200)),
+                (primary.id, candidate("fast-model", 100)),
+                (secondary.id, candidate("other-model", 100)),
+            ],
+        );
+
+        assert_eq!(
+            repo.get_active_route_by_key("secondary")
+                .await
+                .unwrap()
+                .map(|route| route.id),
+            Some(secondary.id)
+        );
+        assert!(
+            repo.get_active_route_by_key("absent")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            repo.get_default_route()
+                .await
+                .unwrap()
+                .map(|route| route.id),
+            Some(primary.id)
+        );
+
+        // Lowest `policy_priority` first, and a route's candidates never leak into another's.
+        let candidates = repo
+            .list_model_candidates(primary.id, None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.model_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fast-model", "slow-model"]
+        );
+        assert_eq!(
+            repo.list_model_candidates(secondary.id, None, None, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // `limit` is honoured.
+        assert_eq!(
+            repo.list_model_candidates(primary.id, None, None, 1)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// The fake never hands back synthetic credential material; the credential path stays
+    /// Postgres-backed on purpose.
+    #[tokio::test]
+    async fn fake_runtime_repository_refuses_to_resolve_credentials() {
+        let repo = InMemoryRuntimeRepository::default();
+        let error = repo
+            .resolve_runtime_credential(
+                Uuid::now_v7(),
+                &[CredentialType::ApiKey],
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("credential resolution is not faked");
+        assert!(error.to_string().contains("not stubbed"));
     }
 }

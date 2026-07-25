@@ -2,10 +2,7 @@ use std::{future::Future, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use rig_core::{
-    OneOrMany,
-    completion::{CompletionRequest, Message},
-};
+use rig_core::completion::CompletionRequest;
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use tokio::{
@@ -21,7 +18,7 @@ use crate::{
     application::RequestContext,
     domain::{
         AgentProfileRecord, AttemptStatus, AuditLogInsert, AuditResult, CallerRuntimeIdentity,
-        CredentialDecision, DiagnosticExecutionRequest, DiagnosticExecutionResponse,
+        CredentialDecision, DiagnosticExecutionRequest, DiagnosticExecutionResponse, DomainMessage,
         EffectiveExecutionPolicy, ExecutionCommand, ExecutionFailure, ExecutionFailureClass,
         ExecutionOutcome, ExecutionStatus, ExecutionStreamHandle, ModelCandidate, ModelDecision,
         ModelSelectionReason, ProviderAttemptSummary, ProviderRuntimePolicyRecord, ProviderType,
@@ -34,11 +31,12 @@ use crate::{
         pg_rows::{credential_type_to_db, scope_type_to_db},
         repositories::{
             AdminRepository, ExecutionAttemptInsert, ExecutionAttemptUpdate, PgAdminRepository,
-            PgRuntimeRepository, UsageRecordInsert,
+            PgRuntimeRepository, RuntimeRepository, UsageRecordInsert,
         },
     },
     orchestration::{
         RigRuntimeFactory, RuntimeCacheKey, RuntimeFactory, RuntimeModelHandle, RuntimeStreamItem,
+        rig_chat_history,
     },
     security::{Actor, ActorType, CredentialAadParts, SecretCipher, credential_aad},
 };
@@ -89,7 +87,7 @@ impl MoiraExecutionService {
             external_user_id: request
                 .external_user_id
                 .or_else(|| actor.external_user_id.clone().or(actor.subject.clone())),
-            messages: vec![Message::user(request.prompt)],
+            messages: vec![DomainMessage::user(request.prompt)],
             route_hint: request.route,
             provider_hint: request.provider_id,
             model_hint: request.provider_model_id,
@@ -1791,12 +1789,7 @@ fn build_completion_request(
     command: &ExecutionCommand,
     agent_profile: Option<&AgentProfileRecord>,
 ) -> Result<CompletionRequest, ExecutionFailure> {
-    let chat_history = OneOrMany::many(command.messages.clone()).map_err(|_| {
-        ExecutionFailure::new(
-            ExecutionFailureClass::InvalidExecutionRequest,
-            "execution command must contain at least one message",
-        )
-    })?;
+    let chat_history = rig_chat_history(&command.messages)?;
     let output_schema = command
         .options
         .output_schema
@@ -1953,19 +1946,8 @@ fn first_text(command: &ExecutionCommand) -> String {
     command
         .messages
         .iter()
-        .find_map(|message| match message {
-            Message::User { content } => content.iter().find_map(|content| match content {
-                rig_core::completion::message::UserContent::Text(text) => Some(text.text.clone()),
-                _ => None,
-            }),
-            Message::System { content } => Some(content.clone()),
-            Message::Assistant { content, .. } => {
-                content.iter().find_map(|content| match content {
-                    rig_core::completion::AssistantContent::Text(text) => Some(text.text.clone()),
-                    _ => None,
-                })
-            }
-        })
+        .find_map(DomainMessage::first_text)
+        .map(ToOwned::to_owned)
         .unwrap_or_default()
 }
 
@@ -2236,7 +2218,7 @@ mod tests {
             application_id: None,
             external_tenant_id: None,
             external_user_id: None,
-            messages: vec![Message::user("hello")],
+            messages: vec![DomainMessage::user("hello")],
             route_hint: Some("general".to_string()),
             provider_hint: Some(Uuid::now_v7()),
             model_hint: Some(Uuid::now_v7()),
@@ -2266,7 +2248,7 @@ mod tests {
             application_id: None,
             external_tenant_id: None,
             external_user_id: None,
-            messages: vec![Message::user("hello")],
+            messages: vec![DomainMessage::user("hello")],
             route_hint: None,
             provider_hint: None,
             model_hint: None,

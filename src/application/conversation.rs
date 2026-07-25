@@ -24,7 +24,7 @@ use crate::{
     error::AppError,
     infra::repositories::{
         AdminRepository, ConversationAccess, ConversationInsert, ConversationMessageInsert,
-        MemoryInsert, PgAdminRepository, PgConversationRepository,
+        ConversationRepository, MemoryInsert, PgAdminRepository, PgConversationRepository,
         create_rag_collection_with_connection, create_rag_document_with_connection,
         ingest_rag_document_with_connection,
     },
@@ -1284,9 +1284,12 @@ pub(crate) const RAG_DOCUMENT_INGEST_OPERATION: &str = "rag.document.ingest";
 /// stays `None`: these routes accept no `If-Match` today, and adding optimistic concurrency
 /// is a separate contract change (`plans/02b-idempotency-replay.md`, Excluded scope).
 ///
-/// The actor fingerprint comes from the single crate-wide `admin::actor_fingerprint` — these
-/// four routes authenticate through `admin_actor`, not `public_actor`, so
-/// `public_actor_fingerprint` must not be used here.
+/// The actor fingerprint comes from `admin::actor_fingerprint`, which since plan 06
+/// (Module 16 / P2-15) is the only formula in the crate: `runtime_admin` and `public` no
+/// longer keep their own weaker copies, so there is nothing left to pick wrongly here.
+/// Reusing it is still load-bearing rather than stylistic — the fingerprint is a column of
+/// the `idempotency_records` unique index and an input to the advisory-lock key, so a
+/// divergent copy would silently un-scope replay for these four routes.
 pub(crate) fn conversation_command_spec<T: Serialize>(
     ctx: &RequestContext,
     actor: &Actor,

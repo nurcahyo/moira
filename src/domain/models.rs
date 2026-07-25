@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -111,28 +111,6 @@ pub struct AuditEvent {
     pub resource_id: Option<String>,
     pub metadata: Value,
     pub created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatCompletionRequest {
-    pub model: Option<String>,
-    pub provider_id: Option<Uuid>,
-    pub messages: Vec<ChatMessage>,
-    #[serde(default)]
-    pub stream: bool,
-    pub temperature: Option<f32>,
-    pub top_p: Option<f32>,
-    pub max_tokens: Option<u32>,
-    #[serde(default)]
-    pub extra_body: Map<String, Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatMessage {
-    pub role: String,
-    pub content: Value,
-    #[serde(flatten)]
-    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

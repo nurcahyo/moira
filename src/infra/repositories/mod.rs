@@ -9,8 +9,8 @@ pub use admin::{
     PgAdminCommandTransaction, PgAdminRepository, StoredCredentialSecret,
 };
 pub use conversation::{
-    ConversationAccess, ConversationInsert, ConversationMessageInsert, MemoryInsert,
-    PgConversationRepository,
+    ConversationAccess, ConversationInsert, ConversationMessageInsert, ConversationRepository,
+    MemoryInsert, PgConversationRepository,
 };
 // Deliberately `pub(crate)`, not `pub`: these three free functions mutate RAG state with no
 // authorization check, no audit row and no idempotency envelope of their own — those are
@@ -22,11 +22,28 @@ pub(crate) use conversation::{
     ingest_rag_document_with_connection,
 };
 pub use public::{
-    IdempotencyClaim, PgPublicRepository, PublicAccess, ResponseStartedInsert,
+    IdempotencyClaim, PgPublicRepository, PublicAccess, PublicRepository, ResponseStartedInsert,
     ResponseTerminalUpdate, default_application_execution_policy, idempotency_record,
 };
 pub use runtime::{
     ExecutionAttemptInsert, ExecutionAttemptUpdate, PgRuntimeRepository,
-    RuntimeCredentialCandidate, UsageRecordInsert, execution_failure_class_to_db,
+    RuntimeCredentialCandidate, RuntimeRepository, UsageRecordInsert,
+    execution_failure_class_to_db,
 };
-pub use setup::{PgSetupRepository, SetupReadinessSnapshot};
+pub use setup::{PgSetupRepository, SetupReadinessSnapshot, SetupRepository};
+// Test-only in-memory fakes (plan 06, Module 8 / P2-3). Exported `pub(crate)` under `cfg(test)`
+// so application-layer unit tests can drive a service without Postgres; they are compiled out of
+// every shipped binary. Each fake backs one coherent slice of its trait and returns an explicit
+// "not stubbed" error elsewhere — never a plausible empty result — so a unit test cannot pass
+// while exercising nothing. None of them holds credential material.
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use conversation::InMemoryConversationRepository;
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use public::InMemoryPublicRepository;
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use runtime::InMemoryRuntimeRepository;
+#[cfg(test)]
+pub(crate) use setup::InMemorySetupRepository;

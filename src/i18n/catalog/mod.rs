@@ -7,6 +7,16 @@
 //! - `mod.rs` provides lookups and catalog-level validation.
 //!
 //! Keep the docs mirror in `docs/i18n-response-catalog.json` synchronized with this code.
+//! That synchronization is no longer a convention: `docs_mirror_matches_rust_catalog`
+//! below reads the JSON at test time and fails on any divergence, so the mirror cannot
+//! drift silently the way it did before plan 06.
+//!
+//! **The `moira.notice.*` half of this catalog has no production consumers.** All four
+//! entries in `notices.rs` are referenced only by this module's tests and by
+//! `src/domain/i18n.rs`; nothing in `src/http`, `src/application` or `src/orchestration`
+//! emits a notice key today. The next plan that returns a user-visible success string
+//! (plan 07 is the first candidate) will be the catalog's first real notice consumer and
+//! should expect to add the emission path, not just the entry.
 
 mod errors;
 mod notices;
@@ -373,5 +383,343 @@ mod tests {
                 response.error.code
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Docs-mirror gates (plan 06, module 10c)
+    //
+    // Until these landed, *nothing* in `src/` or `tests/` read
+    // `docs/i18n-response-catalog.json`. The mirror is the artifact translators
+    // and the console consume, and it could diverge from the Rust catalog
+    // arbitrarily without a single test noticing — the two duplicate objects
+    // plan 02b removed were found by hand, not by CI. These three tests are the
+    // gate that closes that hole.
+    // -----------------------------------------------------------------------
+
+    const DOCS_MIRROR_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/docs/i18n-response-catalog.json"
+    );
+
+    #[derive(serde::Deserialize)]
+    struct MirrorEntry {
+        key: String,
+        default_message: String,
+        description: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct DocsMirror {
+        entries: Vec<MirrorEntry>,
+    }
+
+    fn read_docs_mirror() -> DocsMirror {
+        let raw = std::fs::read_to_string(DOCS_MIRROR_PATH)
+            .unwrap_or_else(|error| panic!("read {DOCS_MIRROR_PATH}: {error}"));
+        serde_json::from_str(&raw)
+            .unwrap_or_else(|error| panic!("parse {DOCS_MIRROR_PATH} as JSON: {error}"))
+    }
+
+    /// The mirror in `docs/` must be byte-equivalent to the Rust catalog on all
+    /// three fields, not merely key-compatible: a translator working from a
+    /// stale `default_message` ships a wrong string with a correct key, which is
+    /// the failure mode a key-only comparison cannot see.
+    #[test]
+    fn docs_mirror_matches_rust_catalog() {
+        use std::collections::BTreeMap;
+
+        let mirror = read_docs_mirror();
+        let mirror_by_key: BTreeMap<&str, (&str, &str)> = mirror
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.key.as_str(),
+                    (entry.default_message.as_str(), entry.description.as_str()),
+                )
+            })
+            .collect();
+        let rust_by_key: BTreeMap<&str, (&str, &str)> = all_entries()
+            .map(|entry| (entry.key, (entry.default_message, entry.description)))
+            .collect();
+
+        let mut problems: Vec<String> = Vec::new();
+        for key in rust_by_key.keys() {
+            if !mirror_by_key.contains_key(key) {
+                problems.push(format!(
+                    "{key}: present in the Rust catalog, missing from docs/i18n-response-catalog.json"
+                ));
+            }
+        }
+        for key in mirror_by_key.keys() {
+            if !rust_by_key.contains_key(key) {
+                problems.push(format!(
+                    "{key}: present in docs/i18n-response-catalog.json, missing from the Rust catalog"
+                ));
+            }
+        }
+        for (key, (rust_message, rust_description)) in &rust_by_key {
+            let Some((mirror_message, mirror_description)) = mirror_by_key.get(key) else {
+                continue;
+            };
+            if rust_message != mirror_message {
+                problems.push(format!(
+                    "{key}: default_message differs\n  rust:   {rust_message:?}\n  mirror: {mirror_message:?}"
+                ));
+            }
+            if rust_description != mirror_description {
+                problems.push(format!(
+                    "{key}: description differs\n  rust:   {rust_description:?}\n  mirror: {mirror_description:?}"
+                ));
+            }
+        }
+
+        assert!(
+            problems.is_empty(),
+            "docs/i18n-response-catalog.json has drifted from the Rust catalog \
+             ({} problem(s)):\n{}",
+            problems.len(),
+            problems.join("\n")
+        );
+    }
+
+    /// JSON objects with a repeated `key` parse happily and are invisible to a
+    /// set comparison that keeps only the last one. This is the assertion that
+    /// would have caught the duplicated `idempotency_conflict` / `rate_limited`
+    /// objects plan 02b removed by hand.
+    #[test]
+    fn docs_mirror_has_no_duplicate_keys() {
+        use std::collections::BTreeMap;
+
+        let mirror = read_docs_mirror();
+        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for entry in &mirror.entries {
+            *counts.entry(entry.key.as_str()).or_insert(0) += 1;
+        }
+        let duplicates: Vec<String> = counts
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .map(|(key, count)| format!("{key} ({count}x)"))
+            .collect();
+
+        assert!(
+            duplicates.is_empty(),
+            "docs/i18n-response-catalog.json contains duplicate keys: {}",
+            duplicates.join(", ")
+        );
+        assert_eq!(
+            mirror.entries.len(),
+            all_entries().count(),
+            "docs/i18n-response-catalog.json entry count must equal the Rust catalog's"
+        );
+    }
+
+    /// The three `AppError` constructors that take a caller-supplied error code,
+    /// paired with the zero-based argument position that code occupies.
+    /// `coded` also takes a `StatusCode` first; `conflict` and `unprocessable`
+    /// fix the status themselves.
+    ///
+    /// The needles are assembled with `concat!` on purpose: this file is itself
+    /// walked by the scanner below, and a literal `AppError`-plus-`::coded(`
+    /// spelled out here would be found in its own source and parsed as a call.
+    const CODED_CONSTRUCTORS: &[(&str, usize)] = &[
+        (concat!("AppError", "::coded("), 1),
+        (concat!("AppError", "::conflict("), 0),
+        (concat!("AppError", "::unprocessable("), 0),
+    ];
+
+    /// Every `.rs` file under `src/`, in a deterministic (sorted, depth-first)
+    /// order so a failure names the same file on every machine.
+    fn rust_sources_under(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .unwrap_or_else(|error| panic!("read_dir {}: {error}", dir.display()))
+            .map(|entry| entry.expect("directory entry").path())
+            .collect();
+        paths.sort();
+        for path in paths {
+            if path.is_dir() {
+                rust_sources_under(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Splits the comma-separated top-level arguments of a call, given the slice
+    /// of the source that begins at the call's opening `(`. String literals are
+    /// tracked so a comma or a bracket inside a message never splits an
+    /// argument. Returns whatever it has if the call is never closed, which
+    /// cannot happen in a file that compiles.
+    fn top_level_args(from_open_paren: &str) -> Vec<String> {
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        let mut current = String::new();
+        let mut args = Vec::new();
+
+        for character in from_open_paren.chars() {
+            if in_string {
+                current.push(character);
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match character {
+                '"' => {
+                    in_string = true;
+                    current.push(character);
+                }
+                '(' | '[' | '{' => {
+                    depth += 1;
+                    if depth > 1 {
+                        current.push(character);
+                    }
+                }
+                ')' | ']' | '}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        args.push(current.trim().to_string());
+                        return args;
+                    }
+                    current.push(character);
+                }
+                ',' if depth == 1 => {
+                    args.push(current.trim().to_string());
+                    current.clear();
+                }
+                _ => current.push(character),
+            }
+        }
+        args
+    }
+
+    /// Returns the contents of `argument` when it is a plain `"snake_case"`
+    /// string literal, and `None` when the code is computed at runtime.
+    fn string_literal_code(argument: &str) -> Option<&str> {
+        let inner = argument.strip_prefix('"')?.strip_suffix('"')?;
+        if inner.is_empty()
+            || !inner.chars().all(|character| {
+                character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+            })
+        {
+            return None;
+        }
+        Some(inner)
+    }
+
+    /// `AppError::coded`/`conflict`/`unprocessable` codes reach the wire as
+    /// `moira.error.<code>` (`AppError::message_key`, `src/error.rs`), so every
+    /// one of them needs a catalog entry — but no test looked at them until now,
+    /// which is exactly how `routing_policy_provider_model_mismatch` shipped
+    /// uncatalogued from `src/application/runtime_admin.rs`.
+    ///
+    /// Codes that are *not* string literals cannot be resolved by reading the
+    /// source, so they are collected separately and pinned: a new dynamic code
+    /// site must be a deliberate, reviewed decision rather than a silent way out
+    /// of this gate. See the note on the final assertion.
+    #[test]
+    fn every_coded_error_literal_in_src_has_a_catalog_entry() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        rust_sources_under(&manifest.join("src"), &mut files);
+        assert!(
+            files.len() > 20,
+            "the source walker found only {} files under src/ — it is broken, \
+             and a broken walker asserts nothing",
+            files.len()
+        );
+
+        let mut literal_codes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut dynamic_sites: Vec<String> = Vec::new();
+
+        for file in &files {
+            let source = std::fs::read_to_string(file)
+                .unwrap_or_else(|error| panic!("read {}: {error}", file.display()));
+            let relative = file
+                .strip_prefix(manifest)
+                .unwrap_or(file)
+                .display()
+                .to_string();
+
+            for (needle, code_position) in CODED_CONSTRUCTORS {
+                let mut cursor = 0usize;
+                while let Some(offset) = source[cursor..].find(needle) {
+                    let start = cursor + offset;
+                    let open = start + needle.len() - 1;
+                    cursor = start + needle.len();
+
+                    // A mention inside a `//` comment is prose, not a call site.
+                    let line_start = source[..start].rfind('\n').map_or(0, |index| index + 1);
+                    if source[line_start..start].contains("//") {
+                        continue;
+                    }
+
+                    let args = top_level_args(&source[open..]);
+                    let Some(argument) = args.get(*code_position) else {
+                        dynamic_sites.push(format!("{relative}: {needle} (unparsed arguments)"));
+                        continue;
+                    };
+                    match string_literal_code(argument) {
+                        Some(code) => {
+                            literal_codes
+                                .entry(code.to_string())
+                                .or_default()
+                                .insert(relative.clone());
+                        }
+                        None => {
+                            dynamic_sites.push(format!("{relative}: {needle}…, {argument}, …)"))
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            literal_codes.len() > 40,
+            "expected the whole `AppError::coded`/`conflict`/`unprocessable` surface \
+             (~53 distinct codes), found {} — the scanner is not matching",
+            literal_codes.len()
+        );
+
+        let missing: Vec<String> = literal_codes
+            .iter()
+            .filter(|(code, _)| !is_known_key(&format!("moira.error.{code}")))
+            .map(|(code, files)| {
+                format!(
+                    "moira.error.{code} (emitted in {})",
+                    files.iter().cloned().collect::<Vec<_>>().join(", ")
+                )
+            })
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "these error codes are emitted from src/ but have no catalog entry \
+             in src/i18n/catalog/errors.rs (CONVENTIONS §4.1):\n  {}",
+            missing.join("\n  ")
+        );
+
+        // The two known runtime-computed codes, both in the public execution
+        // path: `AppError::coded(status, failure_code(failure.class), …)` and the
+        // `code` it is re-raised with. Their values come from
+        // `failure_code` (`src/application/public.rs`), 23 of which have **no**
+        // catalog entry — a pre-existing gap this plan records rather than
+        // closes (it needs 23 reviewed English strings, not a mechanical fix).
+        // If this count moves, either that gap was addressed or a new dynamic
+        // code site was introduced; both deserve a look.
+        assert_eq!(
+            dynamic_sites.len(),
+            2,
+            "expected exactly the 2 known runtime-computed error-code sites, found {}:\n  {}",
+            dynamic_sites.len(),
+            dynamic_sites.join("\n  ")
+        );
     }
 }

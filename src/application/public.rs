@@ -3,10 +3,6 @@ use std::{pin::Pin, time::Duration};
 use async_stream::stream;
 use chrono::Utc;
 use futures_util::Stream;
-use rig_core::{
-    OneOrMany,
-    completion::{Message, message::UserContent},
-};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -19,21 +15,21 @@ use crate::{
     },
     domain::{
         ApplicationExecutionPolicyPutRequest, ApplicationExecutionPolicyRecord, AuditLogInsert,
-        AuditResult, CallerRuntimeIdentity, ExecutionCommand, ExecutionFailure,
-        ExecutionFailureClass, ExecutionOptions, ExecutionOutcome, ExecutionQuery, ExecutionStatus,
-        IdempotencyRecord, ListResponse, OpenAiResponseCompatRequest, PublicCapabilities,
-        PublicContentPart, PublicConversationRef, PublicExecutionSummary, PublicInputMessage,
-        PublicMessageRole, PublicModelRef, PublicModelResource, PublicOutputContentPart,
-        PublicOutputItem, PublicResponse, PublicResponseFormat, PublicResponseRecord,
-        PublicResponseRequest, PublicResponseStatus, PublicRouteRef, PublicRouteResource,
-        PublicSseEnvelope, PublicUsageRecord, PublicUsageSummary, RuntimeEventEnvelope,
-        RuntimeEventType, UsageQuery,
+        AuditResult, CallerRuntimeIdentity, DomainMessage, DomainMessageContent, DomainMessageRole,
+        ExecutionCommand, ExecutionFailure, ExecutionFailureClass, ExecutionOptions,
+        ExecutionOutcome, ExecutionQuery, ExecutionStatus, IdempotencyRecord, ListResponse,
+        OpenAiResponseCompatRequest, PublicCapabilities, PublicContentPart, PublicConversationRef,
+        PublicExecutionSummary, PublicInputMessage, PublicMessageRole, PublicModelRef,
+        PublicModelResource, PublicOutputContentPart, PublicOutputItem, PublicResponse,
+        PublicResponseFormat, PublicResponseRecord, PublicResponseRequest, PublicResponseStatus,
+        PublicRouteRef, PublicRouteResource, PublicSseEnvelope, PublicUsageRecord,
+        PublicUsageSummary, RuntimeEventEnvelope, RuntimeEventType, UsageQuery,
     },
     error::AppError,
     infra::repositories::{
         AdminRepository, IdempotencyClaim, PgAdminRepository, PgPublicRepository, PublicAccess,
-        ResponseStartedInsert, ResponseTerminalUpdate, default_application_execution_policy,
-        idempotency_record,
+        PublicRepository, ResponseStartedInsert, ResponseTerminalUpdate,
+        default_application_execution_policy, idempotency_record,
     },
     security::{Actor, ActorType, IdempotencyHasher, secret_fingerprint},
 };
@@ -1037,27 +1033,55 @@ impl PublicExecutionService {
         let Some(key) = ctx.idempotency_key.as_deref() else {
             return Ok(None);
         };
-        let actor_fingerprint = public_actor_fingerprint(actor, application_id);
+        let actor_fingerprint = crate::application::admin::actor_fingerprint(actor);
         let hasher = &self.state.idempotency_hasher;
         let request_bytes = normalized_request_bytes(&(application_id, request))?;
 
-        // Dual lookup, deliberately *before* the claim insert. `idempotency_key_hash` is
-        // the index key of the unique index on
-        // (idempotency_key_hash, actor_fingerprint, operation), so a row written before the
-        // switch to keyed hashing (plan 03, P1-1) is invisible to the new hash: claiming
-        // first would insert a second row and execute a contractual replay a second time.
-        // Cost is one extra SELECT per idempotent request, removable once no pre-switch row
-        // can still be unexpired (ledger retention is 24h).
-        if let Some(existing) = self
-            .public_repo
-            .get_idempotency_record(
-                &hasher.legacy_hash(key.as_bytes()),
-                &actor_fingerprint,
-                "response.create",
-            )
-            .await?
-        {
-            return replayed_idempotency_state(hasher, &request_bytes, existing).map(Some);
+        // Pre-claim sweep, deliberately *before* the claim insert, over every historical
+        // spelling of this row's position in the unique index
+        // (idempotency_key_hash, actor_fingerprint, operation). Two of its three columns
+        // have been redefined under deployed rows:
+        //
+        //   * `idempotency_key_hash` — unkeyed SHA-256 → keyed HMAC (plan 03, P1-1). The
+        //     current hash needs no pre-claim probe: the claim's `on conflict` finds it.
+        //   * `actor_fingerprint` — this module's 4-field formula → the crate-wide 10-field
+        //     one (plan 06, Module 16 / P2-15). Both key hashes must be probed under the
+        //     legacy value, because a pre-plan-06 row may carry either.
+        //
+        // Skipping the sweep is not a slow replay, it is a *wrong* one: an unswept row sits
+        // at a different point of the unique index, so the claim below would insert
+        // alongside it rather than conflict with it, and `/v1/responses` would execute a
+        // second time against the provider — a contractual replay turned into a duplicate
+        // billable call.
+        //
+        // Cost: up to three indexed lookups per idempotent request, on the miss path only.
+        // The write below always uses the current pair, so the legacy value can never
+        // re-enter the ledger and the sweep drains as rows expire.
+        //
+        // TODO(plan-07): drop the two `legacy_actor_fingerprint` probes once every ledger
+        // row written before plan 06 shipped has expired. `idempotency_record` sets
+        // `expires_at` 24h ahead, so the earliest safe removal date is the deploy date of
+        // Module 16 + 1 day. The plan-03 `legacy_hash` probe has its own, earlier window.
+        let legacy_actor_fingerprint = legacy_public_actor_fingerprint(actor, application_id);
+        let legacy_key_hash = hasher.legacy_hash(key.as_bytes());
+        let current_key_hash = hasher.hash(key.as_bytes());
+        let candidates = [
+            (&legacy_key_hash, &actor_fingerprint),
+            (&current_key_hash, &legacy_actor_fingerprint),
+            (&legacy_key_hash, &legacy_actor_fingerprint),
+        ];
+        for (candidate_key_hash, candidate_fingerprint) in candidates {
+            if let Some(existing) = self
+                .public_repo
+                .get_idempotency_record(
+                    candidate_key_hash,
+                    candidate_fingerprint,
+                    "response.create",
+                )
+                .await?
+            {
+                return replayed_idempotency_state(hasher, &request_bytes, existing).map(Some);
+            }
         }
 
         let record = idempotency_record(
@@ -1544,7 +1568,7 @@ fn validate_image_url(value: &str) -> Result<(), AppError> {
 fn map_public_messages(
     request: &PublicResponseRequest,
     policy: &ApplicationExecutionPolicyRecord,
-) -> Result<Vec<Message>, AppError> {
+) -> Result<Vec<DomainMessage>, AppError> {
     request
         .input
         .iter()
@@ -1555,7 +1579,7 @@ fn map_public_messages(
 fn map_public_message(
     message: &PublicInputMessage,
     policy: &ApplicationExecutionPolicyRecord,
-) -> Result<Message, AppError> {
+) -> Result<DomainMessage, AppError> {
     match message.role {
         PublicMessageRole::System | PublicMessageRole::Developer => {
             if !policy.caller_system_instructions_allowed {
@@ -1564,26 +1588,30 @@ fn map_public_message(
                     "system and developer roles are not allowed",
                 ));
             }
-            Ok(Message::system(text_only_content(message)?))
+            Ok(DomainMessage::system(text_only_content(message)?))
         }
         PublicMessageRole::User => {
-            let parts = message
+            let content = message
                 .content
                 .iter()
                 .map(|part| match part {
-                    PublicContentPart::InputText { text } => Ok(UserContent::text(text.clone())),
-                    PublicContentPart::InputImage { image_url } => {
-                        Ok(UserContent::image_url(image_url.clone(), None, None))
+                    PublicContentPart::InputText { text } => {
+                        DomainMessageContent::Text { text: text.clone() }
                     }
+                    PublicContentPart::InputImage { image_url } => DomainMessageContent::ImageUrl {
+                        url: image_url.clone(),
+                    },
                 })
-                .collect::<Result<Vec<_>, AppError>>()?;
-            Ok(Message::User {
-                content: OneOrMany::many(parts).map_err(|_| {
-                    AppError::unprocessable("invalid_execution_request", "user message is empty")
-                })?,
-            })
+                .collect::<Vec<_>>();
+            if content.is_empty() {
+                return Err(AppError::unprocessable(
+                    "invalid_execution_request",
+                    "user message is empty",
+                ));
+            }
+            Ok(DomainMessage::new(DomainMessageRole::User, content))
         }
-        PublicMessageRole::Assistant => Ok(Message::assistant(text_only_content(message)?)),
+        PublicMessageRole::Assistant => Ok(DomainMessage::assistant(text_only_content(message)?)),
         PublicMessageRole::Tool => Err(AppError::unprocessable(
             "unsupported_message_role",
             "tool messages require an approved tool registry",
@@ -1890,7 +1918,27 @@ fn request_has_image(request: &PublicResponseRequest) -> bool {
     })
 }
 
-fn public_actor_fingerprint(actor: &Actor, application_id: Option<Uuid>) -> String {
+/// The fingerprint `/v1/responses` wrote **before** plan 06 unified the three formulas.
+///
+/// Read-only, consulted by `claim_idempotency` so a ledger row written by the previous
+/// release still replays; never written. It hashes
+/// `{actor_type, subject, api_key_id, application_id}`, so two callers differing only by
+/// tenant, trusted-JWT issuer, external user or delegated subject collided — the public
+/// half of the P2-15 hole.
+///
+/// `application_id` stays an explicit parameter rather than being read off the `Actor`
+/// because that is what the pre-plan-06 call site passed, and reproducing the old value
+/// byte-for-byte is the entire point. It is
+/// `effective_application_id(actor) == actor.internal_application_id` at the one call site,
+/// which is why the unified formula loses no information by dropping the parameter —
+/// `internal_application_id` is one of its ten fields.
+/// `tests::the_legacy_public_fingerprint_collided_across_tenant_and_delegation` pins both
+/// halves of that claim.
+///
+/// TODO(plan-07): delete together with the legacy passes in `claim_idempotency`, once 24h
+/// (the `expires_at` window set by `infra::repositories::public::idempotency_record`) have
+/// elapsed since the deploy carrying plan 06 Module 16.
+fn legacy_public_actor_fingerprint(actor: &Actor, application_id: Option<Uuid>) -> String {
     secret_fingerprint(
         format!(
             "{:?}:{}:{}:{}",
@@ -2184,6 +2232,117 @@ mod tests {
                 Duration::from_millis(10),
             )
             .await
+        );
+    }
+
+    /// The public half of the P2-15 hole, pinned rather than described.
+    ///
+    /// Plan 06 §16.4 asks for proof that the pre-unification formula was actually broken.
+    /// This asserts both halves in one place: the 4-field formula `/v1/responses` used to
+    /// write collided on every field below, and the formula now writing the ledger does
+    /// not. `application_id` is held constant throughout — it was the only identity field
+    /// beyond `{actor_type, subject, api_key_id}` the old formula could see, so varying it
+    /// would prove nothing about what was missing.
+    #[test]
+    fn the_legacy_public_fingerprint_collided_across_tenant_and_delegation() {
+        use crate::security::ActorType;
+
+        let application_id = Some(Uuid::now_v7());
+        let base = Actor {
+            actor_type: ActorType::ConsumerKey,
+            subject: Some("shared-subject".to_string()),
+            api_key_id: Some(Uuid::nil()),
+            internal_application_id: application_id,
+            ..Actor::default()
+        };
+
+        let variants: [(&str, Actor); 5] = [
+            (
+                "tenant_id",
+                Actor {
+                    tenant_id: Some("other-tenant".to_string()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "external_tenant_id",
+                Actor {
+                    external_tenant_id: Some("other-tenant".to_string()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "external_user_id",
+                Actor {
+                    external_user_id: Some("other-user".to_string()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "delegated_subject",
+                Actor {
+                    delegated_subject: Some("other-user".to_string()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "trusted_jwt_issuer_id",
+                Actor {
+                    trusted_jwt_issuer_id: Some(Uuid::now_v7()),
+                    ..base.clone()
+                },
+            ),
+        ];
+
+        for (field, variant) in variants {
+            assert_eq!(
+                legacy_public_actor_fingerprint(&base, application_id),
+                legacy_public_actor_fingerprint(&variant, application_id),
+                "the pre-plan-06 formula is supposed to be blind to `{field}` — if this \
+                 stops holding, `claim_idempotency`'s legacy sweep is probing a value \
+                 production never wrote and pre-deploy rows will not replay"
+            );
+            assert_ne!(
+                crate::application::admin::actor_fingerprint(&base),
+                crate::application::admin::actor_fingerprint(&variant),
+                "the unified formula must isolate replay across `{field}`"
+            );
+        }
+    }
+
+    /// The unified formula drops `claim_idempotency`'s explicit `application_id` argument.
+    /// That is only lossless because the argument was always
+    /// `effective_application_id(actor)`, i.e. `actor.internal_application_id`, which the
+    /// unified formula already covers. If a future caller passes something else, the two
+    /// halves of this test disagree and it fails.
+    #[test]
+    fn dropping_the_explicit_application_id_argument_loses_no_isolation() {
+        use crate::security::ActorType;
+
+        let base = Actor {
+            actor_type: ActorType::ConsumerKey,
+            subject: Some("shared-subject".to_string()),
+            api_key_id: Some(Uuid::nil()),
+            internal_application_id: Some(Uuid::now_v7()),
+            ..Actor::default()
+        };
+        let other = Actor {
+            internal_application_id: Some(Uuid::now_v7()),
+            ..base.clone()
+        };
+
+        assert_eq!(
+            effective_application_id(&base),
+            base.internal_application_id
+        );
+        assert_ne!(
+            crate::application::admin::actor_fingerprint(&base),
+            crate::application::admin::actor_fingerprint(&other),
+            "application identity must still partition the ledger without the argument"
+        );
+        assert_ne!(
+            legacy_public_actor_fingerprint(&base, effective_application_id(&base)),
+            legacy_public_actor_fingerprint(&other, effective_application_id(&other)),
         );
     }
 }

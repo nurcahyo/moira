@@ -9,17 +9,17 @@ description: Authoritative entry point for any work that touches Rig (rig-core 0
 
 Moira orchestrates runtime config, identity claims, credentials, routing, and streaming; Rig owns AI execution primitives.
 
-`rig_core` is imported by exactly five files today, and only four of them are live:
+`rig_core` is imported by exactly three files today, and only two of them are live:
 
 | File | Role |
 |---|---|
-| `src/orchestration/runtime_factory.rs` | the execution seam — clients, models, requests, responses, errors, usage, stream chunks |
+| `src/orchestration/runtime_factory.rs` | the execution seam — clients, models, requests, responses, errors, usage, stream chunks, and `DomainMessage` → `Message` conversion |
 | `src/application/execution.rs` | request assembly (`CompletionRequest`) and output reading |
-| `src/application/public.rs` | public DTO → `Message` normalisation |
-| `src/domain/runtime.rs` | `Message` as the element type of `ExecutionCommand.messages` — a type reference, not an execution seam |
 | `src/orchestration/executor.rs` | **legacy, dead-ended** — see "Where Rig May Appear" |
 
-Adding a sixth is a design change, not an implementation detail. Justify it before you write it.
+Adding a fourth is a design change, not an implementation detail. Justify it before you write it.
+
+`src/domain/runtime.rs` and `src/application/public.rs` used to import `Message`; plan 06 (P2-2) replaced that with `crate::domain::DomainMessage` so `src/domain` carries no upstream dependency. `src/domain/message.rs` is Moira's caller-input message shape, **not** a re-expression of Rig's `Message` — it models only role plus text/image content parts, and everything else about a Rig message stays behind `runtime_factory.rs`.
 
 Never wrap Rig in a second generic LLM client abstraction. The only abstraction permitted over Rig is `RuntimeFactory` — a factory that returns Rig's own model types.
 
@@ -56,7 +56,8 @@ rg -n 'pub type CompletionModel' "$RIG/src/providers"                       # al
 | Base-URL normalisation, credential-type gating | Moira | `orchestration/resolver.rs`, `runtime_factory.rs` |
 | Handle caching, TTL, invalidation | Moira | `orchestration/controls.rs` (`ProviderRuntimeCache`) |
 | Routing, fallback, retry/backoff, deadlines, circuit breaking, permits | Moira | `orchestration/controls.rs`, `application/execution.rs` |
-| Public DTO → `rig_core::completion::Message` | Moira | `application/public.rs` |
+| Public DTO → `DomainMessage` | Moira | `application/public.rs` |
+| `DomainMessage` → `rig_core::completion::Message` | Moira | `orchestration/runtime_factory.rs` (`impl TryFrom<&DomainMessage> for Message`, `rig_chat_history`) |
 | Runtime event envelopes, public SSE contract, persistence, audit | Moira | `application/*`, `http/public.rs` |
 | Failure classification and sanitised error text | Moira | `classify_completion_error` in `runtime_factory.rs` |
 
@@ -84,13 +85,11 @@ Also read `docs/rig-integration.md`, `docs/provider-runtime-factory.md`, and `do
 Allowed imports of `rig_core`:
 
 - `src/orchestration/runtime_factory.rs` — the full execution surface (clients, models, `CompletionRequest`, `CompletionResponse`, `CompletionError`, `Usage`, `StreamedAssistantContent`).
-- `src/application/execution.rs` — `OneOrMany`, `CompletionRequest`, `Message`, `rig_core::schemars::Schema`, and content enums for output assembly.
-- `src/application/public.rs` — `Message`, `message::UserContent`, `OneOrMany` for public-DTO normalisation only.
-- `src/domain/runtime.rs` — `Message` as the element type of `ExecutionCommand.messages`.
+- `src/application/execution.rs` — `CompletionRequest` and `rig_core::schemars::Schema` for request assembly.
 
 Forbidden:
 
-- `src/http/**`, `src/infra/**`, `src/security/**`, `src/config/**`, `src/app/**` — no `rig_core` import. HTTP layers see Moira envelopes only.
+- `src/domain/**`, `src/application/public.rs`, `src/http/**`, `src/infra/**`, `src/security/**`, `src/config/**`, `src/app/**` — no `rig_core` import. They speak `DomainMessage` and Moira envelopes only.
 - `src/orchestration/executor.rs` — **legacy, do not extend.** It uses Rig only to compute a base URL and then hand-rolls `reqwest` against `/chat/completions` with a plaintext key. Its HTTP consumer `src/http/chat.rs` is not even compiled (`src/http/mod.rs` declares no `mod chat;`). Treat "derive a URL from Rig, then hand-roll the request" as the canonical anti-pattern. New work goes through `RuntimeFactory`.
 
 ## The RuntimeFactory / RuntimeModelHandle Seam
@@ -172,15 +171,15 @@ Details of each provider arm belong to `.agents/skills/moira-rig-providers/SKILL
 ## Rules Against a Parallel LLM Abstraction
 
 1. Do not introduce a `trait LlmClient` / `trait ChatModel` / `trait Provider` that mirrors `CompletionModel`. If you need behaviour across providers, add a method to `RuntimeModelHandle` that matches and delegates to a generic free function.
-2. Do not define Moira structs that duplicate `CompletionRequest`, `CompletionResponse`, `Message`, `AssistantContent`, or `Usage`. Moira's `RuntimeStreamItem` / `RuntimeCompletionOutput` / `UsageSummary` exist to *narrow* Rig output into the persisted and public contract, not to re-express it.
+2. Do not define Moira structs that duplicate `CompletionRequest`, `CompletionResponse`, `AssistantContent`, or `Usage`. Moira's `RuntimeStreamItem` / `RuntimeCompletionOutput` / `UsageSummary` exist to *narrow* Rig output into the persisted and public contract, not to re-express it. `DomainMessage` is the one deliberate counterpart on the input side, and it is a strict subset — role plus text/image parts. Do not grow it toward parity with `Message`: tool calls, tool results, reasoning, audio, video, and documents belong behind `runtime_factory.rs`, and adding any of them here means designing the feature, not widening a DTO.
 3. Do not add a provider by hand-rolling HTTP. If Rig 0.40 lacks a provider, the answer is `AppError::Config` (as `ProviderType::Custom` does today), or an upstream contribution — not a bespoke client.
-4. Do not re-export Rig types from `src/domain` or `src/http`. The one deliberate exception is `ExecutionCommand.messages: Vec<rig_core::completion::Message>` in `src/domain/runtime.rs`.
-5. Keep exactly one conversion point per direction: public DTO → `Message` in `application/public.rs`; `CompletionError` → `ExecutionFailure` in `classify_completion_error`; `Usage` → `UsageSummary` in `usage_from_rig`. Adding a second conversion site is a review-blocking defect.
+4. Do not re-export Rig types from `src/domain` or `src/http`. There is no exception; since plan 06 (P2-2), `src/domain` has no `rig_core` import at all.
+5. Keep exactly one conversion point per direction: public DTO → `DomainMessage` in `application/public.rs`; `DomainMessage` → `Message` in `runtime_factory.rs`; `CompletionError` → `ExecutionFailure` in `classify_completion_error`; `Usage` → `UsageSummary` in `usage_from_rig`. Adding a second conversion site is a review-blocking defect.
 
 ## Workflow
 
 1. Read `skills/moira-project-structure/SKILL.md`, then this file, then the sibling skill(s) from the Skill Map that own the change.
-2. Locate the current behaviour in the four allowed files. Confirm you are in the `runtime_factory.rs` path, not `executor.rs`.
+2. Locate the current behaviour in the two live allowed files. Confirm you are in the `runtime_factory.rs` path, not `executor.rs`.
 3. Open the vendored crate and verify every type path, field name, and method signature you intend to use. Prefer `rg -n` over memory. Record the `path:line` you verified against in the PR description or commit body.
 4. Implement inside the existing seam. Provider work → the `match provider.provider_type` arm. Request work → `build_completion_request`. Stream work → `start_stream_with_model`. Error work → `classify_completion_error`.
 5. Preserve redaction invariants: hand-written `Debug` on anything holding a handle or a secret (`RuntimeModelHandle`, `ResolvedCredential`), `expose_secret()` called at most once and only at the provider builder, provider error bodies never propagated (`safe_config_error`, `safe_provider_error_message`). Never log, serialise, or embed plaintext keys, decrypted material, or internal prompts.
