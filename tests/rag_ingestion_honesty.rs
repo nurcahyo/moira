@@ -593,20 +593,29 @@ async fn reindex_supersedes_the_previous_version_without_ever_writing_indexed() 
     );
 }
 
-/// Test 6 — asserts the *current, honest* contract: these routes do not replay today, so the same
-/// `Idempotency-Key` sent twice produces two versions.
+/// Test 6 — the inverse of 02a's interim characterization test.
 ///
-/// TODO(02b): `plans/02b-idempotency-replay.md` DELETES this test and replaces it with its
-/// inverse, `repeated_ingest_with_the_same_key_replays_and_creates_exactly_one_version`. Do not
-/// "fix" this test — while it passes, replay is genuinely unimplemented.
+/// 02a shipped `repeated_ingest_with_the_same_idempotency_key_creates_two_versions_until_02b`,
+/// which asserted that a repeated `Idempotency-Key` produced TWO versions because replay was
+/// genuinely unimplemented. Plan 02b implements replay, so that assertion is now wrong and has
+/// been replaced here by its inverse: one key, one version, one replayed response body.
+/// The full replay contract (conflict, in-progress, cached failures, concurrency, actor
+/// isolation) lives in `tests/rag_idempotency_replay.rs`; this test stays in the honesty file so
+/// 02a's own e2e surface keeps a truthful statement about the same behaviour it once characterised.
+///
+/// The name deliberately differs from the replay suite's
+/// `repeated_ingest_with_the_same_key_replays_and_creates_exactly_one_version`: two test
+/// functions sharing one name across two binaries make the `cargo test` transcript ambiguous
+/// about which one a failure came from. (Cargo does apply the filter to every test target, so
+/// neither would be skipped — the cost is triage confusion, not lost coverage.)
 #[tokio::test]
-async fn repeated_ingest_with_the_same_idempotency_key_creates_two_versions_until_02b() {
+async fn repeated_ingest_with_the_same_key_replays_exactly_one_pending_version() {
     let Some(fixture) = RagFixture::new().await else {
         return;
     };
-    let collection_id = fixture.create_collection("idempotency-interim").await;
+    let collection_id = fixture.create_collection("idempotency-replay").await;
     let created = fixture
-        .create_document(&collection_id, "idempotency-interim", None)
+        .create_document(&collection_id, "idempotency-replay", None)
         .await;
     assert_eq!(
         created.status,
@@ -633,31 +642,41 @@ async fn repeated_ingest_with_the_same_idempotency_key_creates_two_versions_unti
     assert_eq!(
         second.status,
         StatusCode::OK,
-        "second ingest failed: {}",
+        "replayed ingest failed: {}",
         second.body
     );
 
-    assert_ne!(
+    assert_eq!(
+        second.body.to_string(),
+        first.body.to_string(),
+        "the second call must replay the original response verbatim"
+    );
+    assert_eq!(
         second.current_version_id(),
         first.current_version_id(),
-        "replay is not implemented on this route yet, so the second call must create a new version"
+        "replay must point at the original version, not a newly created one"
     );
 
     let versions = fixture.versions(document_uuid).await;
     assert_eq!(
         versions.len(),
-        2,
-        "the same Idempotency-Key twice must currently write two versions: {versions:?}"
+        1,
+        "the same Idempotency-Key twice must write exactly one version: {versions:?}"
     );
     assert_eq!(versions[0].version_number, 1);
-    assert_eq!(versions[1].version_number, 2);
+    assert_eq!(
+        versions[0].ingestion_status, "pending",
+        "02a's honesty contract must survive the move into the runner's transaction: {versions:?}"
+    );
 }
 
 /// Test 7 — `plans/CONVENTIONS.md` §4 rule 5, live-response half.
 ///
-/// Deliberately asserts the wire envelope only: `src/i18n/` is orphaned (`src/lib.rs` declares no
-/// `pub mod i18n;`, finding P0-5), so `moira::i18n::is_known_key` is neither compiled nor reachable
-/// from `tests/`. 02b Wave 0 / plan 04 Wave 0 wire the catalog and upgrade this assertion.
+/// 02a could assert the wire envelope only, because `src/i18n/` was orphaned (`src/lib.rs`
+/// declared no `pub mod i18n;`, finding P0-5). 02b Wave 0 wired the catalog, so this test is
+/// upgraded to also resolve the key against the compiled Rust catalog via
+/// `moira::i18n::is_known_key` — the assertion that catches a `message_key` which merely *looks*
+/// well-formed but has no catalog entry behind it.
 #[tokio::test]
 async fn rag_document_error_responses_carry_catalog_message_keys() {
     let Some(fixture) = RagFixture::new().await else {
@@ -681,9 +700,12 @@ async fn rag_document_error_responses_carry_catalog_message_keys() {
         "unexpected error code: {}",
         result.body
     );
+    let message_key = error
+        .get("message_key")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("message_key must be a string: {}", result.body));
     assert_eq!(
-        error.get("message_key"),
-        Some(&json!("moira.error.rag_document_not_found")),
+        message_key, "moira.error.rag_document_not_found",
         "message_key must be derived as moira.error.<code>: {}",
         result.body
     );
@@ -695,6 +717,10 @@ async fn rag_document_error_responses_carry_catalog_message_keys() {
         !message.trim().is_empty(),
         "message must be a non-empty default English string: {}",
         result.body
+    );
+    assert!(
+        moira::i18n::is_known_key(message_key),
+        "{message_key} must resolve in the compiled i18n catalog"
     );
 }
 

@@ -1,9 +1,13 @@
+use serde::Serialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
     app::AppState,
-    application::RequestContext,
+    application::{
+        AdminCommandIdempotency, AdminCommandMutation, AdminCommandRunner, AdminCommandSpec,
+        RequestContext,
+    },
     domain::{
         AuditLogInsert, AuditResult, ConversationCreateRequest, ConversationMessageCreateRequest,
         ConversationMessageQuery, ConversationMessageRecord, ConversationMessageRole,
@@ -21,6 +25,8 @@ use crate::{
     infra::repositories::{
         AdminRepository, ConversationAccess, ConversationInsert, ConversationMessageInsert,
         MemoryInsert, PgAdminRepository, PgConversationRepository,
+        create_rag_collection_with_connection, create_rag_document_with_connection,
+        ingest_rag_document_with_connection,
     },
     security::{Actor, ActorType, request_hash},
 };
@@ -757,22 +763,45 @@ impl ConversationService {
         self.state
             .authz
             .require(actor, "moira:rag-collections:write")?;
+        // Authorization and validation stay outside the runner: they are cheap and
+        // deterministic, and a rejected request must never occupy an idempotency key.
         validate_metadata(&request.metadata)?;
-        let id = Uuid::now_v7();
-        let record = self
-            .repo
-            .create_rag_collection(id, &format!("collection_{id}"), &request)
-            .await?;
-        self.audit(
-            actor,
+        let spec = conversation_command_spec(
             ctx,
-            "rag.collection.created",
-            "rag_collection",
-            Some(record.id.clone()),
-            json!({ "application_id": record.application_id }),
-        )
-        .await?;
-        Ok(record)
+            actor,
+            RAG_COLLECTION_CREATE_OPERATION,
+            json!({}),
+            &request,
+        )?;
+        let actor = actor.clone();
+        let ctx = ctx.clone();
+        let outcome = AdminCommandRunner::new(self.admin_repo.clone())
+            .execute(spec, |transaction| {
+                Box::pin(async move {
+                    // Inside the closure so a replayed request never burns an identifier.
+                    let id = Uuid::now_v7();
+                    let record = create_rag_collection_with_connection(
+                        transaction.connection(),
+                        id,
+                        &format!("collection_{id}"),
+                        &request,
+                    )
+                    .await?;
+                    transaction
+                        .insert_audit(conversation_audit(
+                            &actor,
+                            &ctx,
+                            "rag.collection.created",
+                            "rag_collection",
+                            Some(record.id.clone()),
+                            json!({ "application_id": record.application_id }),
+                        ))
+                        .await?;
+                    AdminCommandMutation::new(record.clone(), 201, Some(record.id.clone()))
+                })
+            })
+            .await?;
+        Ok(outcome.response)
     }
 
     pub async fn list_rag_collections(
@@ -870,33 +899,58 @@ impl ConversationService {
         self.state
             .authz
             .require(actor, "moira:rag-documents:write")?;
+        // Authorization and validation stay outside the runner: they are cheap and
+        // deterministic, and a rejected request must never occupy an idempotency key.
         validate_metadata(&request.metadata)?;
         validate_document(&request)?;
-        let content_hash = request
-            .content
-            .as_ref()
-            .map(|content| request_hash(content.as_bytes()));
-        let id = Uuid::now_v7();
-        let record = self
-            .repo
-            .create_rag_document(
-                id,
-                &format!("doc_{id}"),
-                collection_id,
-                &request,
-                content_hash.as_deref(),
-            )
-            .await?;
-        self.audit(
-            actor,
+        let spec = conversation_command_spec(
             ctx,
-            "rag.document.created",
-            "rag_document",
-            Some(record.id.clone()),
-            json!({ "collection_id": collection_id, "has_content": request.content.is_some() }),
-        )
-        .await?;
-        Ok(record)
+            actor,
+            RAG_DOCUMENT_CREATE_OPERATION,
+            json!({ "collection_id": collection_id }),
+            &request,
+        )?;
+        let actor = actor.clone();
+        let ctx = ctx.clone();
+        let collection_id = collection_id.to_string();
+        let outcome = AdminCommandRunner::new(self.admin_repo.clone())
+            .execute(spec, |transaction| {
+                Box::pin(async move {
+                    // The content hash is an input to the mutation, not to the idempotency
+                    // envelope, so it is computed inside the transaction.
+                    let content_hash = request
+                        .content
+                        .as_ref()
+                        .map(|content| request_hash(content.as_bytes()));
+                    // Inside the closure so a replayed request never burns an identifier.
+                    let id = Uuid::now_v7();
+                    let record = create_rag_document_with_connection(
+                        transaction.connection(),
+                        id,
+                        &format!("doc_{id}"),
+                        &collection_id,
+                        &request,
+                        content_hash.as_deref(),
+                    )
+                    .await?;
+                    transaction
+                        .insert_audit(conversation_audit(
+                            &actor,
+                            &ctx,
+                            "rag.document.created",
+                            "rag_document",
+                            Some(record.id.clone()),
+                            json!({
+                                "collection_id": collection_id,
+                                "has_content": request.content.is_some(),
+                            }),
+                        ))
+                        .await?;
+                    AdminCommandMutation::new(record.clone(), 201, Some(record.id.clone()))
+                })
+            })
+            .await?;
+        Ok(outcome.response)
     }
 
     pub async fn list_rag_documents(
@@ -956,6 +1010,8 @@ impl ConversationService {
         self.state
             .authz
             .require(actor, "moira:rag-documents:ingest")?;
+        // Authorization and validation stay outside the runner: they are cheap and
+        // deterministic, and a rejected request must never occupy an idempotency key.
         let content = request.content.as_deref().ok_or_else(|| {
             AppError::unprocessable(
                 "rag_document_parse_failed",
@@ -964,20 +1020,46 @@ impl ConversationService {
         })?;
         validate_content(content)?;
         validate_metadata(&request.metadata)?;
-        let record = self
-            .repo
-            .ingest_rag_document(document_id, &request, &request_hash(content.as_bytes()))
-            .await?;
-        self.audit(
-            actor,
+        let spec = conversation_command_spec(
             ctx,
-            "rag.document.ingested",
-            "rag_document",
-            Some(record.id.clone()),
-            json!({}),
-        )
-        .await?;
-        Ok(record)
+            actor,
+            RAG_DOCUMENT_INGEST_OPERATION,
+            json!({ "document_id": document_id }),
+            &request,
+        )?;
+        let actor = actor.clone();
+        let ctx = ctx.clone();
+        let document_id = document_id.to_string();
+        let outcome = AdminCommandRunner::new(self.admin_repo.clone())
+            .execute(spec, |transaction| {
+                Box::pin(async move {
+                    // The content hash is an input to the mutation, not to the idempotency
+                    // envelope, so it is computed inside the transaction. `content` is
+                    // known to be present: the check above already ran.
+                    let content = request.content.as_deref().unwrap_or_default();
+                    let content_hash = request_hash(content.as_bytes());
+                    let record = ingest_rag_document_with_connection(
+                        transaction.connection(),
+                        &document_id,
+                        &request,
+                        &content_hash,
+                    )
+                    .await?;
+                    transaction
+                        .insert_audit(conversation_audit(
+                            &actor,
+                            &ctx,
+                            "rag.document.ingested",
+                            "rag_document",
+                            Some(record.id.clone()),
+                            json!({}),
+                        ))
+                        .await?;
+                    AdminCommandMutation::new(record.clone(), 200, Some(record.id.clone()))
+                })
+            })
+            .await?;
+        Ok(outcome.response)
     }
 
     async fn ensure_conversation_write(
@@ -1009,23 +1091,94 @@ impl ConversationService {
         metadata: Value,
     ) -> Result<(), AppError> {
         self.admin_repo
-            .insert_audit(AuditLogInsert {
-                request_id: Some(ctx.request_id.clone()),
-                actor_type: Some(format!("{:?}", actor.actor_type)),
-                actor_subject: actor.subject.clone(),
-                delegated_subject: actor.delegated_subject.clone(),
-                external_user_id: actor.external_user_id.clone(),
-                external_tenant_id: actor.external_tenant_id.clone(),
-                application_id: actor.internal_application_id,
-                resource_type: resource_type.to_string(),
+            .insert_audit(conversation_audit(
+                actor,
+                ctx,
+                action,
+                resource_type,
                 resource_id,
-                action: action.to_string(),
-                result: AuditResult::Success,
-                source_ip: ctx.source_ip,
-                user_agent: ctx.user_agent.clone(),
                 metadata,
-            })
+            ))
             .await
+    }
+}
+
+/// Operation identity for `POST /api/v1/admin/rag-collections`.
+pub(crate) const RAG_COLLECTION_CREATE_OPERATION: &str = "rag.collection.create";
+/// Operation identity for `POST /api/v1/admin/rag-collections/{collection_id}/documents`.
+pub(crate) const RAG_DOCUMENT_CREATE_OPERATION: &str = "rag.document.create";
+/// Operation identity shared by `POST /api/v1/admin/rag-documents/{id}/ingest` **and**
+/// `POST /api/v1/admin/rag-documents/{id}/reindex`.
+///
+/// `reindex_rag_document` is a literal call-through to `ingest_rag_document`
+/// (`src/http/conversation.rs`) and performs an identical mutation, so the two aliases share
+/// one operation identity and one `path` envelope. Consequence, decided deliberately in
+/// `plans/02b-idempotency-replay.md` (Architecture -> "Operation identities"): the same key
+/// and body sent to `/reindex` after `/ingest` replays the ingest response instead of
+/// creating a second version. Discriminating the two routes inside the `path` envelope
+/// would instead yield `409 idempotency_conflict`, which is worse UX for no correctness
+/// gain.
+pub(crate) const RAG_DOCUMENT_INGEST_OPERATION: &str = "rag.document.ingest";
+
+/// Builds the idempotency envelope for a conversation-surface write command.
+///
+/// Mirrors `crate::application::admin::admin_command_spec`. `expected_version` deliberately
+/// stays `None`: these routes accept no `If-Match` today, and adding optimistic concurrency
+/// is a separate contract change (`plans/02b-idempotency-replay.md`, Excluded scope).
+///
+/// The actor fingerprint comes from the single crate-wide `admin::actor_fingerprint` — these
+/// four routes authenticate through `admin_actor`, not `public_actor`, so
+/// `public_actor_fingerprint` must not be used here.
+pub(crate) fn conversation_command_spec<T: Serialize>(
+    ctx: &RequestContext,
+    actor: &Actor,
+    operation: &str,
+    path: Value,
+    request: &T,
+) -> Result<AdminCommandSpec, AppError> {
+    AdminCommandSpec::new(operation, path, request).map(|spec| {
+        spec.with_idempotency(
+            ctx.idempotency_key
+                .as_ref()
+                .map(|key| AdminCommandIdempotency {
+                    key: key.clone(),
+                    actor_fingerprint: crate::application::admin::actor_fingerprint(actor),
+                }),
+        )
+    })
+}
+
+/// The conversation surface's audit-row builder.
+///
+/// Deliberately **not** `crate::application::admin::success_audit`: that one lowercases
+/// `actor_type`, whereas this surface has always written the `Debug` casing verbatim.
+/// Reusing it would silently rewrite the recorded `actor_type` for every RAG and
+/// conversation audit row. The casing divergence is pre-existing debt tracked for plan 06;
+/// this builder reproduces today's mapping exactly so moving the write inside the
+/// transaction changes atomicity and nothing else.
+pub(crate) fn conversation_audit(
+    actor: &Actor,
+    ctx: &RequestContext,
+    action: &str,
+    resource_type: &str,
+    resource_id: Option<String>,
+    metadata: Value,
+) -> AuditLogInsert {
+    AuditLogInsert {
+        request_id: Some(ctx.request_id.clone()),
+        actor_type: Some(format!("{:?}", actor.actor_type)),
+        actor_subject: actor.subject.clone(),
+        delegated_subject: actor.delegated_subject.clone(),
+        external_user_id: actor.external_user_id.clone(),
+        external_tenant_id: actor.external_tenant_id.clone(),
+        application_id: actor.internal_application_id,
+        resource_type: resource_type.to_string(),
+        resource_id,
+        action: action.to_string(),
+        result: AuditResult::Success,
+        source_ip: ctx.source_ip,
+        user_agent: ctx.user_agent.clone(),
+        metadata,
     }
 }
 
@@ -1257,6 +1410,184 @@ mod tests {
             &state
         ));
         assert!(!can_read_all(&trusted_jwt, "moira:memories:read", &state));
+    }
+
+    fn test_context(idempotency_key: Option<String>) -> RequestContext {
+        RequestContext {
+            request_id: "req-test".to_string(),
+            source_ip: None,
+            user_agent: None,
+            idempotency_key,
+        }
+    }
+
+    #[test]
+    fn conversation_command_hash_is_stable_across_object_key_order() {
+        let ctx = test_context(None);
+        let actor = Actor::default();
+        let left = conversation_command_spec(
+            &ctx,
+            &actor,
+            RAG_DOCUMENT_CREATE_OPERATION,
+            json!({ "collection_id": "collection_1" }),
+            &json!({"title": "doc", "metadata": {"b": 2, "a": 1}}),
+        )
+        .unwrap();
+        let right = conversation_command_spec(
+            &ctx,
+            &actor,
+            RAG_DOCUMENT_CREATE_OPERATION,
+            json!({ "collection_id": "collection_1" }),
+            &json!({"metadata": {"a": 1, "b": 2}, "title": "doc"}),
+        )
+        .unwrap();
+
+        assert_eq!(left.request_hash().unwrap(), right.request_hash().unwrap());
+    }
+
+    #[test]
+    fn conversation_command_hash_covers_operation_and_path() {
+        let ctx = test_context(None);
+        let actor = Actor::default();
+        let body = json!({ "content": "hello" });
+
+        let document_a = conversation_command_spec(
+            &ctx,
+            &actor,
+            RAG_DOCUMENT_INGEST_OPERATION,
+            json!({ "document_id": "doc_a" }),
+            &body,
+        )
+        .unwrap();
+        let document_b = conversation_command_spec(
+            &ctx,
+            &actor,
+            RAG_DOCUMENT_INGEST_OPERATION,
+            json!({ "document_id": "doc_b" }),
+            &body,
+        )
+        .unwrap();
+        assert_ne!(
+            document_a.request_hash().unwrap(),
+            document_b.request_hash().unwrap(),
+            "the document id must be inside the hash envelope"
+        );
+
+        let collection_create = conversation_command_spec(
+            &ctx,
+            &actor,
+            RAG_COLLECTION_CREATE_OPERATION,
+            json!({}),
+            &body,
+        )
+        .unwrap();
+        let document_create = conversation_command_spec(
+            &ctx,
+            &actor,
+            RAG_DOCUMENT_CREATE_OPERATION,
+            json!({}),
+            &body,
+        )
+        .unwrap();
+        assert_ne!(
+            collection_create.request_hash().unwrap(),
+            document_create.request_hash().unwrap(),
+            "the operation identity must be inside the hash envelope"
+        );
+    }
+
+    #[test]
+    fn ingest_and_reindex_share_one_operation_and_request_envelope() {
+        // DOCUMENTS the `/reindex` decision; it does not guard it. `POST .../reindex` is a
+        // literal call-through to `ingest_rag_document` (src/http/conversation.rs), so both
+        // routes reach this one method and build their spec from this one
+        // `RAG_DOCUMENT_INGEST_OPERATION` constant with one path envelope. Because there is
+        // only one construction site, this test necessarily builds both specs from the same
+        // constant, the same path and the same body — it reduces to `f(x) == f(x)` and is
+        // structurally incapable of failing. Keep it as executable documentation of the
+        // shared identity, but do not count it as coverage.
+        //
+        // The real guard is the e2e test
+        // `reindex_replays_an_ingest_performed_under_the_same_key` in
+        // tests/rag_idempotency_replay.rs, which drives both HTTP routes for real and
+        // asserts the second one replays the first's response instead of creating a new
+        // version row. That test is load-bearing (mutation testing killed it three ways);
+        // this one is not.
+        let ctx = test_context(None);
+        let actor = Actor::default();
+        let body = json!({ "content": "hello", "metadata": {} });
+        let path = json!({ "document_id": "doc_shared" });
+
+        let ingest_spec = conversation_command_spec(
+            &ctx,
+            &actor,
+            RAG_DOCUMENT_INGEST_OPERATION,
+            path.clone(),
+            &body,
+        )
+        .unwrap();
+        let reindex_spec =
+            conversation_command_spec(&ctx, &actor, RAG_DOCUMENT_INGEST_OPERATION, path, &body)
+                .unwrap();
+
+        assert_eq!(
+            ingest_spec.request_hash().unwrap(),
+            reindex_spec.request_hash().unwrap()
+        );
+    }
+
+    #[test]
+    fn conversation_command_spec_omits_idempotency_when_no_key_is_present() {
+        let ctx = test_context(None);
+        let actor = Actor::default();
+        let spec = conversation_command_spec(
+            &ctx,
+            &actor,
+            RAG_COLLECTION_CREATE_OPERATION,
+            json!({}),
+            &json!({}),
+        )
+        .unwrap();
+        assert!(
+            format!("{spec:?}").contains("idempotency: None"),
+            "a spec built without ctx.idempotency_key must carry no AdminCommandIdempotency"
+        );
+
+        let ctx_with_key = test_context(Some("replay-key".to_string()));
+        let spec_with_key = conversation_command_spec(
+            &ctx_with_key,
+            &actor,
+            RAG_COLLECTION_CREATE_OPERATION,
+            json!({}),
+            &json!({}),
+        )
+        .unwrap();
+        assert!(
+            format!("{spec_with_key:?}").contains("idempotency: Some"),
+            "a spec built with ctx.idempotency_key must carry an AdminCommandIdempotency"
+        );
+    }
+
+    #[test]
+    fn conversation_audit_preserves_the_existing_actor_type_casing() {
+        let actor = Actor {
+            actor_type: ActorType::SystemKey,
+            ..Actor::default()
+        };
+        let ctx = test_context(None);
+        let insert = conversation_audit(
+            &actor,
+            &ctx,
+            "rag.document.ingested",
+            "rag_document",
+            Some("doc_1".to_string()),
+            json!({}),
+        );
+        assert_eq!(
+            insert.actor_type,
+            Some("SystemKey".to_string()),
+            "conversation_audit must not lowercase actor_type, unlike admin::success_audit"
+        );
     }
 
     #[test]

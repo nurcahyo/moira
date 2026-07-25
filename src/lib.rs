@@ -6,6 +6,7 @@ pub mod config;
 pub mod domain;
 pub mod error;
 pub mod http;
+pub mod i18n;
 pub mod infra;
 pub mod orchestration;
 pub mod security;
