@@ -1112,9 +1112,15 @@ impl PgConversationRepository {
 // The caller owns the transaction. An inner `begin()` here would nest a transaction inside
 // the admin command runner's `savepoint admin_command_mutation` and silently break the
 // rollback semantics that `begin_command_savepoint`/`rollback_command_savepoint` depend on.
+//
+// INVARIANT: these stay `pub(crate)` and must never be re-exported as `pub` from
+// `src/infra/repositories/mod.rs`. They perform no authorization check, write no audit row
+// and claim no idempotency record; all three are the responsibility of their only
+// legitimate caller, `crate::application::conversation`. A `pub` export would hand external
+// code an unauthenticated, unaudited RAG write path that bypasses the envelope entirely.
 // ---------------------------------------------------------------------------
 
-pub async fn create_rag_collection_with_connection(
+pub(crate) async fn create_rag_collection_with_connection(
     connection: &mut PgConnection,
     id: Uuid,
     public_id: &str,
@@ -1144,7 +1150,7 @@ pub async fn create_rag_collection_with_connection(
     rag_collection_record_from_row(&row)
 }
 
-pub async fn create_rag_document_with_connection(
+pub(crate) async fn create_rag_document_with_connection(
     connection: &mut PgConnection,
     id: Uuid,
     public_id: &str,
@@ -1226,7 +1232,7 @@ pub async fn create_rag_document_with_connection(
     rag_document_record_from_row(&row)
 }
 
-pub async fn ingest_rag_document_with_connection(
+pub(crate) async fn ingest_rag_document_with_connection(
     connection: &mut PgConnection,
     public_id: &str,
     request: &RagDocumentIngestRequest,

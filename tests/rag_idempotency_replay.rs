@@ -18,7 +18,10 @@
 
 mod support;
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     Router,
@@ -206,6 +209,37 @@ impl RagFixture {
         .await
     }
 
+    /// A request whose `x-request-id` is chosen by the caller. Correlating an HTTP exchange with
+    /// the `audit_logs` row it produced is only possible when the request id is known up front,
+    /// and `request` generates a fresh one internally.
+    async fn request_as(
+        &self,
+        method: &str,
+        path: &str,
+        key: Option<&str>,
+        request_id: &str,
+        body: Option<Value>,
+    ) -> HttpResult {
+        send(self.router.clone(), method, path, key, request_id, body).await
+    }
+
+    async fn ingest_as(
+        &self,
+        document_id: &str,
+        content: &str,
+        key: Option<&str>,
+        request_id: &str,
+    ) -> HttpResult {
+        self.request_as(
+            "POST",
+            &format!("/api/v1/admin/rag-documents/{document_id}/ingest"),
+            key,
+            request_id,
+            Some(json!({ "content": content })),
+        )
+        .await
+    }
+
     async fn reindex(&self, document_id: &str, content: &str, key: Option<&str>) -> HttpResult {
         self.request(
             "POST",
@@ -336,6 +370,79 @@ impl RagFixture {
         .expect("ledger-by-resource count")
     }
 
+    /// The finalized `response_status` persisted in the ledger for `(operation, key)`.
+    ///
+    /// Nothing on the success path observes this column: all three service methods discard
+    /// `AdminCommandOutcome::status` and the handlers hardcode `201`/`201`/`200`, so a wrong
+    /// stored status is invisible over HTTP until a *replay of a different shape* needs it. A
+    /// reviewer proved the gap by setting the stored statuses to `503`/`418` — the whole e2e and
+    /// honesty suites still passed. These assertions are what make that mutation die.
+    async fn ledger_status(&self, operation: &str, key: &str) -> i32 {
+        timeout(
+            WAIT,
+            sqlx::query_scalar::<_, Option<i32>>(
+                "select response_status from idempotency_records
+                 where operation = $1 and idempotency_key_hash = $2",
+            )
+            .bind(operation)
+            .bind(request_hash(key.as_bytes()))
+            .fetch_one(&self.fixture.pool),
+        )
+        .await
+        .expect("ledger status timed out")
+        .expect("exactly one ledger row for the key")
+        .expect("a finalized ledger record must carry a response_status")
+    }
+
+    /// `xmin` is the id of the transaction that inserted the row. Two rows written by the same
+    /// transaction share it; a row written over a separate pooled connection cannot, because a
+    /// different transaction always has a different id. This is the only observation that
+    /// distinguishes "the audit went through `transaction.insert_audit`" from "the audit went
+    /// through a pooled `admin_repo`", and it needs no schema change and no lock.
+    async fn audit_xmin(&self, request_id: &str) -> String {
+        timeout(
+            WAIT,
+            sqlx::query_scalar::<_, String>(
+                "select xmin::text from audit_logs where request_id = $1",
+            )
+            .bind(request_id)
+            .fetch_one(&self.fixture.pool),
+        )
+        .await
+        .expect("audit xmin timed out")
+        .expect("exactly one audit row for the request id")
+    }
+
+    async fn row_xmin(&self, table: &str, public_id: &str) -> String {
+        // `table` is a hard-coded literal at every call site, never test input.
+        timeout(
+            WAIT,
+            sqlx::query_scalar::<_, String>(&format!(
+                "select xmin::text from {table} where public_id = $1"
+            ))
+            .bind(public_id)
+            .fetch_one(&self.fixture.pool),
+        )
+        .await
+        .expect("row xmin timed out")
+        .expect("exactly one row for the public id")
+    }
+
+    async fn version_xmin(&self, document_public_id: &str) -> String {
+        let document_uuid = self.document_uuid(document_public_id).await;
+        timeout(
+            WAIT,
+            sqlx::query_scalar::<_, String>(
+                "select xmin::text from rag_document_versions where document_id = $1",
+            )
+            .bind(document_uuid)
+            .fetch_one(&self.fixture.pool),
+        )
+        .await
+        .expect("version xmin timed out")
+        .expect("exactly one version row for the document")
+    }
+
     async fn execute(&self, statement: &str, key: &str, operation: &str) {
         timeout(
             WAIT,
@@ -391,6 +498,16 @@ async fn send(
     HttpResult { status, body, etag }
 }
 
+/// One concurrent request, carrying enough evidence to prove that contention actually happened:
+/// the request id that the winning mutation will stamp into `audit_logs`, and the wall-clock
+/// window the request occupied.
+struct ConcurrentIngest {
+    request_id: String,
+    started: Instant,
+    finished: Instant,
+    result: HttpResult,
+}
+
 /// The acknowledgement gate. Each task parks on the shared barrier and only issues its request
 /// once every participant (both tasks plus the test body) has arrived, so the two requests race
 /// deterministically without any timing assumption. `plans/CONVENTIONS.md` §3 rejects `sleep()`.
@@ -400,18 +517,26 @@ fn spawn_ingest(
     document_id: String,
     key: String,
     content: String,
-) -> JoinHandle<HttpResult> {
+) -> JoinHandle<ConcurrentIngest> {
+    let request_id = format!("rag-replay-{}", Uuid::now_v7());
     tokio::spawn(async move {
         barrier.wait().await;
-        send(
+        let started = Instant::now();
+        let result = send(
             router,
             "POST",
             &format!("/api/v1/admin/rag-documents/{document_id}/ingest"),
             Some(&key),
-            &format!("rag-replay-{}", Uuid::now_v7()),
+            &request_id,
             Some(json!({ "content": content })),
         )
-        .await
+        .await;
+        ConcurrentIngest {
+            request_id,
+            started,
+            finished: Instant::now(),
+            result,
+        }
     })
 }
 
@@ -549,6 +674,13 @@ async fn repeated_rag_collection_create_with_the_same_key_replays_one_collection
             .await,
         1
     );
+    assert_eq!(
+        fixture
+            .ledger_status(COLLECTION_CREATE_OPERATION, &key)
+            .await,
+        201,
+        "the ledger must persist the status the original response carried, not a placeholder"
+    );
 }
 
 /// Test 2 — `POST .../{collection_id}/documents` replays verbatim, including the inline-content
@@ -589,6 +721,10 @@ async fn repeated_rag_document_create_with_the_same_key_replays_one_document() {
         replay.body, first.body,
         "the replayed document body must be byte-identical"
     );
+    assert!(
+        first.etag.is_some(),
+        "the create response must carry an ETag, otherwise the equality below is vacuous"
+    );
     assert_eq!(replay.etag, first.etag, "the replayed ETag must match");
 
     let document_id = first.public_id();
@@ -611,6 +747,11 @@ async fn repeated_rag_document_create_with_the_same_key_replays_one_document() {
     assert_eq!(
         fixture.ledger_count(DOCUMENT_CREATE_OPERATION, &key).await,
         1
+    );
+    assert_eq!(
+        fixture.ledger_status(DOCUMENT_CREATE_OPERATION, &key).await,
+        201,
+        "the ledger must persist the status the original response carried, not a placeholder"
     );
 }
 
@@ -645,6 +786,10 @@ async fn repeated_ingest_with_the_same_key_replays_and_creates_exactly_one_versi
         first.body.to_string(),
         "the replayed ingest body must be byte-identical"
     );
+    assert!(
+        first.etag.is_some(),
+        "the ingest response must carry an ETag, otherwise the equality below is vacuous"
+    );
     assert_eq!(replay.etag, first.etag, "the replayed ETag must match");
     assert_eq!(
         replay.current_version_id(),
@@ -670,6 +815,11 @@ async fn repeated_ingest_with_the_same_key_replays_and_creates_exactly_one_versi
         1
     );
     assert_eq!(fixture.ledger_count(INGEST_OPERATION, &key).await, 1);
+    assert_eq!(
+        fixture.ledger_status(INGEST_OPERATION, &key).await,
+        200,
+        "the ledger must persist the status the original response carried, not a placeholder"
+    );
 }
 
 /// Test 4 — pins the deliberate `/ingest` ↔ `/reindex` shared operation identity at the wire level.
@@ -704,6 +854,10 @@ async fn reindex_replays_an_ingest_performed_under_the_same_key() {
     assert_eq!(
         reindexed.body, ingested.body,
         "/reindex shares rag.document.ingest with /ingest, so the same key and body replays"
+    );
+    assert!(
+        ingested.etag.is_some(),
+        "the ingest response must carry an ETag, otherwise the equality below is vacuous"
     );
     assert_eq!(reindexed.etag, ingested.etag);
     assert_eq!(
@@ -802,22 +956,19 @@ async fn different_actors_with_the_same_key_do_not_replay_each_others_responses(
         metadata: json!({"suite": "rag_idempotency_replay"}),
     };
 
+    // The subjects carry the fixture suffix so that two copies of this binary running against
+    // one database never share an `actor_fingerprint`; the fingerprint is part of the ledger's
+    // unique index and of the advisory-lock key, so a shared subject would make the two
+    // processes contend on the same lock.
+    let first_actor = admin_actor(&format!("isolation-actor-one-{}", fixture.suffix));
+    let second_actor = admin_actor(&format!("isolation-actor-two-{}", fixture.suffix));
+
     let first = service
-        .ingest_rag_document(
-            &admin_actor("isolation-actor-one"),
-            &context(&key),
-            &document_id,
-            request.clone(),
-        )
+        .ingest_rag_document(&first_actor, &context(&key), &document_id, request.clone())
         .await
         .expect("first actor ingest");
     let second = service
-        .ingest_rag_document(
-            &admin_actor("isolation-actor-two"),
-            &context(&key),
-            &document_id,
-            request,
-        )
+        .ingest_rag_document(&second_actor, &context(&key), &document_id, request)
         .await
         .expect("second actor ingest must execute independently, not replay");
 
@@ -840,6 +991,12 @@ async fn different_actors_with_the_same_key_do_not_replay_each_others_responses(
 /// Test 8 — the concurrency gate. Two duplicate ingests are released simultaneously by a
 /// `tokio::sync::Barrier`; the winner mutates, the loser either replays the identical body or is
 /// told `409 idempotency_in_progress`. Exactly one version, one audit row and one ledger row.
+///
+/// The one-row assertions alone would still hold if a future change quietly *serialised* the two
+/// requests (a global mutex, a pool of one, a broken barrier) — the test would pass while testing
+/// nothing. Two extra assertions close that hole: the two request windows must overlap in
+/// wall-clock time, and exactly one of the two request ids may appear in `audit_logs`, which
+/// proves the other returned a response without performing a mutation.
 #[tokio::test]
 async fn concurrent_same_key_ingests_produce_one_version_and_one_audit_row() {
     let Some(fixture) = RagFixture::new().await else {
@@ -870,29 +1027,53 @@ async fn concurrent_same_key_ingests_produce_one_version_and_one_audit_row() {
     let first = first.await.expect("first concurrent ingest task");
     let second = second.await.expect("second concurrent ingest task");
 
-    let succeeded =
-        usize::from(first.status == StatusCode::OK) + usize::from(second.status == StatusCode::OK);
+    // Proof 1: the two requests were genuinely in flight at the same time. Disjoint windows mean
+    // the gate released them one after the other and nothing was ever contended.
     assert!(
-        succeeded >= 1,
-        "at least one concurrent ingest must succeed: {} / {}",
-        first.body,
-        second.body
+        first.started < second.finished && second.started < first.finished,
+        "the two ingests never overlapped in time, so no contention was exercised"
     );
-    for result in [&first, &second] {
-        match result.status {
-            StatusCode::OK => {}
-            StatusCode::CONFLICT => {
-                assert_catalogued_error(result, StatusCode::CONFLICT, "idempotency_in_progress");
-            }
-            other => panic!("unexpected concurrent status {other}: {}", result.body),
+
+    // Proof 2: exactly one request mutated. `conversation_audit` stamps `ctx.request_id` into
+    // the audit row, so the audit table names the winner; the loser produced its response
+    // without writing anything, which is only possible via replay or an in-progress rejection.
+    let first_audits = fixture.audit_count_for_request(&first.request_id).await;
+    let second_audits = fixture.audit_count_for_request(&second.request_id).await;
+    assert_eq!(
+        first_audits + second_audits,
+        1,
+        "exactly one of the two concurrent ingests may mutate ({first_audits} / {second_audits})"
+    );
+    let (winner, loser) = if first_audits == 1 {
+        (&first, &second)
+    } else {
+        (&second, &first)
+    };
+    assert_eq!(
+        winner.result.status,
+        StatusCode::OK,
+        "the request that mutated must have returned its own 200: {}",
+        winner.result.body
+    );
+    match loser.result.status {
+        StatusCode::OK => {
+            assert_eq!(
+                loser.result.body, winner.result.body,
+                "the loser mutated nothing, so its 200 must be the winner's replayed body"
+            );
+            assert_eq!(loser.result.etag, winner.result.etag);
         }
-    }
-    if succeeded == 2 {
-        assert_eq!(
-            first.body, second.body,
-            "when the loser waits for the winner it must receive the identical replayed body"
-        );
-        assert_eq!(first.etag, second.etag);
+        StatusCode::CONFLICT => {
+            assert_catalogued_error(
+                &loser.result,
+                StatusCode::CONFLICT,
+                "idempotency_in_progress",
+            );
+        }
+        other => panic!(
+            "unexpected concurrent status {other}: {}",
+            loser.result.body
+        ),
     }
 
     assert_eq!(
@@ -1004,9 +1185,144 @@ async fn failed_ingest_replays_the_same_deterministic_failure() {
     );
 }
 
-/// Test 11 — atomicity of the audit write that moved inside the runner's transaction. A scripted
-/// audit-insert failure must leave zero audit rows *and* zero version rows *and* zero ledger rows.
-/// Before §6 moved the audit inside the transaction, the audit row could outlive a failed mutation.
+/// Test 11 — the audit write is *in* the runner's transaction, proven on the success path for
+/// all three operations plan 02b moved into `AdminCommandRunner`.
+///
+/// This is the assertion that actually discriminates. `xmin` is the id of the transaction that
+/// inserted a row, so an audit row and the row the mutation produced can only share it if one
+/// transaction wrote both. Rewrite any of the three `ConversationService` methods to emit its
+/// audit through a pooled `self.admin_repo.clone()` — the exact pre-02b non-atomic behaviour —
+/// and the two ids diverge and this test fails. Every other test in this file survives that
+/// mutation, which is why this one exists.
+///
+/// It deliberately observes the *committed* success path rather than a scripted failure: a
+/// failure scripted inside the audit insert (the previous approach) leaves zero audit rows
+/// whether the audit ran on the transaction or on a pooled connection, so it proves nothing.
+///
+/// Note the audit is compared against the row the *mutation* wrote, never against the ledger
+/// row: `claim_idempotency` runs before `begin_command_savepoint`, so the ledger row carries the
+/// top-level transaction id while everything inside the savepoint carries the subtransaction's.
+#[tokio::test]
+async fn audit_write_shares_the_mutation_transaction_id() {
+    let Some(fixture) = RagFixture::new().await else {
+        return;
+    };
+
+    // (a) rag.collection.create
+    let collection_request_id = format!("rag-replay-atomic-collection-{}", Uuid::now_v7());
+    let created_collection = fixture
+        .request_as(
+            "POST",
+            "/api/v1/admin/rag-collections",
+            Some(&fixture.key("atomic-audit-collection")),
+            &collection_request_id,
+            Some(fixture.collection_body("atomic-audit-collection")),
+        )
+        .await;
+    assert_eq!(
+        created_collection.status,
+        StatusCode::CREATED,
+        "collection create failed: {}",
+        created_collection.body
+    );
+    let collection_id = created_collection.public_id();
+    assert_eq!(
+        fixture
+            .audit_count_for_request(&collection_request_id)
+            .await,
+        1
+    );
+    let audit = fixture.audit_xmin(&collection_request_id).await;
+    let row = fixture.row_xmin("rag_collections", &collection_id).await;
+    assert_eq!(
+        audit, row,
+        "the collection audit row ({audit}) and the rag_collections row ({row}) were written by \
+         different transactions, so the audit is not inside the command transaction"
+    );
+
+    // (b) rag.document.create, whose inline content also writes version 1
+    let document_request_id = format!("rag-replay-atomic-document-{}", Uuid::now_v7());
+    let created_document = fixture
+        .request_as(
+            "POST",
+            &format!("/api/v1/admin/rag-collections/{collection_id}/documents"),
+            Some(&fixture.key("atomic-audit-document")),
+            &document_request_id,
+            Some(fixture.document_body("atomic-audit-document", None)),
+        )
+        .await;
+    assert_eq!(
+        created_document.status,
+        StatusCode::CREATED,
+        "document create failed: {}",
+        created_document.body
+    );
+    let document_id = created_document.public_id();
+    assert_eq!(
+        fixture.audit_count_for_request(&document_request_id).await,
+        1
+    );
+    let audit = fixture.audit_xmin(&document_request_id).await;
+    let row = fixture.row_xmin("rag_documents", &document_id).await;
+    assert_eq!(
+        audit, row,
+        "the document audit row ({audit}) and the rag_documents row ({row}) were written by \
+         different transactions, so the audit is not inside the command transaction"
+    );
+
+    // (c) rag.document.ingest
+    let ingest_request_id = format!("rag-replay-atomic-ingest-{}", Uuid::now_v7());
+    let ingested = fixture
+        .ingest_as(
+            &document_id,
+            DOCUMENT_BODY,
+            Some(&fixture.key("atomic-audit-ingest")),
+            &ingest_request_id,
+        )
+        .await;
+    assert_eq!(
+        ingested.status,
+        StatusCode::OK,
+        "ingest failed: {}",
+        ingested.body
+    );
+    assert_eq!(
+        fixture.audit_count_for_request(&ingest_request_id).await,
+        1,
+        "the ingest must have written exactly one audit row for this request"
+    );
+    assert_eq!(
+        fixture.version_count(&document_id).await,
+        1,
+        "the ingest must have written exactly one version row"
+    );
+    let audit = fixture.audit_xmin(&ingest_request_id).await;
+    let row = fixture.version_xmin(&document_id).await;
+    assert_eq!(
+        audit, row,
+        "the ingest audit row ({audit}) and the version row ({row}) were written by different \
+         transactions, so the audit is not inside the command transaction"
+    );
+}
+
+/// Test 11b — a command that fails part-way leaves nothing behind: no audit row, no version row,
+/// and no ledger row (an infrastructure failure is not a cacheable failure).
+///
+/// The failure is scripted **without any DDL**. `audit_logs.request_id` is `varchar(128)`
+/// (`migrations/0003_security_foundation.sql:322`) and `conversation_audit` copies
+/// `ctx.request_id` verbatim from the `x-request-id` header, so an over-long header makes the
+/// audit `insert` — and only the audit insert, which runs after the version insert — fail inside
+/// the transaction.
+///
+/// The previous revision installed a `before insert on audit_logs` trigger to do this. That took
+/// an `AccessExclusiveLock` on a database-global table, blocking every audit write everywhere
+/// while installed; with two copies of this binary against one database it deadlocked
+/// (`40P01`) at the `drop`, which then never ran, leaving the trigger firing on every audit
+/// insert in the database. Nothing here touches the schema, so there is nothing to leak.
+///
+/// Note what this test does **not** prove: because the failure is *inside* the audit insert,
+/// zero audit rows survive whether or not the audit ran on the command transaction.
+/// `audit_write_shares_the_mutation_transaction_id` is what proves that.
 #[tokio::test]
 async fn rolled_back_ingest_leaves_no_audit_row_and_no_partial_version() {
     let Some(fixture) = RagFixture::new().await else {
@@ -1015,33 +1331,15 @@ async fn rolled_back_ingest_leaves_no_audit_row_and_no_partial_version() {
     let collection_id = fixture.collection("rollback-collection").await;
     let document_id = fixture.document(&collection_id, "rollback").await;
     let key = fixture.key("rollback");
-    let marker = format!("rollback_{}", fixture.suffix);
-    let function_name = format!("fail_rag_audit_{}", fixture.suffix);
-    let trigger_name = format!("fail_rag_audit_trigger_{}", fixture.suffix);
-    let ddl = format!(
-        "create function {function_name}() returns trigger language plpgsql as $$ begin if new.request_id = '{marker}' then raise exception 'scripted audit failure'; end if; return new; end $$; create trigger {trigger_name} before insert on audit_logs for each row execute function {function_name}()"
+    let marker = format!("rollback-{}-{}", fixture.suffix, "x".repeat(128));
+    assert!(
+        marker.len() > 128,
+        "the marker must exceed audit_logs.request_id's varchar(128) for the insert to fail"
     );
-    sqlx::raw_sql(&ddl)
-        .execute(&fixture.fixture.pool)
-        .await
-        .expect("install audit failure trigger");
 
-    let failed = send(
-        fixture.router.clone(),
-        "POST",
-        &format!("/api/v1/admin/rag-documents/{document_id}/ingest"),
-        Some(&key),
-        &marker,
-        Some(json!({ "content": DOCUMENT_BODY })),
-    )
-    .await;
-
-    let cleanup =
-        format!("drop trigger {trigger_name} on audit_logs; drop function {function_name}()");
-    sqlx::raw_sql(&cleanup)
-        .execute(&fixture.fixture.pool)
-        .await
-        .expect("remove audit failure trigger");
+    let failed = fixture
+        .ingest_as(&document_id, DOCUMENT_BODY, Some(&key), &marker)
+        .await;
 
     assert_eq!(
         failed.status,
@@ -1063,6 +1361,24 @@ async fn rolled_back_ingest_leaves_no_audit_row_and_no_partial_version() {
         fixture.ledger_count(INGEST_OPERATION, &key).await,
         0,
         "an infrastructure failure is not cached, so the key stays reusable"
+    );
+
+    // The rollback was total and the audit insert was the only thing that failed: the identical
+    // ingest under the same key, differing only in the request id, now succeeds and writes
+    // version 1. Without this the 500 above could have come from anywhere.
+    let retried = fixture
+        .ingest(&document_id, DOCUMENT_BODY, Some(&key))
+        .await;
+    assert_eq!(
+        retried.status,
+        StatusCode::OK,
+        "the key must still be usable after a non-cacheable failure: {}",
+        retried.body
+    );
+    assert_eq!(
+        fixture.version_count(&document_id).await,
+        1,
+        "the retry must create exactly the version the rolled-back attempt did not leave behind"
     );
 }
 

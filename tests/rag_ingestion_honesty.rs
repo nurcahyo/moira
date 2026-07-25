@@ -602,8 +602,14 @@ async fn reindex_supersedes_the_previous_version_without_ever_writing_indexed() 
 /// The full replay contract (conflict, in-progress, cached failures, concurrency, actor
 /// isolation) lives in `tests/rag_idempotency_replay.rs`; this test stays in the honesty file so
 /// 02a's own e2e surface keeps a truthful statement about the same behaviour it once characterised.
+///
+/// The name deliberately differs from the replay suite's
+/// `repeated_ingest_with_the_same_key_replays_and_creates_exactly_one_version`: two test
+/// functions sharing one name across two binaries make the `cargo test` transcript ambiguous
+/// about which one a failure came from. (Cargo does apply the filter to every test target, so
+/// neither would be skipped — the cost is triage confusion, not lost coverage.)
 #[tokio::test]
-async fn repeated_ingest_with_the_same_key_replays_and_creates_exactly_one_version() {
+async fn repeated_ingest_with_the_same_key_replays_exactly_one_pending_version() {
     let Some(fixture) = RagFixture::new().await else {
         return;
     };

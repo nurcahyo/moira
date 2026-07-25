@@ -1366,12 +1366,31 @@ fn validate_application_identifiers(
     Ok(())
 }
 
-/// The single definition of the admin actor fingerprint in the crate.
+/// The single definition of the actor fingerprint used by the **admin-command envelope**
+/// (`AdminCommandRunner` / `AdminCommandSpec`), covering the ten admin commands and the RAG
+/// write commands in `crate::application::conversation`.
 ///
 /// It is part of the `idempotency_records` unique index and of the advisory-lock key, so a
 /// second, divergent copy would silently break cross-actor replay isolation. `pub(crate)`
-/// exists solely so `crate::application::conversation` can reuse this exact formula
+/// exists so `crate::application::conversation` can reuse this exact formula
 /// (`plans/02b-idempotency-replay.md` §5); do not copy the body anywhere.
+///
+/// **Warning — this is not the only fingerprint formula writing to `idempotency_records`.**
+/// `crate::application::runtime_admin` holds a separate, *weaker* private copy (its own
+/// `actor_fingerprint`, `src/application/runtime_admin.rs`) which hashes only
+/// `{actor_type, subject, api_key_id}`. It omits the seven identity fields this function
+/// includes — `trusted_jwt_issuer_id`, `internal_application_id`, `application_id`,
+/// `tenant_id`, `external_user_id`, `external_tenant_id`, `delegated_subject` — yet it
+/// feeds the **same** ledger table for the runtime-policy routes (`route.create`,
+/// `routing_policy.create`, `agent_profile.create`, `provider_runtime_policy.*`).
+/// Consequence, measured: two actors differing only in trusted-JWT issuer or in tenant
+/// produce *different* fingerprints here but *identical* fingerprints there, so those
+/// routes do not isolate replay across issuers or tenants.
+///
+/// That is known, pre-existing debt, deliberately out of scope for plan 02b ("No change to
+/// `runtime_admin.rs`'s idempotency scheme") and deferred to
+/// `plans/06-architecture-test-hygiene.md`, which owns unifying the two schemes. Do not
+/// assume a fingerprint found in `idempotency_records` was produced by this function.
 pub(crate) fn actor_fingerprint(actor: &Actor) -> String {
     let identity = serde_json::to_vec(&(
         actor.actor_type,
@@ -1879,11 +1898,21 @@ mod tests {
 
     #[test]
     fn actor_fingerprint_is_shared_by_admin_and_conversation_commands() {
-        // Guards against a divergent second copy of the fingerprint formula being
-        // introduced in `conversation.rs` (plans/02b-idempotency-replay.md §5): the
-        // fingerprint that `conversation_command_spec` embeds in its idempotency
-        // envelope must be byte-identical to calling this module's `actor_fingerprint`
-        // directly, because both are, and must remain, the exact same function.
+        // Asserts exactly one thing: `conversation_command_spec` embeds the fingerprint
+        // produced by *this* module's `actor_fingerprint`, byte for byte, rather than
+        // computing its own (plans/02b-idempotency-replay.md §5).
+        //
+        // It does NOT verify that the fingerprint depends on the actor at all. Both sides
+        // call the same function, so this assertion still passes if that function is
+        // degraded to return a constant — a mutation that reduced `actor_fingerprint` to a
+        // fixed string survived this test. It compares admin against conversation, nothing
+        // more; read "same function", never "correct function".
+        //
+        // Real actor-isolation coverage lives in
+        // `different_actors_with_the_same_key_do_not_replay_each_others_responses`
+        // (tests/rag_idempotency_replay.rs), which drives two distinct admin actors through
+        // one idempotency key and requires two independent resources. That test does kill
+        // the constant-fingerprint mutation; this one does not.
         use crate::{application::conversation::conversation_command_spec, security::ActorType};
 
         let actor = Actor {

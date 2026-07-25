@@ -1498,11 +1498,21 @@ mod tests {
 
     #[test]
     fn ingest_and_reindex_share_one_operation_and_request_envelope() {
-        // `POST .../reindex` is a literal call-through to `ingest_rag_document`
-        // (src/http/conversation.rs) and therefore always builds its idempotency spec
-        // from this same `RAG_DOCUMENT_INGEST_OPERATION` constant with the same path
-        // envelope, never a distinct one. This pins that decision: two specs built the
-        // way each route builds them, for the same document and body, hash identically.
+        // DOCUMENTS the `/reindex` decision; it does not guard it. `POST .../reindex` is a
+        // literal call-through to `ingest_rag_document` (src/http/conversation.rs), so both
+        // routes reach this one method and build their spec from this one
+        // `RAG_DOCUMENT_INGEST_OPERATION` constant with one path envelope. Because there is
+        // only one construction site, this test necessarily builds both specs from the same
+        // constant, the same path and the same body — it reduces to `f(x) == f(x)` and is
+        // structurally incapable of failing. Keep it as executable documentation of the
+        // shared identity, but do not count it as coverage.
+        //
+        // The real guard is the e2e test
+        // `reindex_replays_an_ingest_performed_under_the_same_key` in
+        // tests/rag_idempotency_replay.rs, which drives both HTTP routes for real and
+        // asserts the second one replays the first's response instead of creating a new
+        // version row. That test is load-bearing (mutation testing killed it three ways);
+        // this one is not.
         let ctx = test_context(None);
         let actor = Actor::default();
         let body = json!({ "content": "hello", "metadata": {} });
