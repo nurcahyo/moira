@@ -12,17 +12,20 @@ use jsonwebtoken::{
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use crate::{
-    config::{CallerAuthSettings, JwtAuthSettings},
-    error::AppError,
+    config::{CallerAuthSettings, JwksFetchSettings, JwtAuthSettings},
+    error::{AppError, current_request_id},
 };
 
-use super::ApiKeyHasher;
+use super::{
+    ApiKeyHasher,
+    ssrf::{JwksFetchError, fetch_jwks_hardened},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -51,19 +54,157 @@ pub struct Actor {
     pub api_key_id: Option<Uuid>,
 }
 
+/// How long a successfully fetched JWKS stays *fresh*. An expired entry is not
+/// evicted: it is retained as a last-known-good fallback (see [`JwksCache::load`]).
+const JWKS_CACHE_TTL: Duration = Duration::from_secs(300);
+
 #[derive(Debug, Clone)]
 pub struct AuthService {
     admin_settings: JwtAuthSettings,
     caller_settings: CallerAuthSettings,
     http: Client,
     key_hasher: ApiKeyHasher,
-    jwks_cache: Arc<RwLock<HashMap<String, CachedJwks>>>,
+    jwks_cache: JwksCache,
 }
 
 #[derive(Debug, Clone)]
 struct CachedJwks {
     jwks: JwkSet,
     expires_at: Instant,
+}
+
+/// The single JWKS cache shared by `AuthService`'s trusted-issuer path and by both
+/// static authenticators.
+///
+/// Deliberately one struct, constructed once in `AppState` and cloned into all three
+/// consumers, rather than three divergent copies: the static path previously had no
+/// cache at all (a fetch per request in the worst case) and the trusted-issuer path
+/// had a cache with no singleflight and no stale retention.
+///
+/// Keyed by JWKS **URL** rather than by issuer name, so changing an issuer's
+/// `jwks_url` naturally invalidates instead of serving keys fetched from the old
+/// endpoint, and so the static and trusted paths coalesce when they point at the
+/// same endpoint.
+#[derive(Debug, Clone)]
+pub struct JwksCache {
+    settings: JwksFetchSettings,
+    entries: Arc<RwLock<HashMap<String, CachedJwks>>>,
+    /// One async mutex per URL. Held across the upstream fetch so N concurrent
+    /// cache misses for the same issuer collapse into a single upstream call.
+    /// Bounded by the number of distinct admin-configured JWKS URLs.
+    locks: Arc<RwLock<HashMap<String, Arc<Mutex<()>>>>>,
+}
+
+/// How a JWKS was obtained. The caller needs the distinction because a *stale* result
+/// still has to be audited even though authentication proceeds.
+#[derive(Debug)]
+enum JwksOutcome {
+    /// Served from a fresh cache entry, or freshly fetched.
+    Live(JwkSet),
+    /// The refresh failed and the last-known-good entry was served instead.
+    Stale {
+        jwks: JwkSet,
+        failure: Box<JwksFetchError>,
+    },
+}
+
+impl JwksCache {
+    pub fn new(settings: JwksFetchSettings) -> Self {
+        Self {
+            settings,
+            entries: Arc::new(RwLock::new(HashMap::new())),
+            locks: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    async fn fresh(&self, url: &str) -> Option<JwkSet> {
+        let guard = self.entries.read().await;
+        guard
+            .get(url)
+            .filter(|entry| entry.expires_at > Instant::now())
+            .map(|entry| entry.jwks.clone())
+    }
+
+    /// Any cached value, expired or not — the last-known-good fallback.
+    async fn retained(&self, url: &str) -> Option<JwkSet> {
+        let guard = self.entries.read().await;
+        guard.get(url).map(|entry| entry.jwks.clone())
+    }
+
+    async fn lock_for(&self, url: &str) -> Arc<Mutex<()>> {
+        if let Some(lock) = self.locks.read().await.get(url) {
+            return lock.clone();
+        }
+        let mut guard = self.locks.write().await;
+        guard
+            .entry(url.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Singleflighted, SSRF-hardened JWKS load with last-known-good retention.
+    ///
+    /// 1. fast path on a fresh cache entry;
+    /// 2. take the per-URL lock;
+    /// 3. **re-check the cache under the lock** — a concurrent request may have
+    ///    refreshed it while this one waited;
+    /// 4. fetch only if still stale, then release.
+    ///
+    /// On failure an existing entry is served even if it expired past the TTL —
+    /// a transient IdP outage must not break authentication. The error only
+    /// propagates when nothing has ever been cached for this URL.
+    async fn load(&self, http: &Client, url: &str) -> Result<JwksOutcome, JwksFetchError> {
+        if let Some(jwks) = self.fresh(url).await {
+            return Ok(JwksOutcome::Live(jwks));
+        }
+
+        let lock = self.lock_for(url).await;
+        let _singleflight = lock.lock().await;
+
+        if let Some(jwks) = self.fresh(url).await {
+            return Ok(JwksOutcome::Live(jwks));
+        }
+
+        match fetch_jwks_hardened(http, url, &self.settings).await {
+            Ok(jwks) => {
+                self.entries.write().await.insert(
+                    url.to_string(),
+                    CachedJwks {
+                        jwks: jwks.clone(),
+                        expires_at: Instant::now() + JWKS_CACHE_TTL,
+                    },
+                );
+                Ok(JwksOutcome::Live(jwks))
+            }
+            Err(failure) => match self.retained(url).await {
+                Some(jwks) => {
+                    tracing::warn!(
+                        jwks_url = %url,
+                        reason = failure.reason().as_str(),
+                        detail = %failure.detail(),
+                        "JWKS refresh failed; serving the last-known-good cached key set"
+                    );
+                    Ok(JwksOutcome::Stale {
+                        jwks,
+                        failure: Box::new(failure),
+                    })
+                }
+                None => Err(failure),
+            },
+        }
+    }
+
+    /// Ages every cached entry past its TTL so a test can force the refresh path
+    /// without waiting out `JWKS_CACHE_TTL`.
+    #[cfg(test)]
+    async fn expire_all(&self) {
+        let stale = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        for entry in self.entries.write().await.values_mut() {
+            entry.expires_at = stale;
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -89,12 +230,19 @@ struct TrustedIssuerConfig {
 pub struct AdminAuthenticator {
     settings: JwtAuthSettings,
     http: Client,
+    jwks_cache: JwksCache,
+    /// Optional because `AppState` can be built without a database (unit-grade HTTP
+    /// tests do exactly that). When absent, a JWKS rejection is still traced; only
+    /// the audit row is skipped.
+    pool: Option<PgPool>,
 }
 
 #[derive(Debug, Clone)]
 pub struct CallerAuthenticator {
     settings: CallerAuthSettings,
     http: Client,
+    jwks_cache: JwksCache,
+    pool: Option<PgPool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -113,13 +261,14 @@ impl AuthService {
         caller_settings: CallerAuthSettings,
         http: Client,
         key_hasher: ApiKeyHasher,
+        jwks_cache: JwksCache,
     ) -> Self {
         Self {
             admin_settings,
             caller_settings,
             http,
             key_hasher,
-            jwks_cache: Arc::new(RwLock::new(HashMap::new())),
+            jwks_cache,
         }
     }
 
@@ -314,7 +463,7 @@ impl AuthService {
             ));
         }
 
-        let jwks = self.jwks(&issuer_config).await?;
+        let jwks = self.jwks(pool, &issuer_config).await?;
         let jwk = jwks
             .find(&key_id)
             .ok_or_else(|| AppError::Unauthorized("no matching JWKS key".to_string()))?;
@@ -383,36 +532,128 @@ impl AuthService {
         })
     }
 
-    async fn jwks(&self, issuer: &TrustedIssuerConfig) -> Result<JwkSet, AppError> {
-        if let Some(cached) = self.jwks_cache.read().await.get(&issuer.issuer)
-            && cached.expires_at > Instant::now()
-        {
-            return Ok(cached.jwks.clone());
-        }
-
-        let jwks = self
-            .http
-            .get(&issuer.jwks_url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<JwkSet>()
-            .await?;
-
-        self.jwks_cache.write().await.insert(
-            issuer.issuer.clone(),
-            CachedJwks {
-                jwks: jwks.clone(),
-                expires_at: Instant::now() + Duration::from_secs(300),
-            },
-        );
-        Ok(jwks)
+    async fn jwks(&self, pool: &PgPool, issuer: &TrustedIssuerConfig) -> Result<JwkSet, AppError> {
+        resolve_jwks(
+            &self.jwks_cache,
+            &self.http,
+            Some(pool),
+            &issuer.jwks_url,
+            Some(issuer.id),
+        )
+        .await
     }
 }
 
+/// Shared JWKS resolution for all three authentication paths.
+///
+/// Audits every rejection — including the ones that are survived by falling back to
+/// the retained cache — and maps failures onto the deliberately generic
+/// `unauthorized` error so the verification path is not an SSRF oracle.
+async fn resolve_jwks(
+    cache: &JwksCache,
+    http: &Client,
+    pool: Option<&PgPool>,
+    jwks_url: &str,
+    issuer_id: Option<Uuid>,
+) -> Result<JwkSet, AppError> {
+    match cache.load(http, jwks_url).await {
+        Ok(JwksOutcome::Live(jwks)) => Ok(jwks),
+        Ok(JwksOutcome::Stale { jwks, failure }) => {
+            audit_jwks_rejection(pool, jwks_url, issuer_id, &failure, true).await;
+            Ok(jwks)
+        }
+        Err(failure) => {
+            audit_jwks_rejection(pool, jwks_url, issuer_id, &failure, false).await;
+            Err(failure.into_unauthorized())
+        }
+    }
+}
+
+/// Records a JWKS fetch rejection in `audit_logs`.
+///
+/// The URL is safe to record (URLs are not secrets); the specific denial reason and
+/// the resolved address stay server-side, which is precisely the split that keeps the
+/// caller-visible error from leaking internal topology.
+///
+/// Mirrors `insert_audit_with_connection` in `src/infra/repositories/admin.rs`; the
+/// insert is written directly here because the two static authenticators sit below
+/// the repository layer and hold only a pool.
+async fn audit_jwks_rejection(
+    pool: Option<&PgPool>,
+    jwks_url: &str,
+    issuer_id: Option<Uuid>,
+    failure: &JwksFetchError,
+    served_stale_cache: bool,
+) {
+    tracing::warn!(
+        jwks_url = %jwks_url,
+        reason = failure.reason().as_str(),
+        detail = %failure.detail(),
+        served_stale_cache,
+        "JWKS fetch rejected by the SSRF/resource policy"
+    );
+
+    let Some(pool) = pool else {
+        return;
+    };
+
+    let metadata = json!({
+        "jwks_url": jwks_url,
+        "reason": failure.reason().as_str(),
+        "served_stale_cache": served_stale_cache,
+    });
+    // `audit_logs.resource_id` is varchar(256); the untruncated URL is preserved in
+    // the metadata document.
+    let resource_id = issuer_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| truncate_for_column(jwks_url, 256));
+
+    let insert = sqlx::query(
+        r#"
+        insert into audit_logs
+            (request_id, actor_type, resource_type, resource_id, action, result, metadata)
+        values ($1, $2, $3, $4, $5, $6, $7)
+        "#,
+    )
+    .bind(current_request_id())
+    .bind("anonymous")
+    .bind("jwt_issuer")
+    .bind(resource_id)
+    .bind("jwks_fetch")
+    .bind("denied")
+    .bind(metadata)
+    .execute(pool)
+    .await;
+
+    if let Err(err) = insert {
+        tracing::error!(error = %err, "failed to record the JWKS rejection audit entry");
+    }
+}
+
+fn truncate_for_column(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
+        return value.to_string();
+    }
+    let mut end = limit;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
 impl AdminAuthenticator {
-    pub fn new(settings: JwtAuthSettings, http: Client) -> Self {
-        Self { settings, http }
+    pub fn new(
+        settings: JwtAuthSettings,
+        http: Client,
+        jwks_cache: JwksCache,
+        pool: Option<PgPool>,
+    ) -> Self {
+        Self {
+            settings,
+            http,
+            jwks_cache,
+            pool,
+        }
     }
 
     pub async fn require(&self, headers: &HeaderMap) -> Result<Actor, AppError> {
@@ -428,6 +669,8 @@ impl AdminAuthenticator {
         let token = bearer_token(headers)?;
         let actor = validate_static_jwt(
             &self.http,
+            &self.jwks_cache,
+            self.pool.as_ref(),
             token,
             self.settings.jwks_url.as_deref(),
             self.settings.issuer.as_deref(),
@@ -450,8 +693,18 @@ impl AdminAuthenticator {
 }
 
 impl CallerAuthenticator {
-    pub fn new(settings: CallerAuthSettings, http: Client) -> Self {
-        Self { settings, http }
+    pub fn new(
+        settings: CallerAuthSettings,
+        http: Client,
+        jwks_cache: JwksCache,
+        pool: Option<PgPool>,
+    ) -> Self {
+        Self {
+            settings,
+            http,
+            jwks_cache,
+            pool,
+        }
     }
 
     pub async fn identify(&self, headers: &HeaderMap) -> Result<Actor, AppError> {
@@ -471,6 +724,8 @@ impl CallerAuthenticator {
 
         validate_static_jwt(
             &self.http,
+            &self.jwks_cache,
+            self.pool.as_ref(),
             bearer_token(headers)?,
             self.settings.jwks_url.as_deref(),
             self.settings.issuer.as_deref(),
@@ -481,8 +736,11 @@ impl CallerAuthenticator {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn validate_static_jwt(
     http: &Client,
+    jwks_cache: &JwksCache,
+    pool: Option<&PgPool>,
     token: &str,
     jwks_url: Option<&str>,
     issuer: Option<&str>,
@@ -494,13 +752,10 @@ async fn validate_static_jwt(
     let key_id = header
         .kid
         .ok_or_else(|| AppError::Unauthorized("JWT kid header is required".to_string()))?;
-    let jwks = http
-        .get(jwks_url)
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<JwkSet>()
-        .await?;
+    // Previously an unhardened, uncached `http.get(jwks_url).json::<JwkSet>()` on
+    // every request. Now it shares the singleflighted, SSRF-hardened cache with the
+    // trusted-issuer path.
+    let jwks = resolve_jwks(jwks_cache, http, pool, jwks_url, None).await?;
     let jwk = jwks
         .find(&key_id)
         .ok_or_else(|| AppError::Unauthorized("no matching JWKS key".to_string()))?;
@@ -821,8 +1076,151 @@ fn header_string(headers: &HeaderMap, name: &'static str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::atomic::Ordering;
+
     use serde_json::json;
+    use tokio::sync::{Barrier, Notify};
+
+    use super::{
+        super::ssrf::test_stub::{EMPTY_JWKS, StubPlan, spawn},
+        *,
+    };
+
+    /// JWKS fetch policy for the loopback stub: the dev override is what makes a
+    /// `http://127.0.0.1` IdP reachable at all, which is itself the assertion that
+    /// the production posture would refuse it.
+    fn stub_settings() -> JwksFetchSettings {
+        JwksFetchSettings {
+            allow_insecure_dev_urls: true,
+            timeout_ms: 2_000,
+            ..JwksFetchSettings::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_cache_miss_loads_are_singleflighted_to_one_upstream_call() {
+        const CONCURRENCY: usize = 8;
+
+        let arrived = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let listening = arrived.notified();
+        let stub = spawn(StubPlan {
+            arrived: Some(arrived.clone()),
+            hold: Some(release.clone()),
+            ..StubPlan::json(EMPTY_JWKS)
+        })
+        .await;
+
+        let cache = JwksCache::new(stub_settings());
+        let http = Client::new();
+        // The barrier is the acknowledgement gate (CONVENTIONS §3: no `sleep`): every
+        // task is inside `load` before the stub is allowed to answer, so the seven
+        // followers are genuinely queued behind the leader's per-URL lock.
+        let gate = Arc::new(Barrier::new(CONCURRENCY + 1));
+
+        let mut handles = Vec::with_capacity(CONCURRENCY);
+        for _ in 0..CONCURRENCY {
+            let cache = cache.clone();
+            let http = http.clone();
+            let url = stub.url.clone();
+            let gate = gate.clone();
+            handles.push(tokio::spawn(async move {
+                gate.wait().await;
+                cache.load(&http, &url).await.map(|_| ())
+            }));
+        }
+
+        gate.wait().await;
+        // Wait for the leader's request to reach the stub before releasing it.
+        listening.await;
+        release.notify_waiters();
+
+        for handle in handles {
+            handle
+                .await
+                .expect("no jwks load task may panic")
+                .expect("every coalesced load must succeed");
+        }
+
+        assert_eq!(
+            stub.hits.load(Ordering::SeqCst),
+            1,
+            "{CONCURRENCY} concurrent cache misses must collapse into one upstream fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_serves_the_last_known_good_cached_jwks() {
+        let stub = spawn(StubPlan {
+            fail_after_first: true,
+            ..StubPlan::json(EMPTY_JWKS)
+        })
+        .await;
+
+        let cache = JwksCache::new(stub_settings());
+        let http = Client::new();
+
+        cache
+            .load(&http, &stub.url)
+            .await
+            .expect("the first fetch must warm the cache");
+
+        // Force the refresh path; every later stub response is a 500.
+        cache.expire_all().await;
+
+        let outcome = cache
+            .load(&http, &stub.url)
+            .await
+            .expect("a failed refresh must not break authentication");
+        assert!(
+            matches!(outcome, JwksOutcome::Stale { .. }),
+            "the retained entry must be served and the failure reported for auditing"
+        );
+        assert_eq!(stub.hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_first_ever_fetch_failure_does_not_fail_open() {
+        let stub = spawn(StubPlan {
+            status_line: "HTTP/1.1 503 Service Unavailable",
+            ..StubPlan::json(EMPTY_JWKS)
+        })
+        .await;
+
+        let cache = JwksCache::new(stub_settings());
+        let error = cache
+            .load(&Client::new(), &stub.url)
+            .await
+            .expect_err("with no cached entry the failure must propagate");
+        assert_eq!(error.reason().as_str(), "status");
+    }
+
+    #[tokio::test]
+    async fn a_rejected_jwks_fetch_surfaces_as_a_generic_unauthorized() {
+        let stub = spawn(StubPlan {
+            content_type: "text/html",
+            ..StubPlan::json("<html>redis</html>")
+        })
+        .await;
+
+        let cache = JwksCache::new(stub_settings());
+        // `pool` is `None` here, so the audit row is skipped and only the tracing
+        // event fires — the error mapping is what this asserts.
+        let error = resolve_jwks(&cache, &Client::new(), None, &stub.url, None)
+            .await
+            .expect_err("a rejected fetch must not authenticate the caller");
+
+        assert!(matches!(error, AppError::Unauthorized(_)));
+        let body = format!("{:?}", error.error_response(None));
+        assert!(
+            !body.contains("content_type") && !body.contains("text/html"),
+            "the denial reason must not reach the caller: {body}"
+        );
+        assert!(
+            !body.contains(&stub.url),
+            "the JWKS URL must not reach the caller: {body}"
+        );
+    }
 
     #[test]
     fn actor_claims_merge_scope_formats() {

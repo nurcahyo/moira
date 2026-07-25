@@ -15,7 +15,7 @@ use crate::{
         application_execution_policy_record_from_row, execution_failure_class_from_db,
         provider_type_from_db, public_response_record_from_row, response_persistence_mode_to_db,
     },
-    security::request_hash,
+    security::IdempotencyHasher,
 };
 
 #[derive(Debug, Clone)]
@@ -730,7 +730,13 @@ pub fn default_application_execution_policy(
     }
 }
 
+/// Builds the ledger row for a fresh `/v1/responses` idempotency claim.
+///
+/// The key hash is keyed by the deployment pepper (plan 03, P1-1): the raw
+/// `Idempotency-Key` is caller-supplied and its unkeyed digest was offline-guessable from
+/// a database read alone.
 pub fn idempotency_record(
+    hasher: &IdempotencyHasher,
     key: &str,
     actor_fingerprint: String,
     operation: &str,
@@ -738,7 +744,7 @@ pub fn idempotency_record(
 ) -> IdempotencyRecord {
     IdempotencyRecord {
         id: Uuid::now_v7(),
-        idempotency_key_hash: request_hash(key.as_bytes()),
+        idempotency_key_hash: hasher.hash(key.as_bytes()),
         actor_fingerprint,
         operation: operation.to_string(),
         request_hash: request_hash_value,

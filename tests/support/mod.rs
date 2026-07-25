@@ -128,6 +128,11 @@ impl LifecycleFixture {
         let mut settings = Settings::default();
         settings.provider_security.allow_http_provider_urls = true;
         settings.provider_security.allow_private_provider_urls = true;
+        // The fixtures' stub IdPs live on `http://127.0.0.1:0`, which the JWKS SSRF
+        // policy denies by design. This is the same dev-only escape hatch as the two
+        // `provider_security` flags above; `Settings::validate` rejects it in
+        // production, and the hardened default remains `false`.
+        settings.auth.jwks.allow_insecure_dev_urls = true;
         settings.runtime.default_execution_timeout_seconds = 5;
         settings.runtime.maximum_execution_timeout_seconds = 10;
         settings.runtime.global_execution_concurrency = 64;

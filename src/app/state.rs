@@ -13,7 +13,7 @@ use crate::{
     },
     security::{
         AdminAuthenticator, ApiKeyHasher, AuthService, AuthorizationService, CallerAuthenticator,
-        LocalSecretCipher,
+        IdempotencyHasher, JwksCache, LocalSecretCipher,
     },
 };
 
@@ -24,6 +24,7 @@ pub struct AppState {
     pub http: Client,
     pub cipher: LocalSecretCipher,
     pub key_hasher: ApiKeyHasher,
+    pub idempotency_hasher: IdempotencyHasher,
     pub auth: AuthService,
     pub authz: AuthorizationService,
     pub redis: Option<RedisClient>,
@@ -53,11 +54,20 @@ impl AppState {
             settings.api_keys.pepper_version.clone(),
             settings.api_keys.prefix_length,
         );
+        let idempotency_hasher = IdempotencyHasher::new(
+            settings.idempotency.pepper_bytes()?,
+            settings.idempotency.pepper_version.clone(),
+        );
+        // One JWKS cache, constructed once and cloned into all three authentication
+        // paths, so the trusted-issuer path and both static authenticators share a
+        // single SSRF/singleflight/stale-retention posture instead of drifting apart.
+        let jwks_cache = JwksCache::new(settings.auth.jwks.clone());
         let auth = AuthService::new(
             settings.auth.admin.clone(),
             settings.auth.caller.clone(),
             http.clone(),
             key_hasher.clone(),
+            jwks_cache.clone(),
         );
         let authz = AuthorizationService::new();
         let redis = RedisClient::from_settings(&settings.redis)?;
@@ -77,8 +87,18 @@ impl AppState {
         let public_rate_limiter =
             InMemoryRateLimiter::new(settings.public_api.rate_limiter_max_entries);
         let circuits = CircuitBreakerRegistry::new();
-        let admin_auth = AdminAuthenticator::new(settings.auth.admin.clone(), http.clone());
-        let caller_auth = CallerAuthenticator::new(settings.auth.caller.clone(), http.clone());
+        let admin_auth = AdminAuthenticator::new(
+            settings.auth.admin.clone(),
+            http.clone(),
+            jwks_cache.clone(),
+            pool.clone(),
+        );
+        let caller_auth = CallerAuthenticator::new(
+            settings.auth.caller.clone(),
+            http.clone(),
+            jwks_cache,
+            pool.clone(),
+        );
 
         Ok(Self {
             settings: Arc::new(settings),
@@ -86,6 +106,7 @@ impl AppState {
             http,
             cipher,
             key_hasher,
+            idempotency_hasher,
             auth,
             authz,
             redis,

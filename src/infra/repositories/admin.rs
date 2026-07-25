@@ -35,14 +35,35 @@ pub struct PgAdminCommandTransaction {
     transaction: Transaction<'static, Postgres>,
 }
 
+/// A claim on the idempotency ledger.
+///
+/// Every hash it carries is precomputed by the application layer; this repository never
+/// learns how any of them is derived, it only stores and compares opaque strings. The
+/// `legacy_*` pair exists because the switch to keyed hashing (plan 03, P1-1) changed both
+/// the compared body digest **and** the index key, so a row written before the switch is
+/// unreachable by the new key hash alone.
 #[derive(Debug, Clone)]
 pub struct AdminIdempotencyClaim {
     pub record_id: Uuid,
+    /// The key hash written for a fresh claim and tried first on lookup.
     pub key_hash: String,
+    /// The pre-switch key hash, tried only when `key_hash` misses. Never written.
+    pub legacy_key_hash: String,
     pub actor_fingerprint: String,
     pub operation: String,
+    /// The body digest written for a fresh claim.
     pub request_hash: String,
+    /// The pre-switch body digest, accepted only on a legacy row. Never written.
+    pub legacy_request_hash: String,
     pub expires_at: DateTime<Utc>,
+}
+
+impl AdminIdempotencyClaim {
+    /// Whether a stored body digest describes the same request as this claim, under either
+    /// the current or the pre-switch hashing scheme.
+    pub fn matches_stored_request_hash(&self, stored: &str) -> bool {
+        stored == self.request_hash || stored == self.legacy_request_hash
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -580,26 +601,41 @@ impl PgAdminCommandTransaction {
             sleep(Duration::from_millis(20)).await;
         }
 
+        // Both key hashes are swept: an expired pre-switch row must not be resurrected as a
+        // replay by the legacy lookup below.
         sqlx::query(
             r#"
             delete from idempotency_records
-            where idempotency_key_hash = $1
+            where idempotency_key_hash = any($1)
               and actor_fingerprint = $2
               and operation = $3
               and expires_at <= now()
             "#,
         )
-        .bind(&claim.key_hash)
+        .bind(vec![claim.key_hash.clone(), claim.legacy_key_hash.clone()])
         .bind(&claim.actor_fingerprint)
         .bind(&claim.operation)
         .execute(self.connection())
         .await?;
 
-        if let Some(record) = self
+        // Dual lookup: the current key hash first, then the pre-switch one. The advisory
+        // lock above is keyed on `claim.key_hash`, which is identical for every concurrent
+        // request carrying the same Idempotency-Key, so both branches stay serialized.
+        let mut existing = self
             .load_idempotency(&claim.key_hash, &claim.actor_fingerprint, &claim.operation)
-            .await?
-        {
-            if record.request_hash != claim.request_hash {
+            .await?;
+        if existing.is_none() {
+            existing = self
+                .load_idempotency(
+                    &claim.legacy_key_hash,
+                    &claim.actor_fingerprint,
+                    &claim.operation,
+                )
+                .await?;
+        }
+
+        if let Some(record) = existing {
+            if !claim.matches_stored_request_hash(&record.request_hash) {
                 return Err(AppError::conflict(
                     "idempotency_conflict",
                     "same Idempotency-Key was used with a different request",

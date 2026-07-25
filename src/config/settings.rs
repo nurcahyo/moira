@@ -22,6 +22,8 @@ pub struct Settings {
     #[serde(default)]
     pub api_keys: ApiKeySettings,
     #[serde(default)]
+    pub idempotency: IdempotencySettings,
+    #[serde(default)]
     pub provider_security: ProviderSecuritySettings,
     #[serde(default)]
     pub cors: CorsSettings,
@@ -92,6 +94,31 @@ pub struct AuthSettings {
     pub admin: JwtAuthSettings,
     #[serde(default)]
     pub caller: CallerAuthSettings,
+    /// Shared JWKS fetch policy. One instance, deliberately: `AdminAuthenticator`,
+    /// `CallerAuthenticator` and the trusted-issuer path must not be able to drift
+    /// apart into three divergent SSRF postures.
+    #[serde(default)]
+    pub jwks: JwksFetchSettings,
+}
+
+/// SSRF / resource limits applied to every outbound JWKS fetch.
+///
+/// `#[serde(default)]` on the container so an operator may override a single knob
+/// (e.g. `MOIRA_AUTH__JWKS__TIMEOUT_MS`) without having to restate the others.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct JwksFetchSettings {
+    /// Hard cap on the number of response body bytes read from a JWKS endpoint.
+    /// Enforced by streaming, not by trusting `Content-Length`.
+    pub max_response_bytes: usize,
+    /// Per-request timeout for a JWKS fetch. Deliberately per-request: the shared
+    /// `reqwest::Client` also serves provider execution calls whose timeout
+    /// semantics belong to the execution-deadline system.
+    pub timeout_ms: u64,
+    /// Dev-only escape hatch permitting `http://` and private/loopback/link-local
+    /// JWKS URLs. MUST stay `false` outside development; `Settings::validate`
+    /// hard-fails production when it is `true`.
+    pub allow_insecure_dev_urls: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -120,6 +147,21 @@ pub struct ApiKeySettings {
     pub pepper_version: String,
     pub allow_insecure_dev_pepper: bool,
     pub prefix_length: usize,
+}
+
+/// Dedicated pepper for the keyed (HMAC-SHA-256) idempotency / request-body hash.
+///
+/// Mirrors `ApiKeySettings`'s pepper contract exactly. `#[serde(default)]` on the
+/// container so setting only `MOIRA_IDEMPOTENCY__PEPPER_BASE64` is a valid
+/// configuration — the remaining fields fall back to `Default`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct IdempotencySettings {
+    pub pepper_base64: Option<String>,
+    /// Version tag prefixed to every produced hash (`"{pepper_version}:{digest}"`).
+    /// Must be non-empty and must not contain `:`, which is the format separator.
+    pub pepper_version: String,
+    pub allow_insecure_dev_pepper: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -279,6 +321,12 @@ impl Settings {
         if self.api_keys.allow_insecure_dev_pepper {
             features.push("insecure_api_key_pepper_fallback");
         }
+        if self.idempotency.allow_insecure_dev_pepper {
+            features.push("insecure_idempotency_pepper_fallback");
+        }
+        if self.auth.jwks.allow_insecure_dev_urls {
+            features.push("insecure_jwks_urls");
+        }
         if self.provider_security.allow_http_provider_urls {
             features.push("http_provider_urls");
         }
@@ -324,6 +372,10 @@ impl Settings {
                     .to_string(),
             );
         }
+        if self.auth.jwks.allow_insecure_dev_urls {
+            violations
+                .push("auth.jwks.allow_insecure_dev_urls must be false in production".to_string());
+        }
         if self.workers.enabled {
             violations.push("workers.enabled must be false until workers are implemented".into());
         }
@@ -367,6 +419,26 @@ impl Settings {
         {
             violations
                 .push("api_keys.pepper_version must be non-empty and non-development".to_string());
+        }
+
+        if self.idempotency.allow_insecure_dev_pepper {
+            violations.push(
+                "idempotency.allow_insecure_dev_pepper must be false in production".to_string(),
+            );
+        }
+        validate_32_byte_secret(
+            self.idempotency.pepper_base64.as_deref(),
+            [13; 32],
+            "idempotency.pepper_base64",
+            violations,
+        );
+        // `pepper_version` is the hash *format* version ("v1"), not a deployment
+        // stage, so it is only checked for structural validity: it is the prefix
+        // before the ':' separator in every stored hash.
+        if self.idempotency.pepper_version.trim().is_empty() {
+            violations.push("idempotency.pepper_version must be non-empty".to_string());
+        } else if self.idempotency.pepper_version.contains(':') {
+            violations.push("idempotency.pepper_version must not contain ':'".to_string());
         }
     }
 }
@@ -496,6 +568,24 @@ impl ApiKeySettings {
     }
 }
 
+impl IdempotencySettings {
+    pub fn pepper_bytes(&self) -> Result<Vec<u8>, AppError> {
+        match self
+            .pepper_base64
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            Some(value) => STANDARD.decode(value).map_err(|err| {
+                AppError::Config(format!("invalid idempotency pepper base64: {err}"))
+            }),
+            None if self.allow_insecure_dev_pepper => Ok(vec![13; 32]),
+            None => Err(AppError::Config(
+                "MOIRA_IDEMPOTENCY__PEPPER_BASE64 must be set".to_string(),
+            )),
+        }
+    }
+}
+
 impl Default for ServerSettings {
     fn default() -> Self {
         Self {
@@ -540,6 +630,22 @@ impl Default for AuthSettings {
                 leeway_seconds: 60,
             },
             caller: CallerAuthSettings::default(),
+            jwks: JwksFetchSettings::default(),
+        }
+    }
+}
+
+impl Default for JwksFetchSettings {
+    fn default() -> Self {
+        Self {
+            // JWKS documents are small; 256KiB is generous for even the largest
+            // real-world key set.
+            max_response_bytes: 262_144,
+            timeout_ms: 3_000,
+            // Fails closed by default, unlike the pepper dev fallbacks: an
+            // unhardened JWKS fetch is an SSRF primitive, so the escape hatch must
+            // be opted into explicitly even in development.
+            allow_insecure_dev_urls: false,
         }
     }
 }
@@ -577,6 +683,20 @@ impl Default for ApiKeySettings {
             pepper_version: "dev-local".to_string(),
             allow_insecure_dev_pepper: true,
             prefix_length: 20,
+        }
+    }
+}
+
+impl Default for IdempotencySettings {
+    fn default() -> Self {
+        Self {
+            pepper_base64: None,
+            // Format version of the produced hash, not a deployment stage marker:
+            // "v1" is the correct value in production too. Unlike
+            // `ApiKeySettings::pepper_version` it is therefore NOT rejected as a
+            // development sentinel by `validate_production_crypto`.
+            pepper_version: "v1".to_string(),
+            allow_insecure_dev_pepper: true,
         }
     }
 }
@@ -701,6 +821,8 @@ mod tests {
         settings.api_keys.pepper_base64 = Some(STANDARD.encode([2; 32]));
         settings.api_keys.pepper_version = "prod-2026-07".to_string();
         settings.api_keys.allow_insecure_dev_pepper = false;
+        settings.idempotency.pepper_base64 = Some(STANDARD.encode([3; 32]));
+        settings.idempotency.allow_insecure_dev_pepper = false;
         settings.cors.allowed_origins = vec!["https://admin.example.com".to_string()];
         settings
     }
@@ -746,6 +868,8 @@ mod tests {
             "api_keys.allow_insecure_dev_pepper",
             "api_keys.pepper_base64",
             "api_keys.pepper_version",
+            "idempotency.allow_insecure_dev_pepper",
+            "idempotency.pepper_base64",
             "cors.allowed_origins",
             "database.migrate_on_startup",
         ] {
@@ -775,6 +899,122 @@ mod tests {
         settings.database.url = Some("postgres://postgres:postgres@localhost/moira".to_string());
 
         settings.validate(ProcessMode::Migrate).unwrap();
+    }
+
+    #[test]
+    fn idempotency_pepper_bytes_decodes_base64() {
+        let settings = IdempotencySettings {
+            pepper_base64: Some(STANDARD.encode([9; 32])),
+            pepper_version: "v1".to_string(),
+            allow_insecure_dev_pepper: false,
+        };
+
+        assert_eq!(settings.pepper_bytes().unwrap(), vec![9_u8; 32]);
+    }
+
+    #[test]
+    fn idempotency_pepper_bytes_uses_the_dev_fallback_when_allowed() {
+        let settings = IdempotencySettings::default();
+        assert!(settings.allow_insecure_dev_pepper);
+        assert_eq!(settings.pepper_version, "v1");
+        assert_eq!(settings.pepper_bytes().unwrap(), vec![13_u8; 32]);
+    }
+
+    #[test]
+    fn idempotency_pepper_is_required_without_the_dev_fallback() {
+        let settings = IdempotencySettings {
+            pepper_base64: None,
+            pepper_version: "v1".to_string(),
+            allow_insecure_dev_pepper: false,
+        };
+
+        let error = settings.pepper_bytes().unwrap_err().to_string();
+        assert!(
+            error.contains("MOIRA_IDEMPOTENCY__PEPPER_BASE64 must be set"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn production_rejects_allow_insecure_dev_idempotency_pepper() {
+        let mut settings = valid_production_settings();
+        settings.idempotency.allow_insecure_dev_pepper = true;
+        settings.idempotency.pepper_base64 = None;
+
+        let error = settings
+            .validate(ProcessMode::Serve)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("idempotency.allow_insecure_dev_pepper must be false in production"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("idempotency.pepper_base64 must be set in production"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn production_rejects_the_idempotency_pepper_development_sentinel() {
+        let mut settings = valid_production_settings();
+        settings.idempotency.pepper_base64 = Some(STANDARD.encode([13; 32]));
+
+        let error = settings
+            .validate(ProcessMode::Serve)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("idempotency.pepper_base64 cannot use the development sentinel"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn production_rejects_an_idempotency_pepper_version_containing_the_separator() {
+        let mut settings = valid_production_settings();
+        settings.idempotency.pepper_version = "v1:extra".to_string();
+
+        let error = settings
+            .validate(ProcessMode::Serve)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("idempotency.pepper_version must not contain ':'"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn production_rejects_allow_insecure_dev_jwks_urls() {
+        let mut settings = valid_production_settings();
+        settings.auth.jwks.allow_insecure_dev_urls = true;
+
+        let error = settings
+            .validate(ProcessMode::Serve)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("auth.jwks.allow_insecure_dev_urls must be false in production"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn jwks_fetch_settings_defaults_fail_closed() {
+        let settings = JwksFetchSettings::default();
+
+        assert_eq!(settings.max_response_bytes, 262_144);
+        assert_eq!(settings.timeout_ms, 3_000);
+        assert!(
+            !settings.allow_insecure_dev_urls,
+            "the SSRF escape hatch must default to disabled"
+        );
+        assert_eq!(
+            AuthSettings::default().jwks.max_response_bytes,
+            settings.max_response_bytes,
+            "AuthSettings must embed the shared JwksFetchSettings default"
+        );
     }
 
     #[test]

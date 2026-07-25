@@ -11,7 +11,7 @@ use moira::{
     config::Settings,
     domain::{ApplicationCreateRequest, ProviderCreateRequest, ProviderType},
     infra::db,
-    security::{Actor, ActorType, request_hash},
+    security::{Actor, ActorType},
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -150,8 +150,16 @@ impl Fixture {
         }
     }
 
+    /// The stored `idempotency_key_hash` for a raw Idempotency-Key.
+    ///
+    /// Keyed by the deployment pepper since plan 03 (P1-1), so the ledger can no longer be
+    /// probed with a bare SHA-256 of the key.
+    fn key_hash(&self, key: &str) -> String {
+        self.state.idempotency_hasher.hash(key.as_bytes())
+    }
+
     async fn ledger_count(&self, operation: &str, key: &str) -> i64 {
-        let key_hash = request_hash(key.as_bytes());
+        let key_hash = self.key_hash(key);
         timeout(
             WAIT,
             sqlx::query_scalar::<_, i64>(
@@ -707,7 +715,7 @@ async fn trusted_actor_fingerprint_isolates_issuer_and_application_identity() {
         sqlx::query_scalar::<_, i64>(
             "select count(*) from idempotency_records where operation = 'provider.create' and idempotency_key_hash = $1",
         )
-        .bind(request_hash(key.as_bytes()))
+        .bind(fixture.key_hash(&key))
         .fetch_one(&fixture.pool)
         .await
         .expect("trusted actor ledger count"),
@@ -763,7 +771,7 @@ async fn expired_record_is_reclaimed_and_deterministic_failure_is_replayed() {
         sqlx::query_scalar::<_, i64>(
             "select count(*) from idempotency_records where operation = 'application.create' and idempotency_key_hash = $1 and response_status = 400 and resource_id is null",
         )
-        .bind(request_hash(failure_key.as_bytes()))
+        .bind(fixture.key_hash(&failure_key))
         .fetch_one(&fixture.pool)
         .await
         .expect("cached deterministic failure"),
@@ -813,14 +821,14 @@ async fn advisory_lock_timeout_is_transient_and_does_not_mutate_or_cache() {
     let actor_fingerprint = sqlx::query_scalar::<_, String>(
         "select actor_fingerprint from idempotency_records where operation = 'application.create' and idempotency_key_hash = $1",
     )
-    .bind(request_hash(seed_key.as_bytes()))
+    .bind(fixture.key_hash(&seed_key))
     .fetch_one(&fixture.pool)
     .await
     .expect("seed actor fingerprint");
 
     let key = fixture.key("lock-timeout");
     let lock_key = advisory_lock_key(
-        &request_hash(key.as_bytes()),
+        &fixture.key_hash(&key),
         &actor_fingerprint,
         "application.create",
     );
@@ -938,7 +946,7 @@ async fn audit_failure_and_request_cancellation_roll_back_mutation_and_ledger() 
         sqlx::query_scalar::<_, i64>(
             "select count(*) from idempotency_records where operation = 'application.create' and idempotency_key_hash = $1",
         )
-        .bind(request_hash(failed_key.as_bytes()))
+        .bind(fixture.key_hash(&failed_key))
         .fetch_one(&fixture.pool)
         .await
         .expect("audit-failure ledger count"),
@@ -990,7 +998,7 @@ async fn audit_failure_and_request_cancellation_roll_back_mutation_and_ledger() 
         sqlx::query_scalar::<_, i64>(
             "select count(*) from idempotency_records where operation = 'application.create' and idempotency_key_hash = $1",
         )
-        .bind(request_hash(cancelled_key.as_bytes()))
+        .bind(fixture.key_hash(&cancelled_key))
         .fetch_one(&fixture.pool)
         .await
         .expect("cancelled ledger count"),

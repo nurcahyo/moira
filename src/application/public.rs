@@ -21,12 +21,13 @@ use crate::{
         ApplicationExecutionPolicyPutRequest, ApplicationExecutionPolicyRecord, AuditLogInsert,
         AuditResult, CallerRuntimeIdentity, ExecutionCommand, ExecutionFailure,
         ExecutionFailureClass, ExecutionOptions, ExecutionOutcome, ExecutionQuery, ExecutionStatus,
-        ListResponse, OpenAiResponseCompatRequest, PublicCapabilities, PublicContentPart,
-        PublicConversationRef, PublicExecutionSummary, PublicInputMessage, PublicMessageRole,
-        PublicModelRef, PublicModelResource, PublicOutputContentPart, PublicOutputItem,
-        PublicResponse, PublicResponseFormat, PublicResponseRecord, PublicResponseRequest,
-        PublicResponseStatus, PublicRouteRef, PublicRouteResource, PublicSseEnvelope,
-        PublicUsageRecord, PublicUsageSummary, RuntimeEventEnvelope, RuntimeEventType, UsageQuery,
+        IdempotencyRecord, ListResponse, OpenAiResponseCompatRequest, PublicCapabilities,
+        PublicContentPart, PublicConversationRef, PublicExecutionSummary, PublicInputMessage,
+        PublicMessageRole, PublicModelRef, PublicModelResource, PublicOutputContentPart,
+        PublicOutputItem, PublicResponse, PublicResponseFormat, PublicResponseRecord,
+        PublicResponseRequest, PublicResponseStatus, PublicRouteRef, PublicRouteResource,
+        PublicSseEnvelope, PublicUsageRecord, PublicUsageSummary, RuntimeEventEnvelope,
+        RuntimeEventType, UsageQuery,
     },
     error::AppError,
     infra::repositories::{
@@ -34,7 +35,7 @@ use crate::{
         ResponseStartedInsert, ResponseTerminalUpdate, default_application_execution_policy,
         idempotency_record,
     },
-    security::{Actor, ActorType, request_hash, secret_fingerprint},
+    security::{Actor, ActorType, IdempotencyHasher, secret_fingerprint},
 };
 
 #[derive(Clone)]
@@ -178,7 +179,12 @@ impl PublicExecutionService {
 
         let mapped = match outcome.status {
             ExecutionStatus::Succeeded => {
-                let update = terminal_update_from_outcome(&outcome, &prepared.policy, None);
+                let update = terminal_update_from_outcome(
+                    &self.state.idempotency_hasher,
+                    &outcome,
+                    &prepared.policy,
+                    None,
+                );
                 let record = self
                     .public_repo
                     .complete_response(response.id, &update)
@@ -220,8 +226,12 @@ impl PublicExecutionService {
                         "execution failed without a failure class",
                     )
                 });
-                let update =
-                    terminal_update_from_outcome(&outcome, &prepared.policy, Some(&failure));
+                let update = terminal_update_from_outcome(
+                    &self.state.idempotency_hasher,
+                    &outcome,
+                    &prepared.policy,
+                    Some(&failure),
+                );
                 let record = self.public_repo.fail_response(response.id, &update).await?;
                 let status = failure_http_status(failure.class);
                 let body = json!({
@@ -459,6 +469,7 @@ impl PublicExecutionService {
         }
         if disconnected {
             let update = cancellation_update(
+                &self.state.idempotency_hasher,
                 outcome.as_ref().ok().and_then(|value| value.as_ref().ok()),
                 &policy,
             );
@@ -496,7 +507,12 @@ impl PublicExecutionService {
         let terminal = match outcome {
             Ok(Ok(outcome)) => match outcome.status {
                 ExecutionStatus::Succeeded => {
-                    let update = terminal_update_from_outcome(&outcome, &policy, None);
+                    let update = terminal_update_from_outcome(
+                        &self.state.idempotency_hasher,
+                        &outcome,
+                        &policy,
+                        None,
+                    );
                     match self
                         .public_repo
                         .complete_response(response.id, &update)
@@ -573,7 +589,12 @@ impl PublicExecutionService {
                             "execution failed",
                         )
                     });
-                    let update = terminal_update_from_outcome(&outcome, &policy, Some(&failure));
+                    let update = terminal_update_from_outcome(
+                        &self.state.idempotency_hasher,
+                        &outcome,
+                        &policy,
+                        Some(&failure),
+                    );
                     if self
                         .public_repo
                         .fail_response(response.id, &update)
@@ -598,7 +619,11 @@ impl PublicExecutionService {
                     terminal_failure(&response, sequence, &ctx, failure)
                 }
                 ExecutionStatus::Cancelled => {
-                    let update = cancellation_update(Some(&outcome), &policy);
+                    let update = cancellation_update(
+                        &self.state.idempotency_hasher,
+                        Some(&outcome),
+                        &policy,
+                    );
                     if self
                         .public_repo
                         .cancel_response(response.id, &update)
@@ -1018,12 +1043,34 @@ impl PublicExecutionService {
             return Ok(None);
         };
         let actor_fingerprint = public_actor_fingerprint(actor, application_id);
-        let request_hash_value = normalized_request_hash(&(application_id, request))?;
+        let hasher = &self.state.idempotency_hasher;
+        let request_bytes = normalized_request_bytes(&(application_id, request))?;
+
+        // Dual lookup, deliberately *before* the claim insert. `idempotency_key_hash` is
+        // the index key of the unique index on
+        // (idempotency_key_hash, actor_fingerprint, operation), so a row written before the
+        // switch to keyed hashing (plan 03, P1-1) is invisible to the new hash: claiming
+        // first would insert a second row and execute a contractual replay a second time.
+        // Cost is one extra SELECT per idempotent request, removable once no pre-switch row
+        // can still be unexpired (ledger retention is 24h).
+        if let Some(existing) = self
+            .public_repo
+            .get_idempotency_record(
+                &hasher.legacy_hash(key.as_bytes()),
+                &actor_fingerprint,
+                "response.create",
+            )
+            .await?
+        {
+            return replayed_idempotency_state(hasher, &request_bytes, existing).map(Some);
+        }
+
         let record = idempotency_record(
+            hasher,
             key,
             actor_fingerprint.clone(),
             "response.create",
-            request_hash_value.clone(),
+            hasher.hash(&request_bytes),
         );
         match self.public_repo.claim_idempotency(&record).await? {
             IdempotencyClaim::Claimed => Ok(Some(IdempotencyState {
@@ -1032,23 +1079,7 @@ impl PublicExecutionService {
                 operation: "response.create",
             })),
             IdempotencyClaim::Replay(existing) => {
-                if existing.request_hash != request_hash_value {
-                    return Err(AppError::conflict(
-                        "idempotency_conflict",
-                        "same Idempotency-Key was used with a different request",
-                    ));
-                }
-                if existing.response_body.is_none() {
-                    return Err(AppError::conflict(
-                        "execution_in_progress",
-                        "execution is in progress",
-                    ));
-                }
-                Ok(Some(IdempotencyState {
-                    key_hash: existing.idempotency_key_hash,
-                    actor_fingerprint: existing.actor_fingerprint,
-                    operation: "response.create",
-                }))
+                replayed_idempotency_state(hasher, &request_bytes, existing).map(Some)
             }
         }
     }
@@ -1582,6 +1613,7 @@ fn text_only_content(message: &PublicInputMessage) -> Result<String, AppError> {
 }
 
 fn terminal_update_from_outcome(
+    hasher: &IdempotencyHasher,
     outcome: &ExecutionOutcome,
     policy: &ApplicationExecutionPolicyRecord,
     failure: Option<&ExecutionFailure>,
@@ -1594,7 +1626,7 @@ fn terminal_update_from_outcome(
     let output_hash = outcome
         .output_text
         .as_ref()
-        .map(|text| request_hash(text.as_bytes()));
+        .map(|text| hasher.hash(text.as_bytes()));
     ResponseTerminalUpdate {
         route_id: outcome.route.as_ref().map(|route| route.route_id),
         provider_id: outcome.model.as_ref().map(|model| model.provider_id),
@@ -1715,13 +1747,14 @@ fn failure_update(
 }
 
 fn cancellation_update(
+    hasher: &IdempotencyHasher,
     outcome: Option<&ExecutionOutcome>,
     policy: &ApplicationExecutionPolicyRecord,
 ) -> ResponseTerminalUpdate {
     let failure =
         ExecutionFailure::new(ExecutionFailureClass::RequestCancelled, "stream cancelled");
     outcome
-        .map(|outcome| terminal_update_from_outcome(outcome, policy, Some(&failure)))
+        .map(|outcome| terminal_update_from_outcome(hasher, outcome, policy, Some(&failure)))
         .unwrap_or_else(|| failure_update(&failure, policy))
 }
 
@@ -1878,10 +1911,43 @@ fn public_actor_fingerprint(actor: &Actor, application_id: Option<Uuid>) -> Stri
     )
 }
 
-fn normalized_request_hash<T: Serialize>(request: &T) -> Result<String, AppError> {
+/// The canonical bytes an idempotent `/v1/responses` request hashes to.
+///
+/// Returns bytes rather than a digest so the read path can run them through
+/// `IdempotencyHasher::verify`, which accepts the current keyed digest and the pre-switch
+/// unkeyed one alike.
+fn normalized_request_bytes<T: Serialize>(request: &T) -> Result<Vec<u8>, AppError> {
     serde_json::to_vec(request)
-        .map(|bytes| request_hash(&bytes))
         .map_err(|err| AppError::BadRequest(format!("invalid idempotent request: {err}")))
+}
+
+/// Turns an existing ledger row into the replay state, or into the conflict/in-progress
+/// error the idempotency contract requires.
+///
+/// `verify` — not string equality — so a row written before the switch to keyed hashing
+/// still matches the request that produced it.
+fn replayed_idempotency_state(
+    hasher: &IdempotencyHasher,
+    request_bytes: &[u8],
+    existing: IdempotencyRecord,
+) -> Result<IdempotencyState, AppError> {
+    if !hasher.verify(request_bytes, &existing.request_hash) {
+        return Err(AppError::conflict(
+            "idempotency_conflict",
+            "same Idempotency-Key was used with a different request",
+        ));
+    }
+    if existing.response_body.is_none() {
+        return Err(AppError::conflict(
+            "execution_in_progress",
+            "execution is in progress",
+        ));
+    }
+    Ok(IdempotencyState {
+        key_hash: existing.idempotency_key_hash,
+        actor_fingerprint: existing.actor_fingerprint,
+        operation: "response.create",
+    })
 }
 
 fn validate_policy_request(request: &ApplicationExecutionPolicyPutRequest) -> Result<(), AppError> {

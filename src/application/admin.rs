@@ -29,8 +29,8 @@ use crate::{
         },
     },
     security::{
-        Actor, AuthorizationService, CredentialAadParts, ENVELOPE_VERSION_V1, SecretCipher,
-        credential_aad, secret_fingerprint,
+        Actor, AuthorizationService, CredentialAadParts, ENVELOPE_VERSION_V1, IdempotencyHasher,
+        SecretCipher, credential_aad, secret_fingerprint,
     },
 };
 
@@ -47,6 +47,11 @@ impl<'a> AdminService<'a> {
         })
     }
 
+    /// The keyed hasher every admin command ledger write goes through (plan 03, P1-1).
+    fn command_hasher(&self) -> IdempotencyHasher {
+        self.state.idempotency_hasher.clone()
+    }
+
     pub async fn create_application(
         &self,
         actor: &Actor,
@@ -59,7 +64,7 @@ impl<'a> AdminService<'a> {
         let spec = admin_command_spec(ctx, actor, "application.create", json!({}), &request)?;
         let actor = actor.clone();
         let ctx = ctx.clone();
-        let outcome = AdminCommandRunner::new(self.repo.clone())
+        let outcome = AdminCommandRunner::new(self.repo.clone(), self.command_hasher())
             .execute(spec, |transaction| {
                 Box::pin(async move {
                     validate_application_identifiers(
@@ -215,7 +220,7 @@ impl<'a> AdminService<'a> {
             .settings
             .provider_security
             .allow_http_provider_urls;
-        let outcome = AdminCommandRunner::new(self.repo.clone())
+        let outcome = AdminCommandRunner::new(self.repo.clone(), self.command_hasher())
             .execute(spec, |transaction| {
                 Box::pin(async move {
                     require_non_empty("display_name", &request.display_name)?;
@@ -359,7 +364,7 @@ impl<'a> AdminService<'a> {
         )?;
         let actor = actor.clone();
         let ctx = ctx.clone();
-        let outcome = AdminCommandRunner::new(self.repo.clone())
+        let outcome = AdminCommandRunner::new(self.repo.clone(), self.command_hasher())
             .execute(spec, |transaction| {
                 Box::pin(async move {
                     require_non_empty("model_key", &request.model_key)?;
@@ -491,7 +496,7 @@ impl<'a> AdminService<'a> {
         let actor = actor.clone();
         let ctx = ctx.clone();
         let cipher = self.state.cipher.clone();
-        let outcome = AdminCommandRunner::new(self.repo.clone())
+        let outcome = AdminCommandRunner::new(self.repo.clone(), self.command_hasher())
             .execute(spec, |transaction| {
                 Box::pin(async move {
                     require_active_row(transaction, "providers", request.provider_id, "provider")
@@ -633,7 +638,7 @@ impl<'a> AdminService<'a> {
         let actor = actor.clone();
         let ctx = ctx.clone();
         let cipher = self.state.cipher.clone();
-        let outcome = AdminCommandRunner::new(self.repo.clone())
+        let outcome = AdminCommandRunner::new(self.repo.clone(), self.command_hasher())
             .execute(spec, |transaction| {
                 Box::pin(async move {
                     let existing = load_credential_record(transaction, id).await?;
@@ -818,7 +823,7 @@ impl<'a> AdminService<'a> {
         let ctx = ctx.clone();
         let authz = self.state.authz.clone();
         let key_hasher = self.state.key_hasher.clone();
-        let outcome = AdminCommandRunner::new(self.repo.clone())
+        let outcome = AdminCommandRunner::new(self.repo.clone(), self.command_hasher())
             .execute(spec, |transaction| {
                 Box::pin(async move {
                     let mut request = request;
@@ -908,7 +913,7 @@ impl<'a> AdminService<'a> {
         let ctx = ctx.clone();
         let authz = self.state.authz.clone();
         let key_hasher = self.state.key_hasher.clone();
-        let outcome = AdminCommandRunner::new(self.repo.clone())
+        let outcome = AdminCommandRunner::new(self.repo.clone(), self.command_hasher())
             .execute(spec, |transaction| {
                 Box::pin(async move {
                     let mut request = request;
@@ -1028,7 +1033,7 @@ impl<'a> AdminService<'a> {
         let key_hasher = self.state.key_hasher.clone();
         let table = table.to_string();
         let namespace = namespace.to_string();
-        let outcome = AdminCommandRunner::new(self.repo.clone())
+        let outcome = AdminCommandRunner::new(self.repo.clone(), self.command_hasher())
             .execute(spec, |transaction| {
                 Box::pin(async move {
                     let generated = key_hasher.generate(&namespace)?;
@@ -1132,7 +1137,7 @@ impl<'a> AdminService<'a> {
         let spec = admin_command_spec(ctx, actor, "jwt_issuer.create", json!({}), &request)?;
         let actor = actor.clone();
         let ctx = ctx.clone();
-        let outcome = AdminCommandRunner::new(self.repo.clone())
+        let outcome = AdminCommandRunner::new(self.repo.clone(), self.command_hasher())
             .execute(spec, |transaction| {
                 Box::pin(async move {
                     validate_https_url("jwks_url", &request.jwks_url)?;

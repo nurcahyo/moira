@@ -10,7 +10,7 @@ use crate::{
         AdminIdempotencyClaim, AdminIdempotencyClaimOutcome, PgAdminCommandTransaction,
         PgAdminRepository,
     },
-    security::request_hash,
+    security::{IdempotencyHasher, request_hash},
 };
 
 const ADMIN_COMMAND_VERSION: u16 = 1;
@@ -50,6 +50,10 @@ pub struct AdminCommandOutcome<T> {
 #[derive(Debug, Clone)]
 pub struct AdminCommandRunner {
     repository: PgAdminRepository,
+    /// Keyed hasher for every ledger value this runner writes (plan 03, P1-1). Admin
+    /// command bodies carry provider API keys and credential material, so their digests
+    /// must not be offline-attackable from the database alone.
+    hasher: IdempotencyHasher,
 }
 
 #[derive(Debug, Serialize, serde::Deserialize)]
@@ -93,7 +97,21 @@ impl AdminCommandSpec {
         self
     }
 
-    pub fn request_hash(&self) -> Result<String, AppError> {
+    /// The keyed, versioned hash of the canonical command envelope — the value written to
+    /// `idempotency_records.request_hash` for every new claim.
+    pub fn request_hash(&self, hasher: &IdempotencyHasher) -> Result<String, AppError> {
+        self.envelope_bytes().map(|bytes| hasher.hash(&bytes))
+    }
+
+    /// The legacy unkeyed hash of the same envelope.
+    ///
+    /// Only used to compare against rows written before the HMAC switch (plan 03, P1-1);
+    /// never written. Legacy rows expire within `IDEMPOTENCY_RETENTION_HOURS`.
+    pub fn legacy_request_hash(&self) -> Result<String, AppError> {
+        self.envelope_bytes().map(|bytes| request_hash(&bytes))
+    }
+
+    fn envelope_bytes(&self) -> Result<Vec<u8>, AppError> {
         let envelope = json!({
             "version": ADMIN_COMMAND_VERSION,
             "operation": self.operation,
@@ -101,9 +119,7 @@ impl AdminCommandSpec {
             "request": self.request,
             "expected_version": self.expected_version,
         });
-        serde_json::to_vec(&canonicalize(envelope))
-            .map(|bytes| request_hash(&bytes))
-            .map_err(invalid_command)
+        serde_json::to_vec(&canonicalize(envelope)).map_err(invalid_command)
     }
 }
 
@@ -141,8 +157,8 @@ where
 }
 
 impl AdminCommandRunner {
-    pub fn new(repository: PgAdminRepository) -> Self {
-        Self { repository }
+    pub fn new(repository: PgAdminRepository, hasher: IdempotencyHasher) -> Self {
+        Self { repository, hasher }
     }
 
     pub async fn execute<T, F>(
@@ -160,10 +176,16 @@ impl AdminCommandRunner {
         let claim = spec.idempotency.as_ref().map(|idempotency| {
             Ok::<_, AppError>(AdminIdempotencyClaim {
                 record_id: Uuid::now_v7(),
-                key_hash: request_hash(idempotency.key.as_bytes()),
+                key_hash: self.hasher.hash(idempotency.key.as_bytes()),
+                // The key hash is an index key under the unique index on
+                // (idempotency_key_hash, actor_fingerprint, operation), so a legacy row
+                // is unreachable by the versioned hash alone. Carrying the legacy value
+                // keeps pre-deploy claims replayable until they expire.
+                legacy_key_hash: self.hasher.legacy_hash(idempotency.key.as_bytes()),
                 actor_fingerprint: idempotency.actor_fingerprint.clone(),
                 operation: spec.operation.clone(),
-                request_hash: spec.request_hash()?,
+                request_hash: spec.request_hash(&self.hasher)?,
+                legacy_request_hash: spec.legacy_request_hash()?,
                 expires_at: Utc::now() + Duration::hours(IDEMPOTENCY_RETENTION_HOURS),
             })
         });
@@ -323,6 +345,30 @@ fn invalid_command(error: serde_json::Error) -> AppError {
 mod tests {
     use super::*;
 
+    fn hasher() -> IdempotencyHasher {
+        IdempotencyHasher::new(b"command-pepper".to_vec(), "v1")
+    }
+
+    #[test]
+    fn command_hash_is_keyed_and_versioned() {
+        let spec = AdminCommandSpec::new(
+            "credential.create",
+            json!({}),
+            json!({"secret": "sk-live-not-recoverable"}),
+        )
+        .unwrap();
+
+        let hashed = spec.request_hash(&hasher()).unwrap();
+        assert!(hashed.starts_with("v1:"));
+        assert_ne!(hashed, spec.legacy_request_hash().unwrap());
+        assert_ne!(
+            hashed,
+            spec.request_hash(&IdempotencyHasher::new(b"other".to_vec(), "v1"))
+                .unwrap(),
+            "the pepper must actually key the command envelope digest"
+        );
+    }
+
     #[test]
     fn command_hash_is_stable_across_object_key_order() {
         let left = AdminCommandSpec::new(
@@ -338,7 +384,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(left.request_hash().unwrap(), right.request_hash().unwrap());
+        let hasher = hasher();
+        assert_eq!(
+            left.request_hash(&hasher).unwrap(),
+            right.request_hash(&hasher).unwrap()
+        );
     }
 
     #[test]
@@ -357,13 +407,14 @@ mod tests {
         .unwrap();
         let versioned = base.clone().with_expected_version(Some(4));
 
+        let hasher = hasher();
         assert_ne!(
-            base.request_hash().unwrap(),
-            other_path.request_hash().unwrap()
+            base.request_hash(&hasher).unwrap(),
+            other_path.request_hash(&hasher).unwrap()
         );
         assert_ne!(
-            base.request_hash().unwrap(),
-            versioned.request_hash().unwrap()
+            base.request_hash(&hasher).unwrap(),
+            versioned.request_hash(&hasher).unwrap()
         );
     }
 

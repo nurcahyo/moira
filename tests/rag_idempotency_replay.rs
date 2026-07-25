@@ -31,7 +31,7 @@ use axum::{
 use moira::{
     application::{ConversationService, RequestContext},
     domain::RagDocumentIngestRequest,
-    security::{Actor, ActorType, request_hash},
+    security::{Actor, ActorType},
 };
 use serde_json::{Value, json};
 use tokio::{sync::Barrier, task::JoinHandle, time::timeout};
@@ -337,6 +337,14 @@ impl RagFixture {
         .expect("audit-by-request count")
     }
 
+    /// The stored `idempotency_key_hash` for a raw Idempotency-Key.
+    ///
+    /// Keyed by the deployment pepper since plan 03 (P1-1), so the ledger can no longer be
+    /// probed with a bare SHA-256 of the key.
+    fn key_hash(&self, key: &str) -> String {
+        self.fixture.state.idempotency_hasher.hash(key.as_bytes())
+    }
+
     /// Every ledger row for `(operation, key)` regardless of whether it was finalized.
     async fn ledger_count(&self, operation: &str, key: &str) -> i64 {
         timeout(
@@ -346,7 +354,7 @@ impl RagFixture {
                  where operation = $1 and idempotency_key_hash = $2",
             )
             .bind(operation)
-            .bind(request_hash(key.as_bytes()))
+            .bind(self.key_hash(key))
             .fetch_one(&self.fixture.pool),
         )
         .await
@@ -385,7 +393,7 @@ impl RagFixture {
                  where operation = $1 and idempotency_key_hash = $2",
             )
             .bind(operation)
-            .bind(request_hash(key.as_bytes()))
+            .bind(self.key_hash(key))
             .fetch_one(&self.fixture.pool),
         )
         .await
@@ -447,7 +455,7 @@ impl RagFixture {
         timeout(
             WAIT,
             sqlx::query(statement)
-                .bind(request_hash(key.as_bytes()))
+                .bind(self.key_hash(key))
                 .bind(operation)
                 .execute(&self.fixture.pool),
         )
@@ -1174,7 +1182,7 @@ async fn failed_ingest_replays_the_same_deterministic_failure() {
                    and response_status = 404 and resource_id is null",
             )
             .bind(INGEST_OPERATION)
-            .bind(request_hash(key.as_bytes()))
+            .bind(fixture.key_hash(&key))
             .fetch_one(&fixture.fixture.pool),
         )
         .await

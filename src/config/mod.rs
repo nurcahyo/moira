@@ -3,6 +3,6 @@ pub mod telemetry;
 
 pub use settings::{
     AuthSettings, CacheSettings, CallerAuthSettings, CorsSettings, DatabaseSettings,
-    DeploymentEnvironment, DeploymentSettings, JwtAuthSettings, ProcessMode, RedisSettings,
-    SecretSettings, ServerSettings, Settings, TelemetrySettings, WorkerSettings,
+    DeploymentEnvironment, DeploymentSettings, JwksFetchSettings, JwtAuthSettings, ProcessMode,
+    RedisSettings, SecretSettings, ServerSettings, Settings, TelemetrySettings, WorkerSettings,
 };

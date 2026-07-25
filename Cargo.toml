@@ -4,6 +4,15 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
 
+[features]
+default = []
+# Adds two undocumented probe routes to the router so `tests/http_middleware_contract.rs`
+# can exercise `CatchPanicLayer` and the 504 envelope mapper over a real socket. An
+# integration test links the library built **without** `cfg(test)`, so a `#[cfg(test)]`
+# route is invisible to it; a feature gate is the only cfg that works here. It is off by
+# default, so `cargo build --release --locked` cannot produce a binary containing them.
+test-routes = []
+
 [dependencies]
 aes-gcm = "0.10"
 anyhow = "1"
@@ -15,6 +24,7 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 config = { version = "0.15", default-features = false, features = ["toml", "yaml"] }
 futures-util = "0.3"
+hmac = "0.12"
 jsonwebtoken = "9"
 opentelemetry = "0.32"
 redis = { version = "0.32", default-features = false, features = ["tokio-comp"] }
@@ -29,7 +39,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "request-id", "trace", "util"] }
+tower-http = { version = "0.6", features = ["catch-panic", "cors", "request-id", "timeout", "trace", "util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 utoipa = { version = "5", features = ["chrono", "uuid"] }
