@@ -297,6 +297,11 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         description: "Used when the application policy disables responses.",
     },
     I18nEntry {
+        key: "moira.error.routing_policy_provider_model_mismatch",
+        default_message: "The routing policy references a provider model that does not belong to the selected provider.",
+        description: "Used when a routing policy create/patch names a provider_model_id that is not owned by the given provider_id.",
+    },
+    I18nEntry {
         key: "moira.error.scope_invalid",
         default_message: "The requested scope is invalid.",
         description: "Used when a scope string fails validation.",

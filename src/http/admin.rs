@@ -2292,3 +2292,53 @@ pub async fn diagnose_runtime(
         .await
         .map(Json)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::CredentialType;
+    use axum::http::Uri;
+
+    /// Finding P2-9. `PageQuery` carries `#[serde(deny_unknown_fields)]`
+    /// (`src/domain/admin.rs`), and every admin list handler takes it through
+    /// `Query<PageQuery>` — but nothing asserted the attribute actually
+    /// rejected anything, so removing it would have been silent. This goes
+    /// through the real `Query` extractor rather than `serde_urlencoded`
+    /// directly, because the extractor is what the routes use.
+    #[test]
+    fn page_query_rejects_a_field_absent_from_the_struct() {
+        let uri: Uri = "/api/v1/admin/applications?not_a_real_field=1"
+            .parse()
+            .expect("test URI");
+        let rejection = Query::<PageQuery>::try_from_uri(&uri)
+            .expect_err("a field absent from PageQuery must be rejected");
+        let described = rejection.to_string();
+        assert!(
+            described.contains("not_a_real_field"),
+            "the rejection must name the offending field, got: {described}"
+        );
+
+        // The control: a field that *is* on the struct still parses, so the
+        // assertion above is about the unknown field and not about the
+        // extractor rejecting every query string it sees.
+        let accepted: Uri = "/api/v1/admin/applications?limit=7"
+            .parse()
+            .expect("test URI");
+        let query = Query::<PageQuery>::try_from_uri(&accepted).expect("a known field must parse");
+        assert_eq!(query.0.limit, Some(7));
+    }
+
+    /// The companion to the rejection above: `deny_unknown_fields` is a
+    /// *shape* check, not a relevance check. All 26 fields parse on every
+    /// list route, including ones that endpoint has no use for. Pinned here
+    /// so the nuance recorded on `PageQuery`(P2-9) cannot quietly change.
+    #[test]
+    fn page_query_accepts_a_defined_field_that_the_endpoint_ignores() {
+        let uri: Uri = "/api/v1/admin/applications?credential_type=api_key"
+            .parse()
+            .expect("test URI");
+        let query = Query::<PageQuery>::try_from_uri(&uri)
+            .expect("a field defined on PageQuery must parse on any list route");
+        assert_eq!(query.0.credential_type, Some(CredentialType::ApiKey));
+    }
+}
