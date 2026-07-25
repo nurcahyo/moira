@@ -35,7 +35,31 @@ config = { version = "0.15", default-features = false, features = ["toml", "yaml
 futures-util = "0.3"
 hmac = "0.12"
 jsonwebtoken = "9"
+metrics = "0.24"
+# `default-features = false` is a SECURITY requirement, not a size preference. The default
+# feature set is `["http-listener", "push-gateway"]`: `http-listener` starts an independent
+# HTTP server that exposes the whole metric registry on its own port, bypassing both
+# `settings.telemetry.prometheus_enabled` and the `/metrics` route contract; `push-gateway`
+# ships metrics outbound on a timer. Moira serves `/metrics` itself through Axum and needs
+# only the recorder plus `PrometheusHandle::render()`, both in the feature-free core.
+metrics-exporter-prometheus = { version = "0.17", default-features = false }
 opentelemetry = "0.32"
+# OTLP over HTTP/protobuf, deliberately NOT gRPC. `grpc-tonic` would pull tonic 0.14 +
+# tonic-prost + tonic-types into a tree that contains no tonic today; `http-proto` reuses the
+# `reqwest` 0.13 client Moira already depends on and adds only `prost` + `opentelemetry-proto`
+# (`gen-tonic-messages = ["prost"]` — no tonic). `reqwest-rustls` resolves to
+# `reqwest/default-tls`, which in reqwest 0.13 is `rustls` — matching Moira's rustls-only posture.
+#
+# `reqwest-blocking-client`, NOT `reqwest-client`, and this is load-bearing: the non-experimental
+# `opentelemetry_sdk::trace::BatchSpanProcessor` drains its queue on a dedicated OS thread using
+# `futures_executor::block_on`, which carries no Tokio reactor. The async reqwest backend then
+# panics there with "there is no reactor running, must be called from the context of a Tokio 1.x
+# runtime" on the first export. Verified empirically, not inferred. The blocking backend runs its
+# own internal runtime on its own thread and exports cleanly; it is also upstream's own default.
+# The async backend would additionally require `opentelemetry_sdk`'s
+# `experimental_trace_batch_span_processor_with_async_runtime` + `rt-tokio` features.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "internal-logs", "reqwest-blocking-client", "reqwest-rustls", "trace"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["internal-logs", "trace"] }
 redis = { version = "0.32", default-features = false, features = ["tokio-comp"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 rig-core = "0.40"
@@ -50,6 +74,11 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["catch-panic", "cors", "request-id", "timeout", "trace", "util"] }
 tracing = "0.1"
+# `default-features = false` drops the optional `metrics` feature, which would add
+# `tracing_opentelemetry::MetricsLayer` — a second, OTel-side metrics pipeline. Moira's metrics
+# surface is Prometheus via `src/infra/metrics.rs` only. `tracing-log` is kept so `log`-crate
+# records from dependencies still reach the OTel bridge.
+tracing-opentelemetry = { version = "0.33", default-features = false, features = ["tracing-log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 utoipa = { version = "5", features = ["chrono", "uuid"] }
 utoipa-axum = "0.2"

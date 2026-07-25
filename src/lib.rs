@@ -14,7 +14,7 @@ pub mod security;
 use axum::{
     Router,
     body::Body,
-    extract::State,
+    extract::{MatchedPath, State},
     http::{HeaderValue, Request, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -245,10 +245,24 @@ async fn metrics_middleware(
     next: Next,
 ) -> Response {
     let started = Instant::now();
+    // The route label is the matched route **template** (`/api/v1/admin/applications/{id}`),
+    // taken from `MatchedPath`, never `req.uri().path()`. A resolved path carries
+    // request-scoped UUIDs, which would make the histogram's label set unbounded — a
+    // memory-exhaustion vector in the scrape path, not merely untidy output. Requests that
+    // matched no route carry no `MatchedPath`; `None` is folded into a single constant label
+    // inside `MetricsRegistry`, again rather than falling back to the raw URI.
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|matched| matched.as_str().to_owned());
+    let method = req.method().clone();
     let response = next.run(req).await;
+    let status = response.status();
+    let latency = started.elapsed();
+    state.metrics.record_http_response(status, latency);
     state
         .metrics
-        .record_http_response(response.status(), started.elapsed());
+        .record_http_latency(route.as_deref(), &method, status, latency);
     response
 }
 
@@ -310,6 +324,52 @@ mod tests {
 
     fn router_for(settings: Settings) -> Router {
         build_router(AppState::new(settings, None).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn metrics_middleware_labels_routes_by_template_never_by_resolved_path() {
+        // The half of the low-cardinality contract that lives outside `MetricsRegistry`:
+        // `metrics_middleware` must read `MatchedPath`, not `req.uri().path()`. Driven
+        // through the real router so the assertion covers the actual extension plumbing.
+        let application_id = "3f1a5c4e-9d2b-4f7a-8c11-6b0d5e7a2f93";
+        let state = AppState::new(Settings::default(), None).unwrap();
+        let metrics = state.metrics.clone();
+        let router = build_router(state).unwrap();
+
+        // A parameterised admin route: unauthenticated, so it 401s, but it *matched*, which
+        // is all `MatchedPath` needs.
+        let _ = send(
+            router.clone(),
+            Request::builder()
+                .uri(format!("/api/v1/admin/applications/{application_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        // A path that matches nothing at all: the fallback label must be a constant.
+        let _ = send(
+            router,
+            Request::builder()
+                .uri(format!("/definitely/not/a/route/{application_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        let rendered = metrics.render_prometheus("moira", false, false);
+        assert!(
+            rendered.contains("route=\"/api/v1/admin/applications/{id}\""),
+            "expected the matched route template in:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(application_id),
+            "the resolved path's identifier reached a metric label:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("/definitely/not/a/route"),
+            "an unmatched raw path reached a metric label:\n{rendered}"
+        );
+        assert!(rendered.contains("route=\"unmatched\""));
     }
 
     async fn send(router: Router, request: Request<Body>) -> Response {

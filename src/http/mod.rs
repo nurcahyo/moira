@@ -1439,6 +1439,317 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------
+    // OpenAPI drift gate (plan 05 / P1-10a)
+    //
+    // `docs/openapi.json` is the frozen contract every later plan diffs against.
+    // Everything below exists so that a route, DTO, parameter, status code or
+    // header change that is not accompanied by a regenerated spec fails
+    // `cargo test` with an actionable message, rather than silently shipping a
+    // document that no consumer of `docs/openapi.json` can see.
+    // ---------------------------------------------------------------------
+
+    /// Committed contract, relative to the crate root.
+    const COMMITTED_OPENAPI_PATH: &str = "docs/openapi.json";
+
+    /// The exact command that regenerates the committed contract.
+    ///
+    /// This constant is load-bearing, not decorative: a drift gate whose failure
+    /// message does not say how to fix it gets bypassed, so
+    /// `openapi_drift_failure_message_names_the_regeneration_command` asserts the
+    /// panic text carries it.
+    const REGENERATE_OPENAPI_COMMAND: &str = "UPDATE_SNAPSHOTS=1 cargo test --lib \
+         http::tests::committed_openapi_matches_the_generated_document";
+
+    fn committed_openapi_file() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(COMMITTED_OPENAPI_PATH)
+    }
+
+    /// Serializes the document that `/openapi.json` actually serves.
+    ///
+    /// [`documented_router`] is the only correct source. `MoiraApiDoc::openapi()`
+    /// is *not*: it is the bare derive output, before the `.routes(...)`
+    /// registrations in [`documented_router`] add any path and before
+    /// [`openapi::finalize_document`] adds the `X-Request-Id` parameter and
+    /// response header to every operation. Freezing that document would freeze a
+    /// fiction — [`router`] hands `documented_router(policy).split_for_parts()`'s
+    /// document to the `/openapi.json` handler as an `Extension`, and the handler
+    /// serves exactly that value (`src/http/openapi.rs`, `openapi_json`).
+    ///
+    /// The output is canonical: serializing through [`Value`] first means every
+    /// object key is emitted in sorted order, because `serde_json::Map` is a
+    /// `BTreeMap` (serde_json's `preserve_order` feature is off in this
+    /// workspace) and utoipa's `Paths` is a `BTreeMap` too (its
+    /// `preserve_path_order` feature is off). Nothing in the pipeline is a
+    /// `HashMap`, so the byte output cannot depend on iteration order — which is
+    /// what `openapi_document_serialization_is_byte_stable_within_a_process`
+    /// checks rather than assumes.
+    fn generate_openapi_json(policy: RouterPolicy) -> String {
+        let document = documented_router(policy).into_openapi();
+        let value =
+            serde_json::to_value(document).expect("serialize the generated OpenAPI document");
+        let mut text = serde_json::to_string_pretty(&value)
+            .expect("render the generated OpenAPI document as JSON");
+        text.push('\n');
+        text
+    }
+
+    /// Collects JSON pointers at which two documents disagree.
+    ///
+    /// A whole-document `assert_eq!` on a ~500 KB spec is unreadable, and an
+    /// unreadable failure is a failure engineers learn to ignore.
+    fn json_differences(left: &Value, right: &Value, pointer: &str, differences: &mut Vec<String>) {
+        match (left, right) {
+            (Value::Object(left_object), Value::Object(right_object)) => {
+                let keys: BTreeSet<&String> =
+                    left_object.keys().chain(right_object.keys()).collect();
+                for key in keys {
+                    let child = format!("{pointer}/{key}");
+                    match (left_object.get(key), right_object.get(key)) {
+                        (Some(left_value), Some(right_value)) => {
+                            json_differences(left_value, right_value, &child, differences);
+                        }
+                        (Some(_), None) => differences.push(format!("{child}: only in committed")),
+                        (None, Some(_)) => differences.push(format!("{child}: only in generated")),
+                        (None, None) => unreachable!("key came from one of the two maps"),
+                    }
+                }
+            }
+            (Value::Array(left_values), Value::Array(right_values)) => {
+                if left_values.len() != right_values.len() {
+                    differences.push(format!(
+                        "{pointer}: array length {} in committed, {} in generated",
+                        left_values.len(),
+                        right_values.len()
+                    ));
+                    return;
+                }
+                for (index, (left_value, right_value)) in
+                    left_values.iter().zip(right_values.iter()).enumerate()
+                {
+                    let child = format!("{pointer}/{index}");
+                    json_differences(left_value, right_value, &child, differences);
+                }
+            }
+            _ => {
+                if left != right {
+                    differences.push(format!("{pointer}: committed != generated"));
+                }
+            }
+        }
+    }
+
+    fn drift_failure_message(differences: &[String]) -> String {
+        let shown: Vec<&str> = differences
+            .iter()
+            .take(25)
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let elided = differences.len().saturating_sub(shown.len());
+        let mut message = format!(
+            "{COMMITTED_OPENAPI_PATH} is stale: it no longer matches the document served at \
+             GET /openapi.json.\nRegenerate and commit it with:\n\n    \
+             {REGENERATE_OPENAPI_COMMAND}\n\nDo not hand-edit {COMMITTED_OPENAPI_PATH}.\n\
+             {} difference(s):\n",
+            differences.len()
+        );
+        for difference in shown {
+            message.push_str("  - ");
+            message.push_str(difference);
+            message.push('\n');
+        }
+        if elided > 0 {
+            message.push_str(&format!("  … and {elided} more\n"));
+        }
+        message
+    }
+
+    fn committed_openapi_value() -> Value {
+        let path = committed_openapi_file();
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+            panic!(
+                "cannot read {}: {err}\nGenerate it with:\n\n    {REGENERATE_OPENAPI_COMMAND}\n",
+                path.display()
+            )
+        });
+        serde_json::from_str(&text).unwrap_or_else(|err| {
+            panic!(
+                "{} is not valid JSON: {err}\nRegenerate it with:\n\n    \
+                 {REGENERATE_OPENAPI_COMMAND}\n",
+                path.display()
+            )
+        })
+    }
+
+    /// Generating twice in one process must produce identical bytes.
+    ///
+    /// A gate that flaps on map iteration order gets disabled by the first person
+    /// it annoys, so determinism is verified rather than assumed.
+    #[test]
+    fn openapi_document_serialization_is_byte_stable_within_a_process() {
+        let first = generate_openapi_json(RouterPolicy::default());
+        let second = generate_openapi_json(RouterPolicy::default());
+        assert_eq!(
+            first.len(),
+            second.len(),
+            "OpenAPI serialization is not byte-stable across two generations in one process"
+        );
+        assert!(
+            first == second,
+            "OpenAPI serialization is not byte-stable across two generations in one process"
+        );
+
+        // Key ordering must be sorted, not merely repeatable: a repeatable but
+        // insertion-ordered document would still churn whenever an unrelated
+        // route is added ahead of another.
+        let document: Value = serde_json::from_str(&first).expect("the generated document parses");
+        let paths: Vec<&str> = document["paths"]
+            .as_object()
+            .expect("paths object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut sorted = paths.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            paths, sorted,
+            "OpenAPI path keys must be emitted in sorted order"
+        );
+    }
+
+    /// The frozen document must not depend on `RouterPolicy`.
+    ///
+    /// Body limits and timeouts are tower layers; if one ever leaked into the
+    /// document, the committed contract would silently depend on whichever
+    /// settings the generating machine had.
+    #[test]
+    fn openapi_document_is_independent_of_the_router_policy() {
+        let default_policy = RouterPolicy::default();
+        let alternative = RouterPolicy {
+            public_body_limit_bytes: default_policy.public_body_limit_bytes / 2,
+            conversation_body_limit_bytes: default_policy.conversation_body_limit_bytes / 2,
+            admin_body_limit_bytes: default_policy.admin_body_limit_bytes / 2,
+            non_streaming_timeout: default_policy.non_streaming_timeout + Duration::from_secs(7),
+            streaming_head_timeout: default_policy.streaming_head_timeout + Duration::from_secs(7),
+            request_body_idle_timeout: default_policy.request_body_idle_timeout
+                + Duration::from_secs(7),
+        };
+        assert_ne!(default_policy, alternative);
+        assert!(
+            generate_openapi_json(default_policy) == generate_openapi_json(alternative),
+            "the generated OpenAPI document must not vary with RouterPolicy"
+        );
+    }
+
+    /// The drift gate itself.
+    ///
+    /// Run with `UPDATE_SNAPSHOTS=1` to rewrite the committed contract; the
+    /// default run never writes.
+    #[test]
+    fn committed_openapi_matches_the_generated_document() {
+        let generated = generate_openapi_json(RouterPolicy::default());
+        let path = committed_openapi_file();
+
+        if std::env::var("UPDATE_SNAPSHOTS").is_ok_and(|value| value == "1") {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create the docs directory");
+            }
+            std::fs::write(&path, generated.as_bytes())
+                .unwrap_or_else(|err| panic!("cannot write {}: {err}", path.display()));
+            return;
+        }
+
+        let committed_text = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+            panic!(
+                "cannot read {}: {err}\nGenerate it with:\n\n    {REGENERATE_OPENAPI_COMMAND}\n",
+                path.display()
+            )
+        });
+        let committed_value: Value = serde_json::from_str(&committed_text).unwrap_or_else(|err| {
+            panic!(
+                "{} is not valid JSON: {err}\nRegenerate it with:\n\n    \
+                 {REGENERATE_OPENAPI_COMMAND}\n",
+                path.display()
+            )
+        });
+        let generated_value: Value =
+            serde_json::from_str(&generated).expect("generated document parses");
+
+        // Structural comparison first: it produces the actionable diff, and it
+        // cannot fail on key ordering.
+        let mut differences = Vec::new();
+        json_differences(&committed_value, &generated_value, "", &mut differences);
+        assert!(
+            differences.is_empty(),
+            "{}",
+            drift_failure_message(&differences)
+        );
+
+        // Byte comparison second: structurally-equal-but-differently-formatted
+        // means the file was hand-edited or written by something other than this
+        // test, which would make future diffs unreadable.
+        assert!(
+            committed_text == generated,
+            "{COMMITTED_OPENAPI_PATH} is structurally correct but not in the canonical \
+             formatting this gate writes. Do not hand-edit it; regenerate with:\n\n    \
+             {REGENERATE_OPENAPI_COMMAND}\n"
+        );
+    }
+
+    #[test]
+    fn openapi_drift_failure_message_names_the_regeneration_command() {
+        let message = drift_failure_message(&["/paths/x: committed != generated".to_string()]);
+        assert!(
+            message.contains(REGENERATE_OPENAPI_COMMAND),
+            "the drift failure message must name the regeneration command: {message}"
+        );
+        assert!(
+            message.contains(COMMITTED_OPENAPI_PATH),
+            "the drift failure message must name the committed file: {message}"
+        );
+        assert!(
+            message.contains("/paths/x"),
+            "the drift failure message must name the differing locations: {message}"
+        );
+    }
+
+    #[test]
+    fn committed_openapi_declares_openapi_3_1() {
+        let value = committed_openapi_value();
+        let version = value["openapi"]
+            .as_str()
+            .expect("the committed document must declare an `openapi` version");
+        assert!(
+            version.starts_with("3.1"),
+            "the committed document must declare OpenAPI 3.1, found {version}"
+        );
+    }
+
+    /// Mechanical proof that plan 04 landed before the contract was frozen.
+    ///
+    /// Plan 04 flipped `If-Match` on this operation from optional to required — a
+    /// breaking OpenAPI change. If this test is red, the branch was cut too
+    /// early: rebase onto a `main` that contains plan 04 and regenerate. Never
+    /// hand-edit the JSON to make it pass.
+    #[test]
+    fn committed_openapi_marks_if_match_required_on_execution_policy_put() {
+        let value = committed_openapi_value();
+        let operation = &value["paths"]["/api/v1/admin/applications/{id}/execution-policy"]["put"];
+        assert!(
+            operation.is_object(),
+            "the committed document must describe PUT /api/v1/admin/applications/{{id}}/execution-policy"
+        );
+        assert!(
+            parameter_named(operation, "If-Match"),
+            "the committed document must document the If-Match parameter on the execution-policy PUT"
+        );
+        assert!(
+            parameter_required(operation, "If-Match"),
+            "If-Match must be required on the execution-policy PUT (plan 04 / P1-8); a false here \
+             means the spec was frozen from a tree that predates plan 04"
+        );
+    }
+
     fn parameter_named(operation: &Value, name: &str) -> bool {
         operation["parameters"]
             .as_array()

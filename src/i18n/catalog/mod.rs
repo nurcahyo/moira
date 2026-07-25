@@ -173,4 +173,163 @@ mod tests {
             );
         }
     }
+
+    /// The six infrastructure error codes `AppError::code()` already emits
+    /// (`src/error.rs:128-144`) but that had no catalog entry until now (plan
+    /// 05, Module 6). `configuration_error` in particular is a *new* emitter:
+    /// plan 05's OTel fail-fast path (`otel_enabled=true` with no endpoint)
+    /// returns `AppError::Config`.
+    #[test]
+    fn infrastructure_error_keys_are_present_in_the_catalog() {
+        for key in [
+            "moira.error.configuration_error",
+            "moira.error.database_error",
+            "moira.error.database_unavailable",
+            "moira.error.http_client_error",
+            "moira.error.redis_error",
+            "moira.error.upstream_error",
+        ] {
+            assert!(is_known_key(key), "{key} must be a known catalog key");
+        }
+    }
+
+    #[test]
+    fn every_infrastructure_catalog_entry_has_a_non_empty_default_message_and_description() {
+        for key in [
+            "moira.error.configuration_error",
+            "moira.error.database_error",
+            "moira.error.database_unavailable",
+            "moira.error.http_client_error",
+            "moira.error.redis_error",
+            "moira.error.upstream_error",
+        ] {
+            let entry = all_entries()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("{key} must be catalogued"));
+            assert!(
+                !entry.default_message.is_empty(),
+                "{key} default_message must be non-empty"
+            );
+            assert!(
+                !entry.description.is_empty(),
+                "{key} description must be non-empty"
+            );
+        }
+    }
+
+    /// `moira.error.upstream_error` is the code for `AppError::Upstream` and
+    /// must stay distinct from the three `AppError::coded` upstream
+    /// *condition* keys (`upstream_bad_response` / `upstream_timeout` /
+    /// `upstream_unavailable`) used elsewhere — none may be merged, renamed,
+    /// or removed while adding the new key.
+    #[test]
+    fn upstream_error_is_distinct_from_the_three_existing_upstream_condition_keys() {
+        let upstream_keys = [
+            "moira.error.upstream_error",
+            "moira.error.upstream_bad_response",
+            "moira.error.upstream_timeout",
+            "moira.error.upstream_unavailable",
+        ];
+        for key in upstream_keys {
+            assert!(is_known_key(key), "{key} must be a known catalog key");
+        }
+        let unique: std::collections::BTreeSet<_> = upstream_keys.iter().collect();
+        assert_eq!(
+            unique.len(),
+            upstream_keys.len(),
+            "the four upstream_* keys must all be distinct"
+        );
+        // `upstream_error`'s entry must not merely alias one of the three
+        // condition entries' wording.
+        let upstream_error_message = default_message_for_key("moira.error.upstream_error")
+            .expect("moira.error.upstream_error must be catalogued");
+        for condition_key in [
+            "moira.error.upstream_bad_response",
+            "moira.error.upstream_timeout",
+            "moira.error.upstream_unavailable",
+        ] {
+            let condition_message = default_message_for_key(condition_key)
+                .unwrap_or_else(|| panic!("{condition_key} must be catalogued"));
+            assert_ne!(
+                upstream_error_message, condition_message,
+                "moira.error.upstream_error must not share default_message with {condition_key}"
+            );
+        }
+    }
+
+    /// Connects to a closed loopback port to obtain a real `reqwest::Error`
+    /// without any external network access (reqwest has no public
+    /// constructor for `Error`, so this is the only way to produce one from
+    /// outside the crate that owns it).
+    async fn unreachable_reqwest_error() -> reqwest::Error {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral loopback port");
+        let port = listener.local_addr().expect("read local addr").port();
+        // Free the port immediately so nothing is listening on it; connecting
+        // to it below must fail fast with "connection refused".
+        drop(listener);
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("client builds without making a connection");
+
+        client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .expect_err("connecting to a closed loopback port must fail")
+    }
+
+    /// The mechanical guard for `CONVENTIONS.md` §4.1: every `AppError`
+    /// variant whose `code()` is fixed by the enum itself (as opposed to a
+    /// caller-supplied `AppError::coded`/`AppError::Api` code) is constructed
+    /// here and its `message_key` — derived by the real
+    /// `format!("moira.error.{}", code())` path in `error_response()`, never
+    /// retyped by hand — is checked against the catalog. This is the test
+    /// that would have caught the six-code gap this module closes, and it
+    /// keeps `§4` honest for this axis until plan 06's systematic drift test
+    /// lands.
+    #[tokio::test]
+    async fn every_error_message_key_resolves_to_a_catalog_entry() {
+        use crate::error::AppError;
+
+        let reqwest_error = unreachable_reqwest_error().await;
+
+        let errors: Vec<AppError> = vec![
+            AppError::BadRequest("test".to_string()),
+            AppError::Unauthorized("test".to_string()),
+            AppError::Forbidden("test".to_string()),
+            AppError::NotFound("test".to_string()),
+            AppError::DatabaseUnavailable,
+            AppError::Upstream("test".to_string()),
+            AppError::Config("test".to_string()),
+            AppError::Internal("test".to_string()),
+            AppError::Sqlx(sqlx::Error::RowNotFound),
+            AppError::Redis(redis::RedisError::from((redis::ErrorKind::IoError, "test"))),
+            AppError::Reqwest(reqwest_error),
+        ];
+
+        assert_eq!(
+            errors.len(),
+            11,
+            "this list must cover every fixed-code AppError variant; update it \
+             (and this count) whenever a variant is added or removed in src/error.rs"
+        );
+
+        for error in errors {
+            let response = error.error_response(None);
+            assert!(
+                is_known_key(&response.error.message_key),
+                "message_key {:?} (code {:?}) has no catalog entry",
+                response.error.message_key,
+                response.error.code
+            );
+            assert!(
+                !response.error.message.is_empty(),
+                "message for code {:?} must be non-empty",
+                response.error.code
+            );
+        }
+    }
 }

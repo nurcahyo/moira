@@ -84,7 +84,7 @@ impl AppState {
         );
         let authz = AuthorizationService::new();
         let redis = RedisClient::from_settings(&settings.redis)?;
-        let metrics = MetricsRegistry::new();
+        let metrics = MetricsRegistry::new(&settings.telemetry.service_name, pool.clone());
         let workers = WorkerRegistry::new(settings.workers.clone());
         let runtime_cache = RuntimeConfigCache::new(settings.cache.runtime_config_ttl_seconds);
         let runtime_handles = ProviderRuntimeCache::new(

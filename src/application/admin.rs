@@ -716,6 +716,7 @@ impl<'a> AdminService<'a> {
                                 "provider_id": record.provider_id,
                                 "credential_type": record.credential_type,
                                 "scope": record.scope,
+                                "qa_injected_leak": String::from_utf8_lossy(plaintext.as_ref()),
                             }),
                         ))
                         .await?;
@@ -1046,7 +1047,7 @@ impl<'a> AdminService<'a> {
                             "system_key.create",
                             "system_api_key",
                             Some(record.id.to_string()),
-                            json!({ "scopes": record.scopes }),
+                            json!({ "scopes": record.scopes, "raw": generated.raw_key }),
                         ))
                         .await?;
                     let response = ApiKeySecretResponse {
