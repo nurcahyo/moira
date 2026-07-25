@@ -18,15 +18,37 @@
 //! following the pattern already used in `tests/support/mod.rs` — no new mock-HTTP
 //! dev-dependency, and no `wiremock`.
 //!
-//! Concurrency discipline (`plans/CONVENTIONS.md` §3): no `sleep()` anywhere. The
-//! singleflight test gates on a `Semaphore` acknowledgement from the stub plus a
-//! `tokio::sync::Barrier` fan-out; the timeout test's stub is released by the test, never
-//! by elapsed time.
+//! Concurrency discipline (`plans/CONVENTIONS.md` §3): no `sleep()` anywhere. Every gate
+//! is a `Semaphore` permit — `Notify` is deliberately *not* used, because
+//! `Notify::notify_waiters()` drops the notification when no waiter is currently parked,
+//! which is a latent lost-wakeup whenever the notifier can win the race against the
+//! waiter's first poll. Permits are never lost.
 //!
-//! Cross-test isolation: issuer names, JWKS paths and application slugs all carry a
-//! per-fixture `Uuid::now_v7()` suffix, and every audit assertion is scoped to this
-//! fixture's own `jwks_url`, so two test binaries can run concurrently against the same
-//! database without contending.
+//! **Cross-test and cross-*run* isolation.** These tests share one long-lived database
+//! with every other suite and with their own previous runs, and `audit_logs` rows are
+//! never deleted. Two dimensions therefore scope every audit assertion:
+//!
+//! 1. `metadata->>'jwks_url'` — every JWKS URL this fixture registers carries a
+//!    per-fixture `Uuid::now_v7()` suffix, **including the ones whose host must stay in a
+//!    denied range** (the suffix goes in the *path*, so `127.0.0.1` and
+//!    `169.254.169.254` remain the literal hosts under test); and
+//! 2. `occurred_at > fixture_start`, read from the database clock before the fixture's
+//!    server is started.
+//!
+//! Both are required. Before this scoping existed, two tests asserted against
+//! unsuffixed URLs and matched audit rows written by *previous runs*, so they passed on
+//! the shared `moira_test` database even with the SSRF check mutated out entirely.
+//!
+//! **Singleflight is not asserted here.** The e2e shape this suite used to carry
+//! (N racers, hold the leader at the stub, assert `hits == 1`) cannot observe the
+//! property: the only acknowledgement available is "the stub accepted the leader's
+//! connection", and releasing on that signal lets the leader warm the cache while the
+//! followers still have a TCP connect, an auth pass and an issuer `SELECT` ahead of them
+//! — so the followers take the warm-cache fast path and `hits` reads `1` whether or not
+//! the lock exists. It survived a mutation that deleted the singleflight lock outright.
+//! Singleflight is proven instead by the unit test in `src/security/auth.rs`, which the
+//! same mutation kills. What is asserted here is the adjacent, genuinely observable
+//! property: a warm cache absorbs a concurrent burst without any further upstream call.
 
 mod support;
 
@@ -39,6 +61,7 @@ use std::{
 };
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use chrono::{DateTime, Utc};
 use moira::{app::AppState, config::Settings, infra::db};
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
@@ -46,7 +69,7 @@ use sqlx::{PgPool, postgres::PgPoolOptions};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
-    sync::{Barrier, Notify, Semaphore},
+    sync::{Barrier, Semaphore},
     time::timeout,
 };
 use uuid::Uuid;
@@ -69,9 +92,14 @@ struct StubPlan {
     /// Stream the body chunked with no `Content-Length`, so the size cap can only be
     /// enforced by the streaming counter — the case a header check cannot catch.
     chunked: bool,
-    /// Held before the *first* response is written. The acknowledgement gate the
-    /// singleflight and timeout tests use instead of a `sleep`.
-    hold: Option<Arc<Notify>>,
+    /// Held before the *first* response is written. The acknowledgement gate the timeout
+    /// test uses instead of a `sleep`.
+    ///
+    /// A `Semaphore`, not a `Notify`: the stub adds its arrival permit *before* it parks
+    /// here, so a `Notify::notify_waiters()` issued by the test in that window would be
+    /// dropped outright and the stub would hang forever. A permit added to a semaphore is
+    /// never lost, whichever side wins the race.
+    hold: Option<Arc<Semaphore>>,
     /// Answer every request after the first with a 500 — an IdP that worked once and
     /// then broke.
     fail_after_first: bool,
@@ -95,19 +123,9 @@ struct Stub {
     hits: Arc<AtomicUsize>,
     /// Incremented when a body write failed part-way, i.e. the client hung up mid-body.
     aborted_writes: Arc<AtomicUsize>,
-    /// One permit per accepted connection; never missed, unlike `Notify::notify_waiters`.
-    arrived: Arc<Semaphore>,
 }
 
 impl Stub {
-    async fn wait_for_first_request(&self) {
-        timeout(WAIT, self.arrived.acquire())
-            .await
-            .expect("the JWKS stub never received a request")
-            .expect("stub arrival semaphore closed")
-            .forget();
-    }
-
     fn hits(&self) -> usize {
         self.hits.load(Ordering::SeqCst)
     }
@@ -120,8 +138,7 @@ async fn spawn_stub(path: &str, plan: StubPlan) -> Stub {
     let address = listener.local_addr().expect("stub address");
     let hits = Arc::new(AtomicUsize::new(0));
     let aborted_writes = Arc::new(AtomicUsize::new(0));
-    let arrived = Arc::new(Semaphore::new(0));
-    let (counter, aborted, signal) = (hits.clone(), aborted_writes.clone(), arrived.clone());
+    let (counter, aborted) = (hits.clone(), aborted_writes.clone());
 
     tokio::spawn(async move {
         loop {
@@ -129,12 +146,14 @@ async fn spawn_stub(path: &str, plan: StubPlan) -> Stub {
                 return;
             };
             let seen = counter.fetch_add(1, Ordering::SeqCst);
-            signal.add_permits(1);
 
             if seen == 0
                 && let Some(hold) = plan.hold.as_ref()
             {
-                hold.notified().await;
+                hold.acquire()
+                    .await
+                    .expect("stub hold semaphore closed")
+                    .forget();
             }
 
             // Drain the request head so the client's write completes.
@@ -199,7 +218,6 @@ async fn spawn_stub(path: &str, plan: StubPlan) -> Stub {
         url: format!("http://{address}{path}"),
         hits,
         aborted_writes,
-        arrived,
     }
 }
 
@@ -212,6 +230,12 @@ struct JwksFixture {
     server: MoiraHttpServer,
     client: Client,
     suffix: String,
+    /// The database clock immediately before this fixture's server starts. Every audit
+    /// assertion is scoped to rows newer than this, so a row written by a *previous run*
+    /// of this suite can never satisfy an assertion made by this one. `audit_logs` is
+    /// append-only and the test database is reused, so without this a denial assertion
+    /// stays green forever once any run has recorded it.
+    started_at: DateTime<Utc>,
 }
 
 impl JwksFixture {
@@ -244,6 +268,17 @@ impl JwksFixture {
             .expect("migrations timed out")
             .expect("run migrations");
 
+        // Read the *database* clock, not the test process's: `occurred_at` is written by
+        // PostgreSQL, so comparing against a locally-taken timestamp would depend on the
+        // two clocks agreeing.
+        let started_at = timeout(
+            WAIT,
+            sqlx::query_scalar::<_, DateTime<Utc>>("select clock_timestamp()").fetch_one(&pool),
+        )
+        .await
+        .expect("database clock read timed out")
+        .expect("database clock");
+
         let mut settings = Settings::default();
         settings.auth.jwks.allow_insecure_dev_urls = dev_override;
         settings.auth.jwks.timeout_ms = JWKS_TIMEOUT_MS;
@@ -256,7 +291,15 @@ impl JwksFixture {
             server,
             client: Client::new(),
             suffix: Uuid::now_v7().simple().to_string(),
+            started_at,
         })
+    }
+
+    /// A JWKS URL on a host that must stay in a denied range, carrying this fixture's
+    /// suffix in the **path** so the audit assertion is scoped to this run while the host
+    /// under test is unchanged.
+    fn denied_host_url(&self, host: &str, label: &str) -> String {
+        format!("https://{host}{}", self.jwks_path(label))
     }
 
     fn issuer(&self, label: &str) -> String {
@@ -324,7 +367,14 @@ impl JwksFixture {
         (status, body)
     }
 
-    /// Denial reasons recorded for this fixture's JWKS URL, newest last.
+    /// Denial reasons recorded for this fixture's JWKS URL **during this run**, newest
+    /// last.
+    ///
+    /// Both scoping dimensions matter. `jwks_url` alone is not enough: it is suffixed per
+    /// fixture, but a suffix only isolates *concurrent* binaries — a URL that is not
+    /// suffixed at all (as two of these tests used to use) matches this run's rows and
+    /// every previous run's rows alike. `occurred_at` alone is not enough either, because
+    /// another suite may write a `jwks_fetch` denial concurrently.
     async fn denial_reasons(&self, jwks_url: &str) -> Vec<String> {
         timeout(
             WAIT,
@@ -334,9 +384,11 @@ impl JwksFixture {
                  where action = 'jwks_fetch'
                    and result = 'denied'
                    and metadata->>'jwks_url' = $1
+                   and occurred_at > $2
                  order by occurred_at",
             )
             .bind(jwks_url)
+            .bind(self.started_at)
             .fetch_all(&self.pool),
         )
         .await
@@ -442,10 +494,12 @@ async fn jwks_url_resolving_to_a_private_address_is_rejected_at_issuer_registrat
         return;
     };
     // `https://`, so a scheme-only check passes it. Only an address-range check on the
-    // resolved IP refuses it — which is the whole point of P1-2.
-    let (status, body) = fixture
-        .post_issuer("https://169.254.169.254/latest/meta-data/", "metadata")
-        .await;
+    // resolved IP refuses it — which is the whole point of P1-2. The host is the literal
+    // cloud metadata address; the per-fixture suffix lives in the path, so the
+    // `trusted_jwt_issuers` count below cannot be satisfied — or violated — by a row a
+    // previous run leaked into the shared database.
+    let jwks_url = fixture.denied_host_url("169.254.169.254", "metadata");
+    let (status, body) = fixture.post_issuer(&jwks_url, "metadata").await;
 
     assert_eq!(
         status,
@@ -461,7 +515,7 @@ async fn jwks_url_resolving_to_a_private_address_is_rejected_at_issuer_registrat
     let stored = sqlx::query_scalar::<_, i64>(
         "select count(*) from trusted_jwt_issuers where jwks_url = $1",
     )
-    .bind("https://169.254.169.254/latest/meta-data/")
+    .bind(&jwks_url)
     .fetch_one(&fixture.pool)
     .await
     .expect("issuer count");
@@ -501,12 +555,14 @@ async fn jwks_url_resolving_to_a_denied_address_is_rejected_at_verification_time
         return;
     };
     let issuer = fixture.issuer("ip-range");
-    let jwks_url = "https://127.0.0.1/jwks.json";
-    fixture.register_issuer(&issuer, jwks_url).await;
+    // Loopback host — the property under test — with a per-fixture path so the audited
+    // denial this asserts on can only have been written by *this* run.
+    let jwks_url = fixture.denied_host_url("127.0.0.1", "ip-range");
+    fixture.register_issuer(&issuer, &jwks_url).await;
 
     let (status, body) = fixture.authenticate(&issuer).await;
     assert_generic_unauthorized(status, &body);
-    fixture.expect_denial(jwks_url, "ip_range").await;
+    fixture.expect_denial(&jwks_url, "ip_range").await;
 
     fixture.shutdown().await;
 }
@@ -610,8 +666,9 @@ async fn slow_jwks_response_is_abandoned_at_the_configured_timeout() {
     };
     // The stub holds the first response until the test releases it, and the test only
     // releases it *after* the fetch has already been abandoned. The deadline ends the
-    // fetch; no `sleep()` is involved on either side.
-    let hold = Arc::new(Notify::new());
+    // fetch; no `sleep()` is involved on either side. The hold is a permit rather than a
+    // `Notify`, so the release can never be dropped for want of a parked waiter.
+    let hold = Arc::new(Semaphore::new(0));
     let stub = spawn_stub(
         &fixture.jwks_path("slow"),
         StubPlan {
@@ -626,7 +683,7 @@ async fn slow_jwks_response_is_abandoned_at_the_configured_timeout() {
     let (status, body) = fixture.authenticate(&issuer).await;
     assert_generic_unauthorized(status, &body);
     fixture.expect_denial(&stub.url, "timeout").await;
-    hold.notify_waiters();
+    hold.add_permits(1);
 
     fixture.shutdown().await;
 }
@@ -717,14 +774,20 @@ async fn jwks_rejection_is_audited_without_leaking_the_resolved_ip_to_the_caller
         return;
     };
     let issuer = fixture.issuer("oracle");
-    let jwks_url = "https://169.254.169.254/latest/meta-data/iam/security-credentials/";
-    fixture.register_issuer(&issuer, jwks_url).await;
+    // The literal AWS/GCP/Azure metadata address, with this fixture's suffix in the path
+    // so the audit assertion below is scoped to this run rather than to every run that
+    // ever registered the same well-known URL.
+    let jwks_url = format!(
+        "https://169.254.169.254/latest/meta-data/iam/security-credentials/{}",
+        fixture.suffix
+    );
+    fixture.register_issuer(&issuer, &jwks_url).await;
 
     let (status, body) = fixture.authenticate(&issuer).await;
     assert_generic_unauthorized(status, &body);
 
     // Server side: the reason is recorded in full.
-    fixture.expect_denial(jwks_url, "ip_range").await;
+    fixture.expect_denial(&jwks_url, "ip_range").await;
 
     // Client side: nothing about the address or the decision.
     let rendered = body.to_string();
@@ -739,30 +802,49 @@ async fn jwks_rejection_is_audited_without_leaking_the_resolved_ip_to_the_caller
     fixture.shutdown().await;
 }
 
-/// Singleflight: N concurrent cache-miss authentications for one issuer collapse into a
-/// single upstream call.
+/// A warm JWKS cache absorbs a concurrent burst without any further upstream call.
 ///
-/// The stub holds its first response until the test releases it. Without singleflight,
-/// every racer would find the cache empty and open its own connection while the first is
-/// still parked, so the hit counter would read `RACERS`, not `1`. The gate is an
-/// acknowledgement (`Semaphore` permit from the stub) plus a `Barrier` fan-out — never a
-/// `sleep()`.
+/// **Scope, stated precisely.** This is *not* a singleflight test and must not be read as
+/// one. Singleflight is the cache-**miss** coalescing property, and it is not observable
+/// from outside the library: the only acknowledgement an external stub can offer is "the
+/// leader's connection was accepted", and releasing the leader on that signal lets it
+/// finish its fetch and warm the cache while the followers still have a TCP connect, an
+/// auth pass and an issuer `SELECT` in front of them. The followers then take the
+/// warm-cache path and the upstream hit counter reads `1` with or without the lock — which
+/// is exactly what happened: the earlier e2e test with this shape survived a mutation that
+/// removed the singleflight lock entirely, across ten consecutive runs. Singleflight is
+/// proven by the unit test in `src/security/auth.rs`, which that same mutation kills.
+///
+/// What *is* observable, and is asserted here, is the cache-**hit** half: once a key set
+/// is cached, `RACERS` simultaneous authentications for that issuer contact the upstream
+/// zero further times. A mutation that dropped the cache read (or shortened its lifetime
+/// to nothing) makes the hit counter read `RACERS + 1`.
+///
+/// The fan-out gate is a `tokio::sync::Barrier`; the warm-up is a completed HTTP response,
+/// not a `sleep()`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_cache_miss_fetches_are_singleflighted_to_one_upstream_call() {
+async fn concurrent_authentications_against_a_warm_cache_make_no_further_upstream_calls() {
     let Some(fixture) = JwksFixture::new(true).await else {
         return;
     };
-    let hold = Arc::new(Notify::new());
-    let stub = spawn_stub(
-        &fixture.jwks_path("singleflight"),
-        StubPlan {
-            hold: Some(hold.clone()),
-            ..StubPlan::json(EMPTY_JWKS)
-        },
-    )
-    .await;
-    let issuer = fixture.issuer("singleflight");
+    let stub = spawn_stub(&fixture.jwks_path("warm-cache"), StubPlan::json(EMPTY_JWKS)).await;
+    let issuer = fixture.issuer("warm-cache");
     fixture.register_issuer(&issuer, &stub.url).await;
+
+    // Warm the cache with one completed request. Its 401 is "no matching key", i.e. the
+    // fetch itself succeeded — confirmed by the absence of any audited denial.
+    let (status, body) = fixture.authenticate(&issuer).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(
+        fixture.denial_reasons(&stub.url).await,
+        Vec::<String>::new(),
+        "the warming fetch must succeed"
+    );
+    assert_eq!(
+        stub.hits(),
+        1,
+        "the warming fetch is the only upstream call"
+    );
 
     const RACERS: usize = 5;
     let barrier = Arc::new(Barrier::new(RACERS + 1));
@@ -785,11 +867,6 @@ async fn concurrent_cache_miss_fetches_are_singleflighted_to_one_upstream_call()
     }
     barrier.wait().await;
 
-    // Acknowledgement gate: the stub has accepted the one request the singleflight lock
-    // let through. Every other racer is now parked on that lock.
-    stub.wait_for_first_request().await;
-    hold.notify_waiters();
-
     for task in tasks {
         let status = timeout(WAIT, task)
             .await
@@ -801,7 +878,8 @@ async fn concurrent_cache_miss_fetches_are_singleflighted_to_one_upstream_call()
     assert_eq!(
         stub.hits(),
         1,
-        "{RACERS} concurrent cache misses must coalesce into exactly one upstream fetch"
+        "{RACERS} concurrent authentications against a warm cache must not re-contact the \
+         upstream IdP"
     );
     assert_eq!(
         fixture.denial_reasons(&stub.url).await,

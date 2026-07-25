@@ -149,6 +149,31 @@ pub struct ApiKeySettings {
     pub prefix_length: usize,
 }
 
+/// Widest value the idempotency ledger accepts: `idempotency_records.request_hash`,
+/// `idempotency_records.idempotency_key_hash` and every `content_hash` column are
+/// `varchar(128)` (`migrations/0003_security_foundation.sql`). A stored hash wider than
+/// this is rejected by PostgreSQL with `value too long for type character varying(128)`,
+/// which surfaces as a `500` on every idempotent write.
+pub const IDEMPOTENCY_HASH_MAX_LENGTH: usize = 128;
+
+/// Everything `IdempotencyHasher::hash` appends after the version tag:
+/// `":" + base64url_no_pad(hmac_sha256(...))` = 1 + 43 characters, fixed-width because
+/// HMAC-SHA-256 always produces 32 bytes.
+///
+/// This arithmetic is not trusted on its own —
+/// `idempotency_pepper_version_bound_is_driven_by_the_hasher` derives the real width from
+/// `IdempotencyHasher::hash` and fails if this constant ever drifts from it.
+const IDEMPOTENCY_HASH_SUFFIX_LENGTH: usize = 44;
+
+/// Longest `idempotency.pepper_version` whose hashes still fit the `varchar(128)` ledger
+/// columns (plan 03 finding F1).
+///
+/// Measured in **bytes**, which is deliberately stricter than PostgreSQL's `varchar(128)`
+/// (that counts characters): for any non-ASCII version tag the byte length is the larger
+/// of the two, so satisfying this bound satisfies the column too.
+pub const IDEMPOTENCY_PEPPER_VERSION_MAX_LENGTH: usize =
+    IDEMPOTENCY_HASH_MAX_LENGTH - IDEMPOTENCY_HASH_SUFFIX_LENGTH;
+
 /// Dedicated pepper for the keyed (HMAC-SHA-256) idempotency / request-body hash.
 ///
 /// Mirrors `ApiKeySettings`'s pepper contract exactly. `#[serde(default)]` on the
@@ -159,9 +184,41 @@ pub struct ApiKeySettings {
 pub struct IdempotencySettings {
     pub pepper_base64: Option<String>,
     /// Version tag prefixed to every produced hash (`"{pepper_version}:{digest}"`).
-    /// Must be non-empty and must not contain `:`, which is the format separator.
+    ///
+    /// Must be non-empty, must not contain `:` (the format separator), and must be at
+    /// most [`IDEMPOTENCY_PEPPER_VERSION_MAX_LENGTH`] bytes so the produced hash fits the
+    /// `varchar(128)` ledger columns. All three are *correctness* invariants of the hash
+    /// format, so `Settings::validate` enforces them in **every** environment, not only in
+    /// production.
     pub pepper_version: String,
     pub allow_insecure_dev_pepper: bool,
+    /// Whether ledger values written **before** the HMAC switch (plan 03, P1-1) — plain,
+    /// unkeyed SHA-256 with no `"{version}:"` prefix — are still accepted on read.
+    ///
+    /// # Why this exists
+    ///
+    /// The dual-read path is a *migration* affordance, not a permanent feature: while it
+    /// is on, an attacker who can write a row (or who holds a pre-switch digest) is
+    /// matched against an unkeyed hash, and every idempotent read pays an extra lookup by
+    /// the legacy key hash. Nothing in the code ends that window on its own, so it is a
+    /// setting rather than a comment.
+    ///
+    /// # Operational procedure
+    ///
+    /// 1. Deploy the HMAC switch with this left at its default `true`. From that moment
+    ///    every **new** row is written in the versioned format; legacy rows keep replaying.
+    /// 2. Wait one full idempotency retention period — 24 hours
+    ///    (`IDEMPOTENCY_RETENTION_HOURS`) — after that deploy is fully rolled out. Every
+    ///    pre-switch row has then passed its `expires_at` and is swept.
+    /// 3. Set `MOIRA_IDEMPOTENCY__ACCEPT_LEGACY_HASHES=false` and redeploy. The unkeyed
+    ///    verification arm and the extra legacy lookup are both skipped from then on.
+    ///
+    /// Flipping it to `false` early is safe in the security direction and unsafe only in
+    /// the duplicate-processing direction: an unexpired pre-switch claim stops
+    /// replay-matching and falls through to normal, non-idempotent processing — the same
+    /// bounded window documented for pepper rotation. Flipping it back to `true` restores
+    /// the old behaviour with no data change.
+    pub accept_legacy_hashes: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -282,6 +339,10 @@ impl Settings {
             self.validate_production(mode, &mut violations);
         }
 
+        // Structural invariants of the stored-hash format, not production hardening —
+        // see `validate_idempotency_hash_format`. They run in every environment.
+        self.validate_idempotency_hash_format(&mut violations);
+
         for origin in &self.cors.allowed_origins {
             if origin != "*" && validate_cors_origin(origin).is_err() {
                 violations.push(format!(
@@ -340,6 +401,37 @@ impl Settings {
             features.push("automatic_migrations");
         }
         features
+    }
+
+    /// Enforces the structural invariants of `"{pepper_version}:{digest}"` in **every**
+    /// environment (plan 03 findings F1 and F2).
+    ///
+    /// These are correctness invariants of the stored-hash format, not production-hardening
+    /// policy, so they deliberately do not live in `validate_production_crypto`:
+    ///
+    /// * **empty** — the produced hash would start with a bare `":"`, and a stored value
+    ///   could no longer be attributed to a pepper.
+    /// * **contains `':'`** — `IdempotencyHasher::verify` splits on the *first* separator,
+    ///   so `"v1:extra"` yields the version `"v1"` and a digest of `"extra:<base64>"`,
+    ///   which never decodes. Every replay of a new-format row then fails to match and is
+    ///   rejected with `409 idempotency_conflict`, in development just as much as in
+    ///   production.
+    /// * **too long** — the ledger columns are `varchar(128)`; a longer version tag
+    ///   overflows them and turns every idempotent write into a `500`.
+    fn validate_idempotency_hash_format(&self, violations: &mut Vec<String>) {
+        let version = &self.idempotency.pepper_version;
+        if version.trim().is_empty() {
+            violations.push("idempotency.pepper_version must be non-empty".to_string());
+        } else if version.contains(':') {
+            violations.push("idempotency.pepper_version must not contain ':'".to_string());
+        } else if version.len() > IDEMPOTENCY_PEPPER_VERSION_MAX_LENGTH {
+            violations.push(format!(
+                "idempotency.pepper_version must be at most {IDEMPOTENCY_PEPPER_VERSION_MAX_LENGTH} bytes \
+                 so \"{{version}}:{{digest}}\" fits the varchar({IDEMPOTENCY_HASH_MAX_LENGTH}) ledger columns, \
+                 got {}",
+                version.len()
+            ));
+        }
     }
 
     fn validate_production(&self, mode: ProcessMode, violations: &mut Vec<String>) {
@@ -432,14 +524,11 @@ impl Settings {
             "idempotency.pepper_base64",
             violations,
         );
-        // `pepper_version` is the hash *format* version ("v1"), not a deployment
-        // stage, so it is only checked for structural validity: it is the prefix
-        // before the ':' separator in every stored hash.
-        if self.idempotency.pepper_version.trim().is_empty() {
-            violations.push("idempotency.pepper_version must be non-empty".to_string());
-        } else if self.idempotency.pepper_version.contains(':') {
-            violations.push("idempotency.pepper_version must not contain ':'".to_string());
-        }
+        // `pepper_version` is the hash *format* version ("v1"), not a deployment stage, so
+        // it is never rejected here as a development sentinel the way
+        // `api_keys.pepper_version` is. Its structural checks (non-empty, no ':', length
+        // bound) are correctness invariants and therefore live in
+        // `validate_idempotency_hash_format`, which runs in every environment.
     }
 }
 
@@ -697,6 +786,9 @@ impl Default for IdempotencySettings {
             // development sentinel by `validate_production_crypto`.
             pepper_version: "v1".to_string(),
             allow_insecure_dev_pepper: true,
+            // Defaults to the migration-compatible behaviour: pre-switch rows keep
+            // replaying. See the field's doc comment for how and when to turn it off.
+            accept_legacy_hashes: true,
         }
     }
 }
@@ -907,6 +999,7 @@ mod tests {
             pepper_base64: Some(STANDARD.encode([9; 32])),
             pepper_version: "v1".to_string(),
             allow_insecure_dev_pepper: false,
+            accept_legacy_hashes: true,
         };
 
         assert_eq!(settings.pepper_bytes().unwrap(), vec![9_u8; 32]);
@@ -918,6 +1011,96 @@ mod tests {
         assert!(settings.allow_insecure_dev_pepper);
         assert_eq!(settings.pepper_version, "v1");
         assert_eq!(settings.pepper_bytes().unwrap(), vec![13_u8; 32]);
+        assert!(
+            settings.accept_legacy_hashes,
+            "the dual-read window must stay open by default so the HMAC switch is a \
+             behaviour-preserving deploy; operators close it explicitly"
+        );
+    }
+
+    /// Plan 03 finding F1: the `varchar(128)` guarantee must not rest on the operator
+    /// happening to pick a short `pepper_version`.
+    ///
+    /// The bound is *derived* from `IdempotencyHasher::hash` rather than asserted against a
+    /// hardcoded `"v1"`, so it keeps holding if the digest encoding ever changes width.
+    #[test]
+    fn idempotency_pepper_version_bound_is_driven_by_the_hasher() {
+        use crate::security::IdempotencyHasher;
+
+        fn hash_length(version: &str) -> usize {
+            IdempotencyHasher::new(b"pepper".to_vec(), version.to_string())
+                // 4 KiB of input: HMAC-SHA-256 output width is independent of input size,
+                // so a large body must not widen the stored value.
+                .hash(&vec![7_u8; 4096])
+                .len()
+        }
+
+        // Everything the hasher appends after the version tag, measured, not assumed.
+        let measured_suffix = hash_length("v") - "v".len();
+        assert_eq!(
+            measured_suffix, IDEMPOTENCY_HASH_SUFFIX_LENGTH,
+            "the hash suffix width drifted from the constant the bound is computed from"
+        );
+
+        let longest_allowed = "p".repeat(IDEMPOTENCY_PEPPER_VERSION_MAX_LENGTH);
+        assert_eq!(
+            hash_length(&longest_allowed),
+            IDEMPOTENCY_HASH_MAX_LENGTH,
+            "the longest accepted version must produce a hash that exactly fills varchar(128)"
+        );
+
+        let one_too_long = "p".repeat(IDEMPOTENCY_PEPPER_VERSION_MAX_LENGTH + 1);
+        assert!(
+            hash_length(&one_too_long) > IDEMPOTENCY_HASH_MAX_LENGTH,
+            "the bound must be the exact point where the column overflows, not a guess"
+        );
+
+        // And validation must draw the line in the same place the column does.
+        let mut settings = Settings::default();
+        settings.idempotency.pepper_version = longest_allowed;
+        settings.validate(ProcessMode::Serve).unwrap();
+
+        settings.idempotency.pepper_version = one_too_long;
+        let error = settings
+            .validate(ProcessMode::Serve)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("idempotency.pepper_version must be at most"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Plan 03 finding F2: the structural checks are correctness invariants, so they must
+    /// fire outside production too. A development `pepper_version` containing `':'` makes
+    /// every new-format replay fail to match and return `409 idempotency_conflict`.
+    #[test]
+    fn idempotency_pepper_version_structure_is_validated_outside_production() {
+        let mut settings = Settings::default();
+        assert_eq!(
+            settings.deployment.environment,
+            DeploymentEnvironment::Development,
+            "this test is only meaningful in a non-production environment"
+        );
+
+        for (version, expected) in [
+            (
+                "v1:extra",
+                "idempotency.pepper_version must not contain ':'",
+            ),
+            ("", "idempotency.pepper_version must be non-empty"),
+            ("   ", "idempotency.pepper_version must be non-empty"),
+        ] {
+            settings.idempotency.pepper_version = version.to_string();
+            let error = settings
+                .validate(ProcessMode::Serve)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(expected),
+                "version {version:?} produced unexpected error: {error}"
+            );
+        }
     }
 
     #[test]
@@ -926,6 +1109,7 @@ mod tests {
             pepper_base64: None,
             pepper_version: "v1".to_string(),
             allow_insecure_dev_pepper: false,
+            accept_legacy_hashes: true,
         };
 
         let error = settings.pepper_bytes().unwrap_err().to_string();

@@ -57,9 +57,33 @@ const REQUEST_TIMEOUT_FALLBACK: &str = "The request timed out before it could be
 /// guard is `once_only_secret_routes_carry_no_content_encoding` below.
 ///
 /// Layer order (innermost first, i.e. the order the `.layer()` calls appear):
-/// per-route body limits and the non-SSE timeout live in [`http::router`], then
-/// `CatchPanicLayer`, then the infrastructure-error envelope mapper, then metrics,
-/// secure headers, tracing, and the request-id chain.
+/// per-route body limits, the request-body ingestion timeout and the response-head
+/// timeout live in [`http::router`], then `CatchPanicLayer`, then the
+/// infrastructure-error envelope mapper, then metrics, secure headers, tracing, and the
+/// request-id chain.
+///
+/// **Known residual gap — `CatchPanicLayer` does not cover streaming response bodies.**
+/// `tower_http::catch_panic` wraps exactly two things: the synchronous `inner.call(req)`
+/// and the response *future*. It does not wrap the response **body**. A panic raised
+/// while a handler is running, or while an extractor is running, is therefore caught and
+/// converted by [`handle_panic`] into a 500 envelope; a panic raised inside a body that
+/// has already been handed back is not. Moira's SSE path
+/// (`Sse::new(stream)` over an `async_stream` in `src/http/public.rs`) is exactly that
+/// second shape, so a panic inside the stream produces **zero bytes and a bare
+/// connection close** — no status, no envelope — rather than a 500. Measured:
+/// `/internal/test/panic` (handler panic) returns 500 with the full envelope, while a
+/// panic raised from inside a streaming body returns nothing at all. The process
+/// survives either way; the blast radius is one connection.
+///
+/// This is **latent, not live**: the SSE handler and the runtime stream it wraps contain
+/// no `unwrap`, `expect` or `panic!` today. It is documented rather than fixed because
+/// the only real fixes are to wrap every streamed item in `catch_unwind` (which costs a
+/// `Box`/`AssertUnwindSafe` per chunk on the hot path and cannot produce a status code
+/// anyway — the head is already sent, so the best possible outcome is an
+/// `event: error` frame, not a 500) or to forbid panics in stream code by review. The
+/// invariant to hold instead: **no `unwrap`/`expect`/`panic!`/slicing/indexing in any
+/// code reachable from a streamed item**. Any panic that does occur there is still
+/// recorded by the runtime's own error handling, not silently dropped.
 pub fn build_router(state: AppState) -> Result<Router, AppError> {
     let metrics_state = state.clone();
     let hsts_enabled = matches!(
@@ -604,6 +628,263 @@ mod tests {
             usize::try_from(settings.public_api.maximum_request_bytes).unwrap()
         );
         assert_eq!(policy.admin_body_limit_bytes, http::ADMIN_BODY_LIMIT_BYTES);
+    }
+
+    #[test]
+    fn every_route_group_including_the_sse_group_is_bounded() {
+        // The SSE group used to carry no timeout at all, which removed the bound on
+        // request *ingestion* as well as the one on the response body. Both bounds must
+        // now be present and non-zero for every group.
+        let policy = RouterPolicy::from_settings(&Settings::default());
+
+        assert_eq!(
+            policy.streaming_head_timeout, policy.non_streaming_timeout,
+            "the SSE group's head phase is bounded by the execution deadline like every \
+             other route; only its response body escapes the ceiling"
+        );
+        assert!(!policy.streaming_head_timeout.is_zero());
+        assert_eq!(
+            policy.request_body_idle_timeout.as_secs(),
+            http::REQUEST_BODY_IDLE_TIMEOUT_SECONDS
+        );
+        assert!(policy.request_body_idle_timeout < policy.non_streaming_timeout);
+    }
+
+    #[test]
+    fn the_public_body_limit_is_clamped_to_an_enforceable_ceiling() {
+        // `maximum_request_bytes` is an unbounded i64 that `Settings::validate` does not
+        // bound, so `i64::MAX` used to become an effectively unlimited in-memory body.
+        let mut absurd = Settings::default();
+        absurd.public_api.maximum_request_bytes = i64::MAX;
+        assert_eq!(
+            RouterPolicy::from_settings(&absurd).public_body_limit_bytes,
+            http::MAX_PUBLIC_BODY_LIMIT_BYTES
+        );
+
+        let mut just_over = Settings::default();
+        just_over.public_api.maximum_request_bytes =
+            i64::try_from(http::MAX_PUBLIC_BODY_LIMIT_BYTES).unwrap() + 1;
+        assert_eq!(
+            RouterPolicy::from_settings(&just_over).public_body_limit_bytes,
+            http::MAX_PUBLIC_BODY_LIMIT_BYTES
+        );
+
+        // Exactly at the ceiling, and every legitimate value below it, is untouched.
+        let mut at_ceiling = Settings::default();
+        at_ceiling.public_api.maximum_request_bytes =
+            i64::try_from(http::MAX_PUBLIC_BODY_LIMIT_BYTES).unwrap();
+        assert_eq!(
+            RouterPolicy::from_settings(&at_ceiling).public_body_limit_bytes,
+            http::MAX_PUBLIC_BODY_LIMIT_BYTES
+        );
+
+        // Non-positive and overflowing values keep falling back to the default.
+        for configured in [0, -1, i64::MIN] {
+            let mut settings = Settings::default();
+            settings.public_api.maximum_request_bytes = configured;
+            assert_eq!(
+                RouterPolicy::from_settings(&settings).public_body_limit_bytes,
+                http::CONVERSATION_BODY_LIMIT_BYTES,
+                "unusable value {configured} must fall back, not clamp upward"
+            );
+        }
+    }
+
+    /// The load-bearing half of the SSE exemption: a `TimeoutLayer` on a route that
+    /// returns a streaming body must bound only the response *head*.
+    ///
+    /// `tower_http::timeout::Timeout`'s response future drops its `Sleep` as soon as the
+    /// inner service resolves to a `Response`; the body is polled afterwards, outside the
+    /// tower stack. This test pins that behaviour so the SSE group can safely carry a
+    /// head timeout. The single `sleep` is the assertion itself — proving a stream
+    /// outlives a duration requires that duration to elapse — and every frame boundary is
+    /// an explicit acknowledgement handshake, not a timing race.
+    #[tokio::test]
+    async fn a_timeout_layer_never_caps_an_already_returned_streaming_body() {
+        use axum::body::Bytes;
+        use futures_util::StreamExt;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        const HEAD_TIMEOUT: Duration = Duration::from_millis(50);
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
+        let receiver = Arc::new(Mutex::new(Some(rx)));
+
+        let router: Router = Router::new()
+            .route(
+                "/stream",
+                axum::routing::get(move || {
+                    let receiver = receiver.clone();
+                    async move {
+                        let mut rx = receiver
+                            .lock()
+                            .unwrap()
+                            .take()
+                            .expect("the route is called once");
+                        Response::new(Body::from_stream(async_stream::stream! {
+                            while let Some(chunk) = rx.recv().await {
+                                yield Ok::<_, std::convert::Infallible>(Bytes::from_static(
+                                    chunk.as_bytes(),
+                                ));
+                            }
+                        }))
+                    }
+                }),
+            )
+            .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+                StatusCode::GATEWAY_TIMEOUT,
+                HEAD_TIMEOUT,
+            ));
+
+        tx.send("first").unwrap();
+        let response = send(
+            router,
+            Request::builder()
+                .uri("/stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut frames = response.into_body().into_data_stream();
+        assert_eq!(
+            frames.next().await.expect("first frame").unwrap(),
+            Bytes::from_static(b"first")
+        );
+
+        // Hold the body open for many multiples of the head timeout.
+        tokio::time::sleep(HEAD_TIMEOUT * 6).await;
+
+        tx.send("last").unwrap();
+        drop(tx);
+        assert_eq!(
+            frames
+                .next()
+                .await
+                .expect("frame after the timeout")
+                .unwrap(),
+            Bytes::from_static(b"last"),
+            "the timeout layer must not cap a body it already handed back"
+        );
+        assert!(frames.next().await.is_none(), "the stream must end cleanly");
+    }
+
+    /// Generous relative to every timeout the probes below configure, and orders of
+    /// magnitude below the >= 630 s (or unbounded) window the connection was held for
+    /// before this fix.
+    const PROBE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// The three routes that consume a request body and were measured parked: the two
+    /// SSE-group routes plus one non-SSE control.
+    const STALLED_BODY_PROBE_PATHS: [&str; 3] = [
+        "/api/v1/responses/stream",
+        "/v1/responses",
+        "/api/v1/responses",
+    ];
+
+    /// Opens a real socket, writes request headers announcing a body, never sends the
+    /// body, and returns the first bytes the server writes back.
+    ///
+    /// This is the exact shape of the measured denial of service: authentication is never
+    /// reached, because `public_actor` runs inside the handler, *after* `Json` extraction.
+    /// `DefaultBodyLimit` bounds bytes, not time, and neither `stream_idle_timeout_ms` nor
+    /// `maximum_execution_timeout_seconds` engages because execution never begins.
+    async fn stalled_body_status_line(policy: RouterPolicy, path: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let state = AppState::new(Settings::default(), None).unwrap();
+        let app: Router = http::router(policy).with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        socket
+            .write_all(
+                format!(
+                    "POST {path} HTTP/1.1\r\nHost: localhost\r\n\
+                     Content-Type: application/json\r\nContent-Length: 4096\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        socket.flush().await.unwrap();
+
+        let mut head = [0u8; 64];
+        let read = tokio::time::timeout(PROBE_PATIENCE, socket.read(&mut head))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("{path} parked the connection: no response within {PROBE_PATIENCE:?}")
+            })
+            .unwrap_or_else(|error| panic!("{path} socket error: {error}"));
+        server.abort();
+
+        assert!(read > 0, "{path} closed without writing a response");
+        String::from_utf8_lossy(&head[..read]).to_string()
+    }
+
+    /// The other half of the SSE exemption: the streaming group's response *head* is
+    /// bounded, so `/v1/responses` with `stream: false` — a fully non-streaming JSON
+    /// route that shares the group only because it shares a path with the streaming one —
+    /// satisfies the plan's "every non-SSE route runs under `TimeoutLayer`" requirement.
+    ///
+    /// Deterministic without a database and without racing a timer: the handler cannot
+    /// complete, because the request body it is waiting on never arrives, so the head
+    /// timeout is the only thing that can produce a response. The ingestion timeout is
+    /// pushed far out so that it cannot be what fires.
+    #[tokio::test]
+    async fn the_streaming_group_head_is_governed_by_a_timeout() {
+        use std::time::Duration;
+
+        let policy = RouterPolicy {
+            non_streaming_timeout: Duration::from_millis(300),
+            streaming_head_timeout: Duration::from_millis(300),
+            request_body_idle_timeout: Duration::from_secs(3_600),
+            ..RouterPolicy::default()
+        };
+
+        for path in STALLED_BODY_PROBE_PATHS {
+            let status_line = stalled_body_status_line(policy, path).await;
+            assert!(
+                status_line.starts_with("HTTP/1.1 504"),
+                "{path} is not covered by a response-head timeout, got: {status_line}"
+            );
+        }
+    }
+
+    /// The DoS this closes, reproduced over a real socket.
+    ///
+    /// Before this fix the SSE group carried no timeout of any kind — the head timeout was
+    /// deliberately omitted to avoid capping a stream, which also removed the bound on
+    /// request ingestion — so `/api/v1/responses/stream` and `/v1/responses` held a
+    /// connection task and a file descriptor indefinitely for an unauthenticated client
+    /// that wrote headers and no body. Here the head timeout is left at its production
+    /// value (>= 630 s, so it cannot be what fires) and only the ingestion bound is tight.
+    #[tokio::test]
+    async fn a_stalled_request_body_cannot_park_a_connection_forever() {
+        use std::time::Duration;
+
+        let policy = RouterPolicy {
+            request_body_idle_timeout: Duration::from_millis(300),
+            ..RouterPolicy::default()
+        };
+        assert!(
+            policy.streaming_head_timeout > PROBE_PATIENCE,
+            "the head timeout must not be what releases the connection here"
+        );
+
+        for path in STALLED_BODY_PROBE_PATHS {
+            let status_line = stalled_body_status_line(policy, path).await;
+            assert!(
+                status_line.starts_with("HTTP/1.1 4"),
+                "{path} should reject the stalled body with a 4xx, got: {status_line}"
+            );
+        }
     }
 
     #[tokio::test]

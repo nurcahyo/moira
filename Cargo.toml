@@ -9,8 +9,17 @@ default = []
 # Adds two undocumented probe routes to the router so `tests/http_middleware_contract.rs`
 # can exercise `CatchPanicLayer` and the 504 envelope mapper over a real socket. An
 # integration test links the library built **without** `cfg(test)`, so a `#[cfg(test)]`
-# route is invisible to it; a feature gate is the only cfg that works here. It is off by
-# default, so `cargo build --release --locked` cannot produce a binary containing them.
+# route is invisible to it; a feature gate is the only cfg that works here.
+#
+# Being off by default is NOT sufficient to keep the probes out of a shipped binary:
+# `--all-features` is a different feature set, and this repo's own CI uses it. Verified
+# before the guard below existed: `cargo build --release --all-features --bin moira`
+# produced a binary containing "/internal/test/panic", "/internal/test/slow" and the
+# probe's panic message. `src/http/mod.rs` therefore raises a `compile_error!` on
+# `all(feature = "test-routes", not(debug_assertions))`, so an optimized build carrying
+# this feature fails to compile instead of shipping an unauthenticated panic-on-demand
+# route. `cargo clippy --all-features` and `cargo test --all-features` are unaffected —
+# both build with `debug_assertions` on.
 test-routes = []
 
 [dependencies]

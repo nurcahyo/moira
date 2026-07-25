@@ -20,6 +20,23 @@
 //! rather than re-implemented — `MOIRA_TEST_DATABASE_URL` missing while `CI=true`
 //! panics; otherwise the suite returns early.
 //!
+//! **All three ledgers are covered, not just the admin-command one.** Three independent
+//! code paths read and write `idempotency_records`, and they do *not* share a read
+//! implementation:
+//!
+//! * `src/application/admin_command.rs` compares via
+//!   `AdminIdempotencyClaim::matches_stored_request_hash` and never calls
+//!   `IdempotencyHasher::verify` at all;
+//! * `src/application/public.rs` (`/api/v1/responses`, `/v1/responses`) calls `verify`;
+//! * `src/application/runtime_admin.rs` calls `verify`.
+//!
+//! A review mutation that disabled the legacy branch of `verify` outright
+//! (`None => false`) left this file 7/7 green, because every test here drove only the
+//! admin-command path. The two `verify`-using paths — the ones carrying provider
+//! credentials and runtime policy — had no legacy-downgrade coverage at any level. They
+//! do now: `legacy_public_response_row_still_replays_after_the_hmac_switch` and
+//! `legacy_runtime_admin_row_still_replays_after_the_hmac_switch`.
+//!
 //! Cross-test isolation: every fixture-owned identifier (idempotency keys, application
 //! slugs, conversation titles) carries a per-fixture `Uuid::now_v7()` suffix, so two
 //! test binaries running concurrently against the same database cannot collide on a
@@ -31,7 +48,10 @@ use std::{sync::Arc, time::Duration};
 
 use moira::{
     application::{AdminCommandSpec, AdminService},
-    domain::{ApplicationCreateRequest, ConsumerKeyCreateRequest},
+    domain::{
+        ApplicationCreateRequest, ConsumerKeyCreateRequest, PublicResponseRequest,
+        RouteDefinitionCreateRequest, RouteSelectionStrategy,
+    },
     security::IdempotencyHasher,
 };
 use reqwest::{Client, StatusCode};
@@ -39,10 +59,16 @@ use serde_json::{Value, json};
 use tokio::{sync::Barrier, time::timeout};
 use uuid::Uuid;
 
-use support::{LifecycleFixture, MoiraHttpServer, request_context};
+use support::{
+    LifecycleFixture, MoiraHttpServer, RuntimePolicy,
+    mock_openai::{MockOpenAiServer, ProviderScript},
+    public_response_request, request_context,
+};
 
 const WAIT: Duration = Duration::from_secs(20);
 const OPERATION: &str = "application.create";
+const RESPONSE_OPERATION: &str = "response.create";
+const ROUTE_OPERATION: &str = "route.create";
 
 struct HashFixture {
     fixture: LifecycleFixture,
@@ -164,6 +190,10 @@ impl HashFixture {
     }
 
     async fn ledger_hashes(&self, resource_id: &str) -> (String, String) {
+        self.ledger_hashes_for(OPERATION, resource_id).await
+    }
+
+    async fn ledger_hashes_for(&self, operation: &str, resource_id: &str) -> (String, String) {
         timeout(
             WAIT,
             sqlx::query_as::<_, (String, String)>(
@@ -172,12 +202,91 @@ impl HashFixture {
                  where resource_id = $1 and operation = $2",
             )
             .bind(resource_id)
-            .bind(OPERATION)
+            .bind(operation)
             .fetch_one(&self.fixture.pool),
         )
         .await
         .expect("ledger lookup timed out")
         .expect("exactly one ledger row for this resource")
+    }
+
+    /// Rewrites one ledger row into the **pre-deploy** format on both dimensions at once:
+    /// the indexed `idempotency_key_hash` and the compared `request_hash`.
+    ///
+    /// Unlike [`Self::downgrade_to_legacy`] this takes the canonical request bytes rather
+    /// than an `AdminCommandSpec`, so it works for any of the three ledger users. It
+    /// asserts first that the caller's bytes really are the ones production hashed — a
+    /// mis-derived canonical envelope would otherwise silently turn the replay assertion
+    /// into a tautology.
+    async fn downgrade_row_to_legacy(
+        &self,
+        operation: &str,
+        resource_id: &str,
+        key: &str,
+        request_bytes: &[u8],
+    ) -> (String, String) {
+        let (versioned_key_hash, versioned_request_hash) =
+            self.ledger_hashes_for(operation, resource_id).await;
+        assert_eq!(
+            versioned_key_hash,
+            self.hasher.hash(key.as_bytes()),
+            "{operation}: production did not write the keyed HMAC of this Idempotency-Key"
+        );
+        assert_eq!(
+            versioned_request_hash,
+            self.hasher.hash(request_bytes),
+            "{operation}: the canonical bytes this test derived are not the ones production \
+             hashed, so downgrading them would prove nothing"
+        );
+
+        let legacy_key_hash = self.hasher.legacy_hash(key.as_bytes());
+        let legacy_request_hash = self.hasher.legacy_hash(request_bytes);
+        assert_ne!(legacy_key_hash, versioned_key_hash);
+        assert_ne!(legacy_request_hash, versioned_request_hash);
+        assert!(
+            !legacy_key_hash.contains(':') && !legacy_request_hash.contains(':'),
+            "pre-deploy values carry no version prefix"
+        );
+
+        let affected = timeout(
+            WAIT,
+            sqlx::query(
+                "update idempotency_records
+                 set idempotency_key_hash = $1, request_hash = $2
+                 where resource_id = $3 and operation = $4",
+            )
+            .bind(&legacy_key_hash)
+            .bind(&legacy_request_hash)
+            .bind(resource_id)
+            .bind(operation)
+            .execute(&self.fixture.pool),
+        )
+        .await
+        .expect("ledger downgrade timed out")
+        .expect("ledger downgrade")
+        .rows_affected();
+        assert_eq!(affected, 1, "exactly one ledger row must be downgraded");
+
+        (legacy_key_hash, legacy_request_hash)
+    }
+
+    async fn ledger_count_for(&self, operation: &str, key: &str) -> i64 {
+        timeout(
+            WAIT,
+            sqlx::query_scalar::<_, i64>(
+                "select count(*) from idempotency_records
+                 where idempotency_key_hash = any($1) and operation = $2",
+            )
+            .bind(vec![
+                self.hasher.hash(key.as_bytes()),
+                self.hasher.legacy_hash(key.as_bytes()),
+            ])
+            .bind(operation)
+            .fetch_one(&self.fixture.pool),
+        )
+        .await
+        .expect("ledger count timed out")
+        .expect("ledger count")
     }
 
     /// Rewrites the ledger row this request produced into the **pre-deploy** format:
@@ -233,6 +342,42 @@ impl HashFixture {
         (legacy_key_hash, legacy_request_hash)
     }
 
+    /// `POST /api/v1/responses` as a consumer key, carrying an `Idempotency-Key`.
+    ///
+    /// Nothing sent the header on this route before: `tests/support/mod.rs` hard-coded
+    /// `idempotency_key: None`, so `/v1/responses` had zero idempotency coverage at any
+    /// level even though it is the route whose bodies carry credential material.
+    async fn post_public_response(
+        &self,
+        consumer_key: &str,
+        key: &str,
+        request: &PublicResponseRequest,
+    ) -> HttpResult {
+        let response = timeout(
+            WAIT,
+            self.client
+                .post(self.url("/api/v1/responses"))
+                .header("content-type", "application/json")
+                .header("x-consumer-key", consumer_key)
+                .header("idempotency-key", key)
+                .header("x-request-id", format!("idem-public-{}", Uuid::now_v7()))
+                .body(serde_json::to_string(request).expect("serialise public response request"))
+                .send(),
+        )
+        .await
+        .expect("public response request timed out")
+        .expect("public response");
+        let status = response.status();
+        let bytes = response.bytes().await.expect("response body");
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| panic!("non-JSON body: {}", String::from_utf8_lossy(&bytes)))
+        };
+        HttpResult { status, body }
+    }
+
     async fn count(&self, query: &str, value: &str) -> i64 {
         timeout(
             WAIT,
@@ -251,6 +396,27 @@ impl HashFixture {
             slug,
         )
         .await
+    }
+
+    async fn route_count(&self, route_key: &str) -> i64 {
+        self.count(
+            "select count(*) from route_definitions where route_key = $1",
+            route_key,
+        )
+        .await
+    }
+
+    /// The exact struct `POST /api/v1/admin/routes` deserialises, so the canonical
+    /// envelope this test hashes is byte-identical to the one `runtime_admin.rs` hashes.
+    fn route_request(&self, label: &str) -> RouteDefinitionCreateRequest {
+        RouteDefinitionCreateRequest {
+            route_key: format!("hashmig_{label}_{}", self.suffix),
+            display_name: format!("Hash migration {label} {}", self.suffix),
+            description: None,
+            selection_strategy: RouteSelectionStrategy::Default,
+            agent_profile_id: None,
+            metadata: json!({ "suite": "idempotency_hash_migration" }),
+        }
     }
 
     async fn ledger_count(&self, key: &str) -> i64 {
@@ -361,6 +527,194 @@ async fn legacy_unkeyed_row_still_replays_after_the_hmac_switch() {
     let (stored_key_hash, stored_request_hash) = fixture.ledger_hashes(&resource_id).await;
     assert_eq!(stored_key_hash, legacy_key_hash);
     assert_eq!(stored_request_hash, legacy_request_hash);
+
+    fixture.shutdown().await;
+}
+
+/// The same Definition-of-Done box as the test above, but on the path that actually
+/// calls `IdempotencyHasher::verify` — and the one the plan calls the headline P1-1
+/// exposure, because `/v1/responses` bodies are the ones that can carry credential
+/// material.
+///
+/// The admin-command test above cannot stand in for this: `admin_command.rs` compares
+/// through `AdminIdempotencyClaim::matches_stored_request_hash` and never reaches
+/// `verify` at all. A review mutation that disabled `verify`'s legacy branch
+/// (`None => false`) left every pre-existing test in this file green.
+///
+/// The provider is scripted with exactly **one** completion, so a replay that silently
+/// re-executed would get a 502 from the exhausted mock rather than quietly producing a
+/// second, plausible-looking response.
+#[tokio::test]
+async fn legacy_public_response_row_still_replays_after_the_hmac_switch() {
+    let Some(fixture) = HashFixture::new().await else {
+        return;
+    };
+    let provider = MockOpenAiServer::start([ProviderScript::Completion {
+        text: "legacy replay payload".to_string(),
+    }])
+    .await;
+    fixture
+        .fixture
+        .add_provider(provider.base_url(), 10, RuntimePolicy::default())
+        .await;
+    let consumer_key = fixture.fixture.enable_public_streaming().await;
+
+    let key = fixture.key("public-legacy-replay");
+    let request = public_response_request(&fixture.fixture.route_key);
+    // The canonical envelope `claim_idempotency` hashes: `(application_id, request)`.
+    // `downgrade_row_to_legacy` asserts this really is what production stored before it
+    // rewrites anything.
+    let request_bytes = serde_json::to_vec(&(Some(fixture.fixture.application_id), &request))
+        .expect("canonical /v1/responses envelope");
+
+    let first = fixture
+        .post_public_response(&consumer_key, &key, &request)
+        .await;
+    assert_eq!(first.status, StatusCode::OK, "body: {}", first.body);
+    let response_id = first.id();
+    assert_eq!(
+        provider.call_count().await,
+        1,
+        "the first request must genuinely execute"
+    );
+
+    let (legacy_key_hash, legacy_request_hash) = fixture
+        .downgrade_row_to_legacy(RESPONSE_OPERATION, &response_id, &key, &request_bytes)
+        .await;
+
+    let replay = fixture
+        .post_public_response(&consumer_key, &key, &request)
+        .await;
+    assert_eq!(
+        replay.status,
+        StatusCode::OK,
+        "a pre-deploy /v1/responses row must still replay, got: {}",
+        replay.body
+    );
+    assert_eq!(
+        replay.id(),
+        response_id,
+        "the replay must return the originally created response"
+    );
+    assert_eq!(
+        replay.body, first.body,
+        "the replayed body must be the stored one, verbatim"
+    );
+    assert_eq!(
+        provider.call_count().await,
+        1,
+        "a replay must not re-execute against the provider"
+    );
+    assert_eq!(
+        fixture.ledger_count_for(RESPONSE_OPERATION, &key).await,
+        1,
+        "a replay must not insert a second ledger row"
+    );
+
+    // Still pre-deploy format: the replay went through the legacy branch of both the
+    // lookup and the comparison, not through a fresh claim.
+    let (stored_key_hash, stored_request_hash) = fixture
+        .ledger_hashes_for(RESPONSE_OPERATION, &response_id)
+        .await;
+    assert_eq!(stored_key_hash, legacy_key_hash);
+    assert_eq!(stored_request_hash, legacy_request_hash);
+
+    fixture.shutdown().await;
+    provider.shutdown().await;
+}
+
+/// The third ledger user — `src/application/runtime_admin.rs` — which has its own
+/// `idempotency_replay`/`record_idempotency` pair and its own private canonical-bytes
+/// helper, and which also reads through `IdempotencyHasher::verify`.
+#[tokio::test]
+async fn legacy_runtime_admin_row_still_replays_after_the_hmac_switch() {
+    let Some(fixture) = HashFixture::new().await else {
+        return;
+    };
+    let key = fixture.key("route-legacy-replay");
+    let request = fixture.route_request("legacy");
+    let request_bytes = serde_json::to_vec(&request).expect("canonical runtime-admin envelope");
+    let body = serde_json::to_value(&request).expect("serialise route request");
+
+    let first = fixture
+        .post("/api/v1/admin/routes", Some(&key), body.clone())
+        .await;
+    assert_eq!(first.status, StatusCode::CREATED, "body: {}", first.body);
+    let route_id = first.id();
+
+    let (legacy_key_hash, legacy_request_hash) = fixture
+        .downgrade_row_to_legacy(ROUTE_OPERATION, &route_id, &key, &request_bytes)
+        .await;
+
+    let replay = fixture.post("/api/v1/admin/routes", Some(&key), body).await;
+    assert_eq!(
+        replay.status,
+        StatusCode::CREATED,
+        "a pre-deploy runtime-admin row must still replay, got: {}",
+        replay.body
+    );
+    assert_eq!(replay.id(), route_id);
+    assert_eq!(
+        replay.body, first.body,
+        "the replayed body must be the stored one, verbatim"
+    );
+    assert_eq!(
+        fixture.route_count(&request.route_key).await,
+        1,
+        "a replay must not create a second route definition"
+    );
+    assert_eq!(fixture.ledger_count_for(ROUTE_OPERATION, &key).await, 1);
+
+    let (stored_key_hash, stored_request_hash) =
+        fixture.ledger_hashes_for(ROUTE_OPERATION, &route_id).await;
+    assert_eq!(stored_key_hash, legacy_key_hash);
+    assert_eq!(stored_request_hash, legacy_request_hash);
+
+    fixture.shutdown().await;
+}
+
+/// The negative half on the `verify`-using runtime-admin path: the legacy row must be
+/// *found* and its stored digest must actually be *compared*, so a different body under
+/// the same key conflicts rather than replaying someone else's response.
+#[tokio::test]
+async fn legacy_runtime_admin_row_with_a_different_body_still_conflicts() {
+    let Some(fixture) = HashFixture::new().await else {
+        return;
+    };
+    let key = fixture.key("route-legacy-conflict");
+    let request = fixture.route_request("conflict");
+    let request_bytes = serde_json::to_vec(&request).expect("canonical runtime-admin envelope");
+
+    let first = fixture
+        .post(
+            "/api/v1/admin/routes",
+            Some(&key),
+            serde_json::to_value(&request).expect("serialise route request"),
+        )
+        .await;
+    assert_eq!(first.status, StatusCode::CREATED, "body: {}", first.body);
+    fixture
+        .downgrade_row_to_legacy(ROUTE_OPERATION, &first.id(), &key, &request_bytes)
+        .await;
+
+    // Same label, so the route key (and therefore the resource identity) is unchanged and
+    // only the hashed body differs — exactly the case the compared digest must catch.
+    let mut different = fixture.route_request("conflict");
+    different.display_name = format!("{} (changed)", different.display_name);
+    let conflict = fixture
+        .post(
+            "/api/v1/admin/routes",
+            Some(&key),
+            serde_json::to_value(&different).expect("serialise route request"),
+        )
+        .await;
+
+    assert_eq!(conflict.status, StatusCode::CONFLICT, "{}", conflict.body);
+    assert_eq!(conflict.error()["code"], "idempotency_conflict");
+    assert_eq!(
+        conflict.error()["message_key"],
+        "moira.error.idempotency_conflict"
+    );
 
     fixture.shutdown().await;
 }

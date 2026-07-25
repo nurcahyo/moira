@@ -8,11 +8,36 @@ mod public;
 use std::{sync::Arc, time::Duration};
 
 use axum::{Extension, Router, extract::DefaultBodyLimit, http::StatusCode};
-use tower_http::timeout::TimeoutLayer;
+use tower_http::timeout::{RequestBodyTimeoutLayer, TimeoutLayer};
 use utoipa::OpenApi;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{app::AppState, config::Settings};
+
+// `test-routes` adds two unauthenticated probe routes (`/internal/test/panic`,
+// `/internal/test/slow`) whose entire purpose is to panic on demand and to park a
+// connection. They must never exist in a shipped binary.
+//
+// The Cargo feature alone does not guarantee that: `--all-features` is a different
+// feature set from the default one, and this repository's own CI already uses
+// `--all-features` (clippy and test). `cargo build --release --all-features` would
+// therefore have produced a binary containing both probes plus the panic payload
+// string. Refusing to compile is the only guarantee that holds regardless of which
+// feature flags a build uses, so the gate is `debug_assertions`, not the feature.
+//
+// CI is unaffected: `cargo clippy --all-targets --all-features` and
+// `cargo test --all-features` both build with `debug_assertions` on. A *release* build
+// that adds `--all-features` will now fail to compile — that is the point.
+//
+// Regular comments, not doc comments: rustc emits `unused doc comment` for a doc comment
+// attached to a macro invocation.
+#[cfg(all(feature = "test-routes", not(debug_assertions)))]
+compile_error!(
+    "the `test-routes` feature exposes unauthenticated panic and connection-parking \
+     probe routes and cannot be compiled with `debug_assertions` off. Drop \
+     `--all-features`/`--features test-routes` from optimized builds, or build the \
+     probes under the dev profile."
+);
 
 /// Fixed body limit for the conversation / memory / RAG surface.
 ///
@@ -34,8 +59,55 @@ pub const CONVERSATION_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 /// 1 KiB (the largest generated payload anywhere in `tests/` is a 128-character
 /// repeat), so this cannot regress a known-legitimate payload.
 ///
+/// The rationale above is only true if every `/api/v1/admin/*` path actually receives
+/// this limit. `RagDocumentCreateRequest`/`RagDocumentIngestRequest` carry the document
+/// text inline (`content: Option<String>`), and those routes used to sit in
+/// [`conversation_routes`], which meant the RAG document bodies the rationale names
+/// were in fact capped at [`CONVERSATION_BODY_LIMIT_BYTES`]. They now live in
+/// [`admin_conversation_routes`], which is layered with this constant — see that
+/// function for the full reasoning.
+///
 /// **Needs ops sign-off**: 2 MiB is a judgement call, not a measured requirement.
 pub const ADMIN_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+
+/// Hard ceiling on `PublicApiSettings.maximum_request_bytes`.
+///
+/// `maximum_request_bytes` is an `i64` and `Settings::validate` places no upper bound on
+/// it, so `MOIRA_PUBLIC_API__MAXIMUM_REQUEST_BYTES=9223372036854775807` used to pass
+/// straight into `DefaultBodyLimit::max` and yield an effectively unlimited public body
+/// limit — every accepted byte is buffered in memory by the `Json` extractor, so an
+/// unbounded limit is a memory-exhaustion switch disguised as a tuning knob.
+///
+/// 16 MiB is 16x the 1 MiB default and 8x the admin cap: far above any legitimate
+/// prompt payload, far below "unbounded". Exceeding it is clamped, not rejected, and is
+/// reported through a `warn`-level log at router-construction time so an operator who
+/// genuinely wants more sees why they did not get it.
+///
+/// **Needs ops sign-off**: 16 MiB is a judgement call, not a measured requirement. The
+/// real fix is a bound inside `Settings::validate` (`src/config/settings.rs`), which is
+/// outside this module's ownership; this clamp is the enforcement-side backstop.
+pub const MAX_PUBLIC_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Inactivity ceiling applied to **request body ingestion** on every route group.
+///
+/// `TimeoutLayer` bounds the response-head future, which for a body-consuming handler
+/// includes body ingestion — but the SSE group cannot carry a tight head timeout, and
+/// even the non-SSE ceiling (`maximum_execution_timeout_seconds + 30`, ≥ 630 s by
+/// default) is far too generous to be the only bound on how long a client may take to
+/// send its body. Without an ingestion bound, a client that writes request headers with
+/// a `Content-Length` and then never sends the body pins a connection task and a file
+/// descriptor for that entire window, before any authentication runs.
+///
+/// `RequestBodyTimeoutLayer` bounds the gap *between* body frames and resets on every
+/// frame, so it never penalises a slow-but-progressing upload and never touches the
+/// response body (which is what would break SSE). 30 s of complete silence mid-body is
+/// already far outside normal client behaviour.
+///
+/// Residual, accepted: because the timer resets per frame, a client that drips one byte
+/// every 29 s still holds a connection, bounded by `DefaultBodyLimit` in bytes but not
+/// in time. Closing that fully needs a total-ingestion budget, which tower-http does not
+/// provide; it is recorded as a deferred follow-up rather than hand-rolled here.
+pub const REQUEST_BODY_IDLE_TIMEOUT_SECONDS: u64 = 30;
 
 /// Headroom added on top of `RuntimeSettings.maximum_execution_timeout_seconds` when
 /// sizing the HTTP-level timeout, so the HTTP deadline always sits *above* the
@@ -60,27 +132,76 @@ pub struct RouterPolicy {
     pub conversation_body_limit_bytes: usize,
     /// Applied to `/api/v1/admin/*`.
     pub admin_body_limit_bytes: usize,
-    /// Applied to every non-SSE route group. SSE routes are exempt by construction.
+    /// Applied to every route group that can only ever return a buffered response.
     pub non_streaming_timeout: Duration,
+    /// Applied to the group that *may* return `text/event-stream`.
+    ///
+    /// This bounds the response-**head** future only. `tower_http`'s `Timeout` drops its
+    /// sleep as soon as the inner service resolves to a `Response`, so an SSE body that
+    /// has already been handed back streams for as long as it likes (asserted by
+    /// `a_timeout_layer_never_caps_an_already_returned_streaming_body` in `src/lib.rs`).
+    /// Kept as a distinct field from [`Self::non_streaming_timeout`] precisely so a test
+    /// can drive the non-streaming ceiling down to prove the exemption without also
+    /// capping the stream's setup phase.
+    pub streaming_head_timeout: Duration,
+    /// Applied to every route group as a `RequestBodyTimeoutLayer`: the maximum gap
+    /// between two request-body frames. See [`REQUEST_BODY_IDLE_TIMEOUT_SECONDS`].
+    pub request_body_idle_timeout: Duration,
 }
 
 impl RouterPolicy {
     pub fn from_settings(settings: &Settings) -> Self {
+        let non_streaming_timeout = Duration::from_secs(
+            settings
+                .runtime
+                .maximum_execution_timeout_seconds
+                .saturating_add(NON_STREAMING_TIMEOUT_BUFFER_SECONDS),
+        );
         Self {
-            public_body_limit_bytes: usize::try_from(settings.public_api.maximum_request_bytes)
-                .ok()
-                .filter(|bytes| *bytes > 0)
-                .unwrap_or(CONVERSATION_BODY_LIMIT_BYTES),
+            public_body_limit_bytes: public_body_limit_bytes(
+                settings.public_api.maximum_request_bytes,
+            ),
             conversation_body_limit_bytes: CONVERSATION_BODY_LIMIT_BYTES,
             admin_body_limit_bytes: ADMIN_BODY_LIMIT_BYTES,
-            non_streaming_timeout: Duration::from_secs(
-                settings
-                    .runtime
-                    .maximum_execution_timeout_seconds
-                    .saturating_add(NON_STREAMING_TIMEOUT_BUFFER_SECONDS),
-            ),
+            non_streaming_timeout,
+            // The SSE group's head phase (auth, policy, ledger writes, opening the
+            // upstream stream) is itself bounded by the execution deadline, so the same
+            // ceiling is the right one; only the *body* must escape it.
+            streaming_head_timeout: non_streaming_timeout,
+            request_body_idle_timeout: Duration::from_secs(REQUEST_BODY_IDLE_TIMEOUT_SECONDS),
         }
     }
+}
+
+/// Resolves the configured public body limit into an enforceable one.
+///
+/// `maximum_request_bytes` is an unbounded `i64`, so three cases have to be handled:
+/// non-positive, larger than `usize`, and merely absurd. All three are clamped rather
+/// than rejected — refusing to build the router over a tuning knob would turn a
+/// misconfiguration into an outage — and all three warn.
+fn public_body_limit_bytes(configured: i64) -> usize {
+    let Some(bytes) = usize::try_from(configured).ok().filter(|bytes| *bytes > 0) else {
+        tracing::warn!(
+            configured,
+            applied = CONVERSATION_BODY_LIMIT_BYTES,
+            "public_api.maximum_request_bytes is not a usable positive byte count; \
+             applying the default public body limit"
+        );
+        return CONVERSATION_BODY_LIMIT_BYTES;
+    };
+
+    if bytes > MAX_PUBLIC_BODY_LIMIT_BYTES {
+        tracing::warn!(
+            configured = bytes,
+            applied = MAX_PUBLIC_BODY_LIMIT_BYTES,
+            "public_api.maximum_request_bytes exceeds the enforceable ceiling; clamping. \
+             Request bodies are buffered in memory, so an unbounded limit is a \
+             memory-exhaustion vector"
+        );
+        return MAX_PUBLIC_BODY_LIMIT_BYTES;
+    }
+
+    bytes
 }
 
 impl Default for RouterPolicy {
@@ -151,31 +272,62 @@ async fn probe_slow() -> StatusCode {
 }
 
 fn documented_router(policy: RouterPolicy) -> OpenApiRouter<AppState> {
-    // `TimeoutLayer` here only bounds the time taken to *produce* a response head; it
-    // never bounds an already-returned streaming body. The SSE group is nevertheless
-    // left entirely unlayered so that no future change to this stack can accidentally
-    // cap a long-lived stream.
+    // `TimeoutLayer` bounds the time taken to *produce a response head*. `tower_http`'s
+    // `Timeout::ResponseFuture` drops its sleep the moment the inner service resolves to
+    // a `Response`, so a streaming body that has already been handed back is never
+    // capped by it — which is exactly why the SSE group can carry one too.
+    //
+    // The SSE group used to be left entirely unlayered on the reasoning that "the SSE
+    // group must not be capped". That reasoning conflated two different bounds: leaving
+    // the group unlayered removed the bound on *request ingestion* as well, so a client
+    // could write `POST /api/v1/responses/stream` headers with a `Content-Length` and
+    // never send the body, pinning a connection task and a file descriptor forever —
+    // before `public_actor` (which runs inside the handler, after `Json` extraction) ever
+    // asks for a credential. It also left `/v1/responses` with `stream: false`, a fully
+    // non-streaming JSON route that happens to share a path with the streaming one,
+    // without any timeout at all.
+    //
+    // Two bounds now cover the group, neither of which can touch a response body:
+    //   * `streaming_head_timeout` — head production only (see `RouterPolicy`).
+    //   * `RequestBodyTimeoutLayer` — the gap between request-body frames.
     let timeout =
         TimeoutLayer::with_status_code(StatusCode::GATEWAY_TIMEOUT, policy.non_streaming_timeout);
+    let streaming_timeout =
+        TimeoutLayer::with_status_code(StatusCode::GATEWAY_TIMEOUT, policy.streaming_head_timeout);
+    // Applied to every group: a stalled request body must never be able to park a
+    // connection, whichever route it was addressed to.
+    let body_timeout = RequestBodyTimeoutLayer::new(policy.request_body_idle_timeout);
 
     let mut router = OpenApiRouter::with_openapi(openapi::MoiraApiDoc::openapi())
-        .merge(operational_routes().layer(timeout))
+        .merge(
+            operational_routes()
+                .layer(timeout)
+                .layer(body_timeout.clone()),
+        )
         .merge(
             public_execution_routes()
                 .layer(DefaultBodyLimit::max(policy.public_body_limit_bytes))
-                .layer(timeout),
+                .layer(timeout)
+                .layer(body_timeout.clone()),
         )
-        // No `TimeoutLayer`: SSE connections are long-lived by design.
-        .merge(streaming_routes().layer(DefaultBodyLimit::max(policy.public_body_limit_bytes)))
+        .merge(
+            streaming_routes()
+                .layer(DefaultBodyLimit::max(policy.public_body_limit_bytes))
+                .layer(streaming_timeout)
+                .layer(body_timeout.clone()),
+        )
         .merge(
             conversation_routes()
                 .layer(DefaultBodyLimit::max(policy.conversation_body_limit_bytes))
-                .layer(timeout),
+                .layer(timeout)
+                .layer(body_timeout.clone()),
         )
         .merge(
             admin_routes()
+                .merge(admin_conversation_routes())
                 .layer(DefaultBodyLimit::max(policy.admin_body_limit_bytes))
-                .layer(timeout),
+                .layer(timeout)
+                .layer(body_timeout),
         );
     openapi::finalize_document(router.get_openapi_mut());
     router
@@ -213,6 +365,8 @@ fn streaming_routes() -> OpenApiRouter<AppState> {
         .routes(routes!(public::openai_responses_compat))
 }
 
+/// The caller-facing conversation / memory surface (`/api/v1/conversations*`,
+/// `/api/v1/memories*`), layered with [`CONVERSATION_BODY_LIMIT_BYTES`].
 fn conversation_routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(
@@ -239,6 +393,37 @@ fn conversation_routes() -> OpenApiRouter<AppState> {
             conversation::patch_memory,
             conversation::delete_memory
         ))
+}
+
+/// The `/api/v1/admin/*` routes that happen to be *implemented* in `http::conversation`.
+///
+/// They are split out of [`conversation_routes`] so that the layering invariant is
+/// simply stated and holds without exception: **every `/api/v1/admin/*` path is layered
+/// with [`ADMIN_BODY_LIMIT_BYTES`]**. Previously these paths inherited
+/// [`CONVERSATION_BODY_LIMIT_BYTES`] purely because of which Rust module their handlers
+/// lived in, which contradicted `ADMIN_BODY_LIMIT_BYTES`'s own stated rationale — that
+/// rationale cites "RAG document bodies" as a reason for the larger cap, while the RAG
+/// document routes were the ones getting the smaller one. Measured before the move: a
+/// 1536 KiB body got 400 on `/api/v1/admin/applications` (admitted) but 413 on
+/// `/api/v1/admin/rag-collections`, `.../rag-collections/{id}/documents` and
+/// `.../rag-documents/{id}/ingest`.
+///
+/// Moving rather than rewriting the rationale is the deliberate choice, because the
+/// rationale is correct: `RagDocumentCreateRequest` and `RagDocumentIngestRequest` carry
+/// the document text inline as `content: Option<String>` (`src/domain/conversation.rs`),
+/// so these are the only Moira routes whose body size is bounded by a *document* rather
+/// than by a prompt or a policy object. Capping an operator-supplied document at half
+/// the cap granted to an application-create payload is not defensible. The four
+/// application-scoped `*-policy` routes move with them only because they share the
+/// `/api/v1/admin/` prefix and a one-sentence invariant is worth more than a 1 MiB
+/// distinction on fixed-shape policy objects that are three orders of magnitude smaller.
+///
+/// This is a layering change only: no path, method, operation id, schema or security
+/// requirement moves with it, so the OpenAPI document is unchanged (utoipa's `PathsMap`
+/// is a `BTreeMap` — `preserve_path_order` is not enabled — so even serialisation order
+/// is unaffected by which group registered a path).
+fn admin_conversation_routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
         .routes(routes!(
             conversation::get_conversation_policy,
             conversation::put_conversation_policy

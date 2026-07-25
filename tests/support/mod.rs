@@ -412,11 +412,23 @@ impl LifecycleFixture {
 }
 
 pub fn request_context() -> RequestContext {
+    request_context_with_idempotency_key(None)
+}
+
+/// A `RequestContext` carrying an `Idempotency-Key`, as `RequestContext::from_headers`
+/// would build it for a request that sent the header.
+///
+/// `request_context()` hard-codes `idempotency_key: None`, which silently made every
+/// fixture-driven service call non-idempotent — the reason no test exercised the
+/// `/v1/responses` or runtime-admin idempotency ledgers at all before plan 03's review.
+/// Tests that drive those paths over real HTTP send the header instead; this exists for
+/// direct service-level calls.
+pub fn request_context_with_idempotency_key(key: Option<&str>) -> RequestContext {
     RequestContext {
         request_id: format!("test-{}", Uuid::now_v7()),
         source_ip: None,
         user_agent: Some("moira-lifecycle-test".to_string()),
-        idempotency_key: None,
+        idempotency_key: key.map(str::to_string),
     }
 }
 

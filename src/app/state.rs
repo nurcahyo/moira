@@ -21,6 +21,14 @@ use crate::{
 pub struct AppState {
     pub settings: Arc<Settings>,
     pub pool: Option<PgPool>,
+    /// The general-purpose outbound client: provider execution calls and anything else
+    /// that is *not* a JWKS fetch.
+    ///
+    /// Deliberately left on `reqwest`'s defaults — including `Policy::limited(10)` —
+    /// because changing redirect or timeout behaviour here would silently alter provider
+    /// execution semantics, which plan 03 explicitly excludes. JWKS fetches do **not**
+    /// use this client; they use the purpose-built one inside [`JwksCache`], which
+    /// refuses redirects outright. See `src/security/ssrf.rs`.
     pub http: Client,
     pub cipher: LocalSecretCipher,
     pub key_hasher: ApiKeyHasher,
@@ -37,6 +45,10 @@ pub struct AppState {
     pub circuits: CircuitBreakerRegistry,
     pub admin_auth: AdminAuthenticator,
     pub caller_auth: CallerAuthenticator,
+    /// Shared with all three authentication paths. Exposed on `AppState` so the admin
+    /// `refresh-jwks` command can reuse the same hardened client, validation, caps and
+    /// cache rather than issuing a fetch of its own.
+    pub jwks_cache: JwksCache,
 }
 
 impl AppState {
@@ -59,13 +71,14 @@ impl AppState {
             settings.idempotency.pepper_version.clone(),
         );
         // One JWKS cache, constructed once and cloned into all three authentication
-        // paths, so the trusted-issuer path and both static authenticators share a
-        // single SSRF/singleflight/stale-retention posture instead of drifting apart.
-        let jwks_cache = JwksCache::new(settings.auth.jwks.clone());
+        // paths plus the admin refresh command, so every JWKS fetch in the process
+        // shares a single SSRF/redirect/singleflight/stale-retention posture instead of
+        // drifting apart. The cache owns its own hardened `reqwest::Client`; `http`
+        // above is never used for a JWKS fetch.
+        let jwks_cache = JwksCache::new(settings.auth.jwks.clone())?;
         let auth = AuthService::new(
             settings.auth.admin.clone(),
             settings.auth.caller.clone(),
-            http.clone(),
             key_hasher.clone(),
             jwks_cache.clone(),
         );
@@ -89,14 +102,12 @@ impl AppState {
         let circuits = CircuitBreakerRegistry::new();
         let admin_auth = AdminAuthenticator::new(
             settings.auth.admin.clone(),
-            http.clone(),
             jwks_cache.clone(),
             pool.clone(),
         );
         let caller_auth = CallerAuthenticator::new(
             settings.auth.caller.clone(),
-            http.clone(),
-            jwks_cache,
+            jwks_cache.clone(),
             pool.clone(),
         );
 
@@ -119,6 +130,7 @@ impl AppState {
             circuits,
             admin_auth,
             caller_auth,
+            jwks_cache,
         })
     }
 

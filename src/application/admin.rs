@@ -30,7 +30,7 @@ use crate::{
     },
     security::{
         Actor, AuthorizationService, CredentialAadParts, ENVELOPE_VERSION_V1, IdempotencyHasher,
-        SecretCipher, credential_aad, secret_fingerprint,
+        SecretCipher, credential_aad, secret_fingerprint, validate_jwks_url,
     },
 };
 
@@ -50,6 +50,55 @@ impl<'a> AdminService<'a> {
     /// The keyed hasher every admin command ledger write goes through (plan 03, P1-1).
     fn command_hasher(&self) -> IdempotencyHasher {
         self.state.idempotency_hasher.clone()
+    }
+
+    /// Registration-time `jwks_url` gate (plan 03, P1-2).
+    ///
+    /// The same [`validate_jwks_url`] the verification path runs, applied where the
+    /// value **enters** the system. Without this a `https://169.254.169.254/…` issuer is
+    /// persisted happily and only fails much later, per caller, as an opaque `401` — the
+    /// row sitting in `trusted_jwt_issuers` is itself the finding.
+    ///
+    /// A scheme-and-host check is *not* a substitute: `https://169.254.169.254/` passes
+    /// it, which is exactly how this regressed.
+    ///
+    /// **`Resolution`/`Timeout` are deliberately not fatal here.** Whether a hostname
+    /// resolves *right now* is an availability fact, not a security one: an IdP with a
+    /// briefly unreachable nameserver — or a name that only resolves inside the cluster
+    /// the workload will eventually run in — must still be registrable, and a config API
+    /// that fails on transient DNS is worse than useless. Nothing is weakened by this:
+    /// a name that resolves into denied space is refused as `IpRange` here, and *every*
+    /// fetch re-runs the full validation before a single byte is read.
+    async fn reject_denied_jwks_url(&self, jwks_url: &str) -> Result<(), AppError> {
+        use crate::security::JwksDenialReason;
+
+        let Err(failure) = validate_jwks_url(jwks_url, &self.state.settings.auth.jwks).await else {
+            return Ok(());
+        };
+
+        if matches!(
+            failure.reason(),
+            JwksDenialReason::Resolution | JwksDenialReason::Timeout
+        ) {
+            tracing::warn!(
+                jwks_url = %jwks_url,
+                reason = failure.reason().as_str(),
+                detail = %failure.detail(),
+                "accepted a trusted JWT issuer jwks_url that could not be resolved at \
+                 registration time; the address-range check will run again on every fetch"
+            );
+            return Ok(());
+        }
+
+        // Reason and resolved address stay server-side; the admin gets the single
+        // catalogued `jwks_url_rejected` shape.
+        tracing::warn!(
+            jwks_url = %jwks_url,
+            reason = failure.reason().as_str(),
+            detail = %failure.detail(),
+            "rejected a trusted JWT issuer registration whose jwks_url is not permitted"
+        );
+        Err(failure.into_registration_error())
     }
 
     pub async fn create_application(
@@ -1134,13 +1183,16 @@ impl<'a> AdminService<'a> {
         request: TrustedJwtIssuerCreateRequest,
     ) -> Result<TrustedJwtIssuerRecord, AppError> {
         self.state.authz.require(actor, "moira:jwt-issuers:write")?;
+        // Deliberately *before* the command runner: validation performs DNS, which must
+        // not be held inside a database transaction, and a denied URL must never reach
+        // the idempotency ledger, let alone `trusted_jwt_issuers`.
+        self.reject_denied_jwks_url(&request.jwks_url).await?;
         let spec = admin_command_spec(ctx, actor, "jwt_issuer.create", json!({}), &request)?;
         let actor = actor.clone();
         let ctx = ctx.clone();
         let outcome = AdminCommandRunner::new(self.repo.clone(), self.command_hasher())
             .execute(spec, |transaction| {
                 Box::pin(async move {
-                    validate_https_url("jwks_url", &request.jwks_url)?;
                     validate_jwt_algorithm_list(&request.allowed_algorithms)?;
                     require_non_empty("issuer", &request.issuer)?;
                     let record = transaction
@@ -1193,7 +1245,7 @@ impl<'a> AdminService<'a> {
     ) -> Result<TrustedJwtIssuerRecord, AppError> {
         self.state.authz.require(actor, "moira:jwt-issuers:write")?;
         if let Some(jwks_url) = &request.jwks_url {
-            validate_https_url("jwks_url", jwks_url)?;
+            self.reject_denied_jwks_url(jwks_url).await?;
         }
         if let Some(allowed) = &request.allowed_algorithms {
             validate_jwt_algorithm_list(allowed)?;
@@ -1247,12 +1299,44 @@ impl<'a> AdminService<'a> {
     ) -> Result<TrustedJwtIssuerRecord, AppError> {
         self.state.authz.require(actor, "moira:jwt-issuers:write")?;
         let issuer = self.repo.get_trusted_jwt_issuer(id).await?;
-        self.state
-            .http
-            .get(&issuer.jwks_url)
-            .send()
-            .await?
-            .error_for_status()?;
+
+        // Plan 03 / P1-2, third fetch site. This used to be a bare
+        // `state.http.get(jwks_url).send().await?.error_for_status()?`: no URL
+        // validation, no timeout, no size cap, no content-type check, redirects
+        // followed, and the body discarded so the cache was never warmed.
+        //
+        // `error_for_status()?` also made it a **status oracle** — the upstream's status
+        // came straight back to the caller, so an ordinary admin credential could sweep
+        // the pod's internal network for open ports by reading the response code.
+        // Every outcome now collapses to the one catalogued `jwks_url_rejected` shape,
+        // exactly as `into_unauthorized` protects the verification path; the reason
+        // survives only in the server-side log below.
+        let keys = match self.state.jwks_cache.refresh(&issuer.jwks_url).await {
+            Ok(jwks) => jwks.keys.len(),
+            Err(failure) => {
+                tracing::warn!(
+                    issuer_id = %id,
+                    jwks_url = %issuer.jwks_url,
+                    reason = failure.reason().as_str(),
+                    detail = %failure.detail(),
+                    "admin jwks refresh rejected by the SSRF/resource policy"
+                );
+                self.audit_denied(
+                    actor,
+                    ctx,
+                    "jwt_issuer.refresh_jwks",
+                    "trusted_jwt_issuer",
+                    Some(id.to_string()),
+                    json!({
+                        "jwks_url": issuer.jwks_url,
+                        "reason": failure.reason().as_str(),
+                    }),
+                )
+                .await;
+                return Err(failure.into_registration_error());
+            }
+        };
+
         let record = self.repo.touch_trusted_jwt_issuer(id).await?;
         self.audit_success(
             actor,
@@ -1260,7 +1344,7 @@ impl<'a> AdminService<'a> {
             "jwt_issuer.refresh_jwks",
             "trusted_jwt_issuer",
             Some(id.to_string()),
-            json!({}),
+            json!({ "keys": keys }),
         )
         .await?;
         Ok(record)
@@ -1329,6 +1413,44 @@ impl<'a> AdminService<'a> {
                 metadata,
             })
             .await
+    }
+
+    /// Records a denial without ever changing the caller-visible outcome.
+    ///
+    /// A failed audit insert is logged and swallowed on purpose: if it propagated, the
+    /// admin's response would vary with database state, reintroducing exactly the
+    /// distinguishable-outcome problem the denial path exists to remove.
+    async fn audit_denied(
+        &self,
+        actor: &Actor,
+        ctx: &RequestContext,
+        action: &str,
+        resource_type: &str,
+        resource_id: Option<String>,
+        metadata: Value,
+    ) {
+        let recorded = self
+            .repo
+            .insert_audit(AuditLogInsert {
+                request_id: Some(ctx.request_id.clone()),
+                actor_type: Some(format!("{:?}", actor.actor_type).to_ascii_lowercase()),
+                actor_subject: actor.subject.clone(),
+                delegated_subject: actor.delegated_subject.clone(),
+                external_user_id: actor.external_user_id.clone(),
+                external_tenant_id: actor.external_tenant_id.clone(),
+                application_id: actor.internal_application_id,
+                resource_type: resource_type.to_string(),
+                resource_id,
+                action: action.to_string(),
+                result: AuditResult::Denied,
+                source_ip: ctx.source_ip,
+                user_agent: ctx.user_agent.clone(),
+                metadata,
+            })
+            .await;
+        if let Err(err) = recorded {
+            tracing::error!(error = %err, action, "failed to record an admin denial audit entry");
+        }
     }
 
     fn validate_provider_base_url(&self, value: &str) -> Result<String, AppError> {
@@ -1733,18 +1855,6 @@ fn validate_jwt_algorithm_list(values: &[String]) -> Result<(), AppError> {
                 "unsupported JWT algorithm {value}"
             )));
         }
-    }
-    Ok(())
-}
-
-fn validate_https_url(label: &str, value: &str) -> Result<(), AppError> {
-    let parsed = url::Url::parse(value)
-        .map_err(|err| AppError::BadRequest(format!("invalid {label}: {err}")))?;
-    if parsed.scheme() != "https" {
-        return Err(AppError::BadRequest(format!("{label} must use https")));
-    }
-    if parsed.host_str().is_none() {
-        return Err(AppError::BadRequest(format!("{label} must include a host")));
     }
     Ok(())
 }

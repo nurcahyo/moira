@@ -23,9 +23,22 @@
 //! asserts both halves of that gate, so a build that accidentally shipped them would fail
 //! this suite.
 //!
-//! Concurrency discipline (`plans/CONVENTIONS.md` §3): no `sleep()`. The SSE test's
-//! ordering gate is a *completed 504 response* — a real elapsed timeout observed over the
-//! wire — plus the mock provider's `ScriptGate` acknowledgements.
+//! ## Which router each test drives
+//!
+//! Most tests here go through `MoiraHttpServer`, i.e. `moira::build_router` — the
+//! production stack. Two go through `moira::http::router(policy)` directly, and only
+//! because the property under test is the *timeout layer's placement*, which is
+//! unobservable at the production value (`maximum_execution_timeout_seconds + 30`, never
+//! below 30 s and always above every execution deadline). Those tests choose the timeout
+//! value; the layer placement, and the SSE group's exemption from it, is production code
+//! either way. `sse_streams_incrementally_through_the_production_middleware_stack` covers
+//! the SSE contract through the full stack, because a response-rewriting middleware that
+//! buffers a stream is exactly the regression `moira::http::router` alone cannot see.
+//!
+//! Concurrency discipline (`plans/CONVENTIONS.md` §3): no `sleep()`. Ordering is gated on
+//! the mock provider's `ScriptGate` acknowledgements, and on an already-elapsed
+//! (`Duration::ZERO`) timeout that resolves on a handler's first pend rather than on
+//! wall-clock racing.
 
 mod support;
 
@@ -560,38 +573,183 @@ impl RawServer {
     }
 }
 
-/// `/api/v1/responses/stream` must outlive the timeout that governs non-streaming routes.
+/// Every non-SSE route **group** is genuinely governed by
+/// [`RouterPolicy::non_streaming_timeout`], and the SSE group is genuinely exempt.
 ///
-/// The ordering gate is a *completed* 504 on the same router: when that response comes
-/// back, the non-streaming ceiling has demonstrably elapsed in real time while the SSE
-/// connection was open. Only then is the stream released, and it must still complete
-/// normally. No `sleep()` is involved on either side.
+/// This is the test behind `RouterPolicy`'s doc comment ("Applied to every non-SSE route
+/// group"). Nothing else asserts it: `slow_non_streaming_request_returns_504_with_the_
+/// request_timeout_key` targets `/internal/test/slow`, which carries its **own** separate
+/// `TimeoutLayer` (`PROBE_TIMEOUT`), so it proves the envelope mapper rather than the
+/// production layer's placement. A review mutation that deleted `.layer(timeout)` from the
+/// conversation and admin groups in `src/http/mod.rs` survived the entire suite.
 ///
-/// Why the timeout is set here rather than taken from settings: the production value is
-/// `maximum_execution_timeout_seconds + 30`, and it is deliberately sized to sit *above*
-/// every execution deadline — so no execution-bearing route can ever reach it, and no
-/// stream (which is itself bounded by that deadline) can ever outlive it. The exemption is
-/// only observable at a timeout below the execution deadline. That the production value
-/// sits above the deadline is asserted separately by
-/// `the_non_streaming_timeout_sits_above_the_execution_deadline` (`src/lib.rs`).
+/// **Why the ceiling is zero.** The production value is
+/// `maximum_execution_timeout_seconds + 30`, i.e. never below 30 s and deliberately above
+/// every execution deadline — unreachable inside a test. A zero ceiling makes the
+/// assertion *deterministic* rather than merely fast: `tower_http`'s timeout polls the
+/// inner future first and only then the (already-elapsed) deadline, so any handler that
+/// suspends even once — all of these hit PostgreSQL — times out on its first pend, with no
+/// interleaving to race and no `sleep()` anywhere. Only the layer's presence is under
+/// test here; that the configured *value* is `maximum_execution_timeout_seconds + 30` is
+/// asserted by `the_non_streaming_timeout_sits_above_the_execution_deadline`
+/// (`src/lib.rs`).
+///
+/// The control arm — the same requests against the same router built with the production
+/// policy — is what keeps this from degenerating into "everything is a 504".
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn sse_stream_outlives_the_non_streaming_timeout() {
+async fn every_non_sse_route_group_is_governed_by_the_non_streaming_timeout() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let provider = MockOpenAiServer::start([ProviderScript::Stream {
+        deltas: vec!["exempt-first".to_string(), "exempt-last".to_string()],
+    }])
+    .await;
+    fixture
+        .add_provider(provider.base_url(), 10, RuntimePolicy::default())
+        .await;
+    let consumer_key = fixture.enable_public_streaming().await;
+    let client = Client::new();
+
+    // One request per non-SSE route group. Every one of them reaches PostgreSQL — the
+    // admin listing queries it directly, and the two consumer-key routes hit it while
+    // authenticating — so every one of them suspends at least once, which is what makes
+    // the already-elapsed deadline fire deterministically. They are all `GET`s on
+    // purpose: a request body could in principle be extracted and rejected without ever
+    // suspending, and a `POST` that did survive would leave a side effect behind.
+    let probes: [(&str, &str, bool); 3] = [
+        ("admin", "/api/v1/admin/applications", false),
+        ("conversation", "/api/v1/conversations", true),
+        ("public execution", "/api/v1/models", true),
+    ];
+
+    let expired = RouterPolicy {
+        non_streaming_timeout: Duration::ZERO,
+        ..RouterPolicy::from_settings(&fixture.state.settings)
+    };
+    let timed_out_server =
+        serve(moira::http::router(expired).with_state(fixture.state.clone())).await;
+
+    for (group, path, needs_key) in probes {
+        let mut builder = client
+            .get(format!("{}{path}", timed_out_server.base_url))
+            .header("x-request-id", format!("group-{}", Uuid::now_v7()));
+        if needs_key {
+            builder = builder.header("x-consumer-key", &consumer_key);
+        }
+        let response = timeout(WAIT, builder.send())
+            .await
+            .unwrap_or_else(|_| panic!("{group} probe timed out at the test level"))
+            .unwrap_or_else(|_| panic!("{group} probe response"));
+        assert_eq!(
+            response.status(),
+            StatusCode::GATEWAY_TIMEOUT,
+            "the {group} route group is not layered with RouterPolicy::non_streaming_timeout"
+        );
+    }
+
+    // The SSE group must be exempt by construction: the same, already-elapsed ceiling
+    // must not touch it.
+    let stream_response = timeout(
+        WAIT,
+        client
+            .post(format!(
+                "{}/api/v1/responses/stream",
+                timed_out_server.base_url
+            ))
+            .header("x-consumer-key", &consumer_key)
+            .header("x-request-id", format!("sse-exempt-{}", Uuid::now_v7()))
+            .json(&public_response_request(&fixture.route_key))
+            .send(),
+    )
+    .await
+    .expect("SSE open timed out")
+    .expect("SSE response");
+    assert_eq!(
+        stream_response.status(),
+        StatusCode::OK,
+        "the SSE group must not be governed by the non-streaming timeout"
+    );
+    assert!(
+        stream_response.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap_or_default()
+            .starts_with("text/event-stream")
+    );
+    let streamed = read_until_completed(stream_response).await;
+    assert!(
+        streamed.contains("response.completed"),
+        "the exempt stream must terminate normally: {streamed}"
+    );
+
+    timed_out_server.shutdown().await;
+
+    // Control arm: with the production policy the very same requests are not 504s, so the
+    // assertions above are about the timeout layer and not about the requests themselves.
+    let normal_server = serve(
+        moira::http::router(RouterPolicy::from_settings(&fixture.state.settings))
+            .with_state(fixture.state.clone()),
+    )
+    .await;
+    for (group, path, needs_key) in probes {
+        let mut builder = client
+            .get(format!("{}{path}", normal_server.base_url))
+            .header("x-request-id", format!("group-ok-{}", Uuid::now_v7()));
+        if needs_key {
+            builder = builder.header("x-consumer-key", &consumer_key);
+        }
+        let response = timeout(WAIT, builder.send())
+            .await
+            .unwrap_or_else(|_| panic!("{group} control timed out at the test level"))
+            .unwrap_or_else(|_| panic!("{group} control response"));
+        assert_ne!(
+            response.status(),
+            StatusCode::GATEWAY_TIMEOUT,
+            "the {group} control request must not 504 under the production ceiling"
+        );
+    }
+
+    normal_server.shutdown().await;
+    provider.shutdown().await;
+}
+
+async fn read_until_completed(response: Response) -> String {
+    timeout(WAIT, async {
+        let mut buffer = String::new();
+        let mut chunks = response.bytes_stream();
+        while let Some(chunk) = chunks.next().await {
+            buffer.push_str(&String::from_utf8_lossy(&chunk.expect("SSE chunk")));
+            if buffer.contains("response.completed") {
+                break;
+            }
+        }
+        buffer
+    })
+    .await
+    .expect("the SSE stream never reached response.completed")
+}
+
+/// The SSE contract through the **production** stack: `build_router`, i.e. with
+/// `CatchPanicLayer`, the infrastructure-error envelope mapper, the metrics middleware,
+/// the secure-header middleware, `TraceLayer` and the request-id chain all present.
+///
+/// The previous version of this test used `moira::http::router` directly, so it proved
+/// nothing about any of those layers — and buffering an SSE body is exactly the kind of
+/// regression a response-rewriting middleware introduces. The ordering gate is the
+/// provider's `ScriptGate`: the first frame must reach the client while the provider is
+/// still parked, which is only possible if no layer in the stack is accumulating the body.
+/// No `sleep()` on either side.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sse_streams_incrementally_through_the_production_middleware_stack() {
     let Some(fixture) = LifecycleFixture::new().await else {
         return;
     };
     let stream_gate = ScriptGate::new();
-    let completion_gate = ScriptGate::new();
-    let provider = MockOpenAiServer::start([
-        ProviderScript::HeldStream {
-            first_delta: "sse-first".to_string(),
-            remaining_deltas: vec!["sse-last".to_string()],
-            gate: stream_gate.clone(),
-        },
-        ProviderScript::HeldCompletion {
-            text: "never delivered".to_string(),
-            gate: completion_gate.clone(),
-        },
-    ])
+    let provider = MockOpenAiServer::start([ProviderScript::HeldStream {
+        first_delta: "sse-first".to_string(),
+        remaining_deltas: vec!["sse-last".to_string()],
+        gate: stream_gate.clone(),
+    }])
     .await;
     fixture
         .add_provider(
@@ -606,81 +764,71 @@ async fn sse_stream_outlives_the_non_streaming_timeout() {
         .await;
     let consumer_key = fixture.enable_public_streaming().await;
 
-    const NON_STREAMING_CEILING: Duration = Duration::from_millis(400);
-    let policy = RouterPolicy {
-        non_streaming_timeout: NON_STREAMING_CEILING,
-        ..RouterPolicy::from_settings(&fixture.state.settings)
-    };
-    let server = serve(moira::http::router(policy).with_state(fixture.state.clone())).await;
+    // `MoiraHttpServer::start` goes through `moira::build_router` — the production stack.
+    let server = MoiraHttpServer::start(fixture.state.clone()).await;
     let client = Client::new();
 
-    // 1. Open the stream and wait until the provider acknowledges it is parked mid-stream.
     let stream_response = timeout(
         WAIT,
         client
             .post(format!("{}/api/v1/responses/stream", server.base_url))
             .header("x-consumer-key", &consumer_key)
-            .header("x-request-id", format!("sse-{}", Uuid::now_v7()))
+            .header("x-request-id", format!("sse-prod-{}", Uuid::now_v7()))
             .json(&public_response_request(&fixture.route_key))
             .send(),
     )
     .await
     .expect("SSE open timed out")
     .expect("SSE response");
+
     assert_eq!(stream_response.status(), StatusCode::OK);
+    let headers = stream_response.headers().clone();
     assert!(
-        stream_response.headers()[header::CONTENT_TYPE]
+        headers[header::CONTENT_TYPE]
             .to_str()
             .unwrap_or_default()
             .starts_with("text/event-stream")
     );
-    stream_gate.wait_arrived().await;
-
-    // 2. With the stream still open, drive a non-streaming request into the timeout. Its
-    //    504 is the acknowledgement that the ceiling has elapsed.
-    let timed_out = timeout(
-        WAIT,
-        client
-            .post(format!("{}/api/v1/responses", server.base_url))
-            .header("x-consumer-key", &consumer_key)
-            .header("x-request-id", format!("slow-{}", Uuid::now_v7()))
-            .json(&public_response_request(&fixture.route_key))
-            .send(),
-    )
-    .await
-    .expect("non-streaming request timed out at the test level")
-    .expect("non-streaming response");
-    assert_eq!(
-        timed_out.status(),
-        StatusCode::GATEWAY_TIMEOUT,
-        "the non-streaming group must be governed by the timeout layer"
+    assert!(
+        !headers.contains_key(header::CONTENT_LENGTH),
+        "a buffered response would carry a Content-Length: {headers:?}"
     );
-    completion_gate.release();
+    // The secure-header middleware must still have run on a streamed response.
+    assert_eq!(headers[header::X_FRAME_OPTIONS], "DENY");
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
 
-    // 3. Release the stream. It has now been open strictly longer than the non-streaming
-    //    ceiling and must still complete normally.
+    // The provider is parked after its first delta and has *not* been released. A frame
+    // arriving now can only have been forwarded incrementally.
+    stream_gate.wait_arrived().await;
+    let mut chunks = stream_response.bytes_stream();
+    let first_frame = timeout(WAIT, chunks.next())
+        .await
+        .expect("no SSE frame arrived while the provider was still parked")
+        .expect("SSE stream ended before its first frame")
+        .expect("SSE chunk");
+    assert!(
+        !first_frame.is_empty(),
+        "the first forwarded frame must carry bytes"
+    );
+    let mut body = String::from_utf8_lossy(&first_frame).to_string();
+    assert!(
+        !stream_gate.is_completed(),
+        "the provider must still be mid-stream when the first frame reaches the client"
+    );
+
     stream_gate.release();
-    let body = timeout(WAIT, async {
-        let mut buffer = String::new();
-        let mut chunks = stream_response.bytes_stream();
-        while let Some(chunk) = chunks.next().await {
-            buffer.push_str(&String::from_utf8_lossy(&chunk.expect("SSE chunk")));
-            if buffer.contains("response.completed") {
-                break;
-            }
-        }
-        buffer
-    })
-    .await
-    .expect("the SSE stream was cut off after the non-streaming timeout elapsed");
+    while !body.contains("response.completed") {
+        let chunk = timeout(WAIT, chunks.next())
+            .await
+            .expect("the SSE stream stalled after the provider was released")
+            .expect("the SSE stream ended before response.completed")
+            .expect("SSE chunk");
+        body.push_str(&String::from_utf8_lossy(&chunk));
+    }
 
     assert!(
         body.contains("sse-first") && body.contains("sse-last"),
-        "the stream must deliver every delta emitted after the ceiling elapsed: {body}"
-    );
-    assert!(
-        body.contains("response.completed"),
-        "the stream must terminate normally, not be aborted: {body}"
+        "the production stack must deliver every delta: {body}"
     );
 
     server.shutdown().await;
