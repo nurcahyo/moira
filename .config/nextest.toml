@@ -1,11 +1,24 @@
 # cargo-nextest configuration.
 #
-# nextest runs each test in its own process rather than as a thread in a shared binary. That is
-# faster on this suite (27 binaries, 622 tests), but the reason it is worth adopting here is
-# isolation: two shared-database races in plan 07 — the `setup_state` singleton reset and the
-# global unique slot in `auth_provider_settings` — were possible because tests share a process
-# and a pool. Process isolation does not fix shared *database* state on its own, but it makes
-# the boundaries explicit and stops one test's panic from taking its siblings' state with it.
+# nextest runs each test in its own process rather than as a thread in a shared binary.
+#
+# **It is NOT faster on this suite, and this file previously claimed it was.** Measured on a warm
+# build, same machine, same database:
+#
+#     cargo test --workspace --all-features      1m39s   622 passed
+#     cargo nextest run --workspace --all-features  2m07s   621 passed   (~28% slower)
+#
+# The reason is specific to this project rather than to nextest: 621 process spawns each build
+# their own Postgres pool, the integration suites clone a template database per test, and the
+# advisory locks guarding shared singletons now serialise across processes instead of within one.
+# Isolation costs more here than parallelism returns.
+#
+# It is kept anyway, as a *second* way to run the suite rather than the default gate, because the
+# isolation is diagnostically valuable: running under nextest forces every test to contend
+# cross-process, which is the case an in-process `Mutex` would silently not cover. Both plan 07
+# shared-database fixes were re-verified under it for exactly that reason.
+#
+# The default gate stays `cargo test`. Reach for nextest when hunting an isolation bug.
 
 [profile.default]
 # Report every failure rather than stopping at the first. When a change breaks several tests,
