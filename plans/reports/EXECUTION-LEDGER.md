@@ -242,6 +242,51 @@ silently.
 exactly two paths) rather than claiming a gate that does not exist. **Cheap to close properly:** one
 test in the `supply_chain_policy.rs` style. Recommended for plan 07.
 
+### F8 — `authz` fails OPEN on unknown actor types (latent today, a live hazard the moment anyone adds a variant)
+
+`AuthorizationService::has_scope` (`src/security/authz.rs:116-120`) and `can_grant` (`:145-148`) do
+not match on `ActorType`. They test a single negated equality:
+
+```rust
+scopes.contains(required_scope)
+    || (actor.actor_type != ActorType::ConsumerKey && scopes.contains(ADMIN_SCOPE))
+```
+
+So admin implication is **allow-by-default for every actor type except `ConsumerKey`**. Any new
+`ActorType` variant added in future silently inherits full admin implication and grant authority,
+and the compiler says nothing — there is no match to make non-exhaustive.
+
+This is not currently exploitable: the existing variants are all intended to have implication. It is
+a **fail-open default** in the authorization core, one variant away from becoming a privilege
+escalation. Plan 07 proposes adding exactly such a variant (`ActorType::SetupToken`) and its own text
+claims it will "update the two `ActorType` matches" — matches that do not exist. Implemented as
+written, `SetupToken` would receive full admin authority: the precise opposite of the plan's intent.
+
+**Fix (small, worth doing regardless of plan 07):** convert both to an explicit allow-list —
+`matches!(actor.actor_type, ActorType::SystemKey | ActorType::TrustedJwt | ActorType::DevAdmin)` —
+so a new variant is denied by default and adding one forces a deliberate decision.
+
+### F9 — a `moira:admin` grant on a trusted JWT would reach the PUBLIC API, unanalysed by plan 07
+
+`authenticate_caller` (`src/security/auth.rs:385-387`) calls `authenticate_trusted_jwt` for a bare
+bearer token and returns that actor **verbatim**, `ActorType::TrustedJwt`. The consumer-key+JWT path
+(`:375`) is safe — `combine_consumer_and_jwt` intersects scopes and strips `moira:admin` — but the
+bare-JWT path does not.
+
+Plan 07 grants `moira:admin` to trusted-JWT identities. Combined with F8's admin implication, a
+granted human calling `POST /api/v1/responses` with only their bearer token would satisfy **every**
+scope check — including `moira:execution:override-credential`, `override-model`, and
+`moira:identity:delegate`.
+
+That may even be intended, but the plan neither states it nor tests it, and its
+backward-compatibility claim covers only actors *without* a grant. Its reviewer checklist inspects
+the dev-trust-header branch (genuinely unreachable — `actor_from_trusted_headers` bypasses
+`authenticate_trusted_jwt` entirely) and misses the branch that matters.
+
+**Decision needed before plan 07 implements grants:** should an admin grant apply on the public
+execution API, or only on `/api/v1/admin/*`? If the latter, the grant must be scoped at
+`authenticate_caller`, not at `authenticate_trusted_jwt`.
+
 ---
 
 ## Plan order (forced)
