@@ -790,11 +790,17 @@ impl<'a> RuntimeAdminService<'a> {
         // writes `actor_fingerprint(actor)` unconditionally, so the legacy value can never
         // re-enter the ledger and the fallback drains as rows expire.
         //
-        // TODO(plan-07): delete `legacy_actor_fingerprint` and the second half of this
+        // TODO(post-deploy): delete `legacy_actor_fingerprint` and the second half of this
         // sweep once every ledger row written before plan 06 shipped has expired.
         // `idempotency_records.expires_at` is set 24h ahead (`record_idempotency` below),
         // so the window closes 24h after the deploy that carries Module 16; the earliest
         // safe removal date is therefore deploy-date + 1 day.
+        //
+        // Gated on a DEPLOY, not on a merge, and deliberately not owned by any plan — plan 07
+        // was originally named here, but a plan lands when it is merged and this window does
+        // not open until the code is running in production. Removing it early means a client
+        // retrying an idempotent request across the deploy boundary misses its ledger row and
+        // executes a second time, which is the exact failure the sweep exists to prevent.
         let actor_fingerprint = actor_fingerprint(actor);
         let legacy_actor_fingerprint = legacy_actor_fingerprint(actor);
         let key_hashes = [
@@ -885,9 +891,9 @@ struct ProviderRuntimePolicyIdempotencyRequest<'a> {
 /// pins that collision so this stays a documented historical value rather than something a
 /// later reader mistakes for a second live formula.
 ///
-/// TODO(plan-07): delete together with the legacy half of `idempotency_replay`'s sweep,
+/// TODO(post-deploy): delete together with the legacy half of `idempotency_replay`'s sweep,
 /// once 24h (the `expires_at` window set in `record_idempotency`) have elapsed since the
-/// deploy carrying plan 06 Module 16.
+/// deploy carrying plan 06 Module 16. Gated on a deploy, not on a merge, and owned by no plan.
 fn legacy_actor_fingerprint(actor: &Actor) -> String {
     secret_fingerprint(
         format!(

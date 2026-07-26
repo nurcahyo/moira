@@ -1058,10 +1058,13 @@ impl PublicExecutionService {
         // The write below always uses the current pair, so the legacy value can never
         // re-enter the ledger and the sweep drains as rows expire.
         //
-        // TODO(plan-07): drop the two `legacy_actor_fingerprint` probes once every ledger
+        // TODO(post-deploy): drop the two `legacy_actor_fingerprint` probes once every ledger
         // row written before plan 06 shipped has expired. `idempotency_record` sets
         // `expires_at` 24h ahead, so the earliest safe removal date is the deploy date of
         // Module 16 + 1 day. The plan-03 `legacy_hash` probe has its own, earlier window.
+        //
+        // Gated on a DEPLOY, not on a merge, and deliberately not owned by any plan — see the
+        // matching note in `runtime_admin.rs`.
         let legacy_actor_fingerprint = legacy_public_actor_fingerprint(actor, application_id);
         let legacy_key_hash = hasher.legacy_hash(key.as_bytes());
         let current_key_hash = hasher.hash(key.as_bytes());
@@ -1935,9 +1938,10 @@ fn request_has_image(request: &PublicResponseRequest) -> bool {
 /// `tests::the_legacy_public_fingerprint_collided_across_tenant_and_delegation` pins both
 /// halves of that claim.
 ///
-/// TODO(plan-07): delete together with the legacy passes in `claim_idempotency`, once 24h
+/// TODO(post-deploy): delete together with the legacy passes in `claim_idempotency`, once 24h
 /// (the `expires_at` window set by `infra::repositories::public::idempotency_record`) have
-/// elapsed since the deploy carrying plan 06 Module 16.
+/// elapsed since the deploy carrying plan 06 Module 16. Gated on a deploy, not on a merge,
+/// and owned by no plan.
 fn legacy_public_actor_fingerprint(actor: &Actor, application_id: Option<Uuid>) -> String {
     secret_fingerprint(
         format!(
