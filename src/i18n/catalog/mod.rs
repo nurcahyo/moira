@@ -264,28 +264,25 @@ mod tests {
         }
     }
 
+    /// `setup_token_issued` is named by the plan's i18n table alongside the claimed
+    /// notice, but D1 cuts `mint_setup_token` entirely — there is no emitter, and a
+    /// catalog entry with no emitter is worse than the gap (§0.7 Wave 2's own rule for
+    /// `auth_provider_method_unsupported`). It is deliberately not asserted here, which
+    /// is also why this checks a single key rather than looping over a list of one.
     #[test]
     fn identity_notice_keys_exist_in_the_catalog() {
-        for key in [
-            "moira.notice.admin_identity_claimed",
-            // `setup_token_issued` is named by the plan's i18n table alongside the
-            // claimed notice, but D1 cuts `mint_setup_token` entirely — there is no
-            // emitter, and a catalog entry with no emitter is worse than the gap
-            // (§0.7 Wave 2's own rule for `auth_provider_method_unsupported`). It is
-            // deliberately not asserted here.
-        ] {
-            let entry = all_entries()
-                .find(|entry| entry.key == key)
-                .unwrap_or_else(|| panic!("{key} must be catalogued"));
-            assert!(
-                !entry.default_message.is_empty(),
-                "{key} default_message must be non-empty"
-            );
-            assert!(
-                !entry.description.is_empty(),
-                "{key} description must be non-empty"
-            );
-        }
+        let key = "moira.notice.admin_identity_claimed";
+        let entry = all_entries()
+            .find(|entry| entry.key == key)
+            .unwrap_or_else(|| panic!("{key} must be catalogued"));
+        assert!(
+            !entry.default_message.is_empty(),
+            "{key} default_message must be non-empty"
+        );
+        assert!(
+            !entry.description.is_empty(),
+            "{key} description must be non-empty"
+        );
     }
 
     /// **D7 regression guard.** The client-secret error codes an earlier draft of plan
