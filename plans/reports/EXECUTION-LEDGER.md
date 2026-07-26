@@ -9,7 +9,44 @@ Console draft PR **#23 stays HELD**. Security findings escalate to the user imme
 
 ---
 
-## STANDING RISK — GitHub Actions is failing repo-wide
+## ⚠️ CORRECTION (2026-07-27) — CI IS NO LONGER DOWN. THE OVERRIDE'S PREMISE IS VOID.
+
+**Everything in the section below is stale and must not be relied on.** It is kept because the
+merge override was granted on its basis and the record should show what that basis was.
+
+`gh run view 30192737818` on **`main`**, 2026-07-26:
+
+```
+rust                success  steps=13
+supply-chain        failure  steps=10
+container-and-helm  failure  steps=1
+```
+
+Jobs **run now**, for 5–6 minutes, with steps executing. The `rust` job — fmt, clippy, tests, build
+— **passes on `main`**. The 2-second/0-step signature is gone.
+
+That inverts the override. Its load-bearing condition was *"a job that never started tells you
+nothing; a job that ran and failed is real and blocks the merge."* Both failures now **ran**:
+
+1. **`supply-chain` — a real finding, now fixed** (`b011ae3`). The job runs `cargo audit` **and**
+   `cargo deny check`. **`cargo audit` was never one of the five local gates**, so "all five gates
+   green" never covered half of what this job checks. It was failing on RUSTSEC-2023-0071 (Marvin
+   timing sidechannel in `rsa` 0.9.10, severity 5.9, no fixed upgrade). **Inapplicable here** —
+   `rsa` is not in the build graph on any target (`cargo tree --invert rsa --target all` prints
+   nothing); it is in `Cargo.lock` only because `sqlx` records its unused MySQL backend. That is why
+   `cargo deny` reported clean on the same tree. Closed with a documented `.cargo/audit.toml`.
+2. **`container-and-helm` — infrastructure rot, not code.** `Unable to resolve action
+   aquasecurity/trivy-action@0.28.0` (version does not exist) and `yannh/kubeconform-action`
+   (repository not found). Pinned actions that no longer resolve. **Still open** — needs the pins
+   updated to versions that exist.
+
+**The gate list is now SIX, not five.** `cargo fmt --check`, `cargo clippy`, `cargo test`,
+`cargo build --release --locked`, `cargo deny check`, **`cargo audit`**. Any claim of "all gates
+green" that omits `cargo audit` is incomplete — that is exactly how this went unnoticed.
+
+---
+
+## STANDING RISK — GitHub Actions is failing repo-wide *(SUPERSEDED — see the correction above)*
 
 **Status: unresolved. Merging proceeds under an explicit user-granted override; see below.**
 
