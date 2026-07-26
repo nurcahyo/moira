@@ -231,7 +231,9 @@ does not reach for the dangerous knob. **Worth considering for a later plan:** a
 refuses to export third-party spans regardless of level, so the safety does not rest on operator
 discipline.
 
-### F7 — the "no `rig_core` under `src/domain/`" rule has no automated gate
+### F7 — the "no `rig_core` under `src/domain/`" rule has no automated gate — **CLOSED** `d7580a6`
+
+Closed by `tests/rig_boundary.rs`. Teeth verified by injection, not assumed. Original finding:
 
 Plan 06 Module 7 verified it by a one-off `grep`, and the coordinator subsequently described it as
 enforced by a test. **It is not.** There is no source-scanning test for it — the only source-scanning
@@ -360,6 +362,30 @@ Plan 05 froze the OpenAPI spec: any later route/DTO change must regenerate `docs
 ---
 
 ## Cycle log
+
+### Cycle 7 — 2026-07-26 → 07-27
+
+- **F8 CLOSED** `8039c53` — admin implication is an allow-list; `Anonymous` + `moira:admin` no
+  longer receives it. **F9 DECIDED** — admin plane only, hooked at `authenticate_admin`.
+- **F7 CLOSED** `d7580a6` — `tests/rig_boundary.rs`. The rule was described as test-enforced and was
+  not; there was no import-scanning test in the tree at all. Checked in both directions (a stale
+  allow-list entry fails too), with vacuity guards. **Teeth verified**: injecting `use rig_core::…`
+  into `src/domain/runtime.rs` fired both assertions naming the right file, then reverted.
+- **D2 done** `c45257f` — the four `TODO(plan-07)` markers are now `TODO(post-deploy)`. Plan 07 is
+  next in the order, so "plan 07 owns this" was about to cash out as a removal ~a day early.
+- **Plan 07 Wave 0 rewrite** `0ee1419` — §0 drift table, 303 insertions. **8 blockers**: 3 would not
+  compile (`AdminCommandRunner::new` arity, `AdminCommandMutation::new` returns `Result`,
+  `src/application/admin.rs` no longer exists), 1 is a silent prod regression (attaching NOTIFY to
+  `auth_provider_settings` resets **every** provider circuit breaker on every write, because
+  `circuit_reset_scope` treats an unknown table as unknown rather than harmless), 1 is a migration
+  collision (`0009`/`0010`/`0011` all taken → `0012`/`0013`/`0014`), and 3 instruct working around
+  defects 06b already fixed. **Module 13 was missing entirely** — assigned to an agent, depended on
+  by the DoD and an e2e test, specified nowhere.
+
+**Method note.** The audit checked ~62 citations one at a time rather than sampling: ~40 were stale.
+A sample of ten would have found the file-level rot and missed B3, which is the only one that would
+have reached production. Plan 06's Wave 0 found 14 problems the same way. **Assume a plan written
+before the preceding plan merged is wrong about the tree, and budget a cycle to prove where.**
 
 ### Cycle 4-6 — 2026-07-26
 
