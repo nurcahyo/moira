@@ -491,4 +491,75 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         default_message: "The response stream was closed because it was not being read quickly enough.",
         description: "Used when a streaming consumer stops accepting events for long enough to miss the delivery deadline. Read the stream as it arrives, or use the non-streaming endpoint.",
     },
+    // ---------------------------------------------------------------------
+    // Plan 07 — identity foundation (admin identity claiming + runtime auth
+    // provider settings).
+    //
+    // Every one of these is raised through `AppError::coded`/`conflict`, never
+    // through `AppError::BadRequest`/`Forbidden`/`NotFound`, because those
+    // derive the generic `bad_request`/`forbidden`/`not_found` codes and would
+    // silently drop the specific key plan 08's console binds to.
+    //
+    // Deliberately absent: the setup-token credential codes
+    // (`setup_token_invalid`/`_expired`/`_consumed`/`_target_mismatch`) and
+    // `auth_provider_secret_*`. The first group belongs to the deferred
+    // one-time-token path (decision D1); the second describes conditions that
+    // can no longer occur, because Moira accepts, stores and binds no OAuth
+    // client secret (decision D7).
+    // ---------------------------------------------------------------------
+    I18nEntry {
+        key: "moira.error.unregistered_trusted_issuer",
+        default_message: "The target issuer is not a registered, active trusted JWT issuer.",
+        description: "Used when an admin-identity claim, or an auth-provider configuration, names a JWT issuer that has no active row in trusted_jwt_issuers. Moira never accepts a free-text issuer at claim time; register and enable the issuer first.",
+    },
+    I18nEntry {
+        key: "moira.error.admin_claim_email_required",
+        default_message: "An email address is required to claim an admin identity.",
+        description: "Used when a claim omits an email address, presents an empty one, or presents a value from which no domain can be extracted. Email is required on every credential path; there is no exemption.",
+    },
+    I18nEntry {
+        key: "moira.error.admin_claim_email_not_verified",
+        default_message: "The email address for this identity is not verified.",
+        description: "Used when a claim names an email address that the identity provider has not marked verified. The requirement is hard, not configurable, and applies on every credential path.",
+    },
+    I18nEntry {
+        key: "moira.error.admin_claim_domain_not_allowed",
+        default_message: "This email domain is not allowed to claim an admin identity.",
+        description: "Used when the deny-by-default email-domain policy refuses a claim, either because no enabled auth-provider configuration governs the target issuer or because the email's domain is not in its allowed_email_domains. An unconfigured or empty allow-list denies every claim on every credential path; there is no first-claim exemption. The operator must create and enable an auth-provider configuration with the intended domains before any claim can succeed.",
+    },
+    I18nEntry {
+        key: "moira.error.admin_identity_already_claimed",
+        default_message: "This identity has already been granted admin access.",
+        description: "Used when a claim targets an (issuer, subject) pair that already holds a grant. Raised by the unique index on admin_identities, so it holds even if the command runner's advisory-lock window is raced.",
+    },
+    I18nEntry {
+        key: "moira.error.setup_token_not_supported",
+        default_message: "The one-time setup token path is not available on this deployment.",
+        description: "Used when a claim populates the reserved setup_token field. The one-time-token credential path is deferred, and the field is refused rather than ignored: accepting and discarding it would let a caller believe Moira had honoured a credential it never read. Present the system key instead.",
+    },
+    I18nEntry {
+        key: "moira.error.auth_provider_not_found",
+        default_message: "The auth provider configuration was not found.",
+        description: "Used when an auth-provider settings row does not exist or has been soft-deleted.",
+    },
+    I18nEntry {
+        key: "moira.error.duplicate_auth_provider",
+        default_message: "An auth provider is already configured for this method and issuer.",
+        description: "Used when a create or patch would collide with the unique index over live auth_provider_settings rows on (method, issuer).",
+    },
+    I18nEntry {
+        key: "moira.error.auth_provider_method_config_incomplete",
+        default_message: "The auth provider configuration is incomplete for this method.",
+        description: "Used when a create or enable request leaves the method's required non-secret configuration incomplete - for example generic_oidc with neither issuer nor discovery_url, or jwks with no jwks_url. Moira never checks for an OAuth client secret: under decision D7 the client secret is owned by the console and Moira does not store it.",
+    },
+    I18nEntry {
+        key: "moira.error.auth_provider_url_not_allowed",
+        default_message: "The configured URL is not allowed.",
+        description: "Used when an auth-provider URL is not an absolute https URL with a host. This is a syntactic gate: no fetch happens here, and any future fetch must go through the SSRF-hardened client rather than a second implementation.",
+    },
+    I18nEntry {
+        key: "moira.error.console_issuer_must_not_assert_scopes",
+        default_message: "A console issuer must not map a scopes claim.",
+        description: "Used when an auth-provider configuration links a trusted JWT issuer whose scopes_claim is set. Such an issuer's tokens self-assert scopes, which would defeat the admin_identities grant table as the sole source of human authorization (CONVENTIONS 7.5).",
+    },
 ];
