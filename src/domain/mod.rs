@@ -1,6 +1,8 @@
 mod admin;
+mod auth_settings;
 mod conversation;
 mod i18n;
+mod identity;
 mod ids;
 mod message;
 mod models;
@@ -21,6 +23,10 @@ pub use admin::{
     SetupStatus, SetupStatusResponse, SystemKeyCreateRequest, TrustedJwtIssuerCreateRequest,
     TrustedJwtIssuerPatchRequest, TrustedJwtIssuerRecord,
 };
+pub use auth_settings::{
+    AuthMethod, AuthProviderSettingsCreateRequest, AuthProviderSettingsPatchRequest,
+    AuthProviderSettingsRecord, PublicAuthMethod, SetupAuthMethodsResponse,
+};
 pub use conversation::{
     ConversationContentPersistence, ConversationCreateRequest, ConversationMessageCreateRequest,
     ConversationMessageQuery, ConversationMessageRecord, ConversationMessageRole,
@@ -36,6 +42,9 @@ pub use conversation::{
     RetrievalPolicyRecord,
 };
 pub use i18n::{ResponseText, ResponseTextArgs};
+pub use identity::{
+    AdminIdentityRecord, AdminIdentityStatus, ClaimAdminIdentityRequest, SetupClaimStatusResponse,
+};
 pub use ids::{
     AgentProfileId, ApplicationId, ApplicationSlug, AttemptId, AuditEventId, ConsumerKeyId,
     ExecutionId, ExternalApplicationId, ExternalTenantId, ExternalUserId, ProviderCredentialId,
