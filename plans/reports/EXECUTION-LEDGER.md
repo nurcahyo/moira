@@ -363,6 +363,53 @@ Plan 05 froze the OpenAPI spec: any later route/DTO change must regenerate `docs
 
 ## Cycle log
 
+### Cycle 8 — 2026-07-27 — plan 07 implemented
+
+Branch `plan/07-identity-foundation`, four waves. **All five gates green: 622 passed, 0 failed,
+0 skipped**, run twice consecutively from cold (F5 template-database flake did not reappear).
+OpenAPI 131 → 141 operations, snapshot regenerated and committed; zero `rotate-secret` references.
+
+| Commit | Wave |
+|---|---|
+| `d291e47` | 1 — migrations `0012`/`0013`, domain DTOs |
+| `621b498` | B3 fix — `auth_provider_settings` keeps provider breakers |
+| `bf5a744` | 2 — repositories, services, deny-by-default domain policy |
+| `d5f5aa8` | 3 — D2 auth wiring, HTTP surface, auth-settings cache, OpenAPI regen |
+| `9718273` `113c08b` | 4 — the named-test coverage gap |
+
+**D2 verified directly, not on report.** `apply_admin_identity_grant` is called at exactly one site,
+`src/security/auth.rs:334`, inside `authenticate_admin`'s bearer branch. The two `authenticate_caller`
+paths (`:383`, `:394`) receive the ungranted actor. `git diff` on `src/security/authz.rs` is empty.
+`a_granted_identity_gains_admin_scope_only_on_the_admin_plane` pins both directions and asserts the
+403's message names the missing scope, so it cannot be confused with the application-binding 403.
+
+**Three real defects the plan would have shipped**, none of which the citation audit found — they
+needed an implementer and a live database:
+
+1. **`order by (issuer = $1) desc` applies the wrong policy.** `issuer` is nullable, `null = $1` is
+   `NULL`, and Postgres sorts nulls **first** under `desc` — so an issuer-less row outranks an exact
+   match and the wrong `allowed_email_domains` governs a grant. Fixed with `is not distinct from`.
+   No unit test can see this; it needs a real sort.
+2. **The plan's unique index is invalid SQL** — a bare `COALESCE` in an index column list.
+3. **`auth_provider_settings` would have reset every provider circuit breaker on every write** (B3),
+   found by the audit but only closable outside Wave 1's file set. Fixed in `621b498`, teeth verified.
+
+**Named-test audit: 80 extracted, 80 verified**, deliberately not sampled — plan 05's two false
+"complete and green" calls both came from checking a subset and generalising. 21 tests written; 5 are
+unwritable because D1 cut the setup-token path, which the plan's own D1 text predicts. Five of the
+highest-risk new tests had their teeth checked by injection.
+
+**A false claim of mine was caught and corrected** (`c3f6c09`): §0.4 said plan 06c made *any* missing
+catalog entry a `cargo build` failure. The `const` block covers `ExecutionFailureClass::ALL` only;
+everything else is a source-walking **test**. Still gated, but a green build is not proof of a
+complete catalog. §0.4's correction was also narrower than its phrasing implied — a third code,
+`setup_claim_credential_required`, was missing and Wave 3 found it.
+
+**Process note:** two agents wrote commit messages to the same scratchpad `msg.txt` and one commit
+briefly carried the other's message. Content was never affected — `git commit --only -- <paths>`
+scoped correctly throughout. **Use inline `-m`, or a per-agent path.** Add this to the shared-index
+lesson: the scratchpad is shared state too.
+
 ### Cycle 7 — 2026-07-26 → 07-27
 
 - **F8 CLOSED** `8039c53` — admin implication is an allow-list; `Anonymous` + `moira:admin` no
