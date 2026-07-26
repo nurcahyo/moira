@@ -472,13 +472,101 @@ mod tests {
         }
     }
 
-    async fn migrated_pool() -> Option<sqlx::PgPool> {
+    /// Mutual exclusion for the `setup_state` singleton, keyed so that every process
+    /// touching the shared test database agrees on it.
+    ///
+    /// PostgreSQL advisory locks are *database*-scoped, which is exactly the scope of the
+    /// problem: `setup_state` is one row per database, and `MOIRA_TEST_DATABASE_URL` is a
+    /// database several test threads — and, under `cargo test --workspace`, several test
+    /// *binaries* — share. A `Mutex` in this module would only serialise the threads of
+    /// one binary, so the lock lives in the database instead.
+    ///
+    /// The integration suites take the other established route (`tests/support/mod.rs`
+    /// clones a private database per fixture) and therefore never contend for this key.
+    /// That harness is an integration-test module, not part of the library crate, so it is
+    /// unreachable from a `#[cfg(test)]` module in `src/`; reproducing its
+    /// `CREATE DATABASE … TEMPLATE`, leak-sweeping machinery inside the shipped crate to
+    /// isolate six tests would be far more code than this lock, for the same guarantee.
+    const SETUP_STATE_LOCK_KEY: i64 = i64::from_be_bytes(*b"moirastp");
+
+    /// Exclusive access to the `setup_state` singleton for the lifetime of one test.
+    ///
+    /// # Why the connection is not drawn from the pool
+    ///
+    /// `pg_advisory_lock` takes a *session*-level lock, so it is released by the session
+    /// that took it — and a pooled connection is returned to the pool still holding it,
+    /// where a later checkout would silently inherit (and re-entrantly re-take) the lock.
+    /// A dedicated connection instead ties the lock's lifetime to a socket: dropping it
+    /// closes the socket, PostgreSQL reaps the backend, and the lock is released. That is
+    /// what makes the guard sound under a **panicking** test, which is the case that
+    /// matters — the assertion failure this guards against aborts the test before any
+    /// explicit release could run.
+    struct SetupStateLock {
+        _session: sqlx::PgConnection,
+    }
+
+    impl SetupStateLock {
+        async fn acquire(database_url: &str) -> Self {
+            use sqlx::Connection as _;
+
+            let mut session = sqlx::PgConnection::connect(database_url)
+                .await
+                .expect("open the setup-state lock session");
+            sqlx::query("select pg_advisory_lock($1)")
+                .bind(SETUP_STATE_LOCK_KEY)
+                .execute(&mut session)
+                .await
+                .expect("take the setup-state advisory lock");
+            Self { _session: session }
+        }
+    }
+
+    /// Restores the singleton to its migrated state.
+    ///
+    /// Called at both ends of every database-backed test in this module: at the end so a
+    /// claim does not leak a "setup is done" fact, and at the *start* so a test that
+    /// panicked before its cleanup — or a run killed outright — cannot poison the next
+    /// one. Neither of those is sufficient alone; see [`migrated_pool`].
+    async fn reset_setup_state(pool: &sqlx::PgPool) {
+        sqlx::query(
+            "update setup_state set claimed = false, claimed_admin_identity_id = null, \
+             claimed_at = null where id",
+        )
+        .execute(pool)
+        .await
+        .expect("reset the setup singleton");
+    }
+
+    /// A pool onto the shared test database, plus exclusive access to `setup_state`.
+    ///
+    /// # The guard is not optional, and must be bound for the whole test
+    ///
+    /// Bind it as `let Some((pool, _setup_lock)) = …`, never `_`: a bare `_` drops the
+    /// guard immediately and reopens the window below.
+    ///
+    /// `setup_state` is a singleton row on a database every test thread in this binary
+    /// shares, and `cleanup` resets it *globally* — it has no per-test predicate to scope
+    /// it by, because a singleton has no key. So a sibling test finishing mid-test writes
+    /// `claimed = false` underneath whoever is running, and
+    /// `a_configured_domain_lets_the_claim_through_and_marks_setup_claimed` reads that
+    /// zero back out of `claim_status()` between its own claim and its own assertion.
+    ///
+    /// Resetting at the start of the test — which this does — fixes only the inherited
+    /// half of the problem. It cannot fix that half, because the offending write lands
+    /// *during* the test, after any start-of-test reset has already run. Only holding the
+    /// singleton exclusively for the test's duration closes it, which is why the lock is
+    /// taken here rather than a reset being relied on alone.
+    async fn migrated_pool() -> Option<(sqlx::PgPool, SetupStateLock)> {
         let database_url = std::env::var("MOIRA_TEST_DATABASE_URL").ok()?;
         let pool = sqlx::PgPool::connect(&database_url)
             .await
             .expect("connect the test database");
+        // Before the lock, not under it: `migrate` takes sqlx's own advisory lock, and
+        // acquiring ours first would order the two locks differently in different tests.
         crate::infra::db::migrate(&pool).await.expect("migrate");
-        Some(pool)
+        let lock = SetupStateLock::acquire(&database_url).await;
+        reset_setup_state(&pool).await;
+        Some((pool, lock))
     }
 
     async fn register_issuer(pool: &sqlx::PgPool, issuer: &str) -> Uuid {
@@ -497,13 +585,10 @@ mod tests {
         // a successful claim also flips `claimed`. Restoring the singleton to its migrated
         // state keeps this test from leaking a "setup is done" fact into the shared
         // database every other unit test also uses.
-        sqlx::query(
-            "update setup_state set claimed = false, claimed_admin_identity_id = null, \
-             claimed_at = null where id",
-        )
-        .execute(pool)
-        .await
-        .expect("reset the setup singleton");
+        //
+        // This write is global — a singleton has no key to scope it by — so it is only
+        // safe while the caller holds the `SetupStateLock` that `migrated_pool` returns.
+        reset_setup_state(pool).await;
         sqlx::query("delete from admin_identities where issuer = $1")
             .bind(issuer)
             .execute(pool)
@@ -527,7 +612,7 @@ mod tests {
     /// "so bootstrap works" short-circuit, this is the test that turns red.
     #[tokio::test]
     async fn a_system_key_claim_is_denied_on_a_fresh_deployment() {
-        let Some(pool) = migrated_pool().await else {
+        let Some((pool, _setup_lock)) = migrated_pool().await else {
             eprintln!("skipping admin identity claim integration: set MOIRA_TEST_DATABASE_URL");
             return;
         };
@@ -566,7 +651,7 @@ mod tests {
     /// means unrestricted" reading, refuted.
     #[tokio::test]
     async fn a_system_key_claim_is_denied_when_the_allow_list_is_empty() {
-        let Some(pool) = migrated_pool().await else {
+        let Some((pool, _setup_lock)) = migrated_pool().await else {
             eprintln!("skipping admin identity claim integration: set MOIRA_TEST_DATABASE_URL");
             return;
         };
@@ -607,7 +692,7 @@ mod tests {
     /// This is what makes the two denials above a *policy* rather than a broken path.
     #[tokio::test]
     async fn a_configured_domain_lets_the_claim_through_and_marks_setup_claimed() {
-        let Some(pool) = migrated_pool().await else {
+        let Some((pool, _setup_lock)) = migrated_pool().await else {
             eprintln!("skipping admin identity claim integration: set MOIRA_TEST_DATABASE_URL");
             return;
         };
@@ -672,7 +757,7 @@ mod tests {
     /// never believe Moira read a credential it does not support.
     #[tokio::test]
     async fn a_populated_setup_token_is_refused_rather_than_ignored() {
-        let Some(pool) = migrated_pool().await else {
+        let Some((pool, _setup_lock)) = migrated_pool().await else {
             eprintln!("skipping admin identity claim integration: set MOIRA_TEST_DATABASE_URL");
             return;
         };
@@ -697,7 +782,7 @@ mod tests {
     /// JWT is not a claim credential, even carrying `moira:admin`.
     #[tokio::test]
     async fn a_trusted_jwt_actor_cannot_claim_even_with_admin_scope() {
-        let Some(pool) = migrated_pool().await else {
+        let Some((pool, _setup_lock)) = migrated_pool().await else {
             eprintln!("skipping admin identity claim integration: set MOIRA_TEST_DATABASE_URL");
             return;
         };
@@ -728,7 +813,7 @@ mod tests {
     /// the catalog already covers.
     #[tokio::test]
     async fn claim_rejects_a_scope_outside_admin_scopes() {
-        let Some(pool) = migrated_pool().await else {
+        let Some((pool, _setup_lock)) = migrated_pool().await else {
             eprintln!("skipping admin identity claim integration: set MOIRA_TEST_DATABASE_URL");
             return;
         };
