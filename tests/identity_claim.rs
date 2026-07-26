@@ -17,7 +17,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use moira::app::AppState;
 use serde_json::{Value, json};
 use support::LifecycleFixture;
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{net::TcpListener, sync::Barrier, task::JoinHandle};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -226,6 +226,32 @@ async fn post_json(
         builder = builder.header("if-match", version.to_string());
     }
     send(router, builder.body(Body::from(body.to_string())).unwrap()).await
+}
+
+/// Releases every task on the same `barrier.wait()` before it issues the claim, so the
+/// requests race rather than run sequentially — the acknowledgement-gate pattern
+/// `tests/admin_idempotency.rs` uses (`spawn_post` there), in place of a fixed `sleep()`
+/// (CONVENTIONS §3).
+#[allow(clippy::too_many_arguments)]
+fn spawn_claim(
+    router: Router,
+    barrier: std::sync::Arc<Barrier>,
+    headers: HeaderMap,
+    idempotency_key: Option<String>,
+    body: Value,
+) -> JoinHandle<HttpResult> {
+    tokio::spawn(async move {
+        barrier.wait().await;
+        post_json(
+            router,
+            "/api/v1/admin/setup/claim",
+            headers,
+            idempotency_key.as_deref(),
+            None,
+            body,
+        )
+        .await
+    })
 }
 
 fn system_key_headers(secret: &str) -> HeaderMap {
@@ -725,6 +751,458 @@ async fn a_populated_setup_token_is_refused_with_its_own_code() {
         refused.body
     );
     assert_eq!(refused.code(), "setup_token_not_supported");
+}
+
+/// **Barrier-gated.** Two concurrent claims for the identical `(issuer, subject)`, with no
+/// `Idempotency-Key` on either — so the only thing that can prevent a duplicate grant is
+/// `admin_identities_issuer_subject_active_unique`, raced honestly rather than serialized
+/// by an artificial delay. Exactly one request must observe `201`; the other must observe
+/// `409 admin_identity_already_claimed`, the database-level backstop `insert_grant`'s
+/// `already_claimed_on_unique_violation` maps a unique violation to. Never both `201`,
+/// never both `409`, never a second row.
+#[tokio::test]
+async fn concurrent_claims_for_the_same_identity_yield_one_201_and_one_409() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let issuer = ConsoleIssuer::start(&fixture.pool).await;
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let secret = mint_system_key(&router, &fixture.state).await;
+    configure_and_enable_policy(&router, &issuer.issuer, &["example.com"]).await;
+    let body = claim_body(&issuer.issuer, "contested", "owner@example.com");
+
+    let barrier = std::sync::Arc::new(Barrier::new(3));
+    let first = spawn_claim(
+        router.clone(),
+        barrier.clone(),
+        system_key_headers(&secret),
+        None,
+        body.clone(),
+    );
+    let second = spawn_claim(
+        router.clone(),
+        barrier.clone(),
+        system_key_headers(&secret),
+        None,
+        body,
+    );
+    barrier.wait().await;
+    let first = first.await.expect("first claim task");
+    let second = second.await.expect("second claim task");
+
+    let statuses = [first.status, second.status];
+    assert!(
+        statuses.contains(&StatusCode::CREATED),
+        "one of the two concurrent claims must succeed: {statuses:?}"
+    );
+    assert!(
+        statuses.contains(&StatusCode::CONFLICT),
+        "the other must be refused as already claimed, not silently succeed too: {statuses:?}"
+    );
+    let loser = if first.status == StatusCode::CONFLICT {
+        &first
+    } else {
+        &second
+    };
+    assert_eq!(loser.code(), "admin_identity_already_claimed");
+
+    let grants: i64 = sqlx::query_scalar("select count(*) from admin_identities where issuer = $1")
+        .bind(&issuer.issuer)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count grants");
+    assert_eq!(grants, 1, "a race must never produce a second grant row");
+}
+
+/// **Barrier-gated**, the sibling assertion: the advisory-lock/unique-index machinery that
+/// serializes a race for *one* identity must not also serialize unrelated identities. Two
+/// different subjects on the same governing issuer, released together, must both succeed —
+/// the lock key is per-identity, not per-issuer or global.
+#[tokio::test]
+async fn concurrent_claims_for_different_identities_both_succeed() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let issuer = ConsoleIssuer::start(&fixture.pool).await;
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let secret = mint_system_key(&router, &fixture.state).await;
+    configure_and_enable_policy(&router, &issuer.issuer, &["example.com"]).await;
+
+    let barrier = std::sync::Arc::new(Barrier::new(3));
+    let first = spawn_claim(
+        router.clone(),
+        barrier.clone(),
+        system_key_headers(&secret),
+        None,
+        claim_body(&issuer.issuer, "distinct-one", "owner-one@example.com"),
+    );
+    let second = spawn_claim(
+        router.clone(),
+        barrier.clone(),
+        system_key_headers(&secret),
+        None,
+        claim_body(&issuer.issuer, "distinct-two", "owner-two@example.com"),
+    );
+    barrier.wait().await;
+    let first = first.await.expect("first claim task");
+    let second = second.await.expect("second claim task");
+
+    assert_eq!(first.status, StatusCode::CREATED, "{:?}", first.body);
+    assert_eq!(second.status, StatusCode::CREATED, "{:?}", second.body);
+    assert_ne!(
+        first.body["id"], second.body["id"],
+        "two different identities must produce two different grants"
+    );
+
+    let grants: i64 = sqlx::query_scalar("select count(*) from admin_identities where issuer = $1")
+        .bind(&issuer.issuer)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count grants");
+    assert_eq!(grants, 2, "independent identities proceed independently");
+}
+
+#[tokio::test]
+async fn claim_with_an_unregistered_issuer_returns_400_unregistered_trusted_issuer() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let secret = mint_system_key(&router, &fixture.state).await;
+
+    // No `ConsoleIssuer` is started, and no `trusted_jwt_issuers` row is registered for
+    // this string: Moira never accepts a free-text issuer at claim time (module 5).
+    let refused = post_json(
+        router,
+        "/api/v1/admin/setup/claim",
+        system_key_headers(&secret),
+        None,
+        None,
+        claim_body(
+            "https://never-registered.invalid",
+            "owner",
+            "owner@example.com",
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+    assert_eq!(refused.code(), "unregistered_trusted_issuer");
+    assert_eq!(
+        refused.message_key(),
+        "moira.error.unregistered_trusted_issuer"
+    );
+}
+
+/// Policy step 2 at the HTTP level: a registered issuer, an enabled and matching domain
+/// policy, and a body that simply asserts `email_verified: false`. The hard requirement
+/// holds regardless of how permissive the domain configuration is.
+#[tokio::test]
+async fn claim_with_an_unverified_email_returns_403() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let issuer = ConsoleIssuer::start(&fixture.pool).await;
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let secret = mint_system_key(&router, &fixture.state).await;
+    configure_and_enable_policy(&router, &issuer.issuer, &["example.com"]).await;
+
+    let mut body = claim_body(&issuer.issuer, "owner", "owner@example.com");
+    body["email_verified"] = json!(false);
+    let refused = post_json(
+        router,
+        "/api/v1/admin/setup/claim",
+        system_key_headers(&secret),
+        None,
+        None,
+        body,
+    )
+    .await;
+
+    assert_eq!(refused.status, StatusCode::FORBIDDEN, "{:?}", refused.body);
+    assert_eq!(refused.code(), "admin_claim_email_not_verified");
+    assert_eq!(
+        refused.message_key(),
+        "moira.error.admin_claim_email_not_verified"
+    );
+}
+
+/// Policy step 4 at the HTTP level, distinct from the "no configuration at all" sibling:
+/// an enabled `auth_provider_settings` row genuinely governs this issuer, but its
+/// `allowed_email_domains` names a different domain than the one being claimed.
+#[tokio::test]
+async fn claim_with_a_disallowed_domain_returns_403() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let issuer = ConsoleIssuer::start(&fixture.pool).await;
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let secret = mint_system_key(&router, &fixture.state).await;
+    configure_and_enable_policy(&router, &issuer.issuer, &["allowed.example"]).await;
+
+    let refused = post_json(
+        router,
+        "/api/v1/admin/setup/claim",
+        system_key_headers(&secret),
+        None,
+        None,
+        claim_body(&issuer.issuer, "owner", "owner@not-allowed.example"),
+    )
+    .await;
+
+    assert_eq!(refused.status, StatusCode::FORBIDDEN, "{:?}", refused.body);
+    assert_eq!(refused.code(), "admin_claim_domain_not_allowed");
+    assert_eq!(
+        refused.message_key(),
+        "moira.error.admin_claim_domain_not_allowed"
+    );
+}
+
+/// Deny-by-default at the HTTP level, distinct from
+/// `claim_is_denied_when_no_auth_provider_configuration_exists_at_all`: here a row
+/// genuinely exists and is enabled, but its `allowed_email_domains` is the empty array —
+/// refuting the "empty means unrestricted" reading specifically, rather than the stricter
+/// "no configuration governs this issuer at all" case.
+#[tokio::test]
+async fn claim_is_denied_by_default_when_no_domain_allow_list_is_configured() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let issuer = ConsoleIssuer::start(&fixture.pool).await;
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let secret = mint_system_key(&router, &fixture.state).await;
+    // Empty allow-list, deliberately: `configure_and_enable_policy` with no domains.
+    configure_and_enable_policy(&router, &issuer.issuer, &[]).await;
+
+    let refused = post_json(
+        router,
+        "/api/v1/admin/setup/claim",
+        system_key_headers(&secret),
+        None,
+        None,
+        claim_body(&issuer.issuer, "owner", "owner@example.com"),
+    )
+    .await;
+
+    assert_eq!(refused.status, StatusCode::FORBIDDEN, "{:?}", refused.body);
+    assert_eq!(refused.code(), "admin_claim_domain_not_allowed");
+    assert_eq!(
+        refused.message_key(),
+        "moira.error.admin_claim_domain_not_allowed"
+    );
+}
+
+/// A vacuity-guarded walk: performs several successful claims across the suite's own
+/// fixtures and asserts every resulting `admin_identities` row carries a non-null,
+/// non-empty email. `record.email` is `String`, not `Option<String>` (decision D5) — this
+/// is the corresponding database-level guarantee, checked against real rows rather than
+/// trusted from the type alone.
+#[tokio::test]
+async fn every_granted_admin_identity_row_carries_a_non_null_email() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let secret = mint_system_key(&router, &fixture.state).await;
+
+    let mut issuers = Vec::new();
+    for index in 0..3 {
+        let issuer = ConsoleIssuer::start(&fixture.pool).await;
+        configure_and_enable_policy(&router, &issuer.issuer, &["example.com"]).await;
+        let granted = post_json(
+            router.clone(),
+            "/api/v1/admin/setup/claim",
+            system_key_headers(&secret),
+            None,
+            None,
+            claim_body(
+                &issuer.issuer,
+                &format!("owner-{index}"),
+                &format!("owner-{index}@example.com"),
+            ),
+        )
+        .await;
+        assert_eq!(granted.status, StatusCode::CREATED, "{:?}", granted.body);
+        issuers.push(issuer);
+    }
+
+    let mut walked = 0;
+    for issuer in &issuers {
+        let email: Option<String> =
+            sqlx::query_scalar("select email from admin_identities where issuer = $1")
+                .bind(&issuer.issuer)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("read the grant written by this test");
+        assert!(
+            email.is_some_and(|email| !email.trim().is_empty()),
+            "every grant this plan writes must carry a non-null, non-empty email"
+        );
+        walked += 1;
+    }
+    // The vacuity guard: this walk finds nothing and proves nothing if the claims above
+    // did not actually land.
+    assert_eq!(
+        walked,
+        issuers.len(),
+        "expected to have walked exactly one grant row per claim made in this test"
+    );
+}
+
+/// A vacuity-guarded walk across every documented non-2xx status this endpoint can
+/// return, each triggered for real: CONVENTIONS §4.5 requires a non-empty `message_key`
+/// and `message` on every error response, not merely on the ones a hand-picked assertion
+/// happens to check.
+#[tokio::test]
+async fn every_claim_error_response_carries_a_nonempty_message_key_and_message() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let issuer = ConsoleIssuer::start(&fixture.pool).await;
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let secret = mint_system_key(&router, &fixture.state).await;
+    configure_and_enable_policy(&router, &issuer.issuer, &["allowed.example"]).await;
+
+    let mut unverified_body = claim_body(&issuer.issuer, "unverified", "owner@allowed.example");
+    unverified_body["email_verified"] = json!(false);
+
+    let scenarios: Vec<(&str, HeaderMap, Value)> = vec![
+        (
+            "no credential",
+            HeaderMap::new(),
+            claim_body(&issuer.issuer, "no-credential", "owner@allowed.example"),
+        ),
+        (
+            "unregistered issuer",
+            system_key_headers(&secret),
+            claim_body(
+                "https://never-registered.invalid",
+                "owner",
+                "owner@allowed.example",
+            ),
+        ),
+        (
+            "unverified email",
+            system_key_headers(&secret),
+            unverified_body,
+        ),
+        (
+            "disallowed domain",
+            system_key_headers(&secret),
+            claim_body(&issuer.issuer, "owner", "owner@disallowed.example"),
+        ),
+        (
+            "missing email field",
+            system_key_headers(&secret),
+            json!({ "issuer": issuer.issuer, "subject": "owner", "email_verified": true }),
+        ),
+    ];
+
+    let mut checked = 0;
+    for (label, headers, body) in scenarios {
+        let result = post_json(
+            router.clone(),
+            "/api/v1/admin/setup/claim",
+            headers,
+            None,
+            None,
+            body,
+        )
+        .await;
+        assert!(
+            result.status.is_client_error(),
+            "{label} was expected to fail with a 4xx: {:?}",
+            result.body
+        );
+        assert!(
+            !result.code().is_empty(),
+            "{label}: error.code must be non-empty: {:?}",
+            result.body
+        );
+        assert!(
+            !result.message_key().is_empty(),
+            "{label}: error.message_key must be non-empty: {:?}",
+            result.body
+        );
+        assert!(
+            !result.body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty(),
+            "{label}: error.message must be non-empty: {:?}",
+            result.body
+        );
+        checked += 1;
+    }
+    // The vacuity guard: fail loudly if the scenario list above is ever emptied out
+    // rather than silently "passing" a walk that checked nothing.
+    assert!(
+        checked >= 5,
+        "expected to have exercised at least 5 distinct error scenarios"
+    );
+}
+
+/// Audit-row fidelity: a successful claim writes **exactly one** `audit_logs` row, naming
+/// the real actor type — `success_audit` records `format!("{:?}", actor.actor_type)`
+/// lower-cased, so a `SystemKey` actor is stored as `"systemkey"` (Debug's own spelling,
+/// not the JSON/API `snake_case` rendering) — and its metadata carries the identity being
+/// granted but never the system key that authorized the write.
+#[tokio::test]
+async fn every_claim_attempt_writes_exactly_one_audit_row_with_the_correct_actor_type() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let issuer = ConsoleIssuer::start(&fixture.pool).await;
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let secret = mint_system_key(&router, &fixture.state).await;
+    configure_and_enable_policy(&router, &issuer.issuer, &["example.com"]).await;
+
+    let granted = post_json(
+        router,
+        "/api/v1/admin/setup/claim",
+        system_key_headers(&secret),
+        None,
+        None,
+        claim_body(&issuer.issuer, "audited-owner", "owner@example.com"),
+    )
+    .await;
+    assert_eq!(granted.status, StatusCode::CREATED, "{:?}", granted.body);
+    let resource_id = granted.body["id"].as_str().expect("grant id").to_string();
+
+    let rows: Vec<(String, Option<String>, serde_json::Value)> = sqlx::query_as(
+        "select actor_type, actor_subject, metadata from audit_logs \
+         where resource_type = 'admin_identity' and action = 'admin_identity.claim' \
+         and resource_id = $1",
+    )
+    .bind(&resource_id)
+    .fetch_all(&fixture.pool)
+    .await
+    .expect("read the audit rows for this claim");
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one audit row per successful claim, got {rows:?}"
+    );
+    let (actor_type, actor_subject, metadata) = &rows[0];
+    assert_eq!(
+        actor_type, "systemkey",
+        "the audit row must name the real credential type"
+    );
+    assert!(
+        actor_subject.is_some(),
+        "the audit row must name an actor subject"
+    );
+    let rendered = metadata.to_string();
+    assert!(
+        !rendered.contains(&secret),
+        "the audit row metadata must never contain the system key secret"
+    );
 }
 
 /// The two setup concepts must stay distinct: this plan's identity-claiming status lives

@@ -722,6 +722,33 @@ mod tests {
         assert_eq!(error.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// Scope validation runs on the system-key path before any DB write reaches the
+    /// issuer lookup: an unknown scope string is refused with the **existing**
+    /// `scope_invalid` code, per module 8 step 3 — no new key is minted for a condition
+    /// the catalog already covers.
+    #[tokio::test]
+    async fn claim_rejects_a_scope_outside_admin_scopes() {
+        let Some(pool) = migrated_pool().await else {
+            eprintln!("skipping admin identity claim integration: set MOIRA_TEST_DATABASE_URL");
+            return;
+        };
+        let state =
+            AppState::new(crate::config::Settings::default(), Some(pool)).expect("build app state");
+        let mut request = claim_request("https://unused.invalid", "sub", "owner@example.com");
+        request.scopes = vec!["moira:not-a-real-scope".to_string()];
+
+        let error = AdminIdentityService::new(&state)
+            .expect("service")
+            .claim(
+                &context(),
+                ClaimCredential::SystemKey(system_key_actor()),
+                request,
+            )
+            .await
+            .expect_err("an unknown scope must be rejected before any issuer lookup");
+        assert_coded(&error, StatusCode::UNPROCESSABLE_ENTITY, "scope_invalid");
+    }
+
     #[test]
     fn the_claim_notice_resolves_through_the_catalog() {
         let notice = claimed_notice();

@@ -708,3 +708,486 @@ async fn an_auth_settings_write_invalidates_the_cache_via_listen_notify() {
          existing LISTEN/NOTIFY path (CONVENTIONS §7.2)",
     );
 }
+
+/// The D7 drift-protection contract, at the HTTP level rather than the domain-type level:
+/// both read endpoints the console binds to (`GET …/{id}` and `GET …/setup/auth-methods`)
+/// must return `client_id`, and it must reflect the value most recently written — not a
+/// stale snapshot from creation.
+#[tokio::test]
+async fn client_id_is_returned_by_the_read_endpoints_for_drift_comparison() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let secret = mint_system_key(&router, &["moira:admin"]).await;
+    let created = create_provider(&router, json!({ "client_id": "initial-client" })).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    let enabled = request(
+        router.clone(),
+        "POST",
+        &format!("/api/v1/admin/auth/providers/{id}/enable"),
+        HeaderMap::new(),
+        Some(created.version()),
+        None,
+    )
+    .await;
+    assert_eq!(enabled.status, StatusCode::OK, "{:?}", enabled.body);
+
+    let patched = request(
+        router.clone(),
+        "PATCH",
+        &format!("/api/v1/admin/auth/providers/{id}"),
+        HeaderMap::new(),
+        Some(enabled.version()),
+        Some(json!({ "client_id": "rotated-client" })),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK, "{:?}", patched.body);
+
+    let get = request(
+        router.clone(),
+        "GET",
+        &format!("/api/v1/admin/auth/providers/{id}"),
+        HeaderMap::new(),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(get.body["client_id"], json!("rotated-client"));
+
+    let auth_methods = request(
+        router,
+        "GET",
+        "/api/v1/admin/setup/auth-methods",
+        system_key_headers(&secret),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        auth_methods.status,
+        StatusCode::OK,
+        "{:?}",
+        auth_methods.body
+    );
+    let methods = auth_methods.body["methods"].as_array().expect("methods");
+    let method = methods
+        .iter()
+        .find(|method| method["id"] == json!(id))
+        .expect("the enabled provider must appear in the bootstrap projection");
+    assert_eq!(
+        method["client_id"],
+        json!("rotated-client"),
+        "the bootstrap read must reflect the most recently written client_id, not a stale copy"
+    );
+}
+
+#[tokio::test]
+async fn jwks_method_without_a_jwks_url_returns_400() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+
+    let incomplete = create_provider(
+        &router,
+        json!({
+            "method": "jwks",
+            "client_id": null,
+            "issuer": null,
+            "jwks_url": null
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        incomplete.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        incomplete.body
+    );
+    assert_eq!(incomplete.code(), "auth_provider_method_config_incomplete");
+}
+
+#[tokio::test]
+async fn a_second_provider_for_the_same_method_and_issuer_returns_409() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let issuer = format!("https://accounts.test/{}", Uuid::now_v7());
+
+    let first = create_provider(&router, json!({ "issuer": issuer })).await;
+    assert_eq!(first.status, StatusCode::CREATED, "{:?}", first.body);
+
+    let second = create_provider(&router, json!({ "issuer": issuer })).await;
+
+    assert_eq!(second.status, StatusCode::CONFLICT, "{:?}", second.body);
+    assert_eq!(second.code(), "duplicate_auth_provider");
+}
+
+#[tokio::test]
+async fn create_is_idempotent_under_an_idempotency_key() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "idempotency-key",
+        format!("auth-provider-{}", Uuid::now_v7())
+            .parse()
+            .expect("idempotency-key header"),
+    );
+    let body = json!({
+        "method": "google_oauth",
+        "display_name": "Google",
+        "issuer": format!("https://accounts.test/{}", Uuid::now_v7()),
+        "client_id": "console-client",
+        "allowed_email_domains": ["example.com"]
+    });
+
+    let fresh = request(
+        router.clone(),
+        "POST",
+        "/api/v1/admin/auth/providers",
+        headers.clone(),
+        None,
+        Some(body.clone()),
+    )
+    .await;
+    let replay = request(
+        router,
+        "POST",
+        "/api/v1/admin/auth/providers",
+        headers,
+        None,
+        Some(body),
+    )
+    .await;
+
+    assert_eq!(fresh.status, StatusCode::CREATED, "{:?}", fresh.body);
+    assert_eq!(replay.status, StatusCode::CREATED, "{:?}", replay.body);
+    assert_eq!(fresh.body["id"], replay.body["id"]);
+}
+
+/// The scope matrix, across all seven `/api/v1/admin/auth/providers…` operations: a system
+/// key presenting its credential explicitly (never the anonymous dev-admin fallback, which
+/// only applies when *no* credential is supplied at all — `authenticate_admin`,
+/// `src/security/auth.rs`) must be refused every operation it does not hold the scope for,
+/// and admitted to every operation it does. `If-Match` is supplied on every mutating
+/// negative check too: the header is extracted before authorization runs
+/// (`src/http/auth_settings.rs`'s handlers call `require_if_match` ahead of the service
+/// call), so an absent header would produce `400 if_match_required` and mask the `403` this
+/// test exists to prove.
+#[tokio::test]
+async fn auth_settings_endpoints_require_their_scopes() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+
+    let read_only = mint_system_key(&router, &["moira:auth-settings:read"]).await;
+    let write_only = mint_system_key(&router, &["moira:auth-settings:write"]).await;
+    let delete_only = mint_system_key(&router, &["moira:auth-settings:delete"]).await;
+    let unrelated = mint_system_key(&router, &["moira:models:read"]).await;
+
+    // A fixed target for every negative check below. None of them can succeed — the
+    // scope gate is the very first thing every service method does — so its version
+    // never moves and it is safe to reuse across the whole matrix.
+    let target = create_provider(&router, json!({})).await;
+    let target_id = target.body["id"].as_str().unwrap().to_string();
+    let target_version = target.version();
+
+    struct Case<'a> {
+        label: &'a str,
+        method: &'a str,
+        path: String,
+        if_match: Option<i64>,
+        body: Option<Value>,
+    }
+    let cases = [
+        Case {
+            label: "list",
+            method: "GET",
+            path: "/api/v1/admin/auth/providers".to_string(),
+            if_match: None,
+            body: None,
+        },
+        Case {
+            label: "get",
+            method: "GET",
+            path: format!("/api/v1/admin/auth/providers/{target_id}"),
+            if_match: None,
+            body: None,
+        },
+        Case {
+            label: "create",
+            method: "POST",
+            path: "/api/v1/admin/auth/providers".to_string(),
+            if_match: None,
+            body: Some(json!({
+                "method": "jwks",
+                "display_name": "Scope probe",
+                "jwks_url": "https://idp.test/jwks"
+            })),
+        },
+        Case {
+            label: "patch",
+            method: "PATCH",
+            path: format!("/api/v1/admin/auth/providers/{target_id}"),
+            if_match: Some(target_version),
+            body: Some(json!({ "display_name": "Renamed by scope probe" })),
+        },
+        Case {
+            label: "delete",
+            method: "DELETE",
+            path: format!("/api/v1/admin/auth/providers/{target_id}"),
+            if_match: Some(target_version),
+            body: None,
+        },
+        Case {
+            label: "enable",
+            method: "POST",
+            path: format!("/api/v1/admin/auth/providers/{target_id}/enable"),
+            if_match: Some(target_version),
+            body: None,
+        },
+        Case {
+            label: "disable",
+            method: "POST",
+            path: format!("/api/v1/admin/auth/providers/{target_id}/disable"),
+            if_match: Some(target_version),
+            body: None,
+        },
+    ];
+
+    // Every unscoped or wrongly-scoped key must be refused every operation.
+    for key in [&read_only, &write_only, &delete_only, &unrelated] {
+        for case in &cases {
+            let required_scope = match case.label {
+                "list" | "get" => "moira:auth-settings:read",
+                "create" | "patch" | "enable" | "disable" => "moira:auth-settings:write",
+                "delete" => "moira:auth-settings:delete",
+                other => unreachable!("unhandled case {other}"),
+            };
+            let held = match key {
+                _ if key == &read_only => "moira:auth-settings:read",
+                _ if key == &write_only => "moira:auth-settings:write",
+                _ if key == &delete_only => "moira:auth-settings:delete",
+                _ => "moira:models:read",
+            };
+            if held == required_scope {
+                continue;
+            }
+            let result = request(
+                router.clone(),
+                case.method,
+                &case.path,
+                system_key_headers(key),
+                case.if_match,
+                case.body.clone(),
+            )
+            .await;
+            assert_eq!(
+                result.status,
+                StatusCode::FORBIDDEN,
+                "{} with scope {held} (needs {required_scope}) should be refused: {:?}",
+                case.label,
+                result.body
+            );
+        }
+    }
+
+    // Verify the target was never actually mutated by the negative sweep above.
+    let unchanged = request(
+        router.clone(),
+        "GET",
+        &format!("/api/v1/admin/auth/providers/{target_id}"),
+        system_key_headers(&read_only),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        unchanged.version(),
+        target_version,
+        "no negative check may have mutated the target"
+    );
+
+    // Now prove the correctly-scoped key succeeds at each operation, each against its own
+    // fixture so a successful mutation cannot invalidate a later positive check.
+    let list_ok = request(
+        router.clone(),
+        "GET",
+        "/api/v1/admin/auth/providers",
+        system_key_headers(&read_only),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(list_ok.status, StatusCode::OK, "{:?}", list_ok.body);
+
+    let get_ok = request(
+        router.clone(),
+        "GET",
+        &format!("/api/v1/admin/auth/providers/{target_id}"),
+        system_key_headers(&read_only),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(get_ok.status, StatusCode::OK, "{:?}", get_ok.body);
+
+    let create_ok = request(
+        router.clone(),
+        "POST",
+        "/api/v1/admin/auth/providers",
+        system_key_headers(&write_only),
+        None,
+        Some(json!({
+            "method": "jwks",
+            "display_name": "Scope probe create",
+            "jwks_url": "https://idp.test/jwks"
+        })),
+    )
+    .await;
+    assert_eq!(
+        create_ok.status,
+        StatusCode::CREATED,
+        "{:?}",
+        create_ok.body
+    );
+
+    let patch_target = create_provider(&router, json!({})).await;
+    let patch_ok = request(
+        router.clone(),
+        "PATCH",
+        &format!(
+            "/api/v1/admin/auth/providers/{}",
+            patch_target.body["id"].as_str().unwrap()
+        ),
+        system_key_headers(&write_only),
+        Some(patch_target.version()),
+        Some(json!({ "display_name": "Renamed" })),
+    )
+    .await;
+    assert_eq!(patch_ok.status, StatusCode::OK, "{:?}", patch_ok.body);
+
+    let enable_target = create_provider(&router, json!({})).await;
+    let enable_ok = request(
+        router.clone(),
+        "POST",
+        &format!(
+            "/api/v1/admin/auth/providers/{}/enable",
+            enable_target.body["id"].as_str().unwrap()
+        ),
+        system_key_headers(&write_only),
+        Some(enable_target.version()),
+        None,
+    )
+    .await;
+    assert_eq!(enable_ok.status, StatusCode::OK, "{:?}", enable_ok.body);
+
+    let disable_ok = request(
+        router.clone(),
+        "POST",
+        &format!(
+            "/api/v1/admin/auth/providers/{}/disable",
+            enable_target.body["id"].as_str().unwrap()
+        ),
+        system_key_headers(&write_only),
+        Some(enable_ok.version()),
+        None,
+    )
+    .await;
+    assert_eq!(disable_ok.status, StatusCode::OK, "{:?}", disable_ok.body);
+
+    let delete_target = create_provider(&router, json!({})).await;
+    let delete_ok = request(
+        router,
+        "DELETE",
+        &format!(
+            "/api/v1/admin/auth/providers/{}",
+            delete_target.body["id"].as_str().unwrap()
+        ),
+        system_key_headers(&delete_only),
+        Some(delete_target.version()),
+        None,
+    )
+    .await;
+    assert_eq!(
+        delete_ok.status,
+        StatusCode::NO_CONTENT,
+        "{:?}",
+        delete_ok.body
+    );
+}
+
+/// Pagination correctness for `GET /api/v1/admin/auth/providers`, which plan 07 added
+/// without an accompanying walk in `tests/list_pagination.rs`. Seeds more rows than fit in
+/// one page and walks the whole list through `pagination.next_cursor`, asserting the
+/// concatenation of every page contains each seeded row exactly once — the failure mode a
+/// single-page test cannot see (a `cursor` that is accepted and then ignored still passes a
+/// one-page assertion).
+#[tokio::test]
+async fn auth_provider_settings_list_pages_without_duplicates_or_gaps() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+
+    let mut seeded_ids = std::collections::HashSet::new();
+    for _ in 0..5 {
+        let created = create_provider(&router, json!({})).await;
+        assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+        seeded_ids.insert(created.body["id"].as_str().unwrap().to_string());
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let path = match &cursor {
+            Some(cursor) => format!("/api/v1/admin/auth/providers?limit=2&cursor={cursor}"),
+            None => "/api/v1/admin/auth/providers?limit=2".to_string(),
+        };
+        let page = request(router.clone(), "GET", &path, HeaderMap::new(), None, None).await;
+        assert_eq!(page.status, StatusCode::OK, "{:?}", page.body);
+        pages += 1;
+        assert!(
+            pages < 1000,
+            "pagination did not terminate — a cursor is likely being ignored"
+        );
+
+        for row in page.body["data"].as_array().expect("data array") {
+            let id = row["id"].as_str().unwrap().to_string();
+            assert!(
+                seen.insert(id.clone()),
+                "row {id} was returned on more than one page — the cursor skipped nothing \
+                 but the walk still duplicated it"
+            );
+        }
+
+        let has_more = page.body["pagination"]["has_more"]
+            .as_bool()
+            .unwrap_or(false);
+        let next = page.body["pagination"]["next_cursor"]
+            .as_str()
+            .map(str::to_string);
+        if !has_more {
+            assert!(next.is_none(), "has_more=false must carry no next_cursor");
+            break;
+        }
+        cursor = Some(next.expect("has_more=true must carry a next_cursor"));
+    }
+
+    // The vacuity guard: the walk must actually have observed every row this test seeded,
+    // not merely "found nothing and terminated immediately".
+    for id in &seeded_ids {
+        assert!(
+            seen.contains(id),
+            "seeded row {id} was never observed across the full walk"
+        );
+    }
+}

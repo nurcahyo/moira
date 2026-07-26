@@ -284,4 +284,32 @@ mod tests {
             );
         }
     }
+
+    /// The positive counterpart to the guard above: `client_id` is not merely absent of
+    /// a secret shape, it is **present** and carries the value it was given. This is the
+    /// whole of Moira's D7 drift-protection obligation — the console fingerprints this
+    /// field, so a projection that dropped it would silently break plan 08 with no
+    /// signal on Moira's side.
+    #[test]
+    fn public_auth_method_exposes_client_id() {
+        let method = PublicAuthMethod {
+            id: Uuid::nil(),
+            method: AuthMethod::GoogleOauth,
+            display_name: "Google".to_string(),
+            issuer: Some("https://accounts.google.com".to_string()),
+            discovery_url: None,
+            authorization_url: None,
+            jwks_url: None,
+            client_id: Some("console-client".to_string()),
+            requested_scopes: default_requested_scopes(),
+            allowed_email_domains: vec!["example.com".to_string()],
+        };
+
+        let json = serde_json::to_value(&method).expect("projection serializes");
+        assert_eq!(
+            json["client_id"],
+            serde_json::json!("console-client"),
+            "client_id must survive the narrow bootstrap projection"
+        );
+    }
 }

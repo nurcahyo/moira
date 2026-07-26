@@ -320,4 +320,42 @@ mod tests {
         assert_eq!(response.error.message_key, "moira.error.duplicate_resource");
         assert_eq!(response.error.message, "resource already exists");
     }
+
+    /// The trap plan 07's i18n section names explicitly: `AppError::BadRequest` /
+    /// `Forbidden` / `NotFound` / `Unauthorized` derive the generic codes
+    /// `bad_request`/`forbidden`/`not_found`/`unauthorized` and would silently drop a
+    /// plan's specific key. Every identity and auth-settings condition must be raised
+    /// with `AppError::coded`/`conflict`/`unprocessable` instead, so its `message_key`
+    /// is `moira.error.<the documented code>`, not one of the four generic ones — and
+    /// the resulting key must actually resolve in the catalog.
+    #[test]
+    fn identity_error_codes_derive_their_documented_message_keys() {
+        for code in [
+            "unregistered_trusted_issuer",
+            "admin_claim_email_required",
+            "admin_claim_email_not_verified",
+            "admin_claim_domain_not_allowed",
+            "admin_identity_already_claimed",
+            "setup_claim_credential_required",
+            "setup_token_not_supported",
+            "auth_provider_not_found",
+            "duplicate_auth_provider",
+            "auth_provider_method_config_incomplete",
+            "auth_provider_url_not_allowed",
+            "console_issuer_must_not_assert_scopes",
+        ] {
+            let error = AppError::coded(StatusCode::BAD_REQUEST, code, "test message");
+            let expected_key = format!("moira.error.{code}");
+            assert_eq!(
+                error.message_key(),
+                expected_key,
+                "{code} must derive {expected_key}, never a generic bad_request/forbidden/\
+                 not_found/unauthorized code"
+            );
+            assert!(
+                crate::i18n::default_message_for_key(&expected_key).is_some(),
+                "{expected_key} must actually resolve in the i18n catalog"
+            );
+        }
+    }
 }
