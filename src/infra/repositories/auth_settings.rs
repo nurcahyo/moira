@@ -605,12 +605,79 @@ mod tests {
         );
     }
 
+    /// Mutual exclusion for the issuer-less `generic_oidc` row.
+    ///
+    /// `auth_provider_settings_method_issuer_active_unique`
+    /// (`migrations/0013_auth_provider_settings.sql:67-69`) indexes
+    /// `(method, coalesce(issuer, ''))`, so an issuer-less `generic_oidc` row occupies the
+    /// single slot `('generic_oidc', '')` for the whole database — not a `Uuid`-keyed one
+    /// like every other row this suite writes. On the shared `MOIRA_TEST_DATABASE_URL`
+    /// database that makes the slot a global resource, and two test processes inserting
+    /// into it collide on a unique violation.
+    ///
+    /// Same idiom, and for the same reason, as `SetupStateLock` in
+    /// `src/application/identity.rs` — a different global resource, so a different key.
+    /// The two are deliberately not shared: `src/` has no test-support module, and adding
+    /// one to the library crate to host twenty lines of test scaffolding would be a
+    /// structural change for a test-only concern.
+    const ISSUERLESS_GENERIC_OIDC_LOCK_KEY: i64 = i64::from_be_bytes(*b"moiraoid");
+
+    /// Exclusive ownership of the `('generic_oidc', '')` slot for one test.
+    ///
+    /// The connection is opened directly rather than taken from the pool because
+    /// `pg_advisory_lock` is *session*-scoped: a pooled connection goes back to the pool
+    /// still holding the lock, and a later checkout would silently inherit it. Binding the
+    /// lock to its own socket means dropping the guard — including while unwinding from a
+    /// panic — closes the session and releases it.
+    struct IssuerlessSlotLock {
+        _session: sqlx::PgConnection,
+    }
+
+    impl IssuerlessSlotLock {
+        /// Takes the lock, then clears the slot.
+        ///
+        /// The delete is what makes the test **self-healing**. The lock alone stops two
+        /// concurrent runs from colliding, but it does nothing about a run that panicked
+        /// between inserting the issuer-less row and the cleanup below — before this, that
+        /// left the row behind permanently, and *every* later run of this test then died on
+        /// the same unique violation, on a database no one would think to inspect.
+        ///
+        /// Deleting by the slot rather than by the row's identity is deliberate: the point
+        /// is to reclaim the contended resource whatever stale row is sitting in it. Under
+        /// the lock, and given this is the only place in the tree that writes an
+        /// issuer-less row to the shared database, the only row this can remove is a leak.
+        async fn acquire(database_url: &str, pool: &PgPool) -> Self {
+            use sqlx::Connection as _;
+
+            let mut session = sqlx::PgConnection::connect(database_url)
+                .await
+                .expect("open the issuer-less slot lock session");
+            sqlx::query("select pg_advisory_lock($1)")
+                .bind(ISSUERLESS_GENERIC_OIDC_LOCK_KEY)
+                .execute(&mut session)
+                .await
+                .expect("take the issuer-less slot advisory lock");
+            sqlx::query(
+                "delete from auth_provider_settings \
+                 where method = 'generic_oidc' and issuer is null and deleted_at is null",
+            )
+            .execute(pool)
+            .await
+            .expect("reclaim the issuer-less generic_oidc slot");
+            Self { _session: session }
+        }
+    }
+
     /// The `order by … desc` tie-break, exercised against a real planner.
     ///
     /// Written `=` instead of `is not distinct from`, this returns the *issuer-less* row:
     /// `null = $1` is `NULL`, and a descending sort puts nulls first in Postgres. The bug
     /// is invisible in a single-row deployment and silently applies the wrong allow-list in
     /// a multi-provider one, which is exactly the shape of defect a unit test cannot see.
+    ///
+    /// The `null` issuer is therefore load-bearing and cannot be replaced with a
+    /// `Uuid`-keyed one to sidestep the shared slot; [`IssuerlessSlotLock`] exists to make
+    /// holding that slot safe instead.
     #[tokio::test]
     async fn an_exact_issuer_match_outranks_a_match_through_the_trusted_issuer_id() {
         let Ok(database_url) = std::env::var("MOIRA_TEST_DATABASE_URL") else {
@@ -619,6 +686,9 @@ mod tests {
         };
         let pool = PgPool::connect(&database_url).await.expect("connect");
         crate::infra::db::migrate(&pool).await.expect("migrate");
+        // Bound for the whole test, never as a bare `_`: dropping it early puts the slot
+        // back up for grabs while this test is still using it.
+        let _slot_lock = IssuerlessSlotLock::acquire(&database_url, &pool).await;
 
         let issuer = format!("https://governing-{}.invalid", Uuid::now_v7().simple());
         let issuer_id = sqlx::query_scalar::<_, Uuid>(
