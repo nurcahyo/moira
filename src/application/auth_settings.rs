@@ -128,6 +128,7 @@ impl<'a> AuthProviderSettingsService<'a> {
                 })
             })
             .await?;
+        self.invalidate_cache().await;
         Ok((outcome.response, outcome.replayed))
     }
 
@@ -201,6 +202,7 @@ impl<'a> AuthProviderSettingsService<'a> {
             json!({}),
         )
         .await?;
+        self.invalidate_cache().await;
         Ok(record)
     }
 
@@ -255,6 +257,7 @@ impl<'a> AuthProviderSettingsService<'a> {
             json!({}),
         )
         .await?;
+        self.invalidate_cache().await;
         Ok(record)
     }
 
@@ -278,7 +281,9 @@ impl<'a> AuthProviderSettingsService<'a> {
             Some(id.to_string()),
             json!({}),
         )
-        .await
+        .await?;
+        self.invalidate_cache().await;
+        Ok(())
     }
 
     /// The bootstrap read behind `GET /api/v1/admin/setup/auth-methods`.
@@ -298,9 +303,31 @@ impl<'a> AuthProviderSettingsService<'a> {
     ) -> Result<SetupAuthMethodsResponse, AppError> {
         require_setup_actor(actor)?;
         self.state.authz.require(actor, "moira:setup:read")?;
-        Ok(SetupAuthMethodsResponse {
-            methods: self.settings.list_enabled_public().await?,
-        })
+        // Read-through the process-local cache (module 13a). The gate above runs *first*
+        // and unconditionally: a cache hit must never be a way to skip authorization.
+        if let Some(methods) = self.state.auth_settings_cache.enabled_methods().await {
+            return Ok(SetupAuthMethodsResponse { methods });
+        }
+        let methods = self.settings.list_enabled_public().await?;
+        self.state
+            .auth_settings_cache
+            .put_enabled_methods(methods.clone())
+            .await;
+        Ok(SetupAuthMethodsResponse { methods })
+    }
+
+    /// Drops this instance's cached copy after a write.
+    ///
+    /// Cross-instance invalidation is the NOTIFY trigger's job — `auth_provider_settings`
+    /// fires `notify_moira_runtime_config_change()`, and `listen_once` clears this cache on
+    /// every instance that hears it. This local drop closes the one gap that leaves: the
+    /// writing process's own listener is asynchronous, so without it a read issued on the
+    /// same instance immediately after the write could still be served the pre-write list.
+    /// It mirrors `schedule_runtime_cache_invalidation`'s intent, but is awaited rather
+    /// than spawned, because a write handler is already in an async context and the
+    /// invalidation must be visible before it returns.
+    async fn invalidate_cache(&self) {
+        self.state.auth_settings_cache.invalidate_all().await;
     }
 
     async fn reject_self_asserting_console_issuer(

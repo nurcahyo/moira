@@ -48,14 +48,18 @@ pub async fn get_setup_status(
     SetupService::new(&state)?.status(&actor).await.map(Json)
 }
 
-async fn admin_actor(
+/// `pub(super)` so `src/http/auth_settings.rs` (plan 07, module 12) gates on the *same*
+/// wrapper every other admin handler uses. A second transcription of "authenticate the
+/// admin plane" is how one surface silently keeps accepting a credential another stopped
+/// accepting.
+pub(super) async fn admin_actor(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<crate::security::Actor, AppError> {
     state.auth.authenticate_admin(state.pool()?, headers).await
 }
 
-fn etag_headers(version: i64) -> HeaderMap {
+pub(super) fn etag_headers(version: i64) -> HeaderMap {
     let mut headers = HeaderMap::new();
     if let Ok(value) = HeaderValue::from_str(&format!("\"{version}\"")) {
         headers.insert(header::ETAG, value);
@@ -63,7 +67,7 @@ fn etag_headers(version: i64) -> HeaderMap {
     headers
 }
 
-fn require_if_match(headers: &HeaderMap) -> Result<i64, AppError> {
+pub(super) fn require_if_match(headers: &HeaderMap) -> Result<i64, AppError> {
     let value = headers
         .get(header::IF_MATCH)
         .ok_or_else(|| {

@@ -1,6 +1,69 @@
 {
   "components": {
     "schemas": {
+      "AdminIdentityRecord": {
+        "description": "A granted admin identity, as returned by `POST /api/v1/admin/setup/claim`.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "email": {
+            "description": "Always present — a grant cannot be created without a verified email (decision D5).\nThe `admin_identities.email` column stays nullable so a future anonymisation path\ncan clear it; the always-present invariant is an application invariant.",
+            "type": "string"
+          },
+          "email_verified": {
+            "type": "boolean"
+          },
+          "granted_scopes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "issuer": {
+            "type": "string"
+          },
+          "notice": {
+            "$ref": "#/components/schemas/ResponseText",
+            "description": "i18n envelope for the success message (CONVENTIONS §4.2)."
+          },
+          "status": {
+            "$ref": "#/components/schemas/AdminIdentityStatus"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "issuer",
+          "subject",
+          "email",
+          "email_verified",
+          "granted_scopes",
+          "status",
+          "created_at",
+          "version",
+          "notice"
+        ],
+        "type": "object"
+      },
+      "AdminIdentityStatus": {
+        "enum": [
+          "active",
+          "revoked"
+        ],
+        "type": "string"
+      },
       "AgentProfileCreateRequest": {
         "additionalProperties": false,
         "properties": {
@@ -707,6 +770,403 @@
           "failed"
         ],
         "type": "string"
+      },
+      "AuthMethod": {
+        "enum": [
+          "google_oauth",
+          "generic_oidc",
+          "jwks"
+        ],
+        "type": "string"
+      },
+      "AuthProviderSettingsCreateRequest": {
+        "additionalProperties": false,
+        "description": "Request body of `POST /api/v1/admin/auth/providers`.\n\nDefaults mirror the column defaults in `migrations/0013_auth_provider_settings.sql`, so\na row created through this DTO and a row created by raw insert agree.",
+        "properties": {
+          "allowed_algorithms": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "allowed_email_domains": {
+            "description": "Deny-by-default: an empty list refuses every claim. Operators configure this\n**before** the first claim, or every claim is refused.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "authorization_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "client_id": {
+            "description": "Non-secret. There is no companion `client_secret` field, and there never will be\n(D7) — the secret belongs to the console's own store.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "discovery_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "expected_audiences": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "issuer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "jwks_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {},
+          "method": {
+            "$ref": "#/components/schemas/AuthMethod"
+          },
+          "redirect_uris": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "requested_scopes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "token_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "trusted_jwt_issuer_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "userinfo_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "method",
+          "display_name"
+        ],
+        "type": "object"
+      },
+      "AuthProviderSettingsPatchRequest": {
+        "additionalProperties": false,
+        "description": "Request body of `PATCH /api/v1/admin/auth/providers/{id}`.\n\nEvery field is optional; an absent field leaves the stored value alone. `issuer` and\n`client_id` are ordinary mutable configuration here — under D7 no secret is bound to\nthem, so there is no rebind-or-rotate rule and no `409` on changing either.",
+        "properties": {
+          "allowed_algorithms": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "allowed_email_domains": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "authorization_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "client_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "discovery_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "expected_audiences": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "issuer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "jwks_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {},
+          "redirect_uris": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "requested_scopes": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "token_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "trusted_jwt_issuer_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "userinfo_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "AuthProviderSettingsRecord": {
+        "description": "One configured auth method, as returned by the `/api/v1/admin/auth/providers` surface.\n\nEvery field is non-secret configuration and is serialized normally.",
+        "properties": {
+          "allowed_algorithms": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "allowed_email_domains": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "authorization_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "client_id": {
+            "description": "Non-secret. Always returned. This is the value the console fingerprints and compares\nagainst its own stored fingerprint for D7 drift protection — a `client_id` changed\nin Moira while the console still holds the old client's secret would otherwise fail\nthe code exchange with an opaque provider error. Exposing it on the read path is the\nwhole of Moira's obligation there; no extra endpoint, header, or\nfingerprint-computation is required, and Moira deliberately does not store the\nconsole's fingerprint.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "discovery_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "expected_audiences": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "issuer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "jwks_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {},
+          "method": {
+            "$ref": "#/components/schemas/AuthMethod"
+          },
+          "redirect_uris": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "requested_scopes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ResourceStatus"
+          },
+          "token_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "trusted_jwt_issuer_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "userinfo_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "method",
+          "display_name",
+          "enabled",
+          "requested_scopes",
+          "allowed_email_domains",
+          "allowed_algorithms",
+          "expected_audiences",
+          "redirect_uris",
+          "metadata",
+          "status",
+          "created_at",
+          "updated_at",
+          "version"
+        ],
+        "type": "object"
+      },
+      "ClaimAdminIdentityRequest": {
+        "additionalProperties": false,
+        "description": "Request body of `POST /api/v1/admin/setup/claim`.\n\nThe endpoint is gated by `X-Moira-System-Key` only. A bare trusted-JWT bearer token is\nrejected even if it verifies, which is the structural refusal of \"the first successful\nadmin JWT wins\" (`plans/01` §4.4).",
+        "properties": {
+          "email": {
+            "description": "Required, not optional (decision D5). Carrying a human-identifiable attribute on\nevery grant is what makes the deny-by-default allowed-domain policy enforceable.",
+            "type": "string"
+          },
+          "email_verified": {
+            "description": "Required, and with **no `#[serde(default)]`** — that omission is load-bearing rather\nthan cosmetic. With a default, a body that simply left the field out would\ndeserialize to `false` and then fail the verified-email check with a *misleading*\n403 telling the caller their email is unverified, when in fact they never sent the\nfield. Without it, an omitted field is the schema violation it actually is.\n\nMust be `true`; a claim naming an unverified address is refused.",
+            "type": "boolean"
+          },
+          "issuer": {
+            "description": "Must resolve to an **active, registered** `trusted_jwt_issuers` row. Moira never\naccepts a free-text issuer at claim time.",
+            "type": "string"
+          },
+          "scopes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "setup_token": {
+            "description": "**Reserved and rejected — never silently ignored.**\n\nThe one-time setup-token credential path is deferred (plan 07 §0.2 decision D1):\nplan 08's console declares this field and never sends it, and the path was specified\nbut never exercised. The field survives in the schema only so that plan 08's\ngenerated client keeps typechecking.\n\nA request that populates it is refused with a clear, keyed error. Accepting and\ndiscarding it would let a caller believe they had presented a credential Moira had\nhonoured, when Moira had in fact authenticated them by some other means entirely —\nthe one failure mode worse than not supporting the field at all.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "subject": {
+            "description": "The identity provider's stable subject. Together with `issuer` this is the grant's\nuniqueness key — never email, which is mutable and reassignable.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "issuer",
+          "subject",
+          "email",
+          "email_verified"
+        ],
+        "type": "object"
       },
       "ConsumerKeyCreateRequest": {
         "additionalProperties": false,
@@ -2561,6 +3021,152 @@
                 "action",
                 "result",
                 "metadata"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/Pagination"
+          }
+        },
+        "required": [
+          "data",
+          "pagination"
+        ],
+        "type": "object"
+      },
+      "ListResponse_AuthProviderSettingsRecord": {
+        "properties": {
+          "data": {
+            "items": {
+              "description": "One configured auth method, as returned by the `/api/v1/admin/auth/providers` surface.\n\nEvery field is non-secret configuration and is serialized normally.",
+              "properties": {
+                "allowed_algorithms": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "allowed_email_domains": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "authorization_url": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "client_id": {
+                  "description": "Non-secret. Always returned. This is the value the console fingerprints and compares\nagainst its own stored fingerprint for D7 drift protection — a `client_id` changed\nin Moira while the console still holds the old client's secret would otherwise fail\nthe code exchange with an opaque provider error. Exposing it on the read path is the\nwhole of Moira's obligation there; no extra endpoint, header, or\nfingerprint-computation is required, and Moira deliberately does not store the\nconsole's fingerprint.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "created_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "discovery_url": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "display_name": {
+                  "type": "string"
+                },
+                "enabled": {
+                  "type": "boolean"
+                },
+                "expected_audiences": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "issuer": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "jwks_url": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "metadata": {},
+                "method": {
+                  "$ref": "#/components/schemas/AuthMethod"
+                },
+                "redirect_uris": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "requested_scopes": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "status": {
+                  "$ref": "#/components/schemas/ResourceStatus"
+                },
+                "token_url": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "trusted_jwt_issuer_id": {
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "updated_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "userinfo_url": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "version": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "id",
+                "method",
+                "display_name",
+                "enabled",
+                "requested_scopes",
+                "allowed_email_domains",
+                "allowed_algorithms",
+                "expected_audiences",
+                "redirect_uris",
+                "metadata",
+                "status",
+                "created_at",
+                "updated_at",
+                "version"
               ],
               "type": "object"
             },
@@ -4989,6 +5595,72 @@
         ],
         "type": "string"
       },
+      "PublicAuthMethod": {
+        "description": "A deliberately narrower projection of [`AuthProviderSettingsRecord`] for the bootstrap\nread.\n\nIt must never gain a field carrying secret material. Under D7 no such field exists on\nthe source record either, so the guard is a *forward* one against reintroduction rather\nthan a redaction check.",
+        "properties": {
+          "allowed_email_domains": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "authorization_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "client_id": {
+            "description": "Non-secret. The D7 drift-protection anchor: the console reads this on boot and\ncompares its fingerprint against the one stored beside its own client secret.\nSufficient on its own — plan 08 needs nothing more.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "discovery_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "issuer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "jwks_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "method": {
+            "$ref": "#/components/schemas/AuthMethod"
+          },
+          "requested_scopes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "method",
+          "display_name",
+          "requested_scopes",
+          "allowed_email_domains"
+        ],
+        "type": "object"
+      },
       "PublicCapabilities": {
         "properties": {
           "max_input_items": {
@@ -7131,6 +7803,21 @@
         ],
         "type": "string"
       },
+      "SetupAuthMethodsResponse": {
+        "description": "Response body of `GET /api/v1/admin/setup/auth-methods`.\n\nAuthenticated, not anonymous (decision D4): the response is identity *configuration* —\nwhich IdP, which issuer, which client id, which allowed domains — and that is\nreconnaissance-worthy even though D7 removed the secret. Plan 08's console calls it\nserver-side with the system key it already holds; the browser never sees it.",
+        "properties": {
+          "methods": {
+            "items": {
+              "$ref": "#/components/schemas/PublicAuthMethod"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "methods"
+        ],
+        "type": "object"
+      },
       "SetupCheckName": {
         "enum": [
           "database",
@@ -7192,6 +7879,18 @@
           "provider_credential",
           "routing_policy",
           "executable_path"
+        ],
+        "type": "object"
+      },
+      "SetupClaimStatusResponse": {
+        "description": "The entire response body of `GET /api/v1/admin/setup/claim-status`.\n\nOne boolean is the whole contract, deliberately. This is the only unauthenticated\nendpoint in the identity surface, and it is unauthenticated *because* its response is a\nsingle bit that an attacker could infer anyway from the fact that the instance is\nfreshly deployed. No count, no timestamp, no issuer, no subject, no enumeration of who\nholds a grant — anything more would be reconnaissance on the surface an attacker would\ntarget during the setup window, when the deployment is least defended.",
+        "properties": {
+          "claimed": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "claimed"
         ],
         "type": "object"
       },
@@ -11060,6 +11759,982 @@
         ],
         "tags": [
           "admin-audit"
+        ]
+      }
+    },
+    "/api/v1/admin/auth/providers": {
+      "get": {
+        "operationId": "list_auth_providers",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "external_application_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "application_slug",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_before",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_after",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "provider_id",
+            "required": false,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "credential_type",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/CredentialType"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scope_type",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ScopeType"
+            }
+          },
+          {
+            "in": "query",
+            "name": "application_id",
+            "required": false,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "external_user_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "external_tenant_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "expires_before",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "expires_after",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "request_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "actor_type",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "actor_subject",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "delegated_subject",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "resource_type",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "resource_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "action",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "result",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/AuditResult"
+            }
+          },
+          {
+            "in": "query",
+            "name": "occurred_before",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "occurred_after",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListResponse_AuthProviderSettingsRecord"
+                }
+              }
+            },
+            "description": "Paginated auth provider configurations",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Query, authentication, or authorization error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-auth-settings"
+        ]
+      },
+      "post": {
+        "operationId": "create_auth_provider",
+        "parameters": [
+          {
+            "description": "Optional replay key. A repeated request with the same key and body replays the stored response instead of creating a second configuration.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuthProviderSettingsCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthProviderSettingsRecord"
+                }
+              }
+            },
+            "description": "Auth provider configuration created. The body carries non-secret configuration only; Moira accepts and stores no OAuth client secret.",
+            "headers": {
+              "ETag": {
+                "description": "Current resource version",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "duplicate_auth_provider, idempotency_conflict or idempotency_in_progress",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request, authentication, authorization, or conflict error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-auth-settings"
+        ]
+      }
+    },
+    "/api/v1/admin/auth/providers/{id}": {
+      "delete": {
+        "operationId": "delete_auth_provider",
+        "parameters": [
+          {
+            "description": "Auth provider configuration identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required current resource version",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Auth provider configuration deleted",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Authentication, authorization, conflict, or not-found error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-auth-settings"
+        ]
+      },
+      "get": {
+        "operationId": "get_auth_provider",
+        "parameters": [
+          {
+            "description": "Auth provider configuration identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthProviderSettingsRecord"
+                }
+              }
+            },
+            "description": "Auth provider configuration. `client_id` is always returned: it is the non-secret anchor the console fingerprints to detect configuration drift against the client secret it stores itself.",
+            "headers": {
+              "ETag": {
+                "description": "Current resource version",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Authentication, authorization, or not-found error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-auth-settings"
+        ]
+      },
+      "patch": {
+        "operationId": "patch_auth_provider",
+        "parameters": [
+          {
+            "description": "Auth provider configuration identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required current resource version",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuthProviderSettingsPatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthProviderSettingsRecord"
+                }
+              }
+            },
+            "description": "Auth provider configuration updated. `issuer` and `client_id` are ordinary mutable configuration: Moira binds no secret to them, so changing either is not a conflict.",
+            "headers": {
+              "ETag": {
+                "description": "Current resource version",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request, authentication, authorization, conflict, or not-found error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-auth-settings"
+        ]
+      }
+    },
+    "/api/v1/admin/auth/providers/{id}/disable": {
+      "post": {
+        "operationId": "disable_auth_provider",
+        "parameters": [
+          {
+            "description": "Auth provider configuration identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required current resource version",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthProviderSettingsRecord"
+                }
+              }
+            },
+            "description": "Auth provider configuration disabled",
+            "headers": {
+              "ETag": {
+                "description": "Current resource version",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Authentication, authorization, conflict, or not-found error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-auth-settings"
+        ]
+      }
+    },
+    "/api/v1/admin/auth/providers/{id}/enable": {
+      "post": {
+        "operationId": "enable_auth_provider",
+        "parameters": [
+          {
+            "description": "Auth provider configuration identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required current resource version",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthProviderSettingsRecord"
+                }
+              }
+            },
+            "description": "Auth provider configuration enabled. Refused with auth_provider_method_config_incomplete if the method's required non-secret configuration is missing; Moira never checks for a client secret, which it does not store.",
+            "headers": {
+              "ETag": {
+                "description": "Current resource version",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Authentication, authorization, conflict, or not-found error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-auth-settings"
         ]
       }
     },
@@ -19821,6 +21496,357 @@
         ],
         "tags": [
           "admin-runtime"
+        ]
+      }
+    },
+    "/api/v1/admin/setup/auth-methods": {
+      "get": {
+        "operationId": "get_setup_auth_methods",
+        "parameters": [
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetupAuthMethodsResponse"
+                }
+              }
+            },
+            "description": "Enabled auth methods and their non-secret configuration. Authenticated on purpose: the response is identity configuration - which IdP, which issuer, which client id, which allowed domains - and that is reconnaissance-worthy even though Moira stores no client secret. Plan 08's console calls this server-side with the system key it already holds.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Authentication failed",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Caller type or scope is not permitted",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "PostgreSQL is unavailable",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-setup"
+        ]
+      }
+    },
+    "/api/v1/admin/setup/claim": {
+      "post": {
+        "description": "Grants Moira admin scope to a specific (issuer, subject). Requires an X-Moira-System-Key; a bare trusted-JWT bearer token is refused even if it verifies. `email` and `email_verified` are REQUIRED. The email domain allow-list is DENY-BY-DEFAULT: a claim is refused 403 unless an enabled auth-provider configuration governs the target issuer AND its `allowed_email_domains` explicitly contains the email's domain. An unconfigured or empty allow-list denies every claim, including the first one - there is no first-claim exemption and no bootstrap bypass. Configure the policy first via POST /api/v1/admin/auth/providers, then POST /api/v1/admin/auth/providers/{id}/enable.",
+        "operationId": "claim_admin_identity",
+        "parameters": [
+          {
+            "description": "Optional replay key. A repeated request with the same key and body replays the stored response with status 200 instead of creating a second grant; without one, retrying an already-succeeded claim returns 409.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClaimAdminIdentityRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminIdentityRecord"
+                }
+              }
+            },
+            "description": "Idempotent replay of a prior successful claim",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminIdentityRecord"
+                }
+              }
+            },
+            "description": "Admin identity granted",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "unregistered_trusted_issuer, admin_claim_email_required, setup_token_not_supported, or invalid_request (malformed body)",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "setup_claim_credential_required or an invalid system key",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "admin_claim_email_not_verified or admin_claim_domain_not_allowed",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "admin_identity_already_claimed, idempotency_conflict, or idempotency_in_progress",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "invalid_request - the body is well-formed JSON but violates the schema, e.g. `email` or `email_verified` omitted - or scope_invalid",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "PostgreSQL is unavailable",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "systemKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-setup"
+        ]
+      }
+    },
+    "/api/v1/admin/setup/claim-status": {
+      "get": {
+        "operationId": "get_setup_claim_status",
+        "parameters": [
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetupClaimStatusResponse"
+                }
+              }
+            },
+            "description": "Whether an admin identity has been claimed. Intentionally returns a single boolean and nothing else - no count, timestamp, issuer, or subject - so that an unauthenticated caller learns nothing about the deployment beyond whether the setup wizard should be shown.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "PostgreSQL is unavailable",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "admin-setup"
         ]
       }
     },

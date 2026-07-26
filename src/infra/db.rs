@@ -13,7 +13,8 @@ use crate::{
     config::DatabaseSettings,
     error::AppError,
     orchestration::{
-        CircuitBreakerRegistry, CircuitResetScope, ProviderRuntimeCache, RuntimeConfigCache,
+        AuthProviderSettingsCache, CircuitBreakerRegistry, CircuitResetScope, ProviderRuntimeCache,
+        RuntimeConfigCache,
     },
 };
 
@@ -48,11 +49,14 @@ pub fn spawn_runtime_config_listener(
     pool: PgPool,
     cache: RuntimeConfigCache,
     runtime_handles: ProviderRuntimeCache,
+    auth_settings: AuthProviderSettingsCache,
     circuits: CircuitBreakerRegistry,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            if let Err(err) = listen_once(&pool, &cache, &runtime_handles, &circuits).await {
+            if let Err(err) =
+                listen_once(&pool, &cache, &runtime_handles, &auth_settings, &circuits).await
+            {
                 warn!(error = %err, "runtime config listener disconnected");
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
@@ -64,6 +68,7 @@ async fn listen_once(
     pool: &PgPool,
     cache: &RuntimeConfigCache,
     runtime_handles: &ProviderRuntimeCache,
+    auth_settings: &AuthProviderSettingsCache,
     circuits: &CircuitBreakerRegistry,
 ) -> Result<(), sqlx::Error> {
     let mut listener = PgListener::connect_with(pool).await?;
@@ -73,11 +78,20 @@ async fn listen_once(
     loop {
         let notification = listener.recv().await?;
         let scope = circuit_reset_scope(notification.payload());
-        // The two caches stay unconditional: they are keyed by version and rebuild on
-        // the next read, so re-reading them costs a query. Breaker state is earned by
-        // observing real failures and cannot be rebuilt, which is why only it is scoped.
+        // The three caches stay unconditional: they are keyed by version (or, for the
+        // auth-settings cache, are a single small list) and rebuild on the next read, so
+        // re-reading them costs a query. Breaker state is earned by observing real
+        // failures and cannot be rebuilt, which is why only it is scoped.
+        //
+        // The auth-settings cache joins them here rather than being invalidated only by
+        // its own resource type, and that is deliberate: unconditional invalidation is
+        // what satisfies CONVENTIONS §7.2 even if a future trigger, view or rename makes
+        // an auth-settings change arrive under a payload this function does not
+        // recognise. Over-invalidating a list of three rows is free; under-invalidating
+        // the identity configuration is not.
         cache.invalidate_all().await;
         runtime_handles.invalidate_all().await;
+        auth_settings.invalidate_all().await;
         circuits.reset_for_resource(scope).await;
         info!(
             channel = notification.channel(),

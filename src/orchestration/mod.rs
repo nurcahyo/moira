@@ -9,7 +9,7 @@ pub use controls::{
     is_fallback_eligible, is_retryable,
 };
 pub use provider_url::normalize_openai_base_url;
-pub use runtime_cache::RuntimeConfigCache;
+pub use runtime_cache::{AuthProviderSettingsCache, RuntimeConfigCache};
 pub use runtime_factory::{
     RigRuntimeFactory, RuntimeCompletionOutput, RuntimeEventSeed, RuntimeFactory,
     RuntimeItemStream, RuntimeModelHandle, RuntimeStreamItem, RuntimeStreamOutput,

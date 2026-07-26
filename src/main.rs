@@ -93,6 +93,7 @@ async fn run(mode: ProcessMode, settings: Settings) -> anyhow::Result<()> {
             pool.clone(),
             state.runtime_cache.clone(),
             state.runtime_handles.clone(),
+            state.auth_settings_cache.clone(),
             state.circuits.clone(),
         )
     });

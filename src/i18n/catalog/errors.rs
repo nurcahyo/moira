@@ -533,6 +533,11 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         description: "Used when a claim targets an (issuer, subject) pair that already holds a grant. Raised by the unique index on admin_identities, so it holds even if the command runner's advisory-lock window is raced.",
     },
     I18nEntry {
+        key: "moira.error.setup_claim_credential_required",
+        default_message: "A system key is required to claim an admin identity.",
+        description: "Used when POST /api/v1/admin/setup/claim arrives with no X-Moira-System-Key. A trusted-JWT bearer token is deliberately not accepted here, however well it verifies: if a verified JWT could claim, whoever reached a fresh deployment first would own it. Present the system key the operator holds.",
+    },
+    I18nEntry {
         key: "moira.error.setup_token_not_supported",
         default_message: "The one-time setup token path is not available on this deployment.",
         description: "Used when a claim populates the reserved setup_token field. The one-time-token credential path is deferred, and the field is refused rather than ignored: accepting and discarding it would let a caller believe Moira had honoured a credential it never read. Present the system key instead.",
