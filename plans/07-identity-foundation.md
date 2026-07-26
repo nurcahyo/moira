@@ -2,6 +2,109 @@
 
 > **Binding cross-cutting spec:** `plans/CONVENTIONS.md`. Where anything below conflicts with that file, **CONVENTIONS.md wins**. This plan has been re-audited against the real tree and brought into compliance with CONVENTIONS §1 (branch/PR), §2 (gates), §3 (unit **and** e2e), §4 (i18n), §7.2/§7.3/§7.5 (auth configured in settings at runtime), and §8 (Definition of Done).
 
+---
+
+## §0 — Wave 0: drift against the tree (re-audit 2026-07-26, HEAD `c45257f`)
+
+**Read this section before any other. The body of this plan was written against the pre-03 tree and
+plans 03, 04, 05, 06, 06b and 06c have all merged since.** An exhaustive citation-by-citation audit
+checked ~62 file:line references: **~14 are true, ~8 are true within a few lines, and ~40 are stale.**
+Three would fail to compile, one would cause a silent production regression, and three instruct the
+implementer to work around defects that plan 06b already fixed.
+
+The rule from plan 06's Wave 0 applies again: **where §0 and the body disagree, §0 wins.** The body is
+left in place because its *design* is still sound — it is the citations, not the intent, that rotted.
+
+### §0.1 Blockers — these break the build or corrupt state
+
+| # | Body says | Reality | Required change |
+|---|---|---|---|
+| **B1** | Migrations `0009_admin_identity_claims.sql`, `0010_auth_provider_settings.sql`, rollback `0011_…`; "`0008` is the current highest" (`:127`) | `0009`, `0010` **and** `0011` are all taken (`backfill_false_indexed_ingestion_status`, `list_cursor_indexes`, `retention_indexes`). Next free is **`0012`** | Renumber to **`0012`**, **`0013`**, rollback **`0014`** — in all ~14 places (`:16-17`, `:40`, `:71-72`, `:129`, `:207`, `:322`, `:777`, `:993`, `:1044`). The append-only window is now `0001-0011`, not `0001-0008` |
+| **B2** | `AdminCommandRunner::new(self.repo.clone())` (`:521`) | Takes **two** args. Every real call site is `AdminCommandRunner::new(self.repo.clone(), command_hasher(self.state))` (`src/application/admin_command.rs:169`) | Add the hasher argument |
+| **B3** | Attach `notify_moira_runtime_config_change()` to `auth_provider_settings` (`:273-277`); "the existing mechanism, no new channel" (`:866`) | **Silently resets every provider circuit breaker on every auth-settings write.** `auth_provider_settings` is absent from `CIRCUIT_UNAFFECTED_RESOURCE_TYPES` (`src/infra/db.rs:119-138`), so it falls to the `other =>` arm (`:175-181`) → `CircuitResetScope::All` **plus a `warn!` per write**. The plan mentions circuits nowhere | Add `"auth_provider_settings"` to `CIRCUIT_UNAFFECTED_RESOURCE_TYPES`, **with a test**. See §0.3 |
+| **B4** | "same `etag_headers` / `require_if_match` / **`ensure_version` (`:86-95`)** helpers" (`:664`) | `ensure_version` **was deleted** by plan 06b (`498221a`). `src/http/admin.rs:85-90` is now `optional_if_match` | Drop the reference. Use `require_if_match` + pass `expected_version` into the repository, per §0.2 |
+| **B5** | "update the two exhaustive `ActorType` matches in `src/security/authz.rs` (`:119`, `:146`)" (`:86`, `:301`, `:505`, `:765`, `:1046`) | **There are no such matches, and never were.** `8039c53` replaced the old `!= ConsumerKey` test with an allow-list constant `ADMIN_IMPLYING_ACTOR_TYPES` (`src/security/authz.rs:129-133`) | **Do nothing in `authz.rs`.** Omission from the allow-list *is* denial. Reviewer item `:765(e)` is unsatisfiable as written and becomes "`SetupToken` is absent from `ADMIN_IMPLYING_ACTOR_TYPES`" — moot under D1 below |
+| **B6** | "**Known defect to not copy:** the issuer handlers version-check outside the transaction (`admin.rs:1449-1452`, `:1480-1483`, `:1532-1535`, `:1563-1566`) — a TOCTOU window" (`:666`, `:861`); listed again as a deferred follow-up (`:1056`) | **Fixed by plan 06b.** All 33 sites now pass `expected_version` into the transaction and evaluate it via `lock_and_match_version` under `select … for update` (`src/infra/repositories/admin.rs:2503-2516`) | Delete the warning, the contrast at `:861`, and the deferred item at `:1056`. Copy `lock_and_match_version` + the `*_VERSION_FOR_UPDATE` consts (`:2495-2500`), **not** `rotate_credential`'s inline form |
+| **B7** | "Reuse `AdminCommandRunner`/`admin_command_spec`/`AdminCommandMutation` from `src/application/admin_command.rs` verbatim" (`:521`); "follows `src/application/admin.rs`'s `create_credential` (`:483-544`)" (`:534`) | **`src/application/admin.rs` does not exist** — plan 06 split it into `src/application/admin/{mod,shared,applications,providers,credentials,keys,jwt_issuers,audit}.rs`. `admin_command_spec` (`shared.rs:383`), `success_audit` (`:402`) and `command_hasher` (`:163`) are `pub(crate)` in `admin/shared.rs` | Retarget to `src/application/admin/shared.rs` and `src/application/admin/credentials.rs:50-111` |
+| **B8** | `AdminCommandMutation::new(record, 201, Some(record.id.to_string()))` used as a value (`:521`, `:536`) | Returns `Result<Self, AppError>` (`src/application/admin_command.rs:136`) | Add `?` |
+
+### §0.2 Scope decisions taken at Wave 0
+
+Both are recorded with their reversal conditions in `plans/reports/EXECUTION-LEDGER.md`.
+
+**D1 — the setup-token credential path is DEFERRED, not implemented.**
+This plan's second claim credential (`admin_setup_tokens` table, `ActorType::SetupToken`, the
+one-time-token gate on `POST /api/v1/admin/setup/claim`) **is cut from scope.** Plan 08's console
+declares `setup_token?: string` in its DTO (`plans/08-…:697`) and **never sends it** — its entire
+setup triple uses `X-Moira-System-Key` (`plans/08-…:701-706`). The path was specified and never
+exercised.
+
+Consequences: no `admin_setup_tokens` table, no `ActorType::SetupToken` variant, no
+`GeneratedSetupTokenResponse`, and the ~8 tests covering that path are not written. The DTO keeps
+`setup_token: Option<String>` so 08's generated client still typechecks against the schema, and the
+field is documented as reserved-and-rejected rather than silently ignored. **B5 becomes moot** — the
+new `ActorType` variant that made the allow-list question urgent no longer exists.
+
+**D2 — the `moira:admin` grant applies on the ADMIN plane only.**
+`authenticate_admin` (`src/security/auth.rs:308`) and `authenticate_caller` (`:353`) **both** delegate
+to the same `authenticate_trusted_jwt` (`:474`), and `authenticate_caller` returns that actor verbatim
+for a bare bearer token (`:386-388`). Injecting the grant inside `authenticate_trusted_jwt` — which is
+what the body implies — therefore puts `moira:admin` on the **public execution API**, where combined
+with admin implication it satisfies `moira:execution:override-credential`, `override-model` and
+`moira:identity:delegate`.
+
+**The grant lookup goes in `authenticate_admin`, applied to the actor *after*
+`authenticate_trusted_jwt` returns.** `combine_consumer_and_jwt` (`:941`) already strips `moira:admin`
+on the consumer+JWT path, so admin-plane-only is the direction the existing code already goes; a bare
+JWT carrying admin onto the public surface would be the one path that disagrees. **Required test:** a
+granted identity receives **403** on a public-API scope it does not independently hold.
+
+### §0.3 Additional required work the body does not contain
+
+| Item | Why |
+|---|---|
+| Add `"auth_provider_settings"` to `CIRCUIT_UNAFFECTED_RESOURCE_TYPES` (`src/infra/db.rs:119-138`) + a test asserting `circuit_reset_scope` returns `Unaffected` for it | B3. Without it every auth-settings write discards breaker state that was earned by observing real failures and cannot be rebuilt |
+| **Regenerate `docs/openapi.json` unconditionally**, via `UPDATE_SNAPSHOTS=1 cargo test --lib http::tests::committed_openapi_matches_the_generated_document` | The body treats this as conditional on whether 05 landed (`:46`, `:744`, `:976`). **It landed** (`3ea8037`). Two gates enforce it: `src/http/mod.rs:1649` and `tests/openapi_drift.rs:100`. Adding 10 operations without regenerating fails both |
+| Satisfy four spec gates the body predates: `every_if_match_operation_declares_the_documented_precondition` (`src/http/mod.rs:1122`), `atomic_admin_idempotency_contract_is_explicit` (`:907`), `once_only_key_responses_use_the_secret_envelope` (`:884`), `committed_openapi_matches_the_generated_document` (`:1649`) | All 8 new `If-Match` operations and every new idempotent operation must declare their preconditions in the utoipa annotations |
+| **Write the missing Module 13.** `:745` and `:754` assign "module 13" (the `AppState` auth-settings cache field, the `db.rs` listener hook, the `settings.rs` TTL) to Agent 6, but Detailed Implementation stops at Module 12 | The DoD item `:1001` and the e2e test `an_auth_settings_write_invalidates_the_cache_via_listen_notify` (`:968`) both depend on a cache that no module specifies |
+| Register new routes in **`admin_routes()`** (`src/http/mod.rs:466`), not `documented_router()` (`:274`) | `documented_router` now only merges route groups and applies layers |
+| Re-export or mirror `header_string` (`src/security/auth.rs:1086`) | It is a module-private free function; `src/security/mod.rs:9-21` does not export it, so a new `src/http/identity.rs` cannot call it |
+
+### §0.4 Body claims that are simply false
+
+| Body | Reality |
+|---|---|
+| "`moira.error.database_unavailable` … has **no** catalog entry today (verified). The earlier draft of this plan asserted it already existed. **It does not.**" (`:719`) | **It does** — `src/i18n/catalog/errors.rs:29-32`. The earlier draft was right and the correction was wrong |
+| "`idempotency_in_progress` … no catalog entry today" (`:720`) | **Present** — `src/i18n/catalog/errors.rs:49-52` |
+| The whole "if 06 has not landed, 07 must add these two entries itself" contingency (`:722`) | Moot. 06 landed; both keys are catalogued. Note also that plan 06c made a missing catalog entry a **compile** error, so this class of gap can no longer reach review |
+| "`AuthSettings` currently holds **only** `admin` and `caller` sub-structs" (`:572`) | It also holds `jwks: JwksFetchSettings` (`src/config/settings.rs:100-101`) |
+| "`src/http/mod.rs` has **8** spec tests" (`:294`, `:976`) | ~26 |
+| `tests/execution_lifecycle.rs` "(14)" (`:971`) | 18 |
+
+### §0.5 Citation staleness by file — assume every line number is wrong until re-checked
+
+| File | Status |
+|---|---|
+| `src/security/auth.rs` | **12 of 12 cites stale.** The file grew ~270 lines. Real anchors: `ActorType` `:30-39`, `authenticate_admin` `:308`, `authenticate_caller` `:353`, `verify_api_key` `:408`, `authenticate_trusted_jwt` `:474`, `actor_from_trusted_claims` `:826`, `header_string` `:1086` |
+| `src/http/mod.rs` | **6 of 6 stale.** `router` `:213`, `documented_router` `:274`, `admin_routes` `:466`, `mod tests` `:580` |
+| `src/application/admin.rs` | **File does not exist.** See B7 |
+| `src/infra/repositories/admin.rs` | All stale. `AdminRepository` trait `:93`, `rotate_credential` `:475`, `claim_idempotency` `:651`, `begin_command_savepoint` `:738`, `finalize_idempotency` `:759`, `lock_and_match_version` `:2503` |
+| `src/infra/db.rs` | All stale. `MIGRATOR` `:20`, `migrate()` `:40`, `spawn_runtime_config_listener` `:47`, `listen_once` `:62` |
+| `src/http/admin.rs` | Mostly **true**, except `ensure_version` (B4) and the four TOCTOU sites (B6) |
+| `migrations/*` | All internal cites **true**; only the *new* filenames collide (B1) |
+| `src/security/authz.rs`, `src/security/crypto.rs`, `src/error.rs`, `src/application/context.rs`, `src/domain/i18n.rs` | Substantially **true** — see the audit for one-or-two-line offsets |
+
+### §0.6 What this plan must NOT do
+
+The four `TODO(post-deploy)` markers in `src/application/runtime_admin.rs` and
+`src/application/public.rs` were named `TODO(plan-07)` until `c45257f`. **This plan does not remove
+them.** Their precondition is 24 hours after the **deploy** carrying plan 06 Module 16 — not after a
+merge — and removing the `legacy_actor_fingerprint` read-fallbacks early makes a client retrying an
+idempotent request across the deploy boundary miss its ledger row and execute a second time against
+the provider. `plans/06-architecture-test-hygiene.md:377` still refers to them by the old name.
+
+---
+
 ## Summary
 
 **Objective.** Give Moira a Moira-native way to grant a **human** admin authority without Moira ever issuing passwords or sessions, and to hold the auth-provider configuration that grant depends on as **runtime, database-backed settings** rather than build-time environment. Concretely: a new `admin_identities` table binding admin scope to a stable `(issuer, subject)` pair from an already-trusted JWT issuer; a `setup_state` singleton for setup-required detection; single-use `admin_setup_tokens`; a new `auth_provider_settings` table holding enabled auth methods with their **non-secret config only** (decision **D7** — the OAuth client secret is owned by the console, never by Moira); the two frozen setup endpoints (`GET /api/v1/admin/setup/claim-status`, `POST /api/v1/admin/setup/claim`); a scope-gated, `If-Match`-versioned, idempotent auth-settings admin surface; and an additive extension to `src/security/auth.rs`'s Actor mapping so a trusted-JWT caller whose `(issuer, subject)` has a grant resolves to admin scope on every subsequent request.
@@ -13,13 +116,14 @@
 **User-visible outcome.** An operator holding the bootstrap system key (existing `bootstrap-system-key` CLI, `src/main.rs`) can (a) configure which auth methods this deployment offers and with what policy — non-secret configuration only; the OAuth client secret is never sent to Moira (**D7**) — and (b) grant a specific human's `(issuer, subject)` Moira admin scope — exactly once per identity, idempotently, and auditably. An unauthenticated caller can check whether setup is still required (a single boolean, no internal detail). After a grant, that human's future trusted-JWT-authenticated requests resolve to `moira:admin` automatically. No password, session cookie, or login page exists in Moira itself.
 
 **Included scope.** P1-11 in full, plus the CONVENTIONS §7.2 runtime-auth-settings requirement:
-- migration `0009_admin_identity_claims.sql` — `admin_identities`, `setup_state`, `admin_setup_tokens`
-- migration `0010_auth_provider_settings.sql` — `auth_provider_settings` (**non-secret config only**, no secret envelope — decision **D7** — + NOTIFY trigger)
-- `GET /api/v1/admin/setup/claim-status` (unauthenticated) and `POST /api/v1/admin/setup/claim` (system-key **or** one-time-token gated)
+- migration `0012_admin_identity_claims.sql` — `admin_identities`, `setup_state` (**no `admin_setup_tokens`** — §0.2 D1)
+- migration `0013_auth_provider_settings.sql` — `auth_provider_settings` (**non-secret config only**, no secret envelope — decision **D7** — + NOTIFY trigger), **plus the `CIRCUIT_UNAFFECTED_RESOURCE_TYPES` entry that trigger requires** (§0.1 B3)
+- `GET /api/v1/admin/setup/claim-status` (unauthenticated) and `POST /api/v1/admin/setup/claim` (**system-key gated only** — the one-time-token path is deferred, §0.2 D1)
 - `GET /api/v1/admin/setup/auth-methods` (setup-actor gated) + the seven `/api/v1/admin/auth/providers…` admin routes
-- `src/security/auth.rs` Actor-mapping extension; `ActorType::SetupToken`; three new `ADMIN_SCOPES` entries
-- verified-email + **DB-backed, deny-by-default** allowed-domain policy enforced at grant time **on every claim path, with no first-claim exemption and no bootstrap bypass** (resolved decision, 2026-07-25)
-- `email` + `email_verified` **required on both the system-key and setup-token claim paths** (resolved decision, 2026-07-25) — which is what makes the domain policy enforceable everywhere and puts a human-identifiable attribute on every grant
+- `src/security/auth.rs` Actor-mapping extension, **hooked at `authenticate_admin`** (§0.2 D2); three new `ADMIN_SCOPES` entries. **No `ActorType::SetupToken`** and **no change to `src/security/authz.rs`'s allow-list** (§0.1 B5, §0.2 D1)
+- verified-email + **DB-backed, deny-by-default** allowed-domain policy enforced at grant time **with no first-claim exemption and no bootstrap bypass** (resolved decision, 2026-07-25). With D1 there is only one claim path, which removes the token-burn ordering hazard the original two-path design carried
+- `email` + `email_verified` **required on the claim path** (resolved decision, 2026-07-25) — which is what makes the domain policy enforceable and puts a human-identifiable attribute on every grant. The DTO keeps `setup_token: Option<String>`, **rejected rather than ignored**, so plan 08's generated client still typechecks
+- **regenerating and committing `docs/openapi.json`** (§0.3) — mandatory, not conditional
 - `GET /api/v1/admin/setup/auth-methods` **authenticated** (resolved decision **D4**, 2026-07-25) — the console calls it server-side; only `claim-status` is anonymous
 - **no OAuth client secret anywhere in Moira** (resolved decision **D7**, 2026-07-25) — `auth_provider_settings` stores non-secret config only; the console owns the secret in its own `console_auth` database. Moira exposes `client_id` as the drift-protection anchor the console fingerprints against
 - new `moira.error.*` / `moira.notice.*` catalog entries with tests (CONVENTIONS §4)
@@ -37,13 +141,13 @@
 - **PR description — required sections:**
   - **Plan link** — `plans/07-identity-foundation.md`
   - **Findings addressed** — P1-11 (plus CONVENTIONS §7.2 compliance)
-  - **Migrations included** — `migrations/0009_admin_identity_claims.sql`, `migrations/0010_auth_provider_settings.sql`
+  - **Migrations included** — `migrations/0012_admin_identity_claims.sql`, `migrations/0013_auth_provider_settings.sql`
   - **Breaking API/OpenAPI changes** — none against any *shipped* surface; **10 new operations added** (enumerate them), all under `/api/v1/admin/`. Must additionally reproduce **both** ⚠️ callouts from Interfaces & Contracts: (i) **changed by D7** — the client secret is gone from Moira entirely, `POST /api/v1/admin/auth/providers/{id}/rotate-secret` does not exist, and the operation count is **10, not 11**; (ii) `ClaimAdminIdentityRequest.email` is now required (`Option<String>` → `String`), `email_verified` loses its serde default, and `AdminIdentityRecord.email` is now `String`. Both are changes against the shape plans 08/09 were drafted against, which the coordinator must propagate before 08 starts.
   - **Test evidence** — unit + e2e output summary (see Verification)
   - **Rollback procedure** — see Risks & Rollback
   - **Deferred follow-ups** — see Risks & Rollback
 - **Done means merged**, with all gates green and every Definition of Done item objectively verified.
-- **Ordering (CONVENTIONS §1.6):** this plan **adds OpenAPI operations**, so it must land **before** plan 05's OpenAPI-drift gate freezes the committed spec, or the same PR must regenerate and commit the spec snapshot. Confirm 05's landed state at Wave 0 and do whichever applies.
+- **Ordering (CONVENTIONS §1.6):** this plan **adds OpenAPI operations**. The condition is resolved: **plan 05 has landed** (`3ea8037`) and the spec is frozen, so **this PR must regenerate and commit `docs/openapi.json`** — see Verification and §0.3 for the command. There is no "whichever applies" left to decide.
 - Plan 08 stacks on this branch's merged result; never force-push after 08 branches from it.
 
 ---
@@ -68,8 +172,8 @@
 
 | Layer | File | Change |
 |---|---|---|
-| `migrations/` | `0009_admin_identity_claims.sql` (new) | `admin_identities`, `setup_state`, `admin_setup_tokens` |
-| | `0010_auth_provider_settings.sql` (new) | `auth_provider_settings` + version-bump trigger + NOTIFY trigger |
+| `migrations/` | `0012_admin_identity_claims.sql` (new) | `admin_identities`, `setup_state`, `admin_setup_tokens` |
+| | `0013_auth_provider_settings.sql` (new) | `auth_provider_settings` + version-bump trigger + NOTIFY trigger |
 | `src/domain/` | `identity.rs` (new) | `SetupClaimStatusResponse`, `ClaimAdminIdentityRequest`, `AdminIdentityRecord`, `AdminIdentityStatus`, `GeneratedSetupTokenResponse` |
 | | `auth_settings.rs` (new) | `AuthProviderSettingsRecord`, `…CreateRequest`, `…PatchRequest`, `AuthMethod`, `SetupAuthMethodsResponse`, `PublicAuthMethod` |
 | | `mod.rs` | two additive `pub use` blocks |
@@ -124,9 +228,9 @@
 
 ### DB/migration changes
 
-Two new append-only migrations. `0008` is the current highest — **re-verify at execution time**, since 03/04/05 land first and may have added migrations; renumber if so and update every reference in this plan and in 08.
+Two new append-only migrations. **`0011` is the current highest** (verified at HEAD `c45257f`): 03/04/05 did land first and did add migrations, which is why the numbers below are `0012` and `0013` rather than the `0009`/`0010` this plan originally reserved. The append-only window is `0001-0011`. If further plans merge before this branch is cut, re-verify and renumber again — and update `plans/08` alongside.
 
-#### `migrations/0009_admin_identity_claims.sql`
+#### `migrations/0012_admin_identity_claims.sql`
 
 Style follows `0003_security_foundation.sql` / `0004_admin_api_contract.sql`: uuid PK `default gen_random_uuid()`, `created_at`/`updated_at timestamptz not null default now()`, `deleted_at timestamptz` where the table supports mutation, `status varchar(32) … check (…)` enums, partial unique indexes `where deleted_at is null`.
 
@@ -204,7 +308,7 @@ for each row execute function moira_bump_resource_version();
 - `admin_setup_tokens` mirrors `system_api_keys`' exact column vocabulary (`key_prefix varchar(64)`, `key_hash text`, `fingerprint varchar(128)`, `pepper_version varchar(64)` — verified `0003:262-278`) rather than inventing a new secret-storage shape.
 - `trusted_jwt_issuer_id` (FK) proves the grant is bound to a currently-registered issuer row; `issuer` is denormalized beside it so the hot-path lookup in `authenticate_trusted_jwt` needs no join. The denormalization cannot drift because `trusted_jwt_issuers_issuer_active_unique` (`0003:254-256`) makes the string a key.
 
-#### `migrations/0010_auth_provider_settings.sql`
+#### `migrations/0013_auth_provider_settings.sql`
 
 This is the CONVENTIONS §7.2 table: enabled auth methods and their **non-secret** config. **Decision `D7`: there is no secret envelope on this table** — no `encrypted_payload`, `encryption_algorithm`, `encryption_version`, `encrypted_data_key`, `nonce`, `secret_fingerprint`, or `masked_secret` column, and therefore no envelope-completeness CHECK constraint. The OAuth client secret is owned by the console and stored in the console's own `console_auth` database. Every column below is safe to read.
 
@@ -278,7 +382,32 @@ for each row execute function notify_moira_runtime_config_change();
 
 **Reuse, do not redefine, `notify_moira_runtime_config_change()`** — it exists (`0002:101`, re-declared `0003:439`, `0004:108`) and emits `json_build_object('resource_type', tg_table_name, 'resource_id', changed_id::text)` (`0004:116-119`) on channel `moira_runtime_config`. Attaching to it is exactly how CONVENTIONS §7.2's "changing auth settings must invalidate the runtime cache through the existing Postgres LISTEN/NOTIFY path" is satisfied — **no new channel and no new mechanism is invented**. Match the trigger-attachment style used at `0004:132-162`.
 
-**Note the DDL statement style must match the surrounding migrations** — verify whether existing triggers use `after insert or update or delete … for each row` and copy that form exactly rather than the shape written above.
+⚠️ **Attaching the trigger is NOT free, and this plan treats it as free (§0.1 B3). A required Rust
+change accompanies this migration.**
+
+`listen_once` (`src/infra/db.rs:62-88`) now routes every notification through
+`circuit_reset_scope(payload)` (`:147-183`). That function maps `providers` and `provider_models` to
+narrow scopes, maps the 18 tables in `CIRCUIT_UNAFFECTED_RESOURCE_TYPES` (`:119-138`) to
+`Unaffected`, and falls through to **`CircuitResetScope::All` plus a `warn!` for anything it has
+never heard of** — deliberately, because an unknown table is treated as unknown rather than assumed
+harmless (`:116-118`).
+
+`auth_provider_settings` is a table it has never heard of. So without the accompanying change, **every
+auth-settings write discards every provider circuit breaker in the process** and logs a warning. That
+matters more than it sounds: the two runtime caches are keyed by version and rebuild on the next read
+(`:72-74` accepts that cost explicitly), but breaker state is *earned* by observing real failures and
+cannot be rebuilt — resetting it sends live traffic back at a provider that was just failing.
+
+**Required with this migration:** add `"auth_provider_settings"` to
+`CIRCUIT_UNAFFECTED_RESOURCE_TYPES`, plus a unit test asserting `circuit_reset_scope` returns
+`Unaffected` for a payload naming it. Auth settings do not affect provider health, so `Unaffected` is
+the honest classification. Note also that both runtime caches *are* invalidated unconditionally on
+every notification — that is the existing design, and it is what makes the NOTIFY attachment do the
+job CONVENTIONS §7.2 asks for.
+
+**DDL style — verified, no need to re-check:** the existing triggers do use
+`after insert or update or delete … for each row` (`migrations/0004_admin_api_contract.sql:132-134`),
+which is the form written above.
 
 **Deliberate non-decisions.** No secret-envelope columns and no `key_id` column exist on this table, because no secret is stored on it (**D7**). Envelope key rotation remains a concern of `provider_credentials` alone and stays a deferred follow-up there — see Risks & Rollback. **Do not "restore symmetry" with `provider_credentials` by adding envelope columns here**; the asymmetry is the decision, not an oversight.
 
@@ -319,7 +448,7 @@ Standard migrate-then-deploy. Both migrations must run before the new binary ser
 
 ### Module 1 — Migrations
 
-`migrations/0009_admin_identity_claims.sql` and `migrations/0010_auth_provider_settings.sql`, exactly as specified above. Append-only (`docs/project-structure.md`) — never edited after merge; any correction is a new migration. Re-verify the highest existing migration number at execution time.
+`migrations/0012_admin_identity_claims.sql` and `migrations/0013_auth_provider_settings.sql`, exactly as specified above. Append-only (`docs/project-structure.md`) — never edited after merge; any correction is a new migration. Re-verify the highest existing migration number at execution time.
 
 ### Module 2 — `src/domain/identity.rs` (new)
 
@@ -498,11 +627,45 @@ New private `async fn apply_admin_identity_grant(pool: &PgPool, issuer: &str, mu
 - Run the module-5 lightweight `find_active_grant(issuer, subject)`.
 - If found: `actor.scopes.extend(grant.granted_scopes)` then dedup+sort, **mirroring the existing dedup at `auth.rs:566-567`**. This is a **union**, not a replace, so a trusted issuer that also grants narrower JWT-claimed scopes does not lose them.
 - If not found: return `actor` **unchanged** — the byte-identical no-op path.
-- Reachable from **`authenticate_trusted_jwt` only** — never from `authenticate_admin`'s system-key/consumer-key branches, never from `authenticate_caller`'s dev-trust-header branch. Admin-identity grants apply exclusively to the trusted-JWT path (`plans/01` §4.3 Mode A).
+- ⚠️ **SUPERSEDED BY §0.2 D2 — read that before implementing this bullet.** The grant is applied in
+  **`authenticate_admin` (`src/security/auth.rs:308`), to the actor returned by
+  `authenticate_trusted_jwt`** — *not* inside `authenticate_trusted_jwt` itself, which is what this
+  bullet's "reachable from `authenticate_trusted_jwt` only" phrasing implies.
+
+  The distinction is load-bearing and this bullet gets it wrong. `authenticate_admin` (`:308`) and
+  `authenticate_caller` (`:353`) **both** call `authenticate_trusted_jwt` (`:474`), and
+  `authenticate_caller` returns its actor verbatim for a bare bearer token (`:386-388`). A grant
+  injected at the shared function therefore lands on the **public execution API**, where — combined
+  with admin implication — it satisfies `moira:execution:override-credential`, `override-model` and
+  `moira:identity:delegate` for any granted human sending `POST /api/v1/responses` with nothing but
+  their bearer token.
+
+  This bullet's own reviewer checklist inspects the dev-trust-header branch, which is genuinely
+  unreachable (`actor_from_trusted_headers` bypasses `authenticate_trusted_jwt` entirely), and misses
+  the branch that matters. Admin-identity grants apply exclusively to the **admin plane**
+  (`plans/01` §4.3 Mode A); `combine_consumer_and_jwt` (`:941`) already strips `moira:admin` on the
+  consumer+JWT path, so this is the direction the existing code already goes.
 
 **7b — `verify_system_key_only`.** A small new `pub(crate)` method on `AuthService` wrapping the existing private `verify_api_key` (`:226`, called today as `verify_api_key(pool, "system_api_keys", raw_key)` at `:148`) that reads **only** the `x-moira-system-key` header and never a bearer JWT. This is the structural enforcement of "no first-login-wins."
 
-**7c — `ActorType::SetupToken`.** Add the variant to the enum (`:29-37`). Update the two `ActorType` matches in `src/security/authz.rs` (`:119`, `:146`) so `SetupToken` is treated like `ConsumerKey` — **denied** admin implication. Grep for any other exhaustive `ActorType` match and update it; a non-exhaustive match that silently swallows the new variant is a review failure.
+**7c — `ActorType::SetupToken`.** ⚠️ **CUT — see §0.2 D1.** The setup-token credential path is
+deferred, so no new `ActorType` variant is added and this sub-module is not implemented.
+
+Two things were wrong with it independently of the cut, recorded so neither is reintroduced if the
+setup-token path ever returns:
+
+1. **The "two `ActorType` matches in `src/security/authz.rs` (`:119`, `:146`)" do not exist and never
+   did.** The old code tested a single negated equality (`actor.actor_type != ActorType::ConsumerKey`),
+   not a match. Commit `8039c53` replaced it with an explicit allow-list, `ADMIN_IMPLYING_ACTOR_TYPES`
+   (`src/security/authz.rs:129-133`).
+2. **Under the old form, following this instruction would have produced the opposite of its intent.**
+   `!= ConsumerKey` grants admin implication to every variant *except* `ConsumerKey`, so a newly added
+   `SetupToken` would have inherited **full admin authority** — silently, with no match to make
+   non-exhaustive and therefore no compiler warning. That fail-open default is why `8039c53` exists;
+   its doc comment names this plan (`src/security/authz.rs:124-125`).
+
+Were the variant added today, the correct action in `authz.rs` would be **none**: absence from the
+allow-list *is* denial, which is the safe direction to be wrong in.
 
 **7d — no self-asserted scopes (CONVENTIONS §7.5).** Add a validation, invoked from the auth-settings service (module 9), that any `trusted_jwt_issuers` row linked from `auth_provider_settings.trusted_jwt_issuer_id` has `scopes_claim IS NULL`. Reject with `AppError::coded(StatusCode::BAD_REQUEST, "console_issuer_must_not_assert_scopes", …)`.
 
@@ -518,7 +681,22 @@ New private `async fn apply_admin_identity_grant(pool: &PgPool, issuer: &str, mu
   3. Validate every requested scope is a member of `ADMIN_SCOPES` (`src/security/authz.rs:8-91`); reject unknown scope strings with the **existing** `scope_invalid` code (400) — do not mint a new key for a condition the catalog already covers.
   4. Resolve the target issuer (`resolve_active_issuer`) → `unregistered_trusted_issuer` (400) if absent.
   5. Enforce verified-email + allowed-domain policy (module 10).
-  6. Enter the envelope: `admin_command_spec(ctx, actor_or_synthetic, "admin_identity.claim", json!({ "issuer": …, "subject": … }), &request)?` → `AdminCommandRunner::new(self.repo.clone()).execute(spec, |transaction| Box::pin(async move { … }))`. **Reuse `AdminCommandRunner`/`admin_command_spec`/`AdminCommandMutation` from `src/application/admin_command.rs` verbatim** — do not hand-roll the advisory-lock/savepoint/finalize sequence (`src/infra/repositories/admin.rs:559-687`). Inside: `insert_grant`, `mark_setup_claimed`, `insert_audit(success_audit(actor, ctx, "admin_identity.claim", "admin_identity", Some(id), json!({…})))`, then `AdminCommandMutation::new(record, 201, Some(record.id.to_string()))`.
+  6. Enter the envelope: `admin_command_spec(ctx, actor_or_synthetic, "admin_identity.claim", json!({ "issuer": …, "subject": … }), &request)?` → `AdminCommandRunner::new(self.repo.clone(), command_hasher(self.state)).execute(spec, |transaction| Box::pin(async move { … }))`. **Reuse the envelope verbatim** — do not hand-roll the advisory-lock/savepoint/finalize sequence. Inside: `insert_grant`, `mark_setup_claimed`, `insert_audit(success_audit(actor, ctx, "admin_identity.claim", "admin_identity", Some(id), json!({…})))`, then `AdminCommandMutation::new(record, 201, Some(record.id.to_string()))?`.
+
+  ⚠️ **Three corrections to the line above, all of which were compile errors as originally written
+  (§0.1 B2, B7, B8):**
+  - `AdminCommandRunner::new` takes **two** arguments — the repository *and* an `IdempotencyHasher`
+    (`src/application/admin_command.rs:169`). Every real call site passes
+    `command_hasher(self.state)`; see `src/application/admin/applications.rs:49-51` for the shape.
+  - `AdminCommandMutation::new` returns `Result<Self, AppError>`
+    (`src/application/admin_command.rs:136`), so it needs the `?` — it is not a value.
+  - **`src/application/admin.rs` no longer exists.** Plan 06 split it into `src/application/admin/`.
+    `admin_command_spec` (`admin/shared.rs:383`), `success_audit` (`:402`) and `command_hasher`
+    (`:163`) are `pub(crate)` there; `AdminCommandRunner` and `AdminCommandMutation` remain in
+    `src/application/admin_command.rs`. The closure receives a `&mut PgAdminCommandTransaction`
+    (`src/infra/repositories/admin.rs:34`). The advisory-lock/savepoint/finalize primitives are
+    `claim_idempotency` (`:651`), `begin_command_savepoint` (`:738`) and `finalize_idempotency`
+    (`:759`) — not the `:559-687` range this plan cites.
   7. On unique violation from `insert_grant`: `admin_identity_already_claimed` (409). This is the DB-level backstop that holds even if the advisory-lock window is somehow raced.
 
   **Consequence of the resolved decisions (module 10): step 5 now runs identically on both credential paths, and it can deny a system-key claim.** Two things follow that an implementer must get right. First, do **not** add a `matches!(credential, ClaimCredential::SystemKey(_))` short-circuit around step 5 "so bootstrap works" — that is exactly the bypass module 10 rules out. Second, note the ordering interaction on the setup-token path: step 1 consumes the token *before* step 5 can deny the claim, so a policy-denied token claim burns the token. That is the correct trade-off (the DB-level `consumed_at is null` guard is what makes the token genuinely single-use, and weakening it to "consume only on success" would reintroduce replayability), but it makes it operationally important that the operator configures `allowed_email_domains` **before** minting a setup token — call that out in the operator runbook alongside module 10's ordering guidance.
@@ -661,13 +839,67 @@ fn claim_body_rejection(rejection: JsonRejection) -> AppError {
 
 ### Module 12 — `src/http/auth_settings.rs` (new)
 
-Eight handlers (`get_setup_auth_methods` plus the seven provider operations — **there is no `rotate_secret` handler**, decision **D7**). Follow the trusted-JWT-issuer handlers as the template (`src/http/admin.rs:1353-1571`) — same `security((...))` triple, same `params(PageQuery)` on list, same `etag_headers` (`:58-64`) / `require_if_match` (`:66-77`) / `ensure_version` (`:86-95`) helpers, same `Idempotency-Key` documentation on create.
+Eight handlers (`get_setup_auth_methods` plus the seven provider operations — **there is no `rotate_secret` handler**, decision **D7**). Follow the trusted-JWT-issuer handlers as the template (`src/http/admin.rs:1335-1537`) — same `security((...))` triple, same `params(PageQuery)` on list, same `etag_headers` (`:58-64`) / `require_if_match` (`:66-83`) helpers, same `Idempotency-Key` documentation on create.
 
-**Known defect to *not* copy:** the existing issuer handlers do their version check as a read-then-compare **outside** the repository transaction (`admin.rs:1449-1452`, `:1480-1483`, `:1532-1535`, `:1563-1566`) — a TOCTOU window. This plan's auth-settings mutations must instead pass `expected_version` **into** the service so the check happens inside the transaction under `select … for update`, borrowing the technique `rotate_credential` uses (`src/infra/repositories/admin.rs:392-403`) without borrowing its secret handling. Note the divergence in the PR so the pre-existing issue is visible and separately trackable, and do **not** "fix" the issuer handlers here (out of scope).
+⚠️ **`ensure_version` no longer exists** (§0.1 B4). Plan 06b deleted it; `src/http/admin.rs:85-90` is
+now `optional_if_match`. Referencing it is a compile error.
+
+**The "known defect to not copy" is gone — plan 06b fixed it** (§0.1 B6). This plan previously warned
+that the issuer handlers version-check as a read-then-compare **outside** the transaction
+(`admin.rs:1449-1452`, `:1480-1483`, `:1532-1535`, `:1563-1566`) and instructed the implementer to
+diverge from the template. **All 33 admin mutation sites now do the check inside the transaction**, so
+the template is the correct pattern to copy rather than the one to avoid, and the "note the divergence
+in the PR" and "do not fix the issuer handlers here" instructions are both moot.
+
+The mechanism to copy is `lock_and_match_version` (`src/infra/repositories/admin.rs:2503-2516`) with
+the per-table `*_VERSION_FOR_UPDATE` constants (`:2495-2500`) — **not** `rotate_credential`'s inline
+form, which this plan cites at a line number (`:392-403`) that is now `create_provider`'s INSERT. The
+handler takes `let expected_version = require_if_match(&headers)?;` and passes it into the service,
+which passes it into the repository; the repository evaluates it under `select … for update`.
+
+One gate this plan predates: `every_if_match_operation_declares_the_documented_precondition`
+(`src/http/mod.rs:1122`). All eight new `If-Match` operations must declare the precondition in their
+utoipa annotations or the spec tests fail.
 
 `GET /api/v1/admin/setup/auth-methods` lives in this file and is tagged `admin-setup` (grouping with the other setup endpoints), while the seven `/admin/auth/providers…` operations are tagged `admin-auth-settings`.
 
 **No route, handler, DTO, or utoipa path for `POST /api/v1/admin/auth/providers/{id}/rotate-secret` may appear in this file or in `documented_router()`.** It was removed by decision **D7** and its absence is part of the frozen contract plans 08/09 bind to.
+
+⚠️ **Route registration.** New routes go in **`admin_routes()`** (`src/http/mod.rs:466`), alongside
+the existing `.routes(routes!(admin::get_setup_status))` at `:468`. `documented_router()` (`:274`)
+now only merges route groups and applies layers; registering directly there — which this plan's
+earlier text implies — puts the routes outside the admin body-limit and timeout layers applied at
+`:325-331`.
+
+### Module 13 — cache, listener hook, and settings TTL
+
+⚠️ **This module was missing.** The Multi-Agent Workflow section assigns "module 13" to Agent 6 and
+the Definition of Done and the e2e test
+`an_auth_settings_write_invalidates_the_cache_via_listen_notify` both depend on it, but Detailed
+Implementation stopped at Module 12 — so the auth-settings cache that the whole LISTEN/NOTIFY story
+rests on was specified nowhere (§0.3). Written in here.
+
+**13a — `AppState` cache field.** Add an auth-settings cache to `AppState`
+(`src/app/state.rs:21-52`), following the shape of the existing `RuntimeConfigCache` rather than
+inventing a second caching idiom. It is read by `GET /api/v1/admin/setup/auth-methods` and by the
+console at boot; it is keyed by nothing (the table is effectively a small set) and rebuilt on the next
+read after invalidation.
+
+**13b — listener hook.** `listen_once` (`src/infra/db.rs:62-88`) already calls
+`cache.invalidate_all()` and `runtime_handles.invalidate_all()` unconditionally on every
+notification. Add the auth-settings cache to that unconditional set. **This is also where §0.1 B3's
+`CIRCUIT_UNAFFECTED_RESOURCE_TYPES` entry lands** — the two changes are in the same function's blast
+radius and must be reviewed together, because attaching the NOTIFY trigger without the allow-list
+entry is the silent breaker-reset regression.
+
+**13c — settings TTL.** Add the TTL to `AuthSettings` (`src/config/settings.rs:92-102`). Note that
+struct already holds `jwks: JwksFetchSettings` in addition to `admin` and `caller`, contrary to this
+plan's claim that it holds "only" the two (§0.4). Environment binding is
+`Environment::with_prefix("MOIRA").prefix_separator("_").separator("__")` (`:553-557`).
+
+**13d — required test.** `circuit_reset_scope` returns `CircuitResetScope::Unaffected` for an
+`auth_provider_settings` payload. Without this the B3 regression has no gate and would return the
+moment someone adds another settings table.
 
 ---
 
@@ -714,12 +946,25 @@ Every key below must be added to `src/i18n/catalog/errors.rs` / `notices.rs` **w
 
 ### Pre-existing catalog gaps this plan depends on
 
-Two codes this plan's endpoints **will** emit have **no catalog entry today** (verified):
+⚠️ **RESOLVED — there is no gap. This whole section is obsolete (§0.4).**
 
-- `database_unavailable` — the only error path of `GET /api/v1/admin/setup/claim-status` (503, `AppError::DatabaseUnavailable`, `src/error.rs:136`). **The earlier draft of this plan asserted `moira.error.database_unavailable` already existed. It does not.**
-- `idempotency_in_progress` — 409 from `claim_idempotency` (`src/infra/repositories/admin.rs:576,610`).
+This plan claimed two codes it emits have no catalog entry, and went out of its way to "correct" an
+earlier draft that said otherwise. **The earlier draft was right and the correction was wrong.** Both
+entries exist:
 
-**Plan 06 module 10b adds both** (along with six others) as part of its catalog-completeness work. **If 06 has not landed when 07 executes, 07 must add these two entries itself** — 07 must not ship an endpoint whose only error path has an unresolvable `message_key`. Coordinate at Wave 0; if both plans add them, resolve the duplicate at merge (and plan 06's `docs_mirror_has_no_duplicate_keys` test will catch it).
+- `database_unavailable` — `src/i18n/catalog/errors.rs:29-32`. (The error path itself is real: 503
+  from `GET /api/v1/admin/setup/claim-status`, `AppError::DatabaseUnavailable`, `src/error.rs:136`.)
+- `idempotency_in_progress` — `src/i18n/catalog/errors.rs:49-52`. (409 from `claim_idempotency`,
+  which is now at `src/infra/repositories/admin.rs:651`, not `:576,610`.)
+
+The "if 06 has not landed, 07 must add these two entries itself" contingency is therefore moot — 06
+landed (`39c5326`).
+
+**And the class of bug this section worried about can no longer reach review.** Plan 06c made a
+missing catalog entry a **compile** error, not a test failure: `ExecutionFailureClass::code()` is a
+`const fn` the i18n gate evaluates at compile time, and the gate walks `AppError::coded`/`conflict`/
+`unprocessable` literals plus `validate_override` call sites. Any new `moira.error.*` this plan emits
+without a catalog entry fails `cargo build`. Do not hand-write a coverage test for this.
 
 ### New `moira.notice.*` entries
 
@@ -739,10 +984,14 @@ Two codes this plan's endpoints **will** emit have **no catalog entry today** (v
 ## Multi-Agent Workflow
 
 **Wave 0 (coordinator, sequential, before any agent starts).** Four checks, all blocking:
-1. Re-read `src/security/auth.rs` fresh and re-locate `authenticate_trusted_jwt`, `actor_from_trusted_claims`, `verify_api_key`, `authenticate_admin`'s bearer branch, and `ActorType` against the **post-03** tree. Plan 03's SSRF/middleware hardening touches this file.
-2. Determine whether plan 03 introduced path-scoped auth middleware on `/api/v1/admin`. If so, design the two documented exemptions (API & OpenAPI changes, fact 1) before any route is registered. **If a clean exemption is not possible, stop and re-scope** — an unauthenticated route silently swallowed by middleware, or an admin route silently exempted, are both unacceptable outcomes.
-3. Determine whether plan 05's OpenAPI-drift gate has landed and whether the committed spec snapshot must be regenerated in this PR.
-4. Re-verify the highest existing migration number and whether plan 06's `listen_once` change (P2-14) has landed, so module 13's cache-invalidation edit merges deliberately rather than by blind rebase.
+**All five were performed on 2026-07-26 against HEAD `c45257f`; the answers are in §0. They are kept
+here as the record of what was asked, with each answer recorded inline. Do not re-derive them from
+scratch — verify §0 still matches the tree and move on.**
+
+1. ~~Re-read `src/security/auth.rs` fresh and re-locate `authenticate_trusted_jwt`, `actor_from_trusted_claims`, `verify_api_key`, `authenticate_admin`'s bearer branch, and `ActorType`.~~ **Done — §0.5.** All 12 citations to this file were stale. Real anchors: `ActorType` `:30-39`, `authenticate_admin` `:308`, `authenticate_caller` `:353`, `verify_api_key` `:408`, `authenticate_trusted_jwt` `:474`, `actor_from_trusted_claims` `:826`, `header_string` `:1086`. This audit also produced **§0.2 D2** — the grant hooks into `authenticate_admin`, not `authenticate_trusted_jwt`.
+2. ~~Determine whether plan 03 introduced path-scoped auth middleware on `/api/v1/admin`.~~ **Done — it did not.** `src/http/mod.rs:325-331` layers only `DefaultBodyLimit::max(policy.admin_body_limit_bytes)`, `timeout` and `body_timeout`. Every handler still self-authenticates via `admin_actor` (`src/http/admin.rs:51-56`), so fact 1 holds and no exemption design is needed.
+3. ~~Determine whether plan 05's OpenAPI-drift gate has landed.~~ **Done — it landed** (`3ea8037`). The snapshot **must** be regenerated in this PR; command in §0.3. This is no longer conditional.
+4. ~~Re-verify the highest migration number and whether plan 06's `listen_once` change has landed.~~ **Done — `0011` is highest (§0.1 B1), and `listen_once` already carries the circuit-scoping change.** That is not a future rebase concern; it is the current shape, and it is what makes **§0.1 B3** a blocker.
 5. Choose the exact `docs/` file that carries module 10's operator setup runbook (prefer extending existing setup material over minting a new top-level document) and record it in Components & ownership. **Blocking**, because the deny-by-default decision ships an intentional first-claim 403 and the copy explaining it is a required deliverable, not a nicety.
 
 **Wave 1 (parallel where genuinely disjoint):**
@@ -774,7 +1023,7 @@ Two codes this plan's endpoints **will** emit have **no catalog entry today** (v
 
 | Item | Final value |
 |------|-------------|
-| Migrations | `migrations/0009_admin_identity_claims.sql`, `migrations/0010_auth_provider_settings.sql` (re-verify numbering at execution; 0008 was highest at plan time) |
+| Migrations | `migrations/0012_admin_identity_claims.sql`, `migrations/0013_auth_provider_settings.sql` (re-verify numbering at execution; 0008 was highest at plan time) |
 | Tables | `admin_identities` (unique active key `(issuer, subject)`), `setup_state` (singleton row), `admin_setup_tokens`, `auth_provider_settings` |
 | **Claim-status endpoint** | `GET /api/v1/admin/setup/claim-status` — **unauthenticated** — 200 `{ "claimed": bool }`. **Shape frozen; no fields may be added.** |
 | **Claim endpoint** | `POST /api/v1/admin/setup/claim` — `X-Moira-System-Key` header **or** `setup_token` body field — body `ClaimAdminIdentityRequest`, 201 (fresh) / 200 (replay) `AdminIdentityRecord` |
@@ -858,7 +1107,7 @@ Two codes this plan's endpoints **will** emit have **no catalog entry today** (v
 ### `/api/v1/admin/auth/providers…`
 
 - **Auth:** standard admin authentication (`admin_actor`), plus the new `moira:auth-settings:*` scopes.
-- **Versioning:** `If-Match` **required** on every mutation except create, checked **inside** the transaction under `select … for update` (not the read-then-compare pattern the existing issuer handlers use — see module 12). Stale version → `409 resource_version_conflict`.
+- **Versioning:** `If-Match` **required** on every mutation except create, checked **inside** the transaction under `select … for update` — which since plan 06b is what every existing admin handler already does, so this matches the house pattern rather than diverging from it (the parenthetical contrast this line used to draw is obsolete; see module 12). Stale version → `409 resource_version_conflict`.
 - **Idempotency:** `Idempotency-Key` supported on create, via the shared admin envelope.
 - **Secrets: none (decision `D7`).** No operation on this surface accepts a `client_secret`, and no response contains one — there is no `secret_fingerprint` and no `masked_secret` either, because there is no secret to fingerprint or mask. The OAuth client secret is owned by the console and lives in the console's own `console_auth` database. `POST /api/v1/admin/auth/providers/{id}/rotate-secret` **does not exist**.
 - **Read exposure:** because the payload contains no secret material at all, these reads are safe for any holder of `moira:auth-settings:read`. The scope gate remains, as configuration-disclosure control rather than secret protection.
@@ -972,8 +1221,23 @@ Following `tests/support/mod.rs` and the in-process-router pattern of `tests/adm
 
 ### Other verification
 
-- **Migration:** both new migrations apply cleanly to a fresh database via `sqlx::migrate!` (`src/infra/db.rs:36-41`); `tests/security_foundation.rs`'s migration-contract job passes with them included, confirming append-only compliance (no edit to 0001-0008).
-- **OpenAPI:** `src/http/mod.rs`'s 8 spec tests are **extended** to cover all **ten** new operations — presence, status codes, schemas, security annotations, and the documented-and-commented exemption for `get_setup_claim_status` being unauthenticated. They must also assert the **absence** of `POST /api/v1/admin/auth/providers/{id}/rotate-secret` (**D7**). If plan 05's drift gate has landed, the committed snapshot is regenerated in this PR.
+- **Migration:** both new migrations apply cleanly to a fresh database via `sqlx::migrate!` (`MIGRATOR`, `src/infra/db.rs:20`; `migrate()` `:40-45`); `tests/security_foundation.rs`'s migration-contract job passes with them included, confirming append-only compliance (**no edit to `0001-0011`** — the window grew; see §0.1 B1).
+- **OpenAPI:** `src/http/mod.rs`'s spec tests are **extended** to cover all **ten** new operations — presence, status codes, schemas, security annotations, and the documented-and-commented exemption for `get_setup_claim_status` being unauthenticated. They must also assert the **absence** of `POST /api/v1/admin/auth/providers/{id}/rotate-secret` (**D7**). There are ~26 such tests, not 8 (§0.4).
+
+  ⚠️ **The committed snapshot IS regenerated in this PR — this is no longer conditional (§0.3).** Plan
+  05 landed (`3ea8037`) and `docs/openapi.json` is frozen and committed. Regenerate with:
+
+  ```
+  UPDATE_SNAPSHOTS=1 cargo test --lib http::tests::committed_openapi_matches_the_generated_document
+  ```
+
+  and commit the result. **Two** gates enforce it — the unit gate `committed_openapi_matches_the_generated_document`
+  (`src/http/mod.rs:1649`) and the e2e gate `served_openapi_document_matches_committed_docs_openapi_json`
+  (`tests/openapi_drift.rs:100`) — so adding ten operations without regenerating fails both. Three
+  further gates this plan predates must also be satisfied:
+  `every_if_match_operation_declares_the_documented_precondition` (`:1122`),
+  `atomic_admin_idempotency_contract_is_explicit` (`:907`), and
+  `once_only_key_responses_use_the_secret_envelope` (`:884`).
 - **Secret-leak:** the setup token is the only secret this plan writes. A test asserts `admin_setup_tokens.token_hash` is an Argon2id hash — not plaintext and not a reversible encoding — and that the minted token appears in exactly one response body (the mint response) and nowhere else, mirroring the existing `system_api_keys` handling and `src/security/masking::tests`. **The OAuth client secret needs no leak test in Moira, because Moira never receives one (D7)**; the corresponding secret-leak coverage for it is plan 08's, against the console's own store and bundle.
 - **Required gates (CONVENTIONS §2, verbatim):**
   ```bash
@@ -990,7 +1254,7 @@ Following `tests/support/mod.rs` and the in-process-router pattern of `tests/adm
 
 **Plan-specific**
 
-- [ ] `migrations/0009_admin_identity_claims.sql` and `migrations/0010_auth_provider_settings.sql` exist, are append-only (no prior migration edited), reuse `moira_bump_resource_version()` and `notify_moira_runtime_config_change()` rather than redefining them, and apply cleanly to a fresh database.
+- [ ] `migrations/0012_admin_identity_claims.sql` and `migrations/0013_auth_provider_settings.sql` exist, are append-only (no prior migration edited), reuse `moira_bump_resource_version()` and `notify_moira_runtime_config_change()` rather than redefining them, and apply cleanly to a fresh database.
 - [ ] `GET /api/v1/admin/setup/claim-status` is unauthenticated, returns **only** `{ "claimed": bool }`, and is verified by passing tests to return `false` on a fresh database and `true` after any successful claim.
 - [ ] `POST /api/v1/admin/setup/claim` is verified by passing tests to: reject a bare trusted-JWT bearer token unconditionally (401); accept a valid system-key claim; accept a valid one-time setup-token claim and reject a reused/expired/wrong-target one; enforce verified-email and the **deny-by-default** domain policy; be idempotent under `Idempotency-Key` and conflict safely (409, never duplicate) without one.
 - [ ] A granted `(issuer, subject)`'s next trusted-JWT request resolves to an `Actor` carrying the granted scopes, verified by a test that performs a real `authenticate_trusted_jwt` before and after a grant and diffs `Actor.scopes`; and an ungranted actor's `Actor` is byte-identical to pre-change.
@@ -1041,7 +1305,7 @@ Following `tests/support/mod.rs` and the in-process-router pattern of `tests/adm
 9. *A deny-by-default bypass is reintroduced as a "usability fix".* The most likely regression in this plan, because the symptom (a fresh deployment's first claim returning 403) genuinely looks like a bug to someone who has not read module 10. Mitigated by three things acting together: the operator-facing copy on all three surfaces required by module 10, so the 403 is self-explaining; the explicit "no first-claim exemption / no bootstrap bypass" prohibition recorded in module 10, module 8 step 7's consequence note, the frozen contract, and the Definition of Done; and the tests `claim_is_denied_when_no_auth_provider_configuration_exists_at_all` and `system_key_credential_grants_no_policy_exemption_on_a_fresh_deployment`, which cannot be made to pass by any exemption. A bypass would exist exactly during the setup window — the moment the deployment is least defended — and would be externally indistinguishable from the first-login-wins land-grab this plan exists to prevent.
 10. *`GET …/setup/auth-methods` is relaxed to anonymous so the browser can call it directly.* Mitigated by the decision record in Security boundaries (the dividing line is information content: one bit of "is setup done" is free, the identity configuration is not), by `setup_auth_methods_succeeds_for_a_system_key_actor` proving the server-side path works so the wizard has no reason to reach for anonymity, and by `claim_status_is_anonymous_while_auth_methods_is_not`, which fails the moment the two endpoints' auth postures converge.
 
-**Data-migration.** New tables only; no transformation of existing tables; no risk to existing rows. Migration rollback, if ever needed, is a new `0011_drop_identity_and_auth_settings.sql` — **never edit `0009`/`0010` in place once merged.**
+**Data-migration.** New tables only; no transformation of existing tables; no risk to existing rows. Migration rollback, if ever needed, is a new `0014_drop_identity_and_auth_settings.sql` — **never edit `0009`/`0010` in place once merged.**
 
 **Compatibility.** Fully additive. The one shared-file behavioral change (`auth.rs`) is a byte-identical no-op for every actor without a grant, asserted explicitly. The `ActorType::SetupToken` variant changes the serialized enum's value set; any consumer that exhaustively matched `ActorType` (including in tests and in `authz.rs:119,146`) must be updated — a non-exhaustive match added to accommodate it is a review failure.
 
@@ -1053,4 +1317,8 @@ Following `tests/support/mod.rs` and the in-process-router pattern of `tests/adm
 - (c) Disable all auth providers via `POST …/disable` — a data-level kill switch requiring no deploy.
 - (d) Full rollback (migration `0011` dropping the tables) is available but should be a last resort, since (a)-(c) already neutralize the risk without destroying audit data.
 
-**Deferred follow-ups (explicitly out of scope, not forgotten).** A dedicated `PATCH`/`DELETE` revoke-grant endpoint (the `status`/`revoked_at` columns exist but no route sets them; an operator uses direct DB access until then). Invitation and additional-admin flows (09). Ownership transfer (09). GitHub provider (09). Minting setup tokens over HTTP rather than only via the internal service method. Key-id-based envelope rotation for `provider_credentials` (no `key_id` column today; `auth_provider_settings` is **not** part of this follow-up, since **D7** leaves it with no envelope to rotate). Wildcard/subdomain matching in the email-domain allow-list. Applying module 11's `JsonRejection` → `invalid_request` mapping to the ~20 pre-existing admin handlers that take a bare `Json<T>` (`src/http/admin.rs:112,188,333,…`) and therefore still emit axum's uncatalogued plain-text rejection in violation of CONVENTIONS §4 — a pre-existing, repo-wide gap this plan closes only for its own new endpoint, since fixing it everywhere would violate the "pure iteration" constraint. Fixing the pre-existing read-then-compare TOCTOU in the trusted-JWT-issuer handlers (`src/http/admin.rs:1449-1452,1480-1483,1532-1535,1563-1566`), which this plan deliberately does **not** copy but also does not fix.
+**Deferred follow-ups (explicitly out of scope, not forgotten).** A dedicated `PATCH`/`DELETE` revoke-grant endpoint (the `status`/`revoked_at` columns exist but no route sets them; an operator uses direct DB access until then). Invitation and additional-admin flows (09). Ownership transfer (09). GitHub provider (09). Minting setup tokens over HTTP rather than only via the internal service method. Key-id-based envelope rotation for `provider_credentials` (no `key_id` column today; `auth_provider_settings` is **not** part of this follow-up, since **D7** leaves it with no envelope to rotate). Wildcard/subdomain matching in the email-domain allow-list. Applying module 11's `JsonRejection` → `invalid_request` mapping to the pre-existing admin handlers that take a bare `Json<T>` (e.g. `src/http/admin.rs:1414`; the cited `:112,188,333` are stale, though the class of handler still exists) and therefore still emit axum's uncatalogued plain-text rejection in violation of CONVENTIONS §4 — a pre-existing, repo-wide gap this plan closes only for its own new endpoint, since fixing it everywhere would violate the "pure iteration" constraint.
+
+~~Fixing the pre-existing read-then-compare TOCTOU in the trusted-JWT-issuer handlers.~~ **Already
+done — plan 06b (`46c2c74`) made all 33 admin mutation sites atomic and deleted `ensure_version`
+(§0.1 B6).** Nothing is deferred here.
