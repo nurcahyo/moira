@@ -1,0 +1,34 @@
+# cargo-nextest configuration.
+#
+# nextest runs each test in its own process rather than as a thread in a shared binary. That is
+# faster on this suite (27 binaries, 622 tests), but the reason it is worth adopting here is
+# isolation: two shared-database races in plan 07 — the `setup_state` singleton reset and the
+# global unique slot in `auth_provider_settings` — were possible because tests share a process
+# and a pool. Process isolation does not fix shared *database* state on its own, but it makes
+# the boundaries explicit and stops one test's panic from taking its siblings' state with it.
+
+[profile.default]
+# Report every failure rather than stopping at the first. When a change breaks several tests,
+# one run should tell you all of them — chasing them one per run is how an afternoon disappears.
+fail-fast = false
+
+# **Retries stay at zero, deliberately.** nextest can re-run failures and report a test as flaky
+# rather than failed. That would have silently swallowed the exact defect CI caught on plan 07:
+# `a_configured_domain_lets_the_claim_through_and_marks_setup_claimed` failed roughly 1 run in 10
+# under load, and a single retry would have turned a real isolation bug into a green run with a
+# "flaky" note nobody reads. A test that fails intermittently is failing.
+retries = 0
+
+# Surface tests that are slow enough to be doing something unintended — a missing index, an
+# unawaited timeout, a sleep standing in for a condition. Warn rather than kill: the DB-backed
+# suites legitimately take seconds, and terminating them would just trade a slow test for a
+# flaky one.
+slow-timeout = { period = "30s", terminate-after = 8 }
+
+# Fail the run if a test is left `#[ignore]`d without being asked for explicitly. Ignored tests
+# rot into permanent dead code; plan 06 left one behind and it took a plan to notice.
+[profile.ci]
+fail-fast = false
+retries = 0
+failure-output = "immediate-final"
+status-level = "retry"
