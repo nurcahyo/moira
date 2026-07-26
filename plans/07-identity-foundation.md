@@ -94,6 +94,15 @@ granted identity receives **403** on a public-API scope it does not independentl
 | `migrations/*` | All internal cites **true**; only the *new* filenames collide (B1) |
 | `src/security/authz.rs`, `src/security/crypto.rs`, `src/error.rs`, `src/application/context.rs`, `src/domain/i18n.rs` | Substantially **true** — see the audit for one-or-two-line offsets |
 
+### §0.7 Found during Wave 1 implementation — corrections §0 itself missed
+
+| Finding | Resolution |
+|---|---|
+| **The unique index at `:361` is invalid SQL.** `on auth_provider_settings (method, coalesce(issuer, ''))` — Postgres rejects a bare `COALESCE` in an index column list; an expression needs its own parentheses | Written as `(method, (coalesce(issuer, '')))`. Verified against a live server |
+| `notify_moira_runtime_config_change()` begins at `migrations/0004_admin_api_contract.sql:107`, not `:108` | §0.5 marked all `migrations/*` cites clean; this one was off by one |
+| "Verify whether a singleton convention already exists elsewhere in the schema and prefer it" (`:306`) | **None exists.** Grepped `0001`–`0011`. Used the `id boolean primary key default true check (id)` idiom this plan proposes |
+| **The plan never says what `granted_by_actor_type`'s CHECK should allow under D1** | `'setup_token'` kept in the allowed set. D1 is *deferred with reversal conditions*, and migrations are append-only — dropping the value would make reversing D1 cost another migration, for no security gain, since Moira controls what it writes to that column. Recorded as a judgement call, not something the plan decided |
+
 ### §0.6 What this plan must NOT do
 
 The four `TODO(post-deploy)` markers in `src/application/runtime_admin.rs` and
@@ -172,9 +181,9 @@ the provider. `plans/06-architecture-test-hygiene.md:377` still refers to them b
 
 | Layer | File | Change |
 |---|---|---|
-| `migrations/` | `0012_admin_identity_claims.sql` (new) | `admin_identities`, `setup_state`, `admin_setup_tokens` |
-| | `0013_auth_provider_settings.sql` (new) | `auth_provider_settings` + version-bump trigger + NOTIFY trigger |
-| `src/domain/` | `identity.rs` (new) | `SetupClaimStatusResponse`, `ClaimAdminIdentityRequest`, `AdminIdentityRecord`, `AdminIdentityStatus`, `GeneratedSetupTokenResponse` |
+| `migrations/` | `0012_admin_identity_claims.sql` (new) | `admin_identities`, `setup_state` — **no `admin_setup_tokens`** (§0.2 D1) |
+| | `0013_auth_provider_settings.sql` (new) | `auth_provider_settings` + version-bump trigger + NOTIFY trigger, **and the `CIRCUIT_UNAFFECTED_RESOURCE_TYPES` entry in `src/infra/db.rs` that the NOTIFY trigger requires** (§0.1 B3) |
+| `src/domain/` | `identity.rs` (new) | `SetupClaimStatusResponse`, `ClaimAdminIdentityRequest`, `AdminIdentityRecord`, `AdminIdentityStatus` — **no `GeneratedSetupTokenResponse`** (§0.2 D1) |
 | | `auth_settings.rs` (new) | `AuthProviderSettingsRecord`, `…CreateRequest`, `…PatchRequest`, `AuthMethod`, `SetupAuthMethodsResponse`, `PublicAuthMethod` |
 | | `mod.rs` | two additive `pub use` blocks |
 | `src/infra/repositories/` | `identity.rs` (new) | `AdminIdentityRepository` trait + `PgAdminIdentityRepository` — **trait from day one**, so this plan needs no P2-3-style retrofit |
