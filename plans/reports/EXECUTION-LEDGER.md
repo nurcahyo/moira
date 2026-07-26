@@ -268,6 +268,30 @@ does not reach for the dangerous knob. **Worth considering for a later plan:** a
 refuses to export third-party spans regardless of level, so the safety does not rest on operator
 discipline.
 
+### F10 — two shared-test-database hazards that can PERMANENTLY wedge a test run
+
+Both currently pass by luck. Found while fixing the plan 07 CI race, and worth separating from it:
+that race merely failed intermittently, whereas these two can leave the shared database in a state
+where a test fails *forever* until someone deletes a row by hand.
+
+1. **`tests/retention_worker.rs:329,333-334` — pre-existing, plan 05/06 territory, NOT fixed here.**
+   `retention::run_once` is a cluster-wide sweep, but the test asserts *exact* equality on the delete
+   counter. `sweep_guard` serialises retention tests against each other and nothing else. It seeds
+   century-backdated rows with no cleanup path, so a failure leaks rows that sort ahead of the next
+   run's under `order by expires_at` — self-poisoning. Deliberately left alone: changing retention
+   test semantics is a larger, riskier change than belonged in a regression fix on the plan 07 branch.
+
+2. **`tests/http_middleware_contract.rs:469`** — creates a `system_api_keys` row per run and never
+   deletes it. Minor; no current assertion depends on the count.
+
+**The general lesson.** `migrated_pool()`-style helpers hand every `#[cfg(test)]` module in `src/` the
+*same* database, and `cargo test --workspace` runs binaries concurrently against it. Any test writing
+a singleton, a globally-unique slot, or a cluster-wide counter is sharing mutable state with every
+other test in the tree. The integration suites avoid this with `support::LifecycleFixture`'s cloned
+databases; the lib tests have no equivalent, so they need an explicit advisory lock. **A test that
+leaks a row on the panic path is worse than a flaky one** — it converts one bad run into a permanently
+red suite.
+
 ### F7 — the "no `rig_core` under `src/domain/`" rule has no automated gate — **CLOSED** `d7580a6`
 
 Closed by `tests/rig_boundary.rs`. Teeth verified by injection, not assumed. Original finding:
@@ -397,6 +421,43 @@ Plan 05 froze the OpenAPI spec: any later route/DTO change must regenerate `docs
 `UPDATE_SNAPSHOTS=1 cargo test --lib http::tests::committed_openapi_matches_the_generated_document`.
 
 ---
+
+## LOOP PERFORMANCE — measured 2026-07-27, supersedes the old `cargo clean` rule
+
+The loop was spending most of its wall-clock on build cost and duplicated verification. Measured,
+not estimated:
+
+| Change | Before | After |
+|---|---|---|
+| `[profile.dev] debug = 1` (`0055c7e`) | `target/` **20 GB**, `deps` 11 GB | **2.0 GB**, `deps` 1.5 GB |
+| Full clean rebuild, 405 crates | (avoided — cost minutes) | **2m21s** |
+| `cargo test --workspace --all-features`, warm | — | **1m39s**, 622 pass |
+| `cargo nextest run --workspace` | — | **2m07s** — *28% SLOWER* |
+
+**`cargo clean` is no longer the enemy, and `CARGO_TARGET_DIR` is no longer forbidden.** Both old
+rules were workarounds for artifact bloat that no longer exists:
+
+- **Agents SHOULD now set a private `CARGO_TARGET_DIR`.** Cargo takes an **exclusive lock** on its
+  target directory, so agents sharing one cannot compile simultaneously — one builds, the rest
+  block. Every "parallel" wave so far was parallel *thinking* and serialised *building*. At 2 GB
+  each, three concurrent agents cost ~6 GB. This is the single biggest remaining speedup.
+- **Agents should NOT run the full gate set.** Five agents × (full clippy + 622 tests + release
+  build) is ~40 minutes per wave re-proving a tree nobody changed. Agents run `cargo check` plus
+  their own tests; the coordinator runs all six gates once before the PR. Exceptions: broad `src/`
+  changes, and proving a race — where repeated full runs *are* the evidence.
+- Prefer `scratchpad/reclaim.sh` over `cargo clean`: `debug/incremental` is ~45% of the tree and
+  free to delete, while `deps` is the expensive half. But at 2m21s to recover, cleaning is now an
+  annoyance rather than a lost afternoon.
+
+**nextest was adopted and then demoted.** It is 28% slower here — 621 process spawns each build a
+Postgres pool, integration suites clone a template database per test, and the new advisory locks
+serialise across processes rather than within one. It is kept as a *secondary* runner because it
+forces cross-process contention, which is the case an in-process `Mutex` silently does not cover;
+both plan 07 shared-database fixes were re-verified under it. **`retries` is pinned at 0** — the
+default would have reported the `setup_state` race as "flaky" and shipped the isolation bug.
+
+Rejected: `[profile.dev.package."*"] opt-level = 3`. It optimises 405 dependencies to speed up test
+*runtime*, but this suite is Postgres-I/O-bound, and the cost is repaid on every dependency rebuild.
 
 ## Cycle log
 
