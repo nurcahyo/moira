@@ -257,6 +257,32 @@ Plan 05 froze the OpenAPI spec: any later route/DTO change must regenerate `docs
 
 ## Cycle log
 
+### Cycle 4-6 — 2026-07-26
+
+- **Plan 06 MERGED** `39c5326` — 12 modules. Found and fixed a real cross-issuer response disclosure
+  (Module 16), a latent credential-decryption bug (Module 9), and a demonstrated test flake (Module 13,
+  suites ~3x faster). The plan document itself was wrong in 14 places and one module did not compile;
+  rewriting it first cost one cycle and saved a wasted wave.
+- **Plan 06b MERGED** `46c2c74` — all 33 If-Match sites atomic, `ensure_version` deleted. Both failure
+  modes verified by reintroducing them, including the 404-vs-409 regression the plan predicted.
+  One accepted behaviour change: removing the pre-read also removed an incidental `:read` scope
+  requirement on writes. Write scope is enforced throughout; user decided to merge as-is.
+- **Plan 06c MERGED** `627fe4d` — closes F1. A missing catalog entry is now a COMPILE error.
+  The new gate immediately found a second gap nobody had scoped: `validate_override` forwards its
+  code through a parameter, so four more codes reached clients uncatalogued while every gate was green.
+- **F3 closed** `c546f08` — skill files retargeted at the real tree.
+
+**Process lessons worth keeping:**
+1. **Commit before running injection/teeth tests.** `git checkout --` discards uncommitted work, not
+   just the injection. This cost work three times in one task. The fix is not "revert more carefully"
+   — it is to have nothing uncommitted at risk.
+2. **Every new gate needs a vacuity guard.** `every_validate_override_code_has_a_catalog_entry`
+   asserts it finds >=5 codes; that assertion caught two parser bugs that would otherwise have left
+   the test passing while checking nothing.
+3. **Parallel agents share one git index.** Disjoint files are not enough — use worktree isolation or
+   `git commit --only -- <paths>`.
+
+
 ### Cycle 1 — 2026-07-26
 - Opened PR #27 with the seven required sections and the full evidence bundle.
 - Discovered the repo-wide CI outage above. Did **not** merge: the merge precondition is unmet, and
