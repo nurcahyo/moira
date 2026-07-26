@@ -82,7 +82,7 @@
 
 use serde::Serialize;
 use sqlx::PgPool;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{config::WorkerSettings, error::AppError, infra::metrics::MetricsRegistry};
 
@@ -260,7 +260,11 @@ async fn sweep_table(
 /// One batch, one statement, one transaction.
 ///
 /// PostgreSQL has no `DELETE ... LIMIT`, so the victims are chosen by a bounded
-/// sub-select. `for update skip locked` is load-bearing, not decoration: the
+/// sub-query. It is a `with ... as materialized` CTE and **not** a `where id in
+/// (select ... limit $1)` sub-select, for a correctness reason rather than a
+/// stylistic one — see [`batch_delete_sql`].
+///
+/// `for update skip locked` is load-bearing, not decoration: the
 /// idempotency claim path deletes expired rows for the key it is claiming while
 /// holding an advisory transaction lock, so without `skip locked` a batch that
 /// reached a row *the claim already holds* would park this background sweep
@@ -277,23 +281,71 @@ async fn sweep_table(
 /// The table name is chosen from a closed set of `&'static str` constants in this
 /// module, never from caller input; the bound is a bind parameter.
 async fn delete_expired_batch(pool: &PgPool, table: &str, limit: i64) -> Result<u64, AppError> {
-    let sql = delete_sql(table).ok_or_else(|| {
+    let sql = batch_delete_sql(table).ok_or_else(|| {
         AppError::Internal(format!(
             "retention worker asked to sweep unknown table {table}"
         ))
     })?;
     let result = sqlx::query(sql).bind(limit).execute(pool).await?;
-    Ok(result.rows_affected())
+    let deleted = result.rows_affected();
+    if deleted > limit as u64 {
+        // Unreachable while [`batch_delete_sql`] keeps its materialised CTE: the
+        // victim set is computed once and holds at most `limit` ids. It is checked
+        // anyway because the failure it guards is silent — a sweep that blows past
+        // its per-tick cap looks exactly like a sweep that did its job, and the
+        // only symptom is more rows gone than the operator authorised.
+        warn!(
+            table,
+            limit, deleted, "retention batch deleted more rows than it requested"
+        );
+    }
+    Ok(deleted)
 }
 
 /// Closed-set lookup from table name to its batch-delete statement. Pure, so the
 /// "no caller string ever reaches SQL" property is unit-testable.
-fn delete_sql(table: &str) -> Option<&'static str> {
+///
+/// # Why a materialised CTE and not `where id in (select … limit $1)`
+///
+/// The obvious spelling is a sub-select:
+///
+/// ```sql
+/// delete from t where id in (
+///     select id from t where expires_at < now() order by expires_at
+///     limit $1 for update skip locked
+/// )
+/// ```
+///
+/// **That statement does not bound the number of rows it deletes.** `limit $1`
+/// bounds one *evaluation* of the sub-query, and PostgreSQL is free to evaluate
+/// the sub-query more than once: when the planner turns the `IN` into a
+/// `Nested Loop Semi Join` with the sub-query on the inner side and no
+/// `Materialize`, the inner plan is re-executed for every outer row. Each
+/// re-execution re-locks, and `LockRows` skips rows the *current* command has
+/// already deleted (`TM_SelfModified`), so every re-execution returns a *different*
+/// id — and every id it returns is another row the outer scan deletes. A batch
+/// asking for one row can delete an unbounded number, up to the whole expired set.
+///
+/// This is not theoretical. Against this repository's own schema, with statistics
+/// in the state a drained-then-refilled retention table naturally reaches
+/// (`reltuples = 0` from an autoanalyze that ran after a bulk delete, `relpages`
+/// still non-zero, new rows inserted before the next analyze), the planner picks
+/// exactly that shape and a `limit 1` batch deletes 2 rows — which is how
+/// `retention_run_respects_the_configured_batch_size` came to observe 21 and 22
+/// deletions against a per-tick cap of 20.
+///
+/// `with victims as materialized (...)` removes the planner's freedom: a CTE is
+/// evaluated once into a tuplestore and the join reads that tuplestore, so the
+/// victim set is computed exactly once and holds at most `$1` ids. `materialized`
+/// is explicit rather than relied upon — PostgreSQL 12+ inlines single-reference
+/// CTEs by default, and an inlined CTE is a sub-query again.
+///
+/// Do not "simplify" these back to `id in (select …)`.
+pub fn batch_delete_sql(table: &str) -> Option<&'static str> {
     match table {
         TABLE_IDEMPOTENCY_RECORDS => Some(
             r#"
-            delete from idempotency_records
-            where id in (
+            with victims as materialized (
                 select id
                 from idempotency_records
                 where expires_at < now()
@@ -301,6 +353,9 @@ fn delete_sql(table: &str) -> Option<&'static str> {
                 limit $1
                 for update skip locked
             )
+            delete from idempotency_records
+            using victims
+            where idempotency_records.id = victims.id
             "#,
         ),
         // `expires_at is not null` is redundant against `< now()` but stated
@@ -309,8 +364,7 @@ fn delete_sql(table: &str) -> Option<&'static str> {
         // the planner's predicate-implication prover.
         TABLE_RESPONSES => Some(
             r#"
-            delete from responses
-            where id in (
+            with victims as materialized (
                 select id
                 from responses
                 where expires_at is not null
@@ -319,6 +373,9 @@ fn delete_sql(table: &str) -> Option<&'static str> {
                 limit $1
                 for update skip locked
             )
+            delete from responses
+            using victims
+            where responses.id = victims.id
             "#,
         ),
         _ => None,
@@ -476,8 +533,8 @@ mod tests {
 
     #[test]
     fn only_the_two_retention_tables_resolve_to_sql() {
-        assert!(delete_sql(TABLE_IDEMPOTENCY_RECORDS).is_some());
-        assert!(delete_sql(TABLE_RESPONSES).is_some());
+        assert!(batch_delete_sql(TABLE_IDEMPOTENCY_RECORDS).is_some());
+        assert!(batch_delete_sql(TABLE_RESPONSES).is_some());
         for hostile in [
             "",
             "responses; drop table responses",
@@ -486,8 +543,36 @@ mod tests {
             "audit_logs",
         ] {
             assert!(
-                delete_sql(hostile).is_none(),
+                batch_delete_sql(hostile).is_none(),
                 "unexpected SQL for table name {hostile:?}"
+            );
+        }
+    }
+
+    /// The victim set must be computed **once**. See [`batch_delete_sql`] for the
+    /// mechanism; the short version is that `where id in (select … limit $1)` lets
+    /// the planner re-execute the sub-query per outer row, and each re-execution
+    /// yields a fresh victim, so the batch deletes more rows than it asked for.
+    ///
+    /// This is a string assertion because the property lives in the SQL text, not
+    /// in any Rust value — the load-bearing tokens are `as materialized` (a CTE is
+    /// evaluated once, and PostgreSQL 12+ inlines un-annotated single-reference
+    /// CTEs straight back into a sub-query) and the absence of the `in (select`
+    /// form. `tests/retention_worker.rs` pins the same property against a real
+    /// planner that has been pushed into the hostile plan on purpose.
+    #[test]
+    fn batch_delete_sql_computes_its_victim_set_exactly_once() {
+        for table in [TABLE_IDEMPOTENCY_RECORDS, TABLE_RESPONSES] {
+            let sql = batch_delete_sql(table).expect("known table");
+            assert!(
+                sql.contains("as materialized"),
+                "{table} batch lost its materialised CTE: an inlined or sub-select victim query \
+                 can be re-evaluated per outer row, and each re-evaluation deletes another row"
+            );
+            assert!(
+                !sql.contains("in ("),
+                "{table} batch was rewritten back to a sub-select, which does not bound the \
+                 number of rows one batch deletes"
             );
         }
     }
@@ -495,7 +580,7 @@ mod tests {
     #[test]
     fn batch_delete_sql_binds_its_limit_and_skips_locked_rows() {
         for table in [TABLE_IDEMPOTENCY_RECORDS, TABLE_RESPONSES] {
-            let sql = delete_sql(table).expect("known table");
+            let sql = batch_delete_sql(table).expect("known table");
             // The bound is a bind parameter, never an interpolated literal.
             assert!(
                 sql.contains("limit $1"),
@@ -512,7 +597,7 @@ mod tests {
             assert!(sql.contains("expires_at < now()"));
         }
         assert!(
-            delete_sql(TABLE_RESPONSES)
+            batch_delete_sql(TABLE_RESPONSES)
                 .expect("known table")
                 .contains("expires_at is not null"),
             "responses batch must match the partial index predicate"

@@ -352,6 +352,86 @@ async fn retention_run_respects_the_configured_batch_size() {
     );
 }
 
+/// A batch must delete **at most `limit` rows whatever plan PostgreSQL chooses**.
+///
+/// This is the regression test for the defect that made
+/// [`retention_run_respects_the_configured_batch_size`] report 21 and 22 deletions
+/// against a per-tick cap of 20. The cap arithmetic in `RetentionPlan` was never
+/// wrong; the SQL was. `where id in (select … order by expires_at limit $1 for
+/// update skip locked)` bounds one *evaluation* of the sub-query, and the planner
+/// may evaluate it once per outer row — when it picks a `Nested Loop Semi Join`
+/// with the sub-query inner and un-materialised, each re-execution skips the rows
+/// this command already deleted and returns a fresh victim, which the outer scan
+/// then deletes too. Measured against this schema: a `limit 1` batch deleting 2
+/// rows in the shape the shared test database naturally reaches, and 42 of 42 rows
+/// when the shape is forced.
+///
+/// The plan is forced rather than coaxed, because the natural trigger is a
+/// *statistics* state (`reltuples = 0` left by an autoanalyze after a bulk delete,
+/// with rows inserted before the next analyze) and a test that depends on planner
+/// statistics is a test that passes vacuously the day the statistics move. Forcing
+/// the join shape asserts the invariant directly: the victim set is computed once,
+/// so no plan can exceed the bound. `set local` keeps the forcing inside this
+/// transaction, so the connection returns to the pool unmodified, and the rollback
+/// puts the deleted rows back for the cleanup below to find.
+#[tokio::test]
+async fn a_retention_batch_never_deletes_more_rows_than_its_limit_under_a_hostile_plan() {
+    let Some(pool) = test_pool().await else {
+        return;
+    };
+    let _sweep_guard = sweep_guard(&pool).await;
+    let marker = format!("ret-{}", Uuid::now_v7());
+
+    // Backdated a century so every plan under test reaches these rows first under
+    // `order by expires_at`, whatever else the shared database has left expired.
+    let mut ids = Vec::new();
+    for nth in 0..24 {
+        ids.push(insert_idempotency_record(&pool, &marker, nth, 3_153_600_000).await);
+    }
+
+    let sql = retention::batch_delete_sql("idempotency_records")
+        .expect("idempotency_records is a retention table");
+
+    for limit in [1_i64, 3, 7] {
+        let mut tx = pool.begin().await.expect("begin hostile-plan transaction");
+        // Every join strategy that would evaluate the victim query once is denied,
+        // leaving the planner with the re-executing nested loop.
+        for guc in [
+            "set local enable_material = off",
+            "set local enable_hashagg = off",
+            "set local enable_hashjoin = off",
+            "set local enable_mergejoin = off",
+            "set local enable_sort = off",
+        ] {
+            sqlx::query(guc)
+                .execute(&mut *tx)
+                .await
+                .expect("force the hostile join shape");
+        }
+
+        let deleted = sqlx::query(sql)
+            .bind(limit)
+            .execute(&mut *tx)
+            .await
+            .expect("hostile-plan retention batch")
+            .rows_affected();
+
+        assert_eq!(
+            deleted, limit as u64,
+            "a batch asking for {limit} row(s) deleted {deleted}; the per-tick cap is only a \
+             bound if one batch is, so this is retention removing more than it was authorised to"
+        );
+
+        tx.rollback().await.expect("restore the batch's rows");
+    }
+
+    sqlx::query("delete from idempotency_records where id = any($1)")
+        .bind(&ids)
+        .execute(&pool)
+        .await
+        .expect("cleanup");
+}
+
 #[tokio::test]
 async fn retention_run_does_not_block_a_concurrent_idempotency_claim() {
     let Some(pool) = test_pool().await else {
