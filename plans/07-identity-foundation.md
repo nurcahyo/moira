@@ -103,6 +103,17 @@ granted identity receives **403** on a public-API scope it does not independentl
 | "Verify whether a singleton convention already exists elsewhere in the schema and prefer it" (`:306`) | **None exists.** Grepped `0001`–`0011`. Used the `id boolean primary key default true check (id)` idiom this plan proposes |
 | **The plan never says what `granted_by_actor_type`'s CHECK should allow under D1** | `'setup_token'` kept in the allowed set. D1 is *deferred with reversal conditions*, and migrations are append-only — dropping the value would make reversing D1 cost another migration, for no security gain, since Moira controls what it writes to that column. Recorded as a judgement call, not something the plan decided |
 
+Found during Wave 2:
+
+| Finding | Resolution |
+|---|---|
+| **A latent ordering bug in the implied `governing_policy` query.** Module 10 step 1 says the policy matches "on `issuer`, or via `trusted_jwt_issuer_id`". The natural spelling is `order by (issuer = $1) desc` — but `issuer` is nullable, `null = $1` is `NULL`, and Postgres sorts nulls **first** under `desc`. An issuer-less row would therefore outrank an exact match and the **wrong `allowed_email_domains` would be applied** | Written `is not distinct from`, with a DB-backed test (`an_exact_issuer_match_outranks_a_match_through_the_trusted_issuer_id`). No unit test can see this — it needs a real Postgres sort |
+| **Module 9's enable-time completeness check is unreachable as `0013` is written.** `auth_provider_settings_method_shape` is an *unconditional* CHECK, not `enabled`-conditional, so no incomplete row can be stored to later be enabled | Check kept and documented in-code as forward cover if a later migration relaxes the CHECK to allow drafts, rather than silently dropping a named plan requirement |
+| **`auth_provider_method_unsupported` (`:937`) is unemittable.** `AuthMethod` is a three-variant enum on a `deny_unknown_fields` DTO, so an unsupported method is a serde rejection (`invalid_request`), never a service-level condition | Not added. A catalog entry with no emitter is worse than the gap |
+| **Two files outside Components & ownership had to change** — flagged rather than absorbed, per this plan's own "an unlisted file in the diff is a scope violation to raise" rule | `src/security/authz.rs`: the three `moira:auth-settings:*` scopes. Without them `AuthorizationService::require` returns `AppError::Internal` (500) for an unknown scope, making module 9 **unreachable**, not merely ungated. Scope block only — no `ADMIN_IMPLYING_ACTOR_TYPES` change. `src/application/setup.rs`: `require_setup_actor` widened to `pub(crate)` so module 9 gates on the same function as the existing endpoint rather than a second transcription of the same rule |
+| `scope_invalid` is emitted as **422, not the 400 the plan states** (`:690`) | Deliberate: reuses `AuthorizationService::normalize_scopes`, the existing helper, which emits via `AppError::unprocessable` — the same status the analogous system-key and consumer-key creation paths already return. Diverging per-call-site for one code is worse than the documented drift |
+| `setup_token_not_supported` is a new code the plan's table does not list | D1 says "rejected with a clear error" without naming one. `invalid_request` would fit the catalog description, but plan 08's console needs to distinguish "you sent a reserved field" from any other schema complaint |
+
 ### §0.6 What this plan must NOT do
 
 The four `TODO(post-deploy)` markers in `src/application/runtime_admin.rs` and
@@ -969,11 +980,22 @@ entries exist:
 The "if 06 has not landed, 07 must add these two entries itself" contingency is therefore moot — 06
 landed (`39c5326`).
 
-**And the class of bug this section worried about can no longer reach review.** Plan 06c made a
-missing catalog entry a **compile** error, not a test failure: `ExecutionFailureClass::code()` is a
-`const fn` the i18n gate evaluates at compile time, and the gate walks `AppError::coded`/`conflict`/
-`unprocessable` literals plus `validate_override` call sites. Any new `moira.error.*` this plan emits
-without a catalog entry fails `cargo build`. Do not hand-write a coverage test for this.
+**The class of bug this section worried about is now gated — but read what the gate actually is,
+because an earlier draft of this section overstated it.**
+
+- **Compile error**, via the `const _: () = { … }` block at `src/i18n/catalog/mod.rs:107-121`: only
+  `ExecutionFailureClass::ALL`. `code()` is a `const fn`, so a missing entry for an execution-failure
+  class is `error[E0080]`.
+- **Test failure**, not a build failure, for everything else: codes passed to
+  `AppError::coded`/`conflict`/`unprocessable` are covered by
+  `every_coded_error_literal_in_src_has_a_catalog_entry`, which walks source literals, and
+  `validate_override`'s forwarded codes by `every_validate_override_code_has_a_catalog_entry`. The
+  `docs/i18n-response-catalog.json` mirror has its own test.
+
+So a new `moira.error.*` this plan emits without a catalog entry is caught by **`cargo test`, not
+`cargo build`**. That is still a gate, and no coverage test needs hand-writing — but an implementer
+who trusted the earlier "fails `cargo build`" phrasing could skip the test run and believe a green
+build meant a complete catalog. It does not.
 
 ### New `moira.notice.*` entries
 
