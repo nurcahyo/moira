@@ -113,10 +113,33 @@ impl AuthorizationService {
         }
     }
 
+    /// Actor types for which holding [`ADMIN_SCOPE`] implies every other scope.
+    ///
+    /// **An allow-list, deliberately, because the previous formulation failed open.** This was
+    /// `actor.actor_type != ActorType::ConsumerKey`, which grants admin implication to every actor
+    /// type *except* one — so a new [`ActorType`] variant inherited full admin authority silently,
+    /// with no match to make non-exhaustive and therefore no compiler warning.
+    ///
+    /// That was not exploitable with the variants that existed, but it is a fail-open default in the
+    /// authorization core. Plan 07 proposes adding `ActorType::SetupToken` intending it to be denied
+    /// implication; under the old form it would have received full admin authority instead.
+    ///
+    /// Adding a variant here must be a deliberate decision. A variant absent from this list is
+    /// denied implication, which is the safe direction to be wrong in.
+    const ADMIN_IMPLYING_ACTOR_TYPES: &'static [ActorType] = &[
+        ActorType::DevAdmin,
+        ActorType::SystemKey,
+        ActorType::TrustedJwt,
+    ];
+
+    fn admin_scope_implies_all(actor: &Actor) -> bool {
+        Self::ADMIN_IMPLYING_ACTOR_TYPES.contains(&actor.actor_type)
+    }
+
     pub fn has_scope(&self, actor: &Actor, required_scope: &str) -> bool {
         let scopes: HashSet<_> = actor.scopes.iter().map(String::as_str).collect();
         scopes.contains(required_scope)
-            || (actor.actor_type != ActorType::ConsumerKey && scopes.contains(ADMIN_SCOPE))
+            || (Self::admin_scope_implies_all(actor) && scopes.contains(ADMIN_SCOPE))
     }
 
     pub fn normalize_scopes(scopes: &[String]) -> Result<Vec<String>, AppError> {
@@ -142,8 +165,12 @@ impl AuthorizationService {
         Ok(normalized)
     }
 
+    /// Whether `actor` may mint a key carrying `requested`.
+    ///
+    /// Uses the same allow-list as [`Self::has_scope`] for the same reason: the previous
+    /// `!= ConsumerKey` form handed grant authority to any future [`ActorType`] by default.
     pub fn can_grant(&self, actor: &Actor, requested: &[String]) -> bool {
-        actor.actor_type != ActorType::ConsumerKey
+        Self::admin_scope_implies_all(actor)
             && requested.iter().all(|scope| self.has_scope(actor, scope))
     }
 
@@ -155,6 +182,50 @@ impl AuthorizationService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Admin implication is an allow-list, so an actor type nobody has thought about is denied.
+    ///
+    /// The regression this guards is subtle: the previous form was
+    /// `actor.actor_type != ActorType::ConsumerKey`, which grants implication to everything except
+    /// one variant. A new variant would silently inherit full admin authority, and because there is
+    /// no `match`, the compiler could not warn. Plan 07 intends to add `ActorType::SetupToken`
+    /// *denied* implication — under the old form it would have been granted it instead.
+    ///
+    /// `Anonymous` stands in here for "a variant not on the list". It is a real tightening: an
+    /// anonymous actor carrying `moira:admin` previously received implication.
+    #[test]
+    fn admin_implication_is_denied_to_actor_types_not_on_the_allow_list() {
+        let authz = AuthorizationService::new();
+        let admin_scoped = |actor_type: ActorType| Actor {
+            actor_type,
+            scopes: vec![ADMIN_SCOPE.to_string()],
+            ..Default::default()
+        };
+
+        for actor_type in [
+            ActorType::DevAdmin,
+            ActorType::SystemKey,
+            ActorType::TrustedJwt,
+        ] {
+            assert!(
+                authz.has_scope(&admin_scoped(actor_type), "moira:applications:write"),
+                "{actor_type:?} is on the allow-list and must keep admin implication"
+            );
+        }
+
+        for actor_type in [ActorType::Anonymous, ActorType::ConsumerKey] {
+            let actor = admin_scoped(actor_type);
+            assert!(
+                !authz.has_scope(&actor, "moira:applications:write"),
+                "{actor_type:?} is not on the allow-list, so holding moira:admin must NOT imply \
+                 every other scope — the old `!= ConsumerKey` form failed open here"
+            );
+            assert!(
+                !authz.can_grant(&actor, &["moira:applications:write".to_string()]),
+                "{actor_type:?} must not be able to mint scopes it only holds by implication"
+            );
+        }
+    }
 
     #[test]
     fn deny_by_default_and_admin_implies_admin_scopes() {
