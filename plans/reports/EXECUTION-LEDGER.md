@@ -268,6 +268,48 @@ does not reach for the dangerous knob. **Worth considering for a later plan:** a
 refuses to export third-party spans regardless of level, so the safety does not rest on operator
 discipline.
 
+### F11 — a retention batch could delete its whole table in one transaction — **FIXED** `9799826`
+
+**`limit $1` bounds one *evaluation* of a sub-query, not the statement.** The retention sweep used
+`delete … where id in (select id … order by expires_at limit $1 for update skip locked)` and
+believed that capped a batch at `$1` rows. It does not.
+
+PostgreSQL may plan that as a `Nested Loop Semi Join` with the sub-query on the inner side and no
+`Materialize`, re-executing it **once per outer row**. Each re-execution's `LockRows` skips rows the
+current command has already deleted (`TM_SelfModified`), so it returns a *different* victim every
+time and the outer scan deletes that one too. The chain continues until the victims run out.
+
+**Verified independently, not taken on report.** Same temp table, same hostile statistics, same
+`for update skip locked`, plan confirmed as `Subquery Scan … loops=43`:
+
+| Form | `limit 1` deleted |
+|---|---|
+| `where id in (select … limit $1)` | **43 of 43** |
+| `with victims as materialized (…)` | **1 of 43** |
+
+**Why it hid:** the trigger is a *statistics* state — bulk delete, autoanalyze, then new traffic
+before the next analyze. An idle machine never shows it. It surfaced only as `left: 21`/`left: 22`
+against a cap of 20 in `tests/retention_worker.rs`, during unrelated work.
+
+**Production impact.** No unexpired row was ever at risk — every extra victim still comes from a
+predicate on `expires_at < now()`. The damage is an unbounded *rate*, not corruption. But the
+per-tick cap was fiction: one tick could delete the entire expired set in a single transaction,
+holding row locks and accumulating WAL for all of it, which is exactly what batching exists to
+prevent. The module's documented bound on how long a user-facing `claim_idempotency` can block was
+"how long one batch statement runs" — and that statement had no size limit, so neither did the wait.
+On `responses` it is worse: `migrations/0011_retention_indexes.sql` records a single 500-row batch at
+**12 735 ms** in RI triggers. Every replica runs its own uncapped sweep.
+
+Fixed with `with victims as materialized (…)` — a CTE is evaluated once into a tuplestore whatever
+the planner does. `materialized` is load-bearing: PostgreSQL 12+ inlines un-annotated
+single-reference CTEs, and an inlined CTE is a sub-query again. The regression test forces the
+hostile join shape rather than depending on a statistics snapshot that will drift, and was checked
+non-vacuous against the old SQL (`left: 24, right: 1`).
+
+**Process note.** When this first surfaced I said to leave it — pre-existing, plan 05/06 territory,
+out of scope for a plan 07 branch. That was wrong, and the agent pushed back correctly. *Scope is
+the wrong lens for "an assertion that should be unreachable just fired twice."*
+
 ### F10 — two shared-test-database hazards that can PERMANENTLY wedge a test run
 
 Both currently pass by luck. Found while fixing the plan 07 CI race, and worth separating from it:
