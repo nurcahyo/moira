@@ -93,7 +93,8 @@ exist, found only by checking **all 49** DoD-named tests instead of a sample.
 
 ## Plan 06 — architecture & test hygiene
 
-**Status: IN PROGRESS on `plan/06-architecture-test-hygiene`. Wave 0 and Module 0 landed.**
+**Status: MERGED to `main` as `39c5326` (2026-07-26), with `06b` `46c2c74` and `06c` `627fe4d`.**
+The narrative below is kept as the record of how it was executed; see the cycle log for outcomes.
 
 - `01107bb` — Wave 0: plan rewritten against the real tree. §0 of the plan document carries a
   14-item drift table. Two corrections were load-bearing: Module 9 as written **did not compile**
@@ -242,7 +243,13 @@ silently.
 exactly two paths) rather than claiming a gate that does not exist. **Cheap to close properly:** one
 test in the `supply_chain_policy.rs` style. Recommended for plan 07.
 
-### F8 — `authz` fails OPEN on unknown actor types (latent today, a live hazard the moment anyone adds a variant)
+### F8 — `authz` fails OPEN on unknown actor types — **CLOSED** `8039c53`
+
+Fixed as described below. Both `has_scope` and `can_grant` now consult an explicit
+`ADMIN_IMPLYING_ACTOR_TYPES` allow-list (`DevAdmin`, `SystemKey`, `TrustedJwt`); a variant absent from
+that list is denied implication. `admin_implication_is_denied_to_actor_types_not_on_the_allow_list`
+pins both directions. One real behaviour tightening: an `Anonymous` actor carrying `moira:admin`
+previously received implication and no longer does — nothing depended on it. Original finding:
 
 `AuthorizationService::has_scope` (`src/security/authz.rs:116-120`) and `can_grant` (`:145-148`) do
 not match on `ActorType`. They test a single negated equality:
@@ -283,9 +290,58 @@ backward-compatibility claim covers only actors *without* a grant. Its reviewer 
 the dev-trust-header branch (genuinely unreachable — `actor_from_trusted_headers` bypasses
 `authenticate_trusted_jwt` entirely) and misses the branch that matters.
 
-**Decision needed before plan 07 implements grants:** should an admin grant apply on the public
-execution API, or only on `/api/v1/admin/*`? If the latter, the grant must be scoped at
-`authenticate_caller`, not at `authenticate_trusted_jwt`.
+**DECIDED — the grant applies on the admin plane only.** Taken by the loop on 2026-07-26 after the
+user declined to arbitrate; recorded here so it is reviewable and reversible rather than implicit.
+
+The grant lookup goes in `authenticate_admin` (`src/security/auth.rs:325-327`), applied to the actor
+*after* `authenticate_trusted_jwt` returns — **not inside `authenticate_trusted_jwt`**, which both
+planes share. A granted human therefore administers Moira through `/api/v1/admin/*` and calls
+`POST /api/v1/responses` with only the scopes their consumer key or JWT already carries.
+
+Rationale: the alternative makes one grant silently confer `moira:execution:override-credential`,
+`override-model` and `moira:identity:delegate` on the public surface. `combine_consumer_and_jwt`
+(`:941`) already strips `moira:admin` on the consumer+JWT path, so admin-plane-only is the direction
+the existing code was already going; letting a bare JWT carry admin onto the public API would be the
+one path that disagrees. CONVENTIONS §7.1 keeps the admin and caller planes separate.
+
+Plan 07 must carry a test asserting a granted identity gets 403 on a public-API scope it does not
+independently hold. **Reversible:** if the console later needs it, move the call site — but that
+should be a deliberate change with its own test, not a default.
+
+---
+
+## DECISIONS TAKEN BY THE LOOP — reviewable, reversible
+
+These were resolved without the user because the loop holds full autonomy and stopping would have
+stalled the plan order. Each names what would have to change to reverse it.
+
+### D1 — plan 07 cuts the setup-token credential path (deferred, not deleted)
+
+Plan 07 proposes two credential paths for `POST /api/v1/admin/setup/claim`: `X-Moira-System-Key` and
+a `setup_token` body field, the latter introducing `ActorType::SetupToken` plus its own table.
+
+**Plan 08's console never sends `setup_token`.** Verified: `setup_token?: string` appears in its
+TypeScript DTO (`plans/08-…:697`) but every call in 08's frozen flow uses the system-key header for
+the whole setup triple (`plans/08-…:701-706`). The path is defined and never exercised.
+
+So it is cut from 07's scope: one fewer table, one fewer `ActorType` variant, ~8 fewer tests, and no
+new variant to reason about against F8's allow-list. The DTO field stays optional in the schema so
+08's generated client still typechecks, and 07 documents the deferral rather than pretending the
+feature exists. **Reverse by:** re-adding the module if a bootstrap flow without a system key is
+needed — but that is a product decision, not a prerequisite for LOGIN.
+
+### D2 — the `TODO(plan-07)` fingerprint removals stay, and get retargeted
+
+Four markers (`src/application/runtime_admin.rs:793,888`, `src/application/public.rs:1061,1938`) ask
+for the `legacy_actor_fingerprint` read-fallbacks to be deleted. Their own stated precondition is
+**24h after the *deploy* carrying plan 06 Module 16** — the `expires_at` window on
+`idempotency_records` — not 24h after merge. Plan 06 merged 2026-07-26 and there is no evidence of a
+production deploy.
+
+Removing them early means a client retrying an idempotent request across the deploy boundary misses
+its ledger row and **executes twice**. The fallbacks cost one extra index probe on a miss. They stay;
+the markers are retargeted off plan 07 so 07 is not credited with work it must not do.
+**Reverse by:** confirming the deploy date, then deleting the fallbacks 24h after it.
 
 ---
 
@@ -293,7 +349,10 @@ execution API, or only on `/api/v1/admin/*`? If the latter, the grant must be sc
 
 `02b → 03 → 04 → 05 → 06 → 07 → {08 ∥ 10} → 11 → 09`
 
-02a, 02b, 03, 04 merged. 05 done, PR #27 blocked on CI. 06 next, pending Wave 0 rewrite.
+02a, 02b, 03, 04, 05, 06, 06b, 06c all merged to `main`. **07 is next**, in Wave 0 (plan rewrite).
+Next free migration numbers are **`0012` and `0013`** — `0009`, `0010` and `0011` are taken by
+`backfill_false_indexed_ingestion_status`, `list_cursor_indexes` and `retention_indexes`, so plan 07's
+proposed `0009`/`0010` filenames must be renumbered.
 
 Plan 05 froze the OpenAPI spec: any later route/DTO change must regenerate `docs/openapi.json` via
 `UPDATE_SNAPSHOTS=1 cargo test --lib http::tests::committed_openapi_matches_the_generated_document`.
