@@ -248,13 +248,13 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
     },
     I18nEntry {
         key: "moira.error.model_capability_mismatch",
-        default_message: "The selected model does not support this capability.",
-        description: "Used when a model cannot satisfy a requested feature.",
+        default_message: "The requested capability is not available for this request.",
+        description: "Used when a requested feature cannot be served, either because the selected model does not support it or because the application's execution policy disables it. The previous wording blamed the model alone, which is wrong for the policy emitter (for example vision inputs disabled for an application).",
     },
     I18nEntry {
         key: "moira.error.model_not_found",
         default_message: "The model was not found.",
-        description: "Used when a model is unavailable to the caller.",
+        description: "Used when the named model does not exist, is not visible to the caller, or could not be resolved while routing. Distinct from model_forbidden, which is returned when the model does resolve but the caller may not use it.",
     },
     I18nEntry {
         key: "moira.error.provider_url_not_allowed",
@@ -314,7 +314,7 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
     I18nEntry {
         key: "moira.error.structured_output_invalid",
         default_message: "The structured output is invalid.",
-        description: "Used when the model output does not match the expected schema.",
+        description: "Used when a structured-output request cannot be honoured: either the response schema the caller supplied is rejected, or the model's output does not conform to it. The previous wording covered only the second case, so it did not describe the request-validation emitter at all.",
     },
     I18nEntry {
         key: "moira.error.structured_output_unsupported",
@@ -325,6 +325,26 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         key: "moira.error.system_key_scope_escalation",
         default_message: "The requested scope exceeds the effective system key scope.",
         description: "Used when a system key tries to mint broader scopes.",
+    },
+    I18nEntry {
+        key: "moira.error.credential_override_forbidden",
+        default_message: "Choosing the credential for a request is not allowed.",
+        description: "Used when the caller names a specific credential but the application's execution policy forbids credential overrides, or the caller lacks the scope for them. Retrying will not help; omit the credential and let routing select one.",
+    },
+    I18nEntry {
+        key: "moira.error.model_override_forbidden",
+        default_message: "Choosing the model for a request is not allowed.",
+        description: "Used when the caller names a specific model but the application's execution policy forbids model overrides, or the caller lacks the scope for them. Retrying will not help; omit the model and let routing select one.",
+    },
+    I18nEntry {
+        key: "moira.error.provider_override_forbidden",
+        default_message: "Choosing the provider for a request is not allowed.",
+        description: "Used when the caller names a specific provider but the application's execution policy forbids provider overrides, or the caller lacks the scope for them. Retrying will not help; omit the provider and let routing select one.",
+    },
+    I18nEntry {
+        key: "moira.error.route_override_forbidden",
+        default_message: "Choosing the route for a request is not allowed.",
+        description: "Used when the caller names a specific route but the application's execution policy forbids route overrides, or the caller lacks the scope for them. Retrying will not help; omit the route and let the application's default apply.",
     },
     I18nEntry {
         key: "moira.error.timeout_override_forbidden",
@@ -355,5 +375,120 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         key: "moira.error.unsupported_tool",
         default_message: "The tool is not supported.",
         description: "Used when a tool declaration is not accepted.",
+    },
+    I18nEntry {
+        key: "moira.error.application_unavailable",
+        default_message: "The application is not available to serve this request.",
+        description: "Used when the request targets an application the caller is not bound to, or one that is not currently active. Retrying will not help until the binding or the application's status is corrected.",
+    },
+    I18nEntry {
+        key: "moira.error.route_not_found",
+        default_message: "No route matched this request.",
+        description: "Used when the requested route does not exist or is not visible to the caller. Retrying will not help until a matching route is configured.",
+    },
+    I18nEntry {
+        key: "moira.error.route_forbidden",
+        default_message: "You are not allowed to use this route.",
+        description: "Used when the route resolves but the caller's credentials or scopes do not permit its use. Distinct from route_not_found, which means no route resolved at all.",
+    },
+    I18nEntry {
+        key: "moira.error.model_forbidden",
+        default_message: "You are not allowed to use this model.",
+        description: "Used when the model resolves but the caller's credentials or scopes do not permit its use. Distinct from model_not_found, which means no model resolved at all.",
+    },
+    I18nEntry {
+        key: "moira.error.no_eligible_model",
+        default_message: "No model is available that can serve this request.",
+        description: "Used when no configured model satisfies both the routing policy and the capabilities the request needs. A configuration or request-shape problem, not a transient one.",
+    },
+    I18nEntry {
+        key: "moira.error.credential_not_found",
+        default_message: "No usable credential is available for this request.",
+        description: "Used when no credential could be selected for the chosen model. Retrying will not help until a credential is configured for it.",
+    },
+    I18nEntry {
+        key: "moira.error.credential_forbidden",
+        default_message: "You are not allowed to use the requested credential.",
+        description: "Used when the caller names a specific credential without the scope to override credential selection, or names one that is outside its reach.",
+    },
+    I18nEntry {
+        key: "moira.error.credential_expired",
+        default_message: "The credential needed for this request has expired.",
+        description: "Used when the selected credential is past its validity period. Retrying will not help until it is renewed or replaced.",
+    },
+    I18nEntry {
+        key: "moira.error.credential_disabled",
+        default_message: "The credential needed for this request is disabled.",
+        description: "Used when the selected credential exists but has been deactivated. Retrying will not help until it is re-enabled or replaced.",
+    },
+    I18nEntry {
+        key: "moira.error.credential_decryption_failed",
+        default_message: "The credential needed for this request could not be read.",
+        description: "Used when a stored credential cannot be recovered for use. Nothing in the caller's request causes this and retrying will not help; it needs operator attention.",
+    },
+    I18nEntry {
+        key: "moira.error.provider_configuration_invalid",
+        default_message: "The configuration required to serve this request is invalid.",
+        description: "Used when the stored settings for the selected model or its credential cannot be assembled into a usable request. Retrying will not help until the configuration is corrected.",
+    },
+    I18nEntry {
+        key: "moira.error.provider_unavailable",
+        default_message: "The provider is temporarily unavailable.",
+        description: "Used when the selected provider cannot currently accept the request. Transient — retry after a short delay, or allow routing to fall back to another provider.",
+    },
+    I18nEntry {
+        key: "moira.error.provider_rate_limited",
+        default_message: "The provider is refusing requests because a rate limit was reached.",
+        description: "Used when a provider rejects the attempt for exceeding its own request or token allowance. Transient — retry after a short delay; if it persists, the allowance is too small for the traffic.",
+    },
+    I18nEntry {
+        key: "moira.error.provider_timeout",
+        default_message: "The provider did not respond in time.",
+        description: "Used when a single provider attempt exceeds its timeout. Transient — retry, optionally with a smaller request. Distinct from deadline_exceeded, which covers the whole execution.",
+    },
+    I18nEntry {
+        key: "moira.error.provider_connection_failed",
+        default_message: "The provider could not be reached.",
+        description: "Used when the connection to a provider could not be established, or was lost before a response arrived. Transient — retry after a short delay.",
+    },
+    I18nEntry {
+        key: "moira.error.provider_authentication_failed",
+        default_message: "The provider rejected the credential used for this request.",
+        description: "Used when a provider answers an attempt with an authentication or authorization refusal. Retrying will not help until the credential is corrected or replaced.",
+    },
+    I18nEntry {
+        key: "moira.error.provider_invalid_response",
+        default_message: "The provider returned a response that could not be understood.",
+        description: "Used when a provider replies but the reply cannot be read as a valid completion. Not caused by the caller's input; report it if it persists.",
+    },
+    I18nEntry {
+        key: "moira.error.provider_upstream_error",
+        default_message: "The provider reported an error while handling this request.",
+        description: "Used when a provider attempt fails provider-side in a way not covered by the more specific timeout, rate-limit, connection, or authentication conditions.",
+    },
+    I18nEntry {
+        key: "moira.error.circuit_open",
+        default_message: "Requests to this provider are paused after repeated failures.",
+        description: "Used when the circuit breaker for the selected provider and model is open, so attempts are refused without being sent. Transient — it closes again on its own; retry after a short delay.",
+    },
+    I18nEntry {
+        key: "moira.error.capacity_exhausted",
+        default_message: "The service is at capacity and cannot accept this request right now.",
+        description: "Used when a concurrency or rate allowance is already fully consumed. Transient — retry after a short delay, and reduce concurrency if it recurs.",
+    },
+    I18nEntry {
+        key: "moira.error.request_cancelled",
+        default_message: "The request was cancelled before it completed.",
+        description: "Used when the caller disconnected, or the response stream was closed, before execution finished. Submit the request again if the result is still wanted.",
+    },
+    I18nEntry {
+        key: "moira.error.deadline_exceeded",
+        default_message: "The request ran out of time before it could be completed.",
+        description: "Used when the execution's overall deadline elapses, as opposed to a single attempt timing out. Retry, or allow the request a longer budget.",
+    },
+    I18nEntry {
+        key: "moira.error.stream_backpressure_exceeded",
+        default_message: "The response stream was closed because it was not being read quickly enough.",
+        description: "Used when a streaming consumer stops accepting events for long enough to miss the delivery deadline. Read the stream as it arrives, or use the non-streaming endpoint.",
     },
 ];

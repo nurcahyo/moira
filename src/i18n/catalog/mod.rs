@@ -47,6 +47,79 @@ pub fn default_message_for_key(key: &str) -> Option<&'static str> {
         .map(|entry| entry.default_message)
 }
 
+// ---------------------------------------------------------------------------
+// Compile-time gate: every execution failure class has a catalog entry.
+//
+// `AppError::coded(status, ExecutionFailureClass::code(class), …)` on the public
+// execution path means every variant of that enum ships to clients as
+// `moira.error.<code>` (`AppError::message_key`). The source walker in this
+// module's tests can only see *literal* code arguments, so it never saw any of
+// them — which is how 23 of the 28 shipped as bare keys with no English
+// fallback.
+//
+// The check below closes that for good, and does it at compile time rather than
+// test time: `ExecutionFailureClass::ALL` is generated from the same list as the
+// enum itself (`src/domain/runtime.rs`), so a new variant is automatically in
+// scope here, and if its code has no entry in `errors.rs` the crate does not
+// build. The `const fn`s exist because `is_known_key` cannot run in a `const`
+// block and `format!` is not available there either — hence the prefix-aware
+// byte comparison instead of building `"moira.error." + code`.
+// ---------------------------------------------------------------------------
+
+const ERROR_KEY_PREFIX: &[u8] = b"moira.error.";
+
+/// True when `key` is exactly `moira.error.` followed by `code`.
+const fn error_key_matches_code(key: &str, code: &str) -> bool {
+    let key = key.as_bytes();
+    let code = code.as_bytes();
+    if key.len() != ERROR_KEY_PREFIX.len() + code.len() {
+        return false;
+    }
+    let mut index = 0;
+    while index < ERROR_KEY_PREFIX.len() {
+        if key[index] != ERROR_KEY_PREFIX[index] {
+            return false;
+        }
+        index += 1;
+    }
+    let mut offset = 0;
+    while offset < code.len() {
+        if key[ERROR_KEY_PREFIX.len() + offset] != code[offset] {
+            return false;
+        }
+        offset += 1;
+    }
+    true
+}
+
+/// `const`-evaluable equivalent of `is_known_key(&format!("moira.error.{code}"))`.
+const fn error_catalog_contains_code(code: &str) -> bool {
+    let mut index = 0;
+    while index < RESPONSE_ERROR_CATALOG.len() {
+        if error_key_matches_code(RESPONSE_ERROR_CATALOG[index].key, code) {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+const _: () = {
+    let classes = crate::domain::ExecutionFailureClass::ALL;
+    let mut index = 0;
+    while index < classes.len() {
+        assert!(
+            error_catalog_contains_code(classes[index].code()),
+            "an ExecutionFailureClass variant has no `moira.error.<code>` entry in \
+             src/i18n/catalog/errors.rs — every class reaches clients as a message key, \
+             so it needs an English default_message and a description (CONVENTIONS.md §4.1). \
+             Run `cargo test --lib i18n::catalog::tests::every_execution_failure_class_code_has_a_catalog_entry` \
+             to be told which one."
+        );
+        index += 1;
+    }
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,6 +691,61 @@ mod tests {
     /// which is exactly how `routing_policy_provider_model_mismatch` shipped
     /// uncatalogued from `src/application/runtime_admin.rs`.
     ///
+    /// `validate_override` forwards a `code: &'static str` parameter into `AppError::coded`, so the
+    /// literal scanner cannot see the codes — they live at the *call sites*, not at the constructor.
+    ///
+    /// That blind spot is not hypothetical: four of the five (`route_`, `model_`, `provider_` and
+    /// `credential_override_forbidden`) shipped to clients as `moira.error.<code>` message keys with
+    /// no catalog entry, and every existing gate was green the whole time. This walks the call sites
+    /// directly so a sixth caller with a new code cannot repeat it.
+    #[test]
+    fn every_validate_override_code_has_a_catalog_entry() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/application/public.rs"),
+        )
+        .expect("read src/application/public.rs");
+
+        // The last string literal before each call's closing paren is the `code` argument.
+        let mut codes: Vec<String> = Vec::new();
+        for (index, _) in source.match_indices("validate_override(") {
+            // Skip the definition — its body contains `AppError::coded(…, code, "<message>")`, and
+            // treating it as a call site harvests that human message as though it were a code.
+            if source[..index].trim_end().ends_with("fn") {
+                continue;
+            }
+            let call = &source[index + "validate_override(".len()..];
+            // Terminate on the statement's `;`, not on `);` — these calls end `)?;`, and matching
+            // the wrong terminator silently swallows the next statement's literals.
+            let Some(end) = call.find(';') else { continue };
+            let args = &call[..end];
+            if let Some(last) = args.rmatch_indices('"').nth(1) {
+                let start = last.0 + 1;
+                if let Some(close) = args[start..].find('"') {
+                    codes.push(args[start..start + close].to_string());
+                }
+            }
+        }
+
+        assert!(
+            codes.len() >= 5,
+            "expected to find the `validate_override` call sites and their literal codes; found \
+             {} — the parser above has probably drifted from the call shape, which would make this \
+             gate silently vacuous",
+            codes.len()
+        );
+
+        let missing: Vec<&String> = codes
+            .iter()
+            .filter(|code| !error_catalog_contains_code(code))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these codes are passed to `validate_override` and reach clients as \
+             `moira.error.<code>` message keys, but have no catalog entry (CONVENTIONS §4.1): {:?}",
+            missing
+        );
+    }
+
     /// Codes that are *not* string literals cannot be resolved by reading the
     /// source, so they are collected separately and pinned: a new dynamic code
     /// site must be a deliberate, reviewed decision rather than a silent way out
@@ -706,20 +834,144 @@ mod tests {
             missing.join("\n  ")
         );
 
-        // The two known runtime-computed codes, both in the public execution
-        // path: `AppError::coded(status, failure_code(failure.class), …)` and the
-        // `code` it is re-raised with. Their values come from
-        // `failure_code` (`src/application/public.rs`), 23 of which have **no**
-        // catalog entry — a pre-existing gap this plan records rather than
-        // closes (it needs 23 reviewed English strings, not a mechanical fix).
-        // If this count moves, either that gap was addressed or a new dynamic
-        // code site was introduced; both deserve a look.
-        assert_eq!(
-            dynamic_sites.len(),
-            2,
-            "expected exactly the 2 known runtime-computed error-code sites, found {}:\n  {}",
-            dynamic_sites.len(),
-            dynamic_sites.join("\n  ")
+        // Runtime-computed codes cannot be resolved by reading the source, so
+        // they are only safe if some *other* gate enumerates their possible
+        // values. Plan 06 pinned the count of such sites at 2, which proved
+        // nothing: the 23 uncatalogued execution failure codes sat behind
+        // exactly those two sites and the pin was green throughout.
+        //
+        // The pin is replaced by an allowlist of *expressions*. Each entry names
+        // a computed code together with the gate that covers its value set. A
+        // new dynamic site spelled any other way fails here and has to either
+        // become a literal or bring its own exhaustive gate.
+        const COVERED_DYNAMIC_CODE_EXPRESSIONS: &[&str] = &[
+            // Covered by the `const` block above, which walks
+            // `ExecutionFailureClass::ALL` and refuses to compile when a variant's
+            // code has no catalog entry.
+            //
+            // Matched on the function name, not the whole call expression: the argument is spelled
+            // `failure.class` at two sites and `value.class` at a third, and renaming a local
+            // should not silently drop a site out of this gate's coverage — or, worse, break the
+            // build for a reason that has nothing to do with i18n. `failure_code` is a thin
+            // delegate to `ExecutionFailureClass::code`, so *every* call is covered by the
+            // exhaustive walk regardless of how its argument is written.
+            "failure_code(",
+            // `validate_override` takes `code: &'static str` and passes it straight to
+            // `AppError::coded`. Its five call sites all pass literals, but those literals sit
+            // outside any `AppError::coded(` call, so the literal scanner above never sees them —
+            // which is exactly how four of the five (`route_`, `model_`, `provider_`,
+            // `credential_override_forbidden`) reached clients with no catalog entry until this
+            // gate was written. Covered by
+            // `every_validate_override_code_has_a_catalog_entry` below, which walks the call sites
+            // directly. Adding a sixth caller with a new code fails that test.
+            //
+            // Matched on the rendered argument, not the callee: the site text is rendered without
+            // its enclosing function, and spelling the constructor literally here would be found
+            // by this very scanner when it walks this file.
+            "…, code, …",
+        ];
+
+        let uncovered: Vec<&String> = dynamic_sites
+            .iter()
+            .filter(|site| {
+                !COVERED_DYNAMIC_CODE_EXPRESSIONS
+                    .iter()
+                    .any(|expression| site.contains(expression))
+            })
+            .collect();
+
+        assert!(
+            uncovered.is_empty(),
+            "these error codes are computed at runtime and no exhaustive gate covers \
+             their possible values, so nothing proves they have catalog entries \
+             (CONVENTIONS §4.1). Either use a literal code, or enumerate the source \
+             type the way `ExecutionFailureClass::ALL` is enumerated above:\n  {}",
+            uncovered
+                .iter()
+                .map(|site| site.as_str())
+                .collect::<Vec<_>>()
+                .join("\n  ")
         );
+
+        // The allowlist must stay honest in the other direction too: an entry
+        // that matches nothing is a stale carve-out hiding behind a passing test.
+        for expression in COVERED_DYNAMIC_CODE_EXPRESSIONS {
+            assert!(
+                dynamic_sites.iter().any(|site| site.contains(expression)),
+                "{expression:?} is allowlisted as a covered runtime-computed code site \
+                 but no such site exists in src/ any more — remove the carve-out"
+            );
+        }
+    }
+
+    /// The runtime companion to the `const` gate above.
+    ///
+    /// The `const` version is the one that matters — it fails the *build* — but
+    /// a const panic cannot interpolate, so it cannot say which variant is
+    /// missing. This one can, and it is what a developer should run when the
+    /// build breaks.
+    #[test]
+    fn every_execution_failure_class_code_has_a_catalog_entry() {
+        use crate::domain::ExecutionFailureClass;
+
+        let missing: Vec<&str> = ExecutionFailureClass::ALL
+            .iter()
+            .map(|class| class.code())
+            .filter(|code| !is_known_key(&format!("moira.error.{code}")))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "these execution failure classes reach clients as moira.error.<code> but \
+             have no entry in src/i18n/catalog/errors.rs:\n  {}",
+            missing.join("\n  ")
+        );
+
+        for class in ExecutionFailureClass::ALL {
+            let key = format!("moira.error.{}", class.code());
+            let entry = all_entries()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("{key} must be catalogued"));
+            assert!(
+                !entry.default_message.trim().is_empty(),
+                "{key} default_message must be non-empty"
+            );
+            assert!(
+                !entry.description.trim().is_empty(),
+                "{key} description must be non-empty"
+            );
+            assert_ne!(
+                entry.default_message, entry.description,
+                "{key} description must explain when the key is used, not repeat the message"
+            );
+        }
+    }
+
+    /// `ExecutionFailureClass::code` and the enum's `serde` representation must
+    /// agree, because callers see both: `code` becomes the `error.code` and the
+    /// `moira.error.*` key, while `serde` produces the `failure.class` string in
+    /// the execution summary. If they diverged, the catalog gate would be
+    /// guarding a vocabulary clients never see.
+    #[test]
+    fn execution_failure_class_codes_match_their_serde_representation() {
+        use crate::domain::ExecutionFailureClass;
+        use std::collections::BTreeSet;
+
+        let mut seen = BTreeSet::new();
+        for class in ExecutionFailureClass::ALL {
+            let serialized =
+                serde_json::to_value(class).expect("ExecutionFailureClass serializes to JSON");
+            assert_eq!(
+                serialized,
+                serde_json::Value::String(class.code().to_string()),
+                "{class:?}: code() and the serde representation disagree"
+            );
+            assert!(
+                seen.insert(class.code()),
+                "{:?} duplicates the code {:?}",
+                class,
+                class.code()
+            );
+        }
     }
 }

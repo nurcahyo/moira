@@ -2055,36 +2055,10 @@ fn failure_http_status(class: ExecutionFailureClass) -> axum::http::StatusCode {
 }
 
 fn failure_code(class: ExecutionFailureClass) -> &'static str {
-    match class {
-        ExecutionFailureClass::InvalidExecutionRequest => "invalid_execution_request",
-        ExecutionFailureClass::ApplicationUnavailable => "application_unavailable",
-        ExecutionFailureClass::RouteNotFound => "route_not_found",
-        ExecutionFailureClass::RouteForbidden => "route_forbidden",
-        ExecutionFailureClass::ModelNotFound => "model_not_found",
-        ExecutionFailureClass::ModelForbidden => "model_forbidden",
-        ExecutionFailureClass::ModelCapabilityMismatch => "model_capability_mismatch",
-        ExecutionFailureClass::NoEligibleModel => "no_eligible_model",
-        ExecutionFailureClass::CredentialNotFound => "credential_not_found",
-        ExecutionFailureClass::CredentialForbidden => "credential_forbidden",
-        ExecutionFailureClass::CredentialExpired => "credential_expired",
-        ExecutionFailureClass::CredentialDisabled => "credential_disabled",
-        ExecutionFailureClass::CredentialDecryptionFailed => "credential_decryption_failed",
-        ExecutionFailureClass::ProviderConfigurationInvalid => "provider_configuration_invalid",
-        ExecutionFailureClass::ProviderUnavailable => "provider_unavailable",
-        ExecutionFailureClass::ProviderRateLimited => "provider_rate_limited",
-        ExecutionFailureClass::ProviderTimeout => "provider_timeout",
-        ExecutionFailureClass::ProviderConnectionFailed => "provider_connection_failed",
-        ExecutionFailureClass::ProviderAuthenticationFailed => "provider_authentication_failed",
-        ExecutionFailureClass::ProviderInvalidResponse => "provider_invalid_response",
-        ExecutionFailureClass::ProviderUpstreamError => "provider_upstream_error",
-        ExecutionFailureClass::CircuitOpen => "circuit_open",
-        ExecutionFailureClass::CapacityExhausted => "capacity_exhausted",
-        ExecutionFailureClass::RequestCancelled => "request_cancelled",
-        ExecutionFailureClass::DeadlineExceeded => "deadline_exceeded",
-        ExecutionFailureClass::StructuredOutputInvalid => "structured_output_invalid",
-        ExecutionFailureClass::StreamBackpressureExceeded => "stream_backpressure_exceeded",
-        ExecutionFailureClass::InternalError => "internal_error",
-    }
+    // Delegates to the domain type so the code strings have ONE definition. `ExecutionFailureClass::code`
+    // is walked by the i18n catalog gate, which refuses to compile when a variant has no catalog
+    // entry; a second copy of this mapping here could drift out from under that guarantee.
+    class.code()
 }
 
 #[cfg(test)]
