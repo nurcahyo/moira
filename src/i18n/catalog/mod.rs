@@ -691,11 +691,6 @@ mod tests {
     /// which is exactly how `routing_policy_provider_model_mismatch` shipped
     /// uncatalogued from `src/application/runtime_admin.rs`.
     ///
-    /// Codes that are *not* string literals cannot be resolved by reading the
-    /// source, so they are collected separately and pinned: a new dynamic code
-    /// site must be a deliberate, reviewed decision rather than a silent way out
-    /// of this gate. See the note on the final assertion.
-    #[test]
     /// `validate_override` forwards a `code: &'static str` parameter into `AppError::coded`, so the
     /// literal scanner cannot see the codes — they live at the *call sites*, not at the constructor.
     ///
@@ -751,6 +746,10 @@ mod tests {
         );
     }
 
+    /// Codes that are *not* string literals cannot be resolved by reading the
+    /// source, so they are collected separately and pinned: a new dynamic code
+    /// site must be a deliberate, reviewed decision rather than a silent way out
+    /// of this gate. See the note on the final assertion.
     #[test]
     fn every_coded_error_literal_in_src_has_a_catalog_entry() {
         use std::collections::{BTreeMap, BTreeSet};
