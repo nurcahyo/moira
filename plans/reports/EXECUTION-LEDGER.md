@@ -551,6 +551,51 @@ Rejected: `[profile.dev.package."*"] opt-level = 3`. It optimises 405 dependenci
 
 ## Cycle log
 
+### Cycle 9 — 2026-07-27 — plan 07 MERGED; plans 08 and 10 re-audited
+
+**Plan 07 merged as `27b6e0c` — the first CI-verified merge in this sequence.** Run `30257760315`:
+`rust` success (13 steps), `supply-chain` success (10), `container-and-helm` success (13). Every
+prior plan landed under the infrastructure override on local gates alone. Evidence posted on PR #31.
+
+**The override's premise was stale, and the outage was concealing real defects.** Repairing three
+broken action pins is what made the rest visible — while `container-and-helm` died at step 1, trivy
+never ran. Found and fixed as a direct consequence: F11 (retention could delete a whole table),
+F12 (36 container CVEs), the missing `cargo audit` gate, and two shared-database isolation bugs.
+
+**Plans 08 and 10 re-audited in parallel** — the first wave to genuinely run in parallel, now that
+`debug = 1` made per-agent `CARGO_TARGET_DIR` affordable.
+
+**Plan 10** (`d788ad6`, `7aa1780`): ~45 of ~70 citations stale, 10 blockers. Its Redis breaker
+registry would not compile (plan 04 added a fifth method); its 3-call invalidation sequence is now
+four and would leave plan 07's auth cache stale on replicas while reintroducing the unconditional
+breaker reset; two i18n keys it insists are missing already exist; the metrics module it describes
+was rewritten by plan 05. **The retention worker's own module header is addressed to plan 10** —
+"there is no leader election in Moira today (that is plan 10)" — while plan 10 still lists retention
+as out of scope. Three deployment gaps that only surface in a cluster: workers are **off** in the
+shipped chart, `pod_name` has no downward-API env var, and a rolling update can deadlock against the
+lease ceiling (the grace period clears it by luck, not design).
+
+**Plan 08** (`b4ef754`): five blockers, one of them fatal to the whole design.
+
+**B1 — the wizard as specified could never succeed.** `governing_policy` matches the provider row on
+`issuer = $1 or trusted_jwt_issuer_id = $2` where `$1` is the *claim body's* issuer. Plan 08 writes
+the row for the IdP, sends the console's issuer in the claim, and never sets `trusted_jwt_issuer_id`
+— it is absent from the plan's field list entirely. Neither branch matches → `policy = None` →
+**403 on every run**, including the plan's own happy-path e2e. The console would have been built
+end-to-end and failed at the last step, every time.
+
+The tell: plan 08 states an invariant — the console issuer must not assert scopes — that Moira
+enforces *only* when `trusted_jwt_issuer_id` is supplied. Since the plan never supplies it, **it
+never exercises its own stated invariant.** That is the signature of a design written against an API
+sketch rather than the shipped one.
+
+**Method note.** Both audits were told to be exhaustive rather than representative, and both found
+that the consequential items were not the obvious ones. Agents corrected me on five points in plan
+08 and three in plan 10; I verified each disagreement myself rather than taking either side. One
+agent "correction" was itself half-wrong — it removed a real advisory-lock key from a
+collision-avoidance list on the grounds that production does not take it, when the risk is that
+*tests* do, against the same database (`7aa1780`).
+
 ### Cycle 8 — 2026-07-27 — plan 07 implemented
 
 Branch `plan/07-identity-foundation`, four waves. **All five gates green: 622 passed, 0 failed,
