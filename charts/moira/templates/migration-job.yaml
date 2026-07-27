@@ -21,8 +21,12 @@ spec:
       serviceAccountName: {{ .Values.serviceAccount.name }}
       securityContext:
         runAsNonRoot: true
-        runAsUser: 10001
-        fsGroup: 10001
+        # Must match the deployment and the image. `gcr.io/distroless/cc-debian12:nonroot`
+        # ships exactly one non-root user, uid 65532, and has no package manager or shell to
+        # create another — so a manifest asking for 10001 is asking for a user the image does
+        # not contain.
+        runAsUser: 65532
+        fsGroup: 65532
       containers:
         - name: migrate
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

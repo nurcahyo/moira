@@ -19,7 +19,9 @@ The manifests include:
 
 Security defaults:
 
-- non-root UID `10001`
+- non-root UID `65532`, the sole non-root user in `gcr.io/distroless/cc-debian12:nonroot`.
+  The deployment and the migration job both pin it; the image has no shell or package manager
+  with which to create another, so all three must agree.
 - read-only root filesystem
 - dropped Linux capabilities
 - liveness and readiness probes
