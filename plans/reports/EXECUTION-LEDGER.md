@@ -268,6 +268,34 @@ does not reach for the dangerous knob. **Worth considering for a later plan:** a
 refuses to export third-party spans regardless of level, so the safety does not rest on operator
 discipline.
 
+### F12 — the shipped container image carries 5 CRITICAL and 31 HIGH CVEs — hardening in progress
+
+Found the first time trivy actually ran (`30220949227`). It had been masked: `container-and-helm`
+died at step 1 on a broken action pin, so the scanner never executed. Two earlier pin fixes are what
+made this visible.
+
+**`apt-get upgrade` is not the fix.** Status of the sampled CVEs: **8 `affected`, 7 `fix_deferred`,
+1 `will_not_fix`, 1 `fixed`.** Debian has not shipped patches for nearly all of them, so the only
+real mitigation is removing the packages — 106 in `debian:bookworm-slim`, of which a Rust binary
+calls almost none.
+
+**The largest single contributor was self-inflicted.** `curl` was installed for exactly one reason,
+the `HEALTHCHECK`, and dragged in ~5 curl/libcurl CVEs including an SSH host-verification bypass and
+a TLS downgrade, several `fix_deferred`. Meanwhile `charts/moira/templates/deployment.yaml:42-50`
+already defines `readinessProbe` and `livenessProbe` — Kubernetes does the health checking in the
+real deployment target, so the Docker `HEALTHCHECK` was redundant. A TLS-bypass CVE class was being
+carried to support a probe nothing used.
+
+**User decision (2026-07-27):** harden now, then merge; base becomes
+`gcr.io/distroless/cc-debian12:nonroot`. Verified prerequisite: the lockfile has **zero**
+`openssl-sys`/`native-tls` entries — TLS is pure `rustls` — so glibc + ca-certificates suffices.
+
+**Not yet verified, and must not be reported as fixed until it is:** the image builds, starts, and
+serves `/health/live`, and trivy's actual after-count. Distroless failures appear at *startup*, not
+at build. `bb7009e` fixed a real gap in the first attempt: `deployment.yaml` moved to uid 65532 while
+`migration-job.yaml` stayed at 10001 — same image, and distroless has no shell or package manager
+with which to create a second user.
+
 ### F11 — a retention batch could delete its whole table in one transaction — **FIXED** `9799826`
 
 **`limit $1` bounds one *evaluation* of a sub-query, not the statement.** The retention sweep used
