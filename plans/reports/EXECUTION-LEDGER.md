@@ -290,11 +290,31 @@ carried to support a probe nothing used.
 `gcr.io/distroless/cc-debian12:nonroot`. Verified prerequisite: the lockfile has **zero**
 `openssl-sys`/`native-tls` entries — TLS is pure `rustls` — so glibc + ca-certificates suffices.
 
-**Not yet verified, and must not be reported as fixed until it is:** the image builds, starts, and
-serves `/health/live`, and trivy's actual after-count. Distroless failures appear at *startup*, not
-at build. `bb7009e` fixed a real gap in the first attempt: `deployment.yaml` moved to uid 65532 while
-`migration-job.yaml` stayed at 10001 — same image, and distroless has no shell or package manager
-with which to create a second user.
+**VERIFIED end to end, 2026-07-27 — 36 CVEs → 0.**
+
+| | Before | After |
+|---|---|---|
+| CRITICAL + HIGH | 36 (5 / 31) | **0** |
+| Image size | ~120 MB | **69.6 MB** |
+| Shell | present | **absent** (`exec /bin/sh` → no such file) |
+| UID | 10001 | **65532**, matching both manifests |
+
+Not just built — **run**: the container starts, `/health/live` returns `200 {"status":"ok",…}`, and
+it runs as 65532. That check was the point. Distroless failures appear at *startup*, not at build,
+so a green `docker build` proves nothing about whether the binary can find its dynamic libraries.
+
+Zero, rather than "fewer", because the vulnerable code is *absent* rather than patched — which is
+the whole argument for the approach given that Debian had declined or deferred fixes for nearly all
+36.
+
+**Two process failures worth carrying forward:**
+1. **`docker build … | tail` reports `tail`'s exit status.** A build that died with
+   `DeadlineExceeded` pulling base-image metadata was reported as exit 0. Never judge a piped
+   command by its exit code; check the log or use `PIPESTATUS`.
+2. **`bb7009e` caught a half-done reconciliation reported as complete.** `deployment.yaml` moved to
+   65532 while `migration-job.yaml` stayed at 10001 — same image, and distroless has no shell or
+   package manager with which to create a second user. It would have failed at deploy time, not in
+   CI. When an agent reports "verified", check the specific thing that could fail silently.
 
 ### F11 — a retention batch could delete its whole table in one transaction — **FIXED** `9799826`
 
