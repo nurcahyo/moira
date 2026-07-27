@@ -43,7 +43,11 @@ impl<'a> SetupService<'a> {
     }
 }
 
-fn require_setup_actor(actor: &Actor) -> Result<(), AppError> {
+/// `pub(crate)` so `GET /api/v1/admin/setup/auth-methods` (plan 07, module 9) gates on the
+/// *same* function as the pre-existing structural endpoint rather than on a second copy of
+/// it. Two divergent transcriptions of one authorization rule is how a gate silently
+/// weakens on one surface and not the other.
+pub(crate) fn require_setup_actor(actor: &Actor) -> Result<(), AppError> {
     match actor.actor_type {
         ActorType::SystemKey | ActorType::TrustedJwt => Ok(()),
         ActorType::ConsumerKey | ActorType::DevAdmin | ActorType::Anonymous => Err(

@@ -8,8 +8,8 @@ use crate::{
     error::AppError,
     infra::{metrics::MetricsRegistry, redis::RedisClient, workers::WorkerRegistry},
     orchestration::{
-        CircuitBreakerRegistry, ConcurrencyController, InMemoryRateLimiter, ProviderRuntimeCache,
-        RuntimeConfigCache,
+        AuthProviderSettingsCache, CircuitBreakerRegistry, ConcurrencyController,
+        InMemoryRateLimiter, ProviderRuntimeCache, RuntimeConfigCache,
     },
     security::{
         AdminAuthenticator, ApiKeyHasher, AuthService, AuthorizationService, CallerAuthenticator,
@@ -39,6 +39,14 @@ pub struct AppState {
     pub metrics: MetricsRegistry,
     pub workers: WorkerRegistry,
     pub runtime_cache: RuntimeConfigCache,
+    /// The enabled auth methods behind `GET /api/v1/admin/setup/auth-methods` (plan 07,
+    /// module 13a).
+    ///
+    /// Held on `AppState` alongside the other runtime caches rather than inside the
+    /// service, because the thing that invalidates it — the `moira_runtime_config`
+    /// listener — lives outside the request path and needs a handle to it. That is also
+    /// what makes an auth-settings write on one instance visible on every other one.
+    pub auth_settings_cache: AuthProviderSettingsCache,
     pub runtime_handles: ProviderRuntimeCache,
     pub concurrency: ConcurrencyController,
     pub public_rate_limiter: InMemoryRateLimiter,
@@ -87,6 +95,8 @@ impl AppState {
         let metrics = MetricsRegistry::new(&settings.telemetry.service_name, pool.clone());
         let workers = WorkerRegistry::new(settings.workers.clone());
         let runtime_cache = RuntimeConfigCache::new(settings.cache.runtime_config_ttl_seconds);
+        let auth_settings_cache =
+            AuthProviderSettingsCache::new(settings.auth.provider_settings_cache_ttl_seconds);
         let runtime_handles = ProviderRuntimeCache::new(
             settings.runtime.runtime_cache_ttl_seconds,
             settings.runtime.runtime_cache_max_entries,
@@ -124,6 +134,7 @@ impl AppState {
             metrics,
             workers,
             runtime_cache,
+            auth_settings_cache,
             runtime_handles,
             concurrency,
             public_rate_limiter,

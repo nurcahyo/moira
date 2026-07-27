@@ -1,5 +1,7 @@
 mod admin;
+mod auth_settings;
 mod conversation;
+mod identity;
 mod public;
 mod runtime;
 mod setup;
@@ -8,9 +10,19 @@ pub use admin::{
     AdminIdempotencyClaim, AdminIdempotencyClaimOutcome, AdminRepository, KeyMaterial,
     PgAdminCommandTransaction, PgAdminRepository, StoredCredentialSecret,
 };
+// Plan 07 modules 5-6. Both ship as a trait plus one Postgres implementation from their
+// first commit, so no later plan has to retrofit the seam onto a surface that already has
+// callers — the retrofit P2-3 had to perform for `AdminRepository` and `SetupRepository`.
+pub use auth_settings::{
+    AuthProviderSettingsRepository, GoverningAuthPolicy, PgAuthProviderSettingsRepository,
+};
 pub use conversation::{
     ConversationAccess, ConversationInsert, ConversationMessageInsert, ConversationRepository,
     MemoryInsert, PgConversationRepository,
+};
+pub use identity::{
+    AdminIdentityGrant, AdminIdentityGrantInsert, AdminIdentityRepository,
+    PgAdminIdentityRepository,
 };
 // Deliberately `pub(crate)`, not `pub`: these three free functions mutate RAG state with no
 // authorization check, no audit row and no idempotency envelope of their own — those are

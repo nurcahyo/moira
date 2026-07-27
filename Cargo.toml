@@ -89,3 +89,28 @@ utoipa = { version = "5", features = ["chrono", "uuid"] }
 utoipa-axum = "0.2"
 url = "2"
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
+
+# Build-time profile tuning. Not about the shipped artifact — `--release` is untouched — but about
+# how long the edit/check/test loop takes and how much disk it costs.
+#
+# The measured problem: `target/` reached 131 GB during plan 06 and sat at 20 GB routinely, of which
+# `debug/deps` was 11 GB and `debug/incremental` 8.5 GB. That forced `cargo clean`, which discards
+# all 405 compiled dependencies and buys a multi-minute rebuild to reclaim space that was mostly
+# cache. Shrinking the artifacts is what breaks that cycle; reclaiming harder does not.
+[profile.dev]
+# Line tables instead of full DWARF. Panics still carry file and line — which is all the test suite
+# and the backtraces in CI actually use — but the per-object debuginfo that dominates `deps/` goes
+# away, and linking gets materially cheaper. That matters disproportionately here because 27 test
+# binaries each link the whole crate.
+#
+# Raise this to 2 if you need to step through a debugger; it is a one-line, one-rebuild change.
+debug = 1
+
+[profile.test]
+debug = 1
+
+# Deliberately NOT setting `[profile.dev.package."*"] opt-level = 3`, which is the usual companion
+# advice. It optimises all 405 dependencies to make tests run faster at runtime — but this suite is
+# Postgres-I/O-bound, not CPU-bound, so the runtime win is small, while the cost is paid again in
+# full every time the dependency graph is rebuilt. Worth revisiting only if profiling ever shows
+# tests are CPU-bound.

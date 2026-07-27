@@ -268,6 +268,120 @@ does not reach for the dangerous knob. **Worth considering for a later plan:** a
 refuses to export third-party spans regardless of level, so the safety does not rest on operator
 discipline.
 
+### F12 — the shipped container image carries 5 CRITICAL and 31 HIGH CVEs — hardening in progress
+
+Found the first time trivy actually ran (`30220949227`). It had been masked: `container-and-helm`
+died at step 1 on a broken action pin, so the scanner never executed. Two earlier pin fixes are what
+made this visible.
+
+**`apt-get upgrade` is not the fix.** Status of the sampled CVEs: **8 `affected`, 7 `fix_deferred`,
+1 `will_not_fix`, 1 `fixed`.** Debian has not shipped patches for nearly all of them, so the only
+real mitigation is removing the packages — 106 in `debian:bookworm-slim`, of which a Rust binary
+calls almost none.
+
+**The largest single contributor was self-inflicted.** `curl` was installed for exactly one reason,
+the `HEALTHCHECK`, and dragged in ~5 curl/libcurl CVEs including an SSH host-verification bypass and
+a TLS downgrade, several `fix_deferred`. Meanwhile `charts/moira/templates/deployment.yaml:42-50`
+already defines `readinessProbe` and `livenessProbe` — Kubernetes does the health checking in the
+real deployment target, so the Docker `HEALTHCHECK` was redundant. A TLS-bypass CVE class was being
+carried to support a probe nothing used.
+
+**User decision (2026-07-27):** harden now, then merge; base becomes
+`gcr.io/distroless/cc-debian12:nonroot`. Verified prerequisite: the lockfile has **zero**
+`openssl-sys`/`native-tls` entries — TLS is pure `rustls` — so glibc + ca-certificates suffices.
+
+**VERIFIED end to end, 2026-07-27 — 36 CVEs → 0.**
+
+| | Before | After |
+|---|---|---|
+| CRITICAL + HIGH | 36 (5 / 31) | **0** |
+| Image size | ~120 MB | **69.6 MB** |
+| Shell | present | **absent** (`exec /bin/sh` → no such file) |
+| UID | 10001 | **65532**, matching both manifests |
+
+Not just built — **run**: the container starts, `/health/live` returns `200 {"status":"ok",…}`, and
+it runs as 65532. That check was the point. Distroless failures appear at *startup*, not at build,
+so a green `docker build` proves nothing about whether the binary can find its dynamic libraries.
+
+Zero, rather than "fewer", because the vulnerable code is *absent* rather than patched — which is
+the whole argument for the approach given that Debian had declined or deferred fixes for nearly all
+36.
+
+**Two process failures worth carrying forward:**
+1. **`docker build … | tail` reports `tail`'s exit status.** A build that died with
+   `DeadlineExceeded` pulling base-image metadata was reported as exit 0. Never judge a piped
+   command by its exit code; check the log or use `PIPESTATUS`.
+2. **`bb7009e` caught a half-done reconciliation reported as complete.** `deployment.yaml` moved to
+   65532 while `migration-job.yaml` stayed at 10001 — same image, and distroless has no shell or
+   package manager with which to create a second user. It would have failed at deploy time, not in
+   CI. When an agent reports "verified", check the specific thing that could fail silently.
+
+### F11 — a retention batch could delete its whole table in one transaction — **FIXED** `9799826`
+
+**`limit $1` bounds one *evaluation* of a sub-query, not the statement.** The retention sweep used
+`delete … where id in (select id … order by expires_at limit $1 for update skip locked)` and
+believed that capped a batch at `$1` rows. It does not.
+
+PostgreSQL may plan that as a `Nested Loop Semi Join` with the sub-query on the inner side and no
+`Materialize`, re-executing it **once per outer row**. Each re-execution's `LockRows` skips rows the
+current command has already deleted (`TM_SelfModified`), so it returns a *different* victim every
+time and the outer scan deletes that one too. The chain continues until the victims run out.
+
+**Verified independently, not taken on report.** Same temp table, same hostile statistics, same
+`for update skip locked`, plan confirmed as `Subquery Scan … loops=43`:
+
+| Form | `limit 1` deleted |
+|---|---|
+| `where id in (select … limit $1)` | **43 of 43** |
+| `with victims as materialized (…)` | **1 of 43** |
+
+**Why it hid:** the trigger is a *statistics* state — bulk delete, autoanalyze, then new traffic
+before the next analyze. An idle machine never shows it. It surfaced only as `left: 21`/`left: 22`
+against a cap of 20 in `tests/retention_worker.rs`, during unrelated work.
+
+**Production impact.** No unexpired row was ever at risk — every extra victim still comes from a
+predicate on `expires_at < now()`. The damage is an unbounded *rate*, not corruption. But the
+per-tick cap was fiction: one tick could delete the entire expired set in a single transaction,
+holding row locks and accumulating WAL for all of it, which is exactly what batching exists to
+prevent. The module's documented bound on how long a user-facing `claim_idempotency` can block was
+"how long one batch statement runs" — and that statement had no size limit, so neither did the wait.
+On `responses` it is worse: `migrations/0011_retention_indexes.sql` records a single 500-row batch at
+**12 735 ms** in RI triggers. Every replica runs its own uncapped sweep.
+
+Fixed with `with victims as materialized (…)` — a CTE is evaluated once into a tuplestore whatever
+the planner does. `materialized` is load-bearing: PostgreSQL 12+ inlines un-annotated
+single-reference CTEs, and an inlined CTE is a sub-query again. The regression test forces the
+hostile join shape rather than depending on a statistics snapshot that will drift, and was checked
+non-vacuous against the old SQL (`left: 24, right: 1`).
+
+**Process note.** When this first surfaced I said to leave it — pre-existing, plan 05/06 territory,
+out of scope for a plan 07 branch. That was wrong, and the agent pushed back correctly. *Scope is
+the wrong lens for "an assertion that should be unreachable just fired twice."*
+
+### F10 — two shared-test-database hazards that can PERMANENTLY wedge a test run
+
+Both currently pass by luck. Found while fixing the plan 07 CI race, and worth separating from it:
+that race merely failed intermittently, whereas these two can leave the shared database in a state
+where a test fails *forever* until someone deletes a row by hand.
+
+1. **`tests/retention_worker.rs:329,333-334` — pre-existing, plan 05/06 territory, NOT fixed here.**
+   `retention::run_once` is a cluster-wide sweep, but the test asserts *exact* equality on the delete
+   counter. `sweep_guard` serialises retention tests against each other and nothing else. It seeds
+   century-backdated rows with no cleanup path, so a failure leaks rows that sort ahead of the next
+   run's under `order by expires_at` — self-poisoning. Deliberately left alone: changing retention
+   test semantics is a larger, riskier change than belonged in a regression fix on the plan 07 branch.
+
+2. **`tests/http_middleware_contract.rs:469`** — creates a `system_api_keys` row per run and never
+   deletes it. Minor; no current assertion depends on the count.
+
+**The general lesson.** `migrated_pool()`-style helpers hand every `#[cfg(test)]` module in `src/` the
+*same* database, and `cargo test --workspace` runs binaries concurrently against it. Any test writing
+a singleton, a globally-unique slot, or a cluster-wide counter is sharing mutable state with every
+other test in the tree. The integration suites avoid this with `support::LifecycleFixture`'s cloned
+databases; the lib tests have no equivalent, so they need an explicit advisory lock. **A test that
+leaks a row on the panic path is worse than a flaky one** — it converts one bad run into a permanently
+red suite.
+
 ### F7 — the "no `rig_core` under `src/domain/`" rule has no automated gate — **CLOSED** `d7580a6`
 
 Closed by `tests/rig_boundary.rs`. Teeth verified by injection, not assumed. Original finding:
@@ -398,7 +512,91 @@ Plan 05 froze the OpenAPI spec: any later route/DTO change must regenerate `docs
 
 ---
 
+## LOOP PERFORMANCE — measured 2026-07-27, supersedes the old `cargo clean` rule
+
+The loop was spending most of its wall-clock on build cost and duplicated verification. Measured,
+not estimated:
+
+| Change | Before | After |
+|---|---|---|
+| `[profile.dev] debug = 1` (`0055c7e`) | `target/` **20 GB**, `deps` 11 GB | **2.0 GB**, `deps` 1.5 GB |
+| Full clean rebuild, 405 crates | (avoided — cost minutes) | **2m21s** |
+| `cargo test --workspace --all-features`, warm | — | **1m39s**, 622 pass |
+| `cargo nextest run --workspace` | — | **2m07s** — *28% SLOWER* |
+
+**`cargo clean` is no longer the enemy, and `CARGO_TARGET_DIR` is no longer forbidden.** Both old
+rules were workarounds for artifact bloat that no longer exists:
+
+- **Agents SHOULD now set a private `CARGO_TARGET_DIR`.** Cargo takes an **exclusive lock** on its
+  target directory, so agents sharing one cannot compile simultaneously — one builds, the rest
+  block. Every "parallel" wave so far was parallel *thinking* and serialised *building*. At 2 GB
+  each, three concurrent agents cost ~6 GB. This is the single biggest remaining speedup.
+- **Agents should NOT run the full gate set.** Five agents × (full clippy + 622 tests + release
+  build) is ~40 minutes per wave re-proving a tree nobody changed. Agents run `cargo check` plus
+  their own tests; the coordinator runs all six gates once before the PR. Exceptions: broad `src/`
+  changes, and proving a race — where repeated full runs *are* the evidence.
+- Prefer `scratchpad/reclaim.sh` over `cargo clean`: `debug/incremental` is ~45% of the tree and
+  free to delete, while `deps` is the expensive half. But at 2m21s to recover, cleaning is now an
+  annoyance rather than a lost afternoon.
+
+**nextest was adopted and then demoted.** It is 28% slower here — 621 process spawns each build a
+Postgres pool, integration suites clone a template database per test, and the new advisory locks
+serialise across processes rather than within one. It is kept as a *secondary* runner because it
+forces cross-process contention, which is the case an in-process `Mutex` silently does not cover;
+both plan 07 shared-database fixes were re-verified under it. **`retries` is pinned at 0** — the
+default would have reported the `setup_state` race as "flaky" and shipped the isolation bug.
+
+Rejected: `[profile.dev.package."*"] opt-level = 3`. It optimises 405 dependencies to speed up test
+*runtime*, but this suite is Postgres-I/O-bound, and the cost is repaid on every dependency rebuild.
+
 ## Cycle log
+
+### Cycle 8 — 2026-07-27 — plan 07 implemented
+
+Branch `plan/07-identity-foundation`, four waves. **All five gates green: 622 passed, 0 failed,
+0 skipped**, run twice consecutively from cold (F5 template-database flake did not reappear).
+OpenAPI 131 → 141 operations, snapshot regenerated and committed; zero `rotate-secret` references.
+
+| Commit | Wave |
+|---|---|
+| `d291e47` | 1 — migrations `0012`/`0013`, domain DTOs |
+| `621b498` | B3 fix — `auth_provider_settings` keeps provider breakers |
+| `bf5a744` | 2 — repositories, services, deny-by-default domain policy |
+| `d5f5aa8` | 3 — D2 auth wiring, HTTP surface, auth-settings cache, OpenAPI regen |
+| `9718273` `113c08b` | 4 — the named-test coverage gap |
+
+**D2 verified directly, not on report.** `apply_admin_identity_grant` is called at exactly one site,
+`src/security/auth.rs:334`, inside `authenticate_admin`'s bearer branch. The two `authenticate_caller`
+paths (`:383`, `:394`) receive the ungranted actor. `git diff` on `src/security/authz.rs` is empty.
+`a_granted_identity_gains_admin_scope_only_on_the_admin_plane` pins both directions and asserts the
+403's message names the missing scope, so it cannot be confused with the application-binding 403.
+
+**Three real defects the plan would have shipped**, none of which the citation audit found — they
+needed an implementer and a live database:
+
+1. **`order by (issuer = $1) desc` applies the wrong policy.** `issuer` is nullable, `null = $1` is
+   `NULL`, and Postgres sorts nulls **first** under `desc` — so an issuer-less row outranks an exact
+   match and the wrong `allowed_email_domains` governs a grant. Fixed with `is not distinct from`.
+   No unit test can see this; it needs a real sort.
+2. **The plan's unique index is invalid SQL** — a bare `COALESCE` in an index column list.
+3. **`auth_provider_settings` would have reset every provider circuit breaker on every write** (B3),
+   found by the audit but only closable outside Wave 1's file set. Fixed in `621b498`, teeth verified.
+
+**Named-test audit: 80 extracted, 80 verified**, deliberately not sampled — plan 05's two false
+"complete and green" calls both came from checking a subset and generalising. 21 tests written; 5 are
+unwritable because D1 cut the setup-token path, which the plan's own D1 text predicts. Five of the
+highest-risk new tests had their teeth checked by injection.
+
+**A false claim of mine was caught and corrected** (`c3f6c09`): §0.4 said plan 06c made *any* missing
+catalog entry a `cargo build` failure. The `const` block covers `ExecutionFailureClass::ALL` only;
+everything else is a source-walking **test**. Still gated, but a green build is not proof of a
+complete catalog. §0.4's correction was also narrower than its phrasing implied — a third code,
+`setup_claim_credential_required`, was missing and Wave 3 found it.
+
+**Process note:** two agents wrote commit messages to the same scratchpad `msg.txt` and one commit
+briefly carried the other's message. Content was never affected — `git commit --only -- <paths>`
+scoped correctly throughout. **Use inline `-m`, or a per-agent path.** Add this to the shared-index
+lesson: the scratchpad is shared state too.
 
 ### Cycle 7 — 2026-07-26 → 07-27
 

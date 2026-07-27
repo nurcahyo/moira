@@ -7,6 +7,10 @@ mod masking;
 mod ssrf;
 
 pub use api_keys::{ApiKeyHasher, GeneratedApiKey};
+/// Re-exported for `src/http/identity.rs` (plan 07 module 11), which reads
+/// `X-Moira-System-Key` directly instead of going through `authenticate_admin`. Mirroring
+/// the parsing there instead would be a second implementation of a one-line rule.
+pub(crate) use auth::header_string;
 pub use auth::{Actor, ActorType, AdminAuthenticator, AuthService, CallerAuthenticator, JwksCache};
 pub use authz::AuthorizationService;
 pub use crypto::{

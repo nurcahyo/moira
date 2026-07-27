@@ -34,6 +34,15 @@ pub const ADMIN_SCOPES: &[&str] = &[
     "moira:consumer-keys:rotate",
     "moira:consumer-keys:revoke",
     "moira:audit:read",
+    // Plan 07 — the runtime auth-provider settings surface. `AuthorizationService::require`
+    // rejects an unknown scope with a 500, so these are not decoration: without them the
+    // whole `/api/v1/admin/auth/providers…` surface would be unreachable rather than
+    // unprotected. Nothing else about `authz.rs` changes for plan 07 — in particular no
+    // `ADMIN_IMPLYING_ACTOR_TYPES` entry is added, because decision D1 defers the
+    // `ActorType::SetupToken` variant that would have raised the question.
+    "moira:auth-settings:read",
+    "moira:auth-settings:write",
+    "moira:auth-settings:delete",
     "moira:identity:delegate",
     "moira:routes:read",
     "moira:routes:write",

@@ -223,6 +223,7 @@ impl Listener {
             fixture.pool.clone(),
             fixture.state.runtime_cache.clone(),
             fixture.state.runtime_handles.clone(),
+            fixture.state.auth_settings_cache.clone(),
             fixture.state.circuits.clone(),
         );
         // The listener loops forever, so nothing else will ever join it; aborting on

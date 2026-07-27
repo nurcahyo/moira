@@ -1,6 +1,8 @@
 mod admin;
+mod auth_settings;
 mod conversation;
 mod health;
+mod identity;
 mod observability;
 mod openapi;
 mod public;
@@ -466,6 +468,31 @@ fn admin_conversation_routes() -> OpenApiRouter<AppState> {
 fn admin_routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(admin::get_setup_status))
+        // Plan 07's identity surface registers **here**, in `admin_routes`, not in
+        // `documented_router`. `documented_router` only merges route groups and applies
+        // layers, so a route registered directly on it would sit outside the admin body
+        // limit and the admin timeout — including `POST /api/v1/admin/setup/claim`, which
+        // accepts an operator-authored body.
+        //
+        // `get_setup_claim_status` is intentionally unauthenticated and is registered
+        // alongside the rest anyway: the admin prefix is what keeps it inside
+        // `public_document`'s admin strip, and no router-level auth middleware exists on
+        // `/api/v1/admin` for it to need an exemption from — every handler self-
+        // authenticates in its own body.
+        .routes(routes!(identity::get_setup_claim_status))
+        .routes(routes!(identity::claim_admin_identity))
+        .routes(routes!(auth_settings::get_setup_auth_methods))
+        .routes(routes!(
+            auth_settings::list_auth_providers,
+            auth_settings::create_auth_provider
+        ))
+        .routes(routes!(
+            auth_settings::get_auth_provider,
+            auth_settings::patch_auth_provider,
+            auth_settings::delete_auth_provider
+        ))
+        .routes(routes!(auth_settings::enable_auth_provider))
+        .routes(routes!(auth_settings::disable_auth_provider))
         .routes(routes!(admin::list_applications, admin::create_application))
         .routes(routes!(
             admin::get_application,
@@ -617,6 +644,13 @@ mod tests {
             "/api/v1/memories/{id}",
             "/v1/responses",
             "/api/v1/admin/setup/status",
+            "/api/v1/admin/setup/claim-status",
+            "/api/v1/admin/setup/claim",
+            "/api/v1/admin/setup/auth-methods",
+            "/api/v1/admin/auth/providers",
+            "/api/v1/admin/auth/providers/{id}",
+            "/api/v1/admin/auth/providers/{id}/enable",
+            "/api/v1/admin/auth/providers/{id}/disable",
             "/api/v1/admin/applications",
             "/api/v1/admin/applications/{id}",
             "/api/v1/admin/applications/{id}/enable",
@@ -699,7 +733,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(operation_count, 131);
+        assert_eq!(operation_count, 141);
     }
 
     #[test]
@@ -798,6 +832,15 @@ mod tests {
             ("/metrics", "get"),
             ("/openapi.json", "get"),
             ("/docs", "get"),
+            // Deliberately unauthenticated (plan 07 module 11): its entire response is
+            // `{"claimed": bool}` — one bit an attacker could infer anyway from the fact
+            // that the instance is freshly deployed, and one a setup wizard genuinely
+            // needs before any human holds a credential. Its sibling
+            // `/api/v1/admin/setup/auth-methods` stays authenticated because *its*
+            // response is identity configuration; the dividing line is information
+            // content, not endpoint category. Anyone adding a second unauthenticated
+            // admin operation to this list must first explain why that line has moved.
+            ("/api/v1/admin/setup/claim-status", "get"),
         ];
 
         for (path, item) in paths {
@@ -832,10 +875,18 @@ mod tests {
                                 .flat_map(|requirement| requirement.keys().map(String::as_str))
                         })
                         .collect();
-                    let expected = if path == "/api/v1/admin/setup/status" {
-                        BTreeSet::from(["bearerAuth", "systemKeyAuth"])
-                    } else {
-                        BTreeSet::from(["bearerAuth", "consumerKeyAuth", "systemKeyAuth"])
+                    let expected = match path.as_str() {
+                        // Setup-actor gated: `require_setup_actor` admits only
+                        // `ActorType::SystemKey` and `TrustedJwt`, so a consumer key is
+                        // not an alternative and must not be advertised as one.
+                        "/api/v1/admin/setup/status" | "/api/v1/admin/setup/auth-methods" => {
+                            BTreeSet::from(["bearerAuth", "systemKeyAuth"])
+                        }
+                        // System key only, and that narrowness is the security property:
+                        // accepting a bearer JWT here would make "the first successful
+                        // admin JWT wins" possible on a fresh deployment.
+                        "/api/v1/admin/setup/claim" => BTreeSet::from(["systemKeyAuth"]),
+                        _ => BTreeSet::from(["bearerAuth", "consumerKeyAuth", "systemKeyAuth"]),
                     };
                     assert_eq!(
                         alternatives, expected,
@@ -948,6 +999,8 @@ mod tests {
                 true,
             ),
             ("/api/v1/admin/jwt-issuers", "post", "201", false, false),
+            ("/api/v1/admin/setup/claim", "post", "201", false, false),
+            ("/api/v1/admin/auth/providers", "post", "201", false, false),
         ];
 
         for (path, method, success_status, requires_if_match, once_only_secret) in operations {
@@ -1029,7 +1082,7 @@ mod tests {
     ///
     /// `false` is reserved for preconditions that are genuinely advisory: the provider
     /// runtime-policy `PUT` reads the header through `optional_if_match`.
-    const IF_MATCH_OPERATIONS: [(&str, &str, bool); 36] = [
+    const IF_MATCH_OPERATIONS: [(&str, &str, bool); 40] = [
         ("/api/v1/admin/agent-profiles/{id}", "delete", true),
         ("/api/v1/admin/agent-profiles/{id}", "patch", true),
         ("/api/v1/admin/agent-profiles/{id}/disable", "post", true),
@@ -1038,6 +1091,10 @@ mod tests {
         ("/api/v1/admin/applications/{id}", "patch", true),
         ("/api/v1/admin/applications/{id}/disable", "post", true),
         ("/api/v1/admin/applications/{id}/enable", "post", true),
+        ("/api/v1/admin/auth/providers/{id}", "delete", true),
+        ("/api/v1/admin/auth/providers/{id}", "patch", true),
+        ("/api/v1/admin/auth/providers/{id}/disable", "post", true),
+        ("/api/v1/admin/auth/providers/{id}/enable", "post", true),
         (
             "/api/v1/admin/applications/{id}/execution-policy",
             "put",

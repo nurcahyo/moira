@@ -20,6 +20,7 @@ use uuid::Uuid;
 use crate::{
     config::{CallerAuthSettings, JwksFetchSettings, JwtAuthSettings},
     error::{AppError, current_request_id},
+    infra::repositories::AdminIdentityRepository,
 };
 
 use super::{
@@ -323,7 +324,14 @@ impl AuthService {
         }
 
         if let Some(token) = token {
-            return self.authenticate_trusted_jwt(pool, token).await;
+            // Plan 07 module 7a / decision D2. The admin-identity grant is applied
+            // **here**, to the actor `authenticate_trusted_jwt` returns, and nowhere
+            // else. See [`apply_admin_identity_grant`] for why the shared function is the
+            // wrong home for it.
+            let (actor, issuer) = self
+                .authenticate_trusted_jwt_with_issuer(pool, token)
+                .await?;
+            return apply_admin_identity_grant(pool, &issuer, actor).await;
         }
 
         if let Some(raw_key) = system_key {
@@ -405,6 +413,23 @@ impl AuthService {
         ))
     }
 
+    /// Verifies an `X-Moira-System-Key` value and **nothing else** (plan 07, module 7b).
+    ///
+    /// `POST /api/v1/admin/setup/claim` cannot call [`Self::authenticate_admin`], which
+    /// happily accepts a bearer JWT. If it did, whoever reached a freshly deployed
+    /// instance first with any verifying trusted JWT could grant themselves admin — the
+    /// "first-login-wins" land-grab `plans/01` §4.4 requires to be structurally
+    /// impossible. This method has no bearer branch, no consumer-key branch and no
+    /// dev-admin fallback, so that refusal is a property of the signature rather than of
+    /// a conditional a later edit could invert.
+    pub(crate) async fn verify_system_key_only(
+        &self,
+        pool: &PgPool,
+        raw_key: &str,
+    ) -> Result<Actor, AppError> {
+        self.verify_api_key(pool, "system_api_keys", raw_key).await
+    }
+
     async fn verify_api_key(
         &self,
         pool: &PgPool,
@@ -476,6 +501,27 @@ impl AuthService {
         pool: &PgPool,
         token: &str,
     ) -> Result<Actor, AppError> {
+        self.authenticate_trusted_jwt_with_issuer(pool, token)
+            .await
+            .map(|(actor, _issuer)| actor)
+    }
+
+    /// The trusted-JWT path, additionally returning the **verified** issuer string.
+    ///
+    /// The issuer is threaded out rather than re-derived because the only caller that
+    /// wants it — [`Self::authenticate_admin`]'s bearer branch — would otherwise have to
+    /// query `trusted_jwt_issuers` a second time on every authenticated admin request
+    /// just to recover a string this function already held. Returning it costs nothing
+    /// and keeps the grant lookup to one round trip.
+    ///
+    /// It is the *verified* issuer (`issuer_config.issuer`, the registered row's value
+    /// that `Validation::set_issuer` was pinned to), never the unverified `iss` claim,
+    /// so the grant lookup key cannot be influenced by an attacker-chosen token.
+    async fn authenticate_trusted_jwt_with_issuer(
+        &self,
+        pool: &PgPool,
+        token: &str,
+    ) -> Result<(Actor, String), AppError> {
         let header = decode_header(token).map_err(|err| AppError::Unauthorized(err.to_string()))?;
         let key_id = header
             .kid
@@ -521,7 +567,8 @@ impl AuthService {
         let claims = decode::<Value>(token, &key, &validation)
             .map_err(|err| AppError::Unauthorized(err.to_string()))?
             .claims;
-        actor_from_trusted_claims(&issuer_config, claims)
+        let actor = actor_from_trusted_claims(&issuer_config, claims)?;
+        Ok((actor, issuer_config.issuer))
     }
 
     async fn load_issuer(
@@ -823,6 +870,73 @@ fn actor_from_static_claims(claims: StaticClaims) -> Result<Actor, AppError> {
     })
 }
 
+/// Unions an `admin_identities` grant onto a trusted-JWT actor (plan 07, module 7a).
+///
+/// # Why this is a free function called from `authenticate_admin`, not a step inside
+/// `authenticate_trusted_jwt` — decision D2, and the single most important line in this file
+///
+/// [`AuthService::authenticate_admin`] and [`AuthService::authenticate_caller`] **both**
+/// delegate to `authenticate_trusted_jwt`, and `authenticate_caller` returns that actor
+/// **verbatim** for a bare bearer token. Applying the grant inside the shared function
+/// would therefore put `moira:admin` on the **public execution API**, where — combined with
+/// [`AuthorizationService`](super::AuthorizationService)'s admin implication for
+/// `ActorType::TrustedJwt` — it satisfies `moira:execution:override-credential`,
+/// `moira:execution:override-model` and `moira:identity:delegate` for any granted human
+/// sending `POST /api/v1/responses` with nothing but their bearer token.
+///
+/// Admin-identity grants apply on the **admin plane only** (`plans/01` §4.3 Mode A).
+/// `combine_consumer_and_jwt` already strips `moira:admin` on the consumer+JWT path, so
+/// admin-plane-only is the direction the surrounding code already goes; a bare JWT carrying
+/// admin onto the public surface would be the one path that disagreed.
+///
+/// Moving this call into `authenticate_trusted_jwt` is a privilege-escalation regression,
+/// not a refactor. `a_granted_identity_gains_admin_scope_only_on_the_admin_plane` fails in
+/// both directions if it happens.
+///
+/// # No-grant callers are byte-identical to pre-change behaviour
+///
+/// For every `(issuer, subject)` with no active grant row — the overwhelming majority of
+/// trusted-JWT callers, including every machine-to-machine integration — the lookup returns
+/// nothing and the actor is returned untouched.
+async fn apply_admin_identity_grant(
+    pool: &PgPool,
+    issuer: &str,
+    mut actor: Actor,
+) -> Result<Actor, AppError> {
+    // Guaranteed by `actor_from_trusted_claims`, which errors when the subject claim is
+    // missing. Probing the grant table with an empty subject would be a lookup on a key
+    // that cannot exist, so there is nothing to gain by re-deriving it.
+    let Some(subject) = actor.subject.clone() else {
+        return Ok(actor);
+    };
+
+    let Some(grant) = crate::infra::repositories::PgAdminIdentityRepository::new(pool.clone())
+        .find_active_grant(issuer, &subject)
+        .await?
+    else {
+        return Ok(actor);
+    };
+
+    union_granted_scopes(&mut actor, grant.granted_scopes);
+    Ok(actor)
+}
+
+/// A **union**, never a replace.
+///
+/// An issuer that also maps narrower JWT-claimed scopes must not lose them because its
+/// subject happens to hold a grant — replacing would *reduce* authority in that case, which
+/// is a surprising way for a grant to behave. The sort-then-dedup mirrors what
+/// [`actor_from_trusted_claims`] already does to the claimed scopes, so an actor's scope list
+/// has one canonical form however it was assembled.
+///
+/// Split out from [`apply_admin_identity_grant`] purely so the merge semantics are testable
+/// without a database; the lookup around it is what needs one.
+fn union_granted_scopes(actor: &mut Actor, granted: Vec<String>) {
+    actor.scopes.extend(granted);
+    actor.scopes.sort();
+    actor.scopes.dedup();
+}
+
 fn actor_from_trusted_claims(
     issuer: &TrustedIssuerConfig,
     claims: Value,
@@ -1083,7 +1197,12 @@ fn optional_bearer_token(headers: &HeaderMap) -> Result<Option<&str>, AppError> 
         .ok_or_else(|| AppError::Unauthorized("Authorization must use Bearer token".to_string()))
 }
 
-fn header_string(headers: &HeaderMap, name: &'static str) -> Option<String> {
+/// `pub(crate)` for plan 07 module 11: `POST /api/v1/admin/setup/claim` reads
+/// `X-Moira-System-Key` itself rather than delegating to `authenticate_admin`, and it must
+/// read it through the *same* helper the rest of this file uses. A second transcription of
+/// "pull a header out as a string" is how two surfaces end up disagreeing about, say, a
+/// non-ASCII header value.
+pub(crate) fn header_string(headers: &HeaderMap, name: &'static str) -> Option<String> {
     headers
         .get(name)
         .and_then(|value| value.to_str().ok())
@@ -1101,6 +1220,57 @@ mod tests {
         super::ssrf::test_stub::{EMPTY_JWKS, StubPlan, spawn},
         *,
     };
+
+    /// Module 7a's merge semantics, without a database.
+    ///
+    /// The union direction matters: a granted human whose issuer also maps narrower
+    /// JWT-claimed scopes must keep both sets. Replacing would make holding a grant
+    /// *reduce* authority in that case — a surprising enough behaviour that it is worth
+    /// pinning rather than leaving to the reader of a one-line `extend`.
+    #[test]
+    fn admin_identity_grant_unions_and_dedups_scopes() {
+        let mut actor = Actor {
+            actor_type: ActorType::TrustedJwt,
+            subject: Some("granted-human".to_string()),
+            scopes: vec![
+                "moira:conversations:read".to_string(),
+                "moira:admin".to_string(),
+            ],
+            ..Actor::default()
+        };
+
+        union_granted_scopes(
+            &mut actor,
+            vec!["moira:admin".to_string(), "moira:setup:read".to_string()],
+        );
+
+        assert_eq!(
+            actor.scopes,
+            vec![
+                "moira:admin".to_string(),
+                "moira:conversations:read".to_string(),
+                "moira:setup:read".to_string(),
+            ],
+            "the grant must be unioned in, deduplicated, and left in the same canonical \
+             sorted form `actor_from_trusted_claims` produces"
+        );
+    }
+
+    /// The no-grant path is the overwhelming majority of trusted-JWT traffic, and it must
+    /// stay byte-identical to pre-plan-07 behaviour: an empty grant list changes nothing,
+    /// not even the ordering the caller's own claims arrived in.
+    #[test]
+    fn an_actor_without_a_grant_is_left_untouched() {
+        let claimed = vec!["a".to_string(), "b".to_string()];
+        let mut actor = Actor {
+            scopes: claimed.clone(),
+            ..Actor::default()
+        };
+
+        union_granted_scopes(&mut actor, Vec::new());
+
+        assert_eq!(actor.scopes, claimed);
+    }
 
     /// JWKS fetch policy for the loopback stub: the dev override is what makes a
     /// `http://127.0.0.1` IdP reachable at all, which is itself the assertion that

@@ -99,6 +99,25 @@ pub struct AuthSettings {
     /// apart into three divergent SSRF postures.
     #[serde(default)]
     pub jwks: JwksFetchSettings,
+    /// Backstop staleness bound on the in-process auth-provider settings cache
+    /// (`MOIRA_AUTH__PROVIDER_SETTINGS_CACHE_TTL_SECONDS`).
+    ///
+    /// It is **not** the invalidation mechanism: the `moira_runtime_config` NOTIFY trigger
+    /// on `auth_provider_settings` clears the cache on every instance the moment a write
+    /// commits (CONVENTIONS §7.2). This TTL only bounds how long a stale entry could
+    /// survive a *lost* notification — for instance across a listener reconnect — so it is
+    /// a safety net rather than a tuning knob, and it is set well above the interval any
+    /// operator would notice.
+    ///
+    /// This is an infrastructure knob and correctly lives in settings. The auth-method
+    /// policy itself — including `allowed_email_domains` — lives in the **database**, per
+    /// CONVENTIONS §7.2, so that plan 08's setup wizard can configure it.
+    #[serde(default = "default_auth_provider_settings_cache_ttl_seconds")]
+    pub provider_settings_cache_ttl_seconds: u64,
+}
+
+fn default_auth_provider_settings_cache_ttl_seconds() -> u64 {
+    300
 }
 
 /// SSRF / resource limits applied to every outbound JWKS fetch.
@@ -738,6 +757,7 @@ impl Default for AuthSettings {
             },
             caller: CallerAuthSettings::default(),
             jwks: JwksFetchSettings::default(),
+            provider_settings_cache_ttl_seconds: default_auth_provider_settings_cache_ttl_seconds(),
         }
     }
 }

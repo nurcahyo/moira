@@ -228,6 +228,97 @@ mod tests {
         assert!(is_known_key("moira.error.if_match_required"));
     }
 
+    /// Plan 07's error keys, named exactly (CONVENTIONS §4.5). D1 cuts the
+    /// setup-token credential path, so the four token-lifecycle codes the plan's body
+    /// once named (`setup_token_invalid`/`_expired`/`_consumed`/`_target_mismatch`) and
+    /// the unemittable `auth_provider_method_unsupported` (§0.7 Wave 2) are deliberately
+    /// **absent** here — listing them would pin codes nothing in this tree ever raises.
+    /// `setup_token_not_supported` replaces them as D1's one refusal code.
+    #[test]
+    fn identity_error_keys_exist_in_the_catalog() {
+        for key in [
+            "moira.error.unregistered_trusted_issuer",
+            "moira.error.admin_claim_email_required",
+            "moira.error.admin_claim_email_not_verified",
+            "moira.error.admin_claim_domain_not_allowed",
+            "moira.error.admin_identity_already_claimed",
+            "moira.error.setup_claim_credential_required",
+            "moira.error.setup_token_not_supported",
+            "moira.error.auth_provider_not_found",
+            "moira.error.duplicate_auth_provider",
+            "moira.error.auth_provider_method_config_incomplete",
+            "moira.error.auth_provider_url_not_allowed",
+            "moira.error.console_issuer_must_not_assert_scopes",
+        ] {
+            let entry = all_entries()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("{key} must be catalogued"));
+            assert!(
+                !entry.default_message.is_empty(),
+                "{key} default_message must be non-empty"
+            );
+            assert!(
+                !entry.description.is_empty(),
+                "{key} description must be non-empty"
+            );
+        }
+    }
+
+    /// `setup_token_issued` is named by the plan's i18n table alongside the claimed
+    /// notice, but D1 cuts `mint_setup_token` entirely — there is no emitter, and a
+    /// catalog entry with no emitter is worse than the gap (§0.7 Wave 2's own rule for
+    /// `auth_provider_method_unsupported`). It is deliberately not asserted here, which
+    /// is also why this checks a single key rather than looping over a list of one.
+    #[test]
+    fn identity_notice_keys_exist_in_the_catalog() {
+        let key = "moira.notice.admin_identity_claimed";
+        let entry = all_entries()
+            .find(|entry| entry.key == key)
+            .unwrap_or_else(|| panic!("{key} must be catalogued"));
+        assert!(
+            !entry.default_message.is_empty(),
+            "{key} default_message must be non-empty"
+        );
+        assert!(
+            !entry.description.is_empty(),
+            "{key} description must be non-empty"
+        );
+    }
+
+    /// **D7 regression guard.** The client-secret error codes an earlier draft of plan
+    /// 07 specified must never reappear in the catalog: their existence would imply a
+    /// secret-handling code path that decision D7 deleted. If one of these keys is ever
+    /// added back, it means someone reintroduced the secret envelope this plan removed.
+    #[test]
+    fn no_auth_provider_client_secret_keys_exist_in_the_catalog() {
+        for key in [
+            "moira.error.auth_provider_secret_required",
+            "moira.error.auth_provider_secret_not_supported",
+            "moira.error.auth_provider_secret_rebind_required",
+        ] {
+            assert!(
+                !is_known_key(key),
+                "{key} must not exist: decision D7 removed the OAuth client secret \
+                 from Moira entirely, so no code describing a secret condition on \
+                 auth_provider_settings may be catalogued"
+            );
+        }
+
+        let mirror = read_docs_mirror();
+        for entry in &mirror.entries {
+            for key in [
+                "moira.error.auth_provider_secret_required",
+                "moira.error.auth_provider_secret_not_supported",
+                "moira.error.auth_provider_secret_rebind_required",
+            ] {
+                assert_ne!(
+                    entry.key, key,
+                    "{key} must not exist in docs/i18n-response-catalog.json either"
+                );
+            }
+        }
+    }
+
     #[test]
     fn new_catalog_entries_have_non_empty_default_messages_and_descriptions() {
         for key in [

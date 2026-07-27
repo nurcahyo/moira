@@ -94,6 +94,38 @@ granted identity receives **403** on a public-API scope it does not independentl
 | `migrations/*` | All internal cites **true**; only the *new* filenames collide (B1) |
 | `src/security/authz.rs`, `src/security/crypto.rs`, `src/error.rs`, `src/application/context.rs`, `src/domain/i18n.rs` | Substantially **true** — see the audit for one-or-two-line offsets |
 
+### §0.7 Found during Wave 1 implementation — corrections §0 itself missed
+
+| Finding | Resolution |
+|---|---|
+| **The unique index at `:361` is invalid SQL.** `on auth_provider_settings (method, coalesce(issuer, ''))` — Postgres rejects a bare `COALESCE` in an index column list; an expression needs its own parentheses | Written as `(method, (coalesce(issuer, '')))`. Verified against a live server |
+| `notify_moira_runtime_config_change()` begins at `migrations/0004_admin_api_contract.sql:107`, not `:108` | §0.5 marked all `migrations/*` cites clean; this one was off by one |
+| "Verify whether a singleton convention already exists elsewhere in the schema and prefer it" (`:306`) | **None exists.** Grepped `0001`–`0011`. Used the `id boolean primary key default true check (id)` idiom this plan proposes |
+| **The plan never says what `granted_by_actor_type`'s CHECK should allow under D1** | `'setup_token'` kept in the allowed set. D1 is *deferred with reversal conditions*, and migrations are append-only — dropping the value would make reversing D1 cost another migration, for no security gain, since Moira controls what it writes to that column. Recorded as a judgement call, not something the plan decided |
+
+Found during Wave 2:
+
+| Finding | Resolution |
+|---|---|
+| **A latent ordering bug in the implied `governing_policy` query.** Module 10 step 1 says the policy matches "on `issuer`, or via `trusted_jwt_issuer_id`". The natural spelling is `order by (issuer = $1) desc` — but `issuer` is nullable, `null = $1` is `NULL`, and Postgres sorts nulls **first** under `desc`. An issuer-less row would therefore outrank an exact match and the **wrong `allowed_email_domains` would be applied** | Written `is not distinct from`, with a DB-backed test (`an_exact_issuer_match_outranks_a_match_through_the_trusted_issuer_id`). No unit test can see this — it needs a real Postgres sort |
+| **Module 9's enable-time completeness check is unreachable as `0013` is written.** `auth_provider_settings_method_shape` is an *unconditional* CHECK, not `enabled`-conditional, so no incomplete row can be stored to later be enabled | Check kept and documented in-code as forward cover if a later migration relaxes the CHECK to allow drafts, rather than silently dropping a named plan requirement |
+| **`auth_provider_method_unsupported` (`:937`) is unemittable.** `AuthMethod` is a three-variant enum on a `deny_unknown_fields` DTO, so an unsupported method is a serde rejection (`invalid_request`), never a service-level condition | Not added. A catalog entry with no emitter is worse than the gap |
+| **Two files outside Components & ownership had to change** — flagged rather than absorbed, per this plan's own "an unlisted file in the diff is a scope violation to raise" rule | `src/security/authz.rs`: the three `moira:auth-settings:*` scopes. Without them `AuthorizationService::require` returns `AppError::Internal` (500) for an unknown scope, making module 9 **unreachable**, not merely ungated. Scope block only — no `ADMIN_IMPLYING_ACTOR_TYPES` change. `src/application/setup.rs`: `require_setup_actor` widened to `pub(crate)` so module 9 gates on the same function as the existing endpoint rather than a second transcription of the same rule |
+| `scope_invalid` is emitted as **422, not the 400 the plan states** (`:690`) | Deliberate: reuses `AuthorizationService::normalize_scopes`, the existing helper, which emits via `AppError::unprocessable` — the same status the analogous system-key and consumer-key creation paths already return. Diverging per-call-site for one code is worse than the documented drift |
+| `setup_token_not_supported` is a new code the plan's table does not list | D1 says "rejected with a clear error" without naming one. `invalid_request` would fit the catalog description, but plan 08's console needs to distinguish "you sent a reserved field" from any other schema complaint |
+
+Found during Wave 3:
+
+| Finding | Resolution |
+|---|---|
+| **`setup_claim_credential_required` had no catalog entry.** §0.4 declared the catalog-gap section obsolete, but that covered only `database_unavailable` and `idempotency_in_progress`. Module 11 emits this third code, which the i18n table lists as *new*; Wave 2's i18n pass added the other fifteen and missed it, there being no emitter yet | Added to `src/i18n/catalog/errors.rs` and the `docs/` mirror. A reminder that §0.4's correction was narrower than its phrasing suggested |
+| **Module 13c's TTL cannot be `setup_token_ttl_seconds` under D1** — it would configure a cut feature, while Module 13a needs a TTL for the cache it introduces | Shipped `AuthSettings.provider_settings_cache_ttl_seconds` (default 300). The frozen-contract "New config" row and the matching DoD line are **amended** above. Plan 08 binds to no config field, so the frozen contract for the console is unmoved |
+| **`spawn_runtime_config_listener` gains a fifth parameter**, so `src/main.rs` and `tests/runtime_config_invalidation.rs` had to change — neither is in Components & ownership | Raised rather than absorbed, per this plan's own scope-violation rule |
+| **`src/http/admin.rs` had to change** — Module 12 says to reuse `etag_headers`/`require_if_match`/`admin_actor`, but they are private and the file is listed nowhere in the ownership table | Widened to `pub(super)`. Copying them into the new file would be the transcription divergence this plan warns against elsewhere |
+| **`src/security/auth.rs` now imports `crate::infra::repositories`** — the first security→infra edge in the tree | `docs/project-structure.md` does not forbid it, and it is better than the raw SQL `load_issuer` already runs, but it is a new edge in the layer graph and should be a deliberate decision rather than a side effect |
+| **`every_operation_documents_request_ids_and_protected_operations_document_auth` needs a three-way security match**, not the two-way one §0.3 implies | `setup/auth-methods` declares `{bearerAuth, systemKeyAuth}` (setup-actor gating excludes consumer keys); `setup/claim` declares `{systemKeyAuth}` alone |
+| **The module 10 operator runbook was never written.** Wave 0 item 5 was left unchecked and no later wave owned it | Shipped `docs/admin-identity-claiming.md`, linked from `README.md`. Flagged as work taken outside the assigned modules rather than absorbed silently |
+
 ### §0.6 What this plan must NOT do
 
 The four `TODO(post-deploy)` markers in `src/application/runtime_admin.rs` and
@@ -172,9 +204,9 @@ the provider. `plans/06-architecture-test-hygiene.md:377` still refers to them b
 
 | Layer | File | Change |
 |---|---|---|
-| `migrations/` | `0012_admin_identity_claims.sql` (new) | `admin_identities`, `setup_state`, `admin_setup_tokens` |
-| | `0013_auth_provider_settings.sql` (new) | `auth_provider_settings` + version-bump trigger + NOTIFY trigger |
-| `src/domain/` | `identity.rs` (new) | `SetupClaimStatusResponse`, `ClaimAdminIdentityRequest`, `AdminIdentityRecord`, `AdminIdentityStatus`, `GeneratedSetupTokenResponse` |
+| `migrations/` | `0012_admin_identity_claims.sql` (new) | `admin_identities`, `setup_state` — **no `admin_setup_tokens`** (§0.2 D1) |
+| | `0013_auth_provider_settings.sql` (new) | `auth_provider_settings` + version-bump trigger + NOTIFY trigger, **and the `CIRCUIT_UNAFFECTED_RESOURCE_TYPES` entry in `src/infra/db.rs` that the NOTIFY trigger requires** (§0.1 B3) |
+| `src/domain/` | `identity.rs` (new) | `SetupClaimStatusResponse`, `ClaimAdminIdentityRequest`, `AdminIdentityRecord`, `AdminIdentityStatus` — **no `GeneratedSetupTokenResponse`** (§0.2 D1) |
 | | `auth_settings.rs` (new) | `AuthProviderSettingsRecord`, `…CreateRequest`, `…PatchRequest`, `AuthMethod`, `SetupAuthMethodsResponse`, `PublicAuthMethod` |
 | | `mod.rs` | two additive `pub use` blocks |
 | `src/infra/repositories/` | `identity.rs` (new) | `AdminIdentityRepository` trait + `PgAdminIdentityRepository` — **trait from day one**, so this plan needs no P2-3-style retrofit |
@@ -960,11 +992,22 @@ entries exist:
 The "if 06 has not landed, 07 must add these two entries itself" contingency is therefore moot — 06
 landed (`39c5326`).
 
-**And the class of bug this section worried about can no longer reach review.** Plan 06c made a
-missing catalog entry a **compile** error, not a test failure: `ExecutionFailureClass::code()` is a
-`const fn` the i18n gate evaluates at compile time, and the gate walks `AppError::coded`/`conflict`/
-`unprocessable` literals plus `validate_override` call sites. Any new `moira.error.*` this plan emits
-without a catalog entry fails `cargo build`. Do not hand-write a coverage test for this.
+**The class of bug this section worried about is now gated — but read what the gate actually is,
+because an earlier draft of this section overstated it.**
+
+- **Compile error**, via the `const _: () = { … }` block at `src/i18n/catalog/mod.rs:107-121`: only
+  `ExecutionFailureClass::ALL`. `code()` is a `const fn`, so a missing entry for an execution-failure
+  class is `error[E0080]`.
+- **Test failure**, not a build failure, for everything else: codes passed to
+  `AppError::coded`/`conflict`/`unprocessable` are covered by
+  `every_coded_error_literal_in_src_has_a_catalog_entry`, which walks source literals, and
+  `validate_override`'s forwarded codes by `every_validate_override_code_has_a_catalog_entry`. The
+  `docs/i18n-response-catalog.json` mirror has its own test.
+
+So a new `moira.error.*` this plan emits without a catalog entry is caught by **`cargo test`, not
+`cargo build`**. That is still a gate, and no coverage test needs hand-writing — but an implementer
+who trusted the earlier "fails `cargo build`" phrasing could skip the test run and believe a green
+build meant a complete catalog. It does not.
 
 ### New `moira.notice.*` entries
 
@@ -1048,7 +1091,7 @@ scratch — verify §0 still matches the tree and move on.**
 | Default granted scope | `["moira:admin"]` (member of `ADMIN_SCOPES`, `src/security/authz.rs:7-91`) |
 | New scopes | `moira:auth-settings:read`, `moira:auth-settings:write`, `moira:auth-settings:delete` — appended to `ADMIN_SCOPES` |
 | New `ActorType` | `SetupToken` (serializes as `"setup_token"`); denied admin implication |
-| New config | `AuthSettings.setup_token_ttl_seconds` (default 900) — **the only** new settings field; auth-method policy including allowed email domains lives in the **database**, per CONVENTIONS §7.2 |
+| New config | ⚠️ **AMENDED (§0.7).** `AuthSettings.provider_settings_cache_ttl_seconds` (default 300) — **the only** new settings field. It is *not* `setup_token_ttl_seconds`: D1 cuts the setup-token path, so that field would configure a feature that does not exist, while Module 13a genuinely needs a TTL for the auth-settings cache it introduces. Auth-method policy including allowed email domains still lives in the **database**, per CONVENTIONS §7.2. Plan 08 binds to no config field, so this amendment does not move the frozen contract for the console |
 | New error codes | 16 (see i18n section), each with a `moira.error.<code>` catalog entry. **D7 removed three** (`auth_provider_secret_required`, `auth_provider_secret_not_supported`, `auth_provider_secret_rebind_required`) and added one (`auth_provider_method_config_incomplete`) |
 | New notice keys | `moira.notice.admin_identity_claimed`, `moira.notice.setup_token_issued` |
 
@@ -1265,7 +1308,7 @@ Following `tests/support/mod.rs` and the in-process-router pattern of `tests/adm
 - [ ] **An auth-settings write invalidates the runtime cache on every instance through the existing Postgres `LISTEN/NOTIFY` path — proven by a test, not asserted** (CONVENTIONS §7.2).
 - [ ] All three CONVENTIONS §7.3 modes are reachable from settings: `google_oauth` and `generic_oidc` via `auth_provider_settings`; `jwks` via `auth_provider_settings` linked to the **pre-existing** `trusted_jwt_issuers` surface, with **no new trust mechanism invented**.
 - [ ] Any `trusted_jwt_issuers` row linked as a console issuer has `scopes_claim IS NULL`, enforced on write and asserted by a test (CONVENTIONS §7.5 — no self-asserted scopes).
-- [ ] The allowed-email-domain policy lives in the **database** (`auth_provider_settings.allowed_email_domains`), not in environment variables; `AuthSettings.setup_token_ttl_seconds` is the **only** new settings field.
+- [ ] The allowed-email-domain policy lives in the **database** (`auth_provider_settings.allowed_email_domains`), not in environment variables; `AuthSettings.provider_settings_cache_ttl_seconds` is the **only** new settings field (amended from `setup_token_ttl_seconds` — see the frozen-contract row and §0.7).
 - [ ] The existing `GET /api/v1/admin/setup/status` endpoint, `SetupStatusResponse`, `SetupChecks`/`SetupCheckName`, `SETUP_READINESS_SQL`, and the secret-column guard test at `src/infra/repositories/setup.rs:164-179` are **unmodified** and their tests still pass.
 - [ ] The existing `bootstrap-system-key` CLI is **unmodified** and documented as the break-glass root that the claim flow's system-key path depends on.
 - [ ] **No Next.js / OAuth-client / session / cookie code exists in this diff** — a reviewer grep for `next`, `oauth` (outside config field names and doc text), `session`, `cookie` returns nothing new. Moira runs no OAuth flow.
