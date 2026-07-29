@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use reqwest::Client;
 use sqlx::PgPool;
@@ -7,10 +7,14 @@ use crate::{
     app::cluster_lease::ClusterLeaseStatus,
     config::Settings,
     error::AppError,
-    infra::{metrics::MetricsRegistry, redis::RedisClient, workers::WorkerRegistry},
+    infra::{
+        coordination::RedisCoordinator, metrics::MetricsRegistry, redis::RedisClient,
+        workers::WorkerRegistry,
+    },
     orchestration::{
-        AuthProviderSettingsCache, CircuitBreakerRegistry, ConcurrencyController,
-        InMemoryRateLimiter, ProviderRuntimeCache, RuntimeConfigCache,
+        AuthProviderSettingsCache, CircuitBreakerRegistry, ClusterCoordinator, ClusterRateLimiter,
+        ConcurrencyController, InMemoryRateLimiter, ProviderRuntimeCache, RateLimiterBackend,
+        RuntimeConfigCache,
     },
     security::{
         AdminAuthenticator, ApiKeyHasher, AuthService, AuthorizationService, CallerAuthenticator,
@@ -59,7 +63,15 @@ pub struct AppState {
     pub auth_settings_cache: AuthProviderSettingsCache,
     pub runtime_handles: ProviderRuntimeCache,
     pub concurrency: ConcurrencyController,
-    pub public_rate_limiter: InMemoryRateLimiter,
+    pub public_rate_limiter: RateLimiterBackend,
+    /// **Per-process, deliberately, whether or not Redis is enabled.**
+    ///
+    /// Breaker state is *earned* by a replica observing its own transport
+    /// failures. Sharing it would let one replica behind a bad network path open
+    /// the circuit for replicas whose path to the same provider is healthy —
+    /// converting a local fault into a cluster-wide one. Plan 10 §0.4b makes this
+    /// explicit; there is no Redis breaker backend and adding one would be a
+    /// regression, not a feature.
     pub circuits: CircuitBreakerRegistry,
     pub admin_auth: AdminAuthenticator,
     pub caller_auth: CallerAuthenticator,
@@ -118,14 +130,41 @@ impl AppState {
             settings.runtime.runtime_cache_ttl_seconds,
             settings.runtime.runtime_cache_max_entries,
         );
+        // The one place the coordination backend is chosen, and it is chosen from
+        // one condition: whether a Redis client exists. `RedisClient::from_settings`
+        // already returned `None` for the default `redis.enabled = false`, so the
+        // absent case needs no second flag to agree with — there is nothing for a
+        // second flag to disagree with it about.
+        //
+        // Rate limiting and concurrency are the *only* two controls this affects.
+        // They are also the only two that are not already cluster-correct: the
+        // admission lease, leader election, idempotency and runtime-config
+        // invalidation all coordinate through Postgres regardless.
+        let coordinator: Option<Arc<dyn ClusterCoordinator>> = redis
+            .clone()
+            .map(|redis| Arc::new(RedisCoordinator::new(redis, metrics.clone())) as Arc<_>);
+
         let concurrency = ConcurrencyController::new(
             settings.runtime.global_execution_concurrency,
             settings.runtime.application_execution_concurrency,
             settings.runtime.external_user_execution_concurrency,
             settings.runtime.runtime_cache_max_entries,
         );
-        let public_rate_limiter =
-            InMemoryRateLimiter::new(settings.public_api.rate_limiter_max_entries);
+        let concurrency = match coordinator.as_ref() {
+            Some(coordinator) => concurrency.with_cluster(
+                coordinator.clone(),
+                Duration::from_secs(settings.redis.permit_ttl_seconds.max(1)),
+            ),
+            None => concurrency,
+        };
+        let public_rate_limiter = match coordinator.as_ref() {
+            Some(coordinator) => {
+                RateLimiterBackend::Cluster(ClusterRateLimiter::new(coordinator.clone()))
+            }
+            None => RateLimiterBackend::InMemory(InMemoryRateLimiter::new(
+                settings.public_api.rate_limiter_max_entries,
+            )),
+        };
         let circuits = CircuitBreakerRegistry::new();
         let admin_auth = AdminAuthenticator::new(
             settings.auth.admin.clone(),

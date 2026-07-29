@@ -302,13 +302,44 @@ pub struct PublicApiSettings {
     pub rate_limiter_max_entries: usize,
 }
 
+/// The optional Redis coordination client's configuration.
+///
+/// `#[serde(default)]` on the container, same convention as [`WorkerSettings`]
+/// and [`ClusterSettings`]: an operator turns Redis on with a single
+/// `MOIRA_REDIS__ENABLED` without restating the timing knobs, and a config file
+/// written before `permit_ttl_seconds` existed still deserializes.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct RedisSettings {
+    /// **Default `false`, and plan 10 §0.4b makes that a decision rather than a
+    /// starting point.** Postgres and per-process memory are the coordination
+    /// path Moira ships with; Redis is additive and buys exactly two things —
+    /// cluster-wide rate-limit windows and cluster-wide concurrency counters.
+    ///
+    /// The honest cost of leaving it off is recorded on
+    /// [`RuntimeSettings::global_execution_concurrency`] and
+    /// [`PublicApiSettings::rate_limit_per_minute`]: with Redis off those limits
+    /// are **per replica**, so N replicas admit up to N times the configured
+    /// value. That is tolerable only because `cluster.max_replicas` bounds N.
     pub enabled: bool,
     pub url: Option<String>,
     pub namespace: String,
     pub connect_timeout_seconds: u64,
     pub invalidation_channel: String,
+    /// How long an unrefreshed cluster-wide concurrency counter survives.
+    ///
+    /// This is a **leak bound**, not an expiry policy. An in-memory permit is
+    /// released by `Drop`, and a process that dies releases everything it held by
+    /// ceasing to exist; a Redis counter has no such guarantee, so a replica
+    /// killed mid-request would hold its slot forever. The TTL is refreshed on
+    /// every acquire against the same key, so a busy counter never expires under
+    /// live work — but it **must exceed the longest execution**, or a long stream
+    /// will have its slot reclaimed while it is still running and the ceiling
+    /// will drift above the configured limit.
+    ///
+    /// Default 900s (15 minutes), comfortably above
+    /// `runtime.maximum_execution_timeout_seconds`.
+    pub permit_ttl_seconds: u64,
 }
 
 /// Multi-replica admission (plan 10, finding P3-2).
@@ -378,6 +409,29 @@ pub struct WorkerSettings {
     /// by [`Settings::leader_election_enabled`], which is the only thing that
     /// should read this field.
     pub leader_election_enabled: Option<bool>,
+    /// How often each replica polls `worker_jobs` for claimable work.
+    ///
+    /// Every replica polls — the claim is `for update skip locked` over a
+    /// materialised victim set, so it is safe under any replica count and needs
+    /// no leadership. Only the *enqueue* of a periodic singleton job would.
+    pub queue_poll_interval_seconds: u64,
+    /// How long a claimed job may stay `running` with no completion before
+    /// another replica may take it back.
+    ///
+    /// This is what makes the queue survive a pod kill: a replica that dies
+    /// mid-job never writes a terminal state, and without this threshold the row
+    /// would stay `running` forever. It must exceed the longest job body, or a
+    /// slow job gets a second executor while the first is still working.
+    pub queue_stale_claim_seconds: u64,
+    /// Pending-depth cap. `enqueue` refuses beyond it with
+    /// `moira.error.worker_queue_capacity_exceeded`.
+    ///
+    /// An unbounded queue is not a queue, it is a slow memory leak in table
+    /// form: a producer faster than the drain rate grows `worker_jobs` until the
+    /// claim's index scan is the slowest query in the deployment, and the first
+    /// symptom is unrelated latency. Refusing at a known depth converts that into
+    /// an error with a name.
+    pub queue_max_pending_jobs: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -428,6 +482,12 @@ impl Settings {
         // because the symptom otherwise is replicas continuously reclaiming each
         // other's leases — visible only as an unexplained restart loop.
         self.validate_cluster(&mut violations);
+
+        // Same category again: a permit TTL below the longest possible execution
+        // reclaims a slot that is still in use, and a queue whose stale-claim
+        // threshold is zero hands every running job to a second executor
+        // immediately. Neither is a tuning choice.
+        self.validate_coordination(&mut violations);
 
         for origin in &self.cors.allowed_origins {
             if origin != "*" && validate_cors_origin(origin).is_err() {
@@ -552,6 +612,41 @@ impl Settings {
                  ({}), or a live replica's lease is reclaimable before it renews",
                 self.cluster.lease_expiry_seconds, self.cluster.lease_heartbeat_seconds
             ));
+        }
+    }
+
+    /// Invariants of the Redis-backed permits and the durable worker queue.
+    ///
+    /// The Redis half is checked **only when Redis is enabled**: an operator who
+    /// never turns Redis on should not be made to reason about a TTL that governs
+    /// nothing. The queue half is checked unconditionally, because the queue rides
+    /// `workers.enabled` and a nonsensical value there is nonsensical whether or
+    /// not the supervisor is currently running.
+    fn validate_coordination(&self, violations: &mut Vec<String>) {
+        if self.redis.enabled
+            && self.redis.permit_ttl_seconds <= self.runtime.maximum_execution_timeout_seconds
+        {
+            violations.push(format!(
+                "redis.permit_ttl_seconds ({}) must exceed \
+                 runtime.maximum_execution_timeout_seconds ({}), or a cluster-wide \
+                 concurrency slot is reclaimed while the execution holding it is still \
+                 running and the effective ceiling drifts above the configured limit",
+                self.redis.permit_ttl_seconds, self.runtime.maximum_execution_timeout_seconds
+            ));
+        }
+        if self.workers.queue_stale_claim_seconds == 0 {
+            violations.push(
+                "workers.queue_stale_claim_seconds must be at least 1, or every claimed \
+                 job is immediately reclaimable by another replica"
+                    .to_string(),
+            );
+        }
+        if self.workers.queue_max_pending_jobs < 1 {
+            violations.push(
+                "workers.queue_max_pending_jobs must be at least 1, or no job can ever be \
+                 enqueued"
+                    .to_string(),
+            );
         }
     }
 
@@ -984,6 +1079,7 @@ impl Default for RedisSettings {
             namespace: "moira".to_string(),
             connect_timeout_seconds: 2,
             invalidation_channel: "moira:runtime-config".to_string(),
+            permit_ttl_seconds: 900,
         }
     }
 }
@@ -1026,6 +1122,14 @@ impl Default for WorkerSettings {
             // leaving the database idle between sweeps.
             retention_interval_seconds: 300,
             leader_election_enabled: None,
+            queue_poll_interval_seconds: 5,
+            // 5 minutes, matching the plan's `stale_claim_seconds`. Every job body
+            // shipped today is a stub that completes immediately; the threshold is
+            // sized for the real bodies plan 11 will add.
+            queue_stale_claim_seconds: 300,
+            // 10k pending rows is roughly where the claim's `(status, run_at)`
+            // index scan stops being free on commodity hardware.
+            queue_max_pending_jobs: 10_000,
         }
     }
 }

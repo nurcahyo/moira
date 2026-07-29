@@ -1,4 +1,5 @@
 pub mod leader;
+pub mod queue;
 pub mod retention;
 
 use std::{sync::Arc, time::Duration};
@@ -6,12 +7,44 @@ use std::{sync::Arc, time::Duration};
 use serde::Serialize;
 use tokio::{sync::watch, task::JoinHandle};
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
-use crate::{app::AppState, config::WorkerSettings};
+use crate::{app::AppState, config::WorkerSettings, infra::repositories::PgWorkerJobRepository};
 
 /// Spec name of the retention/cleanup worker. Referenced rather than typed as a
 /// literal at the call site so the spec table stays the single source of truth.
 pub const RETENTION_CLEANUP_WORKER: &str = "retention-cleanup";
+
+/// Every job name the queue and the metrics layer will ever see.
+///
+/// A closed set, and that is the point: `job_name` is a metric **label**, and
+/// `src/infra/metrics.rs` seeds one zero-valued series per name at process start.
+/// A name minted at runtime — from a payload, from a caller, from a typo — would
+/// open the label set, which is the memory-exhaustion vector the metrics module's
+/// header calls out. `worker_job_names_match_the_spec_table` pins this list
+/// against [`WorkerRegistry::new`]'s specs so the two cannot drift.
+pub const WORKER_JOB_NAMES: &[&str] = &[
+    "memory-extraction-retry",
+    "conversation-summarization-retry",
+    "embedding-retry",
+    "document-ingestion-retry",
+    "oauth-token-refresh",
+    "provider-health-check",
+    RETENTION_CLEANUP_WORKER,
+    "runtime-cache-warmer",
+];
+
+/// Jobs that are leader-gated, and therefore the only ones with a meaningful
+/// `moira_worker_leader_held` gauge. Pinned against `leader::LEADER_LOCK_KEYS` by
+/// `every_leader_gated_worker_has_a_lock_key`.
+pub const LEADER_GATED_WORKERS: &[&str] = &[RETENTION_CLEANUP_WORKER];
+
+/// Whether `name` is one of Moira's declared job names.
+///
+/// The single gate between an arbitrary string and a metric label.
+pub fn is_known_job_name(name: &str) -> bool {
+    WORKER_JOB_NAMES.contains(&name)
+}
 
 #[derive(Debug, Clone)]
 pub struct WorkerRegistry {
@@ -196,6 +229,36 @@ impl WorkerRegistry {
             RETENTION_CLEANUP_WORKER,
             self.leader_election_enabled && retention_configured,
         );
+        // Reported from the first tick so the family is not merely seeded but
+        // *correct* from process start: a gauge that only appears once leadership
+        // changes hands would read as "no data" on the replica that never wins.
+        state
+            .metrics
+            .record_worker_leadership(RETENTION_CLEANUP_WORKER, false);
+
+        // The queue polls on its own cadence, independent of both the base tick
+        // and the retention sweep. Every replica polls — the claim is safe under
+        // any replica count by construction — so this arm is deliberately *not*
+        // leader-gated.
+        let queue = state.pool.as_ref().map(|pool| {
+            queue::WorkerQueue::new(
+                Arc::new(PgWorkerJobRepository::new(pool.clone())),
+                self.settings.clone(),
+                // Per-process and diagnostic only. Claim correctness comes from
+                // `for update skip locked`, never from this id, which is why it
+                // does not have to be the admission lease's `replica_id` — a
+                // process with admission off has no lease and still needs to claim.
+                Uuid::now_v7(),
+            )
+        });
+        let dispatcher = queue::StubJobDispatcher;
+        let mut queue_interval = tokio::time::interval(Duration::from_secs(
+            self.settings.queue_poll_interval_seconds.max(1),
+        ));
+        // `Delay` for the same reason the retention sweep uses it: a poll that
+        // overruns its period must defer the next one rather than build a backlog
+        // of ticks against a database that is evidently already busy.
+        queue_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         info!(
             max_concurrent_jobs = self.settings.max_concurrent_jobs,
@@ -218,7 +281,11 @@ impl WorkerRegistry {
                     state.metrics.record_worker_tick();
                 }
                 _ = retention_interval.tick(), if retention_configured => {
-                    if leader.should_run(state.pool.as_ref()).await {
+                    let leads = leader.should_run(state.pool.as_ref()).await;
+                    state
+                        .metrics
+                        .record_worker_leadership(RETENTION_CLEANUP_WORKER, leads);
+                    if leads {
                         self.run_retention_cleanup(&state).await;
                     } else {
                         debug!(
@@ -227,6 +294,10 @@ impl WorkerRegistry {
                         );
                     }
                 }
+                _ = queue_interval.tick(), if queue.is_some() => {
+                    let Some(queue) = queue.as_ref() else { continue };
+                    Self::run_queue_poll(queue, &dispatcher, &state).await;
+                }
             }
         }
 
@@ -234,6 +305,35 @@ impl WorkerRegistry {
         // leadership to the next replica in milliseconds rather than waiting for
         // PostgreSQL to notice a closed socket.
         leader.resign().await;
+        state
+            .metrics
+            .record_worker_leadership(RETENTION_CLEANUP_WORKER, false);
+    }
+
+    /// One queue poll. Never propagates, for the same reason the retention sweep
+    /// does not: a failing poll must not take the supervisor — and with it every
+    /// other worker — down. The next tick retries, and a job left `running` by a
+    /// failure here is reclaimed by the stale-claim sweep.
+    async fn run_queue_poll(
+        queue: &queue::WorkerQueue,
+        dispatcher: &dyn queue::JobDispatcher,
+        state: &AppState,
+    ) {
+        match queue.run_once(dispatcher, &state.metrics).await {
+            Ok(outcome) if outcome.claimed > 0 || outcome.reclaimed > 0 => info!(
+                reclaimed = outcome.reclaimed,
+                claimed = outcome.claimed,
+                completed = outcome.completed,
+                rescheduled = outcome.rescheduled,
+                dead_lettered = outcome.dead_lettered,
+                pruned = outcome.pruned,
+                "worker queue poll settled"
+            ),
+            Ok(_) => debug!("worker queue poll found nothing to claim"),
+            // `AppError::Sqlx` renders as a constant string, so no database detail
+            // leaks here.
+            Err(error) => warn!(%error, "worker queue poll failed; retrying on the next tick"),
+        }
     }
 
     /// One retention sweep. Never propagates: a failing sweep must not take the
@@ -270,5 +370,50 @@ impl WorkerSupervisor {
             warn!("worker supervisor already stopped");
         }
         let _ = self.handle.await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registry() -> WorkerRegistry {
+        WorkerRegistry::new(WorkerSettings::default(), false)
+    }
+
+    /// `WORKER_JOB_NAMES` is what `src/infra/metrics.rs` seeds one zero-valued
+    /// series per entry from, and what `WorkerQueue::enqueue` validates against.
+    /// A spec added without a matching entry would be enqueueable and invisible;
+    /// an entry with no spec would seed a series for a job that cannot run.
+    #[test]
+    fn worker_job_names_match_the_spec_table() {
+        let declared: std::collections::BTreeSet<&str> = WORKER_JOB_NAMES.iter().copied().collect();
+        let specs: std::collections::BTreeSet<&str> =
+            registry().specs.iter().map(|spec| spec.name).collect();
+        assert_eq!(declared, specs);
+        assert_eq!(
+            declared.len(),
+            WORKER_JOB_NAMES.len(),
+            "a duplicated name would seed the same metric series twice"
+        );
+    }
+
+    #[test]
+    fn every_leader_gated_worker_has_a_lock_key() {
+        for name in LEADER_GATED_WORKERS {
+            assert!(
+                leader::leader_lock_key(name).is_some(),
+                "{name} is leader-gated but has no declared advisory-lock key, so it \
+                 would silently run on every replica"
+            );
+            assert!(is_known_job_name(name));
+        }
+    }
+
+    #[test]
+    fn an_undeclared_job_name_is_rejected() {
+        assert!(!is_known_job_name("memory-extraction"));
+        assert!(!is_known_job_name(""));
+        assert!(is_known_job_name(RETENTION_CLEANUP_WORKER));
     }
 }

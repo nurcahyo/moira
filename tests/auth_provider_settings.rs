@@ -648,10 +648,7 @@ async fn an_auth_settings_write_invalidates_the_cache_via_listen_notify() {
 
     let listener = moira::infra::db::spawn_runtime_config_listener(
         fixture.pool.clone(),
-        fixture.state.runtime_cache.clone(),
-        fixture.state.runtime_handles.clone(),
-        fixture.state.auth_settings_cache.clone(),
-        fixture.state.circuits.clone(),
+        moira::infra::db::RuntimeInvalidationTargets::from_state(&fixture.state),
     );
 
     // Populate the cache through the read path the console uses.

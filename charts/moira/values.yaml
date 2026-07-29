@@ -95,9 +95,43 @@ config:
   MOIRA_API_KEYS__ALLOW_INSECURE_DEV_PEPPER: "false"
   MOIRA_PROVIDER_SECURITY__ALLOW_HTTP_PROVIDER_URLS: "false"
   MOIRA_CORS__ALLOWED_ORIGINS: "https://moira.example.com"
+  # Redis coordination. **Off, and that is the shipped configuration** — Moira
+  # coordinates admission, leader election, idempotency and runtime-config
+  # invalidation through PostgreSQL, none of which needs Redis.
+  #
+  # What turning it on buys is exactly two things: rate-limit windows and
+  # execution-concurrency counters shared across replicas. With it off, both are
+  # enforced **per replica**, so N replicas admit up to N times the configured
+  # limit. That is the accepted trade, and it is only acceptable because
+  # `cluster.maxReplicas` above bounds N — raising that ceiling raises every rate
+  # limit and every concurrency cap by the same factor.
+  #
+  # Circuit breakers stay per-process either way. Breaker state is earned by a
+  # replica observing its own transport failures, and sharing it would let one
+  # replica's bad network path open the circuit for healthy replicas.
+  #
+  # Requires MOIRA_REDIS__URL from the referenced Secret when enabled — the URL
+  # may embed a password and must never be written here in plaintext.
   MOIRA_REDIS__ENABLED: "false"
   MOIRA_REDIS__NAMESPACE: "moira"
   MOIRA_REDIS__INVALIDATION_CHANNEL: "moira:runtime-config"
+  # Leak bound on a cluster-wide concurrency slot, not an expiry policy: a replica
+  # killed mid-request cannot return its slot, so the counter reclaims it one TTL
+  # after the last acquire. Must exceed the longest execution
+  # (MOIRA_RUNTIME__MAXIMUM_EXECUTION_TIMEOUT_SECONDS) — Settings::validate
+  # refuses to start otherwise.
+  MOIRA_REDIS__PERMIT_TTL_SECONDS: "900"
+  # Durable worker queue. Rides workers.enabled above: with workers off there is
+  # no supervisor and therefore no queue poll.
+  MOIRA_WORKERS__QUEUE_POLL_INTERVAL_SECONDS: "5"
+  # How long a claimed job may stay running with no outcome before another replica
+  # may take it back. This is what makes a job survive a pod kill; it must exceed
+  # the longest job body.
+  MOIRA_WORKERS__QUEUE_STALE_CLAIM_SECONDS: "300"
+  # Pending-depth cap. Beyond it, enqueue refuses with
+  # moira.error.worker_queue_capacity_exceeded rather than letting the backlog
+  # grow until the claim query becomes the slowest thing in the deployment.
+  MOIRA_WORKERS__QUEUE_MAX_PENDING_JOBS: "10000"
   MOIRA_TELEMETRY__JSON: "true"
   MOIRA_TELEMETRY__PROMETHEUS_ENABLED: "true"
   MOIRA_TELEMETRY__OTEL_ENABLED: "false"

@@ -1062,3 +1062,51 @@ pub fn public_response_request(route: &str) -> moira::domain::PublicResponseRequ
         seed: None,
     }
 }
+
+// ---------------------------------------------------------------------------
+// Redis harness (plan 10 wave 2).
+//
+// Redis is **off by default** in Moira (plan 10 §0.4b), so nothing above needs
+// it and no fixture creates one. These helpers exist for the suites that
+// deliberately turn it on to exercise the cluster-wide arm of rate limiting and
+// concurrency — everything else must keep passing with Redis absent, which is the
+// property `tests/coordination_default_path.rs` pins.
+// ---------------------------------------------------------------------------
+
+/// A Redis client on a namespace private to one test, or `None` when Redis is not
+/// configured outside CI.
+///
+/// Fail-closed in CI, matching `database_origin` exactly: when `CI=true` and no
+/// URL is set this panics rather than silently skipping, because a skipped Redis
+/// test in CI is indistinguishable from a passing one in the summary. The value
+/// check is `eq_ignore_ascii_case("true")`, never `var_os(..).is_some()` —
+/// GitHub Actions sets `CI` on every runner, and `is_some()` would make the
+/// distinction meaningless.
+///
+/// The namespace is per-call and UUID-suffixed, so parallel tests cannot see each
+/// other's keys and **no test ever needs `FLUSHDB`** — which would break every
+/// other suite running against the same instance.
+pub fn test_redis() -> Option<moira::infra::redis::RedisClient> {
+    let url = match env::var("MOIRA_TEST_REDIS_URL").or_else(|_| env::var("MOIRA_REDIS__URL")) {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ if env::var("CI").is_ok_and(|value| value.eq_ignore_ascii_case("true")) => panic!(
+            "MOIRA_TEST_REDIS_URL (or MOIRA_REDIS__URL) is required when CI=true for \
+             Redis-backed tests"
+        ),
+        _ => {
+            eprintln!("skipping Redis-backed test: MOIRA_TEST_REDIS_URL is not set");
+            return None;
+        }
+    };
+    let settings = moira::config::RedisSettings {
+        enabled: true,
+        url: Some(url),
+        namespace: format!("moira-test-{}", Uuid::now_v7().simple()),
+        ..moira::config::RedisSettings::default()
+    };
+    Some(
+        moira::infra::redis::RedisClient::from_settings(&settings)
+            .expect("build the test Redis client")
+            .expect("Redis is enabled in the test settings"),
+    )
+}

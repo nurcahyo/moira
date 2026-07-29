@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use serde::Deserialize;
 use sqlx::{
     PgPool,
@@ -12,6 +13,10 @@ use uuid::Uuid;
 use crate::{
     config::DatabaseSettings,
     error::AppError,
+    infra::{
+        metrics::{InvalidationChannel, MetricsRegistry, RedisOperation},
+        redis::RedisClient,
+    },
     orchestration::{
         AuthProviderSettingsCache, CircuitBreakerRegistry, CircuitResetScope, ProviderRuntimeCache,
         RuntimeConfigCache,
@@ -45,18 +50,82 @@ pub async fn migrate(pool: &PgPool) -> Result<(), AppError> {
         .map_err(|err| AppError::Internal(format!("run migrations: {err}")))
 }
 
+/// The caches one invalidation clears, bundled so the two listeners cannot be
+/// handed different sets.
+///
+/// Plan 10 wave 2 adds a second listener over Redis pub/sub. The sequence it has
+/// to reproduce is **four calls, and the last one is scoped** — a subscriber that
+/// dropped the third would leave plan 07's auth-settings cache stale on every
+/// replica that learned of a change over Redis, and one that used `reset_all`
+/// instead of `reset_for_resource` would discard every provider's earned breaker
+/// health on every config write. Bundling them into one type and one
+/// [`apply_invalidation`] means neither listener can get the sequence wrong
+/// independently of the other.
+#[derive(Clone)]
+pub struct RuntimeInvalidationTargets {
+    pub cache: RuntimeConfigCache,
+    pub runtime_handles: ProviderRuntimeCache,
+    pub auth_settings: AuthProviderSettingsCache,
+    pub circuits: CircuitBreakerRegistry,
+    pub metrics: MetricsRegistry,
+}
+
+impl RuntimeInvalidationTargets {
+    /// The five handles, taken from the one place that owns all of them.
+    ///
+    /// Both listeners and every test that starts one go through here, so a cache
+    /// added to `AppState` later cannot be wired into one listener and forgotten
+    /// in the other.
+    pub fn from_state(state: &crate::app::AppState) -> Self {
+        Self {
+            cache: state.runtime_cache.clone(),
+            runtime_handles: state.runtime_handles.clone(),
+            auth_settings: state.auth_settings_cache.clone(),
+            circuits: state.circuits.clone(),
+            metrics: state.metrics.clone(),
+        }
+    }
+}
+
+/// Applies one invalidation, whichever channel delivered it.
+///
+/// The three caches stay unconditional: they are keyed by version (or, for the
+/// auth-settings cache, are a single small list) and rebuild on the next read, so
+/// re-reading them costs a query. Breaker state is earned by observing real
+/// failures and cannot be rebuilt, which is why only it is scoped.
+///
+/// The auth-settings cache joins them here rather than being invalidated only by
+/// its own resource type, and that is deliberate: unconditional invalidation is
+/// what satisfies CONVENTIONS §7.2 even if a future trigger, view or rename makes
+/// an auth-settings change arrive under a payload this function does not
+/// recognise. Over-invalidating a list of three rows is free; under-invalidating
+/// the identity configuration is not.
+async fn apply_invalidation(
+    targets: &RuntimeInvalidationTargets,
+    payload: &str,
+    source: InvalidationChannel,
+) {
+    let scope = circuit_reset_scope(payload);
+    targets.cache.invalidate_all().await;
+    targets.runtime_handles.invalidate_all().await;
+    targets.auth_settings.invalidate_all().await;
+    targets.circuits.reset_for_resource(scope).await;
+    targets.metrics.record_runtime_invalidation(source);
+    info!(
+        channel = source.label(),
+        payload,
+        circuit_reset_scope = ?scope,
+        "runtime config cache invalidated"
+    );
+}
+
 pub fn spawn_runtime_config_listener(
     pool: PgPool,
-    cache: RuntimeConfigCache,
-    runtime_handles: ProviderRuntimeCache,
-    auth_settings: AuthProviderSettingsCache,
-    circuits: CircuitBreakerRegistry,
+    targets: RuntimeInvalidationTargets,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            if let Err(err) =
-                listen_once(&pool, &cache, &runtime_handles, &auth_settings, &circuits).await
-            {
+            if let Err(err) = listen_once(&pool, &targets).await {
                 warn!(error = %err, "runtime config listener disconnected");
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
@@ -66,10 +135,7 @@ pub fn spawn_runtime_config_listener(
 
 async fn listen_once(
     pool: &PgPool,
-    cache: &RuntimeConfigCache,
-    runtime_handles: &ProviderRuntimeCache,
-    auth_settings: &AuthProviderSettingsCache,
-    circuits: &CircuitBreakerRegistry,
+    targets: &RuntimeInvalidationTargets,
 ) -> Result<(), sqlx::Error> {
     let mut listener = PgListener::connect_with(pool).await?;
     listener.listen("moira_runtime_config").await?;
@@ -77,29 +143,83 @@ async fn listen_once(
 
     loop {
         let notification = listener.recv().await?;
-        let scope = circuit_reset_scope(notification.payload());
-        // The three caches stay unconditional: they are keyed by version (or, for the
-        // auth-settings cache, are a single small list) and rebuild on the next read, so
-        // re-reading them costs a query. Breaker state is earned by observing real
-        // failures and cannot be rebuilt, which is why only it is scoped.
-        //
-        // The auth-settings cache joins them here rather than being invalidated only by
-        // its own resource type, and that is deliberate: unconditional invalidation is
-        // what satisfies CONVENTIONS §7.2 even if a future trigger, view or rename makes
-        // an auth-settings change arrive under a payload this function does not
-        // recognise. Over-invalidating a list of three rows is free; under-invalidating
-        // the identity configuration is not.
-        cache.invalidate_all().await;
-        runtime_handles.invalidate_all().await;
-        auth_settings.invalidate_all().await;
-        circuits.reset_for_resource(scope).await;
-        info!(
-            channel = notification.channel(),
-            payload = notification.payload(),
-            circuit_reset_scope = ?scope,
-            "runtime config cache invalidated"
-        );
+        apply_invalidation(
+            targets,
+            notification.payload(),
+            InvalidationChannel::Postgres,
+        )
+        .await;
     }
+}
+
+/// The Redis pub/sub invalidation listener.
+///
+/// # A second channel, never a replacement
+///
+/// Postgres `LISTEN/NOTIFY` is authoritative and is fired by a database trigger,
+/// so it is delivered for *every* runtime-config write regardless of which code
+/// path performed it and regardless of whether Redis is enabled — which it is
+/// not, by default. This listener exists only where Redis is enabled, and only as
+/// a lower-latency second signal. A deployment with Redis off still invalidates,
+/// on every replica, exactly as it did before plan 10.
+///
+/// # It runs the identical payload through the identical classifier
+///
+/// [`apply_invalidation`] is shared with the Postgres path, so the four-call
+/// sequence and the `circuit_reset_scope` mapping cannot drift between them. A
+/// message whose payload is not the `{resource_type, resource_id}` shape lands in
+/// that function's unparseable arm and falls back to `CircuitResetScope::All`
+/// with a `warn!` — safe, loud, and the reason `RuntimeConfigInvalidation` is the
+/// only way to publish.
+pub fn spawn_redis_invalidation_listener(
+    redis: RedisClient,
+    targets: RuntimeInvalidationTargets,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if let Err(err) = subscribe_once(&redis, &targets).await {
+                warn!(error = %err, "redis invalidation listener disconnected");
+                targets
+                    .metrics
+                    .record_redis_operation_failure(RedisOperation::Subscribe);
+                // The same backoff the Postgres listener uses. Deliberately not
+                // exponential: this is a local dependency, an outage is measured
+                // in seconds, and a listener that backs off to minutes would leave
+                // the second channel dark long after the first recovered.
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    })
+}
+
+async fn subscribe_once(
+    redis: &RedisClient,
+    targets: &RuntimeInvalidationTargets,
+) -> Result<(), AppError> {
+    let mut pubsub = redis.subscribe_invalidation().await?;
+    info!(
+        channel = redis.invalidation_channel(),
+        "redis invalidation listener attached"
+    );
+    let mut messages = pubsub.on_message();
+    while let Some(message) = messages.next().await {
+        let payload = match message.get_payload::<String>() {
+            Ok(payload) => payload,
+            Err(error) => {
+                // A non-UTF-8 message is not ours. Skipped rather than treated as
+                // an unparseable invalidation, because handing it to
+                // `apply_invalidation` would reset every breaker in the process on
+                // the say-so of anything with `PUBLISH` on this channel.
+                warn!(%error, "redis invalidation message was not a string; ignoring");
+                continue;
+            }
+        };
+        apply_invalidation(targets, &payload, InvalidationChannel::Redis).await;
+    }
+    // The stream ending means the connection went away.
+    Err(AppError::Config(
+        "redis invalidation subscription ended".to_string(),
+    ))
 }
 
 /// The `moira_runtime_config` payload, as `notify_moira_runtime_config_change` builds
@@ -161,6 +281,28 @@ const CIRCUIT_UNAFFECTED_RESOURCE_TYPES: &[&str] = &[
     "routing_policies",
     "system_api_keys",
     "trusted_jwt_issuers",
+];
+
+/// Table names that Moira itself publishes onto the Redis invalidation channel.
+///
+/// Declared **here, beside the classifier**, and referenced by
+/// `RuntimeAdminService` rather than re-typed as literals at each call site. That
+/// is the whole guard: [`every_publishable_resource_type_is_classified`] proves
+/// each of these maps to something other than [`CircuitResetScope::All`], so a
+/// publisher cannot emit a name this function has never heard of — which would
+/// otherwise turn every admin write into a full breaker reset on every replica,
+/// silently, and only when Redis happened to be enabled.
+pub const RESOURCE_TYPE_ROUTE_DEFINITIONS: &str = "route_definitions";
+pub const RESOURCE_TYPE_ROUTING_POLICIES: &str = "routing_policies";
+pub const RESOURCE_TYPE_AGENT_PROFILES: &str = "agent_profiles";
+pub const RESOURCE_TYPE_PROVIDER_RUNTIME_POLICIES: &str = "provider_runtime_policies";
+
+/// Every name the paragraph above governs.
+pub const PUBLISHABLE_RESOURCE_TYPES: &[&str] = &[
+    RESOURCE_TYPE_ROUTE_DEFINITIONS,
+    RESOURCE_TYPE_ROUTING_POLICIES,
+    RESOURCE_TYPE_AGENT_PROFILES,
+    RESOURCE_TYPE_PROVIDER_RUNTIME_POLICIES,
 ];
 
 /// Maps one notification payload onto the breaker entries it may clear.
@@ -300,6 +442,66 @@ mod tests {
                 "{table} is triggered but unclassified, so it still resets every circuit"
             );
         }
+    }
+
+    /// The guard on the Redis publisher.
+    ///
+    /// `RuntimeAdminService` publishes each of these onto the invalidation
+    /// channel, and the subscriber classifies the payload with the very function
+    /// under test. A name this function does not recognise falls back to
+    /// [`CircuitResetScope::All`] — so an unclassified publishable name would
+    /// discard every provider's earned breaker health on every admin write, on
+    /// every replica, and only in deployments that had turned Redis on.
+    #[test]
+    fn every_publishable_resource_type_is_classified() {
+        let resource_id = Uuid::now_v7();
+        for resource_type in PUBLISHABLE_RESOURCE_TYPES {
+            let scope = circuit_reset_scope(&format!(
+                r#"{{"resource_type":"{resource_type}","resource_id":"{resource_id}"}}"#
+            ));
+            assert_ne!(
+                scope,
+                CircuitResetScope::All,
+                "{resource_type} is published but unclassified, so publishing it resets \
+                 every circuit in every replica"
+            );
+        }
+    }
+
+    /// Both listeners must be reachable only through [`apply_invalidation`], which
+    /// is what keeps the four-call sequence identical between them. Asserted on
+    /// the source rather than the behaviour because the failure is an *omission* —
+    /// a future subscriber that inlines three of the four calls compiles, passes
+    /// every behavioural test that does not happen to read the auth-settings
+    /// cache, and leaves plan 07's identity configuration stale on every replica
+    /// that learned of a change over Redis.
+    #[test]
+    fn both_listeners_share_one_invalidation_sequence() {
+        let source = include_str!("db.rs");
+        // Needles are assembled from fragments rather than written out, because
+        // this file includes its own source: a literal needle would match itself
+        // and the count would be off by one for reasons nothing in the failure
+        // message would explain.
+        let invalidate = concat!("cache.invalidate_all", "().await");
+        let scoped_reset = concat!("reset_for_resource", "(scope).await");
+        let reset_all = concat!("circuits.reset_all", "()");
+
+        assert_eq!(
+            source.matches(invalidate).count(),
+            1,
+            "invalidate_all is called outside apply_invalidation; both listeners must \
+             route through it"
+        );
+        assert_eq!(
+            source.matches(scoped_reset).count(),
+            1,
+            "a second scoped breaker reset means a second copy of the sequence"
+        );
+        assert!(
+            !source.contains(reset_all),
+            "reset_all on an invalidation path discards every provider's earned \
+             breaker health; the scoped reset exists precisely to avoid that"
+        );
     }
 
     #[test]

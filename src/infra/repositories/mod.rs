@@ -6,6 +6,7 @@ mod identity;
 mod public;
 mod runtime;
 mod setup;
+mod worker_jobs;
 
 pub use admin::{
     AdminIdempotencyClaim, AdminIdempotencyClaimOutcome, AdminRepository, KeyMaterial,
@@ -32,6 +33,10 @@ pub use identity::{
     AdminIdentityGrant, AdminIdentityGrantInsert, AdminIdentityRepository,
     PgAdminIdentityRepository,
 };
+// Plan 10 wave 2. Trait plus one Postgres implementation, same convention as the
+// modules above — which is what lets `WorkerQueue`'s retry, dead-letter and
+// dispatch logic be tested against a fake with no database.
+pub use worker_jobs::{ClaimedJob, PgWorkerJobRepository, WorkerJobInsert, WorkerJobRepository};
 // Deliberately `pub(crate)`, not `pub`: these three free functions mutate RAG state with no
 // authorization check, no audit row and no idempotency envelope of their own — those are
 // supplied by their only legitimate caller, `crate::application::conversation`, which wraps

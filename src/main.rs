@@ -102,14 +102,17 @@ async fn run(mode: ProcessMode, settings: Settings) -> anyhow::Result<()> {
     .context("acquire the cluster admission lease")?;
 
     let worker_supervisor = state.workers.spawn_supervisor(state.clone());
-    let _runtime_config_listener = state.pool.as_ref().map(|pool| {
-        db::spawn_runtime_config_listener(
-            pool.clone(),
-            state.runtime_cache.clone(),
-            state.runtime_handles.clone(),
-            state.auth_settings_cache.clone(),
-            state.circuits.clone(),
-        )
+    let invalidation_targets = db::RuntimeInvalidationTargets::from_state(&state);
+    let _runtime_config_listener = state
+        .pool
+        .as_ref()
+        .map(|pool| db::spawn_runtime_config_listener(pool.clone(), invalidation_targets.clone()));
+    // The second channel, and only ever a second one. It exists when Redis is
+    // enabled — which is not the default — and the Postgres listener above is
+    // spawned regardless, so turning Redis off removes a signal path rather than
+    // the signal.
+    let _redis_invalidation_listener = state.redis.as_ref().map(|redis| {
+        db::spawn_redis_invalidation_listener(redis.clone(), invalidation_targets.clone())
     });
     let app = build_router(state)?;
 

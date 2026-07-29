@@ -3,6 +3,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
@@ -19,8 +20,13 @@ use crate::{
         RoutingPolicyPatchRequest, RoutingPolicyRecord,
     },
     error::AppError,
-    infra::repositories::{
-        AdminRepository, PgAdminRepository, PgRuntimeRepository, RuntimeRepository,
+    infra::{
+        db,
+        metrics::RedisOperation,
+        redis::RuntimeConfigInvalidation,
+        repositories::{
+            AdminRepository, PgAdminRepository, PgRuntimeRepository, RuntimeRepository,
+        },
     },
     orchestration::CircuitResetScope,
     security::{Actor, secret_fingerprint},
@@ -79,7 +85,11 @@ impl<'a> RuntimeAdminService<'a> {
             .runtime_repo
             .create_route_definition(Uuid::now_v7(), &request)
             .await?;
-        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
+        self.invalidate_runtime(
+            RuntimeConfigInvalidation::new(db::RESOURCE_TYPE_ROUTE_DEFINITIONS, record.id),
+            CircuitResetScope::Unaffected,
+        )
+        .await;
         self.audit_success(
             actor,
             ctx,
@@ -148,7 +158,11 @@ impl<'a> RuntimeAdminService<'a> {
             .runtime_repo
             .patch_route_definition(id, expected_version, &request)
             .await?;
-        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
+        self.invalidate_runtime(
+            RuntimeConfigInvalidation::new(db::RESOURCE_TYPE_ROUTE_DEFINITIONS, id),
+            CircuitResetScope::Unaffected,
+        )
+        .await;
         self.audit_success(
             actor,
             ctx,
@@ -172,7 +186,11 @@ impl<'a> RuntimeAdminService<'a> {
         self.runtime_repo
             .soft_delete_route_definition(id, expected_version)
             .await?;
-        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
+        self.invalidate_runtime(
+            RuntimeConfigInvalidation::new(db::RESOURCE_TYPE_ROUTE_DEFINITIONS, id),
+            CircuitResetScope::Unaffected,
+        )
+        .await;
         self.audit_success(
             actor,
             ctx,
@@ -201,7 +219,11 @@ impl<'a> RuntimeAdminService<'a> {
                 if enabled { "active" } else { "disabled" },
             )
             .await?;
-        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
+        self.invalidate_runtime(
+            RuntimeConfigInvalidation::new(db::RESOURCE_TYPE_ROUTE_DEFINITIONS, id),
+            CircuitResetScope::Unaffected,
+        )
+        .await;
         self.audit_success(
             actor,
             ctx,
@@ -243,7 +265,11 @@ impl<'a> RuntimeAdminService<'a> {
             .runtime_repo
             .create_routing_policy(Uuid::now_v7(), &request)
             .await?;
-        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
+        self.invalidate_runtime(
+            RuntimeConfigInvalidation::new(db::RESOURCE_TYPE_ROUTING_POLICIES, record.id),
+            CircuitResetScope::Unaffected,
+        )
+        .await;
         self.audit_success(
             actor,
             ctx,
@@ -315,7 +341,11 @@ impl<'a> RuntimeAdminService<'a> {
             .runtime_repo
             .patch_routing_policy(id, expected_version, &request)
             .await?;
-        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
+        self.invalidate_runtime(
+            RuntimeConfigInvalidation::new(db::RESOURCE_TYPE_ROUTING_POLICIES, id),
+            CircuitResetScope::Unaffected,
+        )
+        .await;
         self.audit_success(
             actor,
             ctx,
@@ -359,7 +389,11 @@ impl<'a> RuntimeAdminService<'a> {
         self.runtime_repo
             .soft_delete_routing_policy(id, expected_version)
             .await?;
-        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
+        self.invalidate_runtime(
+            RuntimeConfigInvalidation::new(db::RESOURCE_TYPE_ROUTING_POLICIES, id),
+            CircuitResetScope::Unaffected,
+        )
+        .await;
         self.audit_success(
             actor,
             ctx,
@@ -390,7 +424,11 @@ impl<'a> RuntimeAdminService<'a> {
                 if enabled { "active" } else { "disabled" },
             )
             .await?;
-        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
+        self.invalidate_runtime(
+            RuntimeConfigInvalidation::new(db::RESOURCE_TYPE_ROUTING_POLICIES, id),
+            CircuitResetScope::Unaffected,
+        )
+        .await;
         self.audit_success(
             actor,
             ctx,
@@ -436,7 +474,11 @@ impl<'a> RuntimeAdminService<'a> {
             .runtime_repo
             .create_agent_profile(Uuid::now_v7(), &request)
             .await?;
-        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
+        self.invalidate_runtime(
+            RuntimeConfigInvalidation::new(db::RESOURCE_TYPE_AGENT_PROFILES, record.id),
+            CircuitResetScope::Unaffected,
+        )
+        .await;
         self.audit_success(
             actor,
             ctx,
@@ -507,7 +549,11 @@ impl<'a> RuntimeAdminService<'a> {
             .runtime_repo
             .patch_agent_profile(id, expected_version, &request)
             .await?;
-        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
+        self.invalidate_runtime(
+            RuntimeConfigInvalidation::new(db::RESOURCE_TYPE_AGENT_PROFILES, id),
+            CircuitResetScope::Unaffected,
+        )
+        .await;
         self.audit_success(
             actor,
             ctx,
@@ -533,7 +579,11 @@ impl<'a> RuntimeAdminService<'a> {
         self.runtime_repo
             .soft_delete_agent_profile(id, expected_version)
             .await?;
-        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
+        self.invalidate_runtime(
+            RuntimeConfigInvalidation::new(db::RESOURCE_TYPE_AGENT_PROFILES, id),
+            CircuitResetScope::Unaffected,
+        )
+        .await;
         self.audit_success(
             actor,
             ctx,
@@ -564,7 +614,11 @@ impl<'a> RuntimeAdminService<'a> {
                 if enabled { "active" } else { "disabled" },
             )
             .await?;
-        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
+        self.invalidate_runtime(
+            RuntimeConfigInvalidation::new(db::RESOURCE_TYPE_AGENT_PROFILES, id),
+            CircuitResetScope::Unaffected,
+        )
+        .await;
         self.audit_success(
             actor,
             ctx,
@@ -647,7 +701,14 @@ impl<'a> RuntimeAdminService<'a> {
             .runtime_repo
             .put_provider_runtime_policy(provider_id, &request)
             .await?;
-        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
+        self.invalidate_runtime(
+            RuntimeConfigInvalidation::new(
+                db::RESOURCE_TYPE_PROVIDER_RUNTIME_POLICIES,
+                provider_id,
+            ),
+            CircuitResetScope::Unaffected,
+        )
+        .await;
         self.audit_success(
             actor,
             ctx,
@@ -716,13 +777,55 @@ impl<'a> RuntimeAdminService<'a> {
     /// state diverging from every other node's for the very same row.
     ///
     /// [`before_call`]: crate::orchestration::CircuitBreakerRegistry::before_call
-    async fn invalidate_runtime(&self, circuits: CircuitResetScope) {
+    async fn invalidate_runtime(
+        &self,
+        invalidation: RuntimeConfigInvalidation,
+        circuits: CircuitResetScope,
+    ) {
         // Both caches stay unconditional, as they are on the NOTIFY path: they are keyed
         // by row version and rebuild from a query, so re-reading them costs one. Breaker
         // state cannot be rebuilt, which is why it is the only thing scoped.
         self.state.runtime_cache.invalidate_all().await;
         self.state.runtime_handles.invalidate_all().await;
         self.state.circuits.reset_for_resource(circuits).await;
+        self.publish_runtime_invalidation(invalidation).await;
+    }
+
+    /// Publishes the same change onto the Redis invalidation channel, when Redis
+    /// is enabled (plan 10 wave 2).
+    ///
+    /// # Best-effort, and never able to fail the write
+    ///
+    /// The database trigger has already fired `NOTIFY moira_runtime_config` inside
+    /// the committed transaction, so every replica learns of this change over the
+    /// authoritative channel whether or not the line below succeeds — and whether
+    /// or not Redis is configured at all, which by default it is not. A publish
+    /// failure is therefore a lost *optimisation*, and turning it into a failed
+    /// admin command would trade a correct-but-slower invalidation for a rejected
+    /// write.
+    ///
+    /// # The payload is typed for a reason
+    ///
+    /// [`RuntimeConfigInvalidation`] carries the real table name and row id,
+    /// because the subscriber classifies it with the same `circuit_reset_scope`
+    /// the Postgres path uses. A free-form payload would land in that function's
+    /// unparseable arm and reset every provider breaker in every replica.
+    /// `every_published_resource_type_is_classified` pins each name this file can
+    /// emit against that classifier.
+    async fn publish_runtime_invalidation(&self, invalidation: RuntimeConfigInvalidation) {
+        let Some(redis) = self.state.redis.as_ref() else {
+            return;
+        };
+        if let Err(error) = redis.publish_runtime_config_change(&invalidation).await {
+            self.state
+                .metrics
+                .record_redis_operation_failure(RedisOperation::Publish);
+            debug!(
+                %error,
+                resource_type = invalidation.resource_type,
+                "redis invalidation publish failed; postgres NOTIFY already carried the change"
+            );
+        }
     }
 
     async fn audit_success(
