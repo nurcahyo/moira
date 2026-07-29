@@ -6,6 +6,68 @@ unilaterally, and conflicts auto-resolved by a runner.
 
 Ongoing work items live in [`TODO.md`](./TODO.md).
 
+## Recommended answers (proceeding on these unless overridden)
+
+Each open question below has a recommendation. Execution continues on these defaults rather than
+blocking; overturning any of them is cheap and localised, and the reversal cost is noted.
+
+| # | Question | Recommendation | If you disagree |
+|---|----------|----------------|-----------------|
+| 1 | Backfill migration shipped under a plan advertising none | **Keep it.** The audit's position is that `'indexed'` was never true, so there is no legitimate prior state; without it the API keeps serving the exact false value P0-1 targets. | Revert `0009` alone; no schema change to undo. |
+| 2 | Verified on PostgreSQL 18.3, not the pinned 16 | **Accept, with CI on PG16 as the authoritative gate.** No version-specific SQL is introduced; only long-settled DML/CHECK/PK-join/trigger behaviour is exercised. | Install Docker and re-run; the suite is unchanged. |
+| 3 | `ETag`/`version` now `2` on inline-content create | **Keep it.** The old `"1"` was stale against the committed row — an immediate `If-Match` round-trip would have spuriously conflicted. It is a correction, now pinned by test. | Re-select before the trigger fires; loses `ingestion_status` in the create response. |
+| 4 | Plan 02a's Wave 4 grep guard is unsatisfiable | **Fix the plan text** to `grep -c '("Idempotency-Key"'`. Plan 02b's Wave 5 repeats the same broken command and will fail a compliant tree. | None — the current text cannot be satisfied by any implementation. |
+
+Question 4 is the only one with a live downstream effect: it is corrected in plan 02b's execution
+rather than left to fail that plan's reviewer.
+
+| # | Question | Recommendation | If you disagree |
+|---|----------|----------------|-----------------|
+| 5 | Plan 02b's DoD requires `actor_fingerprint` to have exactly one definition, but its Excluded scope forbids touching the second one | **Correct the DoD wording, do not touch `runtime_admin.rs`.** The box as written is unsatisfiable within the plan's own scope; plan 06 owns the unification. | Pull the `runtime_admin.rs` unification into 02b — a wider security change with its own test surface. |
+| 6 | Plan 02b verified on PostgreSQL 18.3, not the pinned 16 | **Accept, same rationale as question 2.** 02b adds no migration and no version-sensitive SQL; it exercises advisory locks, savepoints, `select … for update`, a unique index and a plpgsql trigger, all long-settled. | Install Docker and re-run; the suite is unchanged. |
+
+---
+
+## Plan 02b's Definition of Done contains a box its own Excluded scope makes impossible to tick
+
+**Context.** Plan 02b's DoD and its Wave 5 check 3 both require that `grep -rn 'fn actor_fingerprint' src/`
+return exactly one hit — "no divergent copy". It returns two:
+`src/application/admin.rs:1375` (10 identity fields) and `src/application/runtime_admin.rs:702`
+(`actor_type`, `subject`, `api_key_id` only). The same plan's Excluded scope says "No change to
+`runtime_admin.rs`'s idempotency scheme". The reviewer is therefore asked to certify something the plan
+forbids fixing. All four QA lenses flagged this independently.
+
+**Why it is not cosmetic.** The `runtime_admin` copy writes into the *same* `idempotency_records` table.
+A lens proved with a standalone binary linking the real crate that it fails to isolate issuer,
+application or tenant — three actors differing only in those fields all hashed to `oBmwFVvCAAAh`. Two
+`TrustedJwt` actors sharing a `sub` across different registered issuers can replay each other's
+runtime-policy responses. This is **pre-existing on `main`**; 02b neither introduces nor widens it, and
+02b's own routes are unaffected because `operation` is part of the unique index and the `rag.*`
+operations are disjoint from the runtime-policy ones.
+
+**What I did.** Left `runtime_admin.rs` untouched, and corrected the doc comment 02b had added at
+`src/application/admin.rs:1369` — it read "The single definition of the admin actor fingerprint in the
+crate", which is false and would have misled the next reader. It now names the second copy and points at
+plan 06. Recorded the unification in [`TODO.md`](./TODO.md). The DoD box is reported as **not met, by
+design**, rather than ticked.
+
+**What I need confirmed.** That deferring the unification to plan 06 is right, rather than pulling it
+into 02b — and that the plan text itself should be corrected so plan 06's reviewer does not hit the same
+contradiction.
+
+---
+
+## Plan 02b was verified on PostgreSQL 18.3, not the pinned PostgreSQL 16
+
+Same root cause as the 02a entry below: Docker is unavailable on this machine. Re-recorded here because
+02b's evidence is separate. 02b adds **no** migration and no version-sensitive SQL; what it exercises is
+`pg_try_advisory_xact_lock`, `savepoint`/`rollback to savepoint`, `select … for update`, a unique index
+on `(idempotency_key_hash, actor_fingerprint, operation)`, `on conflict do nothing` and a plpgsql
+`before` trigger — all long-settled with no semantic change between 16 and 18. Three independent lenses
+assessed the deviation as immaterial for this diff. The one plausible 16-vs-18 difference is
+lock-contention *timing* in the concurrency test, and that test asserts row-count invariants rather than
+a timing outcome. CI on PG16 remains the authoritative gate.
+
 ---
 
 ## Plan 02a shipped a migration, though the plan advertises "no migrations"

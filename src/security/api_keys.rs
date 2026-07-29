@@ -4,6 +4,7 @@ use argon2::{
     password_hash::{SaltString, rand_core::OsRng as PasswordOsRng},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use secrecy::SecretString;
 
 use crate::error::AppError;
 
@@ -16,9 +17,25 @@ pub struct ApiKeyHasher {
     prefix_length: usize,
 }
 
+/// A freshly minted API key. `raw_key` is the only place the plaintext exists — everything
+/// persisted is derived from it.
+///
+/// **`raw_key` is `SecretString` to make disclosure a compile error, not a review question.**
+/// Plan 05 found a QA probe that had written `json!({ "raw": generated.raw_key })` into
+/// `audit_logs.metadata`, which the admin audit API serialises verbatim; it survived two cleanup
+/// commits and was caught only by a leak test. A `String` there is one careless `json!` away from
+/// doing it again, and the next one might not be planted by someone who wanted it found.
+///
+/// The guarantee does not depend on feature flags: `secrecy` implements
+/// `Serialize for Secret<T> where T: SerializableSecret`, and `String` never implements that
+/// marker — only `CloneableSecret` and `DebugSecret`. So `Secret<String>` cannot be serialised at
+/// all, and `#[derive(Debug, Clone)]` below keeps working with `Debug` redacted.
+///
+/// Reading the plaintext now requires `expose_secret()`, which is greppable: every legitimate
+/// disclosure is one search away from an auditor.
 #[derive(Debug, Clone)]
 pub struct GeneratedApiKey {
-    pub raw_key: String,
+    pub raw_key: SecretString,
     pub key_prefix: String,
     pub key_hash: String,
     pub fingerprint: String,
@@ -47,7 +64,7 @@ impl ApiKeyHasher {
         let fingerprint = secret_fingerprint(raw_key.as_bytes());
 
         Ok(GeneratedApiKey {
-            raw_key,
+            raw_key: SecretString::new(raw_key),
             key_prefix,
             key_hash,
             fingerprint,
@@ -86,6 +103,10 @@ impl ApiKeyHasher {
 
 #[cfg(test)]
 mod tests {
+    // Test-local: the production paths in this module never read the plaintext back, so importing
+    // this at module scope would be an unused import in a non-test build.
+    use secrecy::ExposeSecret;
+
     use super::*;
 
     #[test]
@@ -95,7 +116,7 @@ mod tests {
 
         assert!(
             hasher
-                .verify(&generated.raw_key, &generated.key_hash)
+                .verify(generated.raw_key.expose_secret(), &generated.key_hash)
                 .unwrap()
         );
         assert!(!hasher.verify("wrong", &generated.key_hash).unwrap());

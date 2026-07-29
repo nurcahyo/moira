@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use sqlx::{PgPool, Row};
 
 use crate::error::AppError;
@@ -19,12 +20,25 @@ pub struct PgSetupRepository {
     pool: PgPool,
 }
 
+/// The setup-readiness read surface, abstracted so `SetupService` can be exercised without a
+/// Postgres instance. Mirrors [`AdminRepository`](super::AdminRepository): the trait carries the
+/// documentation and the `#[async_trait] impl` below carries only SQL.
+#[async_trait]
+pub trait SetupRepository: Send + Sync {
+    /// Answers every setup check in a single round trip. The query is deliberately read-only and
+    /// never selects secret material — see `readiness_query_never_selects_secret_material`.
+    async fn inspect(&self) -> Result<SetupReadinessSnapshot, AppError>;
+}
+
 impl PgSetupRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+}
 
-    pub async fn inspect(&self) -> Result<SetupReadinessSnapshot, AppError> {
+#[async_trait]
+impl SetupRepository for PgSetupRepository {
+    async fn inspect(&self) -> Result<SetupReadinessSnapshot, AppError> {
         let row = sqlx::query(SETUP_READINESS_SQL)
             .fetch_one(&self.pool)
             .await?;
@@ -141,8 +155,33 @@ select
     ) as executable_path
 "#;
 
+/// In-memory [`SetupRepository`] for unit tests. Holds only the boolean readiness flags the real
+/// query returns; it never carries credential material, because none is on this surface.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct InMemorySetupRepository {
+    snapshot: SetupReadinessSnapshot,
+}
+
+#[cfg(test)]
+impl InMemorySetupRepository {
+    pub(crate) fn new(snapshot: SetupReadinessSnapshot) -> Self {
+        Self { snapshot }
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl SetupRepository for InMemorySetupRepository {
+    async fn inspect(&self) -> Result<SetupReadinessSnapshot, AppError> {
+        Ok(self.snapshot)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     #[tokio::test]
@@ -176,6 +215,26 @@ mod tests {
                 "query must not select or inspect {forbidden}"
             );
         }
+    }
+
+    /// `SetupService` stores its repository as `Arc<dyn SetupRepository>`, which only compiles
+    /// while the trait stays object-safe. Adding a generic method or a `Self: Sized` receiver
+    /// would break that silently at the consumer; this asserts it here, at the definition.
+    #[test]
+    fn setup_repository_trait_is_object_safe() {
+        let repo: Arc<dyn SetupRepository> = Arc::new(InMemorySetupRepository::default());
+        let _: &dyn SetupRepository = repo.as_ref();
+    }
+
+    #[tokio::test]
+    async fn fake_setup_repository_reports_incomplete_configuration() {
+        let repo = InMemorySetupRepository::new(SetupReadinessSnapshot {
+            root_system_key: true,
+            ..SetupReadinessSnapshot::default()
+        });
+        let snapshot = repo.inspect().await.expect("fake snapshot");
+        assert!(snapshot.root_system_key);
+        assert!(!snapshot.executable_path);
     }
 
     #[test]

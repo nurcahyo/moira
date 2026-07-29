@@ -4,6 +4,392 @@
 >
 > **D7 in one paragraph.** Better Auth needs the **plaintext** client secret in console process memory to run the OAuth code exchange. Moira's secret envelope is write-only by design, and its load-bearing invariant is that *a decrypted secret never crosses a network boundary*. Preserving that invariant was judged more important than having a single configuration store. Therefore Moira's `auth_provider_settings` holds **non-secret config only** (issuer, discovery/authorization/token/userinfo/JWKS URLs, `client_id`, scopes, `allowed_email_domains`, algorithms, audiences, redirect URIs, `trusted_jwt_issuer_id`, `enabled`, `version`), the console's own `console_auth` database holds the secret **encrypted at rest**, and `POST /api/v1/admin/auth/providers/{id}/rotate-secret` **no longer exists** — rotation is a console operation. The unavoidable cost is **two configuration stores that can drift**, so the drift protections in *Console-owned client-secret storage* below are **mandatory, not advisory**.
 
+---
+
+## §0 — Wave 0: drift against the tree (audit 2026-07-27, HEAD `27b6e0c`, **plan 07 merged**)
+
+**Read this section before any other.** The body below was written against a pre-07 tree and against
+plan 07's *frozen contract table* rather than against what 07 actually shipped. Plan 07 has now merged
+(`27b6e0c`), and `docs/openapi.json` — not any plan document — is the ground truth for the contract
+this console consumes. A fresh citation-by-citation audit against the real tree found **five
+blockers, six contract mismatches, six deployment mismatches, and eight stale Rust-side citations.**
+
+The rule from plan 07's Wave 0 applies again: **where §0 and the body disagree, §0 wins.** The body is
+not rewritten wholesale, because its *design* is still sound — it is the ordering, the contract
+arithmetic, and the citations that rotted. Two things are corrected inline anyway (migration filename,
+operation count), because leaving those wrong in the body is exactly how they ship.
+
+**Line-reference convention.** Every `:NNN` below is the line number in the **pre-§0** file — i.e. a
+checkout of `27b6e0c` before this section was inserted. Add **386** to locate the same line in the
+current file. Section names are given alongside the numbers wherever the target is not obvious.
+
+**Implementation status: `console/` is 0% implemented.** There is no `console/` directory, no
+`package.json` anywhere in the repo, no `charts/moira-console/`, and no frontend job in
+`.github/workflows/ci.yml` (its three jobs are `rust`, `supply-chain`, `container-and-helm`). Nothing
+in this plan has been started, so every correction below is free to make — none of it is a migration
+of existing code.
+
+---
+
+### §0.1 Blockers
+
+#### B1 — the wizard as specified can NEVER produce a successful claim
+
+**This is the one that matters.** An implementer who reads only the body will build the entire console
+— wizard, dual write, Better Auth, JWKS, drift protection — and then hit a `403` on the very last step
+of the very first run, with nothing in the plan to explain why. The plan's own happy-path e2e tests
+`fresh_deployment_completes_when_auth_provider_is_configured_before_claim` (`:831`) and
+`setup-wizard.spec.ts` (`:829`) **cannot pass as specified.**
+
+**What Moira actually does.** `AuthSettingsService`/`governing_policy`
+(`src/infra/repositories/auth_settings.rs:365-388`) selects the governing policy with:
+
+```sql
+select id, allowed_email_domains from auth_provider_settings
+ where deleted_at is null and status = 'active' and enabled
+   and (issuer = $1 or trusted_jwt_issuer_id = $2)
+ order by (issuer is not distinct from $1) desc, created_at asc, id asc
+ limit 1
+```
+
+`$1` is the **claim body's** `issuer`; `$2` is the `trusted_jwt_issuers.id` resolved *from that same
+issuer string* by `resolve_active_issuer` (`src/application/identity.rs:137-146`,
+`src/infra/repositories/identity.rs:172-189`). There is no third branch.
+
+**What this plan sends.**
+
+| Thing | Value this plan gives it | Where |
+|---|---|---|
+| claim body `issuer` | the **console's** `MOIRA_BFF_ISSUER_URL` | `:752` |
+| `auth_provider_settings.issuer` | the **IdP's** issuer / discovery URL (Google, or the generic-OIDC IdP) — that is what `AuthSettingsStep` collects, and what `validate_method_shape` requires for `google_oauth`/`generic_oidc` | `:747`, `:174-177` |
+| `auth_provider_settings.trusted_jwt_issuer_id` | **never set** — absent from the step's field list (`:747`), absent from the frozen-contract column list (`:122`), absent from the create-request description (`:114`) | — |
+
+So at claim time: `$1` = console URL, `$2` = the console issuer's id. The stored row has
+`issuer` = the *IdP* URL and `trusted_jwt_issuer_id` = `NULL`. **Neither branch matches.**
+`policy = None` → `evaluate_claim_policy` returns `domain_not_allowed()` at
+`src/application/identity.rs:237-240` → **`403 admin_claim_domain_not_allowed`, on every run,
+forever.** No amount of correctly populating `allowed_email_domains` changes this: the row is never
+selected in the first place.
+
+The failure lands as a `403` and not the `400 unregistered_trusted_issuer` the body anticipates
+(`:207`, `:264`) precisely *because* the plan already registers the console's JWT issuer before the
+claim (step 10 before step 11) — `resolve_active_issuer` succeeds and then the policy lookup finds
+nothing. Do not "fix" this by only reordering the `jwt-issuers` call; that is already correct in the
+body and it is not sufficient.
+
+**The shipped correct order** is `docs/admin-identity-claiming.md:7-14`, restated in-code as a doc
+comment on `evaluate_claim_policy` (`src/application/identity.rs:224-227`):
+
+> bootstrap the system key → **register the trusted JWT issuer** → create **and enable** an
+> `auth_provider_settings` row carrying `allowed_email_domains` → claim.
+
+**Required change (binding).**
+
+1. Move `POST /api/v1/admin/jwt-issuers` (and its `GET` pre-check) **before** step 6a — it becomes the
+   *first* Moira write of the wizard, not part of the claim action.
+2. Set **`trusted_jwt_issuer_id`** on the `POST /api/v1/admin/auth/providers` body to the id returned
+   by step 1. The field exists and is writable on the create request
+   (`AuthProviderSettingsCreateRequest.trusted_jwt_issuer_id: Option<Uuid>`,
+   `src/domain/auth_settings.rs:112`) and on the patch request (`:139`).
+3. Keep `auth_provider_settings.issuer` as the **IdP's** issuer. It is load-bearing for
+   `validate_method_shape` and for Better Auth composition; do not repurpose it as the console URL.
+
+**This inverts four parts of the body. Change all of them:**
+
+| Body location | What must change |
+|---|---|
+| Data-flow diagram `:150-230` | Steps 9–10 (`POST /jwt-issuers`) move up to become the new step 5a, ahead of 6a. The claim action (`:203-220`) shrinks to the claim call alone. |
+| Wizard table `:734-741` | Row 4's `POST .../jwt-issuers` moves into row 2 (`AuthSettingsStep`) and runs first; row 4 becomes the claim call only. Row 2's advance gate gains a fifth condition: **`trusted_jwt_issuer_id` is set on the Moira row**. |
+| Dual-write ordering `:515-519` | Becomes a **four**-step write: (0) `POST /jwt-issuers` → (1) `POST /auth/providers` **carrying `trusted_jwt_issuer_id`** → (2) `putProviderSecret` → (3) `POST .../{id}/enable` (still the commit point). The partial-state table at `:523-527` gains a row for "step 0 succeeded, step 1 failed" (an orphan trusted issuer — inert, but it must be surfaced and reused rather than re-registered on retry, or the second attempt gets a uniqueness conflict on `issuer`). |
+| DoD `:1044` | "issuer self-registration first" is already the words used, but it must now mean *first of all four writes*, and the item must additionally assert `trusted_jwt_issuer_id` is set on the created provider row. |
+| `SignInClaimStep` gate `:748`, `AuthSettingsStep` test `:814`, ordering spec `:830-835` | The "enabled provider with a non-empty allow-list" precondition becomes "enabled provider, non-empty allow-list, **and `trusted_jwt_issuer_id` bound to the console's issuer**". Add a named e2e: `provider_without_trusted_jwt_issuer_id_still_denies_the_claim` — it is the exact defect this blocker describes, and without it the regression is invisible. |
+
+**An irony worth recording.** The swap is safe against `console_issuer_must_not_assert_scopes`
+(`src/application/auth_settings.rs:333-353`) **only because** this plan already omits `scopes_claim`
+from the `jwt-issuers` create body (`:751`). But that check short-circuits to `Ok(())` when
+`trusted_jwt_issuer_id` is `None` (`:337-339`) — so **as currently written, plan 08 never exercises
+its own most-stated invariant.** Fixing B1 is what finally makes the no-scope-claim rule mechanically
+enforced by Moira rather than merely asserted by a console unit test. Add
+`console_issuer_with_a_scopes_claim_is_rejected_at_provider_create` to the e2e suite.
+
+**Fallback if provider-first ordering is required for UX reasons.** `trusted_jwt_issuer_id` is also
+settable via `PATCH /api/v1/admin/auth/providers/{id}` with `If-Match`
+(`src/domain/auth_settings.rs:139`). The sequence create-provider → register-issuer → patch-provider →
+enable is equally correct. It is *not* preferred — it adds a fourth Moira round-trip and a fourth
+partial state — but it is available and must be documented if chosen, not discovered.
+
+#### B2 — the setup-token path is a hard `400`, not merely unused
+
+The body describes `POST /api/v1/admin/setup/claim` as accepting `X-Moira-System-Key` **or** a
+`setup_token` body field. It does not. `#/paths/~1api~1v1~1admin~1setup~1claim/post/security` in
+`docs/openapi.json` is **`[{"systemKeyAuth": []}]` and nothing else**, and a populated `setup_token` is
+rejected **twice** — at the handler (`src/http/identity.rs:126-132`) and again in the service
+(`src/application/identity.rs:112-118`) — both with `400 setup_token_not_supported`. Plan 07 §0.2
+decision **D1** deferred the whole path.
+
+Wrong in the body at **`:85`** ("Required on both credential paths (system-key **and** setup-token)"),
+**`:112`** ("`X-Moira-System-Key` **or** `setup_token` in body"), **`:264`** (same), and **`:797`**
+("on the **system-key path and the setup-token path alike**"). The row at `:923` is already correct and
+needs no change.
+
+`:697` — the TypeScript field — **survives**, but must be documented as *reserved and rejected*, not
+optional-and-unused, and typed to match the schema:
+
+```ts
+setup_token?: string | null;   // RESERVED. Populating it is a hard 400 `setup_token_not_supported`.
+```
+
+The schema declares `"type": ["string", "null"]` and omits it from `required`. Add a client unit test
+`claim_builder_never_populates_setup_token` and add `setup_token_not_supported` to `moira-keys.ts`.
+
+#### B3 — the claim endpoint's error list is missing eight codes, several on the wizard's own paths
+
+The body enumerates four outcomes for `POST .../setup/claim` (`:264`, `:923`):
+`unregistered_trusted_issuer`, `invalid_request`, `admin_claim_domain_not_allowed`,
+`admin_identity_already_claimed`. The claim and auth-provider surfaces also emit, all catalogued
+already in `src/i18n/catalog/errors.rs` — **the gap is entirely plan-08-side**:
+
+| Code | Status | Emitted from | Console must |
+|---|---|---|---|
+| `setup_token_not_supported` | **400** | `src/http/identity.rs:129`, `src/application/identity.rs:115` | render keyed (B2) |
+| `setup_claim_credential_required` | **401** | `src/http/identity.rs:136` | render keyed — this is what a missing/typo'd system key looks like, and it is *not* a session-expiry 401; it must **not** route into the `console.notice.session_revoked` sign-out flow at `:951` |
+| `admin_claim_email_required` | **400** | `src/application/identity.rs:256` | actionable, routes back to sign-in |
+| `admin_claim_email_not_verified` | **403** | `src/application/identity.rs:245` | actionable; distinct from `domain_not_allowed`, different remedy |
+| `scope_invalid` | **422**, *not* 400 | `AuthorizationService::normalize_scopes`, `src/security/authz.rs:159`/`:165` (`AppError::unprocessable`) | see §0.2 on `scopes: []` |
+| `console_issuer_must_not_assert_scopes` | **400** | `src/application/auth_settings.rs:346-350` | becomes reachable once B1 lands |
+| `auth_provider_method_config_incomplete` | **400** | `src/application/auth_settings.rs:380-385` | the wizard's own provider write hits this on any incomplete method shape |
+| `auth_provider_url_not_allowed` | **400** | `src/application/auth_settings.rs:423-427` | see B5 |
+
+All eight go into `moira-keys.ts`, into the `:948-953` error-handling section, and into
+`i18n-catalog-coverage.test.ts`'s mirrored-key assertion.
+
+#### B4 — "enable is the commit point" is a console convention, not a Moira guarantee
+
+The body asserts at `:517` and `:747` that "07 creates rows `enabled: false`", and the whole
+"a provider is never enabled without its secret" safety property (`:183`, `:519`, `:1031`) rests on it.
+
+`enabled` is a plain writable `bool` on the create request:
+
+```rust
+// src/domain/auth_settings.rs:89-90
+#[serde(default)]
+pub enabled: bool,
+```
+
+`#[serde(default)]` means *omitted* defaults to `false` — it does **not** mean the field is
+server-controlled. A create body sending `enabled: true` lands an **enabled** provider with **no
+console secret**, which is the exact state the dual-write ordering exists to make unreachable.
+
+**Required:** the safety property must be enforced client-side, mechanically. Add to
+`console/tests/unit/lib/moira-client.test.ts`:
+`provider_create_never_sends_enabled` — no code path in `lib/moira-client.ts` constructs an
+`AuthProviderSettingsCreateRequest` containing an `enabled` key at all (not `enabled: false` — absent),
+and only the dedicated `enableProvider(id, version)` method may enable a row. Reword `:517` and `:747`
+from "07 creates rows disabled" to "**the console never sends `enabled` on create**, so the row is
+created disabled".
+
+#### B5 — the e2e suite cannot run as specified: two different URL gates, two different remedies
+
+The mock OIDC provider at `:828` and the CI `jwks_url` hit **two separate, differently-configured**
+validators. The body mentions neither.
+
+**(i) `auth_provider_settings` URLs — https-only, no escape hatch, no private-host check.**
+`validate_https_url` (`src/application/auth_settings.rs:421-434`) is applied unconditionally by
+`validate_urls` (`:388-411`) to `discovery_url`, `authorization_url`, `token_url`, `userinfo_url`,
+`jwks_url` and every entry of `redirect_uris`. There is **no** `allow_http` flag on this path — a
+`http://localhost:PORT` mock IdP is rejected `400 auth_provider_url_not_allowed`. It performs *only* a
+scheme-and-host check (a fact the source comments on explicitly at `:414-420`), so
+**`https://localhost:PORT` passes**. ⇒ the mock IdP needs **TLS**, and the console's e2e runner needs
+the mock's CA trusted. No Moira config change is needed for this half.
+
+**(ii) `POST /api/v1/admin/jwt-issuers` `jwks_url` — full SSRF check with a *different* flag.**
+This does **not** go through `validate_provider_base_url`/`provider_security.allow_private_provider_urls`.
+It goes through `reject_denied_jwks_url` (`src/application/admin/shared.rs:184-220`) →
+`validate_jwks_url` (`src/security/ssrf.rs:342-...`), which requires `https` and rejects loopback,
+private, and link-local addresses. The escape hatch is
+**`auth.jwks.allow_insecure_dev_urls`** (`MOIRA_AUTH__JWKS__ALLOW_INSECURE_DEV_URLS=true`,
+`src/config/settings.rs:137-140`) — and `Settings::validate` **hard-fails production** when it is set,
+so it is a fixture-only knob and must be documented as such.
+
+Two subtleties that matter for writing the fixture:
+
+- `reject_denied_jwks_url` **soft-accepts** `Resolution` and `Timeout` denials (`shared.rs:194-206`):
+  a host that does not resolve is logged and allowed through, and re-checked on every fetch. Only a
+  *resolvable* loopback/private host is refused. Do not build the fixture on that behaviour — the
+  console's JWKS must actually be fetchable for `authenticate_trusted_jwt` to work.
+- The console's own `jwks_url` (the Better Auth `jwt` plugin's published document) is subject to (ii),
+  not (i) — so in CI the console must be reachable from Moira over an https URL that is either
+  non-loopback or covered by the dev flag.
+
+**Required:** add to the e2e fixture section (`:827-828`) and to the Wave 0 checklist: a **TLS** mock
+IdP, a **TLS** console origin, and `MOIRA_AUTH__JWKS__ALLOW_INSECURE_DEV_URLS=true` on the fixture
+Moira with an explicit note that it is dev-only and production-invalid.
+
+---
+
+### §0.2 Contract mismatches vs `docs/openapi.json` (ground truth)
+
+- **The auth-provider surface is SEVEN operations, not ten.** `GET`/`POST` on `/auth/providers`,
+  `GET`/`PATCH`/`DELETE` on `/auth/providers/{id}`, and `POST` on `{id}/enable` and `{id}/disable`.
+  Ten is the **total including the three setup operations** (`claim-status`, `auth-methods`, `claim`),
+  which the body's own table (`:110-118`) lists — so `:106`'s heading "**10 auth-provider
+  operations**", `:773`'s "**10 ops**" (that cell covers auth-settings endpoints only), and `:926`'s
+  "(**10 operations**)" are all mislabelled, and `:120`'s "the four claim/setup rows above plus these
+  six" is arithmetic that matches neither reading (there are **three** setup rows and **six table
+  rows** covering **seven** operations, because `{enable,disable}` share a row).
+  `docs/admin-identity-claiming.md:36` says "Seven operations." **The named test at `:802` —
+  `there_is_no_rotate_secret_method`, asserting "the auth-provider surface is exactly **10**
+  operations" — would fail as specified.** It must assert **7**.
+  `:101`'s D7 before/after count (11 → 10) is a **total** and is correct; leave it.
+  These are corrected inline — see §0.5.
+
+- **`Idempotency-Key` is not declared on every mutating call.** `:709` ("on every mutating call"),
+  `:928` ("(mutations)") and `:1048` are wrong, and so is the `moira-client.test.ts` assertion at
+  `:796` ("`Idempotency-Key` present on every mutation"). Across the whole spec, 23 operations declare
+  it, and every one is a POST-to-collection, a `/rotate`, or one of two `PUT`s. **No `PATCH`, no
+  `DELETE`, no `enable`/`disable`, and no `refresh-jwks` declares it** — those declare `If-Match` +
+  `X-Request-Id` only. Within the ten operations this plan binds to, exactly **two** declare it:
+  `POST /api/v1/admin/setup/claim` and `POST /api/v1/admin/auth/providers`.
+  Consequence for the dual write: **step 3 (`enable`) cannot be idempotency-keyed** — its retry safety
+  comes from `If-Match` and from `enable` being naturally idempotent, and `:519`/`:527` should say so.
+  Sending the header anyway is harmless at runtime (unknown headers are ignored), but the contract
+  claim and the test assertion are false and must be narrowed to "every operation that declares it".
+
+- **`AdminIdentityRecord` has a required `notice` field that this plan elides.** The schema's
+  `required` list is `[id, issuer, subject, email, email_verified, granted_scopes, status, created_at,
+  version, notice]`, where `notice` is a `ResponseText` i18n envelope. `:699-702` and `:756` omit it.
+  `DoneStep` must render it through `t()` per this plan's own §4.6 rule (`:715-716`), and
+  `lib/types.ts` must declare it non-optional. There is also a required `version` the TS shape elides.
+
+- **The cache key at `:605` names a global settings version that does not exist.**
+  `` `${moiraSettingsVersion}:${maxConsoleSecretUpdatedAt}` `` — `version` on
+  `auth_provider_settings` is **per row**, incremented by that row's own writes. There is no
+  deployment-wide settings version to read. Use `max(row.version)` across the fetched rows, or a hash
+  of `(id, version)` pairs; a hash is safer, because `max()` cannot see a row **deletion**. Same
+  correction applies to `:618`'s description of `getAuth()`'s cache key.
+
+- **`scopes: []` is not the same as omitting `scopes`.** `ClaimAdminIdentityRequest.scopes` carries
+  `#[serde(default = "default_admin_grant_scopes")]` (`src/domain/identity.rs:58`), so an **omitted**
+  field yields `["moira:admin"]` — but an explicitly sent empty array normalises to an empty vector
+  (`normalize_scopes` iterates and returns `Ok(vec![])`) and creates a grant with **zero scopes**: a
+  silent, permanent, un-revocable-by-retry no-op admin. `:696` and `:752` correctly say "omitted", but
+  nothing enforces it. Add `claim_builder_omits_scopes_entirely_never_sends_an_empty_array` to
+  `moira-client.test.ts`. Note also that a *non-empty* bad scope yields **422 `scope_invalid`**, not
+  400 (see B3).
+
+- **`GET`/`POST /providers/{id}/models` — the path parameter is `{provider_id}`.** `:766`. The spec
+  declares `/api/v1/admin/providers/{provider_id}/models`; `/provider-models/{id}` uses `{id}`. A
+  hand-written client that guesses `{id}` for the first will build the wrong URL template.
+
+- **`:124`'s scope claim is true, but by implication, not by grant.** The bootstrap system key does not
+  literally carry `moira:auth-settings:{read,write,delete}`. `ActorType::SystemKey` is in
+  `ADMIN_IMPLYING_ACTOR_TYPES` (`src/security/authz.rs:138-142`), so `has_scope` (`:148-152`) returns
+  true for **any** known scope when the actor holds `moira:admin`. The three scopes must nonetheless
+  exist in the known-scope list — they do (`src/security/authz.rs:43-45`) — because
+  `AuthorizationService::require` returns a **500** for an unknown scope, not a 403. State the
+  mechanism; do not restate it as "the console's system-key actor must hold them".
+
+---
+
+### §0.3 Deployment mismatches — the container baseline moved underneath this plan
+
+- **`:1001` says the console's pod security context must "match the `charts/moira` hardening
+  baseline". That baseline is now `runAsUser: 65532` / `fsGroup: 65532`**
+  (`charts/moira/templates/deployment.yaml:27-29`), inherited from
+  `gcr.io/distroless/cc-debian12:nonroot`. **`node:24-slim` has no uid 65532** — its non-root user is
+  `node`, uid **1000**. Copying the baseline literally produces a pod that cannot start. The console
+  chart must state **its own** uid (1000, or a uid it explicitly creates in the Dockerfile), and
+  `:1001` must be reworded to "matches the *shape* of the `charts/moira` baseline
+  (`runAsNonRoot`, dropped capabilities, `readOnlyRootFilesystem`) with a uid appropriate to the
+  console's own base image".
+
+- **`:277` and `:859` mandate a Dockerfile `HEALTHCHECK`. Moira's own Dockerfile no longer has one** —
+  Kubernetes probes handle liveness/readiness, and a `HEALTHCHECK` is dead weight under an
+  orchestrator. Worse, `node:24-slim` ships **neither `curl` nor `wget`**, so the instruction as
+  written is unimplementable without adding a package (and attack surface) to the runtime image.
+  **Recommendation: drop the `HEALTHCHECK` and specify `livenessProbe`/`readinessProbe` on
+  `/api/health` in `charts/moira-console/templates/deployment.yaml` instead.** Keep the
+  `app/api/health/route.ts` handler — it is still the probe target.
+
+- **`readOnlyRootFilesystem: true` (`:1001`) needs writable mounts that are unmentioned.** A Next.js
+  standalone server writes to `.next/cache` (ISR/fetch cache) and to `/tmp`. Add `emptyDir` volumes for
+  both to the deployment template, or the pod crash-loops the first time it renders. This is a
+  template requirement, not just an assertion.
+
+- **`:860`'s "mirroring `charts/moira/templates/`" is an incomplete mirror.** `charts/moira/templates/`
+  contains `networkpolicy.yaml`, `pdb.yaml`, `priorityclass.yaml` and `servicemonitor.yaml` in addition
+  to the eight files `:860` lists. Either mirror them (a `NetworkPolicy` is arguably *more* important
+  for the console, which is the internet-facing half) or state explicitly which are deliberately
+  omitted and why. Silence reads as an oversight.
+
+- **A second image needs its own Trivy step.** `.github/workflows/ci.yml`'s `container-and-helm` job
+  runs `aquasecurity/trivy-action@v0.36.0` with `exit-code: "1"` and `severity: CRITICAL,HIGH` against
+  `moira:ci` only, and `helm lint`/`helm template`/`kubeconform` against `charts/moira` only. Plan 08
+  mentions neither. Add: `docker build -t moira-console:ci console/`, the same Trivy step against it,
+  and the `helm lint`/`template`/`kubeconform` trio for `charts/moira-console` — plus the frontend
+  gate job (`bun install --frozen-lockfile`, `lint`, `typecheck`, `test`, `playwright`, `build`) that
+  `:976-983` describes but no workflow runs. **Note the practical risk:** `node:24-slim` is a Debian
+  base with a far larger CVE surface than Moira's distroless image, and `exit-code: "1"` on
+  CRITICAL,HIGH is a *hard* gate. Budget for either a distroless Node runtime or a documented,
+  time-boxed `.trivyignore`.
+
+- **`:1005-1010` lists `cargo build --release --locked` as a shipped Rust gate. It is not in
+  `ci.yml`.** The `rust` job runs `cargo fmt --check`, `cargo clippy --workspace --all-targets
+  --all-features -- -D warnings`, `cargo test --workspace --all-features`, and a clean-database
+  migration test. The other three lines are accurate. Drop the fourth, or add it deliberately.
+
+---
+
+### §0.4 Citation staleness
+
+23 Rust-side citations were re-checked; **8 are stale**. Assume any unlisted line number is off by a
+few and re-check before quoting it in code comments or docs.
+
+| Body cite | Reality |
+|---|---|
+| `:62` — "`migrations/0001-0008`" | Migrations now run `0001`–`0013`. |
+| `:77`, `:122` — "migration `0010_auth_provider_settings.sql`" | Shipped as **`0013_auth_provider_settings.sql`**. `0010` is `list_cursor_indexes`. **Corrected inline** (§0.5). |
+| `:228` — "the `admin_identities` grant union in `src/security/auth.rs` (07 module 4)" | It is **module 7a / decision D2**: `apply_admin_identity_grant` (`src/security/auth.rs:901`), called from `authenticate_admin` (`:309`) at **`:334`**. Also at `:661` ("07 module 4's grant union") and `:939`. |
+| `:661` — "`actor_from_trusted_claims` (`src/security/auth.rs:555-628`)" | **`:940`**. |
+| `:667`, `:937` — "`validation.validate_aud = false`, `src/security/auth.rs:327-328`" | **`:556`** (admin path) and `:836` (caller path). |
+| `:751` — "`TrustedJwtIssuerCreateRequest`, `src/domain/admin.rs:564`" | **`src/domain/admin.rs:588`**. |
+| `:209`, `:751` — "07 module 3 `resolve_issuer_id`" | The function is **`resolve_active_issuer`** (`src/infra/repositories/identity.rs:172`, called at `src/application/identity.rs:139`). No `resolve_issuer_id` exists. |
+| `:263` — `src/http/admin.rs:33-48`, `:75` — `src/infra/db.rs:43-80`, `:950` — `src/error.rs:52-65` | Within a line or two. **True enough**; no change needed. |
+
+**Additionally: decision D2 must be stated in this plan's authz section (`:944-946`), not just
+implied.** `authenticate_admin` and `authenticate_caller` both delegate to the same
+`authenticate_trusted_jwt`, but **only `authenticate_admin` applies the grant** (`auth.rs:334`);
+`authenticate_caller` returns the trusted-JWT actor verbatim (`:394`). So the console's token carries
+`moira:admin` **on `/api/v1/admin/*` only** — the same token presented to the public execution API
+resolves to exactly whatever the JWT independently claims, which for this console is *nothing*. Plan 08
+makes **zero** non-admin API calls, so there is no functional violation, but `:228` and `:238`
+misdescribe the mechanism ("Moira … resolves `moira:admin` via the grant union" reads as
+unconditional). State the plane restriction explicitly; it is a security property the console depends
+on and should not silently inherit.
+
+**And close a stale open question.** Product decision 2 at `:54` asks Wave 0 to "verify whether Moira
+accepts `EdDSA`". **It does** — `src/security/auth.rs:1146`, `:1160`, `:1177` map `EdDSA` through to
+`jsonwebtoken::Algorithm::EdDSA`. **ES256 nonetheless remains the correct pin**, because
+`allowed_algorithms` defaults to `["RS256"]` per issuer and the console registers its own issuer with
+an explicit `allowed_algorithms: ["ES256"]` anyway — either would work, and ES256 is the more widely
+interoperable of the two. Mark the question **answered**, keep the ES256 pin, and delete the "Wave 0
+must verify" instruction.
+
+---
+
+### §0.5 Corrections applied inline to the body
+
+Everything else above is left for the implementer to apply. Two items are patched directly into the
+body, because they are single tokens that would otherwise be copied verbatim into shipped code:
+
+1. **`0010_auth_provider_settings.sql` → `0013_auth_provider_settings.sql`** at `:77` and `:122`, and
+   `migrations/0001-0008` → `migrations/0001-0013` at `:62`.
+2. **The auth-provider operation count `10` → `7`** at `:106`, `:120`, `:773`, `:802`, `:926` and
+   `:1035`, with the total-of-ten restated where the count covers setup operations too. `:101`'s
+   `11 → 10` D7 delta is a total and is left alone.
+
+---
+
 ## Summary
 
 **Objective.** Ship the first Moira admin console: a Next.js application acting as a Backend-For-Frontend (BFF) in front of Moira. It gives a human operator a browser-based way to (1) complete first-run setup by configuring the auth provider and claiming the initial admin identity, and (2) sign in thereafter to manage providers, credentials, models, routing, and view the audit log — all by calling Moira's *existing* (and plan-07-added) admin APIs. No Moira source in this repository is modified by this plan; it adds a **new**, separately deployed Next.js project plus deployment assets.
@@ -59,7 +445,7 @@
 
 ## Findings Addressed
 
-- **P1-11** (`plans/00-audit-report.md` — "Identity foundation absent — no owner/admin claiming, no user model... no safe basis for a Next.js admin console or OAuth login"): this plan is the console half of the fix; plan 07 is the backend half. Current behavior referenced by P1-11: **no UI/identity exists** — no `users` table, no session store, no OAuth client anywhere in `src/`. Verified by exhaustive grep in the audit (`migrations/0001-0008`, `src/`).
+- **P1-11** (`plans/00-audit-report.md` — "Identity foundation absent — no owner/admin claiming, no user model... no safe basis for a Next.js admin console or OAuth login"): this plan is the console half of the fix; plan 07 is the backend half. Current behavior referenced by P1-11: **no UI/identity exists** — no `users` table, no session store, no OAuth client anywhere in `src/`. Verified by exhaustive grep in the audit (`migrations/0001-0013` — the audit read `0001-0008`; see §0.4, `src/`).
 - **P0-3** (conversation/memory/RAG surface must be explicitly scoped before public exposure): the console MVP screen list deliberately **excludes** RAG/memory/conversation configuration UI so the console does not visually imply capabilities plan **02a** (the honesty half of the split — CONVENTIONS §0 D2) is simultaneously marking as preview/non-functional (`ingestion_status`, empty `citations`, no summarization). If plan **02a** has not yet landed the honest-status change when 08 starts, the console must still not build screens for these surfaces. Note also that per **D1** the `Idempotency-Key` parameter **stays** on Moira's conversation/memory/RAG routes (real replay lands in **02b**); no console text may describe it as removed or `501`-rejected.
 - **P1-10** (no committed OpenAPI spec): the console's Moira client is hand-typed for MVP and switches to generated types once plan 05's committed-spec gate exists. Recorded as a dependency, not silently assumed.
 - **P1-4** (audit-log cursor pagination correctness): the audit-log screen honestly renders "showing latest N" with no "next" control until plan 04 lands the cursor fix, rather than shipping a broken pager.
@@ -74,7 +460,7 @@
 
 CONVENTIONS §7.2 requires auth provider **non-secret** configuration to be **runtime configuration owned by Moira's database**, written by the setup wizard, read by the console at boot and on invalidation, with cache invalidation over the existing Postgres `LISTEN/NOTIFY` path (`src/infra/db.rs:43-80`). **Per D7, client secrets are explicitly excluded from that store**: §7.2 now reads "Client secrets are owned by the console, not Moira… the OAuth client secret lives encrypted at rest in the console's own `console_auth` database, written by the setup wizard, never sent to Moira, never returned to the browser." *(Moira's `SecretCipher` + AAD remains the mechanism for **AI-provider credentials**, which D7 does not touch.)*
 
-**Status: plan 07 now provides this.** An earlier revision of this plan declared D-1 as a *blocking, unspecified* prerequisite because 07 placed the domain policy in static env config, defined no auth-settings resource, and stated "cache invalidation: none needed." **All three conflicts were resolved in 07's compliance pass**: the env-var domain allow-list (`MOIRA_AUTH__ADMIN_CLAIM_ALLOWED_EMAIL_DOMAINS`) was **withdrawn** in favour of DB-backed policy, migration `0010_auth_provider_settings.sql` adds the `auth_provider_settings` table, and invalidation reuses the existing `LISTEN/NOTIFY` channel. This plan now binds to 07's **frozen** names below — it no longer guesses them.
+**Status: plan 07 now provides this.** An earlier revision of this plan declared D-1 as a *blocking, unspecified* prerequisite because 07 placed the domain policy in static env config, defined no auth-settings resource, and stated "cache invalidation: none needed." **All three conflicts were resolved in 07's compliance pass**: the env-var domain allow-list (`MOIRA_AUTH__ADMIN_CLAIM_ALLOWED_EMAIL_DOMAINS`) was **withdrawn** in favour of DB-backed policy, migration `0013_auth_provider_settings.sql` (**not `0010`** — see §0.4) adds the `auth_provider_settings` table, and invalidation reuses the existing `LISTEN/NOTIFY` channel. This plan now binds to 07's **frozen** names below — it no longer guesses them.
 
 #### Frozen-contract change adopted (product-owner decisions D3/D4/D5, 2026-07-25)
 
@@ -103,7 +489,7 @@ D7 removes the client secret from Moira's `auth_provider_settings` **entirely**.
 
 The cost D7 accepts is **two configuration stores that can diverge**, which is why the drift protections below are mandatory.
 
-**Frozen contract this plan consumes** — **10 auth-provider operations** (source of truth: `plans/07-identity-foundation.md` § Interfaces & Contracts as amended by D7 — re-verify at Wave 0, do not re-derive):
+**Frozen contract this plan consumes** — **seven auth-provider operations plus three setup operations = ten in total** (§0.2: "10 auth-provider operations" was wrong; the auth-provider surface is **7**) (source of truth: `plans/07-identity-foundation.md` § Interfaces & Contracts as amended by D7 — re-verify at Wave 0, do not re-derive):
 
 | Endpoint | Auth | Notes |
 |---|---|---|
@@ -117,9 +503,9 @@ The cost D7 accepts is **two configuration stores that can diverge**, which is w
 | `DELETE /api/v1/admin/auth/providers/{id}` | `moira:auth-settings:delete` | **`If-Match` required** → 204 |
 | `POST /api/v1/admin/auth/providers/{id}/{enable,disable}` | `moira:auth-settings:write` | **`If-Match` required** |
 
-**Ten operations, not eleven** — the four claim/setup rows above plus these six. `POST /api/v1/admin/auth/providers/{id}/rotate-secret` **does not exist** (deleted by D7); the console must never call, reference, or document it, and no client-generation step may resurrect it.
+**Ten operations in total, not eleven** — **three** setup rows (`claim-status`, `auth-methods`, `claim`) plus the **seven** auth-provider operations the six rows below cover (`{enable,disable}` is one row, two operations). The auth-provider surface on its own is **7**, matching `docs/admin-identity-claiming.md:36`. `POST /api/v1/admin/auth/providers/{id}/rotate-secret` **does not exist** (deleted by D7); the console must never call, reference, or document it, and no client-generation step may resurrect it.
 
-- **Table:** `auth_provider_settings` (migration `0010_auth_provider_settings.sql`) — **non-secret config only** after D7: issuer, discovery/authorization/token/userinfo/JWKS URLs, `client_id`, requested scopes, `allowed_email_domains`, allowed algorithms, audiences, redirect URIs, `trusted_jwt_issuer_id`, `enabled`, `version`. The encrypted-envelope columns (`encrypted_payload`, `encryption_algorithm`, `encryption_version`, `encrypted_data_key`, `nonce`, `secret_fingerprint`, `masked_secret`) are **removed from 07's spec**; the console must not read, expect, or type them.
+- **Table:** `auth_provider_settings` (migration `0013_auth_provider_settings.sql` — **`0010` is `list_cursor_indexes`**; see §0.4) — **non-secret config only** after D7: issuer, discovery/authorization/token/userinfo/JWKS URLs, `client_id`, requested scopes, `allowed_email_domains`, allowed algorithms, audiences, redirect URIs, `trusted_jwt_issuer_id`, `enabled`, `version`. The encrypted-envelope columns (`encrypted_payload`, `encryption_algorithm`, `encryption_version`, `encrypted_data_key`, `nonce`, `secret_fingerprint`, `masked_secret`) are **removed from 07's spec**; the console must not read, expect, or type them.
 - **Method discriminator — use 07's exact values:** `google_oauth` | `generic_oidc` | `jwks`. *(A previous draft of this plan guessed `google` / `byo_jwks`; those names are wrong and must not appear anywhere in the console.)*
 - **New scopes:** `moira:auth-settings:{read,write,delete}` — the console's system-key actor must hold them.
 - **Mode 3 (bring-your-own JWKS) is the pre-existing `/api/v1/admin/jwt-issuers` surface** — 07 invented nothing new for it, and the console reuses those endpoints rather than a parallel path.
@@ -770,7 +1156,7 @@ Pages under `app/(console)/` stay thin (fetch + guard + render); all rendering l
 | Applications | `app/(console)/applications/page.tsx` | `modules/applications/*` | `GET/POST /applications`, `GET/PATCH/DELETE .../{id}`, execution-policy |
 | Trusted JWT issuers | `app/(console)/jwt-issuers/page.tsx` | `modules/jwtIssuers/JwtIssuerTable` | `GET/POST /jwt-issuers`, `GET/PATCH/DELETE .../{id}`, enable/disable, refresh-jwks |
 | Audit log | `app/(console)/audit-log/page.tsx` | `modules/audit/AuditLogPanel` | `GET /audit-events`, `GET .../{id}` |
-| Auth settings | `app/(console)/settings/auth/page.tsx` | `modules/authSettings/{AuthSettingsForm,ProviderSecretRotatePanel,ProviderDriftBanner}` | Moira auth-settings endpoints (**10 ops, non-secret config only — D7**) + the console's own `authProviderSecret` store for the secret and its rotation |
+| Auth settings | `app/(console)/settings/auth/page.tsx` | `modules/authSettings/{AuthSettingsForm,ProviderSecretRotatePanel,ProviderDriftBanner}` | Moira auth-settings endpoints (**7 ops, non-secret config only — D7**) + the console's own `authProviderSecret` store for the secret and its rotation |
 
 Notes carried forward: **credentials never render a plaintext secret** — the once-only creation response appears in `OnceOnlySecretModal` ("copy now, will not be shown again"), mirroring Moira's `ApiKeySecretResponse` contract, and the value never becomes a prop on any reusable molecule/atom beyond that modal's own render. The **console's own issuer row** is flagged read-only in `JwtIssuerTable` with a typed-issuer-name confirm guard on disable, so an operator cannot casually disable their own login path. The **audit log** shows "showing latest N, no further pages" until P1-4's cursor fix lands in plan 04, rather than a broken "next" control.
 
@@ -799,7 +1185,7 @@ Notes carried forward: **credentials never render a plaintext secret** — the o
   - `auth_methods_read_sends_system_key` — `GET .../setup/auth-methods` always attaches `X-Moira-System-Key` and is never issued credential-free (D4: an anonymous call would 401, and there is no anonymous variant to fall back to).
   - `claim_status_is_the_only_anonymous_call` — enumerating every method on the client, exactly one (`getSetupClaimStatus`) sends no credential; every other Moira call attaches either `X-Moira-System-Key` or `Authorization: Bearer`.
   - **D7:** `no_request_body_or_header_ever_carries_a_client_secret` — every request the client can construct, across every method and every auth-settings shape, is scanned for the fixture client-secret value; the violation set must be **empty**.
-  - **D7:** `there_is_no_rotate_secret_method` — the client exposes no method, no path constant, and no type referencing `rotate-secret`; the auth-provider surface is exactly **10 operations**.
+  - **D7:** `there_is_no_rotate_secret_method` — the client exposes no method, no path constant, and no type referencing `rotate-secret`; the auth-provider surface is exactly **7 operations** (list, create, get, patch, delete, enable, disable — §0.2; asserting 10 here would fail).
 - `console/tests/unit/lib/errors.test.ts` — `ErrorResponse` → client-safe union; `details` never crosses the boundary; 401/403 map to the sign-out-and-redirect outcome.
 - `console/tests/unit/lib/session.test.ts` — server-only session read, no token ever returned to callers.
 - `console/tests/unit/lib/i18n.test.ts` — `t()` resolves catalog first, falls back to the server `message` for an unknown `message_key`, falls back to the key when both are absent, interpolates `message_args` as structured data (never pre-formatted prose).
@@ -923,7 +1309,7 @@ One PR against `main` from `plan/08-nextjs-console-google-oauth`, opened only af
 | `POST /api/v1/admin/setup/claim` | `X-Moira-System-Key`, `Idempotency-Key` | plan 07 frozen; body `ClaimAdminIdentityRequest` with **`email: string` and `email_verified: boolean` REQUIRED on every call, system-key path included (D5)** — no optional-email path exists; response `AdminIdentityRecord.email` is a required `string`; 201 new / 200 replay / 400 `unregistered_trusted_issuer` / 400\|422 `invalid_request` (either field omitted) / **403 `admin_claim_domain_not_allowed` (deny-by-default, no exemption, no bootstrap bypass — D3; rendered as an actionable setup instruction)** / 409 `admin_identity_already_claimed`; bare Bearer JWT rejected 401 |
 | `POST /api/v1/admin/jwt-issuers` | `X-Moira-System-Key`, `Idempotency-Key` | existing; called once, **before** the claim |
 | `GET /api/v1/admin/jwt-issuers` | `X-Moira-System-Key` (setup-time) | existing; already-registered pre-check |
-| Moira auth-settings read/write (**10 operations**) | `X-Moira-System-Key`, `Idempotency-Key` + `If-Match` on write | **D-1 — paths/shapes owned and frozen by plan 07's amendment**; this plan binds to them, does not name them. **D7: non-secret config only.** No request carries the OAuth client secret; no response carries secret material of any kind (no plaintext, no fingerprint, no mask). **`rotate-secret` does not exist** — rotation is console-side. |
+| Moira auth-settings read/write (**7 operations**) | `X-Moira-System-Key`, `Idempotency-Key` + `If-Match` on write | **D-1 — paths/shapes owned and frozen by plan 07's amendment**; this plan binds to them, does not name them. **D7: non-secret config only.** No request carries the OAuth client secret; no response carries secret material of any kind (no plaintext, no fingerprint, no mask). **`rotate-secret` does not exist** — rotation is console-side. |
 | Console-owned client secret (**not a Moira call**) | none — a console-DB write via `lib/provider-secrets.ts` | **D7.** Encrypted at rest in `console_auth.authProviderSecret`, written in the same wizard/settings step as the Moira config write, fingerprinted against Moira's `client_id`. Listed here explicitly so the contract table shows the *whole* configuration write, not just its Moira half. |
 | All other admin CRUD | `Authorization: Bearer <jwt-plugin token>`, `Idempotency-Key` (mutations), `If-Match` (PATCH/PUT and rotate) | existing, per `src/http/mod.rs` |
 
@@ -1032,7 +1418,7 @@ Plus clean PostgreSQL migration validation (unaffected — this plan adds no Moi
 - [ ] **Drift protection (b) — `client_id` fingerprint.** A keyed fingerprint of the `client_id` is stored beside the secret and compared against Moira's `client_id` on **every** load; a mismatch produces the specific, actionable `console.error.auth_provider_client_id_mismatch`, excludes the provider, and **prevents the OAuth exchange from being attempted at all**. Missing / mismatched / undecryptable remain **three distinct** conditions, never collapsed.
 - [ ] **Drift protection (c) — tests.** `console/tests/e2e/auth-secret-drift.spec.ts` passes with all six named tests, and `console/tests/unit/lib/provider-secrets.test.ts` passes with the fingerprint-comparison suite.
 - [ ] **Rotation is a console concern.** An operator rotates the client secret entirely through `/settings/auth` → `ProviderSecretRotatePanel`, with **zero Moira calls** for a secret-only rotation and no redeploy. **No text, type, client method, path constant, or doc anywhere under `console/` references `POST /api/v1/admin/auth/providers/{id}/rotate-secret`** — `no_source_file_references_rotate_secret` and `there_is_no_rotate_secret_method` pass.
-- [ ] **Frozen contract is 10 operations, carrying no secret material.** `auth_provider_record_type_has_no_secret_field` passes; Wave 0's verification that Moira's spec has no `rotate-secret`, no envelope columns, and no `auth_provider_secret_rebind_required` key is recorded in the PR.
+- [ ] **Frozen contract is 7 auth-provider operations (10 including the three setup operations), carrying no secret material.** `auth_provider_record_type_has_no_secret_field` passes; Wave 0's verification that Moira's spec has no `rotate-secret`, no envelope columns, and no `auth_provider_secret_rebind_required` key is recorded in the PR.
 - [ ] Every D7 i18n key in the table above exists in `catalog.en.ts` with a non-empty English default and is covered by `i18n-catalog-coverage.test.ts`.
 
 **Plan-07 frozen-contract conformance (D3/D4/D5) — no residual mismatch**

@@ -25,4 +25,14 @@ pub const RESPONSE_NOTICE_CATALOG: &[I18nEntry] = &[
         default_message: "Streaming has started.",
         description: "Used when a streaming response is opened successfully.",
     },
+    // Plan 07 — the catalog's first production notice consumer. A notice entry
+    // exists only where the response actually carries prose a console shows a
+    // human: `GET …/setup/claim-status` (a bare boolean), the auth-provider
+    // records and `GET …/setup/auth-methods` (pure configuration data) carry
+    // none and get none.
+    I18nEntry {
+        key: "moira.notice.admin_identity_claimed",
+        default_message: "Admin access has been granted to this identity.",
+        description: "Used on both the 201 of a fresh admin-identity claim and the 200 of an idempotent replay, which returns the stored body verbatim. The status code, not the notice, distinguishes the two.",
+    },
 ];

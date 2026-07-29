@@ -1,11 +1,8 @@
-use std::{sync::Arc, time::Instant};
+use std::{future::Future, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use rig_core::{
-    OneOrMany,
-    completion::{CompletionRequest, Message},
-};
+use rig_core::completion::CompletionRequest;
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use tokio::{
@@ -13,6 +10,7 @@ use tokio::{
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::{
@@ -20,7 +18,7 @@ use crate::{
     application::RequestContext,
     domain::{
         AgentProfileRecord, AttemptStatus, AuditLogInsert, AuditResult, CallerRuntimeIdentity,
-        CredentialDecision, DiagnosticExecutionRequest, DiagnosticExecutionResponse,
+        CredentialDecision, DiagnosticExecutionRequest, DiagnosticExecutionResponse, DomainMessage,
         EffectiveExecutionPolicy, ExecutionCommand, ExecutionFailure, ExecutionFailureClass,
         ExecutionOutcome, ExecutionStatus, ExecutionStreamHandle, ModelCandidate, ModelDecision,
         ModelSelectionReason, ProviderAttemptSummary, ProviderRuntimePolicyRecord, ProviderType,
@@ -29,14 +27,16 @@ use crate::{
     },
     error::AppError,
     infra::{
+        metrics::{MetricsRegistry, provider_type_label},
         pg_rows::{credential_type_to_db, scope_type_to_db},
         repositories::{
             AdminRepository, ExecutionAttemptInsert, ExecutionAttemptUpdate, PgAdminRepository,
-            PgRuntimeRepository, UsageRecordInsert,
+            PgRuntimeRepository, RuntimeRepository, UsageRecordInsert,
         },
     },
     orchestration::{
         RigRuntimeFactory, RuntimeCacheKey, RuntimeFactory, RuntimeModelHandle, RuntimeStreamItem,
+        rig_chat_history,
     },
     security::{Actor, ActorType, CredentialAadParts, SecretCipher, credential_aad},
 };
@@ -87,7 +87,7 @@ impl MoiraExecutionService {
             external_user_id: request
                 .external_user_id
                 .or_else(|| actor.external_user_id.clone().or(actor.subject.clone())),
-            messages: vec![Message::user(request.prompt)],
+            messages: vec![DomainMessage::user(request.prompt)],
             route_hint: request.route,
             provider_hint: request.provider_id,
             model_hint: request.provider_model_id,
@@ -246,7 +246,15 @@ impl MoiraExecutionService {
                 }),
             );
 
-            let credential = match self.resolve_credential(&command, &candidate).await {
+            // Phase bound: credential resolution (DB round-trip + AES-256-GCM decrypt) must
+            // fit inside what is left of the total execution deadline. No attempt row and no
+            // permit exist yet, so a breach needs no cleanup beyond the existing error arm.
+            let credential = match bounded_phase(
+                execution_deadline,
+                self.resolve_credential(&command, &candidate),
+            )
+            .await
+            {
                 Ok(credential) => credential,
                 Err(failure) => {
                     last_failure = Some(failure.clone());
@@ -301,9 +309,14 @@ impl MoiraExecutionService {
                 }
             }
 
-            let handle = match self
-                .runtime_handle(&provider, &candidate, &credential)
-                .await
+            // Phase bound: runtime construction. A cache miss builds a Rig client, which can
+            // block on DNS/TLS setup. Still no attempt row and no permit, so the existing
+            // error arm remains the whole cleanup story.
+            let handle = match bounded_phase(
+                execution_deadline,
+                self.runtime_handle(&provider, &candidate, &credential),
+            )
+            .await
             {
                 Ok(handle) => handle,
                 Err(failure) => {
@@ -478,6 +491,27 @@ impl MoiraExecutionService {
                 };
 
                 let cancellation = events.cancellation();
+                // Execution-attempt span (plan 05, Module 2). Attached with `Instrument`
+                // rather than an `enter()` guard because the attempt body awaits: a guard
+                // held across an await point would re-parent whatever else the runtime
+                // schedules onto this thread.
+                //
+                // Attributes are an explicit whitelist of identifiers and closed-set enum
+                // labels — no prompt text, no request or response body, no credential
+                // material, and nothing `Debug`-formatted. `provider_type` reuses
+                // `provider_type_label` so the span attribute and the metric label cannot
+                // drift apart.
+                let attempt_span = tracing::debug_span!(
+                    "execution_attempt",
+                    attempt_id = %attempt_id,
+                    attempt_number,
+                    execution_id = %command.execution_id,
+                    provider_id = %candidate.provider_id,
+                    provider_model_id = %candidate.provider_model_id,
+                    provider_type = provider_type_label(candidate.provider_type),
+                    model_key = %candidate.model_key,
+                    stream = command.options.stream,
+                );
                 let execution = async {
                     if command.options.stream {
                         execute_rig_stream(
@@ -487,14 +521,20 @@ impl MoiraExecutionService {
                             Duration::from_millis(
                                 candidate.runtime_policy.stream_idle_timeout_ms.max(1) as u64,
                             ),
+                            StreamMetricsContext {
+                                metrics: &self.state.metrics,
+                                provider_type: candidate.provider_type,
+                                attempt_started: started,
+                            },
                         )
                         .await
                     } else {
                         execute_rig_completion(handle.clone(), request).await
                     }
-                };
+                }
+                .instrument(attempt_span);
                 let attempt_timeout =
-                    remaining.min(Duration::from_millis(runtime_policy.timeout_ms));
+                    phase_budget(remaining, Duration::from_millis(runtime_policy.timeout_ms));
                 let bounded_by_total_deadline =
                     attempt_timeout < Duration::from_millis(runtime_policy.timeout_ms);
                 let result = tokio::select! {
@@ -506,43 +546,142 @@ impl MoiraExecutionService {
                 match result {
                     Ok(Ok(output)) => {
                         let latency_ms = elapsed_ms(started);
-                        self.runtime_repo
-                            .update_attempt(
-                                attempt_id,
-                                &ExecutionAttemptUpdate {
-                                    status: AttemptStatus::Succeeded,
-                                    failure_class: None,
-                                    provider_status_code: None,
-                                    latency_ms: Some(latency_ms),
+                        // Captured on the same basis as `latency_ms` — i.e. the provider call
+                        // itself — so the histogram is not inflated by the terminal
+                        // persistence writes that follow.
+                        let attempt_latency = started.elapsed();
+                        // Phase bound: terminal persistence. Unlike the two phases above, an
+                        // attempt row already exists in `started` AND the provider call has
+                        // already succeeded, so the three writes are bounded as one logical
+                        // unit and a breach is reported as its own audited condition instead
+                        // of being folded into a plain deadline failure.
+                        let terminal_persistence = async {
+                            self.runtime_repo
+                                .update_attempt(
+                                    attempt_id,
+                                    &ExecutionAttemptUpdate {
+                                        status: AttemptStatus::Succeeded,
+                                        failure_class: None,
+                                        provider_status_code: None,
+                                        latency_ms: Some(latency_ms),
+                                        usage: output.usage.clone(),
+                                        provider_request_id: output.provider_request_id.clone(),
+                                        metadata: json!({}),
+                                    },
+                                )
+                                .await?;
+                            self.runtime_repo
+                                .insert_usage_record(&UsageRecordInsert {
+                                    id: Uuid::now_v7(),
+                                    request_id: command.request_id.clone(),
+                                    execution_id: command.execution_id,
+                                    attempt_id,
+                                    application_id: command.application_id,
+                                    external_tenant_id: command.external_tenant_id.clone(),
+                                    external_user_id: command.external_user_id.clone(),
+                                    provider_id: candidate.provider_id,
+                                    provider_model_id: candidate.provider_model_id,
+                                    credential_id: credential.credential.credential_id,
                                     usage: output.usage.clone(),
-                                    provider_request_id: output.provider_request_id.clone(),
-                                    metadata: json!({}),
-                                },
-                            )
-                            .await?;
-                        self.runtime_repo
-                            .insert_usage_record(&UsageRecordInsert {
-                                id: Uuid::now_v7(),
-                                request_id: command.request_id.clone(),
-                                execution_id: command.execution_id,
-                                attempt_id,
-                                application_id: command.application_id,
-                                external_tenant_id: command.external_tenant_id.clone(),
-                                external_user_id: command.external_user_id.clone(),
-                                provider_id: candidate.provider_id,
-                                provider_model_id: candidate.provider_model_id,
-                                credential_id: credential.credential.credential_id,
-                                usage: output.usage.clone(),
-                                metadata: json!({ "cost_estimation": "unavailable" }),
-                            })
-                            .await?;
-                        self.runtime_repo
-                            .touch_credential_used(credential.credential.credential_id)
-                            .await?;
+                                    metadata: json!({ "cost_estimation": "unavailable" }),
+                                })
+                                .await?;
+                            self.runtime_repo
+                                .touch_credential_used(credential.credential.credential_id)
+                                .await?;
+                            Ok::<(), AppError>(())
+                        };
+                        let persisted = tokio::time::timeout(
+                            terminal_persistence_budget(execution_deadline),
+                            terminal_persistence,
+                        )
+                        .await;
+                        match persisted {
+                            Ok(result) => result?,
+                            Err(_) => {
+                                let failure = terminal_persistence_deadline_failure();
+                                tracing::error!(
+                                    request_id = %command.request_id,
+                                    execution_id = %command.execution_id,
+                                    attempt_id = %attempt_id,
+                                    provider_id = %candidate.provider_id,
+                                    provider_model_id = %candidate.provider_model_id,
+                                    latency_ms,
+                                    "terminal persistence exceeded the execution deadline after a successful provider call; output may already be committed"
+                                );
+                                // The database is by definition slow at this point, so the
+                                // audit write is itself bounded and best-effort: it must not
+                                // become a second unbounded await on the way out.
+                                let audit = self.audit_runtime_event(
+                                    &command,
+                                    "execution.terminal_persistence_deadline_exceeded",
+                                    AuditResult::Failed,
+                                    json!({
+                                        "attempt_id": attempt_id,
+                                        "attempt_number": attempt_number,
+                                        "provider_id": candidate.provider_id,
+                                        "provider_model_id": candidate.provider_model_id,
+                                        "latency_ms": latency_ms,
+                                        "failure_class": failure.class,
+                                        "output_committed": true
+                                    }),
+                                );
+                                match tokio::time::timeout(TERMINAL_PERSISTENCE_AUDIT_BUDGET, audit)
+                                    .await
+                                {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(err)) => tracing::error!(
+                                        error = %err,
+                                        "failed to record the terminal-persistence deadline audit entry"
+                                    ),
+                                    Err(_) => tracing::error!(
+                                        "recording the terminal-persistence deadline audit entry timed out"
+                                    ),
+                                }
+                                attempts.push(attempt_summary(
+                                    attempt_id,
+                                    attempt_number,
+                                    &candidate,
+                                    credential.credential.credential_id,
+                                    Some(failure.class),
+                                    started,
+                                    output.usage.clone(),
+                                ));
+                                events.push(
+                                    RuntimeEventType::ExecutionFailed,
+                                    json!({
+                                        "failure_class": failure.class,
+                                        "phase": "terminal_persistence",
+                                        "output_committed": true
+                                    }),
+                                );
+                                return Ok(failed_outcome(
+                                    command,
+                                    Some(route),
+                                    Some(model),
+                                    attempts,
+                                    failure,
+                                ));
+                            }
+                        }
                         self.state
                             .circuits
                             .on_success(candidate.provider_id, candidate.provider_model_id)
                             .await;
+                        // Additive side-effect recording, in the same position and spirit as
+                        // the circuit-breaker call above: no control flow depends on it.
+                        self.state.metrics.record_execution_latency(
+                            candidate.provider_type,
+                            ExecutionStatus::Succeeded,
+                            None,
+                            attempt_latency,
+                        );
+                        self.state.metrics.record_provider_outcome(
+                            candidate.provider_type,
+                            &candidate.model_key,
+                            ExecutionStatus::Succeeded,
+                            None,
+                        );
                         self.audit_runtime_event(
                             &command,
                             "provider.attempt.completed",
@@ -590,6 +729,18 @@ impl MoiraExecutionService {
                                 failure.class,
                             )
                             .await;
+                        self.state.metrics.record_execution_latency(
+                            candidate.provider_type,
+                            execution_status_for_failure(failure.class),
+                            Some(failure.class),
+                            started.elapsed(),
+                        );
+                        self.state.metrics.record_provider_outcome(
+                            candidate.provider_type,
+                            &candidate.model_key,
+                            execution_status_for_failure(failure.class),
+                            Some(failure.class),
+                        );
                         self.complete_failed_attempt(
                             attempt_id,
                             started,
@@ -652,6 +803,18 @@ impl MoiraExecutionService {
                                 failure.class,
                             )
                             .await;
+                        self.state.metrics.record_execution_latency(
+                            candidate.provider_type,
+                            execution_status_for_failure(failure.class),
+                            Some(failure.class),
+                            started.elapsed(),
+                        );
+                        self.state.metrics.record_provider_outcome(
+                            candidate.provider_type,
+                            &candidate.model_key,
+                            execution_status_for_failure(failure.class),
+                            Some(failure.class),
+                        );
                         self.complete_failed_attempt(
                             attempt_id,
                             started,
@@ -1454,11 +1617,34 @@ async fn execute_rig_completion(
     })
 }
 
+/// Everything the streaming path needs to record time-to-first-token, grouped so the
+/// function signature does not grow a three-argument metrics tail.
+struct StreamMetricsContext<'a> {
+    metrics: &'a MetricsRegistry,
+    provider_type: ProviderType,
+    /// The same `Instant` the attempt's `latency_ms` is measured from, so TTFT is always
+    /// less than or equal to the attempt latency recorded for the same attempt.
+    attempt_started: Instant,
+}
+
+/// Records TTFT exactly once per attempt, on the first output-bearing chunk.
+fn record_first_token(recorded: &mut bool, stream_metrics: &StreamMetricsContext<'_>) {
+    if *recorded {
+        return;
+    }
+    *recorded = true;
+    stream_metrics.metrics.record_ttft(
+        stream_metrics.provider_type,
+        stream_metrics.attempt_started.elapsed(),
+    );
+}
+
 async fn execute_rig_stream(
     handle: Arc<RuntimeModelHandle>,
     request: CompletionRequest,
     events: &mut EventCollector,
     idle_timeout: Duration,
+    stream_metrics: StreamMetricsContext<'_>,
 ) -> Result<ExecutionRunOutput, ExecutionFailure> {
     if let Some(failure) = events.delivery_failure() {
         return Err(failure);
@@ -1472,6 +1658,10 @@ async fn execute_rig_stream(
     let mut usage = UsageSummary::default();
     let mut provider_request_id = None;
     let mut committed = false;
+    // TTFT is recorded on the first *output-bearing* chunk, which is exactly the point
+    // `committed` first flips. Usage and final-metadata chunks are not output and must not
+    // count as a first token.
+    let mut ttft_recorded = false;
 
     loop {
         let item = tokio::select! {
@@ -1518,6 +1708,7 @@ async fn execute_rig_stream(
                     .await?;
                 text.push_str(&delta);
                 committed = true;
+                record_first_token(&mut ttft_recorded, &stream_metrics);
                 events.mark_output_committed();
             }
             RuntimeStreamItem::ToolCallStarted {
@@ -1537,6 +1728,7 @@ async fn execute_rig_stream(
                     )
                     .await?;
                 committed = true;
+                record_first_token(&mut ttft_recorded, &stream_metrics);
                 events.mark_output_committed();
             }
             RuntimeStreamItem::ToolCallDelta {
@@ -1556,6 +1748,7 @@ async fn execute_rig_stream(
                     )
                     .await?;
                 committed = true;
+                record_first_token(&mut ttft_recorded, &stream_metrics);
                 events.mark_output_committed();
             }
             RuntimeStreamItem::UsageUpdated {
@@ -1596,12 +1789,7 @@ fn build_completion_request(
     command: &ExecutionCommand,
     agent_profile: Option<&AgentProfileRecord>,
 ) -> Result<CompletionRequest, ExecutionFailure> {
-    let chat_history = OneOrMany::many(command.messages.clone()).map_err(|_| {
-        ExecutionFailure::new(
-            ExecutionFailureClass::InvalidExecutionRequest,
-            "execution command must contain at least one message",
-        )
-    })?;
+    let chat_history = rig_chat_history(&command.messages)?;
     let output_schema = command
         .options
         .output_schema
@@ -1758,19 +1946,8 @@ fn first_text(command: &ExecutionCommand) -> String {
     command
         .messages
         .iter()
-        .find_map(|message| match message {
-            Message::User { content } => content.iter().find_map(|content| match content {
-                rig_core::completion::message::UserContent::Text(text) => Some(text.text.clone()),
-                _ => None,
-            }),
-            Message::System { content } => Some(content.clone()),
-            Message::Assistant { content, .. } => {
-                content.iter().find_map(|content| match content {
-                    rig_core::completion::AssistantContent::Text(text) => Some(text.text.clone()),
-                    _ => None,
-                })
-            }
-        })
+        .find_map(DomainMessage::first_text)
+        .map(ToOwned::to_owned)
         .unwrap_or_default()
 }
 
@@ -1866,6 +2043,67 @@ fn remaining_execution_time(deadline: Instant) -> Option<Duration> {
         .filter(|remaining| !remaining.is_zero())
 }
 
+/// Floor applied to the terminal-persistence budget.
+///
+/// The three terminal writes run *after* the provider call has already succeeded. Giving
+/// them only the literal leftover budget would orphan `execution_attempts` rows in
+/// `started` whenever the deadline happens to expire during the provider response — a
+/// durability regression introduced by the very bound that is meant to improve
+/// durability. The phase therefore stays bounded (never indefinite) but is guaranteed a
+/// usable minimum.
+const TERMINAL_PERSISTENCE_MIN_BUDGET: Duration = Duration::from_millis(2_000);
+
+/// Bound on the best-effort audit write that records a terminal-persistence breach.
+const TERMINAL_PERSISTENCE_AUDIT_BUDGET: Duration = Duration::from_millis(1_000);
+
+/// Runs a pre-attempt phase under whatever is left of the total execution deadline.
+///
+/// The remaining budget is computed *inside* this helper, so every call site necessarily
+/// re-reads the clock instead of reusing a `remaining` captured before an earlier phase
+/// consumed part of the budget. Both current callers (`resolve_credential`,
+/// `runtime_handle`) run before any attempt row or concurrency permit exists, so a breach
+/// needs no cleanup beyond the failure their own error arms already handle.
+async fn bounded_phase<T, F>(deadline: Instant, phase: F) -> Result<T, ExecutionFailure>
+where
+    F: Future<Output = Result<T, ExecutionFailure>>,
+{
+    let Some(remaining) = remaining_execution_time(deadline) else {
+        return Err(deadline_failure());
+    };
+    match tokio::time::timeout(remaining, phase).await {
+        Ok(result) => result,
+        Err(_) => Err(deadline_failure()),
+    }
+}
+
+/// Effective budget for a phase that also has its own configured timeout.
+fn phase_budget(remaining: Duration, phase_timeout: Duration) -> Duration {
+    remaining.min(phase_timeout)
+}
+
+/// Budget for the terminal-persistence group: the live remaining budget, floored so the
+/// phase is never handed a zero (which `tokio::time::timeout` would treat as "already
+/// elapsed", not "unbounded", but which would still guarantee an orphaned attempt row).
+fn terminal_persistence_budget(deadline: Instant) -> Duration {
+    remaining_execution_time(deadline)
+        .unwrap_or(Duration::ZERO)
+        .max(TERMINAL_PERSISTENCE_MIN_BUDGET)
+}
+
+/// Failure raised when terminal persistence overruns the deadline.
+///
+/// Built through `attempt_timeout_failure(bounded_by_total_deadline = true,
+/// output_committed = true)` so it inherits the existing "output is already committed,
+/// never retry and never fall back" clamp rather than introducing a parallel scheme. The
+/// message is specialised so the condition is distinguishable from a plain
+/// `deadline_failure()` in logs, audit metadata, and the outcome envelope.
+fn terminal_persistence_deadline_failure() -> ExecutionFailure {
+    let mut failure = attempt_timeout_failure(true, true);
+    failure.message =
+        "execution exceeded its total deadline while persisting terminal state".to_string();
+    failure
+}
+
 fn deadline_failure() -> ExecutionFailure {
     ExecutionFailure::new(
         ExecutionFailureClass::DeadlineExceeded,
@@ -1915,6 +2153,11 @@ mod tests {
     use super::*;
     use crate::domain::ExecutionOptions;
     use crate::{app::AppState, config::Settings, security::ActorType};
+
+    /// Guard for assertions whose only failure mode would otherwise be an infinite await.
+    /// Generous enough never to fire on a loaded machine, short enough that a regression
+    /// surfaces as a test failure rather than as a CI job timeout.
+    const UNBOUNDED_PHASE_GUARD: Duration = Duration::from_secs(5);
 
     #[test]
     fn cancellation_uses_terminal_cancelled_states() {
@@ -1975,7 +2218,7 @@ mod tests {
             application_id: None,
             external_tenant_id: None,
             external_user_id: None,
-            messages: vec![Message::user("hello")],
+            messages: vec![DomainMessage::user("hello")],
             route_hint: Some("general".to_string()),
             provider_hint: Some(Uuid::now_v7()),
             model_hint: Some(Uuid::now_v7()),
@@ -2005,7 +2248,7 @@ mod tests {
             application_id: None,
             external_tenant_id: None,
             external_user_id: None,
-            messages: vec![Message::user("hello")],
+            messages: vec![DomainMessage::user("hello")],
             route_hint: None,
             provider_hint: None,
             model_hint: None,
@@ -2017,6 +2260,149 @@ mod tests {
             &command,
             "moira:execution:override-model"
         ));
+    }
+
+    #[test]
+    fn remaining_execution_time_is_none_once_the_deadline_has_passed() {
+        let past = Instant::now() - Duration::from_millis(1);
+        assert!(remaining_execution_time(past).is_none());
+
+        let exactly_now = Instant::now();
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(remaining_execution_time(exactly_now).is_none());
+
+        let future = Instant::now() + Duration::from_secs(30);
+        assert!(remaining_execution_time(future).is_some());
+    }
+
+    #[test]
+    fn remaining_execution_time_shrinks_monotonically_across_successive_phases() {
+        let deadline = Instant::now() + Duration::from_secs(30);
+
+        let before_credential = remaining_execution_time(deadline).expect("budget at phase 1");
+        std::thread::sleep(Duration::from_millis(5));
+        let before_runtime_handle = remaining_execution_time(deadline).expect("budget at phase 2");
+        std::thread::sleep(Duration::from_millis(5));
+        let before_terminal_persistence =
+            remaining_execution_time(deadline).expect("budget at phase 3");
+
+        assert!(
+            before_runtime_handle < before_credential,
+            "phase 2 must recompute the budget, not reuse phase 1's"
+        );
+        assert!(
+            before_terminal_persistence < before_runtime_handle,
+            "phase 3 must recompute the budget, not reuse phase 2's"
+        );
+    }
+
+    #[test]
+    fn phase_budget_is_the_minimum_of_remaining_budget_and_phase_timeout() {
+        assert_eq!(
+            phase_budget(Duration::from_millis(200), Duration::from_millis(5_000)),
+            Duration::from_millis(200),
+            "the total deadline must win when it is the tighter bound"
+        );
+        assert_eq!(
+            phase_budget(Duration::from_millis(5_000), Duration::from_millis(200)),
+            Duration::from_millis(200),
+            "the per-phase timeout must win when it is the tighter bound"
+        );
+        assert_eq!(
+            phase_budget(Duration::from_millis(200), Duration::from_millis(200)),
+            Duration::from_millis(200)
+        );
+    }
+
+    #[test]
+    fn terminal_persistence_timeout_maps_to_the_output_committed_failure_class() {
+        let failure = terminal_persistence_deadline_failure();
+        let plain = deadline_failure();
+
+        assert_eq!(failure.class, ExecutionFailureClass::DeadlineExceeded);
+        assert!(
+            !failure.retryable,
+            "committed output must never be re-executed"
+        );
+        assert!(
+            !failure.fallback_eligible,
+            "committed output must never be sent to a fallback provider"
+        );
+        assert_ne!(
+            failure.message, plain.message,
+            "a terminal-persistence breach must be distinguishable from a plain deadline failure"
+        );
+
+        // The clamp is inherited from the existing output-committed pattern, not reinvented.
+        let inherited = attempt_timeout_failure(true, true);
+        assert_eq!(failure.class, inherited.class);
+        assert_eq!(failure.retryable, inherited.retryable);
+        assert_eq!(failure.fallback_eligible, inherited.fallback_eligible);
+    }
+
+    #[tokio::test]
+    async fn zero_or_negative_remaining_budget_never_produces_an_unbounded_timeout() {
+        let expired = Instant::now() - Duration::from_secs(1);
+
+        // A pre-attempt phase with no budget left fails closed instead of running unbounded.
+        //
+        // The assertion is itself bounded. Without the guard the only symptom of a
+        // regression here is `bounded_phase` awaiting `pending` forever, which in CI reads
+        // as a job timeout — infrastructure flakiness — rather than as a caught regression.
+        // The guard turns that into a fast, legible test failure.
+        let never_completes = std::future::pending::<Result<(), ExecutionFailure>>();
+        let failure = tokio::time::timeout(
+            UNBOUNDED_PHASE_GUARD,
+            bounded_phase(expired, never_completes),
+        )
+        .await
+        .expect("bounded_phase must fail closed on an expired deadline, not await the phase")
+        .expect_err("an expired deadline must not admit a new phase");
+        assert_eq!(failure.class, ExecutionFailureClass::DeadlineExceeded);
+
+        // Terminal persistence is floored, so it is bounded and non-zero, never "no limit".
+        let budget = terminal_persistence_budget(expired);
+        assert_eq!(budget, TERMINAL_PERSISTENCE_MIN_BUDGET);
+        assert!(!budget.is_zero());
+
+        // And `Duration::ZERO` really does mean "already elapsed" to tokio, not "no limit".
+        assert!(
+            tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_phase_passes_through_a_phase_that_finishes_inside_its_budget() {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let value = bounded_phase(deadline, async { Ok::<u8, ExecutionFailure>(7) })
+            .await
+            .expect("a fast phase must not be cut short");
+        assert_eq!(value, 7);
+
+        let failure = bounded_phase(deadline, async {
+            Err::<u8, ExecutionFailure>(ExecutionFailure::new(
+                ExecutionFailureClass::CredentialNotFound,
+                "no eligible provider credential",
+            ))
+        })
+        .await
+        .expect_err("the phase's own failure must survive the wrapper");
+        assert_eq!(failure.class, ExecutionFailureClass::CredentialNotFound);
+        assert!(
+            failure.fallback_eligible,
+            "wrapping must not flatten a fallback-eligible failure into a deadline failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_persistence_budget_uses_the_live_remaining_budget_when_it_exceeds_the_floor()
+    {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let budget = terminal_persistence_budget(deadline);
+        assert!(budget > TERMINAL_PERSISTENCE_MIN_BUDGET);
+        assert!(budget <= Duration::from_secs(30));
     }
 
     #[test]

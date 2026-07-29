@@ -7,7 +7,8 @@ This list tracks what is still left to harden or complete after the current Phas
 - TODO: Complete repository trait coverage for every PostgreSQL repository, including public/runtime repositories, so services can depend on traits consistently.
 - TODO: Extend service-owned command transactions beyond the ten core idempotent admin create/rotate operations to every remaining sensitive multi-step update, revoke, and delete flow.
 - TODO: Replace unkeyed admin command request hashes with versioned HMAC-SHA-256 using a dedicated idempotency pepper, so secret-bearing request hashes cannot be used as offline credential verifiers after a database-only compromise.
-- TODO: Quarantine or remove unused legacy scaffolding that still models old provider/config concepts, such as legacy `owner_scope` DTOs and unregistered chat-route types, once compatibility is confirmed unnecessary.
+- DONE: The unregistered chat-route types are gone — plan 06 module 9 deleted `src/http/chat.rs` along with the dead `src/orchestration/resolver.rs` and `src/orchestration/executor.rs`, after proving all three had no callers.
+- NOT DEAD — DO NOT REMOVE: `OwnerScope` (`src/domain/models.rs:22`) is live and load-bearing. It is the scope discriminator on stored credentials and is bound into the credential AAD by `credential_aad` (`src/security/crypto.rs:96-110`), so dropping or renaming a variant makes existing ciphertext undecryptable. What was actually dead, and is now deleted, was `src/orchestration/resolver.rs`'s credential-resolution functions and its second, divergent local `credential_aad`. `src/security/crypto.rs` is the single AAD implementation; the live resolution path is `resolve_runtime_credential` in `src/infra/repositories/runtime.rs`.
 - TODO: Add deeper credential-resolution integration tests for the full precedence order across user, application, tenant, and global scopes.
 - TODO: Expand AAD regression tests to prove credential ciphertext fails to decrypt when any bound AAD field changes.
 - TODO: Add pepper-rotation tests that verify old API-key hashes remain verifiable while new keys use the active pepper version.
@@ -18,8 +19,8 @@ This list tracks what is still left to harden or complete after the current Phas
 
 - TODO: Split `AdminService` into focused domain services for applications, providers, models, credentials, JWT issuers, system keys, consumer keys, audit queries, idempotency, validation, and runtime invalidation.
 - TODO: Replace simplified list pagination with real opaque cursor pagination using stable `created_at DESC, id DESC` ordering and `has_more`/`next_cursor` calculation.
-- TODO: Require `If-Match` consistently on every versioned mutation and upsert, including application execution policy PUT, and return `409 resource_version_conflict` for stale versions.
-- TODO: Extend atomic idempotency and sanitized deterministic-failure replay to the runtime-policy, RAG, conversation, memory, and other endpoints that advertise `Idempotency-Key`. (For the RAG/conversation/memory slice, see `plans/02b-idempotency-replay.md`.)
+- DONE: `If-Match` is now required on the application execution-policy PUT (`PUT /api/v1/admin/applications/{id}/execution-policy`, `src/http/admin.rs`), matching every other versioned mutation; the missing-header path returns `400 if_match_required` (previously `400 bad_request`) and a stale version still returns `409 resource_version_conflict`. Still open: `PUT /api/v1/admin/providers/{provider_id}/runtime-policy` (`src/http/admin.rs`) has the identical `If-Match` optional / `optional_if_match` gap and was left unchanged — out of scope for plan 04's P1-8 finding, which named only the application execution-policy endpoint; and the version check on the execution-policy PUT is still check-then-act at the repository level (`src/infra/repositories/public.rs::put_application_execution_policy`, a TOCTOU window between the Rust-side compare and the unconditional upsert) — closing it in SQL is a small, self-contained follow-up (see plan 04 PR notes) but was deliberately deferred rather than landed by the same specialist who does not own that file this iteration.
+- TODO: Extend atomic idempotency and sanitized deterministic-failure replay to the runtime-policy, RAG, conversation, memory, and other endpoints that advertise `Idempotency-Key`. (For the RAG/conversation/memory slice, see `plans/02b-idempotency-replay.md`. DONE for RAG: `rag.collection.create`, `rag.document.create`, and `rag.document.ingest` — the latter shared with `/reindex` — now replay atomically through `AdminCommandRunner`, per `plans/02b-idempotency-replay.md` and `docs/idempotency.md`. Still open: runtime-policy routes, and the conversation/memory create routes, which do not yet advertise `Idempotency-Key` at all.)
 - TODO: Reject unknown query fields consistently on all admin list/filter endpoints.
 - TODO: Finish centralized validation coverage for metadata depth/size, secret-like keys, custom headers, dangerous outbound headers, priorities, capabilities, expiration windows, and scope narrowing.
 - TODO: Harden JWKS refresh with full SSRF checks, strict timeout, response size and content-type limits, valid JWKS parsing, singleflight refresh, old-cache retention on failure, and audit records.
@@ -94,14 +95,15 @@ This list tracks what is still left to harden or complete after the current Phas
 - TODO: Persist provider health rolling windows for latency, error rate, timeout rate, rate-limit rate, throughput, token/sec, and circuit state.
 - TODO: Add `GET /api/v1/admin/providers/{provider}/health` backed by persisted health windows and guarded by runtime diagnostic scopes.
 - TODO: Feed provider health, cost, saturation, and recent failures into deterministic adaptive routing.
-- TODO: Add full OpenTelemetry SDK/exporter wiring for HTTP, SQL, Redis, Rig execution, routing, retrieval, embedding, streaming, and workers.
-- TODO: Replace aggregate-only in-process metrics with full Prometheus histograms/summaries for latency, TTFT, TPS, provider health, DB pool utilization, Redis latency, worker queues, and vector search latency.
+- PARTIAL (plan 05, P1-9a): OpenTelemetry SDK/exporter wiring exists and is off by default (`MOIRA_TELEMETRY__OTEL_ENABLED`, OTLP/http-proto). Spans cover HTTP requests and execution attempts. TODO: extend to SQL, Redis, Rig-internal execution, routing, retrieval, embedding, streaming, and workers.
+- PARTIAL (plan 05, P1-9b): aggregate-only counters replaced by real Prometheus histograms via `metrics` + `metrics-exporter-prometheus`, covering HTTP latency, execution latency, TTFT, provider-outcome counters, and DB-pool gauges. TODO: TPS, provider health windows, Redis latency, worker queues, and vector-search latency.
 - TODO: Add Grafana dashboard JSON and Alertmanager alert rules for the documented SLOs.
 - TODO: Add production structured-log redaction tests and trace/log correlation tests for request, execution, application, provider, and route identifiers.
 - TODO: Add Vault, AWS Secrets Manager, GCP Secret Manager, Azure Key Vault, and Kubernetes Secret loaders behind the existing secret configuration boundary.
 - TODO: Add automated PostgreSQL/pgvector backup, restore, and migration rollback drills with documented RPO/RTO evidence.
 - TODO: Add reproducible load-test scripts for 1k, 5k, 10k, and 50k concurrent users covering streaming and non-streaming flows.
 - TODO: Add chaos-test automation for Redis, PostgreSQL, provider, network, high-latency, stream-interruption, and worker-crash scenarios.
+- DONE (plan 05, P0-4): `cargo deny` supply-chain gate given a real `deny.toml` with populated `[advisories]`, `[licenses]`, `[bans]`, and `[sources]` derived from Moira's actual dependency graph, enforced in CI against the final `Cargo.lock`. Previously the gate ran with no config and could not fail.
 - TODO: Add SBOM generation to the Docker build/publish pipeline and store artifacts in CI.
 - TODO: Add SAST, DAST, secret scanning, container scanning, OWASP ASVS evidence, and penetration-test reporting gates.
 - TODO: Validate Helm and Kubernetes artifacts in CI against target cluster versions, including ServiceMonitor CRDs where installed.
@@ -109,9 +111,9 @@ This list tracks what is still left to harden or complete after the current Phas
 
 ## Cross-Phase Verification
 
-- TODO: Add OpenAPI generation validation in CI.
-- TODO: Add secret-leak snapshot tests for HTTP responses, OpenAPI schemas, audit metadata, and logs.
-- TODO: Add prompt/content-leak snapshot tests for conversation messages, memories, RAG documents, vector records, retrieval diagnostics, HTTP responses, audit metadata, and logs.
+- DONE (plan 05, P1-10a): OpenAPI generation validation in CI. `docs/openapi.json` is committed and a drift gate fails the build when the served document diverges, naming the regeneration command.
+- DONE (plan 05, P1-10b): secret-leak snapshot tests for HTTP responses, OpenAPI schemas, audit metadata, and logs — `tests/secret_leak_snapshots.rs`.
+- DONE (plan 05, P1-10b): prompt/content-leak snapshot tests for conversation messages, memories, RAG documents, retrieval diagnostics, HTTP responses, audit metadata, and logs — `tests/content_leak_snapshots.rs`. TODO: vector-record coverage, deferred to plan 11 where the vector write path lands.
 - TODO: Add concurrency tests for simultaneous credential rotations, key rotations, idempotent creates, public response creation, conversation message appends, memory updates, and RAG ingestion.
 - TODO: Add documented manual smoke tests for bootstrap system key, admin setup, route/model configuration, credential setup, internal execution, public response creation, streaming, conversation attach, explicit memory, and direct-text RAG ingestion.
 - TODO: Isolate database-backed integration test binaries or add deterministic teardown so repeated local runs cannot accumulate routing, issuer, credential, or application fixtures.

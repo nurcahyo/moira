@@ -1,0 +1,47 @@
+# cargo-nextest configuration.
+#
+# nextest runs each test in its own process rather than as a thread in a shared binary.
+#
+# **It is NOT faster on this suite, and this file previously claimed it was.** Measured on a warm
+# build, same machine, same database:
+#
+#     cargo test --workspace --all-features      1m39s   622 passed
+#     cargo nextest run --workspace --all-features  2m07s   621 passed   (~28% slower)
+#
+# The reason is specific to this project rather than to nextest: 621 process spawns each build
+# their own Postgres pool, the integration suites clone a template database per test, and the
+# advisory locks guarding shared singletons now serialise across processes instead of within one.
+# Isolation costs more here than parallelism returns.
+#
+# It is kept anyway, as a *second* way to run the suite rather than the default gate, because the
+# isolation is diagnostically valuable: running under nextest forces every test to contend
+# cross-process, which is the case an in-process `Mutex` would silently not cover. Both plan 07
+# shared-database fixes were re-verified under it for exactly that reason.
+#
+# The default gate stays `cargo test`. Reach for nextest when hunting an isolation bug.
+
+[profile.default]
+# Report every failure rather than stopping at the first. When a change breaks several tests,
+# one run should tell you all of them — chasing them one per run is how an afternoon disappears.
+fail-fast = false
+
+# **Retries stay at zero, deliberately.** nextest can re-run failures and report a test as flaky
+# rather than failed. That would have silently swallowed the exact defect CI caught on plan 07:
+# `a_configured_domain_lets_the_claim_through_and_marks_setup_claimed` failed roughly 1 run in 10
+# under load, and a single retry would have turned a real isolation bug into a green run with a
+# "flaky" note nobody reads. A test that fails intermittently is failing.
+retries = 0
+
+# Surface tests that are slow enough to be doing something unintended — a missing index, an
+# unawaited timeout, a sleep standing in for a condition. Warn rather than kill: the DB-backed
+# suites legitimately take seconds, and terminating them would just trade a slow test for a
+# flaky one.
+slow-timeout = { period = "30s", terminate-after = 8 }
+
+# Fail the run if a test is left `#[ignore]`d without being asked for explicitly. Ignored tests
+# rot into permanent dead code; plan 06 left one behind and it took a plan to notice.
+[profile.ci]
+fail-fast = false
+retries = 0
+failure-output = "immediate-final"
+status-level = "retry"

@@ -1,34 +1,121 @@
+use serde::Serialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
     app::AppState,
-    application::RequestContext,
+    application::{
+        AdminCommandIdempotency, AdminCommandMutation, AdminCommandRunner, AdminCommandSpec,
+        RequestContext,
+    },
     domain::{
         AuditLogInsert, AuditResult, ConversationCreateRequest, ConversationMessageCreateRequest,
         ConversationMessageQuery, ConversationMessageRecord, ConversationMessageRole,
         ConversationMessageType, ConversationPatchRequest, ConversationPolicyPutRequest,
         ConversationPolicyRecord, ConversationQuery, ConversationRecord, ConversationStatus,
-        EmbeddingPolicyPutRequest, EmbeddingPolicyRecord, ListResponse, MemoryConsentMode,
-        MemoryCreateRequest, MemoryPatchRequest, MemoryPolicyPutRequest, MemoryPolicyRecord,
-        MemoryQuery, MemoryRecord, MemoryScope, MemoryStatus, PublicContentPart,
-        PublicInputMessage, RagCollectionCreateRequest, RagCollectionPatchRequest,
-        RagCollectionQuery, RagCollectionRecord, RagCollectionStatus, RagDocumentCreateRequest,
-        RagDocumentIngestRequest, RagDocumentRecord, ResponseConversationInput,
-        RetrievalPolicyPutRequest, RetrievalPolicyRecord,
+        CursorScope, EmbeddingPolicyPutRequest, EmbeddingPolicyRecord, ListCursor, ListResponse,
+        MemoryConsentMode, MemoryCreateRequest, MemoryPatchRequest, MemoryPolicyPutRequest,
+        MemoryPolicyRecord, MemoryQuery, MemoryRecord, MemoryScope, MemoryStatus, Pagination,
+        PublicContentPart, PublicInputMessage, RagCollectionCreateRequest,
+        RagCollectionPatchRequest, RagCollectionQuery, RagCollectionRecord, RagCollectionStatus,
+        RagDocumentCreateRequest, RagDocumentIngestRequest, RagDocumentRecord,
+        ResponseConversationInput, RetrievalPolicyPutRequest, RetrievalPolicyRecord, SeqCursor,
     },
     error::AppError,
     infra::repositories::{
         AdminRepository, ConversationAccess, ConversationInsert, ConversationMessageInsert,
-        MemoryInsert, PgAdminRepository, PgConversationRepository,
+        ConversationRepository, MemoryInsert, PgAdminRepository, PgConversationRepository,
+        create_rag_collection_with_connection, create_rag_document_with_connection,
+        ingest_rag_document_with_connection,
     },
-    security::{Actor, ActorType, request_hash},
+    security::{Actor, ActorType},
 };
 
 #[derive(Debug, Clone)]
 pub struct ConversationExecutionLink {
     pub conversation_id: String,
     pub user_message_id: String,
+}
+
+// ---------------------------------------------------------------------------
+// Keyset pagination (plan 04, finding P1-4).
+//
+// One scope per list endpoint, used for BOTH encode and decode. A cursor minted for one list
+// therefore fails closed with `400 invalid_cursor` if replayed against another, instead of
+// paging through an unrelated table's key space — see `crate::domain::pagination`.
+//
+// The labels are wire-visible only through the opaque tag, never as text, so they are free to
+// be descriptive. They must not be edited casually: changing one invalidates every
+// outstanding cursor for that endpoint.
+// ---------------------------------------------------------------------------
+
+const CONVERSATIONS_CURSOR: CursorScope = CursorScope::new("conversations.list");
+const CONVERSATION_MESSAGES_CURSOR: CursorScope = CursorScope::new("conversations.messages");
+const MEMORIES_CURSOR: CursorScope = CursorScope::new("memories.list");
+const RAG_COLLECTIONS_CURSOR: CursorScope = CursorScope::new("rag.collections");
+const RAG_DOCUMENTS_CURSOR: CursorScope = CursorScope::new("rag.documents");
+
+/// The keyset key a listed row is paginated by.
+///
+/// Exists so [`paginate`] can serve both cursor shapes — `(timestamp, id)` for the four
+/// timestamp-ordered lists and a bare sequence number for the message list — without the
+/// page-assembly arithmetic being written out twice and drifting.
+trait PageKey: Copy {
+    fn encode_for(self, scope: CursorScope) -> String;
+}
+
+impl PageKey for ListCursor {
+    fn encode_for(self, scope: CursorScope) -> String {
+        self.encode(scope)
+    }
+}
+
+impl PageKey for SeqCursor {
+    fn encode_for(self, scope: CursorScope) -> String {
+        self.encode(scope)
+    }
+}
+
+/// Rows to ask the repository for when the caller wants `limit` of them.
+///
+/// Exactly one extra row, which is the cheapest way to learn `has_more` — a second
+/// `count(*)` over the same predicate would double the work and still be racy. The extra row
+/// is discarded by [`paginate`] and never reaches the caller.
+///
+/// `saturating_add` rather than `+`: `limit` is clamped to `1..=200` by every caller's
+/// `limit()` helper, but an overflow panic here would be a silly way to find out that
+/// stopped being true.
+fn over_fetch(limit: i64) -> i64 {
+    limit.saturating_add(1)
+}
+
+/// Trims an over-fetched page, computes `has_more`, and encodes `next_cursor`.
+///
+/// `next_cursor` is the key of the **last row actually returned**, not of the over-fetched
+/// row that proved there is more. Encoding the over-fetched row's key instead is the classic
+/// off-by-one that silently drops exactly one row per page boundary.
+fn paginate<T, K: PageKey>(
+    mut rows: Vec<(T, K)>,
+    limit: i64,
+    scope: CursorScope,
+) -> ListResponse<T> {
+    let limit = usize::try_from(limit).unwrap_or(0);
+    let has_more = rows.len() > limit;
+    rows.truncate(limit);
+
+    let next_cursor = if has_more {
+        rows.last().map(|(_, key)| key.encode_for(scope))
+    } else {
+        None
+    };
+
+    ListResponse {
+        data: rows.into_iter().map(|(record, _)| record).collect(),
+        pagination: Pagination {
+            next_cursor,
+            has_more,
+        },
+    }
 }
 
 // NOTE: this ordering is a design placeholder for the future context-assembly pipeline (plans/11-rag-memory-intelligence.md). It is not currently consumed by prepare_response_conversation and does not affect what is sent to the provider.
@@ -64,6 +151,12 @@ impl ConversationService {
             repo: PgConversationRepository::new(pool.clone()),
             admin_repo: PgAdminRepository::new(pool),
         })
+    }
+
+    /// The keyed hasher every conversation/RAG ledger and content hash goes through
+    /// (plan 03, P1-1).
+    fn command_hasher(&self) -> crate::security::IdempotencyHasher {
+        self.state.idempotency_hasher.clone()
     }
 
     pub async fn create_conversation(
@@ -117,6 +210,17 @@ impl ConversationService {
         Ok(record)
     }
 
+    /// Lists conversations, paging by `(updated_at, id)`.
+    ///
+    /// The cursor is decoded **before** the query runs, so a tampered or foreign cursor costs
+    /// a `400 invalid_cursor` and no database round trip.
+    ///
+    /// Because the sort key is the mutable `updated_at`, and the version trigger only ever
+    /// moves it forward, a conversation touched mid-sweep is lifted **above** the cursor: an
+    /// unreached row is silently skipped, and an already-returned row cannot come back. Pages
+    /// are disjoint; callers needing an exactly-once sweep need a completeness check, not a
+    /// de-duplication pass. Documented in full on
+    /// `crate::infra::repositories::conversation`.
     pub async fn list_conversations(
         &self,
         actor: &Actor,
@@ -125,16 +229,21 @@ impl ConversationService {
         self.state
             .authz
             .require(actor, "moira:conversations:read")?;
-        self.repo
+        let cursor = ListCursor::decode_optional(query.cursor.as_deref(), CONVERSATIONS_CURSOR)?;
+        let limit = query.limit();
+        let rows = self
+            .repo
             .list_conversations_authorized(
                 &conversation_access(
                     actor,
                     can_read_all(actor, "moira:conversations:read", &self.state),
                 )?,
                 query,
+                cursor,
+                over_fetch(limit),
             )
-            .await
-            .map(ListResponse::new)
+            .await?;
+        Ok(paginate(rows, limit, CONVERSATIONS_CURSOR))
     }
 
     pub async fn get_conversation(
@@ -236,6 +345,11 @@ impl ConversationService {
         Ok(record)
     }
 
+    /// Lists a conversation's messages, paging by ascending `sequence_number`.
+    ///
+    /// The one ascending list on this surface, so it uses [`SeqCursor`] and a `>` predicate.
+    /// Unlike the four timestamp-ordered lists this sweep is exactly-once: `sequence_number`
+    /// is assigned once at insert and never changes.
     pub async fn list_messages(
         &self,
         actor: &Actor,
@@ -245,6 +359,9 @@ impl ConversationService {
         self.state
             .authz
             .require(actor, "moira:conversations:read")?;
+        let cursor =
+            SeqCursor::decode_optional(query.cursor.as_deref(), CONVERSATION_MESSAGES_CURSOR)?;
+        let limit = query.limit();
         self.repo
             .find_conversation_authorized(
                 conversation_id,
@@ -254,10 +371,11 @@ impl ConversationService {
                 )?,
             )
             .await?;
-        self.repo
-            .list_messages(conversation_id, query)
-            .await
-            .map(ListResponse::new)
+        let rows = self
+            .repo
+            .list_messages(conversation_id, query, cursor, over_fetch(limit))
+            .await?;
+        Ok(paginate(rows, limit, CONVERSATION_MESSAGES_CURSOR))
     }
 
     pub async fn create_message(
@@ -284,7 +402,10 @@ impl ConversationService {
         }
         validate_metadata(&request.metadata)?;
         validate_content(&request.content)?;
-        let content_hash = request_hash(request.content.as_bytes());
+        let content_hash = self
+            .state
+            .idempotency_hasher
+            .hash(request.content.as_bytes());
         let record = self
             .repo
             .add_message(&ConversationMessageInsert {
@@ -351,7 +472,7 @@ impl ConversationService {
         }
         let content = user_text_from_public_input(messages);
         validate_content(&content)?;
-        let content_hash = request_hash(content.as_bytes());
+        let content_hash = self.state.idempotency_hasher.hash(content.as_bytes());
         let message = self
             .repo
             .add_message(&ConversationMessageInsert {
@@ -394,7 +515,7 @@ impl ConversationService {
         let Some(output) = output_text else {
             return Ok(None);
         };
-        let content_hash = request_hash(output.as_bytes());
+        let content_hash = self.state.idempotency_hasher.hash(output.as_bytes());
         let message = self
             .repo
             .add_message(&ConversationMessageInsert {
@@ -454,7 +575,10 @@ impl ConversationService {
         let public_id = format!("mem_{id}");
         let external_tenant_id = effective_tenant(actor);
         let external_user_id = effective_user(actor);
-        let content_hash = request_hash(request.content.as_bytes());
+        let content_hash = self
+            .state
+            .idempotency_hasher
+            .hash(request.content.as_bytes());
         let record = self
             .repo
             .create_memory(&MemoryInsert {
@@ -480,6 +604,11 @@ impl ConversationService {
         Ok(record)
     }
 
+    /// Lists memories, paging by `(updated_at, id)`.
+    ///
+    /// Same mutable-sort-key caveat as [`Self::list_conversations`]: a memory whose
+    /// `updated_at` moves during a sweep is lifted above the cursor, so it is **missed**, not
+    /// re-seen.
     pub async fn list_memories(
         &self,
         actor: &Actor,
@@ -498,16 +627,21 @@ impl ConversationService {
                 "memory listing is disabled",
             ));
         }
-        self.repo
+        let cursor = ListCursor::decode_optional(query.cursor.as_deref(), MEMORIES_CURSOR)?;
+        let limit = query.limit();
+        let rows = self
+            .repo
             .list_memories_authorized(
                 &conversation_access(
                     actor,
                     can_read_all(actor, "moira:memories:read", &self.state),
                 )?,
                 query,
+                cursor,
+                over_fetch(limit),
             )
-            .await
-            .map(ListResponse::new)
+            .await?;
+        Ok(paginate(rows, limit, MEMORIES_CURSOR))
     }
 
     pub async fn get_memory(
@@ -545,7 +679,7 @@ impl ConversationService {
         let hash = request
             .content
             .as_ref()
-            .map(|content| request_hash(content.as_bytes()));
+            .map(|content| self.state.idempotency_hasher.hash(content.as_bytes()));
         let record = self
             .repo
             .patch_memory(memory_id, &request, hash.as_deref())
@@ -757,24 +891,51 @@ impl ConversationService {
         self.state
             .authz
             .require(actor, "moira:rag-collections:write")?;
+        // Authorization and validation stay outside the runner: they are cheap and
+        // deterministic, and a rejected request must never occupy an idempotency key.
         validate_metadata(&request.metadata)?;
-        let id = Uuid::now_v7();
-        let record = self
-            .repo
-            .create_rag_collection(id, &format!("collection_{id}"), &request)
-            .await?;
-        self.audit(
-            actor,
+        let spec = conversation_command_spec(
             ctx,
-            "rag.collection.created",
-            "rag_collection",
-            Some(record.id.clone()),
-            json!({ "application_id": record.application_id }),
-        )
-        .await?;
-        Ok(record)
+            actor,
+            RAG_COLLECTION_CREATE_OPERATION,
+            json!({}),
+            &request,
+        )?;
+        let actor = actor.clone();
+        let ctx = ctx.clone();
+        let outcome = AdminCommandRunner::new(self.admin_repo.clone(), self.command_hasher())
+            .execute(spec, |transaction| {
+                Box::pin(async move {
+                    // Inside the closure so a replayed request never burns an identifier.
+                    let id = Uuid::now_v7();
+                    let record = create_rag_collection_with_connection(
+                        transaction.connection(),
+                        id,
+                        &format!("collection_{id}"),
+                        &request,
+                    )
+                    .await?;
+                    transaction
+                        .insert_audit(conversation_audit(
+                            &actor,
+                            &ctx,
+                            "rag.collection.created",
+                            "rag_collection",
+                            Some(record.id.clone()),
+                            json!({ "application_id": record.application_id }),
+                        ))
+                        .await?;
+                    AdminCommandMutation::new(record.clone(), 201, Some(record.id.clone()))
+                })
+            })
+            .await?;
+        Ok(outcome.response)
     }
 
+    /// Lists RAG collections, paging by `(created_at, id)`.
+    ///
+    /// Immutable sort key, so unlike the conversation and memory lists this sweep is
+    /// exactly-once under concurrent updates.
     pub async fn list_rag_collections(
         &self,
         actor: &Actor,
@@ -783,10 +944,13 @@ impl ConversationService {
         self.state
             .authz
             .require(actor, "moira:rag-collections:read")?;
-        self.repo
-            .list_rag_collections(query)
-            .await
-            .map(ListResponse::new)
+        let cursor = ListCursor::decode_optional(query.cursor.as_deref(), RAG_COLLECTIONS_CURSOR)?;
+        let limit = query.limit();
+        let rows = self
+            .repo
+            .list_rag_collections(query, cursor, over_fetch(limit))
+            .await?;
+        Ok(paginate(rows, limit, RAG_COLLECTIONS_CURSOR))
     }
 
     pub async fn get_rag_collection(
@@ -870,48 +1034,93 @@ impl ConversationService {
         self.state
             .authz
             .require(actor, "moira:rag-documents:write")?;
+        // Authorization and validation stay outside the runner: they are cheap and
+        // deterministic, and a rejected request must never occupy an idempotency key.
         validate_metadata(&request.metadata)?;
         validate_document(&request)?;
-        let content_hash = request
-            .content
-            .as_ref()
-            .map(|content| request_hash(content.as_bytes()));
-        let id = Uuid::now_v7();
-        let record = self
-            .repo
-            .create_rag_document(
-                id,
-                &format!("doc_{id}"),
-                collection_id,
-                &request,
-                content_hash.as_deref(),
-            )
-            .await?;
-        self.audit(
-            actor,
+        let spec = conversation_command_spec(
             ctx,
-            "rag.document.created",
-            "rag_document",
-            Some(record.id.clone()),
-            json!({ "collection_id": collection_id, "has_content": request.content.is_some() }),
-        )
-        .await?;
-        Ok(record)
+            actor,
+            RAG_DOCUMENT_CREATE_OPERATION,
+            json!({ "collection_id": collection_id }),
+            &request,
+        )?;
+        let actor = actor.clone();
+        let ctx = ctx.clone();
+        let collection_id = collection_id.to_string();
+        // Moved out of the closure only because `self` cannot cross the `move` boundary;
+        // the hash itself is still computed inside the transaction, as the comment below says.
+        let content_hasher = self.command_hasher();
+        let outcome = AdminCommandRunner::new(self.admin_repo.clone(), self.command_hasher())
+            .execute(spec, |transaction| {
+                Box::pin(async move {
+                    // The content hash is an input to the mutation, not to the idempotency
+                    // envelope, so it is computed inside the transaction.
+                    let content_hash = request
+                        .content
+                        .as_ref()
+                        .map(|content| content_hasher.hash(content.as_bytes()));
+                    // Inside the closure so a replayed request never burns an identifier.
+                    let id = Uuid::now_v7();
+                    let record = create_rag_document_with_connection(
+                        transaction.connection(),
+                        id,
+                        &format!("doc_{id}"),
+                        &collection_id,
+                        &request,
+                        content_hash.as_deref(),
+                    )
+                    .await?;
+                    transaction
+                        .insert_audit(conversation_audit(
+                            &actor,
+                            &ctx,
+                            "rag.document.created",
+                            "rag_document",
+                            Some(record.id.clone()),
+                            json!({
+                                "collection_id": collection_id,
+                                "has_content": request.content.is_some(),
+                            }),
+                        ))
+                        .await?;
+                    AdminCommandMutation::new(record.clone(), 201, Some(record.id.clone()))
+                })
+            })
+            .await?;
+        Ok(outcome.response)
     }
 
-    pub async fn list_rag_documents(
+    /// Lists a collection's documents, paging by `(created_at, id)`.
+    ///
+    /// This is the **only** entry point, deliberately. It used to have a `list_rag_documents`
+    /// sibling that took a bare `limit` and passed `None` for the cursor, and the handler
+    /// called that one: the route advertised no `cursor` parameter, hard-coded `limit = 50`,
+    /// and still returned a genuine `next_cursor` with `has_more: true` that had nowhere to go.
+    /// Every document past the fiftieth was unreachable over HTTP. Deleting the convenience
+    /// overload is what stops that from being re-introduced — a caller must now decide what to
+    /// do about the cursor in order to compile.
+    ///
+    /// `limit` is clamped here rather than in the repository, so the over-fetch row cannot be
+    /// eaten by a repository-side ceiling at `limit == 200`. The bounds match every other
+    /// `limit()` helper on this surface.
+    pub async fn list_rag_documents_page(
         &self,
         actor: &Actor,
         collection_id: &str,
+        cursor: Option<&str>,
         limit: i64,
     ) -> Result<ListResponse<RagDocumentRecord>, AppError> {
         self.state
             .authz
             .require(actor, "moira:rag-documents:read")?;
-        self.repo
-            .list_rag_documents(collection_id, limit)
-            .await
-            .map(ListResponse::new)
+        let cursor = ListCursor::decode_optional(cursor, RAG_DOCUMENTS_CURSOR)?;
+        let limit = limit.clamp(1, 200);
+        let rows = self
+            .repo
+            .list_rag_documents(collection_id, cursor, over_fetch(limit))
+            .await?;
+        Ok(paginate(rows, limit, RAG_DOCUMENTS_CURSOR))
     }
 
     pub async fn get_rag_document(
@@ -956,6 +1165,8 @@ impl ConversationService {
         self.state
             .authz
             .require(actor, "moira:rag-documents:ingest")?;
+        // Authorization and validation stay outside the runner: they are cheap and
+        // deterministic, and a rejected request must never occupy an idempotency key.
         let content = request.content.as_deref().ok_or_else(|| {
             AppError::unprocessable(
                 "rag_document_parse_failed",
@@ -964,20 +1175,49 @@ impl ConversationService {
         })?;
         validate_content(content)?;
         validate_metadata(&request.metadata)?;
-        let record = self
-            .repo
-            .ingest_rag_document(document_id, &request, &request_hash(content.as_bytes()))
-            .await?;
-        self.audit(
-            actor,
+        let spec = conversation_command_spec(
             ctx,
-            "rag.document.ingested",
-            "rag_document",
-            Some(record.id.clone()),
-            json!({}),
-        )
-        .await?;
-        Ok(record)
+            actor,
+            RAG_DOCUMENT_INGEST_OPERATION,
+            json!({ "document_id": document_id }),
+            &request,
+        )?;
+        let actor = actor.clone();
+        let ctx = ctx.clone();
+        let document_id = document_id.to_string();
+        // Moved out of the closure only because `self` cannot cross the `move` boundary;
+        // the hash itself is still computed inside the transaction, as the comment below says.
+        let content_hasher = self.command_hasher();
+        let outcome = AdminCommandRunner::new(self.admin_repo.clone(), self.command_hasher())
+            .execute(spec, |transaction| {
+                Box::pin(async move {
+                    // The content hash is an input to the mutation, not to the idempotency
+                    // envelope, so it is computed inside the transaction. `content` is
+                    // known to be present: the check above already ran.
+                    let content = request.content.as_deref().unwrap_or_default();
+                    let content_hash = content_hasher.hash(content.as_bytes());
+                    let record = ingest_rag_document_with_connection(
+                        transaction.connection(),
+                        &document_id,
+                        &request,
+                        &content_hash,
+                    )
+                    .await?;
+                    transaction
+                        .insert_audit(conversation_audit(
+                            &actor,
+                            &ctx,
+                            "rag.document.ingested",
+                            "rag_document",
+                            Some(record.id.clone()),
+                            json!({}),
+                        ))
+                        .await?;
+                    AdminCommandMutation::new(record.clone(), 200, Some(record.id.clone()))
+                })
+            })
+            .await?;
+        Ok(outcome.response)
     }
 
     async fn ensure_conversation_write(
@@ -1009,23 +1249,97 @@ impl ConversationService {
         metadata: Value,
     ) -> Result<(), AppError> {
         self.admin_repo
-            .insert_audit(AuditLogInsert {
-                request_id: Some(ctx.request_id.clone()),
-                actor_type: Some(format!("{:?}", actor.actor_type)),
-                actor_subject: actor.subject.clone(),
-                delegated_subject: actor.delegated_subject.clone(),
-                external_user_id: actor.external_user_id.clone(),
-                external_tenant_id: actor.external_tenant_id.clone(),
-                application_id: actor.internal_application_id,
-                resource_type: resource_type.to_string(),
+            .insert_audit(conversation_audit(
+                actor,
+                ctx,
+                action,
+                resource_type,
                 resource_id,
-                action: action.to_string(),
-                result: AuditResult::Success,
-                source_ip: ctx.source_ip,
-                user_agent: ctx.user_agent.clone(),
                 metadata,
-            })
+            ))
             .await
+    }
+}
+
+/// Operation identity for `POST /api/v1/admin/rag-collections`.
+pub(crate) const RAG_COLLECTION_CREATE_OPERATION: &str = "rag.collection.create";
+/// Operation identity for `POST /api/v1/admin/rag-collections/{collection_id}/documents`.
+pub(crate) const RAG_DOCUMENT_CREATE_OPERATION: &str = "rag.document.create";
+/// Operation identity shared by `POST /api/v1/admin/rag-documents/{id}/ingest` **and**
+/// `POST /api/v1/admin/rag-documents/{id}/reindex`.
+///
+/// `reindex_rag_document` is a literal call-through to `ingest_rag_document`
+/// (`src/http/conversation.rs`) and performs an identical mutation, so the two aliases share
+/// one operation identity and one `path` envelope. Consequence, decided deliberately in
+/// `plans/02b-idempotency-replay.md` (Architecture -> "Operation identities"): the same key
+/// and body sent to `/reindex` after `/ingest` replays the ingest response instead of
+/// creating a second version. Discriminating the two routes inside the `path` envelope
+/// would instead yield `409 idempotency_conflict`, which is worse UX for no correctness
+/// gain.
+pub(crate) const RAG_DOCUMENT_INGEST_OPERATION: &str = "rag.document.ingest";
+
+/// Builds the idempotency envelope for a conversation-surface write command.
+///
+/// Mirrors `crate::application::admin::admin_command_spec`. `expected_version` deliberately
+/// stays `None`: these routes accept no `If-Match` today, and adding optimistic concurrency
+/// is a separate contract change (`plans/02b-idempotency-replay.md`, Excluded scope).
+///
+/// The actor fingerprint comes from `admin::actor_fingerprint`, which since plan 06
+/// (Module 16 / P2-15) is the only formula in the crate: `runtime_admin` and `public` no
+/// longer keep their own weaker copies, so there is nothing left to pick wrongly here.
+/// Reusing it is still load-bearing rather than stylistic — the fingerprint is a column of
+/// the `idempotency_records` unique index and an input to the advisory-lock key, so a
+/// divergent copy would silently un-scope replay for these four routes.
+pub(crate) fn conversation_command_spec<T: Serialize>(
+    ctx: &RequestContext,
+    actor: &Actor,
+    operation: &str,
+    path: Value,
+    request: &T,
+) -> Result<AdminCommandSpec, AppError> {
+    AdminCommandSpec::new(operation, path, request).map(|spec| {
+        spec.with_idempotency(
+            ctx.idempotency_key
+                .as_ref()
+                .map(|key| AdminCommandIdempotency {
+                    key: key.clone(),
+                    actor_fingerprint: crate::application::admin::actor_fingerprint(actor),
+                }),
+        )
+    })
+}
+
+/// The conversation surface's audit-row builder.
+///
+/// Deliberately **not** `crate::application::admin::success_audit`: that one lowercases
+/// `actor_type`, whereas this surface has always written the `Debug` casing verbatim.
+/// Reusing it would silently rewrite the recorded `actor_type` for every RAG and
+/// conversation audit row. The casing divergence is pre-existing debt tracked for plan 06;
+/// this builder reproduces today's mapping exactly so moving the write inside the
+/// transaction changes atomicity and nothing else.
+pub(crate) fn conversation_audit(
+    actor: &Actor,
+    ctx: &RequestContext,
+    action: &str,
+    resource_type: &str,
+    resource_id: Option<String>,
+    metadata: Value,
+) -> AuditLogInsert {
+    AuditLogInsert {
+        request_id: Some(ctx.request_id.clone()),
+        actor_type: Some(format!("{:?}", actor.actor_type)),
+        actor_subject: actor.subject.clone(),
+        delegated_subject: actor.delegated_subject.clone(),
+        external_user_id: actor.external_user_id.clone(),
+        external_tenant_id: actor.external_tenant_id.clone(),
+        application_id: actor.internal_application_id,
+        resource_type: resource_type.to_string(),
+        resource_id,
+        action: action.to_string(),
+        result: AuditResult::Success,
+        source_ip: ctx.source_ip,
+        user_agent: ctx.user_agent.clone(),
+        metadata,
     }
 }
 
@@ -1216,6 +1530,181 @@ fn contains_secret_like_text(content: &str) -> bool {
 mod tests {
     use super::*;
 
+    const TEST_SCOPE: CursorScope = CursorScope::new("test.pagination");
+
+    fn list_keys(count: usize) -> Vec<(String, ListCursor)> {
+        (0..count)
+            .map(|index| {
+                let ts =
+                    chrono::DateTime::from_timestamp_micros(1_700_000_000_000_000 - index as i64)
+                        .expect("in-range timestamp");
+                let id = Uuid::from_u128(index as u128 + 1);
+                (format!("row-{index}"), ListCursor::new(ts, id))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn over_fetch_asks_for_exactly_one_extra_row() {
+        assert_eq!(over_fetch(1), 2);
+        assert_eq!(over_fetch(50), 51);
+        assert_eq!(over_fetch(200), 201);
+        // Saturating rather than panicking, even though no caller can reach this.
+        assert_eq!(over_fetch(i64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn has_more_is_false_when_exactly_limit_rows_are_available() {
+        let page = paginate(list_keys(5), 5, TEST_SCOPE);
+
+        assert_eq!(page.data.len(), 5);
+        assert!(!page.pagination.has_more);
+        assert_eq!(page.pagination.next_cursor, None);
+    }
+
+    #[test]
+    fn has_more_is_false_for_a_short_page() {
+        let page = paginate(list_keys(2), 5, TEST_SCOPE);
+
+        assert_eq!(page.data.len(), 2);
+        assert!(!page.pagination.has_more);
+        assert_eq!(page.pagination.next_cursor, None);
+    }
+
+    #[test]
+    fn has_more_is_true_and_the_page_is_trimmed_when_limit_plus_one_rows_are_fetched() {
+        let page = paginate(list_keys(6), 5, TEST_SCOPE);
+
+        assert_eq!(
+            page.data.len(),
+            5,
+            "the over-fetched row must not be served"
+        );
+        assert_eq!(page.data.last().unwrap(), "row-4");
+        assert!(page.pagination.has_more);
+        assert!(page.pagination.next_cursor.is_some());
+    }
+
+    #[test]
+    fn next_cursor_encodes_the_last_returned_row_not_the_over_fetched_row() {
+        let rows = list_keys(6);
+        let last_returned = rows[4].1;
+        let over_fetched = rows[5].1;
+
+        let page = paginate(rows, 5, TEST_SCOPE);
+        let next_cursor = page
+            .pagination
+            .next_cursor
+            .expect("has_more implies a cursor");
+
+        assert_eq!(
+            next_cursor,
+            last_returned.encode(TEST_SCOPE),
+            "next_cursor must resume from the last row the caller SAW; using the over-fetched \
+             row's key silently drops exactly one row per page boundary"
+        );
+        assert_ne!(next_cursor, over_fetched.encode(TEST_SCOPE));
+    }
+
+    #[test]
+    fn next_cursor_round_trips_under_the_scope_it_was_minted_for() {
+        let page = paginate(list_keys(6), 5, TEST_SCOPE);
+        let encoded = page
+            .pagination
+            .next_cursor
+            .expect("has_more implies a cursor");
+
+        assert!(ListCursor::decode(&encoded, TEST_SCOPE).is_ok());
+        assert!(
+            ListCursor::decode(&encoded, CursorScope::new("test.other")).is_err(),
+            "a cursor must not page through another endpoint's key space"
+        );
+    }
+
+    #[test]
+    fn an_empty_result_reports_no_further_pages() {
+        let page = paginate(Vec::<(String, ListCursor)>::new(), 50, TEST_SCOPE);
+
+        assert!(page.data.is_empty());
+        assert!(!page.pagination.has_more);
+        assert_eq!(page.pagination.next_cursor, None);
+    }
+
+    #[test]
+    fn sequence_keyed_pages_use_the_sequence_cursor_shape() {
+        let rows: Vec<(String, SeqCursor)> = (1..=4)
+            .map(|sequence| (format!("msg-{sequence}"), SeqCursor::new(sequence)))
+            .collect();
+
+        let page = paginate(rows, 3, TEST_SCOPE);
+        let encoded = page
+            .pagination
+            .next_cursor
+            .expect("has_more implies a cursor");
+
+        assert_eq!(page.data, vec!["msg-1", "msg-2", "msg-3"]);
+        assert!(page.pagination.has_more);
+        assert_eq!(
+            SeqCursor::decode(&encoded, TEST_SCOPE).unwrap(),
+            SeqCursor::new(3),
+            "the message list resumes from the last sequence number returned"
+        );
+        assert!(
+            ListCursor::decode(&encoded, TEST_SCOPE).is_err(),
+            "a sequence cursor must not decode as a (timestamp, id) cursor"
+        );
+    }
+
+    /// Every list endpoint on this surface must use a distinct scope.
+    ///
+    /// Two endpoints sharing a scope is invisible in normal use — both cursors decode — and
+    /// only shows up as one list silently paging through another's key space.
+    #[test]
+    fn every_list_endpoint_has_its_own_cursor_scope() {
+        let scopes = [
+            CONVERSATIONS_CURSOR,
+            CONVERSATION_MESSAGES_CURSOR,
+            MEMORIES_CURSOR,
+            RAG_COLLECTIONS_CURSOR,
+            RAG_DOCUMENTS_CURSOR,
+        ];
+        let mut labels: Vec<&str> = scopes.iter().map(|scope| scope.label()).collect();
+        labels.sort_unstable();
+        let unique = labels.len();
+        labels.dedup();
+
+        assert_eq!(
+            labels.len(),
+            unique,
+            "cursor scopes must be distinct: {labels:?}"
+        );
+        assert!(labels.iter().all(|label| !label.is_empty()));
+    }
+
+    #[test]
+    fn a_malformed_cursor_is_rejected_before_any_query_runs() {
+        let error = ListCursor::decode_optional(Some("not-a-cursor"), CONVERSATIONS_CURSOR)
+            .expect_err("a garbage cursor must not reach the database");
+        let response = error.error_response(Some("req_test".to_string()));
+
+        assert_eq!(error.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response.error.code, "invalid_cursor");
+        assert_eq!(response.error.message_key, "moira.error.invalid_cursor");
+        assert!(!response.error.message.is_empty());
+
+        // Absent and empty both mean "first page", not "malformed".
+        assert!(
+            ListCursor::decode_optional(None, CONVERSATIONS_CURSOR)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            ListCursor::decode_optional(Some(""), CONVERSATIONS_CURSOR)
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn context_planner_order_keeps_required_content_first() {
         let order = ContextPlanner::deterministic_phase_five_order();
@@ -1257,6 +1746,194 @@ mod tests {
             &state
         ));
         assert!(!can_read_all(&trusted_jwt, "moira:memories:read", &state));
+    }
+
+    fn command_hasher() -> crate::security::IdempotencyHasher {
+        crate::security::IdempotencyHasher::new(b"conversation-pepper".to_vec(), "v1")
+    }
+
+    fn test_context(idempotency_key: Option<String>) -> RequestContext {
+        RequestContext {
+            request_id: "req-test".to_string(),
+            source_ip: None,
+            user_agent: None,
+            idempotency_key,
+        }
+    }
+
+    #[test]
+    fn conversation_command_hash_is_stable_across_object_key_order() {
+        let ctx = test_context(None);
+        let actor = Actor::default();
+        let left = conversation_command_spec(
+            &ctx,
+            &actor,
+            RAG_DOCUMENT_CREATE_OPERATION,
+            json!({ "collection_id": "collection_1" }),
+            &json!({"title": "doc", "metadata": {"b": 2, "a": 1}}),
+        )
+        .unwrap();
+        let right = conversation_command_spec(
+            &ctx,
+            &actor,
+            RAG_DOCUMENT_CREATE_OPERATION,
+            json!({ "collection_id": "collection_1" }),
+            &json!({"metadata": {"a": 1, "b": 2}, "title": "doc"}),
+        )
+        .unwrap();
+
+        let hasher = command_hasher();
+        assert_eq!(
+            left.request_hash(&hasher).unwrap(),
+            right.request_hash(&hasher).unwrap()
+        );
+    }
+
+    #[test]
+    fn conversation_command_hash_covers_operation_and_path() {
+        let ctx = test_context(None);
+        let actor = Actor::default();
+        let body = json!({ "content": "hello" });
+
+        let document_a = conversation_command_spec(
+            &ctx,
+            &actor,
+            RAG_DOCUMENT_INGEST_OPERATION,
+            json!({ "document_id": "doc_a" }),
+            &body,
+        )
+        .unwrap();
+        let document_b = conversation_command_spec(
+            &ctx,
+            &actor,
+            RAG_DOCUMENT_INGEST_OPERATION,
+            json!({ "document_id": "doc_b" }),
+            &body,
+        )
+        .unwrap();
+        let hasher = command_hasher();
+        assert_ne!(
+            document_a.request_hash(&hasher).unwrap(),
+            document_b.request_hash(&hasher).unwrap(),
+            "the document id must be inside the hash envelope"
+        );
+
+        let collection_create = conversation_command_spec(
+            &ctx,
+            &actor,
+            RAG_COLLECTION_CREATE_OPERATION,
+            json!({}),
+            &body,
+        )
+        .unwrap();
+        let document_create = conversation_command_spec(
+            &ctx,
+            &actor,
+            RAG_DOCUMENT_CREATE_OPERATION,
+            json!({}),
+            &body,
+        )
+        .unwrap();
+        assert_ne!(
+            collection_create.request_hash(&hasher).unwrap(),
+            document_create.request_hash(&hasher).unwrap(),
+            "the operation identity must be inside the hash envelope"
+        );
+    }
+
+    #[test]
+    fn ingest_and_reindex_share_one_operation_and_request_envelope() {
+        // DOCUMENTS the `/reindex` decision; it does not guard it. `POST .../reindex` is a
+        // literal call-through to `ingest_rag_document` (src/http/conversation.rs), so both
+        // routes reach this one method and build their spec from this one
+        // `RAG_DOCUMENT_INGEST_OPERATION` constant with one path envelope. Because there is
+        // only one construction site, this test necessarily builds both specs from the same
+        // constant, the same path and the same body — it reduces to `f(x) == f(x)` and is
+        // structurally incapable of failing. Keep it as executable documentation of the
+        // shared identity, but do not count it as coverage.
+        //
+        // The real guard is the e2e test
+        // `reindex_replays_an_ingest_performed_under_the_same_key` in
+        // tests/rag_idempotency_replay.rs, which drives both HTTP routes for real and
+        // asserts the second one replays the first's response instead of creating a new
+        // version row. That test is load-bearing (mutation testing killed it three ways);
+        // this one is not.
+        let ctx = test_context(None);
+        let actor = Actor::default();
+        let body = json!({ "content": "hello", "metadata": {} });
+        let path = json!({ "document_id": "doc_shared" });
+
+        let ingest_spec = conversation_command_spec(
+            &ctx,
+            &actor,
+            RAG_DOCUMENT_INGEST_OPERATION,
+            path.clone(),
+            &body,
+        )
+        .unwrap();
+        let reindex_spec =
+            conversation_command_spec(&ctx, &actor, RAG_DOCUMENT_INGEST_OPERATION, path, &body)
+                .unwrap();
+
+        let hasher = command_hasher();
+        assert_eq!(
+            ingest_spec.request_hash(&hasher).unwrap(),
+            reindex_spec.request_hash(&hasher).unwrap()
+        );
+    }
+
+    #[test]
+    fn conversation_command_spec_omits_idempotency_when_no_key_is_present() {
+        let ctx = test_context(None);
+        let actor = Actor::default();
+        let spec = conversation_command_spec(
+            &ctx,
+            &actor,
+            RAG_COLLECTION_CREATE_OPERATION,
+            json!({}),
+            &json!({}),
+        )
+        .unwrap();
+        assert!(
+            format!("{spec:?}").contains("idempotency: None"),
+            "a spec built without ctx.idempotency_key must carry no AdminCommandIdempotency"
+        );
+
+        let ctx_with_key = test_context(Some("replay-key".to_string()));
+        let spec_with_key = conversation_command_spec(
+            &ctx_with_key,
+            &actor,
+            RAG_COLLECTION_CREATE_OPERATION,
+            json!({}),
+            &json!({}),
+        )
+        .unwrap();
+        assert!(
+            format!("{spec_with_key:?}").contains("idempotency: Some"),
+            "a spec built with ctx.idempotency_key must carry an AdminCommandIdempotency"
+        );
+    }
+
+    #[test]
+    fn conversation_audit_preserves_the_existing_actor_type_casing() {
+        let actor = Actor {
+            actor_type: ActorType::SystemKey,
+            ..Actor::default()
+        };
+        let ctx = test_context(None);
+        let insert = conversation_audit(
+            &actor,
+            &ctx,
+            "rag.document.ingested",
+            "rag_document",
+            Some("doc_1".to_string()),
+            json!({}),
+        );
+        assert_eq!(
+            insert.actor_type,
+            Some("SystemKey".to_string()),
+            "conversation_audit must not lowercase actor_type, unlike admin::success_audit"
+        );
     }
 
     #[test]

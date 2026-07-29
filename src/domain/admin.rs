@@ -28,6 +28,30 @@ impl<T> ListResponse<T> {
     }
 }
 
+/// The single query type shared by all twelve `GET /api/v1/admin/*` list endpoints.
+///
+/// # Finding P2-9 — what `deny_unknown_fields` does and does not buy (plan 06, module 11)
+///
+/// `#[serde(deny_unknown_fields)]` rejects only parameters **absent from this struct**:
+/// `?not_a_real_field=1` is a `400` on every list route, which
+/// `tests/admin_query_contract.rs::each_admin_list_endpoint_rejects_an_unknown_query_field`
+/// pins.
+///
+/// It says nothing about *relevance*. All 26 fields below are accepted by all twelve
+/// endpoints, so `GET /api/v1/admin/applications?credential_type=api_key` is a `200` and the
+/// filter is silently ignored — `credential_type` exists here only for the credentials list.
+/// A caller who mistypes one filter for another therefore gets an unfiltered page rather than
+/// an error. `defined_but_unsupported_page_query_field_is_accepted_and_ignored` pins that
+/// behaviour deliberately, so changing it is a visible decision rather than a surprise.
+///
+/// **This is documented, not fixed, in plan 06.** Per-endpoint query types would change the
+/// `#[into_params]` expansion and therefore `docs/openapi.json`, which plan 05 froze behind a
+/// drift gate; plan 06's premise is that no route or DTO shape moves. Splitting `PageQuery`
+/// belongs to whichever plan is willing to regenerate the spec.
+///
+/// One further consequence of rejecting at the extractor: the `Query` rejection is produced
+/// by axum *before* the handler runs, so it precedes `admin_actor` authentication and does
+/// not pass through `AppError`. See `tests/admin_query_contract.rs` for the recorded shape.
 #[derive(Debug, Clone, Deserialize, Default, IntoParams)]
 #[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]

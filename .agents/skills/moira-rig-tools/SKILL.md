@@ -605,7 +605,7 @@ Non-negotiable. A tool is a model-controlled call into Moira; treat every argume
 - Re-executing tools on a retry after output was already committed downstream.
 - Registering two tools with the same name and expecting an error. You get a silent in-place replacement plus a `warn` log.
 - Adding MCP tools. `rmcp` is not an enabled feature in Moira; enabling it is a dependency decision, not a tool change.
-- Extending `src/orchestration/executor.rs` (legacy raw-`reqwest` V1 path) with tool support. Its only consumer `src/http/chat.rs` is not even compiled — `src/http/mod.rs` declares no `mod chat;`. All new work goes through `RuntimeFactory` / `RuntimeModelHandle`.
+- Adding tool support by hand-rolling `reqwest` against `/chat/completions`. The legacy V1 path that did this (`src/orchestration/executor.rs` plus `src/http/chat.rs` and the `ChatCompletionRequest` / `ChatMessage` DTOs) was deleted in plan 06 — do not resurrect it. All tool work goes through `RuntimeFactory` / `RuntimeModelHandle` and `CompletionRequest.tools`.
 
 ## Related skills
 

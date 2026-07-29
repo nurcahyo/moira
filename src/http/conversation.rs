@@ -14,7 +14,7 @@ use crate::{
         ConversationPolicyRecord, ConversationQuery, ConversationRecord, ConversationStatus,
         EmbeddingPolicyPutRequest, EmbeddingPolicyRecord, ListResponse, MemoryCreateRequest,
         MemoryPatchRequest, MemoryPolicyPutRequest, MemoryPolicyRecord, MemoryQuery, MemoryRecord,
-        RagCollectionCreateRequest, RagCollectionPatchRequest, RagCollectionQuery,
+        PageQuery, RagCollectionCreateRequest, RagCollectionPatchRequest, RagCollectionQuery,
         RagCollectionRecord, RagCollectionStatus, RagDocumentCreateRequest,
         RagDocumentIngestRequest, RagDocumentRecord, RetrievalPolicyPutRequest,
         RetrievalPolicyRecord,
@@ -668,11 +668,12 @@ pub async fn put_embedding_policy(
     post,
     path = "/api/v1/admin/rag-collections",
     tag = "admin-rag",
-    description = "Persistence primitive: no retrieval, chunking, or embedding pipeline runs, and stored content is not used to influence model responses. See docs/conversation-memory-rag-api.md. Idempotency-Key is accepted but replay is not implemented yet; retrying can duplicate side effects.",
+    description = "Persistence primitive: no retrieval, chunking, or embedding pipeline runs, and stored content is not used to influence model responses. See docs/conversation-memory-rag-api.md.",
     request_body = RagCollectionCreateRequest,
-    params(("Idempotency-Key" = Option<String>, Header, description = "Optional replay key. Replay is not yet implemented on this route; see plans/02b-idempotency-replay.md.")),
+    params(("Idempotency-Key" = Option<String>, Header, description = "Optional replay key. A repeated request with the same key and body replays the original response; the same key with a different body returns 409.")),
     responses(
         (status = 201, description = "RAG collection created", body = RagCollectionRecord, headers(("ETag" = String, description = "Current resource version"))),
+        (status = 409, description = "idempotency_conflict or idempotency_in_progress", body = ErrorResponse),
         (status = "4XX", description = "Request, authentication, authorization, or conflict error", body = ErrorResponse),
         (status = "5XX", description = "Infrastructure or internal error", body = ErrorResponse)
     ),
@@ -849,14 +850,15 @@ pub async fn disable_rag_collection(
     post,
     path = "/api/v1/admin/rag-collections/{collection_id}/documents",
     tag = "admin-rag",
-    description = "Persistence primitive: no retrieval, chunking, or embedding pipeline runs, and stored content is not used to influence model responses. See docs/conversation-memory-rag-api.md. Idempotency-Key is accepted but replay is not implemented yet; retrying can duplicate side effects.",
+    description = "Persistence primitive: no retrieval, chunking, or embedding pipeline runs, and stored content is not used to influence model responses. See docs/conversation-memory-rag-api.md.",
     request_body = RagDocumentCreateRequest,
     params(
         ("collection_id" = String, Path, description = "RAG collection identifier"),
-        ("Idempotency-Key" = Option<String>, Header, description = "Optional replay key. Replay is not yet implemented on this route; see plans/02b-idempotency-replay.md.")
+        ("Idempotency-Key" = Option<String>, Header, description = "Optional replay key. A repeated request with the same key and body replays the original response; the same key with a different body returns 409.")
     ),
     responses(
         (status = 201, description = "RAG document created", body = RagDocumentRecord, headers(("ETag" = String, description = "Current resource version"))),
+        (status = 409, description = "idempotency_conflict or idempotency_in_progress", body = ErrorResponse),
         (status = "4XX", description = "Request, authentication, authorization, conflict, or not-found error", body = ErrorResponse),
         (status = "5XX", description = "Infrastructure or internal error", body = ErrorResponse)
     ),
@@ -880,13 +882,28 @@ pub async fn create_rag_document(
     ))
 }
 
+/// Lists a collection's documents.
+///
+/// `cursor` and `limit` are declared inline rather than as `params(PageQuery)` because
+/// [`PageQuery`] is the shared admin-list extractor and carries two dozen filter fields —
+/// audit-log actors, credential types, expiry windows — none of which this route honours.
+/// Declaring the whole struct would advertise twenty-four parameters that do nothing, which
+/// is the same class of lie as the one this handler used to tell in the other direction: it
+/// previously took no query parameters at all, hard-coded `limit = 50`, and still returned a
+/// real `next_cursor` with `has_more: true` that no caller had any way to send back. Document
+/// 51 of a collection was unreachable over HTTP.
 #[utoipa::path(
     get,
     path = "/api/v1/admin/rag-collections/{collection_id}/documents",
     tag = "admin-rag",
-    params(("collection_id" = String, Path, description = "RAG collection identifier")),
+    params(
+        ("collection_id" = String, Path, description = "RAG collection identifier"),
+        ("cursor" = Option<String>, Query, description = "Opaque `next_cursor` from a previous response for this same list. Rejected with 400 invalid_cursor if malformed, tampered with, or minted by a different list."),
+        ("limit" = Option<i64>, Query, description = "Rows per page, clamped to 1..=200. Defaults to 50.")
+    ),
     responses(
-        (status = 200, description = "RAG documents", body = ListResponse<RagDocumentRecord>),
+        (status = 200, description = "Paginated RAG documents", body = ListResponse<RagDocumentRecord>),
+        (status = 400, description = "invalid_cursor", body = ErrorResponse),
         (status = "4XX", description = "Authentication, authorization, or not-found error", body = ErrorResponse),
         (status = "5XX", description = "Infrastructure or internal error", body = ErrorResponse)
     ),
@@ -896,10 +913,16 @@ pub async fn list_rag_documents(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(collection_id): Path<String>,
+    Query(query): Query<PageQuery>,
 ) -> Result<Json<ListResponse<RagDocumentRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     ConversationService::new(&state)?
-        .list_rag_documents(&actor, &collection_id, 50)
+        .list_rag_documents_page(
+            &actor,
+            &collection_id,
+            query.cursor.as_deref(),
+            query.limit(),
+        )
         .await
         .map(Json)
 }
@@ -957,14 +980,15 @@ pub async fn delete_rag_document(
     post,
     path = "/api/v1/admin/rag-documents/{id}/ingest",
     tag = "admin-rag",
-    description = "Persistence primitive: no retrieval, chunking, or embedding pipeline runs, and stored content is not used to influence model responses. See docs/conversation-memory-rag-api.md. Idempotency-Key is accepted but replay is not implemented yet; retrying can duplicate side effects.",
+    description = "Persistence primitive: no retrieval, chunking, or embedding pipeline runs, and stored content is not used to influence model responses. See docs/conversation-memory-rag-api.md.",
     request_body = RagDocumentIngestRequest,
     params(
         ("id" = String, Path, description = "RAG document identifier"),
-        ("Idempotency-Key" = Option<String>, Header, description = "Optional replay key. Replay is not yet implemented on this route; see plans/02b-idempotency-replay.md.")
+        ("Idempotency-Key" = Option<String>, Header, description = "Optional replay key. A repeated request with the same key and body replays the original response; the same key with a different body returns 409.")
     ),
     responses(
         (status = 200, description = "RAG document ingestion scheduled or completed", body = RagDocumentRecord, headers(("ETag" = String, description = "Current resource version"))),
+        (status = 409, description = "idempotency_conflict or idempotency_in_progress", body = ErrorResponse),
         (status = "4XX", description = "Request, authentication, authorization, conflict, or not-found error", body = ErrorResponse),
         (status = "5XX", description = "Infrastructure or internal error", body = ErrorResponse)
     ),
@@ -988,14 +1012,15 @@ pub async fn ingest_rag_document(
     post,
     path = "/api/v1/admin/rag-documents/{id}/reindex",
     tag = "admin-rag",
-    description = "Persistence primitive: no retrieval, chunking, or embedding pipeline runs, and stored content is not used to influence model responses. See docs/conversation-memory-rag-api.md. Idempotency-Key is accepted but replay is not implemented yet; retrying can duplicate side effects.",
+    description = "Persistence primitive: no retrieval, chunking, or embedding pipeline runs, and stored content is not used to influence model responses. See docs/conversation-memory-rag-api.md.",
     request_body = RagDocumentIngestRequest,
     params(
         ("id" = String, Path, description = "RAG document identifier"),
-        ("Idempotency-Key" = Option<String>, Header, description = "Optional replay key. Replay is not yet implemented on this route; see plans/02b-idempotency-replay.md.")
+        ("Idempotency-Key" = Option<String>, Header, description = "Optional replay key. A repeated request with the same key and body replays the original response; the same key with a different body returns 409.")
     ),
     responses(
         (status = 200, description = "RAG document reindexing scheduled or completed", body = RagDocumentRecord, headers(("ETag" = String, description = "Current resource version"))),
+        (status = 409, description = "idempotency_conflict or idempotency_in_progress", body = ErrorResponse),
         (status = "4XX", description = "Request, authentication, authorization, conflict, or not-found error", body = ErrorResponse),
         (status = "5XX", description = "Infrastructure or internal error", body = ErrorResponse)
     ),

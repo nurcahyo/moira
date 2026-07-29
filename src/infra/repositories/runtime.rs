@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::Value;
 use sqlx::{PgPool, Row};
@@ -7,7 +8,7 @@ use crate::{
     domain::{
         AgentProfileCreateRequest, AgentProfilePatchRequest, AgentProfileRecord, AttemptStatus,
         CredentialDecisionSource, CredentialRecord, CredentialType, ExecutionFailureClass,
-        ModelCandidate, ProviderRuntimePolicyPutRequest, ProviderRuntimePolicyRecord,
+        ListCursor, ModelCandidate, ProviderRuntimePolicyPutRequest, ProviderRuntimePolicyRecord,
         RouteDefinitionCreateRequest, RouteDefinitionPatchRequest, RouteDefinitionRecord,
         RoutingPolicyCreateRequest, RoutingPolicyPatchRequest, RoutingPolicyRecord, UsageSummary,
     },
@@ -76,12 +77,216 @@ pub struct UsageRecordInsert {
     pub metadata: Value,
 }
 
+/// The runtime persistence surface: route definitions, routing policies, agent profiles and
+/// provider runtime policies (the runtime-admin write side), plus model-candidate resolution,
+/// credential resolution, execution-attempt rows and usage records (the execution read/write side).
+///
+/// Extracted as a trait (plan 06, Module 8 / P2-3) so `RuntimeAdminService` and the execution
+/// pipeline can be unit-tested against a fake instead of a live Postgres. Mirrors
+/// [`AdminRepository`](super::AdminRepository): the trait carries the documentation, the
+/// `#[async_trait] impl` below carries only SQL.
+///
+/// `resolve_runtime_credential` is the single live credential-precedence implementation in the
+/// process; it returns encrypted material only — decryption stays in `src/security/crypto.rs`, so
+/// an implementation of this trait never sees or produces plaintext secrets.
+#[async_trait]
+pub trait RuntimeRepository: Send + Sync {
+    async fn create_route_definition(
+        &self,
+        id: Uuid,
+        request: &RouteDefinitionCreateRequest,
+    ) -> Result<RouteDefinitionRecord, AppError>;
+
+    /// Lists route definitions newest-first, keyset-paginated on `(created_at, id)`.
+    ///
+    /// `cursor` bounds the page to rows strictly *after* the previously returned last row
+    /// (i.e. strictly less than the cursor under `created_at desc, id desc` ordering); `None`
+    /// returns the first page. Returns up to `limit + 1` rows so the caller (application
+    /// layer) can detect `has_more` without a second `count(*)` query and must trim the
+    /// over-fetched row itself before returning it to a client. `cursor.ts`/`cursor.id` are
+    /// always bound as parameters, never interpolated into the query text — see
+    /// `keyset_predicate_binds_parameters_and_never_interpolates_values` below, which pins
+    /// the query text used here.
+    async fn list_route_definitions(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<RouteDefinitionRecord>, AppError>;
+
+    async fn get_route_definition(&self, id: Uuid) -> Result<RouteDefinitionRecord, AppError>;
+
+    async fn get_active_route_by_key(
+        &self,
+        route_key: &str,
+    ) -> Result<Option<RouteDefinitionRecord>, AppError>;
+
+    async fn get_default_route(&self) -> Result<Option<RouteDefinitionRecord>, AppError>;
+
+    /// `expected_version` is the caller's `If-Match` expectation, evaluated by the
+    /// implementation *inside the same transaction as the write* (plan 06b). The HTTP layer
+    /// no longer pre-reads and compares: a version read on one pooled connection and compared
+    /// in Rust cannot exclude a concurrent writer, so two callers holding the same
+    /// currently-valid version both used to succeed and the first one's values were lost.
+    ///
+    /// A mismatch is a `409` `resource_version_conflict`; an absent row stays `404`.
+    /// The same contract applies to every method on this trait taking `expected_version`.
+    async fn patch_route_definition(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+        request: &RouteDefinitionPatchRequest,
+    ) -> Result<RouteDefinitionRecord, AppError>;
+
+    async fn set_route_definition_status(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+        status: &str,
+    ) -> Result<RouteDefinitionRecord, AppError>;
+
+    async fn soft_delete_route_definition(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+    ) -> Result<(), AppError>;
+
+    async fn create_routing_policy(
+        &self,
+        id: Uuid,
+        request: &RoutingPolicyCreateRequest,
+    ) -> Result<RoutingPolicyRecord, AppError>;
+
+    /// See [`Self::list_route_definitions`] for the keyset-pagination contract this shares.
+    async fn list_routing_policies(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<RoutingPolicyRecord>, AppError>;
+
+    async fn get_routing_policy(&self, id: Uuid) -> Result<RoutingPolicyRecord, AppError>;
+
+    async fn provider_model_belongs_to_provider(
+        &self,
+        provider_id: Uuid,
+        provider_model_id: Uuid,
+    ) -> Result<bool, AppError>;
+
+    /// See [`Self::patch_route_definition`] for the `expected_version` contract.
+    async fn patch_routing_policy(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+        request: &RoutingPolicyPatchRequest,
+    ) -> Result<RoutingPolicyRecord, AppError>;
+
+    async fn set_routing_policy_status(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+        status: &str,
+    ) -> Result<RoutingPolicyRecord, AppError>;
+
+    async fn soft_delete_routing_policy(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+    ) -> Result<(), AppError>;
+
+    async fn create_agent_profile(
+        &self,
+        id: Uuid,
+        request: &AgentProfileCreateRequest,
+    ) -> Result<AgentProfileRecord, AppError>;
+
+    /// See [`Self::list_route_definitions`] for the keyset-pagination contract this shares.
+    async fn list_agent_profiles(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<AgentProfileRecord>, AppError>;
+
+    async fn get_agent_profile(&self, id: Uuid) -> Result<AgentProfileRecord, AppError>;
+
+    async fn get_active_agent_profile(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<AgentProfileRecord>, AppError>;
+
+    /// See [`Self::patch_route_definition`] for the `expected_version` contract.
+    async fn patch_agent_profile(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+        request: &AgentProfilePatchRequest,
+    ) -> Result<AgentProfileRecord, AppError>;
+
+    async fn set_agent_profile_status(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+        status: &str,
+    ) -> Result<AgentProfileRecord, AppError>;
+
+    async fn soft_delete_agent_profile(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+    ) -> Result<(), AppError>;
+
+    async fn get_provider_runtime_policy(
+        &self,
+        provider_id: Uuid,
+    ) -> Result<ProviderRuntimePolicyRecord, AppError>;
+
+    async fn put_provider_runtime_policy(
+        &self,
+        provider_id: Uuid,
+        request: &ProviderRuntimePolicyPutRequest,
+    ) -> Result<ProviderRuntimePolicyRecord, AppError>;
+
+    async fn ensure_application_active(&self, application_id: Uuid) -> Result<(), AppError>;
+
+    async fn list_model_candidates(
+        &self,
+        route_id: Uuid,
+        application_id: Option<Uuid>,
+        external_tenant_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<ModelCandidate>, AppError>;
+
+    async fn resolve_runtime_credential(
+        &self,
+        provider_id: Uuid,
+        credential_types: &[CredentialType],
+        application_id: Option<Uuid>,
+        external_tenant_id: Option<&str>,
+        external_user_id: Option<&str>,
+        explicit_credential_id: Option<Uuid>,
+    ) -> Result<Option<RuntimeCredentialCandidate>, AppError>;
+
+    async fn insert_attempt_started(&self, insert: &ExecutionAttemptInsert)
+    -> Result<(), AppError>;
+
+    async fn update_attempt(
+        &self,
+        attempt_id: Uuid,
+        update: &ExecutionAttemptUpdate,
+    ) -> Result<(), AppError>;
+
+    async fn insert_usage_record(&self, insert: &UsageRecordInsert) -> Result<(), AppError>;
+
+    async fn touch_credential_used(&self, credential_id: Uuid) -> Result<(), AppError>;
+}
+
 impl PgRuntimeRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+}
 
-    pub async fn create_route_definition(
+#[async_trait]
+impl RuntimeRepository for PgRuntimeRepository {
+    async fn create_route_definition(
         &self,
         id: Uuid,
         request: &RouteDefinitionCreateRequest,
@@ -107,27 +312,21 @@ impl PgRuntimeRepository {
         route_definition_record_from_row(&row)
     }
 
-    pub async fn list_route_definitions(
+    async fn list_route_definitions(
         &self,
+        cursor: Option<ListCursor>,
         limit: i64,
     ) -> Result<Vec<RouteDefinitionRecord>, AppError> {
-        let rows = sqlx::query(
-            r#"
-            select id, route_key, display_name, description, status, selection_strategy,
-                   agent_profile_id, metadata, created_at, updated_at, deleted_at, version
-            from route_definitions
-            where deleted_at is null
-            order by created_at desc, id desc
-            limit $1
-            "#,
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query(LIST_ROUTE_DEFINITIONS_SQL)
+            .bind(cursor.map(|c| c.ts))
+            .bind(cursor.map(|c| c.id))
+            .bind(over_fetch_limit(limit))
+            .fetch_all(&self.pool)
+            .await?;
         rows.iter().map(route_definition_record_from_row).collect()
     }
 
-    pub async fn get_route_definition(&self, id: Uuid) -> Result<RouteDefinitionRecord, AppError> {
+    async fn get_route_definition(&self, id: Uuid) -> Result<RouteDefinitionRecord, AppError> {
         let row = sqlx::query(&route_definition_select(
             "where id = $1 and deleted_at is null",
         ))
@@ -138,7 +337,7 @@ impl PgRuntimeRepository {
         route_definition_record_from_row(&row)
     }
 
-    pub async fn get_active_route_by_key(
+    async fn get_active_route_by_key(
         &self,
         route_key: &str,
     ) -> Result<Option<RouteDefinitionRecord>, AppError> {
@@ -153,7 +352,7 @@ impl PgRuntimeRepository {
             .transpose()
     }
 
-    pub async fn get_default_route(&self) -> Result<Option<RouteDefinitionRecord>, AppError> {
+    async fn get_default_route(&self) -> Result<Option<RouteDefinitionRecord>, AppError> {
         let row = sqlx::query(&route_definition_select(
             "where status = 'active' and deleted_at is null order by case when route_key = 'general' then 0 else 1 end, created_at asc limit 1",
         ))
@@ -164,15 +363,25 @@ impl PgRuntimeRepository {
             .transpose()
     }
 
-    pub async fn patch_route_definition(
+    async fn patch_route_definition(
         &self,
         id: Uuid,
+        expected_version: i64,
         request: &RouteDefinitionPatchRequest,
     ) -> Result<RouteDefinitionRecord, AppError> {
         let strategy = request
             .selection_strategy
             .as_ref()
             .map(route_selection_strategy_to_db);
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            ROUTE_DEFINITION_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("route {id}"),
+        )
+        .await?;
         let row = sqlx::query(
             r#"
             update route_definitions
@@ -182,7 +391,7 @@ impl PgRuntimeRepository {
                 agent_profile_id = coalesce($5, agent_profile_id),
                 metadata = coalesce($6, metadata),
                 updated_at = now()
-            where id = $1 and deleted_at is null
+            where id = $1 and deleted_at is null and version = $7
             returning id, route_key, display_name, description, status, selection_strategy,
                       agent_profile_id, metadata, created_at, updated_at, deleted_at, version
             "#,
@@ -193,47 +402,81 @@ impl PgRuntimeRepository {
         .bind(strategy)
         .bind(request.agent_profile_id)
         .bind(&request.metadata)
-        .fetch_optional(&self.pool)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("route {id}")))?;
-        route_definition_record_from_row(&row)
+        .ok_or_else(version_conflict)?;
+        let record = route_definition_record_from_row(&row)?;
+        tx.commit().await?;
+        Ok(record)
     }
 
-    pub async fn set_route_definition_status(
+    async fn set_route_definition_status(
         &self,
         id: Uuid,
+        expected_version: i64,
         status: &str,
     ) -> Result<RouteDefinitionRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            ROUTE_DEFINITION_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("route {id}"),
+        )
+        .await?;
         let row = sqlx::query(
             r#"
             update route_definitions
             set status = $2,
                 deleted_at = case when $2 = 'deleted' then coalesce(deleted_at, now()) else deleted_at end,
                 updated_at = now()
-            where id = $1 and deleted_at is null
+            where id = $1 and deleted_at is null and version = $3
             returning id, route_key, display_name, description, status, selection_strategy,
                       agent_profile_id, metadata, created_at, updated_at, deleted_at, version
             "#,
         )
         .bind(id)
         .bind(status)
-        .fetch_optional(&self.pool)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("route {id}")))?;
-        route_definition_record_from_row(&row)
+        .ok_or_else(version_conflict)?;
+        let record = route_definition_record_from_row(&row)?;
+        tx.commit().await?;
+        Ok(record)
     }
 
-    pub async fn soft_delete_route_definition(&self, id: Uuid) -> Result<(), AppError> {
+    async fn soft_delete_route_definition(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+    ) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            ROUTE_DEFINITION_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("route {id}"),
+        )
+        .await?;
         let result = sqlx::query(
-            "update route_definitions set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null",
+            "update route_definitions set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null and version = $2",
         )
         .bind(id)
-        .execute(&self.pool)
+        .bind(current_version)
+        .execute(&mut *tx)
         .await?;
-        ensure_affected(result.rows_affected(), format!("route {id}"))
+        if result.rows_affected() == 0 {
+            return Err(version_conflict());
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
-    pub async fn create_routing_policy(
+    async fn create_routing_policy(
         &self,
         id: Uuid,
         request: &RoutingPolicyCreateRequest,
@@ -263,31 +506,21 @@ impl PgRuntimeRepository {
         routing_policy_record_from_row(&row)
     }
 
-    pub async fn list_routing_policies(
+    async fn list_routing_policies(
         &self,
+        cursor: Option<ListCursor>,
         limit: i64,
     ) -> Result<Vec<RoutingPolicyRecord>, AppError> {
-        let rows = sqlx::query(
-            r#"
-            select id, application_id, external_tenant_id, route_id, provider_id,
-                   provider_model_id, priority, weight, cost_weight, latency_weight,
-                   quality_weight, privacy_class, required_capabilities,
-                   maximum_cost_per_request, maximum_input_tokens, maximum_output_tokens,
-                   timeout_ms, retry_policy, status, metadata, created_at, updated_at,
-                   deleted_at, version
-            from routing_policies
-            where deleted_at is null
-            order by created_at desc, id desc
-            limit $1
-            "#,
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query(LIST_ROUTING_POLICIES_SQL)
+            .bind(cursor.map(|c| c.ts))
+            .bind(cursor.map(|c| c.id))
+            .bind(over_fetch_limit(limit))
+            .fetch_all(&self.pool)
+            .await?;
         rows.iter().map(routing_policy_record_from_row).collect()
     }
 
-    pub async fn get_routing_policy(&self, id: Uuid) -> Result<RoutingPolicyRecord, AppError> {
+    async fn get_routing_policy(&self, id: Uuid) -> Result<RoutingPolicyRecord, AppError> {
         let row = sqlx::query(&routing_policy_select(
             "where id = $1 and deleted_at is null",
         ))
@@ -298,7 +531,7 @@ impl PgRuntimeRepository {
         routing_policy_record_from_row(&row)
     }
 
-    pub async fn provider_model_belongs_to_provider(
+    async fn provider_model_belongs_to_provider(
         &self,
         provider_id: Uuid,
         provider_model_id: Uuid,
@@ -313,11 +546,21 @@ impl PgRuntimeRepository {
         .map_err(AppError::from)
     }
 
-    pub async fn patch_routing_policy(
+    async fn patch_routing_policy(
         &self,
         id: Uuid,
+        expected_version: i64,
         request: &RoutingPolicyPatchRequest,
     ) -> Result<RoutingPolicyRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            ROUTING_POLICY_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("routing policy {id}"),
+        )
+        .await?;
         let row = sqlx::query(
             r#"
             update routing_policies
@@ -340,7 +583,7 @@ impl PgRuntimeRepository {
                 retry_policy = coalesce($18, retry_policy),
                 metadata = coalesce($19, metadata),
                 updated_at = now()
-            where id = $1 and deleted_at is null
+            where id = $1 and deleted_at is null and version = $20
             returning id, application_id, external_tenant_id, route_id, provider_id,
                       provider_model_id, priority, weight, cost_weight, latency_weight,
                       quality_weight, privacy_class, required_capabilities,
@@ -368,24 +611,37 @@ impl PgRuntimeRepository {
         .bind(request.timeout_ms)
         .bind(&request.retry_policy)
         .bind(&request.metadata)
-        .fetch_optional(&self.pool)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("routing policy {id}")))?;
-        routing_policy_record_from_row(&row)
+        .ok_or_else(version_conflict)?;
+        let record = routing_policy_record_from_row(&row)?;
+        tx.commit().await?;
+        Ok(record)
     }
 
-    pub async fn set_routing_policy_status(
+    async fn set_routing_policy_status(
         &self,
         id: Uuid,
+        expected_version: i64,
         status: &str,
     ) -> Result<RoutingPolicyRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            ROUTING_POLICY_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("routing policy {id}"),
+        )
+        .await?;
         let row = sqlx::query(
             r#"
             update routing_policies
             set status = $2,
                 deleted_at = case when $2 = 'deleted' then coalesce(deleted_at, now()) else deleted_at end,
                 updated_at = now()
-            where id = $1 and deleted_at is null
+            where id = $1 and deleted_at is null and version = $3
             returning id, application_id, external_tenant_id, route_id, provider_id,
                       provider_model_id, priority, weight, cost_weight, latency_weight,
                       quality_weight, privacy_class, required_capabilities,
@@ -396,23 +652,44 @@ impl PgRuntimeRepository {
         )
         .bind(id)
         .bind(status)
-        .fetch_optional(&self.pool)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("routing policy {id}")))?;
-        routing_policy_record_from_row(&row)
+        .ok_or_else(version_conflict)?;
+        let record = routing_policy_record_from_row(&row)?;
+        tx.commit().await?;
+        Ok(record)
     }
 
-    pub async fn soft_delete_routing_policy(&self, id: Uuid) -> Result<(), AppError> {
+    async fn soft_delete_routing_policy(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+    ) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            ROUTING_POLICY_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("routing policy {id}"),
+        )
+        .await?;
         let result = sqlx::query(
-            "update routing_policies set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null",
+            "update routing_policies set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null and version = $2",
         )
         .bind(id)
-        .execute(&self.pool)
+        .bind(current_version)
+        .execute(&mut *tx)
         .await?;
-        ensure_affected(result.rows_affected(), format!("routing policy {id}"))
+        if result.rows_affected() == 0 {
+            return Err(version_conflict());
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
-    pub async fn create_agent_profile(
+    async fn create_agent_profile(
         &self,
         id: Uuid,
         request: &AgentProfileCreateRequest,
@@ -443,28 +720,21 @@ impl PgRuntimeRepository {
         agent_profile_record_from_row(&row)
     }
 
-    pub async fn list_agent_profiles(
+    async fn list_agent_profiles(
         &self,
+        cursor: Option<ListCursor>,
         limit: i64,
     ) -> Result<Vec<AgentProfileRecord>, AppError> {
-        let rows = sqlx::query(
-            r#"
-            select id, profile_key, display_name, preamble, temperature, max_tokens,
-                   tool_policy, context_policy, memory_policy, status, metadata,
-                   created_at, updated_at, deleted_at, version
-            from agent_profiles
-            where deleted_at is null
-            order by created_at desc, id desc
-            limit $1
-            "#,
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query(LIST_AGENT_PROFILES_SQL)
+            .bind(cursor.map(|c| c.ts))
+            .bind(cursor.map(|c| c.id))
+            .bind(over_fetch_limit(limit))
+            .fetch_all(&self.pool)
+            .await?;
         rows.iter().map(agent_profile_record_from_row).collect()
     }
 
-    pub async fn get_agent_profile(&self, id: Uuid) -> Result<AgentProfileRecord, AppError> {
+    async fn get_agent_profile(&self, id: Uuid) -> Result<AgentProfileRecord, AppError> {
         let row = sqlx::query(&agent_profile_select(
             "where id = $1 and deleted_at is null",
         ))
@@ -475,7 +745,7 @@ impl PgRuntimeRepository {
         agent_profile_record_from_row(&row)
     }
 
-    pub async fn get_active_agent_profile(
+    async fn get_active_agent_profile(
         &self,
         id: Uuid,
     ) -> Result<Option<AgentProfileRecord>, AppError> {
@@ -488,11 +758,21 @@ impl PgRuntimeRepository {
         row.as_ref().map(agent_profile_record_from_row).transpose()
     }
 
-    pub async fn patch_agent_profile(
+    async fn patch_agent_profile(
         &self,
         id: Uuid,
+        expected_version: i64,
         request: &AgentProfilePatchRequest,
     ) -> Result<AgentProfileRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            AGENT_PROFILE_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("agent profile {id}"),
+        )
+        .await?;
         let row = sqlx::query(
             r#"
             update agent_profiles
@@ -505,7 +785,7 @@ impl PgRuntimeRepository {
                 memory_policy = coalesce($8, memory_policy),
                 metadata = coalesce($9, metadata),
                 updated_at = now()
-            where id = $1 and deleted_at is null
+            where id = $1 and deleted_at is null and version = $10
             returning id, profile_key, display_name, preamble, temperature, max_tokens,
                       tool_policy, context_policy, memory_policy, status, metadata,
                       created_at, updated_at, deleted_at, version
@@ -520,24 +800,37 @@ impl PgRuntimeRepository {
         .bind(&request.context_policy)
         .bind(&request.memory_policy)
         .bind(&request.metadata)
-        .fetch_optional(&self.pool)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("agent profile {id}")))?;
-        agent_profile_record_from_row(&row)
+        .ok_or_else(version_conflict)?;
+        let record = agent_profile_record_from_row(&row)?;
+        tx.commit().await?;
+        Ok(record)
     }
 
-    pub async fn set_agent_profile_status(
+    async fn set_agent_profile_status(
         &self,
         id: Uuid,
+        expected_version: i64,
         status: &str,
     ) -> Result<AgentProfileRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            AGENT_PROFILE_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("agent profile {id}"),
+        )
+        .await?;
         let row = sqlx::query(
             r#"
             update agent_profiles
             set status = $2,
                 deleted_at = case when $2 = 'deleted' then coalesce(deleted_at, now()) else deleted_at end,
                 updated_at = now()
-            where id = $1 and deleted_at is null
+            where id = $1 and deleted_at is null and version = $3
             returning id, profile_key, display_name, preamble, temperature, max_tokens,
                       tool_policy, context_policy, memory_policy, status, metadata,
                       created_at, updated_at, deleted_at, version
@@ -545,23 +838,44 @@ impl PgRuntimeRepository {
         )
         .bind(id)
         .bind(status)
-        .fetch_optional(&self.pool)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("agent profile {id}")))?;
-        agent_profile_record_from_row(&row)
+        .ok_or_else(version_conflict)?;
+        let record = agent_profile_record_from_row(&row)?;
+        tx.commit().await?;
+        Ok(record)
     }
 
-    pub async fn soft_delete_agent_profile(&self, id: Uuid) -> Result<(), AppError> {
+    async fn soft_delete_agent_profile(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+    ) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            AGENT_PROFILE_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("agent profile {id}"),
+        )
+        .await?;
         let result = sqlx::query(
-            "update agent_profiles set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null",
+            "update agent_profiles set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null and version = $2",
         )
         .bind(id)
-        .execute(&self.pool)
+        .bind(current_version)
+        .execute(&mut *tx)
         .await?;
-        ensure_affected(result.rows_affected(), format!("agent profile {id}"))
+        if result.rows_affected() == 0 {
+            return Err(version_conflict());
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
-    pub async fn get_provider_runtime_policy(
+    async fn get_provider_runtime_policy(
         &self,
         provider_id: Uuid,
     ) -> Result<ProviderRuntimePolicyRecord, AppError> {
@@ -575,7 +889,7 @@ impl PgRuntimeRepository {
         }
     }
 
-    pub async fn put_provider_runtime_policy(
+    async fn put_provider_runtime_policy(
         &self,
         provider_id: Uuid,
         request: &ProviderRuntimePolicyPutRequest,
@@ -639,7 +953,7 @@ impl PgRuntimeRepository {
         provider_runtime_policy_record_from_row(&row)
     }
 
-    pub async fn ensure_application_active(&self, application_id: Uuid) -> Result<(), AppError> {
+    async fn ensure_application_active(&self, application_id: Uuid) -> Result<(), AppError> {
         let exists = sqlx::query_scalar::<_, bool>(
             "select exists(select 1 from applications where id = $1 and status = 'active' and deleted_at is null)",
         )
@@ -653,7 +967,7 @@ impl PgRuntimeRepository {
         }
     }
 
-    pub async fn list_model_candidates(
+    async fn list_model_candidates(
         &self,
         route_id: Uuid,
         application_id: Option<Uuid>,
@@ -772,7 +1086,7 @@ impl PgRuntimeRepository {
             .collect()
     }
 
-    pub async fn resolve_runtime_credential(
+    async fn resolve_runtime_credential(
         &self,
         provider_id: Uuid,
         credential_types: &[CredentialType],
@@ -867,7 +1181,7 @@ impl PgRuntimeRepository {
         }))
     }
 
-    pub async fn insert_attempt_started(
+    async fn insert_attempt_started(
         &self,
         insert: &ExecutionAttemptInsert,
     ) -> Result<(), AppError> {
@@ -897,7 +1211,7 @@ impl PgRuntimeRepository {
         Ok(())
     }
 
-    pub async fn update_attempt(
+    async fn update_attempt(
         &self,
         attempt_id: Uuid,
         update: &ExecutionAttemptUpdate,
@@ -943,7 +1257,7 @@ impl PgRuntimeRepository {
         Ok(())
     }
 
-    pub async fn insert_usage_record(&self, insert: &UsageRecordInsert) -> Result<(), AppError> {
+    async fn insert_usage_record(&self, insert: &UsageRecordInsert) -> Result<(), AppError> {
         sqlx::query(
             r#"
             insert into usage_records
@@ -982,7 +1296,7 @@ impl PgRuntimeRepository {
         Ok(())
     }
 
-    pub async fn touch_credential_used(&self, credential_id: Uuid) -> Result<(), AppError> {
+    async fn touch_credential_used(&self, credential_id: Uuid) -> Result<(), AppError> {
         sqlx::query(
             "update provider_credentials set last_used_at = now(), updated_at = now() where id = $1",
         )
@@ -991,6 +1305,50 @@ impl PgRuntimeRepository {
         .await?;
         Ok(())
     }
+}
+
+/// Keyset predicate shared by every `list_*` query in this file: `$1`/`$2` are the cursor's
+/// `(ts, id)` bound as parameters (both `NULL` for the first page, which short-circuits the
+/// `is null` branch and matches every row), and the strict `<` under `created_at desc, id
+/// desc` ordering returns exactly the rows after the previously returned last row.
+const LIST_ROUTE_DEFINITIONS_SQL: &str = r#"
+    select id, route_key, display_name, description, status, selection_strategy,
+           agent_profile_id, metadata, created_at, updated_at, deleted_at, version
+    from route_definitions
+    where deleted_at is null
+      and ($1::timestamptz is null or (created_at, id) < ($1::timestamptz, $2::uuid))
+    order by created_at desc, id desc
+    limit $3
+    "#;
+
+const LIST_ROUTING_POLICIES_SQL: &str = r#"
+    select id, application_id, external_tenant_id, route_id, provider_id,
+           provider_model_id, priority, weight, cost_weight, latency_weight,
+           quality_weight, privacy_class, required_capabilities,
+           maximum_cost_per_request, maximum_input_tokens, maximum_output_tokens,
+           timeout_ms, retry_policy, status, metadata, created_at, updated_at,
+           deleted_at, version
+    from routing_policies
+    where deleted_at is null
+      and ($1::timestamptz is null or (created_at, id) < ($1::timestamptz, $2::uuid))
+    order by created_at desc, id desc
+    limit $3
+    "#;
+
+const LIST_AGENT_PROFILES_SQL: &str = r#"
+    select id, profile_key, display_name, preamble, temperature, max_tokens,
+           tool_policy, context_policy, memory_policy, status, metadata,
+           created_at, updated_at, deleted_at, version
+    from agent_profiles
+    where deleted_at is null
+      and ($1::timestamptz is null or (created_at, id) < ($1::timestamptz, $2::uuid))
+    order by created_at desc, id desc
+    limit $3
+    "#;
+
+/// Over-fetches by one row so the caller can compute `has_more` without a second query.
+fn over_fetch_limit(limit: i64) -> i64 {
+    limit.saturating_add(1)
 }
 
 fn route_definition_select(suffix: &str) -> String {
@@ -1154,12 +1512,61 @@ fn u64_to_i64(value: u64) -> Result<i64, AppError> {
         .map_err(|_| AppError::Internal("usage value exceeds storage range".to_string()))
 }
 
-fn ensure_affected(rows: u64, target: String) -> Result<(), AppError> {
-    if rows == 0 {
-        Err(AppError::NotFound(target))
-    } else {
-        Ok(())
+/// The `409` a stale `If-Match` produces. Identical code and message to the ones the HTTP
+/// layer used to emit from its own pre-read comparison, so moving the check down here is
+/// invisible on the wire.
+///
+/// Twin of `version_conflict` in `super::admin`, which is private there. Deliberately
+/// duplicated rather than shared: the two modules own disjoint tables and neither should
+/// have to import the other's internals. If you change the code or message here, change it
+/// there too — they are one wire contract.
+fn version_conflict() -> AppError {
+    AppError::conflict(
+        "resource_version_conflict",
+        "resource version does not match If-Match",
+    )
+}
+
+/// The row-lock statements paired with `lock_and_match_version`, one per versioned runtime
+/// entity. Each takes the row's id as `$1` and every one of them ends in `for update`; a
+/// variant that does not is a silent reopening of the write window. The `deleted_at is null`
+/// clause mirrors the `where` clause of the `UPDATE` each one guards, so a soft-deleted row
+/// is `404` here exactly as it was before.
+const ROUTE_DEFINITION_VERSION_FOR_UPDATE: &str =
+    "select version from route_definitions where id = $1 and deleted_at is null for update";
+const ROUTING_POLICY_VERSION_FOR_UPDATE: &str =
+    "select version from routing_policies where id = $1 and deleted_at is null for update";
+const AGENT_PROFILE_VERSION_FOR_UPDATE: &str =
+    "select version from agent_profiles where id = $1 and deleted_at is null for update";
+
+/// Evaluate the caller's `If-Match` expectation where it is actually safe: on a row already
+/// locked by `select … for update`, inside the same transaction as the write that follows.
+///
+/// `select_version_sql` must select `version` for the target row and end in `for update`, with
+/// `$1` bound to `id`. Returns the locked version so the caller can carry `and version = $N`
+/// on the write itself.
+///
+/// The absent-row branch stays `NotFound` and only a genuine mismatch becomes `409`. Folding
+/// the predicate into the existing `UPDATE` without this pre-read would collapse both onto the
+/// update's own zero-row branch and turn a stale `If-Match` into a `404`.
+///
+/// Twin of `lock_and_match_version` in `super::admin`; see `version_conflict` above.
+async fn lock_and_match_version(
+    conn: &mut sqlx::PgConnection,
+    select_version_sql: &str,
+    id: Uuid,
+    expected_version: i64,
+    resource: String,
+) -> Result<i64, AppError> {
+    let current_version = sqlx::query_scalar::<_, i64>(select_version_sql)
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(|| AppError::NotFound(resource))?;
+    if current_version != expected_version {
+        return Err(version_conflict());
     }
+    Ok(current_version)
 }
 
 #[cfg(test)]
@@ -1202,5 +1609,820 @@ mod tests {
             credential_source_from_record(&record),
             CredentialDecisionSource::UserApplicationTenant
         );
+    }
+
+    #[test]
+    fn over_fetch_limit_is_limit_plus_one() {
+        assert_eq!(over_fetch_limit(1), 2);
+        assert_eq!(over_fetch_limit(50), 51);
+        assert_eq!(over_fetch_limit(200), 201);
+    }
+
+    #[test]
+    fn over_fetch_limit_saturates_instead_of_overflowing() {
+        assert_eq!(over_fetch_limit(i64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn keyset_predicate_uses_strict_less_than_for_descending_lists() {
+        for sql in [
+            LIST_ROUTE_DEFINITIONS_SQL,
+            LIST_ROUTING_POLICIES_SQL,
+            LIST_AGENT_PROFILES_SQL,
+        ] {
+            assert!(
+                sql.contains("(created_at, id) < ($1::timestamptz, $2::uuid)"),
+                "missing strict keyset predicate in {sql}"
+            );
+            assert!(
+                sql.contains("order by created_at desc, id desc"),
+                "missing the existing (created_at desc, id desc) tiebreaker in {sql}"
+            );
+            assert!(
+                sql.contains("limit $3"),
+                "over-fetch bind must be the third parameter in {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn keyset_predicate_binds_parameters_and_never_interpolates_values() {
+        // Every cursor-derived value must reach the query as a bound `$N` placeholder, never
+        // as a literal spliced into the SQL text. These are `&'static str` literals (not
+        // built with `format!`/string concatenation of caller input), so this is a structural
+        // guard against a future edit accidentally interpolating a value: only `$1`, `$2`,
+        // `$3` may appear as parameter markers, and no other `$`-prefixed token should.
+        for sql in [
+            LIST_ROUTE_DEFINITIONS_SQL,
+            LIST_ROUTING_POLICIES_SQL,
+            LIST_AGENT_PROFILES_SQL,
+        ] {
+            let placeholders: Vec<&str> = sql.match_indices('$').map(|(i, _)| &sql[i..]).collect();
+            for placeholder in placeholders {
+                let marker: String = placeholder
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '$')
+                    .collect();
+                assert!(
+                    marker == "$1" || marker == "$2" || marker == "$3",
+                    "unexpected placeholder {marker:?} in {sql}"
+                );
+            }
+        }
+    }
+}
+
+/// In-memory [`RuntimeRepository`] for unit tests (plan 06, Module 8 / P2-3).
+///
+/// Backs the **route lookup and model-candidate** slice — the reads the execution pipeline makes
+/// before it ever talks to a provider — with real state, and returns an explicit `not_stubbed`
+/// error for every other method. A fake that answered unbacked reads with `Ok(vec![])` would let
+/// a test pass while exercising nothing, so unbacked methods fail loudly instead.
+///
+/// Holds **no credential material**: `resolve_runtime_credential` is deliberately left unbacked
+/// rather than seeded with a synthetic ciphertext, so no test can grow a dependency on fake
+/// encrypted bytes.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct InMemoryRuntimeRepository {
+    routes: Vec<RouteDefinitionRecord>,
+    /// Keyed by `route_id`, because that is the one scoping dimension a [`ModelCandidate`]
+    /// actually carries. The SQL additionally filters on `application_id` and
+    /// `external_tenant_id`, but `ModelCandidate` has no fields for either — a policy's scope is
+    /// dropped on the way out of the query — so a fake cannot reproduce that filter and this one
+    /// deliberately does not pretend to. Application/tenant scoping stays covered by the
+    /// Postgres-backed integration tests.
+    candidates: Vec<(Uuid, ModelCandidate)>,
+    /// Identity and `version` only, seeded to make the `If-Match` rejection branches of the
+    /// versioned mutations reachable without Postgres (plan 06b §2.3). See [`match_version`]
+    /// for exactly how much these are allowed to decide.
+    routing_policies: Vec<RoutingPolicyRecord>,
+    /// See [`Self::routing_policies`].
+    agent_profiles: Vec<AgentProfileRecord>,
+}
+
+#[cfg(test)]
+fn not_stubbed(method: &str) -> AppError {
+    AppError::Internal(format!(
+        "InMemoryRuntimeRepository::{method} is not stubbed"
+    ))
+}
+
+/// The fake's stand-in for [`lock_and_match_version`].
+///
+/// The nine versioned mutations cannot be *performed* here — the trait takes `&self` and this
+/// fake owns no interior mutability — so their success path stays `not_stubbed`, loudly, exactly
+/// as it was before plan 06b. What the fake can and must do is decide the two *rejection*
+/// branches the way Postgres decides them, so `If-Match` handling is exercisable without a
+/// database:
+///
+/// * entity never seeded → `not_stubbed`; the fake does not pretend a row is absent when it
+///   simply has no rows to speak for, which is what would let a `404` assertion pass against
+///   nothing at all;
+/// * seeded, but `id` is not among the rows → the same `NotFound` the Pg impl returns, with the
+///   same resource string;
+/// * seeded and found, but `version` differs → `resource_version_conflict`, the same `409`;
+/// * seeded, found, versions agree → `not_stubbed`, because the write itself is still unbacked.
+#[cfg(test)]
+fn match_version(
+    rows: impl IntoIterator<Item = (Uuid, i64)>,
+    id: Uuid,
+    expected_version: i64,
+    resource: String,
+    method: &str,
+) -> AppError {
+    let mut seeded = false;
+    for (row_id, version) in rows {
+        seeded = true;
+        if row_id == id {
+            return if version == expected_version {
+                not_stubbed(method)
+            } else {
+                version_conflict()
+            };
+        }
+    }
+    if seeded {
+        AppError::NotFound(resource)
+    } else {
+        not_stubbed(method)
+    }
+}
+
+#[cfg(test)]
+impl InMemoryRuntimeRepository {
+    pub(crate) fn new(
+        routes: Vec<RouteDefinitionRecord>,
+        candidates: Vec<(Uuid, ModelCandidate)>,
+    ) -> Self {
+        Self {
+            routes,
+            candidates,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn with_routing_policies(mut self, rows: Vec<RoutingPolicyRecord>) -> Self {
+        self.routing_policies = rows;
+        self
+    }
+
+    pub(crate) fn with_agent_profiles(mut self, rows: Vec<AgentProfileRecord>) -> Self {
+        self.agent_profiles = rows;
+        self
+    }
+
+    fn route_versions(&self) -> impl Iterator<Item = (Uuid, i64)> + '_ {
+        self.routes.iter().map(|row| (row.id, row.version))
+    }
+
+    fn routing_policy_versions(&self) -> impl Iterator<Item = (Uuid, i64)> + '_ {
+        self.routing_policies
+            .iter()
+            .map(|row| (row.id, row.version))
+    }
+
+    fn agent_profile_versions(&self) -> impl Iterator<Item = (Uuid, i64)> + '_ {
+        self.agent_profiles.iter().map(|row| (row.id, row.version))
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl RuntimeRepository for InMemoryRuntimeRepository {
+    async fn get_active_route_by_key(
+        &self,
+        route_key: &str,
+    ) -> Result<Option<RouteDefinitionRecord>, AppError> {
+        Ok(self
+            .routes
+            .iter()
+            .find(|route| {
+                route.route_key == route_key
+                    && route.status == crate::domain::ResourceStatus::Active
+                    && route.deleted_at.is_none()
+            })
+            .cloned())
+    }
+
+    async fn get_default_route(&self) -> Result<Option<RouteDefinitionRecord>, AppError> {
+        Ok(self
+            .routes
+            .iter()
+            .find(|route| {
+                route.status == crate::domain::ResourceStatus::Active
+                    && route.deleted_at.is_none()
+                    && route
+                        .metadata
+                        .get("default")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+            })
+            .cloned())
+    }
+
+    /// Reproduces the two parts of the SQL contract that are observable from `ModelCandidate`:
+    /// candidates belong to one route, and they come back ordered by ascending `policy_priority`
+    /// then descending `weight`, over-fetched to `limit`. Application/tenant scoping is not
+    /// reproduced — see the `candidates` field.
+    async fn list_model_candidates(
+        &self,
+        route_id: Uuid,
+        _application_id: Option<Uuid>,
+        _external_tenant_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<ModelCandidate>, AppError> {
+        let mut out: Vec<ModelCandidate> = self
+            .candidates
+            .iter()
+            .filter(|(id, _)| *id == route_id)
+            .map(|(_, candidate)| candidate.clone())
+            .collect();
+        out.sort_by_key(|candidate| (candidate.policy_priority, -candidate.weight));
+        out.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        Ok(out)
+    }
+
+    async fn create_route_definition(
+        &self,
+        _id: Uuid,
+        _request: &RouteDefinitionCreateRequest,
+    ) -> Result<RouteDefinitionRecord, AppError> {
+        Err(not_stubbed("create_route_definition"))
+    }
+
+    async fn list_route_definitions(
+        &self,
+        _cursor: Option<ListCursor>,
+        _limit: i64,
+    ) -> Result<Vec<RouteDefinitionRecord>, AppError> {
+        Err(not_stubbed("list_route_definitions"))
+    }
+
+    async fn get_route_definition(&self, _id: Uuid) -> Result<RouteDefinitionRecord, AppError> {
+        Err(not_stubbed("get_route_definition"))
+    }
+
+    async fn patch_route_definition(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+        _request: &RouteDefinitionPatchRequest,
+    ) -> Result<RouteDefinitionRecord, AppError> {
+        Err(match_version(
+            self.route_versions(),
+            id,
+            expected_version,
+            format!("route {id}"),
+            "patch_route_definition",
+        ))
+    }
+
+    async fn set_route_definition_status(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+        _status: &str,
+    ) -> Result<RouteDefinitionRecord, AppError> {
+        Err(match_version(
+            self.route_versions(),
+            id,
+            expected_version,
+            format!("route {id}"),
+            "set_route_definition_status",
+        ))
+    }
+
+    async fn soft_delete_route_definition(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+    ) -> Result<(), AppError> {
+        Err(match_version(
+            self.route_versions(),
+            id,
+            expected_version,
+            format!("route {id}"),
+            "soft_delete_route_definition",
+        ))
+    }
+
+    async fn create_routing_policy(
+        &self,
+        _id: Uuid,
+        _request: &RoutingPolicyCreateRequest,
+    ) -> Result<RoutingPolicyRecord, AppError> {
+        Err(not_stubbed("create_routing_policy"))
+    }
+
+    async fn list_routing_policies(
+        &self,
+        _cursor: Option<ListCursor>,
+        _limit: i64,
+    ) -> Result<Vec<RoutingPolicyRecord>, AppError> {
+        Err(not_stubbed("list_routing_policies"))
+    }
+
+    async fn get_routing_policy(&self, _id: Uuid) -> Result<RoutingPolicyRecord, AppError> {
+        Err(not_stubbed("get_routing_policy"))
+    }
+
+    async fn provider_model_belongs_to_provider(
+        &self,
+        _provider_id: Uuid,
+        _provider_model_id: Uuid,
+    ) -> Result<bool, AppError> {
+        Err(not_stubbed("provider_model_belongs_to_provider"))
+    }
+
+    async fn patch_routing_policy(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+        _request: &RoutingPolicyPatchRequest,
+    ) -> Result<RoutingPolicyRecord, AppError> {
+        Err(match_version(
+            self.routing_policy_versions(),
+            id,
+            expected_version,
+            format!("routing policy {id}"),
+            "patch_routing_policy",
+        ))
+    }
+
+    async fn set_routing_policy_status(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+        _status: &str,
+    ) -> Result<RoutingPolicyRecord, AppError> {
+        Err(match_version(
+            self.routing_policy_versions(),
+            id,
+            expected_version,
+            format!("routing policy {id}"),
+            "set_routing_policy_status",
+        ))
+    }
+
+    async fn soft_delete_routing_policy(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+    ) -> Result<(), AppError> {
+        Err(match_version(
+            self.routing_policy_versions(),
+            id,
+            expected_version,
+            format!("routing policy {id}"),
+            "soft_delete_routing_policy",
+        ))
+    }
+
+    async fn create_agent_profile(
+        &self,
+        _id: Uuid,
+        _request: &AgentProfileCreateRequest,
+    ) -> Result<AgentProfileRecord, AppError> {
+        Err(not_stubbed("create_agent_profile"))
+    }
+
+    async fn list_agent_profiles(
+        &self,
+        _cursor: Option<ListCursor>,
+        _limit: i64,
+    ) -> Result<Vec<AgentProfileRecord>, AppError> {
+        Err(not_stubbed("list_agent_profiles"))
+    }
+
+    async fn get_agent_profile(&self, _id: Uuid) -> Result<AgentProfileRecord, AppError> {
+        Err(not_stubbed("get_agent_profile"))
+    }
+
+    async fn get_active_agent_profile(
+        &self,
+        _id: Uuid,
+    ) -> Result<Option<AgentProfileRecord>, AppError> {
+        Err(not_stubbed("get_active_agent_profile"))
+    }
+
+    async fn patch_agent_profile(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+        _request: &AgentProfilePatchRequest,
+    ) -> Result<AgentProfileRecord, AppError> {
+        Err(match_version(
+            self.agent_profile_versions(),
+            id,
+            expected_version,
+            format!("agent profile {id}"),
+            "patch_agent_profile",
+        ))
+    }
+
+    async fn set_agent_profile_status(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+        _status: &str,
+    ) -> Result<AgentProfileRecord, AppError> {
+        Err(match_version(
+            self.agent_profile_versions(),
+            id,
+            expected_version,
+            format!("agent profile {id}"),
+            "set_agent_profile_status",
+        ))
+    }
+
+    async fn soft_delete_agent_profile(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+    ) -> Result<(), AppError> {
+        Err(match_version(
+            self.agent_profile_versions(),
+            id,
+            expected_version,
+            format!("agent profile {id}"),
+            "soft_delete_agent_profile",
+        ))
+    }
+
+    async fn get_provider_runtime_policy(
+        &self,
+        _provider_id: Uuid,
+    ) -> Result<ProviderRuntimePolicyRecord, AppError> {
+        Err(not_stubbed("get_provider_runtime_policy"))
+    }
+
+    async fn put_provider_runtime_policy(
+        &self,
+        _provider_id: Uuid,
+        _request: &ProviderRuntimePolicyPutRequest,
+    ) -> Result<ProviderRuntimePolicyRecord, AppError> {
+        Err(not_stubbed("put_provider_runtime_policy"))
+    }
+
+    async fn ensure_application_active(&self, _application_id: Uuid) -> Result<(), AppError> {
+        Err(not_stubbed("ensure_application_active"))
+    }
+
+    async fn resolve_runtime_credential(
+        &self,
+        _provider_id: Uuid,
+        _credential_types: &[CredentialType],
+        _application_id: Option<Uuid>,
+        _external_tenant_id: Option<&str>,
+        _external_user_id: Option<&str>,
+        _explicit_credential_id: Option<Uuid>,
+    ) -> Result<Option<RuntimeCredentialCandidate>, AppError> {
+        Err(not_stubbed("resolve_runtime_credential"))
+    }
+
+    async fn insert_attempt_started(
+        &self,
+        _insert: &ExecutionAttemptInsert,
+    ) -> Result<(), AppError> {
+        Err(not_stubbed("insert_attempt_started"))
+    }
+
+    async fn update_attempt(
+        &self,
+        _attempt_id: Uuid,
+        _update: &ExecutionAttemptUpdate,
+    ) -> Result<(), AppError> {
+        Err(not_stubbed("update_attempt"))
+    }
+
+    async fn insert_usage_record(&self, _insert: &UsageRecordInsert) -> Result<(), AppError> {
+        Err(not_stubbed("insert_usage_record"))
+    }
+
+    async fn touch_credential_used(&self, _credential_id: Uuid) -> Result<(), AppError> {
+        Err(not_stubbed("touch_credential_used"))
+    }
+}
+
+#[cfg(test)]
+mod repository_trait_tests {
+    use super::*;
+    use crate::domain::{ProviderType, ResourceStatus, RouteSelectionStrategy};
+
+    fn route(route_key: &str, default: bool) -> RouteDefinitionRecord {
+        RouteDefinitionRecord {
+            id: Uuid::now_v7(),
+            route_key: route_key.to_string(),
+            display_name: route_key.to_string(),
+            description: None,
+            status: ResourceStatus::Active,
+            selection_strategy: RouteSelectionStrategy::Default,
+            agent_profile_id: None,
+            metadata: serde_json::json!({ "default": default }),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            deleted_at: None,
+            version: 1,
+        }
+    }
+
+    fn candidate(model_key: &str, priority: i32) -> ModelCandidate {
+        ModelCandidate {
+            policy_id: Uuid::now_v7(),
+            provider_id: Uuid::now_v7(),
+            provider_version: 1,
+            provider_type: ProviderType::OpenAiCompatible,
+            provider_display_name: "fake provider".to_string(),
+            base_url: Some("https://provider.invalid/v1".to_string()),
+            provider_model_id: Uuid::now_v7(),
+            model_version: 1,
+            model_key: model_key.to_string(),
+            capabilities: serde_json::json!({}),
+            policy_priority: priority,
+            weight: 100,
+            timeout_ms: None,
+            retry_policy: serde_json::json!({}),
+            runtime_policy: default_provider_runtime_policy(Uuid::now_v7()),
+        }
+    }
+
+    /// P2-3: route resolution and candidate ordering — the reads the execution pipeline makes
+    /// before it selects a provider — are now exercisable without Postgres.
+    #[tokio::test]
+    async fn fake_runtime_repository_supports_candidate_selection_unit_test() {
+        let primary = route("primary", true);
+        let secondary = route("secondary", false);
+        let repo = InMemoryRuntimeRepository::new(
+            vec![primary.clone(), secondary.clone()],
+            vec![
+                (primary.id, candidate("slow-model", 200)),
+                (primary.id, candidate("fast-model", 100)),
+                (secondary.id, candidate("other-model", 100)),
+            ],
+        );
+
+        assert_eq!(
+            repo.get_active_route_by_key("secondary")
+                .await
+                .unwrap()
+                .map(|route| route.id),
+            Some(secondary.id)
+        );
+        assert!(
+            repo.get_active_route_by_key("absent")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            repo.get_default_route()
+                .await
+                .unwrap()
+                .map(|route| route.id),
+            Some(primary.id)
+        );
+
+        // Lowest `policy_priority` first, and a route's candidates never leak into another's.
+        let candidates = repo
+            .list_model_candidates(primary.id, None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.model_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fast-model", "slow-model"]
+        );
+        assert_eq!(
+            repo.list_model_candidates(secondary.id, None, None, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // `limit` is honoured.
+        assert_eq!(
+            repo.list_model_candidates(primary.id, None, None, 1)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    fn routing_policy(version: i64) -> RoutingPolicyRecord {
+        RoutingPolicyRecord {
+            id: Uuid::now_v7(),
+            application_id: None,
+            external_tenant_id: None,
+            route_id: Uuid::now_v7(),
+            provider_id: Uuid::now_v7(),
+            provider_model_id: Uuid::now_v7(),
+            priority: 100,
+            weight: 100,
+            cost_weight: 0.0,
+            latency_weight: 0.0,
+            quality_weight: 0.0,
+            privacy_class: None,
+            required_capabilities: Vec::new(),
+            maximum_cost_per_request: None,
+            maximum_input_tokens: None,
+            maximum_output_tokens: None,
+            timeout_ms: None,
+            retry_policy: serde_json::json!({}),
+            status: ResourceStatus::Active,
+            metadata: serde_json::json!({}),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            deleted_at: None,
+            version,
+        }
+    }
+
+    fn agent_profile(version: i64) -> AgentProfileRecord {
+        AgentProfileRecord {
+            id: Uuid::now_v7(),
+            profile_key: "profile".to_string(),
+            display_name: "profile".to_string(),
+            preamble: None,
+            temperature: None,
+            max_tokens: None,
+            tool_policy: serde_json::json!({}),
+            context_policy: serde_json::json!({}),
+            memory_policy: serde_json::json!({}),
+            status: ResourceStatus::Active,
+            metadata: serde_json::json!({}),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            deleted_at: None,
+            version,
+        }
+    }
+
+    fn assert_version_conflict(error: &AppError, method: &str) {
+        assert_eq!(
+            error.status(),
+            axum::http::StatusCode::CONFLICT,
+            "{method} must reject a stale If-Match with 409"
+        );
+        assert_eq!(
+            error.error_response(None).error.code,
+            "resource_version_conflict",
+            "{method} must use the same conflict code the HTTP layer used to emit"
+        );
+    }
+
+    /// Plan 06b §2.3: the fake has to reject a version mismatch with the *same*
+    /// `resource_version_conflict` the Pg implementation produces, otherwise nothing below the
+    /// HTTP layer ever exercises the branch that closes the TOCTOU. All nine versioned
+    /// mutations, because the whole point of moving the check into the repository is that no
+    /// caller can forget it — a method that silently ignored `expected_version` would look
+    /// identical from the service layer.
+    #[tokio::test]
+    async fn fake_runtime_repository_rejects_a_stale_if_match_on_every_versioned_mutation() {
+        let route = route("primary", false);
+        let policy = routing_policy(7);
+        let profile = agent_profile(9);
+        let repo = InMemoryRuntimeRepository::new(vec![route.clone()], Vec::new())
+            .with_routing_policies(vec![policy.clone()])
+            .with_agent_profiles(vec![profile.clone()]);
+
+        let stale = |current: i64| current - 1;
+
+        assert_version_conflict(
+            &repo
+                .patch_route_definition(
+                    route.id,
+                    stale(route.version),
+                    &RouteDefinitionPatchRequest::default(),
+                )
+                .await
+                .expect_err("stale If-Match must not reach the write"),
+            "patch_route_definition",
+        );
+        assert_version_conflict(
+            &repo
+                .set_route_definition_status(route.id, stale(route.version), "disabled")
+                .await
+                .expect_err("stale If-Match must not reach the write"),
+            "set_route_definition_status",
+        );
+        assert_version_conflict(
+            &repo
+                .soft_delete_route_definition(route.id, stale(route.version))
+                .await
+                .expect_err("stale If-Match must not reach the write"),
+            "soft_delete_route_definition",
+        );
+
+        assert_version_conflict(
+            &repo
+                .patch_routing_policy(
+                    policy.id,
+                    stale(policy.version),
+                    &RoutingPolicyPatchRequest::default(),
+                )
+                .await
+                .expect_err("stale If-Match must not reach the write"),
+            "patch_routing_policy",
+        );
+        assert_version_conflict(
+            &repo
+                .set_routing_policy_status(policy.id, stale(policy.version), "disabled")
+                .await
+                .expect_err("stale If-Match must not reach the write"),
+            "set_routing_policy_status",
+        );
+        assert_version_conflict(
+            &repo
+                .soft_delete_routing_policy(policy.id, stale(policy.version))
+                .await
+                .expect_err("stale If-Match must not reach the write"),
+            "soft_delete_routing_policy",
+        );
+
+        assert_version_conflict(
+            &repo
+                .patch_agent_profile(
+                    profile.id,
+                    stale(profile.version),
+                    &AgentProfilePatchRequest::default(),
+                )
+                .await
+                .expect_err("stale If-Match must not reach the write"),
+            "patch_agent_profile",
+        );
+        assert_version_conflict(
+            &repo
+                .set_agent_profile_status(profile.id, stale(profile.version), "disabled")
+                .await
+                .expect_err("stale If-Match must not reach the write"),
+            "set_agent_profile_status",
+        );
+        assert_version_conflict(
+            &repo
+                .soft_delete_agent_profile(profile.id, stale(profile.version))
+                .await
+                .expect_err("stale If-Match must not reach the write"),
+            "soft_delete_agent_profile",
+        );
+    }
+
+    /// The distinction the recipe insists on: a row that is genuinely gone stays `404` with the
+    /// resource string it always had, and only a real mismatch is `409`. Collapsing the two —
+    /// which is what appending `and version = $N` to the `UPDATE` without a locked pre-read
+    /// would do — would report "no such route" for a route that exists.
+    #[tokio::test]
+    async fn fake_runtime_repository_separates_an_absent_row_from_a_stale_if_match() {
+        let route = route("primary", false);
+        let repo = InMemoryRuntimeRepository::new(vec![route.clone()], Vec::new());
+        let absent = Uuid::now_v7();
+
+        let error = repo
+            .patch_route_definition(absent, 1, &RouteDefinitionPatchRequest::default())
+            .await
+            .expect_err("an absent route cannot be patched");
+        assert_eq!(error.status(), axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(error.to_string(), format!("not found: route {absent}"));
+
+        // A matching version is not a success here — the fake cannot persist the write, and
+        // saying otherwise would let a test pass while exercising nothing.
+        let error = repo
+            .patch_route_definition(
+                route.id,
+                route.version,
+                &RouteDefinitionPatchRequest::default(),
+            )
+            .await
+            .expect_err("the fake does not perform the write");
+        assert!(error.to_string().contains("not stubbed"));
+
+        // An entity the fake was never seeded for still fails loudly rather than inventing a 404.
+        let error = repo
+            .patch_agent_profile(absent, 1, &AgentProfilePatchRequest::default())
+            .await
+            .expect_err("agent profiles are not seeded on this fake");
+        assert!(error.to_string().contains("not stubbed"));
+    }
+
+    /// The fake never hands back synthetic credential material; the credential path stays
+    /// Postgres-backed on purpose.
+    #[tokio::test]
+    async fn fake_runtime_repository_refuses_to_resolve_credentials() {
+        let repo = InMemoryRuntimeRepository::default();
+        let error = repo
+            .resolve_runtime_credential(
+                Uuid::now_v7(),
+                &[CredentialType::ApiKey],
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("credential resolution is not faked");
+        assert!(error.to_string().contains("not stubbed"));
     }
 }

@@ -1,6 +1,71 @@
+//! Conversation-, memory- and RAG-domain persistence.
+//!
+//! # Keyset pagination contract (plan 04, finding P1-4)
+//!
+//! The five `list_*` methods below take an optional cursor and return each record paired
+//! with **the cursor for its own row**, in the query's existing sort order. Three rules hold
+//! across all five and must not be relaxed:
+//!
+//! 1. **The sort key is not uniform, and no query's sort key may be changed to make it so.**
+//!    Conversations and memories order by `(updated_at desc, id desc)`; RAG collections and
+//!    documents by `(created_at desc, id desc)`; messages by `sequence_number asc`. The
+//!    keyset predicate is therefore `<` for the four descending lists and `>` for the one
+//!    ascending list. Changing a sort key to unify them would silently reorder every
+//!    existing caller's results.
+//! 2. **Cursor values are bound parameters, never interpolated.** They arrive here already
+//!    parsed into `DateTime<Utc>`/`Uuid`/`i64` by [`crate::domain::ListCursor`], so a
+//!    client-supplied cursor can never reach the query text.
+//! 3. **`limit` is the exact row count to fetch**, including the caller's over-fetch row.
+//!    The repository neither adds one nor clamps; `crate::application::conversation` owns
+//!    both, so the trim/`has_more` arithmetic lives in exactly one place.
+//!
+//! The pairing exists because the public DTOs expose `id` as the caller-facing `public_id`
+//! string (`"conv_…"`), never the table's `uuid` primary key that the sort key and the
+//! cursor are built from. Re-deriving the uuid by parsing the public id would work today and
+//! break silently the day a public id stops being `prefix_{uuid}`. The repository owns the
+//! sort key, so it also mints the cursor; the application layer only trims, counts and
+//! encodes.
+//!
+//! ## Consequence of keying conversations and memories on `updated_at`
+//!
+//! Those two lists sort by a **mutable** column, so a row updated part-way through a
+//! pagination sweep changes position mid-sweep. The direction of that failure is not
+//! symmetric, and getting it backwards sends a caller's reconciliation logic the wrong way:
+//!
+//! `updated_at` is set by the `moira_bump_resource_version` trigger
+//! (`migrations/0004_admin_api_contract.sql`) to `now()` on every update, so it only ever
+//! moves **forward**. Under `order by updated_at desc, id desc` with the keyset predicate
+//! `(updated_at, id) < cursor`, "forward in time" means "further above the cursor":
+//!
+//! * A row that has **already been returned** sits above the cursor. Bumping it pushes it
+//!   further above, where the predicate still excludes it. It cannot come back.
+//!   **Duplicates do not happen.**
+//! * A row that has **not been reached yet** sits below the cursor. Bumping it lifts it
+//!   above, where the predicate now excludes it. The sweep never sees it.
+//!   **Rows are silently skipped.**
+//!
+//! Measured on Postgres with four rows and `limit 2`: after bumping an unreached row, page 2
+//! returned one row instead of two and the whole sweep saw three of the four; after bumping
+//! an already-returned row, page 2 was byte-identical and contained no duplicate.
+//!
+//! So the pages of a sweep **are disjoint**, and de-duplicating by `id` protects against
+//! nothing. What a caller who needs an exactly-once sweep actually needs is a
+//! **completeness** check — a total count, a follow-up pass, or a sweep keyed on an
+//! immutable column — because the rows it is missing are the ones that were busiest.
+//!
+//! The one way a row can move *backwards* is a transaction that started before the previous
+//! page was served and commits after it: `now()` is transaction-start time, so its
+//! `updated_at` can land below the cursor and the row can be returned a second time. That
+//! window is bounded by the length of the overlapping write transaction, not by the length
+//! of the sweep, and it is the only source of duplicates here.
+//!
+//! All of this is standard keyset behaviour for a mutable sort key and is accepted
+//! deliberately — the alternative is changing the sort key, which rule 1 forbids.
+
+use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use serde_json::Value;
-use sqlx::{PgPool, Row};
+use sqlx::{PgConnection, PgPool, Row};
 use uuid::Uuid;
 
 use crate::{
@@ -9,11 +74,11 @@ use crate::{
         ConversationMessageRole, ConversationMessageType, ConversationPatchRequest,
         ConversationPolicyPutRequest, ConversationPolicyRecord, ConversationQuery,
         ConversationRecord, ConversationStatus, EmbeddingPolicyPutRequest, EmbeddingPolicyRecord,
-        MemoryCreateRequest, MemoryPatchRequest, MemoryPolicyPutRequest, MemoryPolicyRecord,
-        MemoryQuery, MemoryRecord, MemoryScope, RagCollectionCreateRequest,
+        ListCursor, MemoryCreateRequest, MemoryPatchRequest, MemoryPolicyPutRequest,
+        MemoryPolicyRecord, MemoryQuery, MemoryRecord, MemoryScope, RagCollectionCreateRequest,
         RagCollectionPatchRequest, RagCollectionQuery, RagCollectionRecord, RagCollectionStatus,
         RagDocumentCreateRequest, RagDocumentIngestRequest, RagDocumentRecord, RagIngestionStatus,
-        RetrievalPolicyPutRequest, RetrievalPolicyRecord,
+        RetrievalPolicyPutRequest, RetrievalPolicyRecord, SeqCursor,
     },
     error::AppError,
     infra::pg_rows::{
@@ -79,12 +144,370 @@ pub struct MemoryInsert<'a> {
     pub content_hash: &'a str,
 }
 
+// ---------------------------------------------------------------------------
+// Keyset list queries.
+//
+// These five live as `const`s rather than inline literals for one reason: being compile-time
+// constants is itself the proof that no cursor value can ever reach the query text. A `const`
+// cannot be built by `format!`, so the SQL-injection question is settled by the type system
+// rather than by review, and the unit tests below can assert the shape of each predicate
+// (`<` for the four descending lists, `>` for the one ascending list, `$N` placeholders only)
+// without a database.
+// ---------------------------------------------------------------------------
+
+const LIST_CONVERSATIONS_SQL: &str = r#"
+            select c.*
+            from conversations c
+            where c.deleted_at is null
+              and ($1::boolean
+                   or (c.application_id = $2
+                       and ($3::text is null or c.external_tenant_id = $3)
+                       and ($4::text is null or c.external_user_id = $4)))
+              and ($5::text is null or c.status = $5)
+              and ($6::timestamptz is null or c.created_at < $6)
+              and ($7::timestamptz is null or c.created_at >= $7)
+              and ($8::timestamptz is null or c.updated_at < $8)
+              and ($9::timestamptz is null or c.updated_at >= $9)
+              and ($10::text is null or c.title ilike '%' || $10 || '%')
+              and ($11::timestamptz is null or (c.updated_at, c.id) < ($11, $12::uuid))
+            order by c.updated_at desc, c.id desc
+            limit $13
+            "#;
+
+// The conversation is resolved by a scalar subquery rather than a join, and that is a
+// performance decision, not a style one. Measured on PostgreSQL 18.3 against 60k messages in
+// one conversation, paging from sequence 30000 with `limit 51`:
+//
+//   join form:     Hash Join over a Seq Scan of conversation_messages, keyset applied as a
+//                  post-fetch Filter (30,000 rows discarded), top-N heapsort,
+//                  1,468 buffers, 28.5 ms
+//   subquery form: InitPlan on conversations_public_id_key, then a plain Index Scan on
+//                  conversation_messages_sequence_unique with the whole predicate as an
+//                  Index Cond and NO sort node, 10 buffers, 0.10 ms
+//
+// The join form cannot be fixed with an index. `conversation_id` arrives from the join, so it
+// is not available as an index-scan constant; forcing a nested loop (`enable_hashjoin=off`)
+// still produced a full bitmap scan and a sort. The subquery makes it an InitPlan constant,
+// which is what lets the existing `(conversation_id, sequence_number)` unique index supply
+// both the filter and the ordering. Reverting this to a join silently reintroduces a scan
+// that grows with the conversation and gets *slower* the deeper the caller pages — the exact
+// failure keyset pagination exists to avoid.
+//
+// Semantics are unchanged: `conversation_messages.conversation_id` is `not null` with an FK to
+// `conversations(id)`, and `public_id` is unique, so the subquery yields exactly the row the
+// join matched — and yields no rows (not an error) for an unknown `public_id`, as before.
+const LIST_MESSAGES_SQL: &str = r#"
+            select m.*
+            from conversation_messages m
+            where m.conversation_id = (
+                    select c.id from conversations c where c.public_id = $1
+                  )
+              and m.deleted_at is null
+              and ($2::bigint is null or m.sequence_number < $2)
+              and ($3::bigint is null or m.sequence_number > $3)
+              and ($4::bigint is null or m.sequence_number > $4)
+            order by m.sequence_number asc
+            limit $5
+            "#;
+
+const LIST_MEMORIES_SQL: &str = r#"
+            select m.*
+            from memory_records m
+            where m.deleted_at is null
+              and ($1::boolean
+                   or (m.application_id = $2
+                       and ($3::text is null or m.external_tenant_id = $3)
+                       and ($4::text is null or m.external_user_id = $4)))
+              and ($5::text is null or m.memory_type = $5)
+              and ($6::text is null or m.status = $6)
+              and ($7::timestamptz is null or (m.updated_at, m.id) < ($7, $8::uuid))
+            order by m.updated_at desc, m.id desc
+            limit $9
+            "#;
+
+const LIST_RAG_COLLECTIONS_SQL: &str = r#"
+            select *
+            from rag_collections
+            where deleted_at is null
+              and ($1::uuid is null or application_id = $1)
+              and ($2::text is null or external_tenant_id = $2)
+              and ($3::text is null or status = $3)
+              and ($4::timestamptz is null or (created_at, id) < ($4, $5::uuid))
+            order by created_at desc, id desc
+            limit $6
+            "#;
+
+// Same scalar-subquery rewrite as `LIST_MESSAGES_SQL`, for the same measured reason, and here
+// it is only half the fix. Against 60k documents in one collection, paging from the midpoint
+// with `limit 51`:
+//
+//   join, no index:       Seq Scan + top-N heapsort, 2,900 buffers, 21.4 ms
+//   join, WITH the index: still Seq Scan + top-N heapsort, 2,906 buffers, 31.4 ms
+//   subquery, no index:   still Seq Scan + top-N heapsort, 2,900 buffers, 11.7 ms
+//   subquery + index:     Index Scan, whole keyset as an Index Cond, no sort,
+//                         36 buffers, 0.07 ms
+//
+// So neither change works alone: the index is unusable while `collection_id` comes from a
+// join, and the subquery alone leaves the planner with no ordered index to walk. The index is
+// `rag_documents_collection_created_cursor_idx` in `migrations/0010_list_cursor_indexes.sql`;
+// it exists because the pre-existing `rag_documents_collection_cursor_idx` puts `status`
+// between `collection_id` and `created_at`, and this query does not constrain `status`.
+const LIST_RAG_DOCUMENTS_SQL: &str = r#"
+            select d.*
+            from rag_documents d
+            where d.collection_id = (
+                    select c.id from rag_collections c where c.public_id = $1
+                  )
+              and d.deleted_at is null
+              and ($2::timestamptz is null or (d.created_at, d.id) < ($2, $3::uuid))
+            order by d.created_at desc, d.id desc
+            limit $4
+            "#;
+
+/// The conversation/memory/RAG persistence surface: the four per-application policy documents,
+/// conversation and message rows, extracted memories, and the RAG collection/document tables.
+///
+/// Extracted as a trait (plan 06, Module 8 / P2-3) so `ConversationService` can be unit-tested
+/// against a fake instead of a live Postgres. Mirrors [`AdminRepository`](super::AdminRepository):
+/// the trait carries the documentation, the `#[async_trait] impl` below carries only SQL.
+///
+/// The `*_authorized` methods apply the caller's [`ConversationAccess`] scoping **in SQL**, not in
+/// the application layer. An implementation that returned rows outside the supplied access scope
+/// would be a cross-tenant disclosure, so that filtering is part of this contract, not an
+/// optimisation. The three `*_with_connection` free functions below are deliberately **not** on
+/// this trait: they run inside the admin-command transaction and carry no authorization of their
+/// own — see the `pub(crate)` note in `repositories/mod.rs`.
+#[async_trait]
+pub trait ConversationRepository: Send + Sync {
+    async fn get_or_create_conversation_policy(
+        &self,
+        application_id: Uuid,
+    ) -> Result<ConversationPolicyRecord, AppError>;
+
+    async fn put_conversation_policy(
+        &self,
+        application_id: Uuid,
+        request: &ConversationPolicyPutRequest,
+    ) -> Result<ConversationPolicyRecord, AppError>;
+
+    async fn get_or_create_memory_policy(
+        &self,
+        application_id: Uuid,
+    ) -> Result<MemoryPolicyRecord, AppError>;
+
+    async fn put_memory_policy(
+        &self,
+        application_id: Uuid,
+        request: &MemoryPolicyPutRequest,
+    ) -> Result<MemoryPolicyRecord, AppError>;
+
+    async fn get_or_create_retrieval_policy(
+        &self,
+        application_id: Uuid,
+    ) -> Result<RetrievalPolicyRecord, AppError>;
+
+    async fn put_retrieval_policy(
+        &self,
+        application_id: Uuid,
+        request: &RetrievalPolicyPutRequest,
+    ) -> Result<RetrievalPolicyRecord, AppError>;
+
+    async fn get_or_create_embedding_policy(
+        &self,
+        application_id: Uuid,
+    ) -> Result<EmbeddingPolicyRecord, AppError>;
+
+    async fn put_embedding_policy(
+        &self,
+        application_id: Uuid,
+        request: &EmbeddingPolicyPutRequest,
+    ) -> Result<EmbeddingPolicyRecord, AppError>;
+
+    async fn create_conversation(
+        &self,
+        insert: &ConversationInsert<'_>,
+    ) -> Result<ConversationRecord, AppError>;
+
+    async fn find_conversation_authorized(
+        &self,
+        public_id: &str,
+        access: &ConversationAccess,
+    ) -> Result<ConversationRecord, AppError>;
+
+    /// Lists conversations newest-updated-first, resuming after `cursor` when supplied.
+    ///
+    /// See the module docs for the keyset contract. The sort key here is
+    /// `(updated_at, id)` — a **mutable** timestamp that the version trigger only ever moves
+    /// forward, so a conversation updated mid-sweep is **skipped**, not duplicated. The full
+    /// argument, and what callers must check instead of de-duplicating, is in the module docs.
+    async fn list_conversations_authorized(
+        &self,
+        access: &ConversationAccess,
+        query: &ConversationQuery,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<(ConversationRecord, ListCursor)>, AppError>;
+
+    async fn patch_conversation(
+        &self,
+        public_id: &str,
+        request: &ConversationPatchRequest,
+    ) -> Result<ConversationRecord, AppError>;
+
+    async fn set_conversation_status(
+        &self,
+        public_id: &str,
+        status: ConversationStatus,
+    ) -> Result<ConversationRecord, AppError>;
+
+    async fn add_message(
+        &self,
+        insert: &ConversationMessageInsert,
+    ) -> Result<ConversationMessageRecord, AppError>;
+
+    /// Lists a conversation's messages in ascending sequence order, resuming after `cursor`.
+    ///
+    /// The only **ascending** list in this file, so its keyset predicate is
+    /// `sequence_number > $n`, not `<`. `sequence_number` is unique per conversation
+    /// (`conversation_messages_sequence_unique`, `migrations/0007_*.sql`), so the ordering is
+    /// already total and no `id` tiebreaker is needed — hence a bare [`SeqCursor`] rather
+    /// than a `(timestamp, id)` pair.
+    ///
+    /// The cursor composes with, and does not replace, the pre-existing `before`/`after`
+    /// filters: all three are separate `and`-ed predicates over the same column.
+    async fn list_messages(
+        &self,
+        conversation_public_id: &str,
+        query: &ConversationMessageQuery,
+        cursor: Option<SeqCursor>,
+        limit: i64,
+    ) -> Result<Vec<(ConversationMessageRecord, SeqCursor)>, AppError>;
+
+    async fn create_memory(&self, insert: &MemoryInsert<'_>) -> Result<MemoryRecord, AppError>;
+
+    async fn find_memory_authorized(
+        &self,
+        public_id: &str,
+        access: &ConversationAccess,
+    ) -> Result<MemoryRecord, AppError>;
+
+    /// Lists memories newest-updated-first, resuming after `cursor` when supplied.
+    ///
+    /// Same `(updated_at, id)` mutable sort key as
+    /// [`Self::list_conversations_authorized`], so a memory updated mid-sweep is **skipped**
+    /// rather than re-seen, for the reason set out in the module docs.
+    async fn list_memories_authorized(
+        &self,
+        access: &ConversationAccess,
+        query: &MemoryQuery,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<(MemoryRecord, ListCursor)>, AppError>;
+
+    async fn patch_memory(
+        &self,
+        public_id: &str,
+        request: &MemoryPatchRequest,
+        content_hash: Option<&str>,
+    ) -> Result<MemoryRecord, AppError>;
+
+    async fn delete_memory(&self, public_id: &str) -> Result<(), AppError>;
+
+    /// Pooled wrapper over [`create_rag_collection_with_connection`].
+    ///
+    /// The SQL body lives in the free function so it can also run inside a caller-supplied
+    /// transaction (the `AdminCommandRunner` idempotency envelope). This method owns the
+    /// transaction lifecycle; the free function must never open one.
+    async fn create_rag_collection(
+        &self,
+        id: Uuid,
+        public_id: &str,
+        request: &RagCollectionCreateRequest,
+    ) -> Result<RagCollectionRecord, AppError>;
+
+    /// Lists RAG collections newest-created-first, resuming after `cursor` when supplied.
+    ///
+    /// Unlike conversations and memories the sort key here is `(created_at, id)` — immutable
+    /// once written, so a sweep over it is exactly-once even under concurrent updates.
+    async fn list_rag_collections(
+        &self,
+        query: &RagCollectionQuery,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<(RagCollectionRecord, ListCursor)>, AppError>;
+
+    async fn get_rag_collection(&self, public_id: &str) -> Result<RagCollectionRecord, AppError>;
+
+    async fn patch_rag_collection(
+        &self,
+        public_id: &str,
+        request: &RagCollectionPatchRequest,
+    ) -> Result<RagCollectionRecord, AppError>;
+
+    async fn set_rag_collection_status(
+        &self,
+        public_id: &str,
+        status: RagCollectionStatus,
+    ) -> Result<RagCollectionRecord, AppError>;
+
+    /// Pooled wrapper over [`create_rag_document_with_connection`].
+    ///
+    /// The SQL body lives in the free function so it can also run inside a caller-supplied
+    /// transaction (the `AdminCommandRunner` idempotency envelope). This method owns the
+    /// transaction lifecycle; the free function must never open one.
+    async fn create_rag_document(
+        &self,
+        id: Uuid,
+        public_id: &str,
+        collection_public_id: &str,
+        request: &RagDocumentCreateRequest,
+        content_hash: Option<&str>,
+    ) -> Result<RagDocumentRecord, AppError>;
+
+    /// Lists a collection's documents newest-created-first, resuming after `cursor`.
+    ///
+    /// The keyset predicate goes **inside** the CTE, where the `limit` is: it selects which
+    /// rows survive into the page. The newest-first ordering of the emitted page is a
+    /// property of [`rag_document_select`]'s outer `order by`, which must not be removed —
+    /// see the comment there and the unit test that guards it.
+    ///
+    /// `limit` is no longer clamped here; `crate::application::conversation` clamps it, so
+    /// the over-fetch row cannot be silently eaten by a repository-side ceiling.
+    async fn list_rag_documents(
+        &self,
+        collection_public_id: &str,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<(RagDocumentRecord, ListCursor)>, AppError>;
+
+    async fn get_rag_document(&self, public_id: &str) -> Result<RagDocumentRecord, AppError>;
+
+    async fn delete_rag_document(&self, public_id: &str) -> Result<(), AppError>;
+
+    /// Pooled wrapper over [`ingest_rag_document_with_connection`].
+    ///
+    /// The SQL body lives in the free function so it can also run inside a caller-supplied
+    /// transaction (the `AdminCommandRunner` idempotency envelope). This method owns the
+    /// transaction lifecycle; the free function must never open one — the `for update` row
+    /// lock and the version supersession must belong to whatever transaction the caller
+    /// already holds.
+    async fn ingest_rag_document(
+        &self,
+        public_id: &str,
+        request: &RagDocumentIngestRequest,
+        content_hash: &str,
+    ) -> Result<RagDocumentRecord, AppError>;
+}
+
 impl PgConversationRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+}
 
-    pub async fn get_or_create_conversation_policy(
+#[async_trait]
+impl ConversationRepository for PgConversationRepository {
+    async fn get_or_create_conversation_policy(
         &self,
         application_id: Uuid,
     ) -> Result<ConversationPolicyRecord, AppError> {
@@ -102,7 +525,7 @@ impl PgConversationRepository {
         conversation_policy_record_from_row(&row)
     }
 
-    pub async fn put_conversation_policy(
+    async fn put_conversation_policy(
         &self,
         application_id: Uuid,
         request: &ConversationPolicyPutRequest,
@@ -188,7 +611,7 @@ impl PgConversationRepository {
         conversation_policy_record_from_row(&row)
     }
 
-    pub async fn get_or_create_memory_policy(
+    async fn get_or_create_memory_policy(
         &self,
         application_id: Uuid,
     ) -> Result<MemoryPolicyRecord, AppError> {
@@ -206,7 +629,7 @@ impl PgConversationRepository {
         memory_policy_record_from_row(&row)
     }
 
-    pub async fn put_memory_policy(
+    async fn put_memory_policy(
         &self,
         application_id: Uuid,
         request: &MemoryPolicyPutRequest,
@@ -295,7 +718,7 @@ impl PgConversationRepository {
         memory_policy_record_from_row(&row)
     }
 
-    pub async fn get_or_create_retrieval_policy(
+    async fn get_or_create_retrieval_policy(
         &self,
         application_id: Uuid,
     ) -> Result<RetrievalPolicyRecord, AppError> {
@@ -313,7 +736,7 @@ impl PgConversationRepository {
         retrieval_policy_record_from_row(&row)
     }
 
-    pub async fn put_retrieval_policy(
+    async fn put_retrieval_policy(
         &self,
         application_id: Uuid,
         request: &RetrievalPolicyPutRequest,
@@ -383,7 +806,7 @@ impl PgConversationRepository {
         retrieval_policy_record_from_row(&row)
     }
 
-    pub async fn get_or_create_embedding_policy(
+    async fn get_or_create_embedding_policy(
         &self,
         application_id: Uuid,
     ) -> Result<EmbeddingPolicyRecord, AppError> {
@@ -401,7 +824,7 @@ impl PgConversationRepository {
         embedding_policy_record_from_row(&row)
     }
 
-    pub async fn put_embedding_policy(
+    async fn put_embedding_policy(
         &self,
         application_id: Uuid,
         request: &EmbeddingPolicyPutRequest,
@@ -449,7 +872,7 @@ impl PgConversationRepository {
         embedding_policy_record_from_row(&row)
     }
 
-    pub async fn create_conversation(
+    async fn create_conversation(
         &self,
         insert: &ConversationInsert<'_>,
     ) -> Result<ConversationRecord, AppError> {
@@ -481,7 +904,7 @@ impl PgConversationRepository {
         conversation_record_from_row(&row)
     }
 
-    pub async fn find_conversation_authorized(
+    async fn find_conversation_authorized(
         &self,
         public_id: &str,
         access: &ConversationAccess,
@@ -515,47 +938,39 @@ impl PgConversationRepository {
         conversation_record_from_row(&row)
     }
 
-    pub async fn list_conversations_authorized(
+    async fn list_conversations_authorized(
         &self,
         access: &ConversationAccess,
         query: &ConversationQuery,
-    ) -> Result<Vec<ConversationRecord>, AppError> {
-        let rows = sqlx::query(&conversation_select(
-            r#"
-            select c.*
-            from conversations c
-            where c.deleted_at is null
-              and ($1::boolean
-                   or (c.application_id = $2
-                       and ($3::text is null or c.external_tenant_id = $3)
-                       and ($4::text is null or c.external_user_id = $4)))
-              and ($5::text is null or c.status = $5)
-              and ($6::timestamptz is null or c.created_at < $6)
-              and ($7::timestamptz is null or c.created_at >= $7)
-              and ($8::timestamptz is null or c.updated_at < $8)
-              and ($9::timestamptz is null or c.updated_at >= $9)
-              and ($10::text is null or c.title ilike '%' || $10 || '%')
-            order by c.updated_at desc, c.id desc
-            limit $11
-            "#,
-        ))
-        .bind(access.privileged)
-        .bind(access.application_id)
-        .bind(&access.external_tenant_id)
-        .bind(&access.external_user_id)
-        .bind(query.status.map(conversation_status_to_db))
-        .bind(query.created_before)
-        .bind(query.created_after)
-        .bind(query.updated_before)
-        .bind(query.updated_after)
-        .bind(&query.search)
-        .bind(query.limit())
-        .fetch_all(&self.pool)
-        .await?;
-        rows.iter().map(conversation_record_from_row).collect()
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<(ConversationRecord, ListCursor)>, AppError> {
+        let rows = sqlx::query(&conversation_select(LIST_CONVERSATIONS_SQL))
+            .bind(access.privileged)
+            .bind(access.application_id)
+            .bind(&access.external_tenant_id)
+            .bind(&access.external_user_id)
+            .bind(query.status.map(conversation_status_to_db))
+            .bind(query.created_before)
+            .bind(query.created_after)
+            .bind(query.updated_before)
+            .bind(query.updated_after)
+            .bind(&query.search)
+            .bind(cursor.map(|cursor| cursor.ts))
+            .bind(cursor.map(|cursor| cursor.id))
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|row| {
+                let record = conversation_record_from_row(row)?;
+                let key = ListCursor::new(record.updated_at, row.try_get("id")?);
+                Ok((record, key))
+            })
+            .collect()
     }
 
-    pub async fn patch_conversation(
+    async fn patch_conversation(
         &self,
         public_id: &str,
         request: &ConversationPatchRequest,
@@ -584,7 +999,7 @@ impl PgConversationRepository {
         conversation_record_from_row(&row)
     }
 
-    pub async fn set_conversation_status(
+    async fn set_conversation_status(
         &self,
         public_id: &str,
         status: ConversationStatus,
@@ -619,7 +1034,7 @@ impl PgConversationRepository {
         conversation_record_from_row(&row)
     }
 
-    pub async fn add_message(
+    async fn add_message(
         &self,
         insert: &ConversationMessageInsert,
     ) -> Result<ConversationMessageRecord, AppError> {
@@ -696,36 +1111,31 @@ impl PgConversationRepository {
         conversation_message_record_from_row(&row)
     }
 
-    pub async fn list_messages(
+    async fn list_messages(
         &self,
         conversation_public_id: &str,
         query: &ConversationMessageQuery,
-    ) -> Result<Vec<ConversationMessageRecord>, AppError> {
-        let rows = sqlx::query(&conversation_message_select(
-            r#"
-            select m.*
-            from conversation_messages m
-            join conversations c on c.id = m.conversation_id
-            where c.public_id = $1
-              and m.deleted_at is null
-              and ($2::bigint is null or m.sequence_number < $2)
-              and ($3::bigint is null or m.sequence_number > $3)
-            order by m.sequence_number asc
-            limit $4
-            "#,
-        ))
-        .bind(conversation_public_id)
-        .bind(message_sequence(query.before.as_deref()))
-        .bind(message_sequence(query.after.as_deref()))
-        .bind(query.limit())
-        .fetch_all(&self.pool)
-        .await?;
+        cursor: Option<SeqCursor>,
+        limit: i64,
+    ) -> Result<Vec<(ConversationMessageRecord, SeqCursor)>, AppError> {
+        let rows = sqlx::query(&conversation_message_select(LIST_MESSAGES_SQL))
+            .bind(conversation_public_id)
+            .bind(message_sequence(query.before.as_deref()))
+            .bind(message_sequence(query.after.as_deref()))
+            .bind(cursor.map(SeqCursor::sequence_number))
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
         rows.iter()
-            .map(conversation_message_record_from_row)
+            .map(|row| {
+                let record = conversation_message_record_from_row(row)?;
+                let key = SeqCursor::new(record.sequence_number);
+                Ok((record, key))
+            })
             .collect()
     }
 
-    pub async fn create_memory(&self, insert: &MemoryInsert<'_>) -> Result<MemoryRecord, AppError> {
+    async fn create_memory(&self, insert: &MemoryInsert<'_>) -> Result<MemoryRecord, AppError> {
         let row = sqlx::query(&memory_select(
             r#"
             insert into memory_records (
@@ -758,7 +1168,7 @@ impl PgConversationRepository {
         memory_record_from_row(&row)
     }
 
-    pub async fn find_memory_authorized(
+    async fn find_memory_authorized(
         &self,
         public_id: &str,
         access: &ConversationAccess,
@@ -792,39 +1202,35 @@ impl PgConversationRepository {
         memory_record_from_row(&row)
     }
 
-    pub async fn list_memories_authorized(
+    async fn list_memories_authorized(
         &self,
         access: &ConversationAccess,
         query: &MemoryQuery,
-    ) -> Result<Vec<MemoryRecord>, AppError> {
-        let rows = sqlx::query(&memory_select(
-            r#"
-            select m.*
-            from memory_records m
-            where m.deleted_at is null
-              and ($1::boolean
-                   or (m.application_id = $2
-                       and ($3::text is null or m.external_tenant_id = $3)
-                       and ($4::text is null or m.external_user_id = $4)))
-              and ($5::text is null or m.memory_type = $5)
-              and ($6::text is null or m.status = $6)
-            order by m.updated_at desc, m.id desc
-            limit $7
-            "#,
-        ))
-        .bind(access.privileged)
-        .bind(access.application_id)
-        .bind(&access.external_tenant_id)
-        .bind(&access.external_user_id)
-        .bind(query.memory_type.map(memory_type_to_db))
-        .bind(query.status.map(memory_status_to_db))
-        .bind(query.limit())
-        .fetch_all(&self.pool)
-        .await?;
-        rows.iter().map(memory_record_from_row).collect()
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<(MemoryRecord, ListCursor)>, AppError> {
+        let rows = sqlx::query(&memory_select(LIST_MEMORIES_SQL))
+            .bind(access.privileged)
+            .bind(access.application_id)
+            .bind(&access.external_tenant_id)
+            .bind(&access.external_user_id)
+            .bind(query.memory_type.map(memory_type_to_db))
+            .bind(query.status.map(memory_status_to_db))
+            .bind(cursor.map(|cursor| cursor.ts))
+            .bind(cursor.map(|cursor| cursor.id))
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|row| {
+                let record = memory_record_from_row(row)?;
+                let key = ListCursor::new(record.updated_at, row.try_get("id")?);
+                Ok((record, key))
+            })
+            .collect()
     }
 
-    pub async fn patch_memory(
+    async fn patch_memory(
         &self,
         public_id: &str,
         request: &MemoryPatchRequest,
@@ -862,7 +1268,7 @@ impl PgConversationRepository {
         memory_record_from_row(&row)
     }
 
-    pub async fn delete_memory(&self, public_id: &str) -> Result<(), AppError> {
+    async fn delete_memory(&self, public_id: &str) -> Result<(), AppError> {
         sqlx::query(
             r#"
             update memory_records
@@ -876,65 +1282,43 @@ impl PgConversationRepository {
         Ok(())
     }
 
-    pub async fn create_rag_collection(
+    async fn create_rag_collection(
         &self,
         id: Uuid,
         public_id: &str,
         request: &RagCollectionCreateRequest,
     ) -> Result<RagCollectionRecord, AppError> {
-        let row = sqlx::query(
-            r#"
-            insert into rag_collections (
-                id, public_id, application_id, external_tenant_id, collection_key,
-                display_name, description, visibility, metadata
-            )
-            values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            returning *
-            "#,
-        )
-        .bind(id)
-        .bind(public_id)
-        .bind(request.application_id)
-        .bind(&request.external_tenant_id)
-        .bind(&request.collection_key)
-        .bind(&request.display_name)
-        .bind(&request.description)
-        .bind(rag_collection_visibility_to_db(request.visibility))
-        .bind(&request.metadata)
-        .fetch_one(&self.pool)
-        .await?;
-        rag_collection_record_from_row(&row)
+        let mut tx = self.pool.begin().await?;
+        let record = create_rag_collection_with_connection(&mut tx, id, public_id, request).await?;
+        tx.commit().await?;
+        Ok(record)
     }
 
-    pub async fn list_rag_collections(
+    async fn list_rag_collections(
         &self,
         query: &RagCollectionQuery,
-    ) -> Result<Vec<RagCollectionRecord>, AppError> {
-        let rows = sqlx::query(
-            r#"
-            select *
-            from rag_collections
-            where deleted_at is null
-              and ($1::uuid is null or application_id = $1)
-              and ($2::text is null or external_tenant_id = $2)
-              and ($3::text is null or status = $3)
-            order by created_at desc, id desc
-            limit $4
-            "#,
-        )
-        .bind(query.application_id)
-        .bind(&query.external_tenant_id)
-        .bind(query.status.map(rag_collection_status_to_db))
-        .bind(query.limit())
-        .fetch_all(&self.pool)
-        .await?;
-        rows.iter().map(rag_collection_record_from_row).collect()
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<(RagCollectionRecord, ListCursor)>, AppError> {
+        let rows = sqlx::query(LIST_RAG_COLLECTIONS_SQL)
+            .bind(query.application_id)
+            .bind(&query.external_tenant_id)
+            .bind(query.status.map(rag_collection_status_to_db))
+            .bind(cursor.map(|cursor| cursor.ts))
+            .bind(cursor.map(|cursor| cursor.id))
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|row| {
+                let record = rag_collection_record_from_row(row)?;
+                let key = ListCursor::new(record.created_at, row.try_get("id")?);
+                Ok((record, key))
+            })
+            .collect()
     }
 
-    pub async fn get_rag_collection(
-        &self,
-        public_id: &str,
-    ) -> Result<RagCollectionRecord, AppError> {
+    async fn get_rag_collection(&self, public_id: &str) -> Result<RagCollectionRecord, AppError> {
         let row = sqlx::query(
             r#"
             select *
@@ -955,7 +1339,7 @@ impl PgConversationRepository {
         rag_collection_record_from_row(&row)
     }
 
-    pub async fn patch_rag_collection(
+    async fn patch_rag_collection(
         &self,
         public_id: &str,
         request: &RagCollectionPatchRequest,
@@ -988,7 +1372,7 @@ impl PgConversationRepository {
         rag_collection_record_from_row(&row)
     }
 
-    pub async fn set_rag_collection_status(
+    async fn set_rag_collection_status(
         &self,
         public_id: &str,
         status: RagCollectionStatus,
@@ -1010,7 +1394,7 @@ impl PgConversationRepository {
         rag_collection_record_from_row(&row)
     }
 
-    pub async fn create_rag_document(
+    async fn create_rag_document(
         &self,
         id: Uuid,
         public_id: &str,
@@ -1019,104 +1403,42 @@ impl PgConversationRepository {
         content_hash: Option<&str>,
     ) -> Result<RagDocumentRecord, AppError> {
         let mut tx = self.pool.begin().await?;
-        let collection_id: Uuid = sqlx::query_scalar(
-            "select id from rag_collections where public_id = $1 and deleted_at is null",
+        let record = create_rag_document_with_connection(
+            &mut tx,
+            id,
+            public_id,
+            collection_public_id,
+            request,
+            content_hash,
         )
-        .bind(collection_public_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| {
-            AppError::coded(
-                axum::http::StatusCode::NOT_FOUND,
-                "rag_collection_not_found",
-                "RAG collection not found",
-            )
-        })?;
-        let mut row = sqlx::query(&rag_document_select(
-            r#"
-            insert into rag_documents (
-                id, public_id, collection_id, external_document_id, title,
-                source_type, source_uri, mime_type, metadata
-            )
-            values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            returning *
-            "#,
-        ))
-        .bind(id)
-        .bind(public_id)
-        .bind(collection_id)
-        .bind(&request.external_document_id)
-        .bind(&request.title)
-        .bind(&request.source_type)
-        .bind(&request.source_uri)
-        .bind(&request.mime_type)
-        .bind(&request.metadata)
-        .fetch_one(&mut *tx)
         .await?;
-        if let (Some(content), Some(hash)) = (&request.content, content_hash) {
-            let version_id = Uuid::now_v7();
-            // Honest status: no chunking/embedding pipeline exists yet (see plans/11-rag-memory-intelligence.md). Content is stored verbatim; ingestion_status reflects "not yet processed", not "indexed for retrieval".
-            sqlx::query(
-                r#"
-                insert into rag_document_versions (
-                    id, document_id, version_number, content_plain, content_hash,
-                    content_size_bytes, ingestion_status, metadata
-                )
-                values ($1, $2, 1, $3, $4, $5, $6, $7)
-                "#,
-            )
-            .bind(version_id)
-            .bind(id)
-            .bind(content)
-            .bind(hash)
-            .bind(content.len() as i64)
-            .bind(rag_ingestion_status_to_db(RagIngestionStatus::Pending))
-            .bind(&request.metadata)
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query("update rag_documents set current_version_id = $2 where id = $1")
-                .bind(id)
-                .bind(version_id)
-                .execute(&mut *tx)
-                .await?;
-            // The row returned by the insert above predates the version insert, so it would
-            // report a null ingestion_status. Re-select it so the response reflects the
-            // version that was just created. Skipped entirely when no version exists, which
-            // keeps `ingestion_status: null` honest for a create without inline content.
-            row = sqlx::query(&rag_document_select(
-                "select d.* from rag_documents d where d.id = $1",
-            ))
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?;
-        }
         tx.commit().await?;
-        rag_document_record_from_row(&row)
+        Ok(record)
     }
 
-    pub async fn list_rag_documents(
+    async fn list_rag_documents(
         &self,
         collection_public_id: &str,
+        cursor: Option<ListCursor>,
         limit: i64,
-    ) -> Result<Vec<RagDocumentRecord>, AppError> {
-        let rows = sqlx::query(&rag_document_select(
-            r#"
-            select d.*
-            from rag_documents d
-            join rag_collections c on c.id = d.collection_id
-            where c.public_id = $1 and d.deleted_at is null
-            order by d.created_at desc, d.id desc
-            limit $2
-            "#,
-        ))
-        .bind(collection_public_id)
-        .bind(limit.clamp(1, 200))
-        .fetch_all(&self.pool)
-        .await?;
-        rows.iter().map(rag_document_record_from_row).collect()
+    ) -> Result<Vec<(RagDocumentRecord, ListCursor)>, AppError> {
+        let rows = sqlx::query(&rag_document_select(LIST_RAG_DOCUMENTS_SQL))
+            .bind(collection_public_id)
+            .bind(cursor.map(|cursor| cursor.ts))
+            .bind(cursor.map(|cursor| cursor.id))
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|row| {
+                let record = rag_document_record_from_row(row)?;
+                let key = ListCursor::new(record.created_at, row.try_get("id")?);
+                Ok((record, key))
+            })
+            .collect()
     }
 
-    pub async fn get_rag_document(&self, public_id: &str) -> Result<RagDocumentRecord, AppError> {
+    async fn get_rag_document(&self, public_id: &str) -> Result<RagDocumentRecord, AppError> {
         let row = sqlx::query(&rag_document_select(
             r#"
             select d.*
@@ -1137,7 +1459,7 @@ impl PgConversationRepository {
         rag_document_record_from_row(&row)
     }
 
-    pub async fn delete_rag_document(&self, public_id: &str) -> Result<(), AppError> {
+    async fn delete_rag_document(&self, public_id: &str) -> Result<(), AppError> {
         sqlx::query(
             "update rag_documents set status = 'deleted', deleted_at = coalesce(deleted_at, now()) where public_id = $1",
         )
@@ -1147,48 +1469,195 @@ impl PgConversationRepository {
         Ok(())
     }
 
-    pub async fn ingest_rag_document(
+    async fn ingest_rag_document(
         &self,
         public_id: &str,
         request: &RagDocumentIngestRequest,
         content_hash: &str,
     ) -> Result<RagDocumentRecord, AppError> {
         let mut tx = self.pool.begin().await?;
-        let document_id: Uuid = sqlx::query_scalar(
-            "select id from rag_documents where public_id = $1 and deleted_at is null for update",
-        )
-        .bind(public_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| {
-            AppError::coded(
-                axum::http::StatusCode::NOT_FOUND,
-                "rag_document_not_found",
-                "RAG document not found",
+        let record =
+            ingest_rag_document_with_connection(&mut tx, public_id, request, content_hash).await?;
+        tx.commit().await?;
+        Ok(record)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connection-taking RAG write bodies.
+//
+// These mirror the `insert_audit_with_connection` precedent in
+// `src/infra/repositories/admin.rs`: the SQL lives in a free function that takes a
+// `&mut PgConnection`, so the same body can run either on a pooled connection (through the
+// `PgConversationRepository` wrappers above) or inside a caller-supplied transaction — in
+// particular `PgAdminCommandTransaction::connection()`, which is how the idempotency
+// envelope in `plans/02b-idempotency-replay.md` reaches them.
+//
+// INVARIANT: none of these functions may call `begin()`, `commit()`, or `rollback()`.
+// The caller owns the transaction. An inner `begin()` here would nest a transaction inside
+// the admin command runner's `savepoint admin_command_mutation` and silently break the
+// rollback semantics that `begin_command_savepoint`/`rollback_command_savepoint` depend on.
+//
+// INVARIANT: these stay `pub(crate)` and must never be re-exported as `pub` from
+// `src/infra/repositories/mod.rs`. They perform no authorization check, write no audit row
+// and claim no idempotency record; all three are the responsibility of their only
+// legitimate caller, `crate::application::conversation`. A `pub` export would hand external
+// code an unauthenticated, unaudited RAG write path that bypasses the envelope entirely.
+// ---------------------------------------------------------------------------
+
+pub(crate) async fn create_rag_collection_with_connection(
+    connection: &mut PgConnection,
+    id: Uuid,
+    public_id: &str,
+    request: &RagCollectionCreateRequest,
+) -> Result<RagCollectionRecord, AppError> {
+    let row = sqlx::query(
+        r#"
+            insert into rag_collections (
+                id, public_id, application_id, external_tenant_id, collection_key,
+                display_name, description, visibility, metadata
             )
-        })?;
-        let version_number: i32 = sqlx::query_scalar(
-            "select coalesce(max(version_number), 0) + 1 from rag_document_versions where document_id = $1",
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            returning *
+            "#,
+    )
+    .bind(id)
+    .bind(public_id)
+    .bind(request.application_id)
+    .bind(&request.external_tenant_id)
+    .bind(&request.collection_key)
+    .bind(&request.display_name)
+    .bind(&request.description)
+    .bind(rag_collection_visibility_to_db(request.visibility))
+    .bind(&request.metadata)
+    .fetch_one(connection)
+    .await?;
+    rag_collection_record_from_row(&row)
+}
+
+pub(crate) async fn create_rag_document_with_connection(
+    connection: &mut PgConnection,
+    id: Uuid,
+    public_id: &str,
+    collection_public_id: &str,
+    request: &RagDocumentCreateRequest,
+    content_hash: Option<&str>,
+) -> Result<RagDocumentRecord, AppError> {
+    let collection_id: Uuid = sqlx::query_scalar(
+        "select id from rag_collections where public_id = $1 and deleted_at is null",
+    )
+    .bind(collection_public_id)
+    .fetch_optional(&mut *connection)
+    .await?
+    .ok_or_else(|| {
+        AppError::coded(
+            axum::http::StatusCode::NOT_FOUND,
+            "rag_collection_not_found",
+            "RAG collection not found",
         )
-        .bind(document_id)
-        .fetch_one(&mut *tx)
-        .await?;
+    })?;
+    let mut row = sqlx::query(&rag_document_select(
+        r#"
+            insert into rag_documents (
+                id, public_id, collection_id, external_document_id, title,
+                source_type, source_uri, mime_type, metadata
+            )
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            returning *
+            "#,
+    ))
+    .bind(id)
+    .bind(public_id)
+    .bind(collection_id)
+    .bind(&request.external_document_id)
+    .bind(&request.title)
+    .bind(&request.source_type)
+    .bind(&request.source_uri)
+    .bind(&request.mime_type)
+    .bind(&request.metadata)
+    .fetch_one(&mut *connection)
+    .await?;
+    if let (Some(content), Some(hash)) = (&request.content, content_hash) {
         let version_id = Uuid::now_v7();
-        let content = request.content.as_deref().unwrap_or("");
+        // Honest status: no chunking/embedding pipeline exists yet (see plans/11-rag-memory-intelligence.md). Content is stored verbatim; ingestion_status reflects "not yet processed", not "indexed for retrieval".
         sqlx::query(
             r#"
+                insert into rag_document_versions (
+                    id, document_id, version_number, content_plain, content_hash,
+                    content_size_bytes, ingestion_status, metadata
+                )
+                values ($1, $2, 1, $3, $4, $5, $6, $7)
+                "#,
+        )
+        .bind(version_id)
+        .bind(id)
+        .bind(content)
+        .bind(hash)
+        .bind(content.len() as i64)
+        .bind(rag_ingestion_status_to_db(RagIngestionStatus::Pending))
+        .bind(&request.metadata)
+        .execute(&mut *connection)
+        .await?;
+        sqlx::query("update rag_documents set current_version_id = $2 where id = $1")
+            .bind(id)
+            .bind(version_id)
+            .execute(&mut *connection)
+            .await?;
+        // The row returned by the insert above predates the version insert, so it would
+        // report a null ingestion_status. Re-select it so the response reflects the
+        // version that was just created. Skipped entirely when no version exists, which
+        // keeps `ingestion_status: null` honest for a create without inline content.
+        row = sqlx::query(&rag_document_select(
+            "select d.* from rag_documents d where d.id = $1",
+        ))
+        .bind(id)
+        .fetch_one(&mut *connection)
+        .await?;
+    }
+    rag_document_record_from_row(&row)
+}
+
+pub(crate) async fn ingest_rag_document_with_connection(
+    connection: &mut PgConnection,
+    public_id: &str,
+    request: &RagDocumentIngestRequest,
+    content_hash: &str,
+) -> Result<RagDocumentRecord, AppError> {
+    let document_id: Uuid = sqlx::query_scalar(
+        "select id from rag_documents where public_id = $1 and deleted_at is null for update",
+    )
+    .bind(public_id)
+    .fetch_optional(&mut *connection)
+    .await?
+    .ok_or_else(|| {
+        AppError::coded(
+            axum::http::StatusCode::NOT_FOUND,
+            "rag_document_not_found",
+            "RAG document not found",
+        )
+    })?;
+    let version_number: i32 = sqlx::query_scalar(
+        "select coalesce(max(version_number), 0) + 1 from rag_document_versions where document_id = $1",
+    )
+    .bind(document_id)
+    .fetch_one(&mut *connection)
+    .await?;
+    let version_id = Uuid::now_v7();
+    let content = request.content.as_deref().unwrap_or("");
+    sqlx::query(
+        r#"
             update rag_document_versions
             set superseded_at = coalesce(superseded_at, now()),
                 ingestion_status = case when ingestion_status = 'indexed' then 'superseded' else ingestion_status end
             where document_id = $1 and superseded_at is null
             "#,
-        )
-        .bind(document_id)
-        .execute(&mut *tx)
-        .await?;
-        // Honest status: no chunking/embedding pipeline exists yet (see plans/11-rag-memory-intelligence.md). Content is stored verbatim; ingestion_status reflects "not yet processed", not "indexed for retrieval".
-        sqlx::query(
-            r#"
+    )
+    .bind(document_id)
+    .execute(&mut *connection)
+    .await?;
+    // Honest status: no chunking/embedding pipeline exists yet (see plans/11-rag-memory-intelligence.md). Content is stored verbatim; ingestion_status reflects "not yet processed", not "indexed for retrieval".
+    sqlx::query(
+        r#"
             insert into rag_document_versions (
                 id, document_id, version_number, content_plain, content_hash,
                 content_size_bytes, source_etag, source_last_modified,
@@ -1196,34 +1665,43 @@ impl PgConversationRepository {
             )
             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             "#,
-        )
+    )
+    .bind(version_id)
+    .bind(document_id)
+    .bind(version_number)
+    .bind(content)
+    .bind(content_hash)
+    .bind(content.len() as i64)
+    .bind(&request.source_etag)
+    .bind(request.source_last_modified)
+    .bind(rag_ingestion_status_to_db(RagIngestionStatus::Pending))
+    .bind(&request.metadata)
+    .execute(&mut *connection)
+    .await?;
+    sqlx::query("update rag_documents set current_version_id = $2 where id = $1")
+        .bind(document_id)
         .bind(version_id)
-        .bind(document_id)
-        .bind(version_number)
-        .bind(content)
-        .bind(content_hash)
-        .bind(content.len() as i64)
-        .bind(&request.source_etag)
-        .bind(request.source_last_modified)
-        .bind(rag_ingestion_status_to_db(RagIngestionStatus::Pending))
-        .bind(&request.metadata)
-        .execute(&mut *tx)
+        .execute(&mut *connection)
         .await?;
-        sqlx::query("update rag_documents set current_version_id = $2 where id = $1")
-            .bind(document_id)
-            .bind(version_id)
-            .execute(&mut *tx)
-            .await?;
-        let row = sqlx::query(&rag_document_select(
-            "select d.* from rag_documents d where d.id = $1",
-        ))
-        .bind(document_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        rag_document_record_from_row(&row)
-    }
+    let row = sqlx::query(&rag_document_select(
+        "select d.* from rag_documents d where d.id = $1",
+    ))
+    .bind(document_id)
+    .fetch_one(&mut *connection)
+    .await?;
+    rag_document_record_from_row(&row)
 }
+
+// The outer `order by` in each of the three helpers below is load-bearing, for the reason
+// already recorded on `rag_document_select`: an inner query's own `order by` decides only
+// which rows the CTE keeps under its `limit`, and does not survive into the outer result once
+// a join is present — the planner may drive the outer result from the joined table and emit
+// rows in that table's heap order. Restating the sort key here is what makes the emitted page
+// match the order the keyset cursor was computed against; without it `next_cursor` could name
+// a row that is not the page's true boundary and the following page would skip rows.
+//
+// Each helper restates the sort key of the *list* query that uses it. Single-row call sites
+// (find/patch/insert … returning) are unaffected by an `order by` over one row.
 
 fn conversation_select(inner: &str) -> String {
     format!(
@@ -1238,6 +1716,7 @@ fn conversation_select(inner: &str) -> String {
                coalesce(mp.consent_mode, 'explicit_only') as memory_behavior
         from conversation_rows
         left join application_memory_policies mp on mp.application_id = conversation_rows.application_id
+        order by conversation_rows.updated_at desc, conversation_rows.id desc
         "#
     )
 }
@@ -1249,6 +1728,7 @@ fn conversation_message_select(inner: &str) -> String {
         select message_rows.*, c.public_id as conversation_public_id
         from message_rows
         join conversations c on c.id = message_rows.conversation_id
+        order by message_rows.sequence_number asc
         "#
     )
 }
@@ -1260,6 +1740,7 @@ fn memory_select(inner: &str) -> String {
         select memory_rows.*, c.public_id as conversation_public_id
         from memory_rows
         left join conversations c on c.id = memory_rows.conversation_id
+        order by memory_rows.updated_at desc, memory_rows.id desc
         "#
     )
 }
@@ -1291,7 +1772,11 @@ fn message_sequence(value: Option<&str>) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::rag_document_select;
+    use super::{
+        LIST_CONVERSATIONS_SQL, LIST_MEMORIES_SQL, LIST_MESSAGES_SQL, LIST_RAG_COLLECTIONS_SQL,
+        LIST_RAG_DOCUMENTS_SQL, conversation_message_select, conversation_select, memory_select,
+        rag_document_select,
+    };
 
     /// The list endpoint's ordering is a property of the OUTER select, and is asserted here at the
     /// SQL level rather than through a query.
@@ -1325,5 +1810,598 @@ mod tests {
             sql.contains("v.ingestion_status as ingestion_status"),
             "every read path must project the current version's ingestion_status:\n{sql}"
         );
+    }
+
+    /// The other three CTE wrappers carry the same hazard `rag_document_select` was fixed for.
+    ///
+    /// Each joins another table onto the CTE, so the inner `order by` — which only decides
+    /// which rows survive the `limit` — does not survive into the outer result. Without the
+    /// outer `order by` the emitted page can be in a different order from the one the keyset
+    /// cursor was computed against, which makes `next_cursor` name a row that is not the
+    /// page's true boundary and silently skips rows on the following page.
+    ///
+    /// Asserted at the SQL level for the reason given on the test above: at fixture scale the
+    /// planner keeps a nested loop and the CTE order survives by accident, so a behavioural
+    /// test passes even with the clause deleted.
+    #[test]
+    fn every_joined_select_orders_the_outer_result() {
+        for (label, sql, join, order_by) in [
+            (
+                "conversation_select",
+                conversation_select("select c.* from conversations c"),
+                "left join application_memory_policies",
+                "order by conversation_rows.updated_at desc, conversation_rows.id desc",
+            ),
+            (
+                "conversation_message_select",
+                conversation_message_select("select m.* from conversation_messages m"),
+                "join conversations c",
+                "order by message_rows.sequence_number asc",
+            ),
+            (
+                "memory_select",
+                memory_select("select m.* from memory_records m"),
+                "left join conversations c",
+                "order by memory_rows.updated_at desc, memory_rows.id desc",
+            ),
+        ] {
+            let join_at = sql
+                .find(join)
+                .unwrap_or_else(|| panic!("{label} must still join the table it projects:\n{sql}"));
+            let order_at = sql.find(order_by).unwrap_or_else(|| {
+                panic!("{label} must restate its list query's sort key on the outer select:\n{sql}")
+            });
+
+            assert!(
+                order_at > join_at,
+                "{label}'s ordering must apply to the joined outer result, not inside the CTE:\n{sql}"
+            );
+        }
+    }
+
+    /// Each helper's outer sort key must match the list query that flows through it.
+    ///
+    /// A mismatch would be the worst kind of failure: rows come back ordered, so nothing looks
+    /// broken, but `next_cursor` is minted from a key that does not correspond to the emitted
+    /// order and pagination quietly loses rows.
+    #[test]
+    fn outer_ordering_matches_the_list_query_it_wraps() {
+        for (label, outer, inner) in [
+            (
+                "conversations",
+                conversation_select(LIST_CONVERSATIONS_SQL),
+                "order by c.updated_at desc, c.id desc",
+            ),
+            (
+                "messages",
+                conversation_message_select(LIST_MESSAGES_SQL),
+                "order by m.sequence_number asc",
+            ),
+            (
+                "memories",
+                memory_select(LIST_MEMORIES_SQL),
+                "order by m.updated_at desc, m.id desc",
+            ),
+            (
+                "rag documents",
+                rag_document_select(LIST_RAG_DOCUMENTS_SQL),
+                "order by d.created_at desc, d.id desc",
+            ),
+        ] {
+            assert!(
+                outer.contains(inner),
+                "{label}: the inner query must keep its own sort key:\n{outer}"
+            );
+            // The outer clause is the last `order by` in the emitted statement.
+            let last = outer
+                .rfind("order by")
+                .unwrap_or_else(|| panic!("{label}: no outer ordering at all:\n{outer}"));
+            let inner_at = outer.find(inner).expect("checked above");
+            assert!(
+                last > inner_at,
+                "{label}: the outer ordering must come after the CTE's own:\n{outer}"
+            );
+        }
+    }
+
+    #[test]
+    fn keyset_predicate_uses_strict_less_than_for_descending_lists() {
+        for (label, sql, predicate) in [
+            (
+                "conversations",
+                LIST_CONVERSATIONS_SQL,
+                "(c.updated_at, c.id) < ($11, $12::uuid)",
+            ),
+            (
+                "memories",
+                LIST_MEMORIES_SQL,
+                "(m.updated_at, m.id) < ($7, $8::uuid)",
+            ),
+            (
+                "rag collections",
+                LIST_RAG_COLLECTIONS_SQL,
+                "(created_at, id) < ($4, $5::uuid)",
+            ),
+            (
+                "rag documents",
+                LIST_RAG_DOCUMENTS_SQL,
+                "(d.created_at, d.id) < ($2, $3::uuid)",
+            ),
+        ] {
+            assert!(
+                sql.contains(predicate),
+                "{label}: a `desc` ordering needs a strictly-less-than row comparison against \
+                 the SAME key it orders by, or the page boundary drifts:\n{sql}"
+            );
+        }
+    }
+
+    /// Conversations and memories key on `updated_at`, **not** `created_at`.
+    ///
+    /// Both tables carry both columns, and both are `timestamptz`, so keying the cursor on the
+    /// wrong one compiles, runs, and returns plausible-looking pages that skip rows. Pinning
+    /// the column name is the only cheap guard.
+    #[test]
+    fn conversation_and_memory_cursors_key_on_updated_at_not_created_at() {
+        assert!(LIST_CONVERSATIONS_SQL.contains("(c.updated_at, c.id) <"));
+        assert!(!LIST_CONVERSATIONS_SQL.contains("(c.created_at, c.id) <"));
+        assert!(LIST_MEMORIES_SQL.contains("(m.updated_at, m.id) <"));
+        assert!(!LIST_MEMORIES_SQL.contains("(m.created_at, m.id) <"));
+    }
+
+    #[test]
+    fn keyset_predicate_uses_strict_greater_than_for_the_ascending_sequence_list() {
+        assert!(
+            LIST_MESSAGES_SQL.contains("($4::bigint is null or m.sequence_number > $4)"),
+            "messages order ascending, so resuming means `>`, not `<`:\n{LIST_MESSAGES_SQL}"
+        );
+        assert!(
+            LIST_MESSAGES_SQL.contains("order by m.sequence_number asc"),
+            "the predicate direction only makes sense against an ascending sort"
+        );
+    }
+
+    /// The SQL-injection guard, made mechanical.
+    ///
+    /// Every one of these queries is a `const`, so it is a compile-time constant that no
+    /// runtime value can enter — that alone settles it. This test additionally pins the
+    /// weaker property a reader can check by eye: every cursor comparison is written against
+    /// `$N` placeholders, so no future edit can start splicing a value in without failing
+    /// here first.
+    #[test]
+    fn keyset_predicates_bind_parameters_and_never_interpolate_values() {
+        for (label, sql) in [
+            ("conversations", LIST_CONVERSATIONS_SQL),
+            ("messages", LIST_MESSAGES_SQL),
+            ("memories", LIST_MEMORIES_SQL),
+            ("rag collections", LIST_RAG_COLLECTIONS_SQL),
+            ("rag documents", LIST_RAG_DOCUMENTS_SQL),
+        ] {
+            assert!(
+                !sql.contains('{') && !sql.contains('}'),
+                "{label}: a `format!` placeholder in a list query means a value can reach the \
+                 query text:\n{sql}"
+            );
+            for comparison in sql.match_indices("<").chain(sql.match_indices(">")) {
+                let tail = &sql[comparison.0 + 1..];
+                let operand = tail.trim_start();
+                assert!(
+                    operand.starts_with('$')
+                        || operand.starts_with("($")
+                        || operand.starts_with('=')
+                        || operand.starts_with("all")
+                        || operand.starts_with("any"),
+                    "{label}: comparison operand must be a bound parameter, found {:?}:\n{sql}",
+                    &operand[..operand.len().min(24)]
+                );
+            }
+            assert!(
+                sql.contains("limit $"),
+                "{label}: the row limit must be bound too:\n{sql}"
+            );
+        }
+    }
+}
+
+/// In-memory [`ConversationRepository`] for unit tests (plan 06, Module 8 / P2-3).
+///
+/// Backs the **conversation-policy document** — the `get_or_create` / `put` pair that gates every
+/// conversation, memory and RAG feature — with real state, and returns an explicit `not_stubbed`
+/// error for every other method. A fake that answered unbacked reads with `Ok(default)` would let
+/// a test pass while exercising nothing, so unbacked methods fail loudly instead.
+///
+/// Carries no conversation content and no credential material: nothing is seeded that a leak test
+/// would have to recognise as synthetic.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct InMemoryConversationRepository {
+    policies: std::sync::Mutex<std::collections::HashMap<Uuid, ConversationPolicyRecord>>,
+}
+
+#[cfg(test)]
+fn not_stubbed(method: &str) -> AppError {
+    AppError::Internal(format!(
+        "InMemoryConversationRepository::{method} is not stubbed"
+    ))
+}
+
+#[cfg(test)]
+fn seed_conversation_policy(application_id: Uuid) -> ConversationPolicyRecord {
+    ConversationPolicyRecord {
+        id: application_id,
+        application_id,
+        conversations_enabled: false,
+        conversation_content_persistence: crate::domain::ConversationContentPersistence::None,
+        default_retention_days: 30,
+        maximum_retention_days: 365,
+        history_strategy: crate::domain::HistoryStrategy::RecentMessages,
+        maximum_recent_messages: 20,
+        maximum_history_tokens: 4096,
+        summarization_enabled: false,
+        summary_trigger_tokens: 3000,
+        summary_target_tokens: 512,
+        minimum_messages_since_summary: 10,
+        memory_enabled: false,
+        memory_extraction_enabled: false,
+        memory_retrieval_enabled: false,
+        memory_consent_mode: crate::domain::MemoryConsentMode::Disabled,
+        rag_enabled: false,
+        default_collection_ids: Vec::new(),
+        caller_can_create_conversations: false,
+        caller_can_delete_conversations: false,
+        caller_can_export_conversations: false,
+        protected_instruction_policy: "reject".to_string(),
+        metadata: Value::Object(serde_json::Map::new()),
+        updated_at: Utc::now(),
+        version: 1,
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl ConversationRepository for InMemoryConversationRepository {
+    async fn get_or_create_conversation_policy(
+        &self,
+        application_id: Uuid,
+    ) -> Result<ConversationPolicyRecord, AppError> {
+        Ok(self
+            .policies
+            .lock()
+            .unwrap()
+            .entry(application_id)
+            .or_insert_with(|| seed_conversation_policy(application_id))
+            .clone())
+    }
+
+    /// Mirrors the SQL's `coalesce($n, existing)` semantics: `None` leaves the stored value
+    /// alone, and every write bumps `version`. That is the part of the contract the application
+    /// layer actually depends on — a fake that overwrote absent fields with defaults would make
+    /// a partial-update bug invisible.
+    async fn put_conversation_policy(
+        &self,
+        application_id: Uuid,
+        request: &ConversationPolicyPutRequest,
+    ) -> Result<ConversationPolicyRecord, AppError> {
+        let mut guard = self.policies.lock().unwrap();
+        let policy = guard
+            .entry(application_id)
+            .or_insert_with(|| seed_conversation_policy(application_id));
+
+        macro_rules! apply {
+            ($($field:ident),* $(,)?) => {$(
+                if let Some(value) = request.$field.clone() {
+                    policy.$field = value;
+                }
+            )*};
+        }
+        apply!(
+            conversations_enabled,
+            conversation_content_persistence,
+            default_retention_days,
+            maximum_retention_days,
+            history_strategy,
+            maximum_recent_messages,
+            maximum_history_tokens,
+            summarization_enabled,
+            summary_trigger_tokens,
+            summary_target_tokens,
+            minimum_messages_since_summary,
+            memory_enabled,
+            memory_extraction_enabled,
+            memory_retrieval_enabled,
+            memory_consent_mode,
+            rag_enabled,
+            default_collection_ids,
+            caller_can_create_conversations,
+            caller_can_delete_conversations,
+            caller_can_export_conversations,
+            protected_instruction_policy,
+            metadata,
+        );
+        policy.updated_at = Utc::now();
+        policy.version += 1;
+        Ok(policy.clone())
+    }
+
+    async fn get_or_create_memory_policy(
+        &self,
+        _application_id: Uuid,
+    ) -> Result<MemoryPolicyRecord, AppError> {
+        Err(not_stubbed("get_or_create_memory_policy"))
+    }
+
+    async fn put_memory_policy(
+        &self,
+        _application_id: Uuid,
+        _request: &MemoryPolicyPutRequest,
+    ) -> Result<MemoryPolicyRecord, AppError> {
+        Err(not_stubbed("put_memory_policy"))
+    }
+
+    async fn get_or_create_retrieval_policy(
+        &self,
+        _application_id: Uuid,
+    ) -> Result<RetrievalPolicyRecord, AppError> {
+        Err(not_stubbed("get_or_create_retrieval_policy"))
+    }
+
+    async fn put_retrieval_policy(
+        &self,
+        _application_id: Uuid,
+        _request: &RetrievalPolicyPutRequest,
+    ) -> Result<RetrievalPolicyRecord, AppError> {
+        Err(not_stubbed("put_retrieval_policy"))
+    }
+
+    async fn get_or_create_embedding_policy(
+        &self,
+        _application_id: Uuid,
+    ) -> Result<EmbeddingPolicyRecord, AppError> {
+        Err(not_stubbed("get_or_create_embedding_policy"))
+    }
+
+    async fn put_embedding_policy(
+        &self,
+        _application_id: Uuid,
+        _request: &EmbeddingPolicyPutRequest,
+    ) -> Result<EmbeddingPolicyRecord, AppError> {
+        Err(not_stubbed("put_embedding_policy"))
+    }
+
+    async fn create_conversation(
+        &self,
+        _insert: &ConversationInsert<'_>,
+    ) -> Result<ConversationRecord, AppError> {
+        Err(not_stubbed("create_conversation"))
+    }
+
+    async fn find_conversation_authorized(
+        &self,
+        _public_id: &str,
+        _access: &ConversationAccess,
+    ) -> Result<ConversationRecord, AppError> {
+        Err(not_stubbed("find_conversation_authorized"))
+    }
+
+    async fn list_conversations_authorized(
+        &self,
+        _access: &ConversationAccess,
+        _query: &ConversationQuery,
+        _cursor: Option<ListCursor>,
+        _limit: i64,
+    ) -> Result<Vec<(ConversationRecord, ListCursor)>, AppError> {
+        Err(not_stubbed("list_conversations_authorized"))
+    }
+
+    async fn patch_conversation(
+        &self,
+        _public_id: &str,
+        _request: &ConversationPatchRequest,
+    ) -> Result<ConversationRecord, AppError> {
+        Err(not_stubbed("patch_conversation"))
+    }
+
+    async fn set_conversation_status(
+        &self,
+        _public_id: &str,
+        _status: ConversationStatus,
+    ) -> Result<ConversationRecord, AppError> {
+        Err(not_stubbed("set_conversation_status"))
+    }
+
+    async fn add_message(
+        &self,
+        _insert: &ConversationMessageInsert,
+    ) -> Result<ConversationMessageRecord, AppError> {
+        Err(not_stubbed("add_message"))
+    }
+
+    async fn list_messages(
+        &self,
+        _conversation_public_id: &str,
+        _query: &ConversationMessageQuery,
+        _cursor: Option<SeqCursor>,
+        _limit: i64,
+    ) -> Result<Vec<(ConversationMessageRecord, SeqCursor)>, AppError> {
+        Err(not_stubbed("list_messages"))
+    }
+
+    async fn create_memory(&self, _insert: &MemoryInsert<'_>) -> Result<MemoryRecord, AppError> {
+        Err(not_stubbed("create_memory"))
+    }
+
+    async fn find_memory_authorized(
+        &self,
+        _public_id: &str,
+        _access: &ConversationAccess,
+    ) -> Result<MemoryRecord, AppError> {
+        Err(not_stubbed("find_memory_authorized"))
+    }
+
+    async fn list_memories_authorized(
+        &self,
+        _access: &ConversationAccess,
+        _query: &MemoryQuery,
+        _cursor: Option<ListCursor>,
+        _limit: i64,
+    ) -> Result<Vec<(MemoryRecord, ListCursor)>, AppError> {
+        Err(not_stubbed("list_memories_authorized"))
+    }
+
+    async fn patch_memory(
+        &self,
+        _public_id: &str,
+        _request: &MemoryPatchRequest,
+        _content_hash: Option<&str>,
+    ) -> Result<MemoryRecord, AppError> {
+        Err(not_stubbed("patch_memory"))
+    }
+
+    async fn delete_memory(&self, _public_id: &str) -> Result<(), AppError> {
+        Err(not_stubbed("delete_memory"))
+    }
+
+    async fn create_rag_collection(
+        &self,
+        _id: Uuid,
+        _public_id: &str,
+        _request: &RagCollectionCreateRequest,
+    ) -> Result<RagCollectionRecord, AppError> {
+        Err(not_stubbed("create_rag_collection"))
+    }
+
+    async fn list_rag_collections(
+        &self,
+        _query: &RagCollectionQuery,
+        _cursor: Option<ListCursor>,
+        _limit: i64,
+    ) -> Result<Vec<(RagCollectionRecord, ListCursor)>, AppError> {
+        Err(not_stubbed("list_rag_collections"))
+    }
+
+    async fn get_rag_collection(&self, _public_id: &str) -> Result<RagCollectionRecord, AppError> {
+        Err(not_stubbed("get_rag_collection"))
+    }
+
+    async fn patch_rag_collection(
+        &self,
+        _public_id: &str,
+        _request: &RagCollectionPatchRequest,
+    ) -> Result<RagCollectionRecord, AppError> {
+        Err(not_stubbed("patch_rag_collection"))
+    }
+
+    async fn set_rag_collection_status(
+        &self,
+        _public_id: &str,
+        _status: RagCollectionStatus,
+    ) -> Result<RagCollectionRecord, AppError> {
+        Err(not_stubbed("set_rag_collection_status"))
+    }
+
+    async fn create_rag_document(
+        &self,
+        _id: Uuid,
+        _public_id: &str,
+        _collection_public_id: &str,
+        _request: &RagDocumentCreateRequest,
+        _content_hash: Option<&str>,
+    ) -> Result<RagDocumentRecord, AppError> {
+        Err(not_stubbed("create_rag_document"))
+    }
+
+    async fn list_rag_documents(
+        &self,
+        _collection_public_id: &str,
+        _cursor: Option<ListCursor>,
+        _limit: i64,
+    ) -> Result<Vec<(RagDocumentRecord, ListCursor)>, AppError> {
+        Err(not_stubbed("list_rag_documents"))
+    }
+
+    async fn get_rag_document(&self, _public_id: &str) -> Result<RagDocumentRecord, AppError> {
+        Err(not_stubbed("get_rag_document"))
+    }
+
+    async fn delete_rag_document(&self, _public_id: &str) -> Result<(), AppError> {
+        Err(not_stubbed("delete_rag_document"))
+    }
+
+    async fn ingest_rag_document(
+        &self,
+        _public_id: &str,
+        _request: &RagDocumentIngestRequest,
+        _content_hash: &str,
+    ) -> Result<RagDocumentRecord, AppError> {
+        Err(not_stubbed("ingest_rag_document"))
+    }
+}
+
+#[cfg(test)]
+mod repository_trait_tests {
+    use super::*;
+
+    /// P2-3: the conversation-policy document — the gate in front of every conversation, memory
+    /// and RAG feature — is now exercisable in a unit test without Postgres.
+    #[tokio::test]
+    async fn fake_conversation_repository_supports_policy_unit_test() {
+        let application_id = Uuid::now_v7();
+        let repo = InMemoryConversationRepository::default();
+
+        // `get_or_create` mints a closed-by-default policy.
+        let created = repo
+            .get_or_create_conversation_policy(application_id)
+            .await
+            .expect("policy");
+        assert!(!created.conversations_enabled);
+        assert!(!created.rag_enabled);
+        assert_eq!(created.version, 1);
+
+        // A partial `put` changes only the fields it names and bumps the version.
+        let updated = repo
+            .put_conversation_policy(
+                application_id,
+                &ConversationPolicyPutRequest {
+                    conversations_enabled: Some(true),
+                    maximum_recent_messages: Some(50),
+                    ..ConversationPolicyPutRequest::default()
+                },
+            )
+            .await
+            .expect("put policy");
+        assert!(updated.conversations_enabled);
+        assert_eq!(updated.maximum_recent_messages, 50);
+        assert_eq!(updated.version, 2);
+        // Untouched fields survive — `coalesce($n, existing)`, not overwrite-with-default.
+        assert_eq!(
+            updated.maximum_history_tokens,
+            created.maximum_history_tokens
+        );
+        assert!(!updated.rag_enabled);
+
+        // The store is the source of truth for the next read.
+        let reread = repo
+            .get_or_create_conversation_policy(application_id)
+            .await
+            .expect("policy");
+        assert!(reread.conversations_enabled);
+        assert_eq!(reread.version, 2);
+
+        // Policies are per application.
+        let other = repo
+            .get_or_create_conversation_policy(Uuid::now_v7())
+            .await
+            .expect("policy");
+        assert!(!other.conversations_enabled);
+    }
+
+    #[tokio::test]
+    async fn unbacked_fake_conversation_methods_fail_loudly() {
+        let repo = InMemoryConversationRepository::default();
+        let error = repo
+            .list_rag_collections(&RagCollectionQuery::default(), None, 10)
+            .await
+            .expect_err("unbacked method");
+        assert!(error.to_string().contains("not stubbed"));
     }
 }

@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
@@ -15,7 +16,7 @@ use crate::{
         application_execution_policy_record_from_row, execution_failure_class_from_db,
         provider_type_from_db, public_response_record_from_row, response_persistence_mode_to_db,
     },
-    security::request_hash,
+    security::IdempotencyHasher,
 };
 
 #[derive(Debug, Clone)]
@@ -62,12 +63,141 @@ pub enum IdempotencyClaim {
     Replay(IdempotencyRecord),
 }
 
+/// The public-API persistence surface: application execution policy, the public idempotency
+/// envelope, response/execution lifecycle rows, and the caller-scoped read models.
+///
+/// Extracted as a trait (plan 06, Module 8 / P2-3) so `PublicExecutionService` can be unit-tested
+/// against a fake instead of a live Postgres. Mirrors [`AdminRepository`](super::AdminRepository):
+/// the trait carries the documentation, the `#[async_trait] impl` below carries only SQL.
+///
+/// Every `*_authorized` / `*_visible_*` method takes a [`PublicAccess`] and applies the caller's
+/// scoping **in SQL**. That is deliberate and load-bearing: an implementation that returned rows
+/// outside the supplied access scope would be a cross-tenant disclosure, not a bug in the caller.
+#[async_trait]
+pub trait PublicRepository: Send + Sync {
+    async fn get_or_create_application_execution_policy(
+        &self,
+        application_id: Uuid,
+    ) -> Result<ApplicationExecutionPolicyRecord, AppError>;
+
+    /// Upserts the policy under a SQL-level optimistic-concurrency check.
+    ///
+    /// The version comparison **must** live in the same transaction as the write. The previous
+    /// shape read the current version on one pooled connection, compared it in Rust, and then
+    /// issued an unconditional `on conflict do update` on a possibly different connection:
+    /// two writers holding the same currently-valid `If-Match` both passed the comparison and
+    /// both wrote, so one update was silently lost and neither caller saw a conflict.
+    ///
+    /// This follows the pattern already established by
+    /// `PgAdminRepository`'s `rotate_credential`: `select … for update` inside a transaction to
+    /// serialise the writers, and — belt and braces, because the row lock alone is easy to
+    /// regress — the `update` itself carries `and version = $22`, with zero affected rows
+    /// mapped onto the same `409 resource_version_conflict` envelope every other versioned
+    /// endpoint already returns.
+    async fn put_application_execution_policy(
+        &self,
+        application_id: Uuid,
+        expected_version: Option<i64>,
+        request: &ApplicationExecutionPolicyPutRequest,
+    ) -> Result<ApplicationExecutionPolicyRecord, AppError>;
+
+    async fn claim_idempotency(
+        &self,
+        record: &IdempotencyRecord,
+    ) -> Result<IdempotencyClaim, AppError>;
+
+    async fn get_idempotency_record(
+        &self,
+        key_hash: &str,
+        actor_fingerprint: &str,
+        operation: &str,
+    ) -> Result<Option<IdempotencyRecord>, AppError>;
+
+    async fn finish_idempotency(
+        &self,
+        key_hash: &str,
+        actor_fingerprint: &str,
+        operation: &str,
+        response_status: i32,
+        response_body: &Value,
+        resource_id: Option<&str>,
+    ) -> Result<(), AppError>;
+
+    async fn insert_response_started(
+        &self,
+        insert: &ResponseStartedInsert,
+    ) -> Result<PublicResponseRecord, AppError>;
+
+    async fn complete_response(
+        &self,
+        id: Uuid,
+        update: &ResponseTerminalUpdate,
+    ) -> Result<PublicResponseRecord, AppError>;
+
+    async fn fail_response(
+        &self,
+        id: Uuid,
+        update: &ResponseTerminalUpdate,
+    ) -> Result<PublicResponseRecord, AppError>;
+
+    async fn cancel_response(
+        &self,
+        id: Uuid,
+        update: &ResponseTerminalUpdate,
+    ) -> Result<PublicResponseRecord, AppError>;
+
+    async fn find_response_authorized(
+        &self,
+        id: Uuid,
+        access: &PublicAccess,
+    ) -> Result<PublicResponseRecord, AppError>;
+
+    async fn find_execution_authorized(
+        &self,
+        execution_id: Uuid,
+        access: &PublicAccess,
+    ) -> Result<PublicExecutionSummary, AppError>;
+
+    async fn list_executions_authorized(
+        &self,
+        access: &PublicAccess,
+        query: &ExecutionQuery,
+    ) -> Result<Vec<PublicExecutionSummary>, AppError>;
+
+    async fn list_usage_authorized(
+        &self,
+        access: &PublicAccess,
+        query: &UsageQuery,
+    ) -> Result<Vec<PublicUsageRecord>, AppError>;
+
+    async fn list_visible_models(
+        &self,
+        access: &PublicAccess,
+        limit: i64,
+    ) -> Result<Vec<PublicModelResource>, AppError>;
+
+    async fn find_visible_model_id_by_key(
+        &self,
+        access: &PublicAccess,
+        model_key: &str,
+    ) -> Result<Option<Uuid>, AppError>;
+
+    async fn list_visible_routes(
+        &self,
+        access: &PublicAccess,
+        limit: i64,
+    ) -> Result<Vec<PublicRouteResource>, AppError>;
+}
+
 impl PgPublicRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+}
 
-    pub async fn get_or_create_application_execution_policy(
+#[async_trait]
+impl PublicRepository for PgPublicRepository {
+    async fn get_or_create_application_execution_policy(
         &self,
         application_id: Uuid,
     ) -> Result<ApplicationExecutionPolicyRecord, AppError> {
@@ -114,49 +244,50 @@ impl PgPublicRepository {
         application_execution_policy_record_from_row(&row)
     }
 
-    pub async fn put_application_execution_policy(
+    async fn put_application_execution_policy(
         &self,
         application_id: Uuid,
+        expected_version: Option<i64>,
         request: &ApplicationExecutionPolicyPutRequest,
     ) -> Result<ApplicationExecutionPolicyRecord, AppError> {
         let persistence_mode = request
             .persistence_mode
             .map(response_persistence_mode_to_db);
+
+        let mut tx = self.pool.begin().await?;
+
+        // Materialise the defaulted row if this application has never had a policy, so the
+        // first write is still an upsert and `select … for update` below always has a row to
+        // lock. The column defaults are identical to the literals the old insert branch
+        // coalesced against, so a first write lands on exactly the same values.
+        sqlx::query(
+            r#"
+            insert into application_execution_policies (application_id)
+            values ($1)
+            on conflict (application_id) do nothing
+            "#,
+        )
+        .bind(application_id)
+        .execute(&mut *tx)
+        .await?;
+
+        let current_version = sqlx::query_scalar::<_, i64>(
+            "select version from application_execution_policies where application_id = $1 for update",
+        )
+        .bind(application_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        if expected_version.is_some_and(|expected| expected != current_version) {
+            return Err(AppError::conflict(
+                "resource_version_conflict",
+                "resource version does not match If-Match",
+            ));
+        }
+
         let row = sqlx::query(
             r#"
-            insert into application_execution_policies (
-                application_id, responses_enabled, streaming_enabled, tools_enabled,
-                vision_enabled, structured_output_enabled, caller_system_instructions_allowed,
-                model_overrides_allowed, route_overrides_allowed, provider_overrides_allowed,
-                credential_overrides_allowed, timeout_overrides_allowed, persistence_mode,
-                response_retention_seconds, maximum_request_bytes, maximum_input_items,
-                maximum_output_tokens, maximum_timeout_ms, rate_limit_requests_per_minute,
-                rate_limit_streams_per_minute, metadata
-            )
-            values (
-                $1,
-                coalesce($2, true),
-                coalesce($3, true),
-                coalesce($4, false),
-                coalesce($5, true),
-                coalesce($6, true),
-                coalesce($7, false),
-                coalesce($8, false),
-                coalesce($9, false),
-                coalesce($10, false),
-                coalesce($11, false),
-                coalesce($12, false),
-                coalesce($13, 'metadata_only'),
-                coalesce($14, 2592000),
-                coalesce($15, 1048576),
-                coalesce($16, 128),
-                coalesce($17, 8192),
-                coalesce($18, 600000),
-                coalesce($19, 120),
-                coalesce($20, 60),
-                coalesce($21, '{}'::jsonb)
-            )
-            on conflict (application_id) do update set
+            update application_execution_policies set
                 responses_enabled = coalesce($2, application_execution_policies.responses_enabled),
                 streaming_enabled = coalesce($3, application_execution_policies.streaming_enabled),
                 tools_enabled = coalesce($4, application_execution_policies.tools_enabled),
@@ -178,6 +309,7 @@ impl PgPublicRepository {
                 rate_limit_streams_per_minute = coalesce($20, application_execution_policies.rate_limit_streams_per_minute),
                 metadata = coalesce($21, application_execution_policies.metadata),
                 updated_at = now()
+            where application_id = $1 and version = $22
             returning id, application_id, responses_enabled, streaming_enabled, tools_enabled,
                       vision_enabled, structured_output_enabled,
                       caller_system_instructions_allowed, model_overrides_allowed,
@@ -210,12 +342,21 @@ impl PgPublicRepository {
         .bind(request.rate_limit_requests_per_minute)
         .bind(request.rate_limit_streams_per_minute)
         .bind(&request.metadata)
-        .fetch_one(&self.pool)
-        .await?;
-        application_execution_policy_record_from_row(&row)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            AppError::conflict(
+                "resource_version_conflict",
+                "resource version does not match If-Match",
+            )
+        })?;
+        let record = application_execution_policy_record_from_row(&row)?;
+        tx.commit().await?;
+        Ok(record)
     }
 
-    pub async fn claim_idempotency(
+    async fn claim_idempotency(
         &self,
         record: &IdempotencyRecord,
     ) -> Result<IdempotencyClaim, AppError> {
@@ -252,7 +393,7 @@ impl PgPublicRepository {
         Ok(IdempotencyClaim::Replay(existing))
     }
 
-    pub async fn get_idempotency_record(
+    async fn get_idempotency_record(
         &self,
         key_hash: &str,
         actor_fingerprint: &str,
@@ -290,7 +431,7 @@ impl PgPublicRepository {
         .transpose()
     }
 
-    pub async fn finish_idempotency(
+    async fn finish_idempotency(
         &self,
         key_hash: &str,
         actor_fingerprint: &str,
@@ -321,7 +462,7 @@ impl PgPublicRepository {
         Ok(())
     }
 
-    pub async fn insert_response_started(
+    async fn insert_response_started(
         &self,
         insert: &ResponseStartedInsert,
     ) -> Result<PublicResponseRecord, AppError> {
@@ -351,7 +492,7 @@ impl PgPublicRepository {
         public_response_record_from_row(&row)
     }
 
-    pub async fn complete_response(
+    async fn complete_response(
         &self,
         id: Uuid,
         update: &ResponseTerminalUpdate,
@@ -386,7 +527,7 @@ impl PgPublicRepository {
         public_response_record_from_row(&row)
     }
 
-    pub async fn fail_response(
+    async fn fail_response(
         &self,
         id: Uuid,
         update: &ResponseTerminalUpdate,
@@ -425,7 +566,7 @@ impl PgPublicRepository {
         public_response_record_from_row(&row)
     }
 
-    pub async fn cancel_response(
+    async fn cancel_response(
         &self,
         id: Uuid,
         update: &ResponseTerminalUpdate,
@@ -464,7 +605,7 @@ impl PgPublicRepository {
         public_response_record_from_row(&row)
     }
 
-    pub async fn find_response_authorized(
+    async fn find_response_authorized(
         &self,
         id: Uuid,
         access: &PublicAccess,
@@ -491,7 +632,7 @@ impl PgPublicRepository {
         public_response_record_from_row(&row)
     }
 
-    pub async fn find_execution_authorized(
+    async fn find_execution_authorized(
         &self,
         execution_id: Uuid,
         access: &PublicAccess,
@@ -516,7 +657,7 @@ impl PgPublicRepository {
         execution_summary_from_row(&row)
     }
 
-    pub async fn list_executions_authorized(
+    async fn list_executions_authorized(
         &self,
         access: &PublicAccess,
         query: &ExecutionQuery,
@@ -542,7 +683,7 @@ impl PgPublicRepository {
         rows.iter().map(execution_summary_from_row).collect()
     }
 
-    pub async fn list_usage_authorized(
+    async fn list_usage_authorized(
         &self,
         access: &PublicAccess,
         query: &UsageQuery,
@@ -591,7 +732,7 @@ impl PgPublicRepository {
         rows.iter().map(usage_record_from_row).collect()
     }
 
-    pub async fn list_visible_models(
+    async fn list_visible_models(
         &self,
         access: &PublicAccess,
         limit: i64,
@@ -626,7 +767,7 @@ impl PgPublicRepository {
         rows.iter().map(public_model_from_row).collect()
     }
 
-    pub async fn find_visible_model_id_by_key(
+    async fn find_visible_model_id_by_key(
         &self,
         access: &PublicAccess,
         model_key: &str,
@@ -661,7 +802,7 @@ impl PgPublicRepository {
         .map_err(AppError::from)
     }
 
-    pub async fn list_visible_routes(
+    async fn list_visible_routes(
         &self,
         access: &PublicAccess,
         limit: i64,
@@ -730,7 +871,13 @@ pub fn default_application_execution_policy(
     }
 }
 
+/// Builds the ledger row for a fresh `/v1/responses` idempotency claim.
+///
+/// The key hash is keyed by the deployment pepper (plan 03, P1-1): the raw
+/// `Idempotency-Key` is caller-supplied and its unkeyed digest was offline-guessable from
+/// a database read alone.
 pub fn idempotency_record(
+    hasher: &IdempotencyHasher,
     key: &str,
     actor_fingerprint: String,
     operation: &str,
@@ -738,7 +885,7 @@ pub fn idempotency_record(
 ) -> IdempotencyRecord {
     IdempotencyRecord {
         id: Uuid::now_v7(),
-        idempotency_key_hash: request_hash(key.as_bytes()),
+        idempotency_key_hash: hasher.hash(key.as_bytes()),
         actor_fingerprint,
         operation: operation.to_string(),
         request_hash: request_hash_value,
@@ -925,4 +1072,307 @@ fn i64_to_u64(value: Option<i64>) -> Result<Option<u64>, AppError> {
         .map(u64::try_from)
         .transpose()
         .map_err(|_| AppError::Internal("usage value was negative".to_string()))
+}
+
+/// In-memory [`PublicRepository`] for unit tests (plan 06, Module 8 / P2-3).
+///
+/// Backs the public **idempotency envelope** and the execution-policy read — the slice
+/// `PublicExecutionService` needs to make a replay decision — with real state, and returns an
+/// explicit `not_stubbed` error for every other method. That is deliberate: a fake that silently
+/// returned `Ok(default)` for an unimplemented read would let a test pass while exercising
+/// nothing. Extend the backed set as unit tests need it.
+///
+/// Carries no credential material; the public surface has none.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct InMemoryPublicRepository {
+    policies: std::sync::Mutex<std::collections::HashMap<Uuid, ApplicationExecutionPolicyRecord>>,
+    idempotency:
+        std::sync::Mutex<std::collections::HashMap<(String, String, String), IdempotencyRecord>>,
+}
+
+#[cfg(test)]
+fn not_stubbed(method: &str) -> AppError {
+    AppError::Internal(format!("InMemoryPublicRepository::{method} is not stubbed"))
+}
+
+#[cfg(test)]
+impl InMemoryPublicRepository {
+    pub(crate) fn with_policy(policy: ApplicationExecutionPolicyRecord) -> Self {
+        let fake = Self::default();
+        fake.policies
+            .lock()
+            .unwrap()
+            .insert(policy.application_id, policy);
+        fake
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl PublicRepository for InMemoryPublicRepository {
+    async fn get_or_create_application_execution_policy(
+        &self,
+        application_id: Uuid,
+    ) -> Result<ApplicationExecutionPolicyRecord, AppError> {
+        Ok(self
+            .policies
+            .lock()
+            .unwrap()
+            .entry(application_id)
+            .or_insert_with(|| default_application_execution_policy(application_id))
+            .clone())
+    }
+
+    /// Same semantics as the SQL: the first claim for a `(key, actor, operation)` triple wins and
+    /// every later one replays the stored record.
+    async fn claim_idempotency(
+        &self,
+        record: &IdempotencyRecord,
+    ) -> Result<IdempotencyClaim, AppError> {
+        let key = (
+            record.idempotency_key_hash.clone(),
+            record.actor_fingerprint.clone(),
+            record.operation.clone(),
+        );
+        let mut guard = self.idempotency.lock().unwrap();
+        match guard.get(&key) {
+            Some(existing) => Ok(IdempotencyClaim::Replay(existing.clone())),
+            None => {
+                guard.insert(key, record.clone());
+                Ok(IdempotencyClaim::Claimed)
+            }
+        }
+    }
+
+    async fn get_idempotency_record(
+        &self,
+        key_hash: &str,
+        actor_fingerprint: &str,
+        operation: &str,
+    ) -> Result<Option<IdempotencyRecord>, AppError> {
+        Ok(self
+            .idempotency
+            .lock()
+            .unwrap()
+            .get(&(
+                key_hash.to_string(),
+                actor_fingerprint.to_string(),
+                operation.to_string(),
+            ))
+            .cloned())
+    }
+
+    async fn finish_idempotency(
+        &self,
+        key_hash: &str,
+        actor_fingerprint: &str,
+        operation: &str,
+        response_status: i32,
+        response_body: &Value,
+        resource_id: Option<&str>,
+    ) -> Result<(), AppError> {
+        let mut guard = self.idempotency.lock().unwrap();
+        let Some(record) = guard.get_mut(&(
+            key_hash.to_string(),
+            actor_fingerprint.to_string(),
+            operation.to_string(),
+        )) else {
+            return Err(not_stubbed("finish_idempotency (unclaimed key)"));
+        };
+        record.response_status = Some(response_status);
+        record.response_body = Some(response_body.clone());
+        record.resource_id = resource_id.map(str::to_string);
+        Ok(())
+    }
+
+    async fn put_application_execution_policy(
+        &self,
+        _application_id: Uuid,
+        _expected_version: Option<i64>,
+        _request: &ApplicationExecutionPolicyPutRequest,
+    ) -> Result<ApplicationExecutionPolicyRecord, AppError> {
+        Err(not_stubbed("put_application_execution_policy"))
+    }
+
+    async fn insert_response_started(
+        &self,
+        _insert: &ResponseStartedInsert,
+    ) -> Result<PublicResponseRecord, AppError> {
+        Err(not_stubbed("insert_response_started"))
+    }
+
+    async fn complete_response(
+        &self,
+        _id: Uuid,
+        _update: &ResponseTerminalUpdate,
+    ) -> Result<PublicResponseRecord, AppError> {
+        Err(not_stubbed("complete_response"))
+    }
+
+    async fn fail_response(
+        &self,
+        _id: Uuid,
+        _update: &ResponseTerminalUpdate,
+    ) -> Result<PublicResponseRecord, AppError> {
+        Err(not_stubbed("fail_response"))
+    }
+
+    async fn cancel_response(
+        &self,
+        _id: Uuid,
+        _update: &ResponseTerminalUpdate,
+    ) -> Result<PublicResponseRecord, AppError> {
+        Err(not_stubbed("cancel_response"))
+    }
+
+    async fn find_response_authorized(
+        &self,
+        _id: Uuid,
+        _access: &PublicAccess,
+    ) -> Result<PublicResponseRecord, AppError> {
+        Err(not_stubbed("find_response_authorized"))
+    }
+
+    async fn find_execution_authorized(
+        &self,
+        _execution_id: Uuid,
+        _access: &PublicAccess,
+    ) -> Result<PublicExecutionSummary, AppError> {
+        Err(not_stubbed("find_execution_authorized"))
+    }
+
+    async fn list_executions_authorized(
+        &self,
+        _access: &PublicAccess,
+        _query: &ExecutionQuery,
+    ) -> Result<Vec<PublicExecutionSummary>, AppError> {
+        Err(not_stubbed("list_executions_authorized"))
+    }
+
+    async fn list_usage_authorized(
+        &self,
+        _access: &PublicAccess,
+        _query: &UsageQuery,
+    ) -> Result<Vec<PublicUsageRecord>, AppError> {
+        Err(not_stubbed("list_usage_authorized"))
+    }
+
+    async fn list_visible_models(
+        &self,
+        _access: &PublicAccess,
+        _limit: i64,
+    ) -> Result<Vec<PublicModelResource>, AppError> {
+        Err(not_stubbed("list_visible_models"))
+    }
+
+    async fn find_visible_model_id_by_key(
+        &self,
+        _access: &PublicAccess,
+        _model_key: &str,
+    ) -> Result<Option<Uuid>, AppError> {
+        Err(not_stubbed("find_visible_model_id_by_key"))
+    }
+
+    async fn list_visible_routes(
+        &self,
+        _access: &PublicAccess,
+        _limit: i64,
+    ) -> Result<Vec<PublicRouteResource>, AppError> {
+        Err(not_stubbed("list_visible_routes"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(key: &str, actor: &str) -> IdempotencyRecord {
+        IdempotencyRecord {
+            id: Uuid::now_v7(),
+            idempotency_key_hash: key.to_string(),
+            actor_fingerprint: actor.to_string(),
+            operation: "response.create".to_string(),
+            request_hash: "request-hash".to_string(),
+            response_status: None,
+            response_body: None,
+            resource_id: None,
+            expires_at: Utc::now() + Duration::hours(24),
+        }
+    }
+
+    /// P2-3: the public idempotency envelope — claim, finish, replay — is now exercisable in a
+    /// unit test. Before `PublicRepository` existed this needed a live Postgres.
+    #[tokio::test]
+    async fn fake_public_repository_supports_execution_service_unit_test() {
+        let application_id = Uuid::now_v7();
+        let repo = InMemoryPublicRepository::with_policy(ApplicationExecutionPolicyRecord {
+            streaming_enabled: false,
+            ..default_application_execution_policy(application_id)
+        });
+
+        let policy = repo
+            .get_or_create_application_execution_policy(application_id)
+            .await
+            .expect("policy");
+        assert!(policy.responses_enabled);
+        assert!(!policy.streaming_enabled);
+
+        // First claim wins.
+        let first = repo
+            .claim_idempotency(&record("key", "actor"))
+            .await
+            .unwrap();
+        assert!(matches!(first, IdempotencyClaim::Claimed));
+
+        repo.finish_idempotency(
+            "key",
+            "actor",
+            "response.create",
+            200,
+            &json!({"id": "r1"}),
+            Some("r1"),
+        )
+        .await
+        .unwrap();
+
+        // The same triple replays the finished response.
+        let second = repo
+            .claim_idempotency(&record("key", "actor"))
+            .await
+            .unwrap();
+        let IdempotencyClaim::Replay(stored) = second else {
+            panic!("expected a replay");
+        };
+        assert_eq!(stored.response_status, Some(200));
+        assert_eq!(stored.resource_id.as_deref(), Some("r1"));
+
+        // A different actor fingerprint is a different envelope — the isolation the unique index
+        // exists to provide.
+        let other = repo
+            .claim_idempotency(&record("key", "other-actor"))
+            .await
+            .unwrap();
+        assert!(matches!(other, IdempotencyClaim::Claimed));
+    }
+
+    /// A method the fake does not back fails loudly rather than returning a plausible empty
+    /// result, so a unit test cannot silently exercise nothing.
+    #[tokio::test]
+    async fn unbacked_fake_methods_fail_loudly() {
+        let repo = InMemoryPublicRepository::default();
+        let error = repo
+            .list_visible_routes(
+                &PublicAccess {
+                    privileged: true,
+                    application_id: None,
+                    external_tenant_id: None,
+                    external_user_id: None,
+                },
+                10,
+            )
+            .await
+            .expect_err("unbacked method");
+        assert!(error.to_string().contains("not stubbed"));
+    }
 }

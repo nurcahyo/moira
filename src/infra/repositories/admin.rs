@@ -3,7 +3,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
-use sqlx::{PgConnection, PgPool, Postgres, Row, Transaction};
+use sqlx::{PgConnection, PgPool, Postgres, Row, Transaction, postgres::PgArguments, query::Query};
 use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
@@ -11,10 +11,10 @@ use crate::{
     domain::{
         ApiKeyRecord, ApplicationCreateRequest, ApplicationPatchRequest, ApplicationRecord,
         AuditLogInsert, AuditLogRecord, CredentialCreateRequest, CredentialPatchRequest,
-        CredentialRecord, IdempotencyRecord, ProviderCreateRequest, ProviderModelCreateRequest,
-        ProviderModelPatchRequest, ProviderModelRecord, ProviderPatchRequest, ProviderRecord,
-        SystemKeyCreateRequest, TrustedJwtIssuerCreateRequest, TrustedJwtIssuerPatchRequest,
-        TrustedJwtIssuerRecord,
+        CredentialRecord, IdempotencyRecord, ListCursor, ProviderCreateRequest,
+        ProviderModelCreateRequest, ProviderModelPatchRequest, ProviderModelRecord,
+        ProviderPatchRequest, ProviderRecord, SystemKeyCreateRequest,
+        TrustedJwtIssuerCreateRequest, TrustedJwtIssuerPatchRequest, TrustedJwtIssuerRecord,
     },
     error::AppError,
     infra::pg_rows::{
@@ -35,20 +35,41 @@ pub struct PgAdminCommandTransaction {
     transaction: Transaction<'static, Postgres>,
 }
 
+/// A claim on the idempotency ledger.
+///
+/// Every hash it carries is precomputed by the application layer; this repository never
+/// learns how any of them is derived, and — since plan 03 finding F3 — it no longer
+/// *compares* them either. It looks a claim up, sweeps expired rows, and either inserts or
+/// hands the existing row back for the application layer to verify, which is what plan 03's
+/// Detailed Implementation item 6 asks for ("prefer verifying in the application layer").
+///
+/// `legacy_key_hash` exists because the switch to keyed hashing (P1-1) changed the index
+/// key as well as the compared digest, so a row written before the switch is unreachable by
+/// the new key hash alone. It is `None` once the operator closes the dual-read window
+/// (`idempotency.accept_legacy_hashes = false`), which also removes the extra lookup it
+/// costs on every claim.
 #[derive(Debug, Clone)]
 pub struct AdminIdempotencyClaim {
     pub record_id: Uuid,
+    /// The key hash written for a fresh claim and tried first on lookup.
     pub key_hash: String,
+    /// The pre-switch key hash, tried only when `key_hash` misses. Never written.
+    pub legacy_key_hash: Option<String>,
     pub actor_fingerprint: String,
     pub operation: String,
+    /// The body digest written for a fresh claim.
     pub request_hash: String,
     pub expires_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
 pub enum AdminIdempotencyClaimOutcome {
+    /// No row existed; this claim now owns the ledger entry.
     Acquired,
-    Replay(IdempotencyRecord),
+    /// A row already exists for this key. Whether it is a legitimate replay or a
+    /// same-key-different-body conflict is the application layer's call, because deciding
+    /// it requires recomputing a keyed digest.
+    Existing(IdempotencyRecord),
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +78,17 @@ pub struct StoredCredentialSecret {
     pub encrypted: EncryptedSecret,
 }
 
+/// # Pagination contract for every `list_*` method below (plan 04, P1-4)
+///
+/// Each takes the already-decoded keyset `cursor` for *its own* sort key plus the caller's
+/// page `limit`, and returns **up to `limit + 1`** rows in that query's existing sort
+/// order. The extra row is deliberate — see [`over_fetch_limit`]. Trimming it off,
+/// computing `has_more` and encoding `next_cursor` belong to the application layer
+/// (`src/application/admin.rs`), which is what keeps this SQL simple and keeps one
+/// convention across all nine lists.
+///
+/// A repository method therefore never returns `has_more` and never encodes a cursor; it
+/// only knows how to seek and how to over-fetch by one.
 #[async_trait]
 pub trait AdminRepository {
     async fn create_application(
@@ -64,19 +96,33 @@ pub trait AdminRepository {
         id: Uuid,
         request: &ApplicationCreateRequest,
     ) -> Result<ApplicationRecord, AppError>;
-    async fn list_applications(&self, limit: i64) -> Result<Vec<ApplicationRecord>, AppError>;
+    async fn list_applications(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<ApplicationRecord>, AppError>;
     async fn get_application(&self, id: Uuid) -> Result<ApplicationRecord, AppError>;
+    /// `expected_version` is the caller's `If-Match`. Implementations must compare it against a
+    /// row locked inside the same transaction as the write — never against a version read on a
+    /// separate connection, which is the lost update this parameter exists to close. A mismatch
+    /// is `409 resource_version_conflict`; an absent row stays `404`.
     async fn patch_application(
         &self,
         id: Uuid,
+        expected_version: i64,
         request: &ApplicationPatchRequest,
     ) -> Result<ApplicationRecord, AppError>;
     async fn set_application_status(
         &self,
         id: Uuid,
+        expected_version: i64,
         status: &str,
     ) -> Result<ApplicationRecord, AppError>;
-    async fn soft_delete_application(&self, id: Uuid) -> Result<(), AppError>;
+    async fn soft_delete_application(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+    ) -> Result<(), AppError>;
 
     async fn create_provider(
         &self,
@@ -84,17 +130,26 @@ pub trait AdminRepository {
         request: &ProviderCreateRequest,
         normalized_base_url: Option<String>,
     ) -> Result<ProviderRecord, AppError>;
-    async fn list_providers(&self, limit: i64) -> Result<Vec<ProviderRecord>, AppError>;
+    async fn list_providers(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<ProviderRecord>, AppError>;
     async fn get_provider(&self, id: Uuid) -> Result<ProviderRecord, AppError>;
     async fn patch_provider(
         &self,
         id: Uuid,
+        expected_version: i64,
         request: &ProviderPatchRequest,
         normalized_base_url: Option<Option<String>>,
     ) -> Result<ProviderRecord, AppError>;
-    async fn set_provider_status(&self, id: Uuid, status: &str)
-    -> Result<ProviderRecord, AppError>;
-    async fn soft_delete_provider(&self, id: Uuid) -> Result<(), AppError>;
+    async fn set_provider_status(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+        status: &str,
+    ) -> Result<ProviderRecord, AppError>;
+    async fn soft_delete_provider(&self, id: Uuid, expected_version: i64) -> Result<(), AppError>;
 
     async fn create_provider_model(
         &self,
@@ -105,20 +160,27 @@ pub trait AdminRepository {
     async fn list_provider_models(
         &self,
         provider_id: Uuid,
+        cursor: Option<ListCursor>,
         limit: i64,
     ) -> Result<Vec<ProviderModelRecord>, AppError>;
     async fn patch_provider_model(
         &self,
         id: Uuid,
+        expected_version: i64,
         request: &ProviderModelPatchRequest,
     ) -> Result<ProviderModelRecord, AppError>;
     async fn get_provider_model(&self, id: Uuid) -> Result<ProviderModelRecord, AppError>;
     async fn set_provider_model_status(
         &self,
         id: Uuid,
+        expected_version: i64,
         status: &str,
     ) -> Result<ProviderModelRecord, AppError>;
-    async fn soft_delete_provider_model(&self, id: Uuid) -> Result<(), AppError>;
+    async fn soft_delete_provider_model(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+    ) -> Result<(), AppError>;
 
     async fn create_credential(
         &self,
@@ -128,10 +190,15 @@ pub trait AdminRepository {
         fingerprint: &str,
         masked: &str,
     ) -> Result<CredentialRecord, AppError>;
-    async fn list_credentials(&self, limit: i64) -> Result<Vec<CredentialRecord>, AppError>;
+    async fn list_credentials(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<CredentialRecord>, AppError>;
     async fn list_user_credentials(
         &self,
         external_user_id: &str,
+        cursor: Option<ListCursor>,
         limit: i64,
     ) -> Result<Vec<CredentialRecord>, AppError>;
     async fn get_credential(&self, id: Uuid) -> Result<CredentialRecord, AppError>;
@@ -139,6 +206,7 @@ pub trait AdminRepository {
     async fn patch_credential(
         &self,
         id: Uuid,
+        expected_version: i64,
         request: &CredentialPatchRequest,
     ) -> Result<CredentialRecord, AppError>;
     async fn rotate_credential(
@@ -151,14 +219,17 @@ pub trait AdminRepository {
     async fn set_credential_status(
         &self,
         id: Uuid,
+        expected_version: i64,
         status: &str,
     ) -> Result<CredentialRecord, AppError>;
     async fn mark_credential_validated(&self, id: Uuid) -> Result<CredentialRecord, AppError>;
-    async fn soft_delete_credential(&self, id: Uuid) -> Result<(), AppError>;
+    async fn soft_delete_credential(&self, id: Uuid, expected_version: i64)
+    -> Result<(), AppError>;
     async fn soft_delete_user_credential(
         &self,
         external_user_id: &str,
         id: Uuid,
+        expected_version: i64,
     ) -> Result<(), AppError>;
 
     async fn create_system_key(
@@ -179,8 +250,16 @@ pub trait AdminRepository {
         expires_at: Option<DateTime<Utc>>,
         material: KeyMaterial<'_>,
     ) -> Result<ApiKeyRecord, AppError>;
-    async fn list_system_keys(&self, limit: i64) -> Result<Vec<ApiKeyRecord>, AppError>;
-    async fn list_consumer_keys(&self, limit: i64) -> Result<Vec<ApiKeyRecord>, AppError>;
+    async fn list_system_keys(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<ApiKeyRecord>, AppError>;
+    async fn list_consumer_keys(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<ApiKeyRecord>, AppError>;
     async fn get_system_key(&self, id: Uuid) -> Result<ApiKeyRecord, AppError>;
     async fn get_consumer_key(&self, id: Uuid) -> Result<ApiKeyRecord, AppError>;
     async fn rotate_key(
@@ -202,24 +281,37 @@ pub trait AdminRepository {
     ) -> Result<TrustedJwtIssuerRecord, AppError>;
     async fn list_trusted_jwt_issuers(
         &self,
+        cursor: Option<ListCursor>,
         limit: i64,
     ) -> Result<Vec<TrustedJwtIssuerRecord>, AppError>;
     async fn get_trusted_jwt_issuer(&self, id: Uuid) -> Result<TrustedJwtIssuerRecord, AppError>;
     async fn patch_trusted_jwt_issuer(
         &self,
         id: Uuid,
+        expected_version: i64,
         request: &TrustedJwtIssuerPatchRequest,
     ) -> Result<TrustedJwtIssuerRecord, AppError>;
     async fn set_trusted_jwt_issuer_status(
         &self,
         id: Uuid,
+        expected_version: i64,
         status: &str,
     ) -> Result<TrustedJwtIssuerRecord, AppError>;
     async fn touch_trusted_jwt_issuer(&self, id: Uuid) -> Result<TrustedJwtIssuerRecord, AppError>;
-    async fn soft_delete_trusted_jwt_issuer(&self, id: Uuid) -> Result<(), AppError>;
+    async fn soft_delete_trusted_jwt_issuer(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+    ) -> Result<(), AppError>;
 
     async fn insert_audit(&self, insert: AuditLogInsert) -> Result<(), AppError>;
-    async fn list_audit_logs(&self, limit: i64) -> Result<Vec<AuditLogRecord>, AppError>;
+    /// Note the sort key: `audit_logs` orders by `occurred_at`, not `created_at` (it has
+    /// no `created_at` column). Same cursor shape, different column.
+    async fn list_audit_logs(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<AuditLogRecord>, AppError>;
     async fn get_audit_log(&self, id: Uuid) -> Result<AuditLogRecord, AppError>;
     async fn get_idempotency_record(
         &self,
@@ -580,38 +672,48 @@ impl PgAdminCommandTransaction {
             sleep(Duration::from_millis(20)).await;
         }
 
+        // Every key hash this claim can reach is swept: an expired pre-switch row must not
+        // be resurrected as a replay by the legacy lookup below.
+        let mut sweep_key_hashes = vec![claim.key_hash.clone()];
+        sweep_key_hashes.extend(claim.legacy_key_hash.clone());
         sqlx::query(
             r#"
             delete from idempotency_records
-            where idempotency_key_hash = $1
+            where idempotency_key_hash = any($1)
               and actor_fingerprint = $2
               and operation = $3
               and expires_at <= now()
             "#,
         )
-        .bind(&claim.key_hash)
+        .bind(sweep_key_hashes)
         .bind(&claim.actor_fingerprint)
         .bind(&claim.operation)
         .execute(self.connection())
         .await?;
 
-        if let Some(record) = self
+        // Dual lookup: the current key hash first, then the pre-switch one — the latter
+        // only while the dual-read window is open, so closing it removes the extra query
+        // (plan 03 finding F4). The advisory lock above is keyed on `claim.key_hash`, which
+        // is identical for every concurrent request carrying the same Idempotency-Key, so
+        // both branches stay serialized.
+        let mut existing = self
             .load_idempotency(&claim.key_hash, &claim.actor_fingerprint, &claim.operation)
-            .await?
+            .await?;
+        if existing.is_none()
+            && let Some(legacy_key_hash) = &claim.legacy_key_hash
         {
-            if record.request_hash != claim.request_hash {
-                return Err(AppError::conflict(
-                    "idempotency_conflict",
-                    "same Idempotency-Key was used with a different request",
-                ));
-            }
-            if record.response_status.is_none() || record.response_body.is_none() {
-                return Err(AppError::conflict(
-                    "idempotency_in_progress",
-                    "another request with this Idempotency-Key is still in progress",
-                ));
-            }
-            return Ok(AdminIdempotencyClaimOutcome::Replay(record));
+            existing = self
+                .load_idempotency(legacy_key_hash, &claim.actor_fingerprint, &claim.operation)
+                .await?;
+        }
+
+        if let Some(record) = existing {
+            // Deliberately no digest comparison here. Deciding whether this row describes
+            // the same request means recomputing a keyed HMAC and comparing it in constant
+            // time, which is hashing policy and belongs to the application layer
+            // (plan 03 finding F3). Returning the row leaves this transaction open, so a
+            // conflict raised upstream still rolls the sweep above back, exactly as before.
+            return Ok(AdminIdempotencyClaimOutcome::Existing(record));
         }
 
         sqlx::query(
@@ -751,20 +853,28 @@ impl AdminRepository for PgAdminRepository {
         application_record_from_row(&row)
     }
 
-    async fn list_applications(&self, limit: i64) -> Result<Vec<ApplicationRecord>, AppError> {
-        let rows = sqlx::query(
+    async fn list_applications(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<ApplicationRecord>, AppError> {
+        let tail = KeysetTail::new("created_at", cursor.as_ref(), 1);
+        let sql = format!(
             r#"
             select id, external_application_id, application_slug, display_name, status,
                    metadata, created_at, updated_at, deleted_at, version
             from applications
             where deleted_at is null
-            order by created_at desc
-            limit $1
+            {}
+            {}
             "#,
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+            tail.and_clause(),
+            tail.order_and_limit,
+        );
+        let rows = bind_cursor(sqlx::query(&sql), cursor.as_ref())
+            .bind(over_fetch_limit(limit))
+            .fetch_all(&self.pool)
+            .await?;
         rows.iter().map(application_record_from_row).collect()
     }
 
@@ -787,8 +897,18 @@ impl AdminRepository for PgAdminRepository {
     async fn patch_application(
         &self,
         id: Uuid,
+        expected_version: i64,
         request: &ApplicationPatchRequest,
     ) -> Result<ApplicationRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            APPLICATION_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("application {id}"),
+        )
+        .await?;
         let row = sqlx::query(
             r#"
             update applications
@@ -797,7 +917,7 @@ impl AdminRepository for PgAdminRepository {
                 display_name = coalesce($4, display_name),
                 updated_at = now()
                 , metadata = coalesce($5, metadata)
-            where id = $1 and deleted_at is null
+            where id = $1 and deleted_at is null and version = $6
             returning id, external_application_id, application_slug, display_name, status,
                       metadata, created_at, updated_at, deleted_at, version
             "#,
@@ -807,44 +927,78 @@ impl AdminRepository for PgAdminRepository {
         .bind(&request.application_slug)
         .bind(&request.display_name)
         .bind(&request.metadata)
-        .fetch_optional(&self.pool)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("application {id}")))?;
-        application_record_from_row(&row)
+        .ok_or_else(version_conflict)?;
+        let record = application_record_from_row(&row)?;
+        tx.commit().await?;
+        Ok(record)
     }
 
     async fn set_application_status(
         &self,
         id: Uuid,
+        expected_version: i64,
         status: &str,
     ) -> Result<ApplicationRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            APPLICATION_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("application {id}"),
+        )
+        .await?;
         let row = sqlx::query(
             r#"
             update applications
             set status = $2,
                 deleted_at = case when $2 = 'deleted' then coalesce(deleted_at, now()) else deleted_at end,
                 updated_at = now()
-            where id = $1 and deleted_at is null
+            where id = $1 and deleted_at is null and version = $3
             returning id, external_application_id, application_slug, display_name, status,
                       metadata, created_at, updated_at, deleted_at, version
             "#,
         )
         .bind(id)
         .bind(status)
-        .fetch_optional(&self.pool)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("application {id}")))?;
-        application_record_from_row(&row)
+        .ok_or_else(version_conflict)?;
+        let record = application_record_from_row(&row)?;
+        tx.commit().await?;
+        Ok(record)
     }
 
-    async fn soft_delete_application(&self, id: Uuid) -> Result<(), AppError> {
+    async fn soft_delete_application(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+    ) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            APPLICATION_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("application {id}"),
+        )
+        .await?;
         let result = sqlx::query(
-            "update applications set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null",
+            "update applications set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null and version = $2",
         )
         .bind(id)
-        .execute(&self.pool)
+        .bind(current_version)
+        .execute(&mut *tx)
         .await?;
-        ensure_affected(result.rows_affected(), format!("application {id}"))
+        if result.rows_affected() == 0 {
+            return Err(version_conflict());
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn create_provider(
@@ -872,20 +1026,28 @@ impl AdminRepository for PgAdminRepository {
         provider_record_from_row(&row)
     }
 
-    async fn list_providers(&self, limit: i64) -> Result<Vec<ProviderRecord>, AppError> {
-        let rows = sqlx::query(
+    async fn list_providers(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<ProviderRecord>, AppError> {
+        let tail = KeysetTail::new("created_at", cursor.as_ref(), 1);
+        let sql = format!(
             r#"
             select id, provider_type, display_name, base_url, status, metadata,
                    created_at, updated_at, deleted_at, version
             from providers
             where deleted_at is null
-            order by created_at desc
-            limit $1
+            {}
+            {}
             "#,
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+            tail.and_clause(),
+            tail.order_and_limit,
+        );
+        let rows = bind_cursor(sqlx::query(&sql), cursor.as_ref())
+            .bind(over_fetch_limit(limit))
+            .fetch_all(&self.pool)
+            .await?;
         rows.iter().map(provider_record_from_row).collect()
     }
 
@@ -908,11 +1070,21 @@ impl AdminRepository for PgAdminRepository {
     async fn patch_provider(
         &self,
         id: Uuid,
+        expected_version: i64,
         request: &ProviderPatchRequest,
         normalized_base_url: Option<Option<String>>,
     ) -> Result<ProviderRecord, AppError> {
         let update_base_url = normalized_base_url.is_some();
         let base_url = normalized_base_url.flatten();
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            PROVIDER_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("provider {id}"),
+        )
+        .await?;
         let row = sqlx::query(
             r#"
             update providers
@@ -920,7 +1092,7 @@ impl AdminRepository for PgAdminRepository {
                 base_url = case when $3 then $4 else base_url end,
                 metadata = coalesce($5, metadata),
                 updated_at = now()
-            where id = $1 and deleted_at is null
+            where id = $1 and deleted_at is null and version = $6
             returning id, provider_type, display_name, base_url, status, metadata,
                       created_at, updated_at, deleted_at, version
             "#,
@@ -930,44 +1102,74 @@ impl AdminRepository for PgAdminRepository {
         .bind(update_base_url)
         .bind(&base_url)
         .bind(&request.metadata)
-        .fetch_optional(&self.pool)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("provider {id}")))?;
-        provider_record_from_row(&row)
+        .ok_or_else(version_conflict)?;
+        let record = provider_record_from_row(&row)?;
+        tx.commit().await?;
+        Ok(record)
     }
 
     async fn set_provider_status(
         &self,
         id: Uuid,
+        expected_version: i64,
         status: &str,
     ) -> Result<ProviderRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            PROVIDER_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("provider {id}"),
+        )
+        .await?;
         let row = sqlx::query(
             r#"
             update providers
             set status = $2,
                 deleted_at = case when $2 = 'deleted' then coalesce(deleted_at, now()) else deleted_at end,
                 updated_at = now()
-            where id = $1 and deleted_at is null
+            where id = $1 and deleted_at is null and version = $3
             returning id, provider_type, display_name, base_url, status, metadata,
                       created_at, updated_at, deleted_at, version
             "#,
         )
         .bind(id)
         .bind(status)
-        .fetch_optional(&self.pool)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("provider {id}")))?;
-        provider_record_from_row(&row)
+        .ok_or_else(version_conflict)?;
+        let record = provider_record_from_row(&row)?;
+        tx.commit().await?;
+        Ok(record)
     }
 
-    async fn soft_delete_provider(&self, id: Uuid) -> Result<(), AppError> {
+    async fn soft_delete_provider(&self, id: Uuid, expected_version: i64) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            PROVIDER_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("provider {id}"),
+        )
+        .await?;
         let result = sqlx::query(
-            "update providers set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null",
+            "update providers set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null and version = $2",
         )
         .bind(id)
-        .execute(&self.pool)
+        .bind(current_version)
+        .execute(&mut *tx)
         .await?;
-        ensure_affected(result.rows_affected(), format!("provider {id}"))
+        if result.rows_affected() == 0 {
+            return Err(version_conflict());
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn create_provider_model(
@@ -998,37 +1200,52 @@ impl AdminRepository for PgAdminRepository {
     async fn list_provider_models(
         &self,
         provider_id: Uuid,
+        cursor: Option<ListCursor>,
         limit: i64,
     ) -> Result<Vec<ProviderModelRecord>, AppError> {
-        let rows = sqlx::query(
+        // `$1` is `provider_id`, so the cursor (if any) starts at `$2`.
+        let tail = KeysetTail::new("created_at", cursor.as_ref(), 2);
+        let sql = format!(
             r#"
             select id, provider_id, model_key, display_name, capabilities, status,
                    created_at, updated_at, deleted_at, version
             from provider_models
             where provider_id = $1 and deleted_at is null
-            order by created_at desc
-            limit $2
+            {}
+            {}
             "#,
-        )
-        .bind(provider_id)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+            tail.and_clause(),
+            tail.order_and_limit,
+        );
+        let rows = bind_cursor(sqlx::query(&sql).bind(provider_id), cursor.as_ref())
+            .bind(over_fetch_limit(limit))
+            .fetch_all(&self.pool)
+            .await?;
         rows.iter().map(provider_model_record_from_row).collect()
     }
 
     async fn patch_provider_model(
         &self,
         id: Uuid,
+        expected_version: i64,
         request: &ProviderModelPatchRequest,
     ) -> Result<ProviderModelRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            PROVIDER_MODEL_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("provider model {id}"),
+        )
+        .await?;
         let row = sqlx::query(
             r#"
             update provider_models
             set display_name = coalesce($2, display_name),
                 capabilities = coalesce($3, capabilities),
                 updated_at = now()
-            where id = $1 and deleted_at is null
+            where id = $1 and deleted_at is null and version = $4
             returning id, provider_id, model_key, display_name, capabilities, status,
                       created_at, updated_at, deleted_at, version
             "#,
@@ -1036,10 +1253,13 @@ impl AdminRepository for PgAdminRepository {
         .bind(id)
         .bind(&request.display_name)
         .bind(&request.capabilities)
-        .fetch_optional(&self.pool)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("provider model {id}")))?;
-        provider_model_record_from_row(&row)
+        .ok_or_else(version_conflict)?;
+        let record = provider_model_record_from_row(&row)?;
+        tx.commit().await?;
+        Ok(record)
     }
 
     async fn get_provider_model(&self, id: Uuid) -> Result<ProviderModelRecord, AppError> {
@@ -1061,35 +1281,66 @@ impl AdminRepository for PgAdminRepository {
     async fn set_provider_model_status(
         &self,
         id: Uuid,
+        expected_version: i64,
         status: &str,
     ) -> Result<ProviderModelRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            PROVIDER_MODEL_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("provider model {id}"),
+        )
+        .await?;
         let row = sqlx::query(
             r#"
             update provider_models
             set status = $2,
                 deleted_at = case when $2 = 'deleted' then coalesce(deleted_at, now()) else deleted_at end,
                 updated_at = now()
-            where id = $1 and deleted_at is null
+            where id = $1 and deleted_at is null and version = $3
             returning id, provider_id, model_key, display_name, capabilities, status,
                       created_at, updated_at, deleted_at, version
             "#,
         )
         .bind(id)
         .bind(status)
-        .fetch_optional(&self.pool)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("provider model {id}")))?;
-        provider_model_record_from_row(&row)
+        .ok_or_else(version_conflict)?;
+        let record = provider_model_record_from_row(&row)?;
+        tx.commit().await?;
+        Ok(record)
     }
 
-    async fn soft_delete_provider_model(&self, id: Uuid) -> Result<(), AppError> {
+    async fn soft_delete_provider_model(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+    ) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            PROVIDER_MODEL_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("provider model {id}"),
+        )
+        .await?;
         let result = sqlx::query(
-            "update provider_models set status = 'disabled', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null",
+            "update provider_models set status = 'disabled', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null and version = $2",
         )
         .bind(id)
-        .execute(&self.pool)
+        .bind(current_version)
+        .execute(&mut *tx)
         .await?;
-        ensure_affected(result.rows_affected(), format!("provider model {id}"))
+        if result.rows_affected() == 0 {
+            return Err(version_conflict());
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn create_credential(
@@ -1138,22 +1389,36 @@ impl AdminRepository for PgAdminRepository {
         credential_record_from_row(&row)
     }
 
-    async fn list_credentials(&self, limit: i64) -> Result<Vec<CredentialRecord>, AppError> {
-        let sql = credential_select_sql("order by created_at desc limit $1");
-        let rows = sqlx::query(&sql).bind(limit).fetch_all(&self.pool).await?;
+    async fn list_credentials(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<CredentialRecord>, AppError> {
+        let tail = KeysetTail::new("created_at", cursor.as_ref(), 1);
+        // `credential_select_sql` already emits `where deleted_at is null`.
+        let sql = credential_select_sql(&format!("{} {}", tail.and_clause(), tail.order_and_limit));
+        let rows = bind_cursor(sqlx::query(&sql), cursor.as_ref())
+            .bind(over_fetch_limit(limit))
+            .fetch_all(&self.pool)
+            .await?;
         rows.iter().map(credential_record_from_row).collect()
     }
 
     async fn list_user_credentials(
         &self,
         external_user_id: &str,
+        cursor: Option<ListCursor>,
         limit: i64,
     ) -> Result<Vec<CredentialRecord>, AppError> {
-        let sql =
-            credential_select_sql("and external_user_id = $1 order by created_at desc limit $2");
-        let rows = sqlx::query(&sql)
-            .bind(external_user_id)
-            .bind(limit)
+        // `$1` is `external_user_id`, so the cursor (if any) starts at `$2`.
+        let tail = KeysetTail::new("created_at", cursor.as_ref(), 2);
+        let sql = credential_select_sql(&format!(
+            "and external_user_id = $1 {} {}",
+            tail.and_clause(),
+            tail.order_and_limit
+        ));
+        let rows = bind_cursor(sqlx::query(&sql).bind(external_user_id), cursor.as_ref())
+            .bind(over_fetch_limit(limit))
             .fetch_all(&self.pool)
             .await?;
         rows.iter().map(credential_record_from_row).collect()
@@ -1203,8 +1468,18 @@ impl AdminRepository for PgAdminRepository {
     async fn patch_credential(
         &self,
         id: Uuid,
+        expected_version: i64,
         request: &CredentialPatchRequest,
     ) -> Result<CredentialRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            CREDENTIAL_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("provider credential {id}"),
+        )
+        .await?;
         let row = sqlx::query(
             r#"
             update provider_credentials
@@ -1213,7 +1488,7 @@ impl AdminRepository for PgAdminRepository {
                 expires_at = coalesce($4, expires_at),
                 metadata = coalesce($5, metadata),
                 updated_at = now()
-            where id = $1 and deleted_at is null
+            where id = $1 and deleted_at is null and version = $6
             returning id, provider_id, credential_type, scope_type, external_tenant_id,
                       application_id, external_user_id, encryption_algorithm,
                       encryption_version, secret_fingerprint, masked_secret, status,
@@ -1226,10 +1501,13 @@ impl AdminRepository for PgAdminRepository {
         .bind(request.priority)
         .bind(request.expires_at)
         .bind(&request.metadata)
-        .fetch_optional(&self.pool)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("provider credential {id}")))?;
-        credential_record_from_row(&row)
+        .ok_or_else(version_conflict)?;
+        let record = credential_record_from_row(&row)?;
+        tx.commit().await?;
+        Ok(record)
     }
 
     async fn rotate_credential(
@@ -1276,15 +1554,25 @@ impl AdminRepository for PgAdminRepository {
     async fn set_credential_status(
         &self,
         id: Uuid,
+        expected_version: i64,
         status: &str,
     ) -> Result<CredentialRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            CREDENTIAL_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("provider credential {id}"),
+        )
+        .await?;
         let row = sqlx::query(
             r#"
             update provider_credentials
             set status = $2,
                 deleted_at = case when $2 = 'deleted' then coalesce(deleted_at, now()) else deleted_at end,
                 updated_at = now()
-            where id = $1 and deleted_at is null
+            where id = $1 and deleted_at is null and version = $3
             returning id, provider_id, credential_type, scope_type, external_tenant_id,
                       application_id, external_user_id, encryption_algorithm,
                       encryption_version, secret_fingerprint, masked_secret, status,
@@ -1294,10 +1582,13 @@ impl AdminRepository for PgAdminRepository {
         )
         .bind(id)
         .bind(status)
-        .fetch_optional(&self.pool)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("provider credential {id}")))?;
-        credential_record_from_row(&row)
+        .ok_or_else(version_conflict)?;
+        let record = credential_record_from_row(&row)?;
+        tx.commit().await?;
+        Ok(record)
     }
 
     async fn mark_credential_validated(&self, id: Uuid) -> Result<CredentialRecord, AppError> {
@@ -1320,29 +1611,68 @@ impl AdminRepository for PgAdminRepository {
         credential_record_from_row(&row)
     }
 
-    async fn soft_delete_credential(&self, id: Uuid) -> Result<(), AppError> {
+    async fn soft_delete_credential(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+    ) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            CREDENTIAL_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("provider credential {id}"),
+        )
+        .await?;
         let result = sqlx::query(
-            "update provider_credentials set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null",
+            "update provider_credentials set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null and version = $2",
         )
         .bind(id)
-        .execute(&self.pool)
+        .bind(current_version)
+        .execute(&mut *tx)
         .await?;
-        ensure_affected(result.rows_affected(), format!("provider credential {id}"))
+        if result.rows_affected() == 0 {
+            return Err(version_conflict());
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn soft_delete_user_credential(
         &self,
         external_user_id: &str,
         id: Uuid,
+        expected_version: i64,
     ) -> Result<(), AppError> {
-        let result = sqlx::query(
-            "update provider_credentials set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and external_user_id = $2 and deleted_at is null",
+        let mut tx = self.pool.begin().await?;
+        // Scoped by `external_user_id` as well as `id`: a credential owned by a different user
+        // must stay a 404 here, exactly as it was before the lock was introduced, rather than
+        // becoming a version conflict that confirms the row exists.
+        let current_version = sqlx::query_scalar::<_, i64>(
+            "select version from provider_credentials where id = $1 and external_user_id = $2 and deleted_at is null for update",
         )
         .bind(id)
         .bind(external_user_id)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("provider credential {id}")))?;
+        if current_version != expected_version {
+            return Err(version_conflict());
+        }
+        let result = sqlx::query(
+            "update provider_credentials set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and external_user_id = $2 and deleted_at is null and version = $3",
+        )
+        .bind(id)
+        .bind(external_user_id)
+        .bind(current_version)
+        .execute(&mut *tx)
         .await?;
-        ensure_affected(result.rows_affected(), format!("provider credential {id}"))
+        if result.rows_affected() == 0 {
+            return Err(version_conflict());
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn create_system_key(
@@ -1410,12 +1740,20 @@ impl AdminRepository for PgAdminRepository {
         api_key_record_from_row(&row)
     }
 
-    async fn list_system_keys(&self, limit: i64) -> Result<Vec<ApiKeyRecord>, AppError> {
-        list_keys(&self.pool, "system_api_keys", false, limit).await
+    async fn list_system_keys(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<ApiKeyRecord>, AppError> {
+        list_keys(&self.pool, "system_api_keys", false, cursor, limit).await
     }
 
-    async fn list_consumer_keys(&self, limit: i64) -> Result<Vec<ApiKeyRecord>, AppError> {
-        list_keys(&self.pool, "consumer_api_keys", true, limit).await
+    async fn list_consumer_keys(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<ApiKeyRecord>, AppError> {
+        list_keys(&self.pool, "consumer_api_keys", true, cursor, limit).await
     }
 
     async fn get_system_key(&self, id: Uuid) -> Result<ApiKeyRecord, AppError> {
@@ -1563,11 +1901,20 @@ impl AdminRepository for PgAdminRepository {
 
     async fn list_trusted_jwt_issuers(
         &self,
+        cursor: Option<ListCursor>,
         limit: i64,
     ) -> Result<Vec<TrustedJwtIssuerRecord>, AppError> {
-        let sql =
-            trusted_issuer_select_sql("where deleted_at is null order by created_at desc limit $1");
-        let rows = sqlx::query(&sql).bind(limit).fetch_all(&self.pool).await?;
+        let tail = KeysetTail::new("created_at", cursor.as_ref(), 1);
+        // `trusted_issuer_select_sql` emits no `where`, so this call site owns it.
+        let sql = trusted_issuer_select_sql(&format!(
+            "where deleted_at is null {} {}",
+            tail.and_clause(),
+            tail.order_and_limit
+        ));
+        let rows = bind_cursor(sqlx::query(&sql), cursor.as_ref())
+            .bind(over_fetch_limit(limit))
+            .fetch_all(&self.pool)
+            .await?;
         rows.iter()
             .map(crate::infra::pg_rows::trusted_jwt_issuer_record_from_row)
             .collect()
@@ -1586,8 +1933,18 @@ impl AdminRepository for PgAdminRepository {
     async fn patch_trusted_jwt_issuer(
         &self,
         id: Uuid,
+        expected_version: i64,
         request: &TrustedJwtIssuerPatchRequest,
     ) -> Result<TrustedJwtIssuerRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            TRUSTED_JWT_ISSUER_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("trusted JWT issuer {id}"),
+        )
+        .await?;
         let row = sqlx::query(
             r#"
             update trusted_jwt_issuers
@@ -1605,7 +1962,7 @@ impl AdminRepository for PgAdminRepository {
                 clock_skew_seconds = coalesce($13, clock_skew_seconds),
                 allow_delegation = coalesce($14, allow_delegation),
                 updated_at = now()
-            where id = $1 and deleted_at is null
+            where id = $1 and deleted_at is null and version = $15
             returning id, issuer, jwks_url, expected_audiences, allowed_algorithms,
                       subject_claim, user_id_claim, tenant_id_claim, application_id_claim,
                       roles_claim, scopes_claim, delegated_user_claim, delegated_tenant_claim,
@@ -1627,24 +1984,37 @@ impl AdminRepository for PgAdminRepository {
         .bind(&request.delegated_tenant_claim)
         .bind(request.clock_skew_seconds)
         .bind(request.allow_delegation)
-        .fetch_optional(&self.pool)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("trusted JWT issuer {id}")))?;
-        crate::infra::pg_rows::trusted_jwt_issuer_record_from_row(&row)
+        .ok_or_else(version_conflict)?;
+        let record = crate::infra::pg_rows::trusted_jwt_issuer_record_from_row(&row)?;
+        tx.commit().await?;
+        Ok(record)
     }
 
     async fn set_trusted_jwt_issuer_status(
         &self,
         id: Uuid,
+        expected_version: i64,
         status: &str,
     ) -> Result<TrustedJwtIssuerRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            TRUSTED_JWT_ISSUER_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("trusted JWT issuer {id}"),
+        )
+        .await?;
         let row = sqlx::query(
             r#"
             update trusted_jwt_issuers
             set status = $2,
                 deleted_at = case when $2 = 'deleted' then coalesce(deleted_at, now()) else deleted_at end,
                 updated_at = now()
-            where id = $1 and deleted_at is null
+            where id = $1 and deleted_at is null and version = $3
             returning id, issuer, jwks_url, expected_audiences, allowed_algorithms,
                       subject_claim, user_id_claim, tenant_id_claim, application_id_claim,
                       roles_claim, scopes_claim, delegated_user_claim, delegated_tenant_claim,
@@ -1654,10 +2024,13 @@ impl AdminRepository for PgAdminRepository {
         )
         .bind(id)
         .bind(status)
-        .fetch_optional(&self.pool)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("trusted JWT issuer {id}")))?;
-        crate::infra::pg_rows::trusted_jwt_issuer_record_from_row(&row)
+        .ok_or_else(version_conflict)?;
+        let record = crate::infra::pg_rows::trusted_jwt_issuer_record_from_row(&row)?;
+        tx.commit().await?;
+        Ok(record)
     }
 
     async fn touch_trusted_jwt_issuer(&self, id: Uuid) -> Result<TrustedJwtIssuerRecord, AppError> {
@@ -1680,14 +2053,32 @@ impl AdminRepository for PgAdminRepository {
         crate::infra::pg_rows::trusted_jwt_issuer_record_from_row(&row)
     }
 
-    async fn soft_delete_trusted_jwt_issuer(&self, id: Uuid) -> Result<(), AppError> {
+    async fn soft_delete_trusted_jwt_issuer(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+    ) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            TRUSTED_JWT_ISSUER_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("trusted JWT issuer {id}"),
+        )
+        .await?;
         let result = sqlx::query(
-            "update trusted_jwt_issuers set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null",
+            "update trusted_jwt_issuers set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null and version = $2",
         )
         .bind(id)
-        .execute(&self.pool)
+        .bind(current_version)
+        .execute(&mut *tx)
         .await?;
-        ensure_affected(result.rows_affected(), format!("trusted JWT issuer {id}"))
+        if result.rows_affected() == 0 {
+            return Err(version_conflict());
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn insert_audit(&self, insert: AuditLogInsert) -> Result<(), AppError> {
@@ -1695,20 +2086,30 @@ impl AdminRepository for PgAdminRepository {
         insert_audit_with_connection(&mut connection, insert).await
     }
 
-    async fn list_audit_logs(&self, limit: i64) -> Result<Vec<AuditLogRecord>, AppError> {
-        let rows = sqlx::query(
+    async fn list_audit_logs(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<AuditLogRecord>, AppError> {
+        // The one admin list whose sort key is not `created_at`, and the one with no
+        // `where` clause of its own — so the keyset predicate has to introduce it.
+        let tail = KeysetTail::new("occurred_at", cursor.as_ref(), 1);
+        let sql = format!(
             r#"
             select id, occurred_at, request_id, actor_type, actor_subject, delegated_subject,
                    external_user_id, external_tenant_id, application_id, resource_type,
                    resource_id, action, result, source_ip::text as source_ip, user_agent, metadata
             from audit_logs
-            order by occurred_at desc
-            limit $1
+            {}
+            {}
             "#,
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+            tail.where_clause(),
+            tail.order_and_limit,
+        );
+        let rows = bind_cursor(sqlx::query(&sql), cursor.as_ref())
+            .bind(over_fetch_limit(limit))
+            .fetch_all(&self.pool)
+            .await?;
         rows.iter().map(audit_log_record_from_row).collect()
     }
 
@@ -1880,6 +2281,92 @@ async fn insert_audit_with_connection(
     Ok(())
 }
 
+/// How many rows a list query actually asks Postgres for.
+///
+/// One more than the caller wants. That extra row is the existence proof for `has_more`:
+/// the application layer trims it off and reports `has_more = true` if it was there. It is
+/// what keeps `has_more` from costing a second `count(*)` over the whole table on every
+/// single page.
+fn over_fetch_limit(limit: i64) -> i64 {
+    limit.saturating_add(1)
+}
+
+/// The `order by` / `limit` tail shared by every admin list query, plus the optional
+/// keyset predicate that makes the advertised `cursor` parameter real.
+///
+/// Two things here are load-bearing:
+///
+/// * **Strictly less-than.** Every admin list is ordered descending, so "the page after
+///   this cursor" is the rows whose sort key is strictly *below* it. `<=` would re-emit
+///   the cursor row itself at the top of every page.
+/// * **The `id` tiebreaker.** The comparison is on the row constructor
+///   `(sort_column, id)`, not on `sort_column` alone. Without the `id` leg, rows sharing a
+///   timestamp come back in an unspecified order, and a page boundary landing inside such
+///   a group silently skips or repeats rows — the exact defect P1-4 describes. None of the
+///   nine admin lists had this tiebreaker before plan 04.
+///
+/// `sort_column` is always a literal chosen by the call sites in this file and is never
+/// caller input. The cursor's *values* never reach the SQL text at all: they are bound as
+/// parameters by [`bind_cursor`].
+struct KeysetTail {
+    /// The bare keyset condition, or `None` when the caller asked for the first page.
+    condition: Option<String>,
+    order_and_limit: String,
+}
+
+impl KeysetTail {
+    /// `first_param` is the next unused `$n` after the query's own fixed parameters, so
+    /// the numbering stays correct whether or not a cursor is present.
+    fn new(sort_column: &str, cursor: Option<&ListCursor>, first_param: usize) -> Self {
+        let (condition, limit_param) = match cursor {
+            Some(_) => (
+                Some(format!(
+                    "({sort_column}, id) < (${first_param}::timestamptz, ${}::uuid)",
+                    first_param + 1
+                )),
+                first_param + 2,
+            ),
+            None => (None, first_param),
+        };
+
+        Self {
+            condition,
+            order_and_limit: format!("order by {sort_column} desc, id desc limit ${limit_param}"),
+        }
+    }
+
+    /// The condition as an `and …` clause, for a query that already has a `where`.
+    fn and_clause(&self) -> String {
+        match &self.condition {
+            Some(condition) => format!("and {condition}"),
+            None => String::new(),
+        }
+    }
+
+    /// The condition as a `where …` clause, for a query that has none (`audit_logs`).
+    fn where_clause(&self) -> String {
+        match &self.condition {
+            Some(condition) => format!("where {condition}"),
+            None => String::new(),
+        }
+    }
+}
+
+/// Binds the cursor's two values, in the order [`KeysetTail`] numbered them.
+///
+/// This is the only place a cursor value meets a query, and it is a bind every time. A
+/// forged or malformed cursor has already been rejected by `ListCursor::decode`, and even
+/// a valid one is a typed `DateTime<Utc>` / `Uuid` that cannot reach the SQL text.
+fn bind_cursor<'q>(
+    query: Query<'q, Postgres, PgArguments>,
+    cursor: Option<&ListCursor>,
+) -> Query<'q, Postgres, PgArguments> {
+    match cursor {
+        Some(cursor) => query.bind(cursor.ts).bind(cursor.id),
+        None => query,
+    }
+}
+
 fn credential_select_sql(suffix: &str) -> String {
     format!(
         r#"
@@ -1913,34 +2400,35 @@ async fn list_keys(
     pool: &PgPool,
     table: &str,
     has_application: bool,
+    cursor: Option<ListCursor>,
     limit: i64,
 ) -> Result<Vec<ApiKeyRecord>, AppError> {
-    let sql = match (table, has_application) {
-        ("system_api_keys", false) => {
-            r#"
-            select id, null::uuid as application_id, display_name, key_prefix, fingerprint,
-                   pepper_version, scopes, status, expires_at, last_used_at, created_at,
-                   updated_at, revoked_at
-            from system_api_keys
-            where deleted_at is null
-            order by created_at desc
-            limit $1
-            "#
-        }
-        ("consumer_api_keys", true) => {
-            r#"
-            select id, application_id, display_name, key_prefix, fingerprint,
-                   pepper_version, scopes, status, expires_at, last_used_at, created_at,
-                   updated_at, revoked_at
-            from consumer_api_keys
-            where deleted_at is null
-            order by created_at desc
-            limit $1
-            "#
-        }
+    // The `(table, has_application)` match is what keeps the interpolated table name a
+    // closed set of literals rather than caller input.
+    let projection = match (table, has_application) {
+        ("system_api_keys", false) => "null::uuid as application_id",
+        ("consumer_api_keys", true) => "application_id",
         _ => return Err(AppError::Internal("unsupported api key table".to_string())),
     };
-    let rows = sqlx::query(sql).bind(limit).fetch_all(pool).await?;
+
+    let tail = KeysetTail::new("created_at", cursor.as_ref(), 1);
+    let sql = format!(
+        r#"
+        select id, {projection}, display_name, key_prefix, fingerprint,
+               pepper_version, scopes, status, expires_at, last_used_at, created_at,
+               updated_at, revoked_at
+        from {table}
+        where deleted_at is null
+        {}
+        {}
+        "#,
+        tail.and_clause(),
+        tail.order_and_limit,
+    );
+    let rows = bind_cursor(sqlx::query(&sql), cursor.as_ref())
+        .bind(over_fetch_limit(limit))
+        .fetch_all(pool)
+        .await?;
     rows.iter().map(api_key_record_from_row).collect()
 }
 
@@ -1984,5 +2472,192 @@ fn ensure_affected(rows_affected: u64, resource: String) -> Result<(), AppError>
         Err(AppError::NotFound(resource))
     } else {
         Ok(())
+    }
+}
+
+/// The `409` a stale `If-Match` produces. Identical code and message to the ones the HTTP
+/// layer used to emit from its own pre-read comparison, so moving the check down here is
+/// invisible on the wire.
+fn version_conflict() -> AppError {
+    AppError::conflict(
+        "resource_version_conflict",
+        "resource version does not match If-Match",
+    )
+}
+
+/// The row-lock statements paired with `lock_and_match_version`, one per versioned admin
+/// entity. Each takes the row's id as `$1` and every one of them ends in `for update`; a
+/// variant that does not is a silent reopening of the write window.
+const APPLICATION_VERSION_FOR_UPDATE: &str =
+    "select version from applications where id = $1 and deleted_at is null for update";
+const PROVIDER_VERSION_FOR_UPDATE: &str =
+    "select version from providers where id = $1 and deleted_at is null for update";
+const PROVIDER_MODEL_VERSION_FOR_UPDATE: &str =
+    "select version from provider_models where id = $1 and deleted_at is null for update";
+const CREDENTIAL_VERSION_FOR_UPDATE: &str =
+    "select version from provider_credentials where id = $1 and deleted_at is null for update";
+const TRUSTED_JWT_ISSUER_VERSION_FOR_UPDATE: &str =
+    "select version from trusted_jwt_issuers where id = $1 and deleted_at is null for update";
+
+/// Evaluate the caller's `If-Match` expectation where it is actually safe: on a row already
+/// locked by `select … for update`, inside the same transaction as the write that follows.
+///
+/// `select_version_sql` must select `version` for the target row and end in `for update`, with
+/// `$1` bound to `id`. Returns the locked version so the caller can carry `and version = $N`
+/// on the write itself.
+///
+/// The absent-row branch stays `NotFound` and only a genuine mismatch becomes `409`. Folding
+/// the predicate into the existing `UPDATE` without this pre-read would collapse both onto the
+/// update's own zero-row branch and turn a stale `If-Match` into a `404`.
+async fn lock_and_match_version(
+    conn: &mut sqlx::PgConnection,
+    select_version_sql: &str,
+    id: Uuid,
+    expected_version: i64,
+    resource: String,
+) -> Result<i64, AppError> {
+    let current_version = sqlx::query_scalar::<_, i64>(select_version_sql)
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(|| AppError::NotFound(resource))?;
+    if current_version != expected_version {
+        return Err(version_conflict());
+    }
+    Ok(current_version)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cursor() -> ListCursor {
+        ListCursor::new(
+            DateTime::from_timestamp_micros(1_753_401_600_123_456).expect("in-range timestamp"),
+            Uuid::parse_str("018f3a7c-1c2d-7e4f-8a9b-0c1d2e3f4a5b").expect("valid uuid"),
+        )
+    }
+
+    #[test]
+    fn keyset_predicate_is_omitted_when_no_cursor_is_supplied() {
+        let tail = KeysetTail::new("created_at", None, 1);
+
+        assert_eq!(tail.and_clause(), "");
+        assert_eq!(tail.where_clause(), "");
+        // With no cursor, the limit takes the first free parameter slot.
+        assert_eq!(
+            tail.order_and_limit,
+            "order by created_at desc, id desc limit $1"
+        );
+    }
+
+    #[test]
+    fn keyset_predicate_uses_strict_less_than_for_descending_lists() {
+        let tail = KeysetTail::new("created_at", Some(&cursor()), 1);
+
+        assert_eq!(
+            tail.and_clause(),
+            "and (created_at, id) < ($1::timestamptz, $2::uuid)"
+        );
+        // `<=` would re-emit the cursor row at the top of every page.
+        assert!(!tail.and_clause().contains("<="));
+        assert!(!tail.and_clause().contains('>'));
+    }
+
+    #[test]
+    fn keyset_predicate_uses_the_occurred_at_column_for_audit_logs() {
+        // The one admin list whose sort key is not `created_at`, and the one that has to
+        // introduce its own `where`.
+        let tail = KeysetTail::new("occurred_at", Some(&cursor()), 1);
+
+        assert_eq!(
+            tail.where_clause(),
+            "where (occurred_at, id) < ($1::timestamptz, $2::uuid)"
+        );
+        assert_eq!(
+            tail.order_and_limit,
+            "order by occurred_at desc, id desc limit $3"
+        );
+        assert!(!tail.where_clause().contains("created_at"));
+    }
+
+    #[test]
+    fn every_keyset_ordering_carries_the_id_tiebreaker() {
+        // Without `id desc`, rows sharing a timestamp come back in an unspecified order and
+        // a page boundary inside such a group silently skips or repeats them. All nine
+        // admin lists lacked this before plan 04.
+        for column in ["created_at", "occurred_at"] {
+            for cursor in [None, Some(&cursor())] {
+                let tail = KeysetTail::new(column, cursor, 1);
+                assert!(
+                    tail.order_and_limit
+                        .starts_with(&format!("order by {column} desc, id desc limit $")),
+                    "missing id tiebreaker for {column}: {}",
+                    tail.order_and_limit
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn keyset_parameter_numbering_follows_the_querys_own_fixed_parameters() {
+        // `list_provider_models` and `list_user_credentials` each bind one fixed parameter
+        // before the cursor, so the cursor starts at `$2` and the limit lands at `$4`.
+        let tail = KeysetTail::new("created_at", Some(&cursor()), 2);
+        assert_eq!(
+            tail.and_clause(),
+            "and (created_at, id) < ($2::timestamptz, $3::uuid)"
+        );
+        assert_eq!(
+            tail.order_and_limit,
+            "order by created_at desc, id desc limit $4"
+        );
+
+        // …and without a cursor the limit moves up to the slot the cursor would have used.
+        let first_page = KeysetTail::new("created_at", None, 2);
+        assert_eq!(
+            first_page.order_and_limit,
+            "order by created_at desc, id desc limit $2"
+        );
+    }
+
+    #[test]
+    fn keyset_predicate_binds_parameters_and_never_interpolates_values() {
+        // The strongest form of this assertion: two cursors that share no bytes must
+        // produce byte-identical SQL. If any cursor-derived value ever reached the query
+        // text, these would differ.
+        let one = ListCursor::new(
+            DateTime::from_timestamp_micros(1).expect("in-range timestamp"),
+            Uuid::parse_str("ffffffff-ffff-4fff-bfff-ffffffffffff").expect("valid uuid"),
+        );
+        let two = cursor();
+
+        for column in ["created_at", "occurred_at"] {
+            let a = KeysetTail::new(column, Some(&one), 1);
+            let b = KeysetTail::new(column, Some(&two), 1);
+
+            assert_eq!(a.and_clause(), b.and_clause());
+            assert_eq!(a.where_clause(), b.where_clause());
+            assert_eq!(a.order_and_limit, b.order_and_limit);
+
+            // And nothing that looks like a value is present at all — only `$n` holes.
+            let fragment = format!("{} {}", a.where_clause(), a.order_and_limit);
+            for forbidden in ["ffffffff", "018f3a7c", "1753401600", "'", "1970"] {
+                assert!(
+                    !fragment.contains(forbidden),
+                    "cursor-derived literal {forbidden:?} leaked into SQL: {fragment}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn over_fetch_limit_is_limit_plus_one() {
+        assert_eq!(over_fetch_limit(1), 2);
+        assert_eq!(over_fetch_limit(50), 51);
+        assert_eq!(over_fetch_limit(200), 201);
+        // Never panics on a hostile value, and never wraps to a negative limit — Postgres
+        // rejects a negative `LIMIT`, so wrapping would turn a bad input into a 500.
+        assert_eq!(over_fetch_limit(i64::MAX), i64::MAX);
     }
 }

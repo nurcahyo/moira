@@ -1,0 +1,57 @@
+# `cargo audit` policy.
+#
+# **Why this file exists.** The `supply-chain` CI job runs *two* tools — `cargo audit` and
+# `cargo deny check` (`.github/workflows/ci.yml`) — and they disagree by design. `cargo deny`
+# resolves the dependency *graph* and judges what is actually built; `cargo audit` reads
+# `Cargo.lock` directly and judges everything recorded there, including crates no enabled feature
+# ever compiles. Neither is wrong. But it means `cargo deny check` passing locally is **not**
+# evidence that the supply-chain job will pass, and that gap went unnoticed until a CI run failed
+# on a finding no local gate could produce.
+#
+# Every entry below carries its analysis. An undocumented ignore is how a supply-chain gate rots
+# quietly — the same reasoning as `deny.toml`, and the two files should be read together.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — `rsa` 0.9.10, "Marvin Attack: potential key recovery through timing
+    # sidechannels". Severity 5.9 (medium). RustSec records "No fixed upgrade is available!".
+    #
+    # Why it is inapplicable to Moira: **`rsa` is not in Moira's build graph on any target.**
+    #   cargo tree --invert rsa --target all --edges normal   ->   "nothing to print."
+    # It appears in `Cargo.lock` only because `sqlx` records the union of its optional backends,
+    # and `sqlx-mysql` — the sole path to `rsa`, which it uses for MySQL's authentication
+    # handshake — is not among the features Moira enables:
+    #   sqlx = { features = ["chrono", "json", "migrate", "postgres", "runtime-tokio-rustls", "uuid"] }
+    # Moira is Postgres-only. No `rsa` code is compiled into, or reachable from, the shipped binary,
+    # so there is no timing sidechannel to attack. This is exactly why `cargo deny check advisories`
+    # reports clean on the same tree: it judges the graph, not the lockfile.
+    #
+    # Why it is not resolved instead: there is no fixed version to upgrade to, and the dependency
+    # is not ours to drop — it is an artifact of how `sqlx` publishes its feature matrix. The
+    # honest options are this documented ignore or removing `sqlx`.
+    #
+    # Scope: exactly one advisory ID. Deliberately NOT solved by lowering the severity threshold or
+    # disabling the `advisories` check, either of which would silently swallow the next real finding
+    # — the failure mode this file is written to avoid.
+    #
+    # Revisit when: `rsa` publishes a fixed release (then this entry goes away on its own), or Moira
+    # enables a MySQL feature — at which point `rsa` enters the build graph, the analysis above
+    # stops holding, and this entry must be deleted rather than re-justified.
+    "RUSTSEC-2023-0071",
+
+    # RUSTSEC-2024-0436 — `paste` 1.0.15 is unmaintained (the author archived the repository).
+    #
+    # Mirrors the entry in `deny.toml`; both tools must be told, or the job fails on whichever one
+    # was not. `cargo audit` treats `unmaintained` as a warning rather than an error, so this is
+    # belt-and-braces — but leaving it implicit would mean a future `cargo audit` default change
+    # silently turns a documented acceptance into a red build.
+    #
+    # `paste` is a proc-macro reached solely through `utoipa-axum` 0.2.0 (the newest published
+    # version, so no upgrade drops it). It runs in the compiler and contributes no code to the
+    # shipped binary. This is an unmaintained advisory, not a vulnerability: no CVE, no known
+    # unsound behaviour.
+    #
+    # Revisit when: `utoipa-axum` publishes a release that drops `paste`, or the advisory is
+    # upgraded to a vulnerability. Either event should remove this entry, not extend it.
+    "RUSTSEC-2024-0436",
+]

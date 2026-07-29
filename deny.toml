@@ -1,0 +1,218 @@
+# Moira supply-chain policy for `cargo deny check` (audit finding P0-4).
+#
+# Before this file existed, `.github/workflows/ci.yml`'s `supply-chain` job ran
+# `cargo deny check` with no policy at all. That is not a no-op: cargo-deny falls back to
+# its built-in defaults, whose `[licenses].allow` list is EMPTY, so every one of Moira's
+# ~326 resolved crates is rejected. The job did not silently pass — measured on this tree it
+# exited 5 with 370 errors: 368 `error[rejected]` (license), 1 `error[unmaintained]`, and
+# 1 `error[unlicensed]`. So the `supply-chain` job was not a green checkmark that checked
+# nothing; it was red and uninformative. Either way the team had no *intentional* policy.
+#
+# Every value below was derived by running the tooling against the real `Cargo.lock`
+# (`cargo metadata --filter-platform <triple>` + `cargo deny check`), not copied from
+# `cargo deny init`. The scaffold's defaults are deliberately NOT kept: it ships
+# `unknown-registry = "warn"`, `unknown-git = "warn"`, `wildcards = "allow"` and
+# `confidence-threshold = 0.8`, all of which are loosened relative to this file.
+#
+# Re-derive after any dependency change:
+#   cargo deny check                       # full gate, must exit 0
+#   cargo deny list                        # license attribution per crate
+
+# ---------------------------------------------------------------------------------------
+[graph]
+# Scoped to the platforms Moira is actually built for, so the gate cannot fail on a crate
+# that never reaches a Moira binary:
+#   - x86_64-unknown-linux-gnu  : CI (`runs-on: ubuntu-latest`) and the `rust:1.97-bookworm`
+#                                 builder in `Dockerfile`.
+#   - aarch64-unknown-linux-gnu : arm64 container builds of the same image.
+#   - aarch64-apple-darwin      : the local development host.
+# Verified: all three resolve to the *same* set of license expressions (326 / 324 / 329
+# crates respectively), so the allow-list below is correct for every target, and no
+# Windows/WASM-only crate (`winapi-util`, `wasi`, `wit-bindgen`, `r-efi`) is dragged in.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+]
+
+# CI runs `cargo clippy --all-features` and `cargo test --all-features`, so the audited
+# graph must be the `--all-features` graph. Moira's only non-default feature is
+# `test-routes`, which adds no dependencies, so this is currently a superset of zero — but
+# it keeps the gate honest if a future feature ever gates a dependency.
+all-features = true
+
+# `exclude-dev` is intentionally left at its default (false): dev-dependencies ARE audited.
+# `Cargo.toml` has no `[dev-dependencies]` section today; plan 05 modules 4/5 may add the
+# first one (e.g. `insta`), and it must pass this policy like anything else.
+
+[output]
+feature-depth = 1
+
+# ---------------------------------------------------------------------------------------
+[advisories]
+# The canonical RustSec database. Pinned explicitly rather than relying on the built-in
+# default so a future cargo-deny release cannot change where advisories come from.
+db-urls = ["https://github.com/rustsec/advisory-db"]
+
+# A yanked crate in `Cargo.lock` fails the build. Yanking is the registry's only
+# revocation signal and it must not degrade to a warning.
+yanked = "deny"
+
+# Ignored advisories. An UNDOCUMENTED entry here is how a supply-chain gate rots, so every
+# entry carries a machine-readable `reason` AND the analysis below. The default posture is
+# RESOLVE (upgrade / replace / drop the dependency); ignoring requires the advisory to be
+# genuinely inapplicable to Moira's threat model.
+ignore = [
+    # RUSTSEC-2024-0436 — `paste` 1.0.15 is unmaintained (author archived the repo).
+    #
+    # Why this is not resolvable: `paste` is not a Moira dependency. The only path is
+    #   paste v1.0.15 (proc-macro) -> utoipa-axum v0.2.0 -> moira v0.1.0
+    # and utoipa-axum 0.2.0 is the newest published version (verified via `cargo search`),
+    # so there is no upgrade that drops it. RustSec itself records
+    # "Solution: No safe upgrade is available!".
+    #
+    # Why it is inapplicable: this is an `unmaintained` advisory, not a vulnerability —
+    # there is no CVE and no known unsound or exploitable behaviour. `paste` is a
+    # proc-macro crate: it runs only in the compiler during the build and contributes zero
+    # code to the shipped `moira` binary, so it is not part of the runtime attack surface.
+    #
+    # Scope of this entry: exactly one advisory ID. Deliberately NOT solved by relaxing the
+    # whole `unmaintained` category, which would silently swallow every future transitive
+    # unmaintained advisory — the "too loose" failure mode this file exists to prevent.
+    #
+    # Revisit when: utoipa-axum publishes a release that drops `paste` (track upstream), or
+    # the advisory is upgraded from `unmaintained` to a vulnerability. Either event should
+    # remove this entry, not extend it.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained-only advisory for `paste`, a build-time proc-macro reached solely through utoipa-axum 0.2.0 (latest published, no upgrade drops it); contributes no code to the shipped binary" },
+]
+
+# ---------------------------------------------------------------------------------------
+[licenses]
+# Derived from the real graph, not guessed. This list is the MINIMAL set that satisfies
+# every SPDX expression in Moira's tree — each entry below is load-bearing, and removing
+# any one of them fails the check:
+#
+#   Apache-2.0          the whole `opentelemetry*` family (0.32), `prost`, `sketches-ddsketch`
+#   MIT                 `rig-core` 0.40, `metrics` 0.24, `metrics-exporter-prometheus` 0.17,
+#                       `metrics-util`, `quanta`, `tracing-opentelemetry` 0.33, and the bulk
+#                       of the tree via `MIT OR Apache-2.0`
+#   BSD-3-Clause        `redis` 0.32 and `subtle` (BSD-3-Clause only — no dual option), and
+#                       the AND-clauses of `encoding_rs`, `matchit`, `aws-lc-sys`
+#   ISC                 `rustls-webpki`, `simple_asn1`, `untrusted` (ISC only), and the
+#                       AND-clauses of `ring` and `aws-lc-rs`
+#   Unicode-3.0         the 18 ICU crates, and the AND-clause of `unicode-ident`
+#   Zlib                `foldhash` 0.1/0.2 (Zlib only — reached via `hashbrown`)
+#   CDLA-Permissive-2.0 `webpki-roots` 0.26/1.0 and `webpki-root-certs` 1.0 (root cert bundles)
+#
+# The three crate families called out for explicit verification were checked by name:
+#   rig-core 0.40.0                  MIT
+#   opentelemetry / _sdk / -otlp /
+#     -proto / -http    all 0.32     Apache-2.0
+#   metrics 0.24.6, metrics-exporter-prometheus 0.17.2, metrics-util 0.20.4, quanta 0.12.6
+#                                    MIT
+#   sketches-ddsketch 0.3.1 (histogram backend)  Apache-2.0
+#
+# Deliberately NOT allowed, even though they appear inside OR-expressions in the tree —
+# every one is satisfiable by a license above, so blanket-allowing them (as a template
+# would) buys nothing and widens the policy: BSL-1.0 (`ryu`, `whoami`), CC0-1.0 and MIT-0
+# (`dunce`), BSD-2-Clause (`zerocopy`), Unlicense (`aho-corasick`, `byteorder`, `memchr`),
+# LGPL-2.1-or-later (`r-efi`), Apache-2.0 WITH LLVM-exception (`wasi`).
+#
+# No copyleft license (GPL/AGPL/LGPL/MPL/EUPL/CDDL/SSPL) is allowed. Adding a dependency
+# under one fails this gate — that is the intended behaviour and requires a deliberate
+# licensing decision, not an edit to this list in passing.
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+# Strict: only an exact match against canonical SPDX license text is accepted when a crate
+# has no SPDX expression in its manifest and cargo-deny must infer one from a LICENSE file.
+# Safe here because every crate in the current graph declares an SPDX expression, so
+# nothing depends on text inference today. A future crate that does will fail loudly and
+# require an explicit `[[licenses.clarify]]` entry — a human decision, which is the point.
+confidence-threshold = 1.0
+
+# No per-crate license exceptions are needed: the allow-list above covers the entire graph.
+exceptions = []
+
+[licenses.private]
+# `moira` itself declares no `license` field (it is a deployed service, not a published
+# crate), which cargo-deny reports as `error[unlicensed]: moira = 0.1.0 is unlicensed`.
+# This setting suppresses that for workspace members marked `publish = false`.
+#
+# `ignore = true` only suppresses the error for workspace members actually marked
+# unpublishable, so this setting is load-bearing together with `publish = false` in
+# `Cargo.toml`. That line has landed. Removing either one turns this gate red again with:
+#     error[unlicensed]: moira = 0.1.0 is unlicensed
+#     advisories ok, bans ok, licenses FAILED, sources ok   (exit 4)
+# This pairing is deliberately preferred over asserting a license Moira does not have via a
+# `[[licenses.clarify]]` entry.
+ignore = true
+registries = []
+
+# ---------------------------------------------------------------------------------------
+[bans]
+# "warn", NOT "deny", and this is a deliberate staged rollout. Measured against the
+# target-scoped graph above, the tree already carries 9 pre-existing duplicate-version
+# groups, none of which Moira introduced or can resolve on its own:
+#   core-foundation 0.9/0.10   hashbrown 0.15/0.16/0.17   hashlink (2)
+#   rand (2)                   rand_chacha (2)            rand_core (2)
+#   foldhash 0.1/0.2           syn 1/2                    getrandom (3)
+# All are legitimate transitive skew between `sqlx`, `reqwest`, `rustls` and the proc-macro
+# ecosystem. Starting at "deny" would turn every one of them into a merge blocker on the
+# first unrelated PR, and the predictable response would be to disable the gate —
+# recreating P0-4.
+#
+# FOLLOW-UP DECISION (eng, not silently taken here): once the duplicates above are either
+# resolved upstream or explicitly enumerated in `skip`/`skip-tree` with reasons, tighten
+# this to "deny". Tracked as a deferred follow-up on plan 05.
+multiple-versions = "warn"
+
+# A `*` version requirement lets an arbitrary future release enter the tree unreviewed.
+# Moira declares none today (all requirements are caret-pinned, e.g. `axum = "0.8"`), so
+# this is free to enforce now and prevents one from being introduced.
+wildcards = "deny"
+
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+
+# No crate is currently known-bad for Moira. Left empty ON PURPOSE rather than seeded with
+# a template's example entries; the seeded-violation verification for this file was
+# performed with a temporary copyleft-licensed dependency (documented in the PR), not with
+# a permanent entry here.
+allow = []
+deny = []
+
+# Empty: no duplicate is being waived. The 9 duplicate groups above surface as warnings
+# (see `multiple-versions`) so they stay visible instead of being silenced.
+skip = []
+skip-tree = []
+
+# ---------------------------------------------------------------------------------------
+[sources]
+# Moira must never silently pull a dependency from anywhere but crates.io. The cargo-deny
+# scaffold defaults both of these to "warn"; "deny" is the whole point of the section.
+unknown-registry = "deny"
+unknown-git = "deny"
+
+# crates.io only. Verified: every entry in `Cargo.lock` is
+# `registry+https://github.com/rust-lang/crates.io-index` — there are no git or path
+# dependencies in the tree.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+# No git dependency is allowed. A git source pins to a commit that no registry attests to,
+# can be force-pushed, and is invisible to RustSec advisory matching. Adding one must be a
+# deliberate, reviewed change to this file.
+allow-git = []
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []

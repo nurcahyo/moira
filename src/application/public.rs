@@ -3,10 +3,6 @@ use std::{pin::Pin, time::Duration};
 use async_stream::stream;
 use chrono::Utc;
 use futures_util::Stream;
-use rig_core::{
-    OneOrMany,
-    completion::{Message, message::UserContent},
-};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -19,22 +15,23 @@ use crate::{
     },
     domain::{
         ApplicationExecutionPolicyPutRequest, ApplicationExecutionPolicyRecord, AuditLogInsert,
-        AuditResult, CallerRuntimeIdentity, ExecutionCommand, ExecutionFailure,
-        ExecutionFailureClass, ExecutionOptions, ExecutionOutcome, ExecutionQuery, ExecutionStatus,
-        ListResponse, OpenAiResponseCompatRequest, PublicCapabilities, PublicContentPart,
-        PublicConversationRef, PublicExecutionSummary, PublicInputMessage, PublicMessageRole,
-        PublicModelRef, PublicModelResource, PublicOutputContentPart, PublicOutputItem,
-        PublicResponse, PublicResponseFormat, PublicResponseRecord, PublicResponseRequest,
-        PublicResponseStatus, PublicRouteRef, PublicRouteResource, PublicSseEnvelope,
-        PublicUsageRecord, PublicUsageSummary, RuntimeEventEnvelope, RuntimeEventType, UsageQuery,
+        AuditResult, CallerRuntimeIdentity, DomainMessage, DomainMessageContent, DomainMessageRole,
+        ExecutionCommand, ExecutionFailure, ExecutionFailureClass, ExecutionOptions,
+        ExecutionOutcome, ExecutionQuery, ExecutionStatus, IdempotencyRecord, ListResponse,
+        OpenAiResponseCompatRequest, PublicCapabilities, PublicContentPart, PublicConversationRef,
+        PublicExecutionSummary, PublicInputMessage, PublicMessageRole, PublicModelRef,
+        PublicModelResource, PublicOutputContentPart, PublicOutputItem, PublicResponse,
+        PublicResponseFormat, PublicResponseRecord, PublicResponseRequest, PublicResponseStatus,
+        PublicRouteRef, PublicRouteResource, PublicSseEnvelope, PublicUsageRecord,
+        PublicUsageSummary, RuntimeEventEnvelope, RuntimeEventType, UsageQuery,
     },
     error::AppError,
     infra::repositories::{
         AdminRepository, IdempotencyClaim, PgAdminRepository, PgPublicRepository, PublicAccess,
-        ResponseStartedInsert, ResponseTerminalUpdate, default_application_execution_policy,
-        idempotency_record,
+        PublicRepository, ResponseStartedInsert, ResponseTerminalUpdate,
+        default_application_execution_policy, idempotency_record,
     },
-    security::{Actor, ActorType, request_hash, secret_fingerprint},
+    security::{Actor, ActorType, IdempotencyHasher, secret_fingerprint},
 };
 
 #[derive(Clone)]
@@ -178,7 +175,12 @@ impl PublicExecutionService {
 
         let mapped = match outcome.status {
             ExecutionStatus::Succeeded => {
-                let update = terminal_update_from_outcome(&outcome, &prepared.policy, None);
+                let update = terminal_update_from_outcome(
+                    &self.state.idempotency_hasher,
+                    &outcome,
+                    &prepared.policy,
+                    None,
+                );
                 let record = self
                     .public_repo
                     .complete_response(response.id, &update)
@@ -220,8 +222,12 @@ impl PublicExecutionService {
                         "execution failed without a failure class",
                     )
                 });
-                let update =
-                    terminal_update_from_outcome(&outcome, &prepared.policy, Some(&failure));
+                let update = terminal_update_from_outcome(
+                    &self.state.idempotency_hasher,
+                    &outcome,
+                    &prepared.policy,
+                    Some(&failure),
+                );
                 let record = self.public_repo.fail_response(response.id, &update).await?;
                 let status = failure_http_status(failure.class);
                 let body = json!({
@@ -459,6 +465,7 @@ impl PublicExecutionService {
         }
         if disconnected {
             let update = cancellation_update(
+                &self.state.idempotency_hasher,
                 outcome.as_ref().ok().and_then(|value| value.as_ref().ok()),
                 &policy,
             );
@@ -496,7 +503,12 @@ impl PublicExecutionService {
         let terminal = match outcome {
             Ok(Ok(outcome)) => match outcome.status {
                 ExecutionStatus::Succeeded => {
-                    let update = terminal_update_from_outcome(&outcome, &policy, None);
+                    let update = terminal_update_from_outcome(
+                        &self.state.idempotency_hasher,
+                        &outcome,
+                        &policy,
+                        None,
+                    );
                     match self
                         .public_repo
                         .complete_response(response.id, &update)
@@ -573,7 +585,12 @@ impl PublicExecutionService {
                             "execution failed",
                         )
                     });
-                    let update = terminal_update_from_outcome(&outcome, &policy, Some(&failure));
+                    let update = terminal_update_from_outcome(
+                        &self.state.idempotency_hasher,
+                        &outcome,
+                        &policy,
+                        Some(&failure),
+                    );
                     if self
                         .public_repo
                         .fail_response(response.id, &update)
@@ -598,7 +615,11 @@ impl PublicExecutionService {
                     terminal_failure(&response, sequence, &ctx, failure)
                 }
                 ExecutionStatus::Cancelled => {
-                    let update = cancellation_update(Some(&outcome), &policy);
+                    let update = cancellation_update(
+                        &self.state.idempotency_hasher,
+                        Some(&outcome),
+                        &policy,
+                    );
                     if self
                         .public_repo
                         .cancel_response(response.id, &update)
@@ -826,21 +847,16 @@ impl PublicExecutionService {
             .authz
             .require(actor, "moira:execution-policies:write")?;
         validate_policy_request(&request)?;
-        if let Some(expected) = expected_version {
-            let current = self
-                .public_repo
-                .get_or_create_application_execution_policy(application_id)
-                .await?;
-            if current.version != expected {
-                return Err(AppError::conflict(
-                    "resource_version_conflict",
-                    "resource version does not match If-Match",
-                ));
-            }
-        }
+        // The `If-Match` comparison is deliberately *not* done here. Reading the current
+        // version on one pooled connection and writing on another is check-then-act: two
+        // writers holding the same currently-valid version both passed and both wrote, losing
+        // one update with no conflict reported to either caller. The repository now performs
+        // the comparison and the write in one transaction, under a row lock, with the version
+        // predicate in the `update` itself, and raises the same
+        // `409 resource_version_conflict` this function used to raise.
         let record = self
             .public_repo
-            .put_application_execution_policy(application_id, &request)
+            .put_application_execution_policy(application_id, expected_version, &request)
             .await?;
         self.state.runtime_cache.invalidate_all().await;
         self.audit(
@@ -1017,13 +1033,66 @@ impl PublicExecutionService {
         let Some(key) = ctx.idempotency_key.as_deref() else {
             return Ok(None);
         };
-        let actor_fingerprint = public_actor_fingerprint(actor, application_id);
-        let request_hash_value = normalized_request_hash(&(application_id, request))?;
+        let actor_fingerprint = crate::application::admin::actor_fingerprint(actor);
+        let hasher = &self.state.idempotency_hasher;
+        let request_bytes = normalized_request_bytes(&(application_id, request))?;
+
+        // Pre-claim sweep, deliberately *before* the claim insert, over every historical
+        // spelling of this row's position in the unique index
+        // (idempotency_key_hash, actor_fingerprint, operation). Two of its three columns
+        // have been redefined under deployed rows:
+        //
+        //   * `idempotency_key_hash` — unkeyed SHA-256 → keyed HMAC (plan 03, P1-1). The
+        //     current hash needs no pre-claim probe: the claim's `on conflict` finds it.
+        //   * `actor_fingerprint` — this module's 4-field formula → the crate-wide 10-field
+        //     one (plan 06, Module 16 / P2-15). Both key hashes must be probed under the
+        //     legacy value, because a pre-plan-06 row may carry either.
+        //
+        // Skipping the sweep is not a slow replay, it is a *wrong* one: an unswept row sits
+        // at a different point of the unique index, so the claim below would insert
+        // alongside it rather than conflict with it, and `/v1/responses` would execute a
+        // second time against the provider — a contractual replay turned into a duplicate
+        // billable call.
+        //
+        // Cost: up to three indexed lookups per idempotent request, on the miss path only.
+        // The write below always uses the current pair, so the legacy value can never
+        // re-enter the ledger and the sweep drains as rows expire.
+        //
+        // TODO(post-deploy): drop the two `legacy_actor_fingerprint` probes once every ledger
+        // row written before plan 06 shipped has expired. `idempotency_record` sets
+        // `expires_at` 24h ahead, so the earliest safe removal date is the deploy date of
+        // Module 16 + 1 day. The plan-03 `legacy_hash` probe has its own, earlier window.
+        //
+        // Gated on a DEPLOY, not on a merge, and deliberately not owned by any plan — see the
+        // matching note in `runtime_admin.rs`.
+        let legacy_actor_fingerprint = legacy_public_actor_fingerprint(actor, application_id);
+        let legacy_key_hash = hasher.legacy_hash(key.as_bytes());
+        let current_key_hash = hasher.hash(key.as_bytes());
+        let candidates = [
+            (&legacy_key_hash, &actor_fingerprint),
+            (&current_key_hash, &legacy_actor_fingerprint),
+            (&legacy_key_hash, &legacy_actor_fingerprint),
+        ];
+        for (candidate_key_hash, candidate_fingerprint) in candidates {
+            if let Some(existing) = self
+                .public_repo
+                .get_idempotency_record(
+                    candidate_key_hash,
+                    candidate_fingerprint,
+                    "response.create",
+                )
+                .await?
+            {
+                return replayed_idempotency_state(hasher, &request_bytes, existing).map(Some);
+            }
+        }
+
         let record = idempotency_record(
+            hasher,
             key,
             actor_fingerprint.clone(),
             "response.create",
-            request_hash_value.clone(),
+            hasher.hash(&request_bytes),
         );
         match self.public_repo.claim_idempotency(&record).await? {
             IdempotencyClaim::Claimed => Ok(Some(IdempotencyState {
@@ -1032,23 +1101,7 @@ impl PublicExecutionService {
                 operation: "response.create",
             })),
             IdempotencyClaim::Replay(existing) => {
-                if existing.request_hash != request_hash_value {
-                    return Err(AppError::conflict(
-                        "idempotency_conflict",
-                        "same Idempotency-Key was used with a different request",
-                    ));
-                }
-                if existing.response_body.is_none() {
-                    return Err(AppError::conflict(
-                        "execution_in_progress",
-                        "execution is in progress",
-                    ));
-                }
-                Ok(Some(IdempotencyState {
-                    key_hash: existing.idempotency_key_hash,
-                    actor_fingerprint: existing.actor_fingerprint,
-                    operation: "response.create",
-                }))
+                replayed_idempotency_state(hasher, &request_bytes, existing).map(Some)
             }
         }
     }
@@ -1518,7 +1571,7 @@ fn validate_image_url(value: &str) -> Result<(), AppError> {
 fn map_public_messages(
     request: &PublicResponseRequest,
     policy: &ApplicationExecutionPolicyRecord,
-) -> Result<Vec<Message>, AppError> {
+) -> Result<Vec<DomainMessage>, AppError> {
     request
         .input
         .iter()
@@ -1529,7 +1582,7 @@ fn map_public_messages(
 fn map_public_message(
     message: &PublicInputMessage,
     policy: &ApplicationExecutionPolicyRecord,
-) -> Result<Message, AppError> {
+) -> Result<DomainMessage, AppError> {
     match message.role {
         PublicMessageRole::System | PublicMessageRole::Developer => {
             if !policy.caller_system_instructions_allowed {
@@ -1538,26 +1591,30 @@ fn map_public_message(
                     "system and developer roles are not allowed",
                 ));
             }
-            Ok(Message::system(text_only_content(message)?))
+            Ok(DomainMessage::system(text_only_content(message)?))
         }
         PublicMessageRole::User => {
-            let parts = message
+            let content = message
                 .content
                 .iter()
                 .map(|part| match part {
-                    PublicContentPart::InputText { text } => Ok(UserContent::text(text.clone())),
-                    PublicContentPart::InputImage { image_url } => {
-                        Ok(UserContent::image_url(image_url.clone(), None, None))
+                    PublicContentPart::InputText { text } => {
+                        DomainMessageContent::Text { text: text.clone() }
                     }
+                    PublicContentPart::InputImage { image_url } => DomainMessageContent::ImageUrl {
+                        url: image_url.clone(),
+                    },
                 })
-                .collect::<Result<Vec<_>, AppError>>()?;
-            Ok(Message::User {
-                content: OneOrMany::many(parts).map_err(|_| {
-                    AppError::unprocessable("invalid_execution_request", "user message is empty")
-                })?,
-            })
+                .collect::<Vec<_>>();
+            if content.is_empty() {
+                return Err(AppError::unprocessable(
+                    "invalid_execution_request",
+                    "user message is empty",
+                ));
+            }
+            Ok(DomainMessage::new(DomainMessageRole::User, content))
         }
-        PublicMessageRole::Assistant => Ok(Message::assistant(text_only_content(message)?)),
+        PublicMessageRole::Assistant => Ok(DomainMessage::assistant(text_only_content(message)?)),
         PublicMessageRole::Tool => Err(AppError::unprocessable(
             "unsupported_message_role",
             "tool messages require an approved tool registry",
@@ -1582,6 +1639,7 @@ fn text_only_content(message: &PublicInputMessage) -> Result<String, AppError> {
 }
 
 fn terminal_update_from_outcome(
+    hasher: &IdempotencyHasher,
     outcome: &ExecutionOutcome,
     policy: &ApplicationExecutionPolicyRecord,
     failure: Option<&ExecutionFailure>,
@@ -1594,7 +1652,7 @@ fn terminal_update_from_outcome(
     let output_hash = outcome
         .output_text
         .as_ref()
-        .map(|text| request_hash(text.as_bytes()));
+        .map(|text| hasher.hash(text.as_bytes()));
     ResponseTerminalUpdate {
         route_id: outcome.route.as_ref().map(|route| route.route_id),
         provider_id: outcome.model.as_ref().map(|model| model.provider_id),
@@ -1715,13 +1773,14 @@ fn failure_update(
 }
 
 fn cancellation_update(
+    hasher: &IdempotencyHasher,
     outcome: Option<&ExecutionOutcome>,
     policy: &ApplicationExecutionPolicyRecord,
 ) -> ResponseTerminalUpdate {
     let failure =
         ExecutionFailure::new(ExecutionFailureClass::RequestCancelled, "stream cancelled");
     outcome
-        .map(|outcome| terminal_update_from_outcome(outcome, policy, Some(&failure)))
+        .map(|outcome| terminal_update_from_outcome(hasher, outcome, policy, Some(&failure)))
         .unwrap_or_else(|| failure_update(&failure, policy))
 }
 
@@ -1862,7 +1921,28 @@ fn request_has_image(request: &PublicResponseRequest) -> bool {
     })
 }
 
-fn public_actor_fingerprint(actor: &Actor, application_id: Option<Uuid>) -> String {
+/// The fingerprint `/v1/responses` wrote **before** plan 06 unified the three formulas.
+///
+/// Read-only, consulted by `claim_idempotency` so a ledger row written by the previous
+/// release still replays; never written. It hashes
+/// `{actor_type, subject, api_key_id, application_id}`, so two callers differing only by
+/// tenant, trusted-JWT issuer, external user or delegated subject collided — the public
+/// half of the P2-15 hole.
+///
+/// `application_id` stays an explicit parameter rather than being read off the `Actor`
+/// because that is what the pre-plan-06 call site passed, and reproducing the old value
+/// byte-for-byte is the entire point. It is
+/// `effective_application_id(actor) == actor.internal_application_id` at the one call site,
+/// which is why the unified formula loses no information by dropping the parameter —
+/// `internal_application_id` is one of its ten fields.
+/// `tests::the_legacy_public_fingerprint_collided_across_tenant_and_delegation` pins both
+/// halves of that claim.
+///
+/// TODO(post-deploy): delete together with the legacy passes in `claim_idempotency`, once 24h
+/// (the `expires_at` window set by `infra::repositories::public::idempotency_record`) have
+/// elapsed since the deploy carrying plan 06 Module 16. Gated on a deploy, not on a merge,
+/// and owned by no plan.
+fn legacy_public_actor_fingerprint(actor: &Actor, application_id: Option<Uuid>) -> String {
     secret_fingerprint(
         format!(
             "{:?}:{}:{}:{}",
@@ -1878,10 +1958,43 @@ fn public_actor_fingerprint(actor: &Actor, application_id: Option<Uuid>) -> Stri
     )
 }
 
-fn normalized_request_hash<T: Serialize>(request: &T) -> Result<String, AppError> {
+/// The canonical bytes an idempotent `/v1/responses` request hashes to.
+///
+/// Returns bytes rather than a digest so the read path can run them through
+/// `IdempotencyHasher::verify`, which accepts the current keyed digest and the pre-switch
+/// unkeyed one alike.
+fn normalized_request_bytes<T: Serialize>(request: &T) -> Result<Vec<u8>, AppError> {
     serde_json::to_vec(request)
-        .map(|bytes| request_hash(&bytes))
         .map_err(|err| AppError::BadRequest(format!("invalid idempotent request: {err}")))
+}
+
+/// Turns an existing ledger row into the replay state, or into the conflict/in-progress
+/// error the idempotency contract requires.
+///
+/// `verify` — not string equality — so a row written before the switch to keyed hashing
+/// still matches the request that produced it.
+fn replayed_idempotency_state(
+    hasher: &IdempotencyHasher,
+    request_bytes: &[u8],
+    existing: IdempotencyRecord,
+) -> Result<IdempotencyState, AppError> {
+    if !hasher.verify(request_bytes, &existing.request_hash) {
+        return Err(AppError::conflict(
+            "idempotency_conflict",
+            "same Idempotency-Key was used with a different request",
+        ));
+    }
+    if existing.response_body.is_none() {
+        return Err(AppError::conflict(
+            "execution_in_progress",
+            "execution is in progress",
+        ));
+    }
+    Ok(IdempotencyState {
+        key_hash: existing.idempotency_key_hash,
+        actor_fingerprint: existing.actor_fingerprint,
+        operation: "response.create",
+    })
 }
 
 fn validate_policy_request(request: &ApplicationExecutionPolicyPutRequest) -> Result<(), AppError> {
@@ -1946,36 +2059,10 @@ fn failure_http_status(class: ExecutionFailureClass) -> axum::http::StatusCode {
 }
 
 fn failure_code(class: ExecutionFailureClass) -> &'static str {
-    match class {
-        ExecutionFailureClass::InvalidExecutionRequest => "invalid_execution_request",
-        ExecutionFailureClass::ApplicationUnavailable => "application_unavailable",
-        ExecutionFailureClass::RouteNotFound => "route_not_found",
-        ExecutionFailureClass::RouteForbidden => "route_forbidden",
-        ExecutionFailureClass::ModelNotFound => "model_not_found",
-        ExecutionFailureClass::ModelForbidden => "model_forbidden",
-        ExecutionFailureClass::ModelCapabilityMismatch => "model_capability_mismatch",
-        ExecutionFailureClass::NoEligibleModel => "no_eligible_model",
-        ExecutionFailureClass::CredentialNotFound => "credential_not_found",
-        ExecutionFailureClass::CredentialForbidden => "credential_forbidden",
-        ExecutionFailureClass::CredentialExpired => "credential_expired",
-        ExecutionFailureClass::CredentialDisabled => "credential_disabled",
-        ExecutionFailureClass::CredentialDecryptionFailed => "credential_decryption_failed",
-        ExecutionFailureClass::ProviderConfigurationInvalid => "provider_configuration_invalid",
-        ExecutionFailureClass::ProviderUnavailable => "provider_unavailable",
-        ExecutionFailureClass::ProviderRateLimited => "provider_rate_limited",
-        ExecutionFailureClass::ProviderTimeout => "provider_timeout",
-        ExecutionFailureClass::ProviderConnectionFailed => "provider_connection_failed",
-        ExecutionFailureClass::ProviderAuthenticationFailed => "provider_authentication_failed",
-        ExecutionFailureClass::ProviderInvalidResponse => "provider_invalid_response",
-        ExecutionFailureClass::ProviderUpstreamError => "provider_upstream_error",
-        ExecutionFailureClass::CircuitOpen => "circuit_open",
-        ExecutionFailureClass::CapacityExhausted => "capacity_exhausted",
-        ExecutionFailureClass::RequestCancelled => "request_cancelled",
-        ExecutionFailureClass::DeadlineExceeded => "deadline_exceeded",
-        ExecutionFailureClass::StructuredOutputInvalid => "structured_output_invalid",
-        ExecutionFailureClass::StreamBackpressureExceeded => "stream_backpressure_exceeded",
-        ExecutionFailureClass::InternalError => "internal_error",
-    }
+    // Delegates to the domain type so the code strings have ONE definition. `ExecutionFailureClass::code`
+    // is walked by the i18n catalog gate, which refuses to compile when a variant has no catalog
+    // entry; a second copy of this mapping here could drift out from under that guarantee.
+    class.code()
 }
 
 #[cfg(test)]
@@ -2123,6 +2210,117 @@ mod tests {
                 Duration::from_millis(10),
             )
             .await
+        );
+    }
+
+    /// The public half of the P2-15 hole, pinned rather than described.
+    ///
+    /// Plan 06 §16.4 asks for proof that the pre-unification formula was actually broken.
+    /// This asserts both halves in one place: the 4-field formula `/v1/responses` used to
+    /// write collided on every field below, and the formula now writing the ledger does
+    /// not. `application_id` is held constant throughout — it was the only identity field
+    /// beyond `{actor_type, subject, api_key_id}` the old formula could see, so varying it
+    /// would prove nothing about what was missing.
+    #[test]
+    fn the_legacy_public_fingerprint_collided_across_tenant_and_delegation() {
+        use crate::security::ActorType;
+
+        let application_id = Some(Uuid::now_v7());
+        let base = Actor {
+            actor_type: ActorType::ConsumerKey,
+            subject: Some("shared-subject".to_string()),
+            api_key_id: Some(Uuid::nil()),
+            internal_application_id: application_id,
+            ..Actor::default()
+        };
+
+        let variants: [(&str, Actor); 5] = [
+            (
+                "tenant_id",
+                Actor {
+                    tenant_id: Some("other-tenant".to_string()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "external_tenant_id",
+                Actor {
+                    external_tenant_id: Some("other-tenant".to_string()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "external_user_id",
+                Actor {
+                    external_user_id: Some("other-user".to_string()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "delegated_subject",
+                Actor {
+                    delegated_subject: Some("other-user".to_string()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "trusted_jwt_issuer_id",
+                Actor {
+                    trusted_jwt_issuer_id: Some(Uuid::now_v7()),
+                    ..base.clone()
+                },
+            ),
+        ];
+
+        for (field, variant) in variants {
+            assert_eq!(
+                legacy_public_actor_fingerprint(&base, application_id),
+                legacy_public_actor_fingerprint(&variant, application_id),
+                "the pre-plan-06 formula is supposed to be blind to `{field}` — if this \
+                 stops holding, `claim_idempotency`'s legacy sweep is probing a value \
+                 production never wrote and pre-deploy rows will not replay"
+            );
+            assert_ne!(
+                crate::application::admin::actor_fingerprint(&base),
+                crate::application::admin::actor_fingerprint(&variant),
+                "the unified formula must isolate replay across `{field}`"
+            );
+        }
+    }
+
+    /// The unified formula drops `claim_idempotency`'s explicit `application_id` argument.
+    /// That is only lossless because the argument was always
+    /// `effective_application_id(actor)`, i.e. `actor.internal_application_id`, which the
+    /// unified formula already covers. If a future caller passes something else, the two
+    /// halves of this test disagree and it fails.
+    #[test]
+    fn dropping_the_explicit_application_id_argument_loses_no_isolation() {
+        use crate::security::ActorType;
+
+        let base = Actor {
+            actor_type: ActorType::ConsumerKey,
+            subject: Some("shared-subject".to_string()),
+            api_key_id: Some(Uuid::nil()),
+            internal_application_id: Some(Uuid::now_v7()),
+            ..Actor::default()
+        };
+        let other = Actor {
+            internal_application_id: Some(Uuid::now_v7()),
+            ..base.clone()
+        };
+
+        assert_eq!(
+            effective_application_id(&base),
+            base.internal_application_id
+        );
+        assert_ne!(
+            crate::application::admin::actor_fingerprint(&base),
+            crate::application::admin::actor_fingerprint(&other),
+            "application identity must still partition the ledger without the argument"
+        );
+        assert_ne!(
+            legacy_public_actor_fingerprint(&base, effective_application_id(&base)),
+            legacy_public_actor_fingerprint(&other, effective_application_id(&other)),
         );
     }
 }

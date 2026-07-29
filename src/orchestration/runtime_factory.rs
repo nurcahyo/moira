@@ -7,7 +7,7 @@ use rig_core::{
     client::CompletionClient,
     completion::{
         AssistantContent, CompletionError, CompletionModel as RigCompletionModel,
-        CompletionRequest, CompletionResponse, GetTokenUsage, Usage,
+        CompletionRequest, CompletionResponse, GetTokenUsage, Message, Usage, message::UserContent,
     },
     providers::{anthropic, azure, deepseek, gemini, openai},
     streaming::StreamedAssistantContent,
@@ -18,9 +18,9 @@ use serde_json::{Value, json};
 
 use crate::{
     domain::{
-        CredentialType, ExecutionFailure, ExecutionFailureClass, ProviderRuntimePolicyRecord,
-        ProviderType, ResolvedCredential, ResolvedProviderConfiguration, RuntimeEventEnvelope,
-        RuntimeEventType, UsageSummary,
+        CredentialType, DomainMessage, DomainMessageContent, DomainMessageRole, ExecutionFailure,
+        ExecutionFailureClass, ProviderRuntimePolicyRecord, ProviderType, ResolvedCredential,
+        ResolvedProviderConfiguration, RuntimeEventEnvelope, RuntimeEventType, UsageSummary,
     },
     error::AppError,
     orchestration::normalize_openai_base_url,
@@ -408,6 +408,72 @@ where
     }))
 }
 
+/// `DomainMessage` -> Rig `Message`. This is the only place either direction is converted; keeping
+/// it here is what lets `src/domain` stay free of `rig_core` (plan 06, P2-2).
+impl TryFrom<&DomainMessage> for Message {
+    type Error = ExecutionFailure;
+
+    fn try_from(message: &DomainMessage) -> Result<Self, Self::Error> {
+        match message.role {
+            DomainMessageRole::System => Ok(Message::system(text_only_content(message)?)),
+            DomainMessageRole::Assistant => Ok(Message::assistant(text_only_content(message)?)),
+            DomainMessageRole::User => {
+                let parts = message
+                    .content
+                    .iter()
+                    .map(|part| match part {
+                        DomainMessageContent::Text { text } => UserContent::text(text.clone()),
+                        DomainMessageContent::ImageUrl { url } => {
+                            UserContent::image_url(url.clone(), None, None)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                Ok(Message::User {
+                    content: OneOrMany::many(parts)
+                        .map_err(|_| invalid_execution_request("user message is empty"))?,
+                })
+            }
+            DomainMessageRole::Tool => Err(invalid_execution_request(
+                "tool messages require an approved tool registry",
+            )),
+        }
+    }
+}
+
+/// Converts an `ExecutionCommand`'s messages into the `chat_history` a `CompletionRequest` needs.
+pub fn rig_chat_history(
+    messages: &[DomainMessage],
+) -> Result<OneOrMany<Message>, ExecutionFailure> {
+    let converted = messages
+        .iter()
+        .map(Message::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    OneOrMany::many(converted).map_err(|_| {
+        invalid_execution_request("execution command must contain at least one message")
+    })
+}
+
+/// Roles that Rig models as a plain `String` carry no image content; joining mirrors how the
+/// public boundary flattens multi-part text (`text_only_content` in `src/application/public.rs`).
+fn text_only_content(message: &DomainMessage) -> Result<String, ExecutionFailure> {
+    let mut text = Vec::with_capacity(message.content.len());
+    for part in &message.content {
+        match part {
+            DomainMessageContent::Text { text: value } => text.push(value.as_str()),
+            DomainMessageContent::ImageUrl { .. } => {
+                return Err(invalid_execution_request(
+                    "this message role only supports text content",
+                ));
+            }
+        }
+    }
+    Ok(text.join("\n"))
+}
+
+fn invalid_execution_request(message: &str) -> ExecutionFailure {
+    ExecutionFailure::new(ExecutionFailureClass::InvalidExecutionRequest, message)
+}
+
 fn output_from_response<T>(response: CompletionResponse<T>) -> RuntimeCompletionOutput {
     RuntimeCompletionOutput {
         text: text_from_choice(response.choice),
@@ -536,6 +602,119 @@ mod tests {
         let err = require_credential_type(CredentialType::BasicAuth, &[CredentialType::ApiKey])
             .unwrap_err();
         assert!(!err.to_string().contains("password"));
+    }
+
+    #[test]
+    fn domain_message_round_trips_through_rig_message() {
+        let system = Message::try_from(&DomainMessage::system("be terse")).expect("system message");
+        assert_eq!(
+            system,
+            Message::System {
+                content: "be terse".to_string()
+            }
+        );
+
+        let assistant =
+            Message::try_from(&DomainMessage::assistant("sure")).expect("assistant message");
+        assert_eq!(assistant, Message::assistant("sure"));
+
+        let user = DomainMessage::new(
+            DomainMessageRole::User,
+            vec![
+                DomainMessageContent::Text {
+                    text: "what is this".to_string(),
+                },
+                DomainMessageContent::ImageUrl {
+                    url: "https://example.test/a.png".to_string(),
+                },
+            ],
+        );
+        let Message::User { content } = Message::try_from(&user).expect("user message") else {
+            panic!("user role must convert to Message::User");
+        };
+        let parts = content.into_iter().collect::<Vec<_>>();
+        assert_eq!(
+            parts,
+            vec![
+                UserContent::text("what is this"),
+                UserContent::image_url("https://example.test/a.png", None, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_part_text_is_joined_for_roles_rig_models_as_a_string() {
+        let message = DomainMessage::new(
+            DomainMessageRole::System,
+            vec![
+                DomainMessageContent::Text {
+                    text: "first".to_string(),
+                },
+                DomainMessageContent::Text {
+                    text: "second".to_string(),
+                },
+            ],
+        );
+        assert_eq!(
+            Message::try_from(&message).expect("system message"),
+            Message::System {
+                content: "first\nsecond".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn tool_and_image_shapes_rig_cannot_carry_fail_as_invalid_execution_requests() {
+        let tool = DomainMessage::new(
+            DomainMessageRole::Tool,
+            vec![DomainMessageContent::Text {
+                text: "result".to_string(),
+            }],
+        );
+        let failure = Message::try_from(&tool).expect_err("tool messages are not supported");
+        assert_eq!(
+            failure.class,
+            ExecutionFailureClass::InvalidExecutionRequest
+        );
+
+        let system_image = DomainMessage::new(
+            DomainMessageRole::System,
+            vec![DomainMessageContent::ImageUrl {
+                url: "https://example.test/a.png".to_string(),
+            }],
+        );
+        let failure = Message::try_from(&system_image).expect_err("system messages are text only");
+        assert_eq!(
+            failure.class,
+            ExecutionFailureClass::InvalidExecutionRequest
+        );
+
+        let empty_user = DomainMessage::new(DomainMessageRole::User, Vec::new());
+        let failure = Message::try_from(&empty_user).expect_err("empty user message");
+        assert_eq!(
+            failure.class,
+            ExecutionFailureClass::InvalidExecutionRequest
+        );
+    }
+
+    #[test]
+    fn an_empty_message_list_is_an_invalid_execution_request() {
+        let failure = rig_chat_history(&[]).expect_err("empty chat history");
+        assert_eq!(
+            failure.class,
+            ExecutionFailureClass::InvalidExecutionRequest
+        );
+        assert_eq!(
+            failure.message,
+            "execution command must contain at least one message"
+        );
+        assert_eq!(
+            rig_chat_history(&[DomainMessage::user("hello")])
+                .expect("chat history")
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![Message::user("hello")]
+        );
     }
 
     #[test]

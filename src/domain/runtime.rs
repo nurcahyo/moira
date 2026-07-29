@@ -1,11 +1,10 @@
 use chrono::{DateTime, Utc};
-use rig_core::completion::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::domain::{CredentialType, ProviderType, ResourceStatus};
+use crate::domain::{CredentialType, DomainMessage, ProviderType, ResourceStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RouteDefinitionRecord {
@@ -246,7 +245,7 @@ pub struct ExecutionCommand {
     pub application_id: Option<Uuid>,
     pub external_tenant_id: Option<String>,
     pub external_user_id: Option<String>,
-    pub messages: Vec<Message>,
+    pub messages: Vec<DomainMessage>,
     pub route_hint: Option<String>,
     pub provider_hint: Option<Uuid>,
     pub model_hint: Option<Uuid>,
@@ -471,6 +470,89 @@ pub enum ExecutionFailureClass {
     StructuredOutputInvalid,
     StreamBackpressureExceeded,
     InternalError,
+}
+
+impl ExecutionFailureClass {
+    /// Every variant, so the i18n catalog gate can walk them.
+    ///
+    /// This exists because the gate that checks "every emitted error code has a catalog entry"
+    /// scans for *literal* code arguments, and these codes are computed by [`Self::code`] — so 23
+    /// of them shipped to clients as `moira.error.<code>` message keys with no catalog entry, and
+    /// no test noticed. Walking the enum instead of the call sites is what makes that class of gap
+    /// impossible rather than merely absent today.
+    ///
+    /// The exhaustive `match` in [`Self::code`] means adding a variant fails to compile until it
+    /// has a code; being listed here means it then fails the catalog test until it has a string.
+    /// **Add new variants to this array** — a variant omitted here is invisible to the gate, which
+    /// is the one way this can still rot.
+    pub const ALL: [Self; 28] = [
+        Self::InvalidExecutionRequest,
+        Self::ApplicationUnavailable,
+        Self::RouteNotFound,
+        Self::RouteForbidden,
+        Self::ModelNotFound,
+        Self::ModelForbidden,
+        Self::ModelCapabilityMismatch,
+        Self::NoEligibleModel,
+        Self::CredentialNotFound,
+        Self::CredentialForbidden,
+        Self::CredentialExpired,
+        Self::CredentialDisabled,
+        Self::CredentialDecryptionFailed,
+        Self::ProviderConfigurationInvalid,
+        Self::ProviderUnavailable,
+        Self::ProviderRateLimited,
+        Self::ProviderTimeout,
+        Self::ProviderConnectionFailed,
+        Self::ProviderAuthenticationFailed,
+        Self::ProviderInvalidResponse,
+        Self::ProviderUpstreamError,
+        Self::CircuitOpen,
+        Self::CapacityExhausted,
+        Self::RequestCancelled,
+        Self::DeadlineExceeded,
+        Self::StructuredOutputInvalid,
+        Self::StreamBackpressureExceeded,
+        Self::InternalError,
+    ];
+
+    /// The public error code for this class, rendered to callers as `moira.error.<code>`.
+    ///
+    /// Lives on the domain type rather than in `application::public` so the catalog gate can reach
+    /// it without depending on the application layer. `const` because the catalog gate evaluates it
+    /// at compile time — a missing entry is then a build failure rather than a test failure.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::InvalidExecutionRequest => "invalid_execution_request",
+            Self::ApplicationUnavailable => "application_unavailable",
+            Self::RouteNotFound => "route_not_found",
+            Self::RouteForbidden => "route_forbidden",
+            Self::ModelNotFound => "model_not_found",
+            Self::ModelForbidden => "model_forbidden",
+            Self::ModelCapabilityMismatch => "model_capability_mismatch",
+            Self::NoEligibleModel => "no_eligible_model",
+            Self::CredentialNotFound => "credential_not_found",
+            Self::CredentialForbidden => "credential_forbidden",
+            Self::CredentialExpired => "credential_expired",
+            Self::CredentialDisabled => "credential_disabled",
+            Self::CredentialDecryptionFailed => "credential_decryption_failed",
+            Self::ProviderConfigurationInvalid => "provider_configuration_invalid",
+            Self::ProviderUnavailable => "provider_unavailable",
+            Self::ProviderRateLimited => "provider_rate_limited",
+            Self::ProviderTimeout => "provider_timeout",
+            Self::ProviderConnectionFailed => "provider_connection_failed",
+            Self::ProviderAuthenticationFailed => "provider_authentication_failed",
+            Self::ProviderInvalidResponse => "provider_invalid_response",
+            Self::ProviderUpstreamError => "provider_upstream_error",
+            Self::CircuitOpen => "circuit_open",
+            Self::CapacityExhausted => "capacity_exhausted",
+            Self::RequestCancelled => "request_cancelled",
+            Self::DeadlineExceeded => "deadline_exceeded",
+            Self::StructuredOutputInvalid => "structured_output_invalid",
+            Self::StreamBackpressureExceeded => "stream_backpressure_exceeded",
+            Self::InternalError => "internal_error",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]

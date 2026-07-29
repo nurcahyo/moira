@@ -104,14 +104,45 @@ pub enum ProviderScript {
         remaining_deltas: Vec<String>,
         gate: Arc<ScriptGate>,
     },
+    /// Emits `delta`, signals arrival, then fails the response body once the test
+    /// releases the gate.
+    ///
+    /// The gate is what makes "the failure happened *after* committed output" a fact
+    /// rather than a hope (P2-12). Both of these scripts used to
+    /// `sleep(Duration::from_millis(50))` between the delta and the error, betting that
+    /// 50 ms was enough for the delta to be read before the body aborted. It usually
+    /// was; when it was not, the assertion under test — that a post-commit failure is
+    /// neither retryable nor fallback-eligible — inverted, because nothing had been
+    /// committed yet. The gate turns the bet into an ordering the test states
+    /// explicitly: release only after the delta has been observed.
     StreamErrorAfterDelta {
         delta: String,
+        gate: Arc<ScriptGate>,
     },
+    /// As [`ProviderScript::StreamErrorAfterDelta`], with a tool call as the committed
+    /// output instead of a text delta.
     StreamErrorAfterToolCall {
         name: String,
+        gate: Arc<ScriptGate>,
     },
     StalledStream {
         first_delta: Option<String>,
+        gate: Arc<ScriptGate>,
+    },
+    /// Emits `first_delta`, signals arrival, waits for the test's release, then emits
+    /// `flood_delta` in an unbounded loop until the consumer drops the connection.
+    ///
+    /// Distinct from [`ProviderScript::HeldStream`], whose `remaining_deltas` are a fixed
+    /// list. A fixed list cannot *guarantee* server-side send backpressure: the number of
+    /// events needed to fill Moira's two internal `mpsc` channels **plus** hyper's write
+    /// buffer **plus** the kernel socket buffers on both ends is platform-dependent, so
+    /// any fixed count is either a guess that may be too small or a large magic number.
+    /// Flooding until the connection closes makes the backpressure deterministic with no
+    /// `sleep` and no buffer-size arithmetic. The loop is naturally throttled: it only
+    /// advances when hyper can write, so it cannot busy-spin.
+    FloodingStream {
+        first_delta: String,
+        flood_delta: String,
         gate: Arc<ScriptGate>,
     },
 }
@@ -243,15 +274,20 @@ async fn handle_completion(
             remaining_deltas,
             gate,
         } => streaming_response(held_stream_body(first_delta, remaining_deltas, gate)),
-        ProviderScript::StreamErrorAfterDelta { delta } => {
-            streaming_response(error_after_delta_body(delta))
+        ProviderScript::StreamErrorAfterDelta { delta, gate } => {
+            streaming_response(error_after_delta_body(delta, gate))
         }
-        ProviderScript::StreamErrorAfterToolCall { name } => {
-            streaming_response(error_after_tool_call_body(name))
+        ProviderScript::StreamErrorAfterToolCall { name, gate } => {
+            streaming_response(error_after_tool_call_body(name, gate))
         }
         ProviderScript::StalledStream { first_delta, gate } => {
             streaming_response(stalled_stream_body(first_delta, gate))
         }
+        ProviderScript::FloodingStream {
+            first_delta,
+            flood_delta,
+            gate,
+        } => streaming_response(flooding_stream_body(first_delta, flood_delta, gate)),
     }
 }
 
@@ -324,16 +360,17 @@ fn held_stream_body(
     Body::from_stream(stream)
 }
 
-fn error_after_delta_body(delta: String) -> Body {
+fn error_after_delta_body(delta: String, gate: Arc<ScriptGate>) -> Body {
     let stream = async_stream::stream! {
         yield Ok::<_, io::Error>(Bytes::from(sse_delta(&delta)));
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        gate.arrived.add_permits(1);
+        gate.wait_for_release().await;
         yield Err(io::Error::other("scripted provider body failure"));
     };
     Body::from_stream(stream)
 }
 
-fn error_after_tool_call_body(name: String) -> Body {
+fn error_after_tool_call_body(name: String, gate: Arc<ScriptGate>) -> Body {
     let stream = async_stream::stream! {
         let chunk = format!(
             "data: {}\n\n",
@@ -370,7 +407,8 @@ fn error_after_tool_call_body(name: String) -> Body {
             })
         );
         yield Ok(Bytes::from(finish));
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        gate.arrived.add_permits(1);
+        gate.wait_for_release().await;
         yield Err(io::Error::other("scripted provider body failure after tool call"));
     };
     Body::from_stream(stream)
@@ -384,6 +422,20 @@ fn stalled_stream_body(first_delta: Option<String>, gate: Arc<ScriptGate>) -> Bo
         }
         gate.arrived.add_permits(1);
         gate.wait_for_release().await;
+    };
+    Body::from_stream(stream)
+}
+
+fn flooding_stream_body(first_delta: String, flood_delta: String, gate: Arc<ScriptGate>) -> Body {
+    let stream = async_stream::stream! {
+        let _guard = ConnectionGuard::new(gate.clone());
+        yield Ok::<_, Infallible>(Bytes::from(sse_delta(&first_delta)));
+        gate.arrived.add_permits(1);
+        gate.wait_for_release().await;
+        let chunk = Bytes::from(sse_delta(&flood_delta));
+        loop {
+            yield Ok(chunk.clone());
+        }
     };
     Body::from_stream(stream)
 }

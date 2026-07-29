@@ -220,14 +220,30 @@ src/security/
   masking.rs              fingerprint and masked secret utilities
 
 src/orchestration/
-  resolver.rs             provider and credential resolution
-  routing.rs              route policy and model selection
-  executor.rs             Rig/OpenAI-compatible execution boundary
-  sse.rs                  Moira event mapping and stream lifecycle
-  limits.rs               concurrency and provider limit integration
+  runtime_factory.rs      Rig client construction and the execution boundary
+  runtime_cache.rs        runtime provider-config cache
+  provider_url.rs         provider base-URL normalisation
+  controls.rs             concurrency, rate limits, circuit breakers, handle cache
 ```
 
-Placement rule: Rig usage stays in `src/orchestration/executor.rs` and adjacent execution modules. Provider selection, credential priority, and runtime config remain Moira behavior.
+> **This section is a design-time proposal, not the shipped tree.** For the layout as it
+> actually stands, `docs/project-structure.md` is authoritative. The `src/orchestration/`
+> block above is kept current because the placement rule below depends on it; the other
+> blocks are the original proposal and several of their files were never created.
+>
+> Two files this section used to list — `resolver.rs` and `executor.rs` — were deleted by
+> plan 06 module 9 after both were proved to have no callers. Provider and credential
+> resolution lives in `src/infra/repositories/runtime.rs`
+> (`resolve_runtime_credential`); route policy and model selection live in
+> `src/application/execution.rs`; SSE event mapping lives in `src/http/public.rs` over the
+> stream items produced by `src/orchestration/runtime_factory.rs`.
+
+Placement rule: Rig usage stays behind `src/orchestration/runtime_factory.rs`, which owns
+every `rig_core` import on the execution path and hands the rest of the process
+Moira-shaped types. Nothing under `src/domain/` may import `rig_core` at all. Provider
+selection, credential priority, and runtime config remain Moira behavior. `CLAUDE.md` and
+`.claude/skills/moira-rig-integration/SKILL.md` state the same boundary; if this line ever
+disagrees with them, they win.
 
 ## 4. PostgreSQL Entity Relationship Design
 

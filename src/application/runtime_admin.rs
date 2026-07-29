@@ -1,26 +1,51 @@
-use chrono::{Duration, Utc};
+use std::sync::Arc;
+
+use chrono::{DateTime, Duration, Utc};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
     app::AppState,
-    application::RequestContext,
+    // The one crate-wide fingerprint formula (plan 06, Module 16). This module previously
+    // had its own 3-field copy writing the same `idempotency_records` unique index; what
+    // remains of it is `legacy_actor_fingerprint`, which is read-only.
+    application::{RequestContext, admin::actor_fingerprint},
     domain::{
         AgentProfileCreateRequest, AgentProfilePatchRequest, AgentProfileRecord, AuditLogInsert,
-        AuditResult, IdempotencyRecord, ListResponse, ProviderRuntimePolicyPutRequest,
-        ProviderRuntimePolicyRecord, RouteDefinitionCreateRequest, RouteDefinitionPatchRequest,
-        RouteDefinitionRecord, RoutingPolicyCreateRequest, RoutingPolicyPatchRequest,
-        RoutingPolicyRecord,
+        AuditResult, CursorScope, IdempotencyRecord, ListCursor, ListResponse, Pagination,
+        ProviderRuntimePolicyPutRequest, ProviderRuntimePolicyRecord, RouteDefinitionCreateRequest,
+        RouteDefinitionPatchRequest, RouteDefinitionRecord, RoutingPolicyCreateRequest,
+        RoutingPolicyPatchRequest, RoutingPolicyRecord,
     },
     error::AppError,
-    infra::repositories::{AdminRepository, PgAdminRepository, PgRuntimeRepository},
-    security::{Actor, request_hash, secret_fingerprint},
+    infra::repositories::{
+        AdminRepository, PgAdminRepository, PgRuntimeRepository, RuntimeRepository,
+    },
+    orchestration::CircuitResetScope,
+    security::{Actor, secret_fingerprint},
 };
+
+/// Per-endpoint cursor scopes (plan 04, Module 3). Declared once and reused for both encode
+/// (building `next_cursor`) and decode (validating a client-supplied `cursor`), so a cursor
+/// minted for one of these lists can never be replayed against another list — see
+/// `domain::pagination`'s module docs for why that matters.
+const ROUTE_DEFINITIONS_SCOPE: CursorScope = CursorScope::new("admin.route_definitions");
+const ROUTING_POLICIES_SCOPE: CursorScope = CursorScope::new("admin.routing_policies");
+const AGENT_PROFILES_SCOPE: CursorScope = CursorScope::new("admin.agent_profiles");
 
 pub struct RuntimeAdminService<'a> {
     state: &'a AppState,
-    runtime_repo: PgRuntimeRepository,
+    /// Held as `dyn RuntimeRepository` (plan 06, Module 8 / P2-3) rather than as a concrete
+    /// `PgRuntimeRepository`, so the runtime read/write surface can be swapped for a fake.
+    ///
+    /// Note for whoever writes the first Postgres-free `RuntimeAdminService` unit test: this
+    /// field alone is not enough. `audit_success` and `idempotency_replay` go through
+    /// `admin_repo`, whose only implementation is `PgAdminRepository` — and *that* requires a
+    /// live `PgPool` at construction. Making this service fully Postgres-free therefore also
+    /// needs an `AdminRepository` fake (60+ methods), which is outside Module 8's four-trait
+    /// scope. Until then this seam is real but not yet exercised.
+    runtime_repo: Arc<dyn RuntimeRepository>,
     admin_repo: PgAdminRepository,
 }
 
@@ -29,7 +54,7 @@ impl<'a> RuntimeAdminService<'a> {
         let pool = state.pool()?.clone();
         Ok(Self {
             state,
-            runtime_repo: PgRuntimeRepository::new(pool.clone()),
+            runtime_repo: Arc::new(PgRuntimeRepository::new(pool.clone())),
             admin_repo: PgAdminRepository::new(pool),
         })
     }
@@ -54,7 +79,7 @@ impl<'a> RuntimeAdminService<'a> {
             .runtime_repo
             .create_route_definition(Uuid::now_v7(), &request)
             .await?;
-        self.invalidate_runtime().await;
+        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
             ctx,
@@ -72,13 +97,21 @@ impl<'a> RuntimeAdminService<'a> {
     pub async fn list_route_definitions(
         &self,
         actor: &Actor,
+        cursor: Option<&str>,
         limit: i64,
     ) -> Result<ListResponse<RouteDefinitionRecord>, AppError> {
         self.state.authz.require(actor, "moira:routes:read")?;
-        self.runtime_repo
-            .list_route_definitions(limit)
-            .await
-            .map(ListResponse::new)
+        let cursor = ListCursor::decode_optional(cursor, ROUTE_DEFINITIONS_SCOPE)?;
+        let rows = self
+            .runtime_repo
+            .list_route_definitions(cursor, limit)
+            .await?;
+        Ok(paginate_by_created_at(
+            rows,
+            limit,
+            ROUTE_DEFINITIONS_SCOPE,
+            |record| (record.created_at, record.id),
+        ))
     }
 
     pub async fn get_route_definition(
@@ -90,11 +123,18 @@ impl<'a> RuntimeAdminService<'a> {
         self.runtime_repo.get_route_definition(id).await
     }
 
+    /// `expected_version` is the caller's `If-Match`, handed to the repository untouched.
+    ///
+    /// There is deliberately no comparison here (plan 06b): the only place the expectation can
+    /// be evaluated safely is under the row lock, in the same transaction as the write. A check
+    /// at this layer would read on a different pooled connection and re-open the window it is
+    /// supposed to close. The same holds for every method below taking `expected_version`.
     pub async fn patch_route_definition(
         &self,
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         request: RouteDefinitionPatchRequest,
     ) -> Result<RouteDefinitionRecord, AppError> {
         self.state.authz.require(actor, "moira:routes:write")?;
@@ -106,9 +146,9 @@ impl<'a> RuntimeAdminService<'a> {
         }
         let record = self
             .runtime_repo
-            .patch_route_definition(id, &request)
+            .patch_route_definition(id, expected_version, &request)
             .await?;
-        self.invalidate_runtime().await;
+        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
             ctx,
@@ -126,10 +166,13 @@ impl<'a> RuntimeAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
     ) -> Result<(), AppError> {
         self.state.authz.require(actor, "moira:routes:delete")?;
-        self.runtime_repo.soft_delete_route_definition(id).await?;
-        self.invalidate_runtime().await;
+        self.runtime_repo
+            .soft_delete_route_definition(id, expected_version)
+            .await?;
+        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
             ctx,
@@ -146,14 +189,19 @@ impl<'a> RuntimeAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         enabled: bool,
     ) -> Result<RouteDefinitionRecord, AppError> {
         self.state.authz.require(actor, "moira:routes:write")?;
         let record = self
             .runtime_repo
-            .set_route_definition_status(id, if enabled { "active" } else { "disabled" })
+            .set_route_definition_status(
+                id,
+                expected_version,
+                if enabled { "active" } else { "disabled" },
+            )
             .await?;
-        self.invalidate_runtime().await;
+        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
             ctx,
@@ -195,7 +243,7 @@ impl<'a> RuntimeAdminService<'a> {
             .runtime_repo
             .create_routing_policy(Uuid::now_v7(), &request)
             .await?;
-        self.invalidate_runtime().await;
+        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
             ctx,
@@ -213,15 +261,23 @@ impl<'a> RuntimeAdminService<'a> {
     pub async fn list_routing_policies(
         &self,
         actor: &Actor,
+        cursor: Option<&str>,
         limit: i64,
     ) -> Result<ListResponse<RoutingPolicyRecord>, AppError> {
         self.state
             .authz
             .require(actor, "moira:routing-policies:read")?;
-        self.runtime_repo
-            .list_routing_policies(limit)
-            .await
-            .map(ListResponse::new)
+        let cursor = ListCursor::decode_optional(cursor, ROUTING_POLICIES_SCOPE)?;
+        let rows = self
+            .runtime_repo
+            .list_routing_policies(cursor, limit)
+            .await?;
+        Ok(paginate_by_created_at(
+            rows,
+            limit,
+            ROUTING_POLICIES_SCOPE,
+            |record| (record.created_at, record.id),
+        ))
     }
 
     pub async fn get_routing_policy(
@@ -240,6 +296,7 @@ impl<'a> RuntimeAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         request: RoutingPolicyPatchRequest,
     ) -> Result<RoutingPolicyRecord, AppError> {
         self.state
@@ -254,8 +311,11 @@ impl<'a> RuntimeAdminService<'a> {
         );
         self.ensure_provider_model_belongs_to_provider(provider_id, provider_model_id)
             .await?;
-        let record = self.runtime_repo.patch_routing_policy(id, &request).await?;
-        self.invalidate_runtime().await;
+        let record = self
+            .runtime_repo
+            .patch_routing_policy(id, expected_version, &request)
+            .await?;
+        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
             ctx,
@@ -291,12 +351,15 @@ impl<'a> RuntimeAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
     ) -> Result<(), AppError> {
         self.state
             .authz
             .require(actor, "moira:routing-policies:delete")?;
-        self.runtime_repo.soft_delete_routing_policy(id).await?;
-        self.invalidate_runtime().await;
+        self.runtime_repo
+            .soft_delete_routing_policy(id, expected_version)
+            .await?;
+        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
             ctx,
@@ -313,6 +376,7 @@ impl<'a> RuntimeAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         enabled: bool,
     ) -> Result<RoutingPolicyRecord, AppError> {
         self.state
@@ -320,9 +384,13 @@ impl<'a> RuntimeAdminService<'a> {
             .require(actor, "moira:routing-policies:write")?;
         let record = self
             .runtime_repo
-            .set_routing_policy_status(id, if enabled { "active" } else { "disabled" })
+            .set_routing_policy_status(
+                id,
+                expected_version,
+                if enabled { "active" } else { "disabled" },
+            )
             .await?;
-        self.invalidate_runtime().await;
+        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
             ctx,
@@ -368,7 +436,7 @@ impl<'a> RuntimeAdminService<'a> {
             .runtime_repo
             .create_agent_profile(Uuid::now_v7(), &request)
             .await?;
-        self.invalidate_runtime().await;
+        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
             ctx,
@@ -386,15 +454,20 @@ impl<'a> RuntimeAdminService<'a> {
     pub async fn list_agent_profiles(
         &self,
         actor: &Actor,
+        cursor: Option<&str>,
         limit: i64,
     ) -> Result<ListResponse<AgentProfileRecord>, AppError> {
         self.state
             .authz
             .require(actor, "moira:agent-profiles:read")?;
-        self.runtime_repo
-            .list_agent_profiles(limit)
-            .await
-            .map(ListResponse::new)
+        let cursor = ListCursor::decode_optional(cursor, AGENT_PROFILES_SCOPE)?;
+        let rows = self.runtime_repo.list_agent_profiles(cursor, limit).await?;
+        Ok(paginate_by_created_at(
+            rows,
+            limit,
+            AGENT_PROFILES_SCOPE,
+            |record| (record.created_at, record.id),
+        ))
     }
 
     pub async fn get_agent_profile(
@@ -413,6 +486,7 @@ impl<'a> RuntimeAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         request: AgentProfilePatchRequest,
     ) -> Result<AgentProfileRecord, AppError> {
         self.state
@@ -429,8 +503,11 @@ impl<'a> RuntimeAdminService<'a> {
             request.memory_policy.as_ref().unwrap_or(&Value::Null),
             request.metadata.as_ref().unwrap_or(&Value::Null),
         )?;
-        let record = self.runtime_repo.patch_agent_profile(id, &request).await?;
-        self.invalidate_runtime().await;
+        let record = self
+            .runtime_repo
+            .patch_agent_profile(id, expected_version, &request)
+            .await?;
+        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
             ctx,
@@ -448,12 +525,15 @@ impl<'a> RuntimeAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
     ) -> Result<(), AppError> {
         self.state
             .authz
             .require(actor, "moira:agent-profiles:delete")?;
-        self.runtime_repo.soft_delete_agent_profile(id).await?;
-        self.invalidate_runtime().await;
+        self.runtime_repo
+            .soft_delete_agent_profile(id, expected_version)
+            .await?;
+        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
             ctx,
@@ -470,6 +550,7 @@ impl<'a> RuntimeAdminService<'a> {
         actor: &Actor,
         ctx: &RequestContext,
         id: Uuid,
+        expected_version: i64,
         enabled: bool,
     ) -> Result<AgentProfileRecord, AppError> {
         self.state
@@ -477,9 +558,13 @@ impl<'a> RuntimeAdminService<'a> {
             .require(actor, "moira:agent-profiles:write")?;
         let record = self
             .runtime_repo
-            .set_agent_profile_status(id, if enabled { "active" } else { "disabled" })
+            .set_agent_profile_status(
+                id,
+                expected_version,
+                if enabled { "active" } else { "disabled" },
+            )
             .await?;
-        self.invalidate_runtime().await;
+        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
             ctx,
@@ -562,7 +647,7 @@ impl<'a> RuntimeAdminService<'a> {
             .runtime_repo
             .put_provider_runtime_policy(provider_id, &request)
             .await?;
-        self.invalidate_runtime().await;
+        self.invalidate_runtime(CircuitResetScope::Unaffected).await;
         self.audit_success(
             actor,
             ctx,
@@ -583,10 +668,61 @@ impl<'a> RuntimeAdminService<'a> {
         Ok(record)
     }
 
-    async fn invalidate_runtime(&self) {
+    /// Drops both runtime caches, and clears exactly the breaker entries the write that
+    /// just happened can plausibly have invalidated.
+    ///
+    /// This called `CircuitBreakerRegistry::reset_all` until plan 06 Module 14, so every
+    /// runtime-admin mutation discarded the health of *every* provider in the process:
+    /// renaming a route re-closed a circuit that was open because some unrelated provider
+    /// was still timing out, and the next request went straight back at it. Module 14
+    /// fixed the same defect on the `LISTEN`/`NOTIFY` side (`src/infra/db.rs`) but could
+    /// not reach this file; this is the service-side half of it.
+    ///
+    /// The scope is a parameter rather than a constant so the compiler puts the question
+    /// to every future caller. Deriving it here from the method name would be a guess,
+    /// and a guess is wrong in both directions — too narrow leaves a breaker stale, too
+    /// wide is the bug above.
+    ///
+    /// Every call site today passes [`CircuitResetScope::Unaffected`], which is a
+    /// property of this service's *write set* rather than a coincidence. A breaker entry
+    /// is keyed on `(provider_id, model_id)` and earned by observing a provider actually
+    /// fail; this service writes four tables, and none of them can change whether a
+    /// provider is answering:
+    ///
+    /// * `route_definitions` — the four route-definition mutations. A route is a named
+    ///   entry point and the row carries neither a provider nor a model, so no breaker
+    ///   entry can name it.
+    /// * `routing_policies` — the four routing-policy mutations. These rows *do* carry a
+    ///   `(provider_id, provider_model_id)` pair, which makes them look scopeable, but
+    ///   the pair says where traffic should be sent, not whether the provider is up.
+    ///   Binding a route to a provider does not make a failing provider healthy, and
+    ///   clearing its breaker on that write is precisely how traffic gets sent back at it.
+    /// * `agent_profiles` — the four agent-profile mutations. Temperature, token limits
+    ///   and tool/context/memory policy; the row carries no provider identity at all.
+    /// * `provider_runtime_policies` — `put_provider_runtime_policy`, the only caller
+    ///   holding a `provider_id` and therefore the only one where `Provider(id)` is even
+    ///   expressible. It is still `Unaffected`, for the reason recorded at
+    ///   `CIRCUIT_UNAFFECTED_RESOURCE_TYPES` in `src/infra/db.rs`: [`before_call`] already
+    ///   resets any entry whose stored `policy_version` disagrees with the policy it is
+    ///   handed, so a policy edit self-heals exactly where the breaker is consulted.
+    ///   Resetting here as well would throw away every breaker for that provider on an
+    ///   edit to, say, `max_concurrent_streams`.
+    ///
+    /// What makes those four answers more than opinion: each of these writes also fires
+    /// the `moira_runtime_config` trigger, and `circuit_reset_scope` in `src/infra/db.rs`
+    /// independently classifies all four tables as `Unaffected`. The two paths have to
+    /// agree — the notification reaches every process, this call only the process that
+    /// served the request — so a disagreement would leave the writing node's breaker
+    /// state diverging from every other node's for the very same row.
+    ///
+    /// [`before_call`]: crate::orchestration::CircuitBreakerRegistry::before_call
+    async fn invalidate_runtime(&self, circuits: CircuitResetScope) {
+        // Both caches stay unconditional, as they are on the NOTIFY path: they are keyed
+        // by row version and rebuild from a query, so re-reading them costs one. Breaker
+        // state cannot be rebuilt, which is why it is the only thing scoped.
         self.state.runtime_cache.invalidate_all().await;
         self.state.runtime_handles.invalidate_all().await;
-        self.state.circuits.reset_all().await;
+        self.state.circuits.reset_for_resource(circuits).await;
     }
 
     async fn audit_success(
@@ -632,17 +768,62 @@ impl<'a> RuntimeAdminService<'a> {
         let Some(key) = &ctx.idempotency_key else {
             return Ok(None);
         };
+        let hasher = &self.state.idempotency_hasher;
+        let request_bytes = normalized_request_bytes(request)?;
+
+        // Two independent dimensions of the unique index have changed under deployed rows,
+        // so the read path sweeps both and the write path emits only the current pair:
+        //
+        //   * `idempotency_key_hash` — unkeyed SHA-256 → keyed HMAC (plan 03, P1-1);
+        //   * `actor_fingerprint`    — this module's 3-field formula → the crate-wide
+        //     10-field one (plan 06, Module 16 / P2-15).
+        //
+        // Three of the four combinations are reachable in a live ledger. The fourth
+        // (current fingerprint + legacy key hash) is not — a row carrying the pre-plan-03
+        // key hash necessarily predates plan 06 too, so it also carries the legacy
+        // fingerprint — but it is still probed, because it costs one indexed lookup on a
+        // path that has already missed twice and dropping it would narrow replay coverage
+        // on an argument about deploy ordering rather than about the data.
+        //
+        // Order is load-bearing: the current fingerprint is tried first so a post-deploy
+        // row always wins, and a legacy hit is only ever *read*. `record_idempotency`
+        // writes `actor_fingerprint(actor)` unconditionally, so the legacy value can never
+        // re-enter the ledger and the fallback drains as rows expire.
+        //
+        // TODO(post-deploy): delete `legacy_actor_fingerprint` and the second half of this
+        // sweep once every ledger row written before plan 06 shipped has expired.
+        // `idempotency_records.expires_at` is set 24h ahead (`record_idempotency` below),
+        // so the window closes 24h after the deploy that carries Module 16; the earliest
+        // safe removal date is therefore deploy-date + 1 day.
+        //
+        // Gated on a DEPLOY, not on a merge, and deliberately not owned by any plan — plan 07
+        // was originally named here, but a plan lands when it is merged and this window does
+        // not open until the code is running in production. Removing it early means a client
+        // retrying an idempotent request across the deploy boundary misses its ledger row and
+        // executes a second time, which is the exact failure the sweep exists to prevent.
         let actor_fingerprint = actor_fingerprint(actor);
-        let key_hash = request_hash(key.as_bytes());
-        let request_hash = normalized_request_hash(request)?;
-        let Some(record) = self
-            .admin_repo
-            .get_idempotency_record(&key_hash, &actor_fingerprint, operation)
-            .await?
-        else {
+        let legacy_actor_fingerprint = legacy_actor_fingerprint(actor);
+        let key_hashes = [
+            hasher.hash(key.as_bytes()),
+            hasher.legacy_hash(key.as_bytes()),
+        ];
+        let mut record = None;
+        'sweep: for fingerprint in [&actor_fingerprint, &legacy_actor_fingerprint] {
+            for key_hash in &key_hashes {
+                record = self
+                    .admin_repo
+                    .get_idempotency_record(key_hash, fingerprint, operation)
+                    .await?;
+                if record.is_some() {
+                    break 'sweep;
+                }
+            }
+        }
+
+        let Some(record) = record else {
             return Ok(None);
         };
-        if record.request_hash != request_hash {
+        if !hasher.verify(&request_bytes, &record.request_hash) {
             return Err(AppError::conflict(
                 "idempotency_conflict",
                 "same Idempotency-Key was used with a different request",
@@ -677,12 +858,13 @@ impl<'a> RuntimeAdminService<'a> {
             .and_then(|value| value.get("id"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
+        let hasher = &self.state.idempotency_hasher;
         let record = IdempotencyRecord {
             id: Uuid::now_v7(),
-            idempotency_key_hash: request_hash(key.as_bytes()),
+            idempotency_key_hash: hasher.hash(key.as_bytes()),
             actor_fingerprint: actor_fingerprint(actor),
             operation: operation.to_string(),
-            request_hash: normalized_request_hash(request)?,
+            request_hash: hasher.hash(&normalized_request_bytes(request)?),
             response_status: Some(200),
             response_body,
             resource_id,
@@ -699,7 +881,20 @@ struct ProviderRuntimePolicyIdempotencyRequest<'a> {
     request: &'a ProviderRuntimePolicyPutRequest,
 }
 
-fn actor_fingerprint(actor: &Actor) -> String {
+/// The fingerprint this module wrote **before** plan 06 unified the three formulas.
+///
+/// Read-only, and deliberately not `pub`: `idempotency_replay` consults it so a ledger row
+/// written by the previous release still replays, and nothing else may call it. It hashes
+/// only `{actor_type, subject, api_key_id}`, which is why two actors differing solely by
+/// trusted-JWT issuer, tenant, application or delegated subject used to collide here — the
+/// P2-15 hole. `tests::the_legacy_runtime_admin_fingerprint_collided_across_issuer_tenant_and_delegation`
+/// pins that collision so this stays a documented historical value rather than something a
+/// later reader mistakes for a second live formula.
+///
+/// TODO(post-deploy): delete together with the legacy half of `idempotency_replay`'s sweep,
+/// once 24h (the `expires_at` window set in `record_idempotency`) have elapsed since the
+/// deploy carrying plan 06 Module 16. Gated on a deploy, not on a merge, and owned by no plan.
+fn legacy_actor_fingerprint(actor: &Actor) -> String {
     secret_fingerprint(
         format!(
             "{:?}:{}:{}",
@@ -714,10 +909,45 @@ fn actor_fingerprint(actor: &Actor) -> String {
     )
 }
 
-fn normalized_request_hash<T: Serialize>(request: &T) -> Result<String, AppError> {
+/// The canonical bytes an idempotent runtime-admin request hashes to.
+///
+/// Returns bytes rather than a digest so the read path can run them through
+/// `IdempotencyHasher::verify`, which accepts both the current keyed digest and the
+/// pre-switch unkeyed one.
+fn normalized_request_bytes<T: Serialize>(request: &T) -> Result<Vec<u8>, AppError> {
     serde_json::to_vec(request)
-        .map(|bytes| request_hash(&bytes))
         .map_err(|err| AppError::BadRequest(format!("invalid idempotent request: {err}")))
+}
+
+/// Trims a `limit + 1`-row over-fetch (see `PgRuntimeRepository::list_route_definitions`)
+/// down to `limit`, computes `has_more`, and encodes `next_cursor` from the last row that is
+/// actually returned — never from the discarded over-fetched row, which would silently skip
+/// a row on the following page.
+fn paginate_by_created_at<T>(
+    mut rows: Vec<T>,
+    limit: i64,
+    scope: CursorScope,
+    key: impl Fn(&T) -> (DateTime<Utc>, Uuid),
+) -> ListResponse<T> {
+    let has_more = (rows.len() as i64) > limit;
+    if has_more {
+        rows.truncate(limit.max(0) as usize);
+    }
+    let next_cursor = if has_more {
+        rows.last().map(|record| {
+            let (ts, id) = key(record);
+            ListCursor::new(ts, id).encode(scope)
+        })
+    } else {
+        None
+    };
+    ListResponse {
+        data: rows,
+        pagination: Pagination {
+            next_cursor,
+            has_more,
+        },
+    }
 }
 
 fn validate_key(label: &str, value: &str) -> Result<(), AppError> {
@@ -882,6 +1112,64 @@ fn validate_runtime_policy(request: &ProviderRuntimePolicyPutRequest) -> Result<
 mod tests {
     use super::*;
 
+    const TEST_SCOPE: CursorScope = CursorScope::new("test.paginate_by_created_at");
+
+    fn sample_rows(count: usize) -> Vec<(DateTime<Utc>, Uuid)> {
+        let base = Utc::now();
+        (0..count)
+            .map(|i| (base - Duration::seconds(i as i64), Uuid::now_v7()))
+            .collect()
+    }
+
+    #[test]
+    fn has_more_is_false_when_exactly_limit_rows_are_available() {
+        let rows = sample_rows(5);
+        let page = paginate_by_created_at(rows.clone(), 5, TEST_SCOPE, |row| *row);
+        assert!(!page.pagination.has_more);
+        assert_eq!(page.pagination.next_cursor, None);
+        assert_eq!(page.data.len(), 5);
+        assert_eq!(page.data, rows);
+    }
+
+    #[test]
+    fn has_more_is_true_and_page_is_trimmed_when_limit_plus_one_rows_are_fetched() {
+        let rows = sample_rows(6);
+        let page = paginate_by_created_at(rows.clone(), 5, TEST_SCOPE, |row| *row);
+        assert!(page.pagination.has_more);
+        assert_eq!(page.data.len(), 5);
+        assert_eq!(page.data, &rows[..5]);
+    }
+
+    #[test]
+    fn next_cursor_encodes_the_last_returned_row_not_the_over_fetched_row() {
+        let rows = sample_rows(6);
+        let page = paginate_by_created_at(rows.clone(), 5, TEST_SCOPE, |row| *row);
+        let (expected_ts, expected_id) = rows[4];
+        let expected = ListCursor::new(expected_ts, expected_id).encode(TEST_SCOPE);
+        assert_eq!(page.pagination.next_cursor, Some(expected));
+        // The 6th (over-fetched, trimmed) row must not be what next_cursor points at.
+        let (sixth_ts, sixth_id) = rows[5];
+        let sixth_encoded = ListCursor::new(sixth_ts, sixth_id).encode(TEST_SCOPE);
+        assert_ne!(page.pagination.next_cursor, Some(sixth_encoded));
+    }
+
+    #[test]
+    fn next_cursor_is_none_when_has_more_is_false() {
+        let rows = sample_rows(3);
+        let page = paginate_by_created_at(rows, 5, TEST_SCOPE, |row| *row);
+        assert!(!page.pagination.has_more);
+        assert_eq!(page.pagination.next_cursor, None);
+    }
+
+    #[test]
+    fn empty_result_set_is_not_has_more() {
+        let page: ListResponse<(DateTime<Utc>, Uuid)> =
+            paginate_by_created_at(Vec::new(), 5, TEST_SCOPE, |row| *row);
+        assert!(!page.pagination.has_more);
+        assert_eq!(page.pagination.next_cursor, None);
+        assert!(page.data.is_empty());
+    }
+
     #[test]
     fn route_keys_are_slug_like() {
         assert!(validate_key("route_key", "coding_v1").is_ok());
@@ -930,5 +1218,102 @@ mod tests {
             ),
             (current_provider_id, replacement_provider_model_id)
         );
+    }
+
+    /// The bug Module 16 fixes, pinned in one test so it cannot be re-argued.
+    ///
+    /// Plan 06 §16.4 asks for the unified formula's isolation tests to be "observed failing
+    /// against the old 3-field formula before that formula was deleted". A transcript of a
+    /// deleted test proves that once, to whoever read it. This proves it on every `cargo
+    /// test` run, for as long as the legacy value survives, and it proves the *pair* of
+    /// claims that matter together: the old formula collided, and the one now writing the
+    /// ledger does not.
+    ///
+    /// Each case varies exactly one identity field. All four were invisible to
+    /// `{actor_type, subject, api_key_id}`, so on the pre-plan-06 code every
+    /// `create_route_definition`, `create_routing_policy`, `create_agent_profile` and
+    /// `put_provider_runtime_policy` call by actor A could replay actor B's stored
+    /// response given the same `Idempotency-Key`.
+    #[test]
+    fn the_legacy_runtime_admin_fingerprint_collided_across_issuer_tenant_and_delegation() {
+        use crate::security::ActorType;
+
+        let base = Actor {
+            actor_type: ActorType::TrustedJwt,
+            subject: Some("shared-subject".to_string()),
+            api_key_id: None,
+            trusted_jwt_issuer_id: Some(Uuid::nil()),
+            ..Actor::default()
+        };
+
+        let variants: [(&str, Actor); 5] = [
+            (
+                "trusted_jwt_issuer_id",
+                Actor {
+                    trusted_jwt_issuer_id: Some(Uuid::now_v7()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "tenant_id",
+                Actor {
+                    tenant_id: Some("other-tenant".to_string()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "external_tenant_id",
+                Actor {
+                    external_tenant_id: Some("other-tenant".to_string()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "internal_application_id",
+                Actor {
+                    internal_application_id: Some(Uuid::now_v7()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "delegated_subject",
+                Actor {
+                    delegated_subject: Some("other-user".to_string()),
+                    ..base.clone()
+                },
+            ),
+        ];
+
+        for (field, variant) in variants {
+            assert_eq!(
+                legacy_actor_fingerprint(&base),
+                legacy_actor_fingerprint(&variant),
+                "the pre-plan-06 formula is supposed to be blind to `{field}` — if this \
+                 stops holding, the legacy fallback is reading a value production never \
+                 wrote and pre-deploy rows will not replay"
+            );
+            assert_ne!(
+                actor_fingerprint(&base),
+                actor_fingerprint(&variant),
+                "the unified formula must isolate replay across `{field}`"
+            );
+        }
+    }
+
+    /// The fallback is a *read* concession, not a second write format. If the two formulas
+    /// ever agreed, `idempotency_replay`'s second sweep pass would be redundant; if
+    /// `record_idempotency` ever emitted the legacy value, the hole would be back.
+    #[test]
+    fn the_legacy_and_unified_fingerprints_are_distinct_values() {
+        use crate::security::ActorType;
+
+        let actor = Actor {
+            actor_type: ActorType::SystemKey,
+            subject: Some("system".to_string()),
+            api_key_id: Some(Uuid::now_v7()),
+            ..Actor::default()
+        };
+
+        assert_ne!(actor_fingerprint(&actor), legacy_actor_fingerprint(&actor));
     }
 }

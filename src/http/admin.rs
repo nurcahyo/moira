@@ -48,14 +48,18 @@ pub async fn get_setup_status(
     SetupService::new(&state)?.status(&actor).await.map(Json)
 }
 
-async fn admin_actor(
+/// `pub(super)` so `src/http/auth_settings.rs` (plan 07, module 12) gates on the *same*
+/// wrapper every other admin handler uses. A second transcription of "authenticate the
+/// admin plane" is how one surface silently keeps accepting a credential another stopped
+/// accepting.
+pub(super) async fn admin_actor(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<crate::security::Actor, AppError> {
     state.auth.authenticate_admin(state.pool()?, headers).await
 }
 
-fn etag_headers(version: i64) -> HeaderMap {
+pub(super) fn etag_headers(version: i64) -> HeaderMap {
     let mut headers = HeaderMap::new();
     if let Ok(value) = HeaderValue::from_str(&format!("\"{version}\"")) {
         headers.insert(header::ETAG, value);
@@ -63,10 +67,16 @@ fn etag_headers(version: i64) -> HeaderMap {
     headers
 }
 
-fn require_if_match(headers: &HeaderMap) -> Result<i64, AppError> {
+pub(super) fn require_if_match(headers: &HeaderMap) -> Result<i64, AppError> {
     let value = headers
         .get(header::IF_MATCH)
-        .ok_or_else(|| AppError::BadRequest("If-Match header is required".to_string()))?
+        .ok_or_else(|| {
+            AppError::coded(
+                StatusCode::BAD_REQUEST,
+                "if_match_required",
+                "If-Match header is required",
+            )
+        })?
         .to_str()
         .map_err(|_| AppError::BadRequest("If-Match header is invalid".to_string()))?;
     value
@@ -80,17 +90,6 @@ fn optional_if_match(headers: &HeaderMap) -> Result<Option<i64>, AppError> {
     match headers.get(header::IF_MATCH) {
         Some(_) => require_if_match(headers).map(Some),
         None => Ok(None),
-    }
-}
-
-fn ensure_version(actual: i64, expected: i64) -> Result<(), AppError> {
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(AppError::conflict(
-            "resource_version_conflict",
-            "resource version does not match If-Match",
-        ))
     }
 }
 
@@ -140,7 +139,7 @@ pub async fn list_applications(
 ) -> Result<Json<ListResponse<ApplicationRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     AdminService::new(&state)?
-        .list_applications(&actor, query.limit())
+        .list_applications(&actor, &query)
         .await
         .map(Json)
 }
@@ -190,11 +189,10 @@ pub async fn patch_application(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = AdminService::new(&state)?;
-    ensure_version(
-        service.get_application(&actor, id).await?.version,
-        require_if_match(&headers)?,
-    )?;
-    let record = service.patch_application(&actor, &ctx, id, request).await?;
+    let expected_version = require_if_match(&headers)?;
+    let record = service
+        .patch_application(&actor, &ctx, id, expected_version, request)
+        .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
 
@@ -219,11 +217,10 @@ pub async fn delete_application(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = AdminService::new(&state)?;
-    ensure_version(
-        service.get_application(&actor, id).await?.version,
-        require_if_match(&headers)?,
-    )?;
-    service.delete_application(&actor, &ctx, id).await?;
+    let expected_version = require_if_match(&headers)?;
+    service
+        .delete_application(&actor, &ctx, id, expected_version)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -248,12 +245,9 @@ pub async fn enable_application(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = AdminService::new(&state)?;
-    ensure_version(
-        service.get_application(&actor, id).await?.version,
-        require_if_match(&headers)?,
-    )?;
+    let expected_version = require_if_match(&headers)?;
     let record = service
-        .set_application_enabled(&actor, &ctx, id, true)
+        .set_application_enabled(&actor, &ctx, id, expected_version, true)
         .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
@@ -279,12 +273,9 @@ pub async fn disable_application(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = AdminService::new(&state)?;
-    ensure_version(
-        service.get_application(&actor, id).await?.version,
-        require_if_match(&headers)?,
-    )?;
+    let expected_version = require_if_match(&headers)?;
     let record = service
-        .set_application_enabled(&actor, &ctx, id, false)
+        .set_application_enabled(&actor, &ctx, id, expected_version, false)
         .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
@@ -316,7 +307,7 @@ pub async fn get_application_execution_policy(
     request_body = ApplicationExecutionPolicyPutRequest,
     params(
         ("id" = Uuid, Path, description = "Application identifier"),
-        ("If-Match" = Option<i64>, Header, description = "Optional current resource version"),
+        ("If-Match" = i64, Header, description = "Required current resource version"),
         ("Idempotency-Key" = Option<String>, Header, description = "Optional replay key")
     ),
     responses(
@@ -335,7 +326,13 @@ pub async fn put_application_execution_policy(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let record = PublicExecutionService::new(&state)?
-        .put_application_execution_policy(&actor, &ctx, id, optional_if_match(&headers)?, request)
+        .put_application_execution_policy(
+            &actor,
+            &ctx,
+            id,
+            Some(require_if_match(&headers)?),
+            request,
+        )
         .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
@@ -386,7 +383,7 @@ pub async fn list_providers(
 ) -> Result<Json<ListResponse<ProviderRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     AdminService::new(&state)?
-        .list_providers(&actor, query.limit())
+        .list_providers(&actor, &query)
         .await
         .map(Json)
 }
@@ -434,11 +431,10 @@ pub async fn patch_provider(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = AdminService::new(&state)?;
-    ensure_version(
-        service.get_provider(&actor, id).await?.version,
-        require_if_match(&headers)?,
-    )?;
-    let record = service.patch_provider(&actor, &ctx, id, request).await?;
+    let expected_version = require_if_match(&headers)?;
+    let record = service
+        .patch_provider(&actor, &ctx, id, expected_version, request)
+        .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
 
@@ -463,11 +459,10 @@ pub async fn delete_provider(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = AdminService::new(&state)?;
-    ensure_version(
-        service.get_provider(&actor, id).await?.version,
-        require_if_match(&headers)?,
-    )?;
-    service.delete_provider(&actor, &ctx, id).await?;
+    let expected_version = require_if_match(&headers)?;
+    service
+        .delete_provider(&actor, &ctx, id, expected_version)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -492,11 +487,10 @@ pub async fn enable_provider(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = AdminService::new(&state)?;
-    ensure_version(
-        service.get_provider(&actor, id).await?.version,
-        require_if_match(&headers)?,
-    )?;
-    let record = service.set_provider_enabled(&actor, &ctx, id, true).await?;
+    let expected_version = require_if_match(&headers)?;
+    let record = service
+        .set_provider_enabled(&actor, &ctx, id, expected_version, true)
+        .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
 
@@ -521,12 +515,9 @@ pub async fn disable_provider(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = AdminService::new(&state)?;
-    ensure_version(
-        service.get_provider(&actor, id).await?.version,
-        require_if_match(&headers)?,
-    )?;
+    let expected_version = require_if_match(&headers)?;
     let record = service
-        .set_provider_enabled(&actor, &ctx, id, false)
+        .set_provider_enabled(&actor, &ctx, id, expected_version, false)
         .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
@@ -585,7 +576,7 @@ pub async fn list_provider_models(
 ) -> Result<Json<ListResponse<ProviderModelRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     AdminService::new(&state)?
-        .list_provider_models(&actor, provider_id, query.limit())
+        .list_provider_models(&actor, provider_id, &query)
         .await
         .map(Json)
 }
@@ -613,12 +604,9 @@ pub async fn patch_provider_model(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = AdminService::new(&state)?;
-    ensure_version(
-        service.get_provider_model(&actor, model_id).await?.version,
-        require_if_match(&headers)?,
-    )?;
+    let expected_version = require_if_match(&headers)?;
     let record = service
-        .patch_provider_model(&actor, &ctx, model_id, request)
+        .patch_provider_model(&actor, &ctx, model_id, expected_version, request)
         .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
@@ -666,12 +654,9 @@ pub async fn delete_provider_model(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = AdminService::new(&state)?;
-    ensure_version(
-        service.get_provider_model(&actor, model_id).await?.version,
-        require_if_match(&headers)?,
-    )?;
+    let expected_version = require_if_match(&headers)?;
     service
-        .delete_provider_model(&actor, &ctx, model_id)
+        .delete_provider_model(&actor, &ctx, model_id, expected_version)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -697,12 +682,9 @@ pub async fn enable_provider_model(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = AdminService::new(&state)?;
-    ensure_version(
-        service.get_provider_model(&actor, model_id).await?.version,
-        require_if_match(&headers)?,
-    )?;
+    let expected_version = require_if_match(&headers)?;
     let record = service
-        .set_provider_model_enabled(&actor, &ctx, model_id, true)
+        .set_provider_model_enabled(&actor, &ctx, model_id, expected_version, true)
         .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
@@ -728,12 +710,9 @@ pub async fn disable_provider_model(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = AdminService::new(&state)?;
-    ensure_version(
-        service.get_provider_model(&actor, model_id).await?.version,
-        require_if_match(&headers)?,
-    )?;
+    let expected_version = require_if_match(&headers)?;
     let record = service
-        .set_provider_model_enabled(&actor, &ctx, model_id, false)
+        .set_provider_model_enabled(&actor, &ctx, model_id, expected_version, false)
         .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
@@ -784,7 +763,7 @@ pub async fn list_credentials(
 ) -> Result<Json<ListResponse<CredentialRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     AdminService::new(&state)?
-        .list_credentials(&actor, query.limit())
+        .list_credentials(&actor, &query)
         .await
         .map(Json)
 }
@@ -834,11 +813,10 @@ pub async fn patch_credential(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = AdminService::new(&state)?;
-    ensure_version(
-        service.get_credential(&actor, id).await?.version,
-        require_if_match(&headers)?,
-    )?;
-    let record = service.patch_credential(&actor, &ctx, id, request).await?;
+    let expected_version = require_if_match(&headers)?;
+    let record = service
+        .patch_credential(&actor, &ctx, id, expected_version, request)
+        .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
 
@@ -863,11 +841,10 @@ pub async fn delete_credential(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = AdminService::new(&state)?;
-    ensure_version(
-        service.get_credential(&actor, id).await?.version,
-        require_if_match(&headers)?,
-    )?;
-    service.delete_credential(&actor, &ctx, id).await?;
+    let expected_version = require_if_match(&headers)?;
+    service
+        .delete_credential(&actor, &ctx, id, expected_version)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -923,12 +900,9 @@ pub async fn enable_credential(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = AdminService::new(&state)?;
-    ensure_version(
-        service.get_credential(&actor, id).await?.version,
-        require_if_match(&headers)?,
-    )?;
+    let expected_version = require_if_match(&headers)?;
     let record = service
-        .set_credential_enabled(&actor, &ctx, id, true)
+        .set_credential_enabled(&actor, &ctx, id, expected_version, true)
         .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
@@ -954,12 +928,9 @@ pub async fn disable_credential(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = AdminService::new(&state)?;
-    ensure_version(
-        service.get_credential(&actor, id).await?.version,
-        require_if_match(&headers)?,
-    )?;
+    let expected_version = require_if_match(&headers)?;
     let record = service
-        .set_credential_enabled(&actor, &ctx, id, false)
+        .set_credential_enabled(&actor, &ctx, id, expected_version, false)
         .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
@@ -1015,7 +986,7 @@ pub async fn list_user_credentials(
 ) -> Result<Json<ListResponse<CredentialRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     AdminService::new(&state)?
-        .list_user_credentials(&actor, &external_user_id, query.limit())
+        .list_user_credentials(&actor, &external_user_id, &query)
         .await
         .map(Json)
 }
@@ -1042,12 +1013,15 @@ pub async fn delete_user_credential(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = AdminService::new(&state)?;
-    ensure_version(
-        service.get_credential(&actor, credential_id).await?.version,
-        require_if_match(&headers)?,
-    )?;
+    let expected_version = require_if_match(&headers)?;
     service
-        .delete_user_credential(&actor, &ctx, &external_user_id, credential_id)
+        .delete_user_credential(
+            &actor,
+            &ctx,
+            &external_user_id,
+            credential_id,
+            expected_version,
+        )
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1094,7 +1068,7 @@ pub async fn list_system_keys(
 ) -> Result<Json<ListResponse<ApiKeyRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     AdminService::new(&state)?
-        .list_system_keys(&actor, query.limit())
+        .list_system_keys(&actor, &query)
         .await
         .map(Json)
 }
@@ -1243,7 +1217,7 @@ pub async fn list_consumer_keys(
 ) -> Result<Json<ListResponse<ApiKeyRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     AdminService::new(&state)?
-        .list_consumer_keys(&actor, query.limit())
+        .list_consumer_keys(&actor, &query)
         .await
         .map(Json)
 }
@@ -1396,7 +1370,7 @@ pub async fn list_trusted_jwt_issuers(
 ) -> Result<Json<ListResponse<TrustedJwtIssuerRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     AdminService::new(&state)?
-        .list_trusted_jwt_issuers(&actor, query.limit())
+        .list_trusted_jwt_issuers(&actor, &query)
         .await
         .map(Json)
 }
@@ -1446,12 +1420,9 @@ pub async fn patch_trusted_jwt_issuer(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = AdminService::new(&state)?;
-    ensure_version(
-        service.get_trusted_jwt_issuer(&actor, id).await?.version,
-        require_if_match(&headers)?,
-    )?;
+    let expected_version = require_if_match(&headers)?;
     let record = service
-        .patch_trusted_jwt_issuer(&actor, &ctx, id, request)
+        .patch_trusted_jwt_issuer(&actor, &ctx, id, expected_version, request)
         .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
@@ -1477,11 +1448,10 @@ pub async fn delete_trusted_jwt_issuer(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = AdminService::new(&state)?;
-    ensure_version(
-        service.get_trusted_jwt_issuer(&actor, id).await?.version,
-        require_if_match(&headers)?,
-    )?;
-    service.delete_trusted_jwt_issuer(&actor, &ctx, id).await?;
+    let expected_version = require_if_match(&headers)?;
+    service
+        .delete_trusted_jwt_issuer(&actor, &ctx, id, expected_version)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1529,12 +1499,9 @@ pub async fn enable_trusted_jwt_issuer(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = AdminService::new(&state)?;
-    ensure_version(
-        service.get_trusted_jwt_issuer(&actor, id).await?.version,
-        require_if_match(&headers)?,
-    )?;
+    let expected_version = require_if_match(&headers)?;
     let record = service
-        .set_trusted_jwt_issuer_enabled(&actor, &ctx, id, true)
+        .set_trusted_jwt_issuer_enabled(&actor, &ctx, id, expected_version, true)
         .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
@@ -1560,12 +1527,9 @@ pub async fn disable_trusted_jwt_issuer(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = AdminService::new(&state)?;
-    ensure_version(
-        service.get_trusted_jwt_issuer(&actor, id).await?.version,
-        require_if_match(&headers)?,
-    )?;
+    let expected_version = require_if_match(&headers)?;
     let record = service
-        .set_trusted_jwt_issuer_enabled(&actor, &ctx, id, false)
+        .set_trusted_jwt_issuer_enabled(&actor, &ctx, id, expected_version, false)
         .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
@@ -1587,7 +1551,7 @@ pub async fn list_audit_events(
 ) -> Result<Json<ListResponse<AuditLogRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     AdminService::new(&state)?
-        .list_audit_logs(&actor, query.limit())
+        .list_audit_logs(&actor, &query)
         .await
         .map(Json)
 }
@@ -1659,7 +1623,7 @@ pub async fn list_route_definitions(
 ) -> Result<Json<ListResponse<RouteDefinitionRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     RuntimeAdminService::new(&state)?
-        .list_route_definitions(&actor, query.limit())
+        .list_route_definitions(&actor, query.cursor.as_deref(), query.limit())
         .await
         .map(Json)
 }
@@ -1709,12 +1673,9 @@ pub async fn patch_route_definition(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = RuntimeAdminService::new(&state)?;
-    ensure_version(
-        service.get_route_definition(&actor, id).await?.version,
-        require_if_match(&headers)?,
-    )?;
+    let expected_version = require_if_match(&headers)?;
     let record = service
-        .patch_route_definition(&actor, &ctx, id, request)
+        .patch_route_definition(&actor, &ctx, id, expected_version, request)
         .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
@@ -1740,11 +1701,10 @@ pub async fn delete_route_definition(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = RuntimeAdminService::new(&state)?;
-    ensure_version(
-        service.get_route_definition(&actor, id).await?.version,
-        require_if_match(&headers)?,
-    )?;
-    service.delete_route_definition(&actor, &ctx, id).await?;
+    let expected_version = require_if_match(&headers)?;
+    service
+        .delete_route_definition(&actor, &ctx, id, expected_version)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1769,12 +1729,9 @@ pub async fn enable_route_definition(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = RuntimeAdminService::new(&state)?;
-    ensure_version(
-        service.get_route_definition(&actor, id).await?.version,
-        require_if_match(&headers)?,
-    )?;
+    let expected_version = require_if_match(&headers)?;
     let record = service
-        .set_route_definition_enabled(&actor, &ctx, id, true)
+        .set_route_definition_enabled(&actor, &ctx, id, expected_version, true)
         .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
@@ -1800,12 +1757,9 @@ pub async fn disable_route_definition(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = RuntimeAdminService::new(&state)?;
-    ensure_version(
-        service.get_route_definition(&actor, id).await?.version,
-        require_if_match(&headers)?,
-    )?;
+    let expected_version = require_if_match(&headers)?;
     let record = service
-        .set_route_definition_enabled(&actor, &ctx, id, false)
+        .set_route_definition_enabled(&actor, &ctx, id, expected_version, false)
         .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
@@ -1855,7 +1809,7 @@ pub async fn list_routing_policies(
 ) -> Result<Json<ListResponse<RoutingPolicyRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     RuntimeAdminService::new(&state)?
-        .list_routing_policies(&actor, query.limit())
+        .list_routing_policies(&actor, query.cursor.as_deref(), query.limit())
         .await
         .map(Json)
 }
@@ -1905,12 +1859,9 @@ pub async fn patch_routing_policy(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = RuntimeAdminService::new(&state)?;
-    ensure_version(
-        service.get_routing_policy(&actor, id).await?.version,
-        require_if_match(&headers)?,
-    )?;
+    let expected_version = require_if_match(&headers)?;
     let record = service
-        .patch_routing_policy(&actor, &ctx, id, request)
+        .patch_routing_policy(&actor, &ctx, id, expected_version, request)
         .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
@@ -1936,11 +1887,10 @@ pub async fn delete_routing_policy(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = RuntimeAdminService::new(&state)?;
-    ensure_version(
-        service.get_routing_policy(&actor, id).await?.version,
-        require_if_match(&headers)?,
-    )?;
-    service.delete_routing_policy(&actor, &ctx, id).await?;
+    let expected_version = require_if_match(&headers)?;
+    service
+        .delete_routing_policy(&actor, &ctx, id, expected_version)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1965,12 +1915,9 @@ pub async fn enable_routing_policy(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = RuntimeAdminService::new(&state)?;
-    ensure_version(
-        service.get_routing_policy(&actor, id).await?.version,
-        require_if_match(&headers)?,
-    )?;
+    let expected_version = require_if_match(&headers)?;
     let record = service
-        .set_routing_policy_enabled(&actor, &ctx, id, true)
+        .set_routing_policy_enabled(&actor, &ctx, id, expected_version, true)
         .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
@@ -1996,12 +1943,9 @@ pub async fn disable_routing_policy(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = RuntimeAdminService::new(&state)?;
-    ensure_version(
-        service.get_routing_policy(&actor, id).await?.version,
-        require_if_match(&headers)?,
-    )?;
+    let expected_version = require_if_match(&headers)?;
     let record = service
-        .set_routing_policy_enabled(&actor, &ctx, id, false)
+        .set_routing_policy_enabled(&actor, &ctx, id, expected_version, false)
         .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
@@ -2051,7 +1995,7 @@ pub async fn list_agent_profiles(
 ) -> Result<Json<ListResponse<AgentProfileRecord>>, AppError> {
     let actor = admin_actor(&state, &headers).await?;
     RuntimeAdminService::new(&state)?
-        .list_agent_profiles(&actor, query.limit())
+        .list_agent_profiles(&actor, query.cursor.as_deref(), query.limit())
         .await
         .map(Json)
 }
@@ -2101,12 +2045,9 @@ pub async fn patch_agent_profile(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = RuntimeAdminService::new(&state)?;
-    ensure_version(
-        service.get_agent_profile(&actor, id).await?.version,
-        require_if_match(&headers)?,
-    )?;
+    let expected_version = require_if_match(&headers)?;
     let record = service
-        .patch_agent_profile(&actor, &ctx, id, request)
+        .patch_agent_profile(&actor, &ctx, id, expected_version, request)
         .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
@@ -2132,11 +2073,10 @@ pub async fn delete_agent_profile(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = RuntimeAdminService::new(&state)?;
-    ensure_version(
-        service.get_agent_profile(&actor, id).await?.version,
-        require_if_match(&headers)?,
-    )?;
-    service.delete_agent_profile(&actor, &ctx, id).await?;
+    let expected_version = require_if_match(&headers)?;
+    service
+        .delete_agent_profile(&actor, &ctx, id, expected_version)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2161,12 +2101,9 @@ pub async fn enable_agent_profile(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = RuntimeAdminService::new(&state)?;
-    ensure_version(
-        service.get_agent_profile(&actor, id).await?.version,
-        require_if_match(&headers)?,
-    )?;
+    let expected_version = require_if_match(&headers)?;
     let record = service
-        .set_agent_profile_enabled(&actor, &ctx, id, true)
+        .set_agent_profile_enabled(&actor, &ctx, id, expected_version, true)
         .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
@@ -2192,12 +2129,9 @@ pub async fn disable_agent_profile(
     let actor = admin_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = RuntimeAdminService::new(&state)?;
-    ensure_version(
-        service.get_agent_profile(&actor, id).await?.version,
-        require_if_match(&headers)?,
-    )?;
+    let expected_version = require_if_match(&headers)?;
     let record = service
-        .set_agent_profile_enabled(&actor, &ctx, id, false)
+        .set_agent_profile_enabled(&actor, &ctx, id, expected_version, false)
         .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
@@ -2279,4 +2213,54 @@ pub async fn diagnose_runtime(
     execute_diagnostic(state, &actor, &ctx, request)
         .await
         .map(Json)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::CredentialType;
+    use axum::http::Uri;
+
+    /// Finding P2-9. `PageQuery` carries `#[serde(deny_unknown_fields)]`
+    /// (`src/domain/admin.rs`), and every admin list handler takes it through
+    /// `Query<PageQuery>` — but nothing asserted the attribute actually
+    /// rejected anything, so removing it would have been silent. This goes
+    /// through the real `Query` extractor rather than `serde_urlencoded`
+    /// directly, because the extractor is what the routes use.
+    #[test]
+    fn page_query_rejects_a_field_absent_from_the_struct() {
+        let uri: Uri = "/api/v1/admin/applications?not_a_real_field=1"
+            .parse()
+            .expect("test URI");
+        let rejection = Query::<PageQuery>::try_from_uri(&uri)
+            .expect_err("a field absent from PageQuery must be rejected");
+        let described = rejection.to_string();
+        assert!(
+            described.contains("not_a_real_field"),
+            "the rejection must name the offending field, got: {described}"
+        );
+
+        // The control: a field that *is* on the struct still parses, so the
+        // assertion above is about the unknown field and not about the
+        // extractor rejecting every query string it sees.
+        let accepted: Uri = "/api/v1/admin/applications?limit=7"
+            .parse()
+            .expect("test URI");
+        let query = Query::<PageQuery>::try_from_uri(&accepted).expect("a known field must parse");
+        assert_eq!(query.0.limit, Some(7));
+    }
+
+    /// The companion to the rejection above: `deny_unknown_fields` is a
+    /// *shape* check, not a relevance check. All 26 fields parse on every
+    /// list route, including ones that endpoint has no use for. Pinned here
+    /// so the nuance recorded on `PageQuery`(P2-9) cannot quietly change.
+    #[test]
+    fn page_query_accepts_a_defined_field_that_the_endpoint_ignores() {
+        let uri: Uri = "/api/v1/admin/applications?credential_type=api_key"
+            .parse()
+            .expect("test URI");
+        let query = Query::<PageQuery>::try_from_uri(&uri)
+            .expect("a field defined on PageQuery must parse on any list route");
+        assert_eq!(query.0.credential_type, Some(CredentialType::ApiKey));
+    }
 }

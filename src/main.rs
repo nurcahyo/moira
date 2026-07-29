@@ -5,7 +5,10 @@ use moira::{
     app::AppState,
     application::{AdminService, MoiraExecutionService, RequestContext},
     build_router,
-    config::{ProcessMode, Settings},
+    config::{
+        ProcessMode, Settings,
+        telemetry::{self, TelemetryShutdown},
+    },
     domain::{DiagnosticExecutionRequest, ExecutionOptions, SystemKeyCreateRequest},
     infra::db,
     security::{Actor, ActorType},
@@ -19,7 +22,38 @@ async fn main() -> anyhow::Result<()> {
         ProcessMode::parse(std::env::args().nth(1).as_deref()).context("parse process mode")?;
     let settings = Settings::load().context("load settings")?;
     settings.validate(mode).context("validate settings")?;
-    moira::config::telemetry::init(&settings.telemetry)?;
+    // Held for the whole process: the OTLP batch processor buffers spans and
+    // nothing flushes them unless this guard is shut down before exit.
+    let telemetry = telemetry::init(&settings.telemetry)?;
+
+    let result = run(mode, settings).await;
+
+    // Runs on every exit path — including the early-returning CLI modes and the
+    // error path — so a clean shutdown never discards the final span batch.
+    flush_telemetry(telemetry).await;
+
+    result
+}
+
+/// Flushes the OpenTelemetry pipeline.
+///
+/// `SdkTracerProvider::shutdown` drains the batch processor's dedicated worker
+/// thread with a blocking wait, so it is moved off the async runtime. A failed
+/// flush is logged, never propagated: losing trailing spans must not turn a
+/// successful run into a failed process exit.
+async fn flush_telemetry(telemetry: moira::config::telemetry::TelemetryGuard) {
+    match tokio::task::spawn_blocking(move || telemetry.shutdown()).await {
+        Ok(TelemetryShutdown::NotEnabled | TelemetryShutdown::Flushed) => {}
+        Ok(TelemetryShutdown::Failed(reason)) => {
+            warn!(%reason, "telemetry pipeline did not flush cleanly on shutdown");
+        }
+        Err(err) => {
+            warn!(%err, "telemetry shutdown task failed to join");
+        }
+    }
+}
+
+async fn run(mode: ProcessMode, settings: Settings) -> anyhow::Result<()> {
     let unsafe_features = settings.unsafe_development_features(mode);
     if !unsafe_features.is_empty() {
         warn!(
@@ -59,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
             pool.clone(),
             state.runtime_cache.clone(),
             state.runtime_handles.clone(),
+            state.auth_settings_cache.clone(),
             state.circuits.clone(),
         )
     });

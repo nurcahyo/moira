@@ -1,8 +1,12 @@
 mod admin;
+mod auth_settings;
 mod conversation;
 mod i18n;
+mod identity;
 mod ids;
+mod message;
 mod models;
+mod pagination;
 mod public;
 mod runtime;
 
@@ -12,12 +16,16 @@ pub use admin::{
     AuditResult, ConsumerKeyCreateRequest, CredentialCreateRequest, CredentialPatchRequest,
     CredentialRecord, CredentialResolutionInput, CredentialResolutionSource, CredentialScope,
     CredentialSecret, CredentialStatus, CredentialType, IdempotencyRecord, JwtClaimMapping,
-    KeyStatus, ListResponse, PageQuery, ProviderCreateRequest, ProviderModelCreateRequest,
-    ProviderModelPatchRequest, ProviderModelRecord, ProviderPatchRequest, ProviderRecord,
-    ProviderType, ResourceStatus, RotateCredentialRequest, ScopeType, SetupCheckName,
-    SetupCheckState, SetupChecks, SetupDeploymentEnvironment, SetupStatus, SetupStatusResponse,
-    SystemKeyCreateRequest, TrustedJwtIssuerCreateRequest, TrustedJwtIssuerPatchRequest,
-    TrustedJwtIssuerRecord,
+    KeyStatus, ListResponse, PageQuery, Pagination, ProviderCreateRequest,
+    ProviderModelCreateRequest, ProviderModelPatchRequest, ProviderModelRecord,
+    ProviderPatchRequest, ProviderRecord, ProviderType, ResourceStatus, RotateCredentialRequest,
+    ScopeType, SetupCheckName, SetupCheckState, SetupChecks, SetupDeploymentEnvironment,
+    SetupStatus, SetupStatusResponse, SystemKeyCreateRequest, TrustedJwtIssuerCreateRequest,
+    TrustedJwtIssuerPatchRequest, TrustedJwtIssuerRecord,
+};
+pub use auth_settings::{
+    AuthMethod, AuthProviderSettingsCreateRequest, AuthProviderSettingsPatchRequest,
+    AuthProviderSettingsRecord, PublicAuthMethod, SetupAuthMethodsResponse,
 };
 pub use conversation::{
     ConversationContentPersistence, ConversationCreateRequest, ConversationMessageCreateRequest,
@@ -34,17 +42,22 @@ pub use conversation::{
     RetrievalPolicyRecord,
 };
 pub use i18n::{ResponseText, ResponseTextArgs};
+pub use identity::{
+    AdminIdentityRecord, AdminIdentityStatus, ClaimAdminIdentityRequest, SetupClaimStatusResponse,
+};
 pub use ids::{
     AgentProfileId, ApplicationId, ApplicationSlug, AttemptId, AuditEventId, ConsumerKeyId,
     ExecutionId, ExternalApplicationId, ExternalTenantId, ExternalUserId, ProviderCredentialId,
     ProviderId, ProviderModelId, RequestId, RouteId, RoutingPolicyId, SystemKeyId,
     TrustedJwtIssuerId,
 };
+pub use message::{DomainMessage, DomainMessageContent, DomainMessageRole};
 pub use models::{
-    AuditEvent, ChatCompletionRequest, ChatMessage, CreateProviderRequest, CredentialSummary,
-    HealthResponse, OwnerScope, ProviderConfig, ProviderKind, SetRoutingDefaultRequest,
-    UpdateProviderRequest, UpsertCredentialRequest,
+    AuditEvent, CreateProviderRequest, CredentialSummary, HealthResponse, OwnerScope,
+    ProviderConfig, ProviderKind, SetRoutingDefaultRequest, UpdateProviderRequest,
+    UpsertCredentialRequest,
 };
+pub use pagination::{CursorScope, ListCursor, SeqCursor};
 pub use public::{
     ApplicationExecutionPolicyPutRequest, ApplicationExecutionPolicyRecord, ExecutionQuery,
     OpenAiResponseCompatRequest, PublicCapabilities, PublicContentPart, PublicExecutionSummary,
