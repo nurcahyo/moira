@@ -1,5 +1,6 @@
 mod admin;
 mod auth_settings;
+mod cluster;
 mod conversation;
 mod identity;
 mod public;
@@ -15,6 +16,13 @@ pub use admin::{
 // callers — the retrofit P2-3 had to perform for `AdminRepository` and `SetupRepository`.
 pub use auth_settings::{
     AuthProviderSettingsRepository, GoverningAuthPolicy, PgAuthProviderSettingsRepository,
+};
+// Plan 10 wave 1. Same shape as the plan-07 modules above: a trait plus one Postgres
+// implementation from the first commit, so the startup gate in `src/app/cluster_lease.rs`
+// is testable without a database.
+pub use cluster::{
+    ClusterLeaseGrant, ClusterLeaseOutcome, ClusterLeaseRepository, PgClusterLeaseRepository,
+    is_undefined_table, pod_name, resolve_pod_name,
 };
 pub use conversation::{
     ConversationAccess, ConversationInsert, ConversationMessageInsert, ConversationRepository,

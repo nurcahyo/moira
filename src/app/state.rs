@@ -4,6 +4,7 @@ use reqwest::Client;
 use sqlx::PgPool;
 
 use crate::{
+    app::cluster_lease::ClusterLeaseStatus,
     config::Settings,
     error::AppError,
     infra::{metrics::MetricsRegistry, redis::RedisClient, workers::WorkerRegistry},
@@ -37,6 +38,15 @@ pub struct AppState {
     pub authz: AuthorizationService,
     pub redis: Option<RedisClient>,
     pub metrics: MetricsRegistry,
+    /// This replica's cluster-admission-lease state (plan 10, P3-2).
+    ///
+    /// Constructed here as `not_enforced` and handed to the startup gate in
+    /// `src/main.rs`, which flips it once a lease is granted. It lives on
+    /// `AppState` rather than inside the lease handle because the thing that has
+    /// to read it — `/health/ready` — is on the request path and the thing that
+    /// writes it is a background heartbeat, exactly like the runtime caches
+    /// above.
+    pub cluster_lease: ClusterLeaseStatus,
     pub workers: WorkerRegistry,
     pub runtime_cache: RuntimeConfigCache,
     /// The enabled auth methods behind `GET /api/v1/admin/setup/auth-methods` (plan 07,
@@ -93,7 +103,14 @@ impl AppState {
         let authz = AuthorizationService::new();
         let redis = RedisClient::from_settings(&settings.redis)?;
         let metrics = MetricsRegistry::new(&settings.telemetry.service_name, pool.clone());
-        let workers = WorkerRegistry::new(settings.workers.clone());
+        let cluster_lease = ClusterLeaseStatus::not_enforced();
+        let workers = WorkerRegistry::new(
+            settings.workers.clone(),
+            // Resolved once, here: `Settings::leader_election_enabled` is the
+            // only place `workers.leader_election_enabled`'s `None` is folded
+            // against `cluster.admission_enabled`.
+            settings.leader_election_enabled(),
+        );
         let runtime_cache = RuntimeConfigCache::new(settings.cache.runtime_config_ttl_seconds);
         let auth_settings_cache =
             AuthProviderSettingsCache::new(settings.auth.provider_settings_cache_ttl_seconds);
@@ -132,6 +149,7 @@ impl AppState {
             authz,
             redis,
             metrics,
+            cluster_lease,
             workers,
             runtime_cache,
             auth_settings_cache,

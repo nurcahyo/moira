@@ -38,6 +38,8 @@ pub struct Settings {
     #[serde(default)]
     pub redis: RedisSettings,
     #[serde(default)]
+    pub cluster: ClusterSettings,
+    #[serde(default)]
     pub workers: WorkerSettings,
     #[serde(default)]
     pub telemetry: TelemetrySettings,
@@ -309,6 +311,38 @@ pub struct RedisSettings {
     pub invalidation_channel: String,
 }
 
+/// Multi-replica admission (plan 10, finding P3-2).
+///
+/// `#[serde(default)]` on the container for the same reason as
+/// [`WorkerSettings`]: an operator sets `MOIRA_CLUSTER__MAX_REPLICAS` without
+/// having to restate the timing knobs, and a config file written before this
+/// section existed still deserializes.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ClusterSettings {
+    /// Master switch for the Postgres `cluster_replica_leases` admission gate.
+    ///
+    /// **Default `false`, and that is not timidity.** With the gate on and
+    /// `max_replicas` at its default of 1, a Kubernetes rolling update that
+    /// surges a second pod before terminating the first deadlocks: the surge pod
+    /// is denied a lease and crash-loops, so the old pod — which still holds the
+    /// lease — is never told to terminate. The chart pairs enabling this with
+    /// `strategy.rollingUpdate.maxSurge: 0`, which is the only configuration
+    /// where the two agree. Turning it on without that pairing is the failure
+    /// mode this default exists to keep out of a default install.
+    pub admission_enabled: bool,
+    /// The ceiling the *database* admits, independent of what Helm allows and of
+    /// what `kubectl scale` asks for.
+    pub max_replicas: u32,
+    /// How often a live replica renews `cluster_replica_leases.heartbeat_at`.
+    pub lease_heartbeat_seconds: u64,
+    /// How stale a heartbeat may get before another replica may reclaim the
+    /// lease. Must exceed `lease_heartbeat_seconds` — see
+    /// [`Settings::validate`]; an expiry at or below the heartbeat interval
+    /// means every replica continuously reclaims every other replica's lease.
+    pub lease_expiry_seconds: u64,
+}
+
 /// Background-worker tuning.
 ///
 /// `#[serde(default)]` sits on the container (same convention as
@@ -335,6 +369,15 @@ pub struct WorkerSettings {
     /// retention sweep is far more expensive than a tick and must not run at
     /// tick cadence. `0` is treated as `1` at runtime.
     pub retention_interval_seconds: u64,
+    /// Whether the supervisor takes a leader lock before running a singleton
+    /// job (today: the retention sweep).
+    ///
+    /// `None` — the default — **mirrors `cluster.admission_enabled`**, which is
+    /// what makes "turn on multi-replica mode" one switch rather than two that
+    /// can silently disagree. Set it explicitly to pin it either way; resolved
+    /// by [`Settings::leader_election_enabled`], which is the only thing that
+    /// should read this field.
+    pub leader_election_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -379,6 +422,12 @@ impl Settings {
         // Structural invariants of the stored-hash format, not production hardening —
         // see `validate_idempotency_hash_format`. They run in every environment.
         self.validate_idempotency_hash_format(&mut violations);
+
+        // Same category: a lease expiry at or below the heartbeat interval is not a
+        // tuning choice, it is a configuration that cannot work. Rejected at startup
+        // because the symptom otherwise is replicas continuously reclaiming each
+        // other's leases — visible only as an unexplained restart loop.
+        self.validate_cluster(&mut violations);
 
         for origin in &self.cors.allowed_origins {
             if origin != "*" && validate_cors_origin(origin).is_err() {
@@ -467,6 +516,41 @@ impl Settings {
                  so \"{{version}}:{{digest}}\" fits the varchar({IDEMPOTENCY_HASH_MAX_LENGTH}) ledger columns, \
                  got {}",
                 version.len()
+            ));
+        }
+    }
+
+    /// Whether the worker supervisor takes a leader lock before a singleton job.
+    ///
+    /// The single place `workers.leader_election_enabled`'s `None` is resolved.
+    /// Reading the raw `Option` anywhere else reintroduces the two-switches-that-
+    /// disagree problem the mirroring default exists to remove.
+    pub fn leader_election_enabled(&self) -> bool {
+        self.workers
+            .leader_election_enabled
+            .unwrap_or(self.cluster.admission_enabled)
+    }
+
+    /// Structural invariants of the admission lease, checked in every environment.
+    ///
+    /// `lease_expiry_seconds <= lease_heartbeat_seconds` is the one that matters:
+    /// a replica's lease would be reclaimable before — or exactly when — it is due
+    /// to renew, so every replica would continuously steal every other replica's
+    /// lease and the admission count would oscillate. The symptom in production is
+    /// pods restarting for no visible reason, which is why this is a startup
+    /// rejection and not a runtime warning.
+    fn validate_cluster(&self, violations: &mut Vec<String>) {
+        if self.cluster.max_replicas == 0 {
+            violations.push("cluster.max_replicas must be at least 1".to_string());
+        }
+        if self.cluster.lease_heartbeat_seconds == 0 {
+            violations.push("cluster.lease_heartbeat_seconds must be at least 1".to_string());
+        }
+        if self.cluster.lease_expiry_seconds <= self.cluster.lease_heartbeat_seconds {
+            violations.push(format!(
+                "cluster.lease_expiry_seconds ({}) must exceed cluster.lease_heartbeat_seconds \
+                 ({}), or a live replica's lease is reclaimable before it renews",
+                self.cluster.lease_expiry_seconds, self.cluster.lease_heartbeat_seconds
             ));
         }
     }
@@ -904,6 +988,23 @@ impl Default for RedisSettings {
     }
 }
 
+impl Default for ClusterSettings {
+    fn default() -> Self {
+        Self {
+            // Off by default: see the field docs. The library default is what
+            // every test, every CLI mode and every non-Helm deployment gets, and
+            // none of them has more than one replica to admit.
+            admission_enabled: false,
+            max_replicas: 1,
+            lease_heartbeat_seconds: 10,
+            // 3x the heartbeat. Two consecutive renewals may be lost — a
+            // failover, a brief pool starvation — before another replica is
+            // entitled to the lease.
+            lease_expiry_seconds: 30,
+        }
+    }
+}
+
 impl Default for WorkerSettings {
     fn default() -> Self {
         Self {
@@ -924,6 +1025,7 @@ impl Default for WorkerSettings {
             // table, comfortably above any plausible steady-state mint rate, while
             // leaving the database idle between sweeps.
             retention_interval_seconds: 300,
+            leader_election_enabled: None,
         }
     }
 }

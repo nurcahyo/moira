@@ -8,3 +8,11 @@ data:
 {{- range $key, $value := .Values.config }}
   {{ $key }}: {{ $value | quote }}
 {{- end }}
+  # Rendered from the typed top-level blocks rather than restated under
+  # `config:`, so there is exactly one place to set each of these. Adding any of
+  # these names under `config:` as well emits a duplicate YAML key, so do not.
+  MOIRA_WORKERS__ENABLED: {{ .Values.workers.enabled | quote }}
+  MOIRA_CLUSTER__ADMISSION_ENABLED: {{ .Values.cluster.admissionEnabled | quote }}
+  MOIRA_CLUSTER__MAX_REPLICAS: {{ .Values.cluster.maxReplicas | quote }}
+  MOIRA_CLUSTER__LEASE_HEARTBEAT_SECONDS: {{ .Values.cluster.leaseHeartbeatSeconds | quote }}
+  MOIRA_CLUSTER__LEASE_EXPIRY_SECONDS: {{ .Values.cluster.leaseExpirySeconds | quote }}

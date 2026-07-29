@@ -17,21 +17,28 @@
 //!
 //! # Multi-replica posture (both halves, honestly)
 //!
-//! **Not multi-replica-safe in the "avoid duplicate work" sense.** There is no
-//! leader election in Moira today (that is plan 10). Every replica that has
-//! workers enabled runs its own sweep on its own schedule, so N replicas do up to
-//! N times the scanning work.
+//! **Correct under concurrency, independently of leadership.** The delete is
+//! idempotent — a row that another replica already removed simply is not there to
+//! remove again — and each batch selects its victims with `for update skip
+//! locked`, so two concurrent sweeps partition the expired rows between
+//! themselves instead of contending for them. No double-delete corruption, no
+//! wrong counts beyond each replica reporting only the rows it personally
+//! deleted. That was true before there was any leader election and it is still
+//! true; nothing below depends on being the only sweeper.
 //!
-//! **But correct under concurrency.** The delete is idempotent — a row that
-//! another replica already removed simply is not there to remove again — and each
-//! batch selects its victims with `for update skip locked`, so two concurrent
-//! sweeps partition the expired rows between themselves instead of contending for
-//! them. No double-delete corruption, no wrong counts beyond each replica
-//! reporting only the rows it personally deleted.
+//! **And now singleton, when leader election is on.** Plan 10 added it: the
+//! supervisor (`super::WorkerRegistry::run_supervisor`) asks
+//! [`super::leader::LeaderElection`] before every sweep, so exactly one replica
+//! holding the `b"moiralrt"` advisory lock does the scanning instead of all N.
+//! Election is resolved by `Settings::leader_election_enabled`, which mirrors
+//! `cluster.admission_enabled` and is **off by default** — so a default
+//! single-replica deployment still takes no lock, does no extra round trip, and
+//! behaves exactly as it did before.
 //!
-//! Both halves are true at once. A comment claiming only the first would suggest
-//! this worker is unsafe to run today; a comment claiming only the second would
-//! suggest leader election is unnecessary. Neither is right.
+//! Both halves matter. A comment claiming only the first would suggest leader
+//! election is decorative; a comment claiming only the second would suggest this
+//! worker is unsafe to run without it. Neither is right: leadership removes
+//! duplicated *work*, never a correctness hazard.
 //!
 //! # Lock interaction with the idempotency claim path — one direction only
 //!

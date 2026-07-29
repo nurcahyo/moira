@@ -1,3 +1,4 @@
+pub mod leader;
 pub mod retention;
 
 use std::{sync::Arc, time::Duration};
@@ -16,6 +17,13 @@ pub const RETENTION_CLEANUP_WORKER: &str = "retention-cleanup";
 pub struct WorkerRegistry {
     settings: Arc<WorkerSettings>,
     specs: Arc<Vec<WorkerSpec>>,
+    /// Whether the supervisor takes a leader lock before a singleton job.
+    ///
+    /// Already resolved: `Settings::leader_election_enabled` folds
+    /// `workers.leader_election_enabled`'s `None` against
+    /// `cluster.admission_enabled`, so this is a plain `bool` and there is
+    /// exactly one place that decides it.
+    leader_election_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -50,9 +58,10 @@ pub struct WorkerSupervisor {
 }
 
 impl WorkerRegistry {
-    pub fn new(settings: WorkerSettings) -> Self {
+    pub fn new(settings: WorkerSettings, leader_election_enabled: bool) -> Self {
         Self {
             settings: Arc::new(settings),
+            leader_election_enabled,
             specs: Arc::new(vec![
                 WorkerSpec {
                     name: "memory-extraction-retry",
@@ -100,6 +109,20 @@ impl WorkerRegistry {
 
     pub fn enabled(&self) -> bool {
         self.settings.enabled
+    }
+
+    /// Whether singleton jobs are leader-gated in this process.
+    ///
+    /// Note the interaction with [`Self::enabled`]: workers off means
+    /// `spawn_supervisor` returns `None`, so there is no tick loop, no
+    /// singleton job and therefore **nothing to elect a leader for** — leader
+    /// election is dead whatever this returns. The shipped Helm chart sets
+    /// `MOIRA_WORKERS__ENABLED: "false"`, which is why
+    /// `charts/moira/templates/_helpers.tpl` refuses a multi-replica release
+    /// with workers disabled rather than letting an operator deploy a cluster
+    /// that elects a leader for no jobs.
+    pub fn leader_election_enabled(&self) -> bool {
+        self.leader_election_enabled
     }
 
     /// The single definition of "this worker will actually run": workers are on
@@ -165,11 +188,21 @@ impl WorkerRegistry {
         // back-to-back against a database that is evidently already busy.
         retention_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        // The retention sweep is Moira's only singleton job today, so it is the
+        // only thing leadership gates. Constructed even when election is off:
+        // the `Disabled` state short-circuits without a database round trip, so
+        // there is no branch here that a default deployment pays for.
+        let mut leader = leader::LeaderElection::new(
+            RETENTION_CLEANUP_WORKER,
+            self.leader_election_enabled && retention_configured,
+        );
+
         info!(
             max_concurrent_jobs = self.settings.max_concurrent_jobs,
             retention_configured,
             retention_interval_seconds = retention_period.as_secs(),
             retention_batch_size = self.settings.retention_batch_size,
+            leader_election_enabled = self.leader_election_enabled,
             "moira worker supervisor started"
         );
 
@@ -185,10 +218,22 @@ impl WorkerRegistry {
                     state.metrics.record_worker_tick();
                 }
                 _ = retention_interval.tick(), if retention_configured => {
-                    self.run_retention_cleanup(&state).await;
+                    if leader.should_run(state.pool.as_ref()).await {
+                        self.run_retention_cleanup(&state).await;
+                    } else {
+                        debug!(
+                            job_name = RETENTION_CLEANUP_WORKER,
+                            "retention sweep skipped: another replica holds leadership"
+                        );
+                    }
                 }
             }
         }
+
+        // Before the supervisor's task ends, so a rolling update hands
+        // leadership to the next replica in milliseconds rather than waiting for
+        // PostgreSQL to notice a closed socket.
+        leader.resign().await;
     }
 
     /// One retention sweep. Never propagates: a failing sweep must not take the

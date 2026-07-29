@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use anyhow::Context;
 use moira::{
-    app::AppState,
+    app::{AppState, cluster_lease},
     application::{AdminService, MoiraExecutionService, RequestContext},
     build_router,
     config::{
@@ -87,6 +87,20 @@ async fn run(mode: ProcessMode, settings: Settings) -> anyhow::Result<()> {
 
     let addr: SocketAddr = settings.server.bind_addr()?;
     let state = AppState::new(settings, pool)?;
+
+    // Before the listener binds and before any worker starts: a replica that the
+    // cluster will not admit must not serve a single request, and must not run a
+    // sweep either. The error propagates to a non-zero exit, which is what makes
+    // the pod fail to become Ready — the only ceiling `kubectl scale` cannot walk
+    // past.
+    let cluster_lease = cluster_lease::acquire(
+        state.pool.as_ref(),
+        &state.settings.cluster,
+        &state.cluster_lease,
+    )
+    .await
+    .context("acquire the cluster admission lease")?;
+
     let worker_supervisor = state.workers.spawn_supervisor(state.clone());
     let _runtime_config_listener = state.pool.as_ref().map(|pool| {
         db::spawn_runtime_config_listener(
@@ -109,8 +123,19 @@ async fn run(mode: ProcessMode, settings: Settings) -> anyhow::Result<()> {
         .await
         .context("serve moira")?;
 
+    // Workers first: the supervisor resigns its leader lock as it stops, and
+    // handing leadership over before giving up the admission lease keeps the two
+    // handovers in a defensible order.
     if let Some(supervisor) = worker_supervisor {
         supervisor.shutdown().await;
+    }
+
+    // Released on the graceful-shutdown path so the replacement pod is admitted
+    // immediately instead of waiting out `cluster.lease_expiry_seconds`. A
+    // rolling update where this does not run — SIGKILL, a panic — still recovers
+    // via heartbeat expiry; it just takes longer.
+    if let Some(lease) = cluster_lease {
+        lease.release().await;
     }
 
     Ok(())

@@ -1,5 +1,11 @@
 replicaCount: 1
 
+# Unchanged in value (45s) but now a value rather than a literal, so
+# _helpers.tpl can check it against cluster.leaseExpirySeconds: a pod must have
+# long enough to release its lease before SIGKILL, or every rollout leaves a
+# lease to expire and the replacement waits out leaseExpirySeconds.
+terminationGracePeriodSeconds: 45
+
 image:
   repository: ghcr.io/example/moira
   tag: latest
@@ -44,6 +50,37 @@ serviceMonitor:
   enabled: false
   interval: 30s
 
+# Multi-replica admission (plan 10, finding P3-2).
+#
+# `moira.validateDeployment` in _helpers.tpl is a *template-time* guard: it runs
+# on helm install/upgrade and nothing else, so `kubectl scale` walks straight
+# past it. Setting admissionEnabled moves the ceiling into PostgreSQL, where a
+# replica has to be granted a row in cluster_replica_leases before it binds a
+# listener.
+#
+# Enabling this also switches the Deployment to `maxSurge: 0` — see the comment
+# in templates/deployment.yaml for why the two cannot be set independently.
+cluster:
+  admissionEnabled: false
+  # The ceiling the database admits. Must be >= replicaCount and >=
+  # autoscaling.maxReplicas; _helpers.tpl refuses the release otherwise.
+  maxReplicas: 1
+  leaseHeartbeatSeconds: 10
+  # Must exceed leaseHeartbeatSeconds (Settings::validate rejects otherwise) and
+  # must stay below terminationGracePeriodSeconds (45) so a terminating pod's
+  # lease is released, not merely expired, during a rollout.
+  leaseExpirySeconds: 30
+
+# Background workers. Rendered into MOIRA_WORKERS__ENABLED below so there is one
+# place to set it rather than an env string that can disagree with this block.
+#
+# Off by default, unchanged from before plan 10. Note the consequence: with
+# workers off there is no retention sweep and therefore no singleton job, so
+# leader election has nothing to elect for. _helpers.tpl refuses a multi-replica
+# release in that state rather than letting it deploy green and run nothing.
+workers:
+  enabled: false
+
 config:
   MOIRA_DEPLOYMENT__ENVIRONMENT: "production"
   MOIRA_SERVER__HOST: "0.0.0.0"
@@ -61,7 +98,6 @@ config:
   MOIRA_REDIS__ENABLED: "false"
   MOIRA_REDIS__NAMESPACE: "moira"
   MOIRA_REDIS__INVALIDATION_CHANNEL: "moira:runtime-config"
-  MOIRA_WORKERS__ENABLED: "false"
   MOIRA_TELEMETRY__JSON: "true"
   MOIRA_TELEMETRY__PROMETHEUS_ENABLED: "true"
   MOIRA_TELEMETRY__OTEL_ENABLED: "false"

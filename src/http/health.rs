@@ -51,6 +51,31 @@ pub async fn healthz(State(state): State<AppState>) -> Json<HealthResponse> {
     )
 )]
 pub async fn readyz(State(state): State<AppState>) -> Result<Json<HealthResponse>, AppError> {
+    // First, and before any I/O. A replica that has lost its cluster admission
+    // lease is outside the configured replica ceiling: its dependencies may all
+    // be perfectly healthy and it still must not receive traffic, or P3-2 is
+    // fixed only at startup. Failing readiness takes it out of the Service's
+    // endpoints without killing in-flight requests.
+    //
+    // `is_denied()` is false unless admission is both enabled and lost, so this
+    // costs one relaxed atomic load on every probe of every default deployment.
+    if state.cluster_lease.is_denied() {
+        // The code is written as a **literal**, not as
+        // `crate::app::CLUSTER_LEASE_DENIED_CODE`, and that is not an oversight:
+        // `every_coded_error_literal_in_src_has_a_catalog_entry` walks the source
+        // for `AppError::coded` arguments and can only prove a catalog entry
+        // exists for a literal. A constant here defeats the gate that guarantees
+        // this response carries an English message. The constant still exists for
+        // the structured `reason` fields in `src/app/cluster_lease.rs`, and
+        // `readyz_returns_503_and_cluster_lease_denied...` in
+        // `tests/cluster_admission.rs` asserts the two agree.
+        return Err(AppError::coded(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "cluster_lease_denied",
+            "this replica does not hold a valid cluster admission lease",
+        ));
+    }
+
     if let Some(pool) = &state.pool {
         sqlx::query("select 1").execute(pool).await?;
     } else {
