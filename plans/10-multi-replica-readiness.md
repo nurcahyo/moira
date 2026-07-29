@@ -91,6 +91,45 @@ is duplicated work at best and a regression at worst.
 | `docs/todo.md` | Phase 6 bullets **true** and still open |
 | `migrations/` | Only the *new* filename collides. See B8 |
 
+### §0.4b DECISION — Postgres is the default coordination backend; Redis ships behind a flag
+
+**Taken by the user, 2026-07-29.** Redis is implemented but **off by default**; the shipped path
+coordinates through Postgres and per-process memory. The reasoning is deployment scale: at a handful
+of users and a small replica count, an extra stateful dependency costs more than it returns.
+
+The flag already exists — `RedisSettings.enabled` (`src/config/settings.rs`), default `false`, with
+`redis_is_optional_by_default` (`src/infra/redis.rs`) pinning it. Wave 2 wires the Redis backends
+*behind* it and must not change that default.
+
+**What is genuinely cluster-correct without Redis:**
+
+| Concern | Backend | Correct across replicas? |
+|---|---|---|
+| Cluster admission lease | Postgres (`cluster_replica_leases`, `0014`) | **yes** |
+| Leader election / singleton workers | Postgres advisory lock | **yes** |
+| Runtime config + auth-settings invalidation | Postgres `LISTEN/NOTIFY` | **yes** — every replica already subscribes |
+| Idempotency / replay | Postgres, unique index + advisory lock | **yes** |
+| Rate limiting | in-process | **no** — see below |
+| Concurrency permits | in-process | **no** — see below |
+| Circuit breakers | in-process | **no**, and deliberately so |
+
+**The honest cost, stated plainly.** With Redis off, rate limits and concurrency caps are
+**per-replica**: N replicas admit up to N× the configured limit. That is not a bug to be fixed
+later — it is the trade being made, and it is only acceptable because the admission lease **bounds
+N**. The two decisions hold together: cap the replica count in the database, then accept an N× limit
+where N is small and known. Document the multiplier wherever a limit is configured, so an operator
+raising `cluster.maxReplicas` understands they are also raising every rate limit by the same factor.
+
+Circuit breakers are a different case and should stay per-process even with Redis available: breaker
+state is *earned* by a replica observing its own transport failures, and sharing it would let one
+replica's bad network path open the circuit for healthy ones.
+
+**Consequences for Wave 2.** The backend split must be a runtime choice behind `redis.enabled`, with
+the Postgres/in-memory path as the default arm and the Redis arm additive. Every Redis code path
+needs a test that the default build still behaves correctly with Redis absent — not merely that it
+compiles. And `publish_runtime_invalidation` must remain a *second* channel alongside `LISTEN/NOTIFY`,
+never a replacement: a deployment with Redis off must still invalidate.
+
 ### §0.5 What is genuinely still open — the honest scope of this plan
 
 Stripping out everything already solved, the real remaining work is smaller than 517 lines suggests,
