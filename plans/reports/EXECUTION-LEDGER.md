@@ -743,12 +743,41 @@ Rejected: `[profile.dev.package."*"] opt-level = 3`. It optimises 405 dependenci
 
 ## STATE AT A GLANCE — update this before every compaction
 
-**Merged to `main` (11 plans):** 02a, 02b, 03, 04, 05, 06, 06b, 06c, **07** (`27b6e0c`),
-**10** (`671eadf`), **08** (`f0ecbbc`). All three of the last were CI-verified with every job
-running steps.
+**Merged to `main` (12 plans):** 02a, 02b, 03, 04, 05, 06, 06b, 06c, **07** (`27b6e0c`),
+**10** (`671eadf`), **08** (`f0ecbbc`), **11** (`e898f80`). The last four were CI-verified with every
+job running steps.
 
-**Remaining:** plan **11** (RAG/memory — §0 written, Wave 1 merged into branch, Wave 2 in flight on
-`plan/11-rag-memory-intelligence`), then plan **09** (generic OIDC + invitations — not yet audited).
+**Remaining: plan 09 only — and it is much larger than it says.** §0 written (`13284f1`) recording
+**9 blockers**. Two are structural rather than citation drift:
+
+- **It extends a console UI that plan 08 never built.** Every "reused from plan 08, not
+  re-implemented" claim is false — 15 named artefacts do not exist. Waves 2–3 are **greenfield**.
+- **It assumes a `console_auth` database that does not exist.** Better Auth is on the in-memory
+  adapter under a header labelled "DELIBERATE SCOPE LIMIT"; secrets are an in-memory map; the JWKS
+  key pair regenerates every process start; the chart is pinned to one replica. Its "real session
+  registry" feature has nothing beneath it.
+
+**And its N-provider premise is a redesign, not an extension.** The console today returns
+`ambiguous_enabled_providers` when more than one provider is enabled — deliberately, because "the
+console refuses to guess". **Enabling a second provider currently breaks sign-in.**
+
+**Re-sequenced into five waves** (the old Wave 2 ∥ Wave 3 split cannot run — Wave 3's screens have
+no foundation to attach to):
+
+1. **Durable console storage** — `console_auth`, Better Auth CLI migrations, a durable
+   `ConsoleSecretStore` behind the existing interface, lift `replicaCount: 1`. Non-negotiable:
+   secret durability and a stable JWKS stop being optional the moment there is a second provider or
+   a second replica.
+2. **Moira invite backend** — parallel with 1; one owner end-to-end for the route table.
+3. **Console foundations** — the `(console)` group, `middleware.ts`, `/login`, `SignInPanel`, the
+   i18n catalog, the architecture guards. **The wave nobody planned for.**
+4. **Multi-provider + auth-settings screen** — including removing `ambiguous_enabled_providers`.
+5. **Invitations, ownership, sessions.**
+
+**DECISION — session management is cut from plan 09 unless waves 1–4 land comfortably.** It is the
+one feature that needs durable storage *and* delivers nothing the invitation flow requires. Shipping
+an "active sessions" screen over an in-memory store would be the appearance of a feature.
+*Reversal condition:* restore it once durable storage ships and the invitation flow is green.
 
 **Open findings, none blocking a merge:**
 

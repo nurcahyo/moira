@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     convert::Infallible,
     io,
     net::SocketAddr,
@@ -147,11 +147,94 @@ pub enum ProviderScript {
     },
 }
 
+/// How the mock's `/v1/embeddings` route behaves.
+///
+/// Separate from [`ProviderScript`] because embeddings and completions are independent routes
+/// on the same server: a test that ingests a document and then runs a completion must be able
+/// to script one without consuming the other's queue.
+#[derive(Debug, Clone)]
+pub enum EmbeddingBehaviour {
+    /// Returns one deterministic unit-length vector per input.
+    ///
+    /// Deterministic in the strong sense: the vector is a pure function of the input text, so
+    /// the same chunk re-ingested embeds identically and two different chunks do not collide.
+    /// That is what lets a test assert "this chunk's stored embedding is the one the provider
+    /// returned for this chunk's text" rather than merely "some vector was stored".
+    Deterministic,
+    /// Fails every embedding call with the given status.
+    HttpError { status: StatusCode, body: String },
+    /// Returns one fewer vector than requested — the short-response case that must be refused
+    /// rather than zip-truncated into embeddings attached to the wrong chunks.
+    ShortResponse,
+    /// Returns vectors of the wrong width.
+    WrongDimension { dimension: usize },
+    /// Returns a hand-chosen vector for an exact input string, falling back to
+    /// [`EmbeddingBehaviour::Deterministic`] for anything unlisted.
+    ///
+    /// [`mock_embedding_for`] is deterministic but pseudo-random, so two different texts are
+    /// near-orthogonal by construction and their cosine similarity is an accident of the
+    /// hash. That is fine for "was a vector stored", and useless for "does *this* row outrank
+    /// *that* one" — which is exactly the question the cross-tenant isolation suite has to ask.
+    ///
+    /// With hand-chosen vectors from [`planar_vector`] the distances are arithmetic, so an
+    /// assertion like "the other tenant's row is a strictly closer match and is still not
+    /// returned" is a fact about the SQL rather than a hope about a hash.
+    Fixed { vectors: HashMap<String, Vec<f32>> },
+}
+
 #[derive(Debug)]
 struct MockState {
     scripts: Mutex<VecDeque<ProviderScript>>,
     requests: Mutex<Vec<RecordedRequest>>,
     request_observed: Notify,
+    embedding: Mutex<EmbeddingBehaviour>,
+    embedding_requests: Mutex<Vec<RecordedRequest>>,
+}
+
+/// The width every embedding this mock returns has, matching `vector(1536)`.
+pub const MOCK_EMBEDDING_DIMENSION: usize = 1536;
+
+/// The vector the mock returns for `text`.
+///
+/// Exposed so a test can assert the *stored* vector equals the one the provider produced for
+/// that exact chunk, which is the only assertion that proves embeddings were not shuffled
+/// between chunks.
+pub fn mock_embedding_for(text: &str) -> Vec<f32> {
+    // A tiny xorshift seeded from the text. Not a hash with any security property — it only has
+    // to be deterministic, cheap, and different for different inputs.
+    let mut seed: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        seed ^= u64::from(*byte);
+        seed = seed.wrapping_mul(0x1000_0000_01b3);
+    }
+    let mut vector = Vec::with_capacity(MOCK_EMBEDDING_DIMENSION);
+    for _ in 0..MOCK_EMBEDDING_DIMENSION {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        // Map into [-1, 1) with a magnitude that survives the f64 -> f32 narrowing exactly:
+        // dividing by a power of two keeps every value representable in binary32.
+        let value = ((seed >> 40) as i32 - 8_388_608 / 8) as f32 / 8_388_608.0;
+        vector.push(value);
+    }
+    vector
+}
+
+/// A unit vector in the plane spanned by the first two basis axes, at `angle` radians from the
+/// first.
+///
+/// Two of these have cosine similarity `cos(a - b)` exactly, so pgvector's `<=>` between them
+/// is `1 - cos(a - b)` — a distance a test can compute in its head. `planar_vector(0.0)` is the
+/// natural query vector; a candidate at `0.0` is a perfect match, one at `PI / 3` sits at
+/// similarity `0.5`, and one at `PI / 2` is orthogonal.
+///
+/// Every component beyond the first two is zero, which keeps the vector exactly unit-length in
+/// `f32` and therefore keeps the arithmetic exact rather than approximately right.
+pub fn planar_vector(angle: f64) -> Vec<f32> {
+    let mut vector = vec![0.0f32; MOCK_EMBEDDING_DIMENSION];
+    vector[0] = angle.cos() as f32;
+    vector[1] = angle.sin() as f32;
+    vector
 }
 
 #[derive(Debug)]
@@ -168,9 +251,12 @@ impl MockOpenAiServer {
             scripts: Mutex::new(scripts.into_iter().collect()),
             requests: Mutex::new(Vec::new()),
             request_observed: Notify::new(),
+            embedding: Mutex::new(EmbeddingBehaviour::Deterministic),
+            embedding_requests: Mutex::new(Vec::new()),
         });
         let app = Router::new()
             .route("/v1/chat/completions", post(handle_completion))
+            .route("/v1/embeddings", post(handle_embeddings))
             .with_state(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -217,6 +303,18 @@ impl MockOpenAiServer {
         self.state.requests.lock().await.clone()
     }
 
+    pub async fn set_embedding_behaviour(&self, behaviour: EmbeddingBehaviour) {
+        *self.state.embedding.lock().await = behaviour;
+    }
+
+    /// Every `/v1/embeddings` request the mock has served, in order.
+    ///
+    /// Counted separately from [`Self::requests`] so an assertion about batching cannot be
+    /// satisfied by completion traffic.
+    pub async fn embedding_requests(&self) -> Vec<RecordedRequest> {
+        self.state.embedding_requests.lock().await.clone()
+    }
+
     pub async fn shutdown(self) {
         self.shutdown.cancel();
         timeout(WAIT_TIMEOUT, self.task)
@@ -224,6 +322,88 @@ impl MockOpenAiServer {
             .expect("mock provider shutdown timed out")
             .expect("mock provider task panicked");
     }
+}
+
+async fn handle_embeddings(
+    State(state): State<Arc<MockState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let parsed_body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    state.embedding_requests.lock().await.push(RecordedRequest {
+        authorization: headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string),
+        body: parsed_body.clone(),
+    });
+    state.request_observed.notify_waiters();
+
+    let inputs: Vec<String> = parsed_body
+        .get("input")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| value.as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let behaviour = state.embedding.lock().await.clone();
+    let (count, dimension) = match &behaviour {
+        EmbeddingBehaviour::HttpError { status, body } => {
+            return (*status, body.clone()).into_response();
+        }
+        EmbeddingBehaviour::Deterministic | EmbeddingBehaviour::Fixed { .. } => {
+            (inputs.len(), MOCK_EMBEDDING_DIMENSION)
+        }
+        EmbeddingBehaviour::ShortResponse => {
+            (inputs.len().saturating_sub(1), MOCK_EMBEDDING_DIMENSION)
+        }
+        EmbeddingBehaviour::WrongDimension { dimension } => (inputs.len(), *dimension),
+    };
+    let fixed = match &behaviour {
+        EmbeddingBehaviour::Fixed { vectors } => Some(vectors),
+        _ => None,
+    };
+
+    let data: Vec<Value> = inputs
+        .iter()
+        .take(count)
+        .enumerate()
+        .map(|(index, text)| {
+            let vector: Vec<f32> = fixed
+                .and_then(|vectors| vectors.get(text).cloned())
+                .unwrap_or_else(|| mock_embedding_for(text))
+                .into_iter()
+                .take(dimension)
+                .collect();
+            json!({
+                "object": "embedding",
+                "index": index,
+                "embedding": vector,
+            })
+        })
+        .collect();
+
+    let total_tokens: usize = inputs.iter().map(|text| text.len().div_ceil(4)).sum();
+    let body = json!({
+        "object": "list",
+        "model": parsed_body.get("model").cloned().unwrap_or(Value::Null),
+        "data": data,
+        "usage": {
+            "prompt_tokens": total_tokens,
+            "total_tokens": total_tokens,
+            "prompt_tokens_details": Value::Null,
+        },
+    });
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
 }
 
 async fn handle_completion(

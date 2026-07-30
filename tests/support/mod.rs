@@ -18,10 +18,11 @@ use moira::{
     domain::{
         ApplicationCreateRequest, ApplicationExecutionPolicyPutRequest, ConsumerKeyCreateRequest,
         ConversationPolicyPutRequest, CredentialCreateRequest, CredentialScope, CredentialSecret,
-        CredentialType, DiagnosticExecutionRequest, ExecutionOptions, ProviderCreateRequest,
+        CredentialType, DiagnosticExecutionRequest, EmbeddingPolicyPutRequest, ExecutionOptions,
+        MemoryConsentMode, MemoryPolicyPutRequest, ProviderCreateRequest,
         ProviderModelCreateRequest, ProviderRuntimePolicyPutRequest, ProviderType,
-        ResponsePersistenceMode, RouteDefinitionCreateRequest, RouteSelectionStrategy,
-        RoutingPolicyCreateRequest, RuntimePolicyStatus,
+        ResponsePersistenceMode, RetrievalPolicyPutRequest, RouteDefinitionCreateRequest,
+        RouteSelectionStrategy, RoutingPolicyCreateRequest, RuntimePolicyStatus,
     },
     security::{Actor, ActorType},
 };
@@ -320,6 +321,229 @@ impl LifecycleFixture {
         }
     }
 
+    /// Points this fixture's application at an embedding-capable provider and turns RAG
+    /// embeddings on.
+    ///
+    /// Deliberately does **not** reuse [`Self::add_provider`]: that one also writes a routing
+    /// policy, which would make the embedding provider a completion candidate for this
+    /// fixture's route and quietly change what an unrelated execution test resolves.
+    ///
+    /// `base_url` is normally a [`mock_openai::MockOpenAiServer::base_url`]. There is no live
+    /// embedding credential anywhere in this repository and none is required: the mock serves
+    /// `/v1/embeddings` with deterministic vectors, so what is proven end to end is the
+    /// pipeline — chunk, call, persist, derive the status — not any particular provider's
+    /// embedding quality.
+    pub async fn enable_rag_embeddings(
+        &self,
+        base_url: String,
+        model_key: &str,
+    ) -> ProviderFixture {
+        let suffix = Uuid::now_v7().simple().to_string();
+        let admin = AdminService::new(&self.state).expect("admin service");
+        let provider = admin
+            .create_provider(
+                &self.actor,
+                &request_context(),
+                ProviderCreateRequest {
+                    provider_type: ProviderType::OpenAiCompatible,
+                    display_name: format!("Embedding provider {suffix}"),
+                    base_url: Some(base_url),
+                    metadata: json!({ "test_fixture": true, "purpose": "embeddings" }),
+                },
+            )
+            .await
+            .expect("create embedding provider");
+        let model = admin
+            .create_provider_model(
+                &self.actor,
+                &request_context(),
+                provider.id,
+                ProviderModelCreateRequest {
+                    model_key: model_key.to_string(),
+                    display_name: Some("Embedding model".to_string()),
+                    capabilities: json!({ "embeddings": true }),
+                },
+            )
+            .await
+            .expect("create embedding provider model");
+        let credential = admin
+            .create_credential(
+                &self.actor,
+                &request_context(),
+                CredentialCreateRequest {
+                    provider_id: provider.id,
+                    credential_type: CredentialType::ApiKey,
+                    scope: CredentialScope::Global,
+                    secret: CredentialSecret::ApiKey {
+                        api_key: "sk-embedding-secret".to_string(),
+                    },
+                    display_name: Some("Embedding credential".to_string()),
+                    priority: 100,
+                    expires_at: None,
+                    metadata: json!({ "test_fixture": true }),
+                },
+            )
+            .await
+            .expect("create embedding credential");
+
+        ConversationService::new(&self.state)
+            .expect("conversation service")
+            .put_embedding_policy(
+                &self.actor,
+                &request_context(),
+                self.application_id,
+                EmbeddingPolicyPutRequest {
+                    embedding_provider_id: Some(provider.id),
+                    embedding_model_id: Some(model.id),
+                    embedding_dimension: Some(1536),
+                    batch_size: Some(2),
+                    rag_embeddings_enabled: Some(true),
+                    ..EmbeddingPolicyPutRequest::default()
+                },
+            )
+            .await
+            .expect("enable RAG embeddings");
+
+        ProviderFixture {
+            provider_id: provider.id,
+            model_id: model.id,
+            credential_id: credential.id,
+        }
+    }
+
+    /// Turns RAG embeddings on with a policy that names no provider or model — the
+    /// misconfiguration whose honest outcome is a `'failed'` version, not an `'indexed'` one.
+    pub async fn enable_rag_embeddings_without_a_provider(&self) {
+        ConversationService::new(&self.state)
+            .expect("conversation service")
+            .put_embedding_policy(
+                &self.actor,
+                &request_context(),
+                self.application_id,
+                EmbeddingPolicyPutRequest {
+                    rag_embeddings_enabled: Some(true),
+                    ..EmbeddingPolicyPutRequest::default()
+                },
+            )
+            .await
+            .expect("enable RAG embeddings without a provider");
+    }
+
+    /// Turns retrieval on for this fixture's application (plan 11 Sub-Phase C).
+    ///
+    /// Thresholds default to `0.0` rather than the schema's `0.5`, and the weights to
+    /// semantic-only, because a retrieval test's subject is *which rows come back*, not the
+    /// blend. A test that wants to prove the threshold or the blend sets them explicitly; every
+    /// other test would otherwise be silently coupled to the default weighting and would start
+    /// failing for reasons unrelated to what it asserts.
+    pub async fn enable_retrieval(&self, overrides: RetrievalPolicyPutRequest) {
+        ConversationService::new(&self.state)
+            .expect("conversation service")
+            .put_retrieval_policy(
+                &self.actor,
+                &request_context(),
+                self.application_id,
+                RetrievalPolicyPutRequest {
+                    enabled: overrides.enabled.or(Some(true)),
+                    memory_retrieval_enabled: overrides.memory_retrieval_enabled.or(Some(true)),
+                    rag_retrieval_enabled: overrides.rag_retrieval_enabled.or(Some(true)),
+                    semantic_weight: overrides.semantic_weight.or(Some(1.0)),
+                    keyword_weight: overrides.keyword_weight.or(Some(0.0)),
+                    recency_weight: overrides.recency_weight.or(Some(0.0)),
+                    importance_weight: overrides.importance_weight.or(Some(0.0)),
+                    minimum_memory_score: overrides.minimum_memory_score.or(Some(0.0)),
+                    minimum_chunk_score: overrides.minimum_chunk_score.or(Some(0.0)),
+                    ..overrides
+                },
+            )
+            .await
+            .expect("enable retrieval policy");
+        // The conversation policy gates memory retrieval independently of the retrieval
+        // policy — both have to say yes, which is the intended belt-and-braces and is easy to
+        // forget when writing a fixture.
+        ConversationService::new(&self.state)
+            .expect("conversation service")
+            .put_conversation_policy(
+                &self.actor,
+                &request_context(),
+                self.application_id,
+                ConversationPolicyPutRequest {
+                    conversations_enabled: Some(true),
+                    caller_can_create_conversations: Some(true),
+                    memory_enabled: Some(true),
+                    memory_retrieval_enabled: Some(true),
+                    ..ConversationPolicyPutRequest::default()
+                },
+            )
+            .await
+            .expect("enable conversation retrieval policy");
+    }
+
+    /// Merges an embedding-policy change onto whatever is already stored.
+    ///
+    /// `put_embedding_policy` is a `coalesce` merge, so omitted fields are preserved — which is
+    /// what lets a test turn on `memory_embeddings_enabled` or switch `failure_behavior`
+    /// without restating the provider wiring `enable_rag_embeddings` put there.
+    pub async fn patch_embedding_policy(&self, request: EmbeddingPolicyPutRequest) {
+        ConversationService::new(&self.state)
+            .expect("conversation service")
+            .put_embedding_policy(
+                &self.actor,
+                &request_context(),
+                self.application_id,
+                request,
+            )
+            .await
+            .expect("patch embedding policy");
+    }
+
+    /// Turns manual memory writes on, so `create_memory` is reachable.
+    pub async fn enable_manual_memory(&self) {
+        ConversationService::new(&self.state)
+            .expect("conversation service")
+            .put_memory_policy(
+                &self.actor,
+                &request_context(),
+                self.application_id,
+                MemoryPolicyPutRequest {
+                    enabled: Some(true),
+                    manual_memory_enabled: Some(true),
+                    consent_mode: Some(MemoryConsentMode::ApplicationManaged),
+                    ..MemoryPolicyPutRequest::default()
+                },
+            )
+            .await
+            .expect("enable manual memory policy");
+    }
+
+    /// A caller-plane actor bound to this fixture's application, with an explicit scope.
+    ///
+    /// Built directly rather than issued as a consumer key because a consumer-key actor carries
+    /// no `external_tenant_id`/`external_user_id` — `authenticate_caller` returns from
+    /// `verify_api_key` before the `x-moira-*` header path is reached — and the tenant/user
+    /// isolation cases have nothing to assert without them. The scope under test is a bound
+    /// parameter derived from these three fields, so constructing them directly tests exactly
+    /// the thing, and the HTTP e2e in `tests/rag_retrieval_end_to_end.rs` covers the
+    /// authentication path that populates them.
+    pub fn caller_actor(&self, tenant: Option<&str>, user: Option<&str>) -> Actor {
+        Actor {
+            actor_type: ActorType::ConsumerKey,
+            subject: user.map(str::to_string),
+            tenant_id: tenant.map(str::to_string),
+            application_id: Some(self.application_id.to_string()),
+            external_user_id: user.map(str::to_string),
+            external_tenant_id: tenant.map(str::to_string),
+            internal_application_id: Some(self.application_id),
+            scopes: vec![
+                "moira:conversations:create".to_string(),
+                "moira:conversations:read".to_string(),
+                "moira:memories:create".to_string(),
+                "moira:memories:read".to_string(),
+            ],
+            ..Actor::default()
+        }
+    }
+
     pub fn execution_service(&self) -> MoiraExecutionService {
         MoiraExecutionService::new(self.state.clone()).expect("execution service")
     }
@@ -395,6 +619,11 @@ impl LifecycleFixture {
                         "moira:responses:read".to_string(),
                         "moira:execution:override-route".to_string(),
                         "moira:conversations:create".to_string(),
+                        // Needed by any second turn: `prepare_response_conversation` reads the
+                        // existing conversation rather than creating one, and that read is
+                        // scope-checked. Without it a multi-turn conversation gets a 403 on
+                        // turn two, which is the shape plan 11's history replay depends on.
+                        "moira:conversations:read".to_string(),
                     ],
                     expires_at: None,
                 },
@@ -941,6 +1170,13 @@ async fn sweep_leaked_databases(maintenance: &mut PgConnection, current_template
 // intended behaviour for an *absence* assertion: a canary must appear in no
 // event emitted by any test, not merely in the ones a given test triggered.
 
+/// Event targets Moira's production subscriber drops at verbose levels.
+///
+/// Must stay in step with `PAYLOAD_BEARING_LOG_TARGET_PREFIXES` in `src/config/telemetry.rs`;
+/// the unit tests there pin the production behaviour, and this list is what lets the e2e leak
+/// suites assert against the same reality rather than against a subscriber Moira never installs.
+const SUPPRESSED_LOG_TARGETS: &[&str] = &["rig::", " rig:"];
+
 static LOG_BUFFER: LazyLock<Arc<StdMutex<Vec<u8>>>> =
     LazyLock::new(|| Arc::new(StdMutex::new(Vec::new())));
 static LOG_CAPTURE_INIT: Once = Once::new();
@@ -956,6 +1192,48 @@ impl CapturedLogs {
     pub fn contents(&self) -> String {
         let guard = self.buffer.lock().expect("captured log buffer poisoned");
         String::from_utf8_lossy(guard.as_slice()).into_owned()
+    }
+
+    /// Everything the capture holds **except** events from targets Moira's shipped subscriber
+    /// hard-suppresses at verbose levels.
+    ///
+    /// # Why this exists, stated plainly
+    ///
+    /// `install_log_capture` installs a bare `TRACE` subscriber with no filter, deliberately —
+    /// a leak that only shows up under a verbose operator filter is still a leak. But that
+    /// subscriber is **not** the one Moira ships. `src/config/telemetry.rs` layers a
+    /// `filter_fn` that drops verbose `rig::*` events below the `EnvFilter`, because
+    /// `rig-core` 0.40 logs the entire completion request body — including, after plan 11, the
+    /// retrieved RAG and memory text — on `rig::completions` at `TRACE`.
+    ///
+    /// So a raw-capture assertion would fail for an upstream reason Moira has already
+    /// mitigated, and asserting on the raw capture *without* naming that would be
+    /// misrepresenting what is proven. This method draws the line explicitly: everything below
+    /// is Moira's own output, and it must be canary-free. What is filtered out is named, has a
+    /// production suppression behind it, and is documented as a residual risk in
+    /// `docs/rag-security.md`.
+    pub fn contents_excluding_suppressed_targets(&self) -> String {
+        // Events are separated by the fmt layer's RFC3339 timestamp at the start of a line; a
+        // pretty-printed JSON body spills onto continuation lines that carry no target, so
+        // filtering line-by-line would keep the payload while dropping its header.
+        let raw = self.contents();
+        let mut kept = String::new();
+        let mut suppressed = false;
+        for line in raw.lines() {
+            let starts_event = line
+                .split_once(' ')
+                .is_some_and(|(first, _)| first.len() >= 20 && first.ends_with('Z'));
+            if starts_event {
+                suppressed = SUPPRESSED_LOG_TARGETS
+                    .iter()
+                    .any(|target| line.contains(target));
+            }
+            if !suppressed {
+                kept.push_str(line);
+                kept.push('\n');
+            }
+        }
+        kept
     }
 
     /// Byte length of the capture buffer.

@@ -77,7 +77,7 @@ use crate::{
         ListCursor, MemoryCreateRequest, MemoryPatchRequest, MemoryPolicyPutRequest,
         MemoryPolicyRecord, MemoryQuery, MemoryRecord, MemoryScope, RagCollectionCreateRequest,
         RagCollectionPatchRequest, RagCollectionQuery, RagCollectionRecord, RagCollectionStatus,
-        RagDocumentCreateRequest, RagDocumentIngestRequest, RagDocumentRecord, RagIngestionStatus,
+        RagDocumentCreateRequest, RagDocumentIngestRequest, RagDocumentRecord,
         RetrievalPolicyPutRequest, RetrievalPolicyRecord, SeqCursor,
     },
     error::AppError,
@@ -91,6 +91,10 @@ use crate::{
         rag_collection_record_from_row, rag_collection_status_to_db,
         rag_collection_visibility_to_db, rag_document_record_from_row, rag_ingestion_status_to_db,
         retrieval_policy_record_from_row,
+    },
+    orchestration::{
+        MemoryCandidate, RagChunkCandidate, RagIngestionPlan, SUPPORTED_EMBEDDING_DIMENSION,
+        encode_vector_literal,
     },
 };
 
@@ -455,6 +459,7 @@ pub trait ConversationRepository: Send + Sync {
     /// The SQL body lives in the free function so it can also run inside a caller-supplied
     /// transaction (the `AdminCommandRunner` idempotency envelope). This method owns the
     /// transaction lifecycle; the free function must never open one.
+    /// See [`ConversationRepository::ingest_rag_document`] on why `plan` is not optional.
     async fn create_rag_document(
         &self,
         id: Uuid,
@@ -462,6 +467,7 @@ pub trait ConversationRepository: Send + Sync {
         collection_public_id: &str,
         request: &RagDocumentCreateRequest,
         content_hash: Option<&str>,
+        plan: &RagIngestionPlan,
     ) -> Result<RagDocumentRecord, AppError>;
 
     /// Lists a collection's documents newest-created-first, resuming after `cursor`.
@@ -491,11 +497,17 @@ pub trait ConversationRepository: Send + Sync {
     /// transaction lifecycle; the free function must never open one — the `for update` row
     /// lock and the version supersession must belong to whatever transaction the caller
     /// already holds.
+    ///
+    /// `plan` is mandatory rather than optional so no implementation and no caller can write a
+    /// version without deciding what the pipeline produced. Passing
+    /// [`RagIngestionPlan::empty`] is a valid answer — it means "no content, nothing to
+    /// index", and it yields `'pending'`. What is not possible is forgetting.
     async fn ingest_rag_document(
         &self,
         public_id: &str,
         request: &RagDocumentIngestRequest,
         content_hash: &str,
+        plan: &RagIngestionPlan,
     ) -> Result<RagDocumentRecord, AppError>;
 }
 
@@ -1401,6 +1413,7 @@ impl ConversationRepository for PgConversationRepository {
         collection_public_id: &str,
         request: &RagDocumentCreateRequest,
         content_hash: Option<&str>,
+        plan: &RagIngestionPlan,
     ) -> Result<RagDocumentRecord, AppError> {
         let mut tx = self.pool.begin().await?;
         let record = create_rag_document_with_connection(
@@ -1410,6 +1423,7 @@ impl ConversationRepository for PgConversationRepository {
             collection_public_id,
             request,
             content_hash,
+            plan,
         )
         .await?;
         tx.commit().await?;
@@ -1474,10 +1488,12 @@ impl ConversationRepository for PgConversationRepository {
         public_id: &str,
         request: &RagDocumentIngestRequest,
         content_hash: &str,
+        plan: &RagIngestionPlan,
     ) -> Result<RagDocumentRecord, AppError> {
         let mut tx = self.pool.begin().await?;
         let record =
-            ingest_rag_document_with_connection(&mut tx, public_id, request, content_hash).await?;
+            ingest_rag_document_with_connection(&mut tx, public_id, request, content_hash, plan)
+                .await?;
         tx.commit().await?;
         Ok(record)
     }
@@ -1542,6 +1558,7 @@ pub(crate) async fn create_rag_document_with_connection(
     collection_public_id: &str,
     request: &RagDocumentCreateRequest,
     content_hash: Option<&str>,
+    plan: &RagIngestionPlan,
 ) -> Result<RagDocumentRecord, AppError> {
     let collection_id: Uuid = sqlx::query_scalar(
         "select id from rag_collections where public_id = $1 and deleted_at is null",
@@ -1579,7 +1596,11 @@ pub(crate) async fn create_rag_document_with_connection(
     .await?;
     if let (Some(content), Some(hash)) = (&request.content, content_hash) {
         let version_id = Uuid::now_v7();
-        // Honest status: no chunking/embedding pipeline exists yet (see plans/11-rag-memory-intelligence.md). Content is stored verbatim; ingestion_status reflects "not yet processed", not "indexed for retrieval".
+        // The status is *derived* from what the pipeline actually produced
+        // (`RagIngestionPlan::terminal_status`) and can never be passed in as a literal. That
+        // is the structural fix for P0-1: the old code bound `'indexed'` unconditionally, and
+        // its 02a replacement bound `'pending'` unconditionally. Both were constants; only one
+        // of them was honest, and neither was derived from work.
         sqlx::query(
             r#"
                 insert into rag_document_versions (
@@ -1594,10 +1615,12 @@ pub(crate) async fn create_rag_document_with_connection(
         .bind(content)
         .bind(hash)
         .bind(content.len() as i64)
-        .bind(rag_ingestion_status_to_db(RagIngestionStatus::Pending))
+        .bind(rag_ingestion_status_to_db(plan.terminal_status()))
         .bind(&request.metadata)
         .execute(&mut *connection)
         .await?;
+        write_rag_ingestion_artifacts(&mut *connection, id, version_id, collection_id, hash, plan)
+            .await?;
         sqlx::query("update rag_documents set current_version_id = $2 where id = $1")
             .bind(id)
             .bind(version_id)
@@ -1622,9 +1645,10 @@ pub(crate) async fn ingest_rag_document_with_connection(
     public_id: &str,
     request: &RagDocumentIngestRequest,
     content_hash: &str,
+    plan: &RagIngestionPlan,
 ) -> Result<RagDocumentRecord, AppError> {
-    let document_id: Uuid = sqlx::query_scalar(
-        "select id from rag_documents where public_id = $1 and deleted_at is null for update",
+    let target = sqlx::query(
+        "select id, collection_id from rag_documents where public_id = $1 and deleted_at is null for update",
     )
     .bind(public_id)
     .fetch_optional(&mut *connection)
@@ -1636,6 +1660,8 @@ pub(crate) async fn ingest_rag_document_with_connection(
             "RAG document not found",
         )
     })?;
+    let document_id: Uuid = target.try_get("id")?;
+    let collection_id: Uuid = target.try_get("collection_id")?;
     let version_number: i32 = sqlx::query_scalar(
         "select coalesce(max(version_number), 0) + 1 from rag_document_versions where document_id = $1",
     )
@@ -1655,7 +1681,7 @@ pub(crate) async fn ingest_rag_document_with_connection(
     .bind(document_id)
     .execute(&mut *connection)
     .await?;
-    // Honest status: no chunking/embedding pipeline exists yet (see plans/11-rag-memory-intelligence.md). Content is stored verbatim; ingestion_status reflects "not yet processed", not "indexed for retrieval".
+    // Derived, never a literal — see the matching comment on the create path.
     sqlx::query(
         r#"
             insert into rag_document_versions (
@@ -1674,9 +1700,18 @@ pub(crate) async fn ingest_rag_document_with_connection(
     .bind(content.len() as i64)
     .bind(&request.source_etag)
     .bind(request.source_last_modified)
-    .bind(rag_ingestion_status_to_db(RagIngestionStatus::Pending))
+    .bind(rag_ingestion_status_to_db(plan.terminal_status()))
     .bind(&request.metadata)
     .execute(&mut *connection)
+    .await?;
+    write_rag_ingestion_artifacts(
+        &mut *connection,
+        document_id,
+        version_id,
+        collection_id,
+        content_hash,
+        plan,
+    )
     .await?;
     sqlx::query("update rag_documents set current_version_id = $2 where id = $1")
         .bind(document_id)
@@ -1690,6 +1725,695 @@ pub(crate) async fn ingest_rag_document_with_connection(
     .fetch_one(&mut *connection)
     .await?;
     rag_document_record_from_row(&row)
+}
+
+// ---------------------------------------------------------------------------
+// RAG ingestion pipeline (plan 11, Sub-Phases A and B).
+//
+// Same INVARIANTS as the block above: no `begin`/`commit`/`rollback`, `pub(crate)` only.
+//
+// Nothing here attaches a `notify_moira_runtime_config_change()` trigger, and nothing here
+// should. `rag_chunks`, `rag_chunk_embeddings`, `rag_ingestion_runs` and
+// `rag_document_versions` carry no NOTIFY trigger today (`migrations/0007…` attaches one to
+// `rag_collections` and `rag_documents` only). Adding one would route every chunk write
+// through `circuit_reset_scope`'s `other =>` arm in `src/infra/db.rs`, which returns
+// `CircuitResetScope::All` — discarding every provider circuit-breaker on every replica, once
+// per chunk, with a `warn!` each time. If a later change ever does attach one, it must add the
+// table to `CIRCUIT_UNAFFECTED_RESOURCE_TYPES` and to `every_triggered_table_has_a_scope` in
+// the same commit.
+// ---------------------------------------------------------------------------
+
+/// Writes the chunks, embeddings and run row for one document version.
+///
+/// Called from both ingestion entry points so `/ingest`, `/reindex` and the inline-content
+/// create path cannot drift — `/reindex` is a literal alias of `/ingest` and the create path
+/// writes version 1, and a pipeline wired into only one of them would leave the others writing
+/// bare, chunk-less versions forever.
+async fn write_rag_ingestion_artifacts(
+    connection: &mut PgConnection,
+    document_id: Uuid,
+    document_version_id: Uuid,
+    collection_id: Uuid,
+    content_hash: &str,
+    plan: &RagIngestionPlan,
+) -> Result<(), AppError> {
+    for chunk in &plan.chunks {
+        let chunk_id = Uuid::now_v7();
+        sqlx::query(
+            r#"
+                insert into rag_chunks (
+                    id, public_id, document_version_id, collection_id, chunk_index,
+                    chunk_text_plain, chunk_hash, token_count, start_offset, end_offset,
+                    section_title, metadata
+                )
+                values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                "#,
+        )
+        .bind(chunk_id)
+        // `rag_chunks_public_id_valid` requires `^chunk_[0-9a-fA-F-]{36}$`, which is the
+        // hyphenated UUID form — not `simple()`.
+        .bind(format!("chunk_{chunk_id}"))
+        .bind(document_version_id)
+        .bind(collection_id)
+        .bind(chunk.chunk_index)
+        .bind(&chunk.text)
+        .bind(&chunk.chunk_hash)
+        .bind(chunk.token_estimate)
+        .bind(chunk.start_offset)
+        .bind(chunk.end_offset)
+        .bind(&chunk.section_title)
+        .bind(Value::Object(serde_json::Map::from_iter([(
+            "chunk_strategy".to_string(),
+            Value::String(plan.strategy.to_string()),
+        )])))
+        .execute(&mut *connection)
+        .await?;
+
+        if let Some(vector) = &chunk.embedding {
+            // The vector is bound as `text` and cast with `$4::vector` rather than through the
+            // `pgvector` crate — decision and reversal condition are recorded on
+            // `crate::orchestration::encode_vector_literal`.
+            sqlx::query(
+                r#"
+                    insert into rag_chunk_embeddings (
+                        chunk_id, embedding_model_id, embedding_version, dimension, embedding
+                    )
+                    values ($1, $2, 1, $3, $4::vector)
+                    "#,
+            )
+            .bind(chunk_id)
+            .bind(plan.embedding_model_id)
+            .bind(vector.len() as i32)
+            .bind(encode_vector_literal(vector))
+            .execute(&mut *connection)
+            .await?;
+        }
+    }
+
+    sqlx::query(
+        r#"
+            insert into rag_ingestion_runs (
+                id, document_id, document_version_id, status, content_hash,
+                chunk_count, embedded_chunk_count, completed_at, failure_class, metadata
+            )
+            values ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9)
+            "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(document_id)
+    .bind(document_version_id)
+    .bind(plan.run_status())
+    .bind(content_hash)
+    .bind(plan.chunk_count())
+    .bind(plan.embedded_chunk_count())
+    .bind(plan.failure_class)
+    .bind(Value::Object(serde_json::Map::from_iter([(
+        "chunk_strategy".to_string(),
+        Value::String(plan.strategy.to_string()),
+    )])))
+    .execute(&mut *connection)
+    .await?;
+    Ok(())
+}
+
+/// Everything the ingestion pipeline needs to know before it opens a transaction.
+#[derive(Debug, Clone)]
+pub(crate) struct RagIngestionContext {
+    /// The application that owns the collection. Embedding credentials resolve against this,
+    /// never against the acting admin's application.
+    pub application_id: Uuid,
+    pub mime_type: Option<String>,
+    /// `None` when the application has no embedding policy, or has one with
+    /// `rag_embeddings_enabled = false`. That is not a failure — it is an application that has
+    /// not asked for semantic indexing, and its documents are still chunked.
+    pub embedding: Option<RagEmbeddingTarget>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RagEmbeddingTarget {
+    pub provider_id: Option<Uuid>,
+    pub model_id: Option<Uuid>,
+    pub declared_dimension: Option<i32>,
+    pub batch_size: i32,
+    pub timeout_ms: i32,
+}
+
+fn ingestion_context_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<RagIngestionContext, AppError> {
+    let enabled: Option<bool> = row.try_get("rag_embeddings_enabled")?;
+    let embedding = if enabled == Some(true) {
+        Some(RagEmbeddingTarget {
+            provider_id: row.try_get("embedding_provider_id")?,
+            model_id: row.try_get("embedding_model_id")?,
+            declared_dimension: row.try_get("embedding_dimension")?,
+            batch_size: row.try_get::<Option<i32>, _>("batch_size")?.unwrap_or(32),
+            timeout_ms: row
+                .try_get::<Option<i32>, _>("timeout_ms")?
+                .unwrap_or(60_000),
+        })
+    } else {
+        None
+    };
+    Ok(RagIngestionContext {
+        application_id: row.try_get("application_id")?,
+        mime_type: row.try_get("mime_type")?,
+        embedding,
+    })
+}
+
+/// Ingestion context for `/ingest` and `/reindex`, keyed on the document's public id.
+///
+/// Returns `None` for a document that does not exist. The caller deliberately does **not**
+/// turn that into a `404` itself: the not-found error must keep being raised inside the
+/// command transaction, where it has always been raised, so the idempotency envelope's
+/// treatment of a failed ingest is unchanged by this plan.
+///
+/// This is a free function rather than a `ConversationRepository` trait method on purpose.
+/// `ConversationService` holds the concrete `PgConversationRepository`, the ingestion write
+/// bodies next to it are already free functions for the transaction-sharing reason documented
+/// above, and adding a method to the trait would oblige `InMemoryConversationRepository` to
+/// stub a method nothing calls.
+pub(crate) async fn find_document_ingestion_context(
+    pool: &PgPool,
+    document_public_id: &str,
+) -> Result<Option<RagIngestionContext>, AppError> {
+    let row = sqlx::query(
+        r#"
+            select c.application_id,
+                   d.mime_type,
+                   p.embedding_provider_id,
+                   p.embedding_model_id,
+                   p.embedding_dimension,
+                   p.batch_size,
+                   p.timeout_ms,
+                   p.rag_embeddings_enabled
+            from rag_documents d
+            join rag_collections c on c.id = d.collection_id
+            left join application_embedding_policies p on p.application_id = c.application_id
+            where d.public_id = $1 and d.deleted_at is null
+            "#,
+    )
+    .bind(document_public_id)
+    .fetch_optional(pool)
+    .await?;
+    row.as_ref().map(ingestion_context_from_row).transpose()
+}
+
+/// Ingestion context for the inline-content create path, keyed on the collection's public id.
+///
+/// The document does not exist yet, so the MIME type comes from the request rather than a row.
+pub(crate) async fn find_collection_ingestion_context(
+    pool: &PgPool,
+    collection_public_id: &str,
+) -> Result<Option<RagIngestionContext>, AppError> {
+    let row = sqlx::query(
+        r#"
+            select c.application_id,
+                   null::varchar as mime_type,
+                   p.embedding_provider_id,
+                   p.embedding_model_id,
+                   p.embedding_dimension,
+                   p.batch_size,
+                   p.timeout_ms,
+                   p.rag_embeddings_enabled
+            from rag_collections c
+            left join application_embedding_policies p on p.application_id = c.application_id
+            where c.public_id = $1 and c.deleted_at is null
+            "#,
+    )
+    .bind(collection_public_id)
+    .fetch_optional(pool)
+    .await?;
+    row.as_ref().map(ingestion_context_from_row).transpose()
+}
+
+// ---------------------------------------------------------------------------
+// Retrieval (plan 11, Sub-Phase C).
+//
+// The two candidate queries below are the plan's single highest-risk surface. Both are free
+// functions rather than `ConversationRepository` trait methods, for the same reason
+// `find_document_ingestion_context` above is: a fake implementation of a vector query is
+// necessarily a fiction, and `InMemoryConversationRepository` stubbing one would let a unit
+// test built on the fake assert that isolation holds while proving nothing at all. There is
+// exactly one implementation, it is the real SQL, and every test of it runs against
+// PostgreSQL.
+//
+// INVARIANT — the cross-tenant isolation predicate is evaluated in the SAME query as the
+// vector `order by`, never as a post-fetch filter in Rust. Filtering afterwards would compute
+// a global nearest-neighbour ordering over every tenant's rows and then discard the ones that
+// do not belong to the caller, which leaks the *shape* of other tenants' corpora through
+// result counts and timing even when no content is returned. If a future refactor is tempted
+// to move a `where` clause out of these strings, it must not.
+// ---------------------------------------------------------------------------
+
+/// The caller scope every retrieval query is bound to.
+#[derive(Debug, Clone)]
+pub struct RetrievalScope {
+    pub application_id: Uuid,
+    pub external_tenant_id: Option<String>,
+    pub external_user_id: Option<String>,
+}
+
+/// Semantically-ranked `memory_records` candidates for one caller scope.
+///
+/// # The scope predicate, and why it is not the flat one
+///
+/// `plans/11-rag-memory-intelligence.md` §Architecture sketches a flat predicate —
+/// `application_id = $2 and coalesce(external_tenant_id,'') = coalesce($3,'') and
+/// coalesce(external_user_id,'') = coalesce($4,'')`. That predicate is strictly isolating, but
+/// it also makes `memory_scope = 'application'` unreachable for any caller that carries an
+/// `external_user_id`, because such rows have a null user by construction
+/// (`memory_records_scope_valid`, `migrations/0007…:262-267`). An application-scoped memory
+/// that nothing can ever retrieve is not a safety property, it is a dead column.
+///
+/// **Decision (plan 11 Wave 2).** The predicate is scope-aware instead: each `memory_scope`
+/// value is matched against exactly the isolation its own definition implies.
+///
+/// * `application_id` is required in **every** arm. There is no path that crosses applications.
+/// * `application` — visible to the whole application, across tenants and users. That is what
+///   the scope value means; the check constraint deliberately requires neither id.
+/// * `tenant_application` — the caller's tenant must match.
+/// * `user_application` and `conversation` — both tenant and user must match.
+///
+/// So the boundary this enforces is: **no row ever crosses an application**, and no row
+/// crosses a tenant or user *unless it was explicitly stored as application-wide*.
+///
+/// **Reversal condition:** collapse to the flat predicate if product decides application-scoped
+/// memories must not cross tenants — at which point the scope value itself should be removed
+/// rather than left meaning nothing.
+pub(crate) async fn find_memory_candidates(
+    pool: &PgPool,
+    scope: &RetrievalScope,
+    query_vector: &str,
+    limit: i64,
+) -> Result<Vec<MemoryCandidate>, AppError> {
+    let rows = sqlx::query(
+        r#"
+            select m.id as memory_uuid,
+                   m.public_id,
+                   m.memory_type,
+                   m.memory_key,
+                   m.content_plain,
+                   m.importance,
+                   (e.embedding <=> $1::vector) as distance,
+                   -- `extract` returns `numeric` on PostgreSQL 14+, which sqlx will not decode as
+                   -- `f64`. The cast is not cosmetic: without it every candidate query fails at
+                   -- decode time and retrieval degrades to "backend failed" on every request.
+                   extract(epoch from (now() - m.updated_at))::float8 as age_seconds
+            from memory_embeddings e
+            join memory_records m on m.id = e.memory_id
+            where e.superseded_at is null
+              and e.embedding is not null
+              and m.deleted_at is null
+              and m.status = 'active'
+              and m.application_id = $2
+              and (
+                    m.memory_scope = 'application'
+                 or (m.memory_scope = 'tenant_application'
+                     and coalesce(m.external_tenant_id, '') = coalesce($3, ''))
+                 or (m.memory_scope in ('user_application', 'conversation')
+                     and coalesce(m.external_tenant_id, '') = coalesce($3, '')
+                     and coalesce(m.external_user_id, '') = coalesce($4, ''))
+              )
+            order by e.embedding <=> $1::vector
+            limit $5
+            "#,
+    )
+    .bind(query_vector)
+    .bind(scope.application_id)
+    .bind(&scope.external_tenant_id)
+    .bind(&scope.external_user_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(memory_candidate_from_row).collect()
+}
+
+fn memory_candidate_from_row(row: &sqlx::postgres::PgRow) -> Result<MemoryCandidate, AppError> {
+    Ok(MemoryCandidate {
+        memory_uuid: row.try_get("memory_uuid")?,
+        public_id: row.try_get("public_id")?,
+        memory_type: row.try_get("memory_type")?,
+        memory_key: row.try_get("memory_key")?,
+        content: row.try_get("content_plain")?,
+        importance: row.try_get("importance")?,
+        distance: row.try_get("distance")?,
+        age_seconds: row.try_get::<Option<f64>, _>("age_seconds")?.unwrap_or(0.0),
+    })
+}
+
+/// Semantically-ranked `rag_chunks` candidates for one caller scope.
+///
+/// # Collection visibility
+///
+/// `rag_collections.visibility` is `'application' | 'tenant' | 'restricted'`
+/// (`migrations/0007…:330-331`). The three rules, all evaluated in this query:
+///
+/// * A collection owned by a tenant (`external_tenant_id` non-null) is only ever a candidate
+///   for that tenant, whatever its visibility. Tenant ownership outranks the visibility label,
+///   so a mislabelled `'application'` collection cannot leak across tenants.
+/// * `'tenant'` additionally requires the caller's tenant to match, which excludes an
+///   application-wide (null-tenant) collection marked `'tenant'` from every caller — the honest
+///   reading of a contradictory configuration.
+/// * `'restricted'` is never a candidate unless its id appears in the application's
+///   `application_retrieval_policies.allowed_collection_ids` (`migrations/0007…:76`), which is
+///   passed in as `$4`.
+///
+/// Superseded document versions are excluded, so re-ingesting a document retires its old
+/// chunks from retrieval without deleting them.
+pub(crate) async fn find_rag_chunk_candidates(
+    pool: &PgPool,
+    scope: &RetrievalScope,
+    query_vector: &str,
+    allowed_collection_ids: &[Uuid],
+    limit: i64,
+) -> Result<Vec<RagChunkCandidate>, AppError> {
+    let rows = sqlx::query(
+        r#"
+            select ch.id as chunk_uuid,
+                   ch.public_id,
+                   ch.chunk_index,
+                   ch.chunk_text_plain,
+                   ch.section_title,
+                   d.id as document_uuid,
+                   d.public_id as document_public_id,
+                   d.title as document_title,
+                   (e.embedding <=> $1::vector) as distance,
+                   extract(epoch from (now() - v.created_at))::float8 as age_seconds
+            from rag_chunk_embeddings e
+            join rag_chunks ch on ch.id = e.chunk_id
+            join rag_collections c on c.id = ch.collection_id
+            join rag_document_versions v on v.id = ch.document_version_id
+            join rag_documents d on d.id = v.document_id
+            where e.superseded_at is null
+              and e.embedding is not null
+              and v.superseded_at is null
+              and d.deleted_at is null
+              and c.deleted_at is null
+              and c.status = 'active'
+              and c.application_id = $2
+              and coalesce(c.external_tenant_id, '') in ('', coalesce($3, ''))
+              and (c.visibility <> 'tenant'
+                   or coalesce(c.external_tenant_id, '') = coalesce($3, ''))
+              and (c.visibility <> 'restricted' or c.id = any($4::uuid[]))
+            order by e.embedding <=> $1::vector
+            limit $5
+            "#,
+    )
+    .bind(query_vector)
+    .bind(scope.application_id)
+    .bind(&scope.external_tenant_id)
+    .bind(allowed_collection_ids)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(chunk_candidate_from_row).collect()
+}
+
+fn chunk_candidate_from_row(row: &sqlx::postgres::PgRow) -> Result<RagChunkCandidate, AppError> {
+    Ok(RagChunkCandidate {
+        chunk_uuid: row.try_get("chunk_uuid")?,
+        public_id: row.try_get("public_id")?,
+        document_uuid: row.try_get("document_uuid")?,
+        document_public_id: row.try_get("document_public_id")?,
+        document_title: row.try_get("document_title")?,
+        section_title: row.try_get("section_title")?,
+        chunk_index: row.try_get("chunk_index")?,
+        text: row.try_get("chunk_text_plain")?,
+        distance: row.try_get("distance")?,
+        age_seconds: row.try_get::<Option<f64>, _>("age_seconds")?.unwrap_or(0.0),
+    })
+}
+
+/// One `retrieval_runs` row — the provenance record for a single retrieval.
+///
+/// The counts are the plan's diagnostic surface *instead of* per-application metric labels:
+/// `ALLOWED_LABEL_KEYS` in `src/infra/metrics.rs` admits no `application_id`, and this table is
+/// what that restriction points at.
+#[derive(Debug, Clone)]
+pub struct RetrievalRunInsert {
+    pub execution_id: Uuid,
+    pub conversation_uuid: Option<Uuid>,
+    pub query_hash: String,
+    pub embedding_model_id: Option<Uuid>,
+    pub memory_candidate_count: i32,
+    pub memory_returned_count: i32,
+    pub chunk_candidate_count: i32,
+    pub chunk_returned_count: i32,
+    pub latency_ms: i64,
+    /// `'completed'` or `'failed'`, per the check constraint.
+    pub status: &'static str,
+    pub failure_class: Option<&'static str>,
+}
+
+pub(crate) async fn insert_retrieval_run(
+    pool: &PgPool,
+    insert: &RetrievalRunInsert,
+) -> Result<Uuid, AppError> {
+    let id = Uuid::now_v7();
+    sqlx::query(
+        r#"
+            insert into retrieval_runs (
+                id, execution_id, conversation_id, query_hash, embedding_model_id,
+                memory_candidate_count, memory_returned_count,
+                chunk_candidate_count, chunk_returned_count,
+                latency_ms, status, failure_class
+            )
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            "#,
+    )
+    .bind(id)
+    .bind(insert.execution_id)
+    .bind(insert.conversation_uuid)
+    .bind(&insert.query_hash)
+    .bind(insert.embedding_model_id)
+    .bind(insert.memory_candidate_count)
+    .bind(insert.memory_returned_count)
+    .bind(insert.chunk_candidate_count)
+    .bind(insert.chunk_returned_count)
+    .bind(insert.latency_ms)
+    .bind(insert.status)
+    .bind(insert.failure_class)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+/// Writes the semantic index entry for one memory.
+///
+/// Upserts rather than inserts: a memory's content can be patched, and a stale vector pointing
+/// at superseded text is worse than none — it would keep surfacing the old meaning under the
+/// new content. `embedding_version` stays at 1 until an embedding-model change makes versioning
+/// meaningful, which is the supersession path Sub-Phase B documented and no code exercises yet.
+pub(crate) async fn insert_memory_embedding(
+    pool: &PgPool,
+    memory_id: Uuid,
+    embedding_model_id: Option<Uuid>,
+    encoded_vector: &str,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+            insert into memory_embeddings (
+                memory_id, embedding_model_id, embedding_version, dimension, embedding
+            )
+            values ($1, $2, 1, $3, $4::vector)
+            on conflict (memory_id, embedding_version) do update
+            set embedding = excluded.embedding,
+                embedding_model_id = excluded.embedding_model_id,
+                dimension = excluded.dimension,
+                created_at = now(),
+                superseded_at = null
+            "#,
+    )
+    .bind(memory_id)
+    .bind(embedding_model_id)
+    .bind(SUPPORTED_EMBEDDING_DIMENSION as i32)
+    .bind(encoded_vector)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// One `context_plans` row — exactly what the planner put in front of the model, by id.
+#[derive(Debug, Clone)]
+pub struct ContextPlanInsert {
+    pub execution_id: Uuid,
+    pub conversation_uuid: Option<Uuid>,
+    pub strategy: String,
+    pub estimated_input_tokens: i64,
+    pub included_message_ids: Vec<Uuid>,
+    pub included_summary_id: Option<Uuid>,
+    pub included_memory_ids: Vec<Uuid>,
+    pub included_chunk_ids: Vec<Uuid>,
+    pub excluded_counts: Value,
+    pub truncation_reason: Option<String>,
+}
+
+pub(crate) async fn insert_context_plan(
+    pool: &PgPool,
+    insert: &ContextPlanInsert,
+) -> Result<Uuid, AppError> {
+    let id = Uuid::now_v7();
+    sqlx::query(
+        r#"
+            insert into context_plans (
+                id, execution_id, conversation_id, strategy, estimated_input_tokens,
+                included_message_ids, included_summary_id, included_memory_ids,
+                included_chunk_ids, excluded_counts, truncation_reason
+            )
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            "#,
+    )
+    .bind(id)
+    .bind(insert.execution_id)
+    .bind(insert.conversation_uuid)
+    .bind(&insert.strategy)
+    .bind(insert.estimated_input_tokens)
+    .bind(&insert.included_message_ids)
+    .bind(insert.included_summary_id)
+    .bind(&insert.included_memory_ids)
+    .bind(&insert.included_chunk_ids)
+    .bind(&insert.excluded_counts)
+    .bind(&insert.truncation_reason)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+/// One prior turn, as the planner needs it.
+#[derive(Debug, Clone)]
+pub struct HistoryMessage {
+    pub message_uuid: Uuid,
+    pub role: String,
+    pub content: Option<String>,
+    pub sequence_number: i64,
+}
+
+/// The most recent `limit` non-deleted messages of a conversation, oldest first.
+///
+/// Deliberately not `list_messages`: that one pages forward from a cursor, so asking it for
+/// "the last N" means reading the whole conversation. This reads the tail directly and then
+/// re-sorts, which is what the planner wants and what the
+/// `conversation_messages_conversation_sequence_idx` index serves.
+///
+/// The `sequence_number` cutoff excludes the turn the current request just wrote: the planner
+/// runs *after* `prepare_response_conversation` has persisted the user's message, and including
+/// it would duplicate the caller's own input into the history block.
+pub(crate) async fn find_recent_messages(
+    pool: &PgPool,
+    conversation_public_id: &str,
+    before_sequence: i64,
+    limit: i64,
+) -> Result<Vec<HistoryMessage>, AppError> {
+    let rows = sqlx::query(
+        r#"
+            select m.id as message_uuid, m.role, m.content_plain, m.sequence_number
+            from conversation_messages m
+            join conversations c on c.id = m.conversation_id
+            where c.public_id = $1
+              and c.deleted_at is null
+              and m.deleted_at is null
+              and m.sequence_number < $2
+            order by m.sequence_number desc
+            limit $3
+            "#,
+    )
+    .bind(conversation_public_id)
+    .bind(before_sequence)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    let mut messages = rows
+        .iter()
+        .map(|row| {
+            Ok(HistoryMessage {
+                message_uuid: row.try_get("message_uuid")?,
+                role: row.try_get("role")?,
+                content: row.try_get("content_plain")?,
+                sequence_number: row.try_get("sequence_number")?,
+            })
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+    messages.reverse();
+    Ok(messages)
+}
+
+/// The conversation's row id and the active summary that covers it, if any.
+///
+/// `conversation_summaries` has no writer yet — summarization is Sub-Phase E, deliberately not
+/// in this wave. The read is here anyway rather than stubbed to `None`, because the planner's
+/// drop-priority order places the summary *above* retrieved content, and wiring that ordering
+/// only once a writer exists would mean the ordering shipped untested. Today this reliably
+/// returns `None`, and the planner's summary branch is exercised by a fixture that inserts a
+/// row directly.
+pub(crate) async fn find_conversation_context_anchor(
+    pool: &PgPool,
+    conversation_public_id: &str,
+) -> Result<Option<(Uuid, Option<Uuid>, Option<String>, i64)>, AppError> {
+    let row = sqlx::query(
+        r#"
+            select c.id as conversation_uuid,
+                   s.id as summary_id,
+                   s.summary_text_plain,
+                   coalesce(c.message_count, 0) as message_count
+            from conversations c
+            left join lateral (
+                select s.id, s.summary_text_plain
+                from conversation_summaries s
+                where s.conversation_id = c.id and s.superseded_at is null
+                order by s.summary_version desc
+                limit 1
+            ) s on true
+            where c.public_id = $1 and c.deleted_at is null
+            "#,
+    )
+    .bind(conversation_public_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|row| {
+        Ok((
+            row.try_get("conversation_uuid")?,
+            row.try_get("summary_id")?,
+            row.try_get("summary_text_plain")?,
+            row.try_get("message_count")?,
+        ))
+    })
+    .transpose()
+}
+
+/// The embedding provider/model/limits for an application, independent of any document.
+///
+/// Retrieval needs the same embedding model ingestion used, but reaches it from the acting
+/// application rather than from a collection or document, so neither
+/// `find_document_ingestion_context` nor `find_collection_ingestion_context` fits.
+pub(crate) async fn find_application_embedding_target(
+    pool: &PgPool,
+    application_id: Uuid,
+) -> Result<Option<RagEmbeddingTarget>, AppError> {
+    let row = sqlx::query(
+        r#"
+            select embedding_provider_id, embedding_model_id, embedding_dimension,
+                   batch_size, timeout_ms
+            from application_embedding_policies
+            where application_id = $1
+            "#,
+    )
+    .bind(application_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|row| {
+        Ok(RagEmbeddingTarget {
+            provider_id: row.try_get("embedding_provider_id")?,
+            model_id: row.try_get("embedding_model_id")?,
+            declared_dimension: row.try_get("embedding_dimension")?,
+            batch_size: row.try_get::<Option<i32>, _>("batch_size")?.unwrap_or(32),
+            timeout_ms: row
+                .try_get::<Option<i32>, _>("timeout_ms")?
+                .unwrap_or(60_000),
+        })
+    })
+    .transpose()
 }
 
 // The outer `order by` in each of the three helpers below is load-bearing, for the reason
@@ -2306,6 +3030,7 @@ impl ConversationRepository for InMemoryConversationRepository {
         _collection_public_id: &str,
         _request: &RagDocumentCreateRequest,
         _content_hash: Option<&str>,
+        _plan: &RagIngestionPlan,
     ) -> Result<RagDocumentRecord, AppError> {
         Err(not_stubbed("create_rag_document"))
     }
@@ -2332,6 +3057,7 @@ impl ConversationRepository for InMemoryConversationRepository {
         _public_id: &str,
         _request: &RagDocumentIngestRequest,
         _content_hash: &str,
+        _plan: &RagIngestionPlan,
     ) -> Result<RagDocumentRecord, AppError> {
         Err(not_stubbed("ingest_rag_document"))
     }

@@ -43,6 +43,39 @@ pub struct Settings {
     pub workers: WorkerSettings,
     #[serde(default)]
     pub telemetry: TelemetrySettings,
+    #[serde(default)]
+    pub rag: RagSettings,
+}
+
+/// Bounds on RAG document ingestion (plan 11, Sub-Phase A).
+///
+/// Deployment-wide rather than per-application: these are resource ceilings that protect the
+/// database and the embedding provider from a single oversized document, not a product policy
+/// an application should be able to raise for itself.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default)]
+pub struct RagSettings {
+    /// Maximum characters in one chunk.
+    pub max_chunk_chars: usize,
+    /// Maximum chunks one document version may produce. Exceeding it is a `422`
+    /// `rag_document_too_large`, never a silent truncation — a truncated document is a
+    /// retrieval index that is quietly incomplete.
+    pub max_chunks_per_document: usize,
+}
+
+impl Default for RagSettings {
+    fn default() -> Self {
+        Self {
+            // ~1000 characters is roughly 250 estimated tokens, comfortably inside every
+            // embedding model's per-input ceiling while still being large enough that a
+            // paragraph usually survives intact.
+            max_chunk_chars: 1_000,
+            // 2000 chunks * 1000 chars caps one version at ~2 MB of chunk text, which is the
+            // same order as `ADMIN_BODY_LIMIT_BYTES` (2 MiB) — the largest body that can reach
+            // the admin ingest route in the first place.
+            max_chunks_per_document: 2_000,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
@@ -488,6 +521,23 @@ impl Settings {
         // threshold is zero hands every running job to a second executor
         // immediately. Neither is a tuning choice.
         self.validate_coordination(&mut violations);
+
+        // `rag_chunks.chunk_index`, `start_offset` and `end_offset` are all `integer`, and the
+        // chunker casts into them. A ceiling at or above `i32::MAX` would make those casts
+        // saturate silently, so it is rejected at startup rather than discovered as a chunk
+        // stored at offset 2147483647.
+        if self.rag.max_chunk_chars == 0 {
+            violations.push("rag.max_chunk_chars must be greater than zero".to_string());
+        }
+        if self.rag.max_chunks_per_document == 0 {
+            violations.push("rag.max_chunks_per_document must be greater than zero".to_string());
+        }
+        if self.rag.max_chunks_per_document >= i32::MAX as usize {
+            violations.push(format!(
+                "rag.max_chunks_per_document must be below {} (rag_chunks.chunk_index is an integer)",
+                i32::MAX
+            ));
+        }
 
         for origin in &self.cors.allowed_origins {
             if origin != "*" && validate_cors_origin(origin).is_err() {

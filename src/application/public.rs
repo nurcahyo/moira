@@ -18,12 +18,12 @@ use crate::{
         AuditResult, CallerRuntimeIdentity, DomainMessage, DomainMessageContent, DomainMessageRole,
         ExecutionCommand, ExecutionFailure, ExecutionFailureClass, ExecutionOptions,
         ExecutionOutcome, ExecutionQuery, ExecutionStatus, IdempotencyRecord, ListResponse,
-        OpenAiResponseCompatRequest, PublicCapabilities, PublicContentPart, PublicConversationRef,
-        PublicExecutionSummary, PublicInputMessage, PublicMessageRole, PublicModelRef,
-        PublicModelResource, PublicOutputContentPart, PublicOutputItem, PublicResponse,
-        PublicResponseFormat, PublicResponseRecord, PublicResponseRequest, PublicResponseStatus,
-        PublicRouteRef, PublicRouteResource, PublicSseEnvelope, PublicUsageRecord,
-        PublicUsageSummary, RuntimeEventEnvelope, RuntimeEventType, UsageQuery,
+        OpenAiResponseCompatRequest, PublicCapabilities, PublicCitation, PublicContentPart,
+        PublicConversationRef, PublicExecutionSummary, PublicInputMessage, PublicMessageRole,
+        PublicModelRef, PublicModelResource, PublicOutputContentPart, PublicOutputItem,
+        PublicResponse, PublicResponseFormat, PublicResponseRecord, PublicResponseRequest,
+        PublicResponseStatus, PublicRouteRef, PublicRouteResource, PublicSseEnvelope,
+        PublicUsageRecord, PublicUsageSummary, RuntimeEventEnvelope, RuntimeEventType, UsageQuery,
     },
     error::AppError,
     infra::repositories::{
@@ -120,7 +120,7 @@ impl PublicExecutionService {
             .await?;
 
         let idempotency_request = request.clone();
-        let prepared = self
+        let mut prepared = self
             .prepare_execution(actor, ctx, request, policy.clone(), application_id, false)
             .await?;
         let idempotency = self
@@ -138,10 +138,12 @@ impl PublicExecutionService {
             .prepare_response_conversation(
                 actor,
                 ctx,
+                prepared.command.execution_id,
                 idempotency_request.conversation.as_ref(),
                 &idempotency_request.input,
             )
             .await?;
+        apply_planned_context(&mut prepared, conversation_link.as_ref());
         let response = self
             .public_repo
             .insert_response_started(&ResponseStartedInsert {
@@ -194,7 +196,11 @@ impl PublicExecutionService {
                     outcome.output_text.as_deref(),
                 )
                 .await?;
-                let public = public_response_from_record(&record, outcome.output_text.clone());
+                let public = public_response_from_record(
+                    &record,
+                    outcome.output_text.clone(),
+                    citations_from_link(conversation_link.as_ref()),
+                );
                 self.audit(
                     actor,
                     ctx,
@@ -295,7 +301,7 @@ impl PublicExecutionService {
         self.check_rate_limit(&actor, application_id, policy.rate_limit_streams_per_minute)
             .await?;
         let conversation_request = request.clone();
-        let prepared = self
+        let mut prepared = self
             .prepare_execution(&actor, &ctx, request, policy.clone(), application_id, true)
             .await?;
         let conversation_service = ConversationService::new(&self.state)?;
@@ -303,10 +309,12 @@ impl PublicExecutionService {
             .prepare_response_conversation(
                 &actor,
                 &ctx,
+                prepared.command.execution_id,
                 conversation_request.conversation.as_ref(),
                 &conversation_request.input,
             )
             .await?;
+        apply_planned_context(&mut prepared, conversation_link.as_ref());
         let response = self
             .public_repo
             .insert_response_started(&ResponseStartedInsert {
@@ -710,7 +718,12 @@ impl PublicExecutionService {
             json!({}),
         )
         .await?;
-        Ok(public_response_from_record(&record, None))
+        // A later `GET /responses/{id}` carries no citations, and that is honest rather than a
+        // gap: provenance lives on the `context_plans` row keyed by execution, and resolving it
+        // back into `PublicCitation`s here would be a second, unauthorised read path over
+        // another request's plan. The diagnostic surface for that is Sub-Phase C's admin
+        // endpoint, deliberately deferred out of this wave.
+        Ok(public_response_from_record(&record, None, Vec::new()))
     }
 
     pub async fn get_execution(
@@ -1669,9 +1682,45 @@ fn terminal_update_from_outcome(
     }
 }
 
+/// Prepends the planner's assembled context to the command's messages.
+///
+/// **Order is load-bearing.** The planner's messages go *before* the caller's own, so the
+/// current turn stays last — which is what providers expect and what keeps retrieved content
+/// from being the final thing the model reads. Any caller-supplied `system` message therefore
+/// keeps its position at the head of the list and is never displaced or merged.
+///
+/// A no-op when nothing was planned, which is the default: retrieval is off unless an
+/// application enables it.
+fn apply_planned_context(
+    prepared: &mut PreparedExecution,
+    link: Option<&ConversationExecutionLink>,
+) {
+    let Some(link) = link else {
+        return;
+    };
+    if link.context.messages.is_empty() {
+        return;
+    }
+    let mut messages = link.context.messages.clone();
+    messages.append(&mut prepared.command.messages);
+    prepared.command.messages = messages;
+}
+
+/// The citations for a response, taken from the plan computed earlier in this same request.
+///
+/// Deliberately **not** re-read from `context_plans`: the ids are already in hand, and
+/// re-querying would open a window where a concurrent plan for another execution could be
+/// resolved onto this response. Empty when nothing was retrieved, which serialises as `[]` and
+/// never as `null`.
+fn citations_from_link(link: Option<&ConversationExecutionLink>) -> Vec<PublicCitation> {
+    link.map(|link| link.context.citations.clone())
+        .unwrap_or_default()
+}
+
 fn public_response_from_record(
     record: &PublicResponseRecord,
     output_text: Option<String>,
+    citations: Vec<PublicCitation>,
 ) -> PublicResponse {
     let output = if let Some(text) = output_text {
         vec![PublicOutputItem::Message {
@@ -1712,8 +1761,11 @@ fn public_response_from_record(
             .clone()
             .map(|id| PublicConversationRef { id }),
         output,
-        // Always empty: RAG retrieval is not wired into response generation (see plans/11-rag-memory-intelligence.md).
-        citations: Vec::new(),
+        // Real provenance, from the `context_plans` row written for this execution — one entry
+        // per memory or chunk that actually reached the assembled context. Never a superset:
+        // a candidate the budget dropped is not cited (`assemble_context` builds both lists in
+        // the same pass, so they cannot disagree).
+        citations,
         usage: record.usage.clone(),
         metadata: record.metadata.clone(),
         output_persisted: record.output_persisted,

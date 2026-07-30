@@ -6,35 +6,54 @@ use crate::{
     app::AppState,
     application::{
         AdminCommandIdempotency, AdminCommandMutation, AdminCommandRunner, AdminCommandSpec,
-        RequestContext,
+        ContextSections, RequestContext, assemble_context, budget_tokens,
     },
     domain::{
         AuditLogInsert, AuditResult, ConversationCreateRequest, ConversationMessageCreateRequest,
         ConversationMessageQuery, ConversationMessageRecord, ConversationMessageRole,
         ConversationMessageType, ConversationPatchRequest, ConversationPolicyPutRequest,
         ConversationPolicyRecord, ConversationQuery, ConversationRecord, ConversationStatus,
-        CursorScope, EmbeddingPolicyPutRequest, EmbeddingPolicyRecord, ListCursor, ListResponse,
-        MemoryConsentMode, MemoryCreateRequest, MemoryPatchRequest, MemoryPolicyPutRequest,
-        MemoryPolicyRecord, MemoryQuery, MemoryRecord, MemoryScope, MemoryStatus, Pagination,
-        PublicContentPart, PublicInputMessage, RagCollectionCreateRequest,
-        RagCollectionPatchRequest, RagCollectionQuery, RagCollectionRecord, RagCollectionStatus,
-        RagDocumentCreateRequest, RagDocumentIngestRequest, RagDocumentRecord,
-        ResponseConversationInput, RetrievalPolicyPutRequest, RetrievalPolicyRecord, SeqCursor,
+        CursorScope, DomainMessage, EmbeddingPolicyPutRequest, EmbeddingPolicyRecord,
+        HistoryStrategy, ListCursor, ListResponse, MemoryConsentMode, MemoryCreateRequest,
+        MemoryPatchRequest, MemoryPolicyPutRequest, MemoryPolicyRecord, MemoryQuery, MemoryRecord,
+        MemoryScope, MemoryStatus, Pagination, PublicCitation, PublicContentPart,
+        PublicInputMessage, RagCollectionCreateRequest, RagCollectionPatchRequest,
+        RagCollectionQuery, RagCollectionRecord, RagCollectionStatus, RagDocumentCreateRequest,
+        RagDocumentIngestRequest, RagDocumentRecord, ResponseConversationInput,
+        RetrievalPolicyPutRequest, RetrievalPolicyRecord, SeqCursor,
     },
     error::AppError,
     infra::repositories::{
-        AdminRepository, ConversationAccess, ConversationInsert, ConversationMessageInsert,
-        ConversationRepository, MemoryInsert, PgAdminRepository, PgConversationRepository,
+        AdminRepository, ContextPlanInsert, ConversationAccess, ConversationInsert,
+        ConversationMessageInsert, ConversationRepository, MemoryInsert, PgAdminRepository,
+        PgConversationRepository, RagIngestionContext, RetrievalRunInsert, RetrievalScope,
         create_rag_collection_with_connection, create_rag_document_with_connection,
-        ingest_rag_document_with_connection,
+        find_application_embedding_target, find_collection_ingestion_context,
+        find_conversation_context_anchor, find_document_ingestion_context,
+        find_embedding_model_target, find_memory_candidates, find_rag_chunk_candidates,
+        find_recent_messages, ingest_rag_document_with_connection, insert_context_plan,
+        insert_memory_embedding, insert_retrieval_run, resolve_embedding_credential,
     },
-    security::{Actor, ActorType},
+    orchestration::{
+        CANDIDATE_OVERFETCH, ChunkStrategy, ChunkingLimits, EmbeddingBatchPlan, EmbeddingFactory,
+        FAILURE_EMBEDDING_DIMENSION_UNSUPPORTED, FAILURE_EMBEDDING_FAILED,
+        FAILURE_EMBEDDING_NOT_CONFIGURED, MAX_CANDIDATE_ROWS, MemoryCandidate, RagChunkCandidate,
+        RagIngestionPlan, RetrievalLimits, RetrievalWeights, RigEmbeddingFactory,
+        SUPPORTED_EMBEDDING_DIMENSION, Scored, embed_texts, encode_vector_literal, prepare_chunks,
+        provider_type_supports_embeddings, rank_chunks, rank_memories,
+    },
+    security::{Actor, ActorType, request_hash},
 };
 
 #[derive(Debug, Clone)]
 pub struct ConversationExecutionLink {
     pub conversation_id: String,
     pub user_message_id: String,
+    /// What the planner assembled for this turn (plan 11 Sub-Phases D and G).
+    ///
+    /// Empty when the application has retrieval disabled, which is the default — the field is
+    /// always present so no call site has to branch on whether planning ran.
+    pub context: PlannedContext,
 }
 
 // ---------------------------------------------------------------------------
@@ -118,22 +137,91 @@ fn paginate<T, K: PageKey>(
     }
 }
 
-// NOTE: this ordering is a design placeholder for the future context-assembly pipeline (plans/11-rag-memory-intelligence.md). It is not currently consumed by prepare_response_conversation and does not affect what is sent to the provider.
-pub struct ContextPlanner;
+// ---------------------------------------------------------------------------
+// Retrieval failure classes (plan 11, Sub-Phase C).
+//
+// These are `retrieval_runs.failure_class` values, not error codes: a retrieval failure is
+// recorded on the run row whether or not it becomes visible to the caller, and under the
+// default `failure_behavior` it never does. Keeping them distinct from the `AppError` codes is
+// what stops "the vector backend was down" from being reported to a caller as an execution
+// failure it can do nothing about.
+// ---------------------------------------------------------------------------
 
-impl ContextPlanner {
-    pub fn deterministic_phase_five_order() -> [&'static str; 8] {
-        [
-            "protected_instructions",
-            "current_input",
-            "tool_state",
-            "recent_messages",
-            "conversation_summary",
-            "retrieved_memory",
-            "retrieved_rag",
-            "older_history",
-        ]
+/// The database or connection pool refused the candidate query.
+const FAILURE_RETRIEVAL_BACKEND: &str = "retrieval_backend_failed";
+
+/// The only `application_embedding_policies.failure_behavior` value that makes retrieval a hard
+/// requirement.
+///
+/// The column has **no check constraint** (`migrations/0007…:109`), so any string can be
+/// stored. Every value other than this one — including typos — is treated as the documented
+/// default `'continue_without_semantic_retrieval'`. Failing open is the right default here: an
+/// operator fat-fingering a policy field must not start returning `503` on the response path.
+pub const FAILURE_BEHAVIOR_FAIL_REQUEST: &str = "fail_request";
+
+/// A query embedding plus the model that produced it.
+struct QueryEmbedding {
+    vector: Vec<f32>,
+    model_id: Option<Uuid>,
+}
+
+/// What one retrieval pass produced, before budgeting.
+#[derive(Default)]
+struct RetrievalOutcome {
+    embedding_model_id: Option<Uuid>,
+    memory_candidate_count: i32,
+    chunk_candidate_count: i32,
+    memories: Vec<Scored<MemoryCandidate>>,
+    chunks: Vec<Scored<RagChunkCandidate>>,
+}
+
+/// Rows to ask the candidate query for, given how many the policy will keep.
+///
+/// Over-fetched so the re-rank can actually change the answer, and hard-capped so a
+/// mis-configured `maximum_*_results` cannot ask PostgreSQL to sort the whole table inside a
+/// request.
+fn candidate_limit(maximum_results: i32) -> i64 {
+    (i64::from(maximum_results.max(1)) * CANDIDATE_OVERFETCH).min(MAX_CANDIDATE_ROWS)
+}
+
+/// How many prior messages to read.
+///
+/// `full_until_limit` still has a ceiling — the token budget is the real bound, and reading an
+/// unbounded conversation to then discard most of it is a denial-of-service shape, not a
+/// feature. The multiplier gives the budget something to trim.
+fn history_message_limit(policy: &ConversationPolicyRecord) -> i64 {
+    let recent = i64::from(policy.maximum_recent_messages.max(1));
+    match policy.history_strategy {
+        HistoryStrategy::FullUntilLimit => (recent * 4).min(MAX_HISTORY_MESSAGES),
+        HistoryStrategy::RecentMessages | HistoryStrategy::SummaryPlusRecent => recent,
     }
+}
+
+/// Hard ceiling on messages read for one plan, whatever the policy says.
+const MAX_HISTORY_MESSAGES: i64 = 200;
+
+fn history_strategy_label(strategy: HistoryStrategy) -> &'static str {
+    match strategy {
+        HistoryStrategy::RecentMessages => "recent_messages",
+        HistoryStrategy::SummaryPlusRecent => "summary_plus_recent",
+        HistoryStrategy::FullUntilLimit => "full_until_limit",
+    }
+}
+
+/// What the context planner decided, threaded from [`ConversationService::prepare_response_conversation`]
+/// through the execution command and out into the response's citations.
+///
+/// Carried on [`ConversationExecutionLink`] rather than re-queried later: the plan was already
+/// computed in this request, and re-reading `context_plans` to build citations would open a
+/// window where a concurrent write could put a different plan's ids on this response.
+#[derive(Debug, Clone, Default)]
+pub struct PlannedContext {
+    /// Prepended to the caller's own messages before the command executes.
+    pub messages: Vec<DomainMessage>,
+    /// Exactly the memories and chunks that made it into [`Self::messages`].
+    pub citations: Vec<PublicCitation>,
+    /// The `context_plans` row id, `None` when nothing was planned.
+    pub context_plan_id: Option<Uuid>,
 }
 
 #[derive(Clone)]
@@ -438,6 +526,7 @@ impl ConversationService {
         &self,
         actor: &Actor,
         ctx: &RequestContext,
+        execution_id: Uuid,
         input: Option<&ResponseConversationInput>,
         messages: &[PublicInputMessage],
     ) -> Result<Option<ConversationExecutionLink>, AppError> {
@@ -497,10 +586,376 @@ impl ConversationService {
             json!({ "conversation_id": conversation.id, "source": "response_request" }),
         )
         .await?;
+        // Planning runs *after* the user's turn is persisted, so `message.sequence_number` is
+        // the cutoff that keeps the current turn out of the replayed history block. It runs
+        // before the command executes, which is what lets the assembled context reach the
+        // provider on this same request.
+        let context = self
+            .plan_context(
+                actor,
+                execution_id,
+                &conversation.id,
+                message.sequence_number,
+                &content,
+            )
+            .await?;
         Ok(Some(ConversationExecutionLink {
             conversation_id: conversation.id,
             user_message_id: message.id,
+            context,
         }))
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Context planning and retrieval (plan 11, Sub-Phases C, D and G).
+    // -----------------------------------------------------------------------------------
+
+    /// Retrieves, budgets and records the context for one turn.
+    ///
+    /// # Failure behaviour
+    ///
+    /// `application_embedding_policies.failure_behavior` decides what a retrieval failure does.
+    /// The default, `'continue_without_semantic_retrieval'`, degrades: the turn proceeds with
+    /// whatever context was assembled without retrieval, and the caller gets a `200` with empty
+    /// citations. *A broken vector index must never take down the execution path.*
+    ///
+    /// The one non-default value, [`FAILURE_BEHAVIOR_FAIL_REQUEST`], surfaces
+    /// `retrieval_unavailable` instead. Any other string is treated as the default — an
+    /// unrecognised operator setting must not silently become fail-closed on the response path.
+    ///
+    /// `context_length_exceeded` is **not** subject to this: it is a caller-input problem, not a
+    /// retrieval outage, and degrading it would mean silently truncating the caller's own turn.
+    async fn plan_context(
+        &self,
+        actor: &Actor,
+        execution_id: Uuid,
+        conversation_public_id: &str,
+        current_sequence: i64,
+        current_input: &str,
+    ) -> Result<PlannedContext, AppError> {
+        // `internal_application_id` is the row id; `application_id` is the caller-facing
+        // string. Retrieval scopes on the row id, so an actor without one — a system key
+        // acting outside any application — plans no context rather than planning across
+        // every application.
+        let Some(application_id) = actor.internal_application_id else {
+            return Ok(PlannedContext::default());
+        };
+        let pool = self.state.pool()?;
+        let conversation_policy = self
+            .repo
+            .get_or_create_conversation_policy(application_id)
+            .await?;
+        let retrieval_policy = self
+            .repo
+            .get_or_create_retrieval_policy(application_id)
+            .await?;
+
+        let Some((conversation_uuid, summary_id, summary_text, _)) =
+            find_conversation_context_anchor(pool, conversation_public_id).await?
+        else {
+            return Ok(PlannedContext::default());
+        };
+
+        let history = find_recent_messages(
+            pool,
+            conversation_public_id,
+            current_sequence,
+            history_message_limit(&conversation_policy),
+        )
+        .await?;
+
+        let mut sections = ContextSections {
+            summary: match (summary_id, summary_text) {
+                // `history_strategy = 'recent_messages'` means exactly that: no summary block,
+                // even when one exists.
+                (Some(id), Some(text))
+                    if conversation_policy.history_strategy != HistoryStrategy::RecentMessages =>
+                {
+                    Some((id, text))
+                }
+                _ => None,
+            },
+            history,
+            memories: Vec::new(),
+            chunks: Vec::new(),
+        };
+
+        let want_memory = retrieval_policy.enabled
+            && retrieval_policy.memory_retrieval_enabled
+            && conversation_policy.memory_retrieval_enabled;
+        let want_rag = retrieval_policy.enabled && retrieval_policy.rag_retrieval_enabled;
+
+        let mut retrieval_failure: Option<&'static str> = None;
+        if want_memory || want_rag {
+            let started = std::time::Instant::now();
+            match self
+                .retrieve(
+                    application_id,
+                    actor,
+                    current_input,
+                    &retrieval_policy,
+                    want_memory,
+                    want_rag,
+                )
+                .await
+            {
+                Ok(outcome) => {
+                    let embedding_model_id = outcome.embedding_model_id;
+                    sections.memories = outcome.memories;
+                    sections.chunks = outcome.chunks;
+                    self.state
+                        .metrics
+                        .record_retrieval_run(started.elapsed(), true);
+                    insert_retrieval_run(
+                        pool,
+                        &RetrievalRunInsert {
+                            execution_id,
+                            conversation_uuid: Some(conversation_uuid),
+                            query_hash: request_hash(current_input.as_bytes()),
+                            embedding_model_id,
+                            memory_candidate_count: outcome.memory_candidate_count,
+                            memory_returned_count: sections.memories.len() as i32,
+                            chunk_candidate_count: outcome.chunk_candidate_count,
+                            chunk_returned_count: sections.chunks.len() as i32,
+                            latency_ms: started.elapsed().as_millis().min(i64::MAX as u128) as i64,
+                            status: "completed",
+                            failure_class: None,
+                        },
+                    )
+                    .await?;
+                }
+                Err(class) => {
+                    retrieval_failure = Some(class);
+                    self.state
+                        .metrics
+                        .record_retrieval_run(started.elapsed(), false);
+                    insert_retrieval_run(
+                        pool,
+                        &RetrievalRunInsert {
+                            execution_id,
+                            conversation_uuid: Some(conversation_uuid),
+                            query_hash: request_hash(current_input.as_bytes()),
+                            embedding_model_id: None,
+                            memory_candidate_count: 0,
+                            memory_returned_count: 0,
+                            chunk_candidate_count: 0,
+                            chunk_returned_count: 0,
+                            latency_ms: started.elapsed().as_millis().min(i64::MAX as u128) as i64,
+                            status: "failed",
+                            failure_class: Some(class),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        if retrieval_failure.is_some() && self.retrieval_is_required(application_id).await? {
+            return Err(AppError::coded(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "retrieval_unavailable",
+                "retrieval is required for this application but could not be served",
+            ));
+        }
+
+        let assembled = assemble_context(
+            sections,
+            budget_tokens(current_input),
+            i64::from(conversation_policy.maximum_history_tokens),
+        )?;
+
+        if assembled.messages.is_empty() && assembled.citations.is_empty() {
+            // Nothing was planned, so there is no plan to record. Writing a `context_plans`
+            // row of all-empty arrays on every unretrieved turn would bloat the table and make
+            // the diagnostic surface useless.
+            return Ok(PlannedContext::default());
+        }
+
+        let context_plan_id = insert_context_plan(
+            pool,
+            &ContextPlanInsert {
+                execution_id,
+                conversation_uuid: Some(conversation_uuid),
+                strategy: history_strategy_label(conversation_policy.history_strategy).to_string(),
+                estimated_input_tokens: assembled.estimated_input_tokens,
+                included_message_ids: assembled.included_message_ids.clone(),
+                included_summary_id: assembled.included_summary_id,
+                included_memory_ids: assembled.included_memory_ids.clone(),
+                included_chunk_ids: assembled.included_chunk_ids.clone(),
+                excluded_counts: assembled.excluded_counts.clone(),
+                truncation_reason: assembled.truncation_reason.clone(),
+            },
+        )
+        .await?;
+
+        Ok(PlannedContext {
+            messages: assembled.messages,
+            citations: assembled.citations,
+            context_plan_id: Some(context_plan_id),
+        })
+    }
+
+    /// Embeds the query and runs both retrieval arms.
+    ///
+    /// `Err` carries a `retrieval_runs.failure_class`, not an `AppError`: every failure here is
+    /// a *retrieval* failure, and whether it becomes a caller-visible error is the
+    /// `failure_behavior` decision made by the caller of this function, not by this function.
+    async fn retrieve(
+        &self,
+        application_id: Uuid,
+        actor: &Actor,
+        query: &str,
+        policy: &RetrievalPolicyRecord,
+        want_memory: bool,
+        want_rag: bool,
+    ) -> Result<RetrievalOutcome, &'static str> {
+        let pool = self.state.pool().map_err(|_| FAILURE_RETRIEVAL_BACKEND)?;
+        let vector = self.embed_query(application_id, query).await?;
+        let encoded = encode_vector_literal(&vector.vector);
+        let scope = RetrievalScope {
+            application_id,
+            external_tenant_id: effective_tenant(actor),
+            external_user_id: effective_user(actor),
+        };
+        let weights = RetrievalWeights {
+            semantic: policy.semantic_weight,
+            keyword: policy.keyword_weight,
+            recency: policy.recency_weight,
+            importance: policy.importance_weight,
+        };
+
+        let mut outcome = RetrievalOutcome {
+            embedding_model_id: vector.model_id,
+            ..RetrievalOutcome::default()
+        };
+
+        if want_memory {
+            let limit = candidate_limit(policy.maximum_memory_results);
+            let candidates = find_memory_candidates(pool, &scope, &encoded, limit)
+                .await
+                .map_err(|_| FAILURE_RETRIEVAL_BACKEND)?;
+            outcome.memory_candidate_count = candidates.len() as i32;
+            outcome.memories = rank_memories(
+                query,
+                candidates,
+                weights,
+                RetrievalLimits {
+                    maximum_results: policy.maximum_memory_results.max(0) as usize,
+                    minimum_score: policy.minimum_memory_score,
+                    maximum_per_group: 0,
+                    diversity_enabled: false,
+                },
+            );
+        }
+
+        if want_rag {
+            let limit = candidate_limit(policy.maximum_chunk_results);
+            let candidates = find_rag_chunk_candidates(
+                pool,
+                &scope,
+                &encoded,
+                &policy.allowed_collection_ids,
+                limit,
+            )
+            .await
+            .map_err(|_| FAILURE_RETRIEVAL_BACKEND)?;
+            outcome.chunk_candidate_count = candidates.len() as i32;
+            outcome.chunks = rank_chunks(
+                query,
+                candidates,
+                weights,
+                RetrievalLimits {
+                    maximum_results: policy.maximum_chunk_results.max(0) as usize,
+                    minimum_score: policy.minimum_chunk_score,
+                    maximum_per_group: policy.maximum_chunks_per_document.max(0) as usize,
+                    diversity_enabled: policy.diversity_enabled,
+                },
+            );
+        }
+
+        Ok(outcome)
+    }
+
+    /// Embeds the current turn with the application's configured embedding model.
+    ///
+    /// The same model ingestion used, reached from the application rather than the document —
+    /// a query embedded by a different model than the corpus would produce distances that are
+    /// arithmetically valid and semantically meaningless.
+    async fn embed_query(
+        &self,
+        application_id: Uuid,
+        query: &str,
+    ) -> Result<QueryEmbedding, &'static str> {
+        let pool = self.state.pool().map_err(|_| FAILURE_RETRIEVAL_BACKEND)?;
+        let target = find_application_embedding_target(pool, application_id)
+            .await
+            .map_err(|_| FAILURE_RETRIEVAL_BACKEND)?
+            .ok_or(FAILURE_EMBEDDING_NOT_CONFIGURED)?;
+        let (Some(provider_id), Some(model_id)) = (target.provider_id, target.model_id) else {
+            return Err(FAILURE_EMBEDDING_NOT_CONFIGURED);
+        };
+        if let Some(declared) = target.declared_dimension
+            && declared != SUPPORTED_EMBEDDING_DIMENSION as i32
+        {
+            return Err(FAILURE_EMBEDDING_DIMENSION_UNSUPPORTED);
+        }
+        let (provider, model_key) = find_embedding_model_target(pool, provider_id, model_id)
+            .await
+            .map_err(|_| FAILURE_RETRIEVAL_BACKEND)?
+            .ok_or(FAILURE_EMBEDDING_NOT_CONFIGURED)?;
+        if !provider_type_supports_embeddings(provider.provider_type) {
+            return Err(FAILURE_EMBEDDING_NOT_CONFIGURED);
+        }
+        let credential = resolve_embedding_credential(
+            pool,
+            &self.state.cipher,
+            provider_id,
+            provider.provider_type,
+            application_id,
+        )
+        .await
+        .map_err(|_| FAILURE_RETRIEVAL_BACKEND)?
+        .ok_or(FAILURE_EMBEDDING_NOT_CONFIGURED)?;
+        let handle = RigEmbeddingFactory::new()
+            .build_embedding_model(
+                &provider,
+                &model_key,
+                &credential,
+                SUPPORTED_EMBEDDING_DIMENSION,
+            )
+            .await
+            .map_err(|_| FAILURE_EMBEDDING_NOT_CONFIGURED)?;
+        let started = std::time::Instant::now();
+        let vectors = embed_texts(
+            &handle,
+            std::slice::from_ref(&query.to_string()),
+            EmbeddingBatchPlan {
+                batch_size: 1,
+                deadline: std::time::Duration::from_millis(target.timeout_ms.max(1) as u64),
+                dimension: SUPPORTED_EMBEDDING_DIMENSION,
+            },
+        )
+        .await;
+        self.state
+            .metrics
+            .record_embedding_batch_latency(started.elapsed());
+        let mut vectors = vectors.map_err(|_| FAILURE_EMBEDDING_FAILED)?;
+        if vectors.len() != 1 {
+            return Err(FAILURE_EMBEDDING_FAILED);
+        }
+        Ok(QueryEmbedding {
+            vector: vectors.remove(0),
+            model_id: Some(model_id),
+        })
+    }
+
+    /// Whether this application's `failure_behavior` makes retrieval a hard requirement.
+    async fn retrieval_is_required(&self, application_id: Uuid) -> Result<bool, AppError> {
+        let policy = self
+            .repo
+            .get_or_create_embedding_policy(application_id)
+            .await?;
+        Ok(policy.failure_behavior == FAILURE_BEHAVIOR_FAIL_REQUEST)
     }
 
     pub async fn record_assistant_response(
@@ -592,6 +1047,17 @@ impl ConversationService {
                 content_hash: &content_hash,
             })
             .await?;
+        // Embed the memory so it can actually be retrieved.
+        //
+        // Wave 1 wired `rag_chunk_embeddings` and left `memory_embeddings` with no writer at
+        // all, which would have made `find_memory_candidates` unreachable in production and
+        // testable only by fabricating rows — a suite that asserts nothing. Written after the
+        // record, not inside its transaction: an embedding failure must not lose a memory the
+        // caller successfully stored, and an unembedded memory is still a valid memory. It is
+        // simply not semantically retrievable, which `memory_embeddings` being empty says
+        // honestly.
+        self.embed_new_memory(application_id, id, &request.content)
+            .await;
         self.audit(
             actor,
             ctx,
@@ -602,6 +1068,38 @@ impl ConversationService {
         )
         .await?;
         Ok(record)
+    }
+
+    /// Writes a `memory_embeddings` row, best-effort.
+    ///
+    /// Silent on failure by design — see the call site. The absence of the row is the record of
+    /// the failure; there is no status column on `memory_records` that could claim otherwise,
+    /// and inventing one would repeat P0-1.
+    async fn embed_new_memory(&self, application_id: Uuid, memory_id: Uuid, content: &str) {
+        let Ok(pool) = self.state.pool() else {
+            return;
+        };
+        let Ok(Some(policy)) = self
+            .repo
+            .get_or_create_embedding_policy(application_id)
+            .await
+            .map(Some)
+        else {
+            return;
+        };
+        if !policy.memory_embeddings_enabled {
+            return;
+        }
+        let Ok(embedding) = self.embed_query(application_id, content).await else {
+            return;
+        };
+        let _ = insert_memory_embedding(
+            pool,
+            memory_id,
+            embedding.model_id,
+            &encode_vector_literal(&embedding.vector),
+        )
+        .await;
     }
 
     /// Lists memories, paging by `(updated_at, id)`.
@@ -1038,6 +1536,26 @@ impl ConversationService {
         // deterministic, and a rejected request must never occupy an idempotency key.
         validate_metadata(&request.metadata)?;
         validate_document(&request)?;
+        // Same pre-transaction pipeline as `/ingest`: a document created with inline content is
+        // an ingestion entry point too, and a version written by this path with no chunks would
+        // be as dishonest as one written by `/ingest`.
+        let context = find_collection_ingestion_context(self.state.pool()?, collection_id).await?;
+        let plan = self
+            .plan_rag_ingestion(
+                context.as_ref(),
+                context
+                    .as_ref()
+                    .map(|context| context.application_id)
+                    .unwrap_or_default(),
+                request.content.as_deref(),
+                Some(request.mime_type.as_str()),
+            )
+            .await?;
+        self.state.metrics.record_rag_ingestion_run(
+            plan.chunk_count() as u64,
+            plan.embedded_chunk_count() as u64,
+            plan.failure_class.is_none(),
+        );
         let spec = conversation_command_spec(
             ctx,
             actor,
@@ -1069,6 +1587,7 @@ impl ConversationService {
                         &collection_id,
                         &request,
                         content_hash.as_deref(),
+                        &plan,
                     )
                     .await?;
                     transaction
@@ -1175,6 +1694,24 @@ impl ConversationService {
         })?;
         validate_content(content)?;
         validate_metadata(&request.metadata)?;
+        // Chunk and embed before the runner opens its transaction; see `plan_rag_ingestion`.
+        let context = find_document_ingestion_context(self.state.pool()?, document_id).await?;
+        let plan = self
+            .plan_rag_ingestion(
+                context.as_ref(),
+                context
+                    .as_ref()
+                    .map(|context| context.application_id)
+                    .unwrap_or_default(),
+                Some(content),
+                None,
+            )
+            .await?;
+        self.state.metrics.record_rag_ingestion_run(
+            plan.chunk_count() as u64,
+            plan.embedded_chunk_count() as u64,
+            plan.failure_class.is_none(),
+        );
         let spec = conversation_command_spec(
             ctx,
             actor,
@@ -1201,6 +1738,7 @@ impl ConversationService {
                         &document_id,
                         &request,
                         &content_hash,
+                        &plan,
                     )
                     .await?;
                     transaction
@@ -1218,6 +1756,189 @@ impl ConversationService {
             })
             .await?;
         Ok(outcome.response)
+    }
+
+    // -----------------------------------------------------------------------------------
+    // RAG ingestion pipeline (plan 11, Sub-Phases A and B).
+    // -----------------------------------------------------------------------------------
+
+    /// Builds the ingestion plan for one document version — chunks, hashes and embeddings —
+    /// **before** the command transaction opens.
+    ///
+    /// Ordering is the whole point. `ingest_rag_document_with_connection` runs inside the
+    /// `AdminCommandRunner` transaction, holding `select … for update` on the document row and
+    /// the idempotency advisory lock. Embedding is a network call, so doing it there would pin
+    /// a pooled connection and both locks across an unbounded await, once per batch. Everything
+    /// expensive therefore happens here, and the transaction only writes.
+    ///
+    /// Two consequences, both accepted deliberately:
+    ///
+    /// * Two concurrent requests carrying the same `Idempotency-Key` both embed, and only one
+    ///   of them wins the envelope. That wastes provider spend; it does not corrupt anything,
+    ///   because the loser's chunks are never written.
+    /// * A `422 rag_document_too_large` is raised before the key is claimed, which matches how
+    ///   every other validation on this surface already behaves — a rejected request must never
+    ///   occupy an idempotency key.
+    async fn plan_rag_ingestion(
+        &self,
+        context: Option<&RagIngestionContext>,
+        application_id: Uuid,
+        content: Option<&str>,
+        mime_type_hint: Option<&str>,
+    ) -> Result<RagIngestionPlan, AppError> {
+        let Some(content) = content.filter(|value| !value.trim().is_empty()) else {
+            return Ok(RagIngestionPlan::empty());
+        };
+        // A missing context means the document or collection does not exist. The 404 is left to
+        // the transaction, which is where it has always been raised — moving it here would
+        // change whether a not-found ingest claims its idempotency key.
+        let Some(context) = context else {
+            return Ok(RagIngestionPlan::empty());
+        };
+
+        let mime_type = context.mime_type.as_deref().or(mime_type_hint);
+        let strategy = ChunkStrategy::for_mime_type(mime_type);
+        let limits = ChunkingLimits {
+            max_chunk_chars: self.state.settings.rag.max_chunk_chars,
+            max_chunks_per_document: self.state.settings.rag.max_chunks_per_document,
+        };
+        let chunks = prepare_chunks(content, strategy, limits)?;
+        let strategy_label = strategy.as_str();
+        if chunks.is_empty() {
+            return Ok(RagIngestionPlan::empty());
+        }
+
+        // No embedding policy, or one with `rag_embeddings_enabled = false`. Not a failure:
+        // the application has not asked for semantic indexing, and the chunks it did ask for
+        // are stored. `embedded_chunk_count = 0` on the run row is how that stays visible.
+        let Some(target) = context.embedding.as_ref() else {
+            return Ok(RagIngestionPlan {
+                chunks,
+                strategy: strategy_label,
+                embedding_model_id: None,
+                embedding_dimension: None,
+                failure_class: None,
+            });
+        };
+
+        let (Some(provider_id), Some(model_id)) = (target.provider_id, target.model_id) else {
+            return Ok(RagIngestionPlan::failed(
+                chunks,
+                strategy_label,
+                FAILURE_EMBEDDING_NOT_CONFIGURED,
+            ));
+        };
+        if let Some(declared) = target.declared_dimension
+            && declared != SUPPORTED_EMBEDDING_DIMENSION as i32
+        {
+            return Ok(RagIngestionPlan::failed(
+                chunks,
+                strategy_label,
+                FAILURE_EMBEDDING_DIMENSION_UNSUPPORTED,
+            ));
+        }
+
+        let pool = self.state.pool()?;
+        let Some((provider, model_key)) =
+            find_embedding_model_target(pool, provider_id, model_id).await?
+        else {
+            return Ok(RagIngestionPlan::failed(
+                chunks,
+                strategy_label,
+                FAILURE_EMBEDDING_NOT_CONFIGURED,
+            ));
+        };
+        if !provider_type_supports_embeddings(provider.provider_type) {
+            return Ok(RagIngestionPlan::failed(
+                chunks,
+                strategy_label,
+                FAILURE_EMBEDDING_NOT_CONFIGURED,
+            ));
+        }
+        let Some(credential) = resolve_embedding_credential(
+            pool,
+            &self.state.cipher,
+            provider_id,
+            provider.provider_type,
+            application_id,
+        )
+        .await?
+        else {
+            return Ok(RagIngestionPlan::failed(
+                chunks,
+                strategy_label,
+                FAILURE_EMBEDDING_NOT_CONFIGURED,
+            ));
+        };
+
+        let handle = match RigEmbeddingFactory::new()
+            .build_embedding_model(
+                &provider,
+                &model_key,
+                &credential,
+                SUPPORTED_EMBEDDING_DIMENSION,
+            )
+            .await
+        {
+            Ok(handle) => handle,
+            // A provider that cannot embed, or a client that will not build, is a
+            // configuration problem — recorded on the run row, not raised at the caller, so
+            // the chunks that did succeed are still stored and the version is honestly
+            // `'failed'` rather than silently `'indexed'`.
+            Err(_) => {
+                return Ok(RagIngestionPlan::failed(
+                    chunks,
+                    strategy_label,
+                    FAILURE_EMBEDDING_NOT_CONFIGURED,
+                ));
+            }
+        };
+
+        let texts: Vec<String> = chunks.iter().map(|chunk| chunk.text.clone()).collect();
+        let plan = EmbeddingBatchPlan {
+            batch_size: target.batch_size.max(1) as usize,
+            deadline: std::time::Duration::from_millis(target.timeout_ms.max(1) as u64),
+            dimension: SUPPORTED_EMBEDDING_DIMENSION,
+        };
+        let started = std::time::Instant::now();
+        let vectors = match embed_texts(&handle, &texts, plan).await {
+            Ok(vectors) => vectors,
+            Err(_) => {
+                self.state
+                    .metrics
+                    .record_embedding_batch_latency(started.elapsed());
+                return Ok(RagIngestionPlan::failed(
+                    chunks,
+                    strategy_label,
+                    FAILURE_EMBEDDING_FAILED,
+                ));
+            }
+        };
+        self.state
+            .metrics
+            .record_embedding_batch_latency(started.elapsed());
+
+        // `embed_texts` guarantees one vector per input and the right width, so this zip
+        // cannot silently drop a chunk. Asserted rather than assumed: a mismatch here would
+        // store an embedding against the wrong chunk, which is undetectable downstream.
+        if vectors.len() != chunks.len() {
+            return Ok(RagIngestionPlan::failed(
+                chunks,
+                strategy_label,
+                FAILURE_EMBEDDING_FAILED,
+            ));
+        }
+        let mut chunks = chunks;
+        for (chunk, vector) in chunks.iter_mut().zip(vectors) {
+            chunk.embedding = Some(vector);
+        }
+        Ok(RagIngestionPlan {
+            chunks,
+            strategy: strategy_label,
+            embedding_model_id: Some(model_id),
+            embedding_dimension: Some(SUPPORTED_EMBEDDING_DIMENSION as i32),
+            failure_class: None,
+        })
     }
 
     async fn ensure_conversation_write(
@@ -1707,7 +2428,7 @@ mod tests {
 
     #[test]
     fn context_planner_order_keeps_required_content_first() {
-        let order = ContextPlanner::deterministic_phase_five_order();
+        let order = crate::application::ContextPlanner::deterministic_phase_five_order();
         assert_eq!(order[0], "protected_instructions");
         assert_eq!(order[1], "current_input");
         assert!(order.contains(&"retrieved_memory"));
