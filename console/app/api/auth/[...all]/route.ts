@@ -15,6 +15,7 @@
 // deliberately absent from the plugin list — see the note in `lib/auth.ts`.
 
 import { consoleRuntime } from "@/lib/auth-runtime";
+import { isMoiraRequestError } from "@/lib/errors";
 
 /**
  * Node runtime, not Edge.
@@ -28,22 +29,40 @@ export const runtime = "nodejs";
 /** Session state and OAuth callbacks are request-scoped; nothing here is static. */
 export const dynamic = "force-dynamic";
 
+/**
+ * A 503 whose body is an i18n KEY and nothing else.
+ *
+ * Never English prose, and never a Moira `request_id` or `details` — those are
+ * server-diagnostic material and `lib/errors.ts` is the only module allowed to
+ * read them.
+ */
+function unavailable(code: string, messageKey: string): Response {
+  return Response.json(
+    { error: { code, message_key: messageKey } },
+    { status: 503, headers: { "cache-control": "no-store" } },
+  );
+}
+
 async function handle(request: Request): Promise<Response> {
-  const runtimeState = await consoleRuntime();
+  let runtimeState: Awaited<ReturnType<typeof consoleRuntime>>;
+  try {
+    runtimeState = await consoleRuntime();
+  } catch (error) {
+    // Resolving the configuration means calling Moira, so a Moira outage lands
+    // here. Without this catch it escapes as an unhandled rejection and Next
+    // renders a 500 with a stack — which reads as a console bug rather than as
+    // "the backend is down", and buries the one fact an operator needs.
+    if (isMoiraRequestError(error)) {
+      return unavailable("moira_unreachable", error.moiraError.text.messageKey);
+    }
+    throw error;
+  }
 
   if (!runtimeState.ok) {
     // A configuration problem, not a crash: "no provider is enabled yet" is the
-    // normal first-run state. The body carries the i18n KEY only — never
-    // English prose, and never a Moira `request_id` or `details`.
-    return Response.json(
-      {
-        error: {
-          code: runtimeState.resolution.problem,
-          message_key: runtimeState.resolution.messageKey,
-        },
-      },
-      { status: 503, headers: { "cache-control": "no-store" } },
-    );
+    // normal first-run state, and the whole of the setup wizard's reason to
+    // exist.
+    return unavailable(runtimeState.resolution.problem, runtimeState.resolution.messageKey);
   }
 
   return runtimeState.auth.handler(request);
