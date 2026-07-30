@@ -352,6 +352,11 @@ fn the_committed_openapi_document_has_no_rotate_secret_operation_or_secret_schem
         "AuthProviderSettingsCreateRequest",
         "AuthProviderSettingsPatchRequest",
         "PublicAuthMethod",
+        // The anonymous one (F15). It matters most here: a secret-shaped property on this
+        // schema is one published to unauthenticated callers. The committed document is a
+        // snapshot, so what makes this bite on a *new* field is the drift gate
+        // (`committed_openapi_matches_the_generated_document`) forcing the snapshot forward.
+        "PublicSignInMethod",
     ] {
         let properties = document["components"]["schemas"][schema]["properties"]
             .as_object()
@@ -483,25 +488,56 @@ async fn enabling_a_provider_with_incomplete_non_secret_config_is_refused() {
 /// client gets one bit from `claim-status` and nothing at all from `auth-methods`. If a
 /// future change makes these two agree, this test fails and forces the reasoning to be
 /// revisited rather than quietly dropped.
-#[tokio::test]
-async fn claim_status_is_anonymous_while_auth_methods_is_not() {
-    let Some(fixture) = LifecycleFixture::new().await else {
-        return;
-    };
-    // Admin JWT auth *enabled*, unlike the default fixture: with it disabled an
-    // uncredentialed admin request falls back to a dev-admin actor, which would mask the
-    // 401 this test exists to assert.
+/// Builds a router whose admin JWT auth is **enabled**, unlike the default fixture.
+///
+/// With it disabled an uncredentialed admin request falls back to a dev-admin actor, which
+/// would mask both halves of the anonymity boundary: the `401` a gated endpoint must return,
+/// and — worse — the `200` an anonymous one returns, which would prove nothing because the
+/// fallback actor would have satisfied a gate had one existed.
+fn router_with_admin_auth_enabled(fixture: &LifecycleFixture) -> Router {
     let mut settings = moira::config::Settings::default();
     settings.auth.jwks.allow_insecure_dev_urls = true;
     settings.auth.admin.enabled = true;
     let state =
         AppState::new(settings, Some(fixture.pool.clone())).expect("state with admin auth on");
-    let router = moira::build_router(state).expect("router");
+    moira::build_router(state).expect("router")
+}
+
+/// The anonymity boundary across the whole `/setup` surface, pinned as one invariant.
+///
+/// **This replaces `claim_status_is_anonymous_while_auth_methods_is_not`, whose two-way
+/// asymmetry is no longer the shape of the contract.** Finding F15: every read of the auth
+/// configuration required a credential, so a console could not render a sign-in button
+/// without one it can only obtain by signing in — circular, and blocking for plan 09's public
+/// `/invite/[token]` page. The fix was a *third* operation, not a relaxation of the second:
+///
+/// * `claim-status` — anonymous, one bit.
+/// * `sign-in-methods` — anonymous, and only what the browser already sees while signing in.
+/// * `auth-methods` — **still authenticated**, because it alone carries
+///   `allowed_email_domains`, the deny-by-default admin-claim policy.
+///
+/// The load-bearing assertion is the third one: relaxing `auth-methods` was the obvious fix
+/// and it is the wrong one, so its `401` is asserted here rather than left to erode.
+#[tokio::test]
+async fn the_anonymous_setup_surface_is_claim_status_and_sign_in_methods_but_never_auth_methods() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let router = router_with_admin_auth_enabled(&fixture);
 
     let claim_status = request(
         router.clone(),
         "GET",
         "/api/v1/admin/setup/claim-status",
+        HeaderMap::new(),
+        None,
+        None,
+    )
+    .await;
+    let sign_in_methods = request(
+        router.clone(),
+        "GET",
+        "/api/v1/admin/setup/sign-in-methods",
         HeaderMap::new(),
         None,
         None,
@@ -521,9 +557,21 @@ async fn claim_status_is_anonymous_while_auth_methods_is_not() {
     assert_eq!(claim_status.body, json!({ "claimed": false }));
 
     assert_eq!(
+        sign_in_methods.status,
+        StatusCode::OK,
+        "a login screen holds no credential by construction: {:?}",
+        sign_in_methods.body
+    );
+    assert!(
+        sign_in_methods.body["methods"].is_array(),
+        "{:?}",
+        sign_in_methods.body
+    );
+
+    assert_eq!(
         auth_methods.status,
         StatusCode::UNAUTHORIZED,
-        "{:?}",
+        "the policy-bearing read stays gated: {:?}",
         auth_methods.body
     );
     assert!(!auth_methods.code().is_empty());
@@ -534,13 +582,176 @@ async fn claim_status_is_anonymous_while_auth_methods_is_not() {
             .is_empty(),
         "even the anonymous refusal carries a catalogued key (CONVENTIONS §4.5)"
     );
-    // Anonymous reconnaissance must yield nothing: no method list, no issuer, no client id,
-    // no domain policy.
+    // Anonymous reconnaissance against the *gated* endpoint must still yield nothing: no
+    // method list, no issuer, no client id, no domain policy.
     assert!(auth_methods.body.get("methods").is_none());
     let rendered = auth_methods.body.to_string();
     for leaked in ["client_id", "issuer", "allowed_email_domains"] {
         assert!(!rendered.contains(leaked), "anonymous call leaked {leaked}");
     }
+}
+
+/// The proof of the F15 fix, against a **real, enabled, populated** provider row.
+///
+/// Asserting "no secret leaked" against an empty `methods` array would pass vacuously and
+/// prove nothing, so this test first creates and enables a provider carrying a `client_id` and
+/// a non-empty `allowed_email_domains`, then asserts the anonymous response contains the
+/// former and not the latter. Both halves matter: dropping `client_id` would leave the console
+/// unable to start a flow, and including `allowed_email_domains` would publish the admin-claim
+/// policy to the internet.
+#[tokio::test]
+async fn sign_in_methods_serves_a_populated_list_with_no_credential_and_no_secret_or_policy() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    // Setup runs on the default fixture router (admin auth off, dev-admin fallback), because
+    // creating and enabling a provider is an authenticated operation. The anonymous read then
+    // runs on a *separate* router whose admin auth is on, over the same pool — so the 200
+    // below cannot be an artefact of the dev-admin fallback.
+    let admin_router = moira::build_router(fixture.state.clone()).expect("router");
+    let created = create_provider(&admin_router, json!({})).await;
+    assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+    let id = created.body["id"].as_str().unwrap().to_string();
+    let enabled = request(
+        admin_router,
+        "POST",
+        &format!("/api/v1/admin/auth/providers/{id}/enable"),
+        HeaderMap::new(),
+        Some(created.version()),
+        None,
+    )
+    .await;
+    assert_eq!(enabled.status, StatusCode::OK, "{:?}", enabled.body);
+
+    let anonymous = request(
+        router_with_admin_auth_enabled(&fixture),
+        "GET",
+        "/api/v1/admin/setup/sign-in-methods",
+        // No bearer token, no system key, no consumer key. Not a weak credential — none.
+        HeaderMap::new(),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(anonymous.status, StatusCode::OK, "{:?}", anonymous.body);
+
+    let methods = anonymous.body["methods"].as_array().expect("methods array");
+    assert_eq!(
+        methods.len(),
+        1,
+        "the anonymous list must actually carry the enabled provider, or every assertion \
+         below is vacuous: {:?}",
+        anonymous.body
+    );
+    let method = methods[0].as_object().expect("a method object");
+
+    // The projection is defined by what it lists — an exact key set, so a field added to an
+    // internet-facing response fails here rather than shipping.
+    let mut keys: Vec<&str> = method.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "authorization_url",
+            "client_id",
+            "discovery_url",
+            "display_name",
+            "id",
+            "issuer",
+            "method",
+            "requested_scopes",
+        ],
+        "unexpected anonymous projection shape: {:?}",
+        anonymous.body
+    );
+
+    // The console can actually render and start a flow from this.
+    assert_eq!(method["client_id"], json!("console-client"));
+    assert_eq!(method["display_name"], json!("Google"));
+    assert_eq!(method["method"], json!("google_oauth"));
+
+    // No secret material of any kind, asserted over the whole rendered body.
+    assert_no_secret_material("anonymous sign-in-methods", &anonymous.body);
+    // And no policy: `create_provider` wrote `allowed_email_domains: ["example.com"]`, so the
+    // needle would match if the field or its value had survived the projection.
+    let rendered = anonymous.body.to_string();
+    for leaked in ["allowed_email_domains", "example.com"] {
+        assert!(
+            !rendered.contains(leaked),
+            "the anonymous sign-in list published the admin-claim policy ({leaked}): {rendered}"
+        );
+    }
+}
+
+/// A `jwks` row is machine token verification, not a button a human can press. It has no
+/// `authorization_url` and no `client_id`, so a console that rendered it would produce a
+/// broken control — and the row's `jwks_url` would be published for nothing.
+#[tokio::test]
+async fn sign_in_methods_omits_enabled_jwks_rows() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let admin_router = moira::build_router(fixture.state.clone()).expect("router");
+    let created = create_provider(
+        &admin_router,
+        json!({
+            "method": "jwks",
+            "display_name": "Machine issuer",
+            "client_id": Value::Null,
+            "jwks_url": "https://issuer.test/jwks"
+        }),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+    let id = created.body["id"].as_str().unwrap().to_string();
+    let enabled = request(
+        admin_router.clone(),
+        "POST",
+        &format!("/api/v1/admin/auth/providers/{id}/enable"),
+        HeaderMap::new(),
+        Some(created.version()),
+        None,
+    )
+    .await;
+    assert_eq!(enabled.status, StatusCode::OK, "{:?}", enabled.body);
+
+    let anonymous = request(
+        router_with_admin_auth_enabled(&fixture),
+        "GET",
+        "/api/v1/admin/setup/sign-in-methods",
+        HeaderMap::new(),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(anonymous.status, StatusCode::OK, "{:?}", anonymous.body);
+    assert!(
+        anonymous.body["methods"]
+            .as_array()
+            .expect("methods array")
+            .is_empty(),
+        "a jwks row is not a sign-in method: {:?}",
+        anonymous.body
+    );
+    // The authenticated read still sees it — this is a projection filter, not a data filter.
+    let admin_key = mint_system_key(&admin_router, &["moira:admin"]).await;
+    let gated = request(
+        admin_router,
+        "GET",
+        "/api/v1/admin/setup/auth-methods",
+        system_key_headers(&admin_key),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(gated.status, StatusCode::OK, "{:?}", gated.body);
+    assert_eq!(
+        gated.body["methods"]
+            .as_array()
+            .expect("methods array")
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]

@@ -37,8 +37,8 @@ use crate::{
     },
     domain::{
         AuthMethod, AuthProviderSettingsCreateRequest, AuthProviderSettingsPatchRequest,
-        AuthProviderSettingsRecord, CursorScope, ListCursor, ListResponse,
-        SetupAuthMethodsResponse,
+        AuthProviderSettingsRecord, CursorScope, ListCursor, ListResponse, PublicAuthMethod,
+        PublicSignInMethod, SetupAuthMethodsResponse, SetupSignInMethodsResponse,
     },
     error::AppError,
     infra::repositories::{
@@ -290,30 +290,70 @@ impl<'a> AuthProviderSettingsService<'a> {
     ///
     /// # Authenticated, decided — the non-optional `Actor` is the enforcement
     ///
-    /// Do not add an anonymous overload, an `Option<Actor>` parameter, or a "public"
-    /// sibling. The response is identity *configuration* — which IdP, which issuer, which
-    /// client id, which allowed domains — and that is reconnaissance-worthy even though D7
-    /// removed the secret. Plan 08's console calls it server-side with the system key it
-    /// already holds; the browser never sees it. The wizard's *first* call, the one that
-    /// must work before any credential exists, is `claim-status`, which is anonymous
-    /// because its entire response is one bit.
+    /// Do not add an anonymous overload of *this* method or an `Option<Actor>` parameter.
+    /// The response is identity *configuration* — which IdP, which issuer, which client id,
+    /// which allowed domains — and that is reconnaissance-worthy even though D7 removed the
+    /// secret. Plan 08's console calls it server-side with the system key it already holds;
+    /// the browser never sees it.
+    ///
+    /// [`Self::public_sign_in_methods`] is a **strictly narrower** anonymous sibling, not a
+    /// relaxation of this one: it returns a different, smaller type that carries no
+    /// `allowed_email_domains`. Widening it back towards this response would reintroduce
+    /// exactly the leak D4 refused.
     pub async fn setup_auth_methods(
         &self,
         actor: &Actor,
     ) -> Result<SetupAuthMethodsResponse, AppError> {
         require_setup_actor(actor)?;
         self.state.authz.require(actor, "moira:setup:read")?;
-        // Read-through the process-local cache (module 13a). The gate above runs *first*
-        // and unconditionally: a cache hit must never be a way to skip authorization.
+        // The gate above runs *first* and unconditionally: a cache hit must never be a way
+        // to skip authorization.
+        Ok(SetupAuthMethodsResponse {
+            methods: self.enabled_methods().await?,
+        })
+    }
+
+    /// The **anonymous** read behind `GET /api/v1/admin/setup/sign-in-methods` (finding F15).
+    ///
+    /// # Why this takes no `Actor`, and why that is not a hole
+    ///
+    /// A login screen cannot present a credential — the credential is what signing in
+    /// produces. Plan 09's public `/invite/[token]` page has to render sign-in buttons for a
+    /// visitor who is unauthenticated by construction, and an operator who removes
+    /// `MOIRA_SYSTEM_KEY` after setup has no way back in otherwise. The circularity is the
+    /// bug; requiring an actor here is what causes it.
+    ///
+    /// What makes it safe is the *response*, not the caller: [`PublicSignInMethod`] carries
+    /// only fields the browser already transmits or receives during the sign-in it is about
+    /// to start. It deliberately omits `allowed_email_domains` — the deny-by-default
+    /// admin-claim policy — which is the field that made the wider projection unsafe to
+    /// publish. Read that type's documentation before adding a field here.
+    pub async fn public_sign_in_methods(&self) -> Result<SetupSignInMethodsResponse, AppError> {
+        Ok(SetupSignInMethodsResponse {
+            methods: self
+                .enabled_methods()
+                .await?
+                .iter()
+                .filter_map(PublicSignInMethod::from_enabled_method)
+                .collect(),
+        })
+    }
+
+    /// Read-through the process-local cache (module 13a), shared by both setup reads so the
+    /// two cannot drift onto different snapshots of the same rows.
+    ///
+    /// It performs **no** authorization: every caller is responsible for its own gate, which
+    /// must run before this is called.
+    async fn enabled_methods(&self) -> Result<Vec<PublicAuthMethod>, AppError> {
         if let Some(methods) = self.state.auth_settings_cache.enabled_methods().await {
-            return Ok(SetupAuthMethodsResponse { methods });
+            return Ok(methods);
         }
         let methods = self.settings.list_enabled_public().await?;
         self.state
             .auth_settings_cache
             .put_enabled_methods(methods.clone())
             .await;
-        Ok(SetupAuthMethodsResponse { methods })
+        Ok(methods)
     }
 
     /// Drops this instance's cached copy after a write.

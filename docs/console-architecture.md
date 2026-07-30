@@ -68,6 +68,22 @@ already treats other runtime configuration (providers, models, routing,
 credentials) as database-owned rather than baked into a build. It is not
 implemented in the scaffold.
 
+**The sign-in screen reads that configuration without a credential.** "Read
+by the console at boot" must not be taken to mean the console always holds a
+Moira credential when it needs to render a login page — it does not, and
+requiring one is circular: the credential is what signing in produces. An
+operator who removes `MOIRA_SYSTEM_KEY` after setup, and a visitor landing on
+a public invitation-acceptance page, both arrive with nothing. Moira
+therefore serves the login-screen list anonymously at
+`GET /api/v1/admin/setup/sign-in-methods`, narrowed to fields the browser
+already sees during the OAuth flow it is about to start.
+
+That endpoint is **not** the full configuration read. The wider
+`GET /api/v1/admin/setup/auth-methods` stays authenticated and remains a
+server-side call, because it carries `allowed_email_domains` — the
+deny-by-default admin-claim policy, which must not be published to an
+anonymous caller. See `docs/admin-identity-claiming.md`.
+
 ## Client secret custody (design decision D7)
 
 The OAuth client secret is planned to be owned by the **console**, stored

@@ -25,7 +25,8 @@ pub use admin::{
 };
 pub use auth_settings::{
     AuthMethod, AuthProviderSettingsCreateRequest, AuthProviderSettingsPatchRequest,
-    AuthProviderSettingsRecord, PublicAuthMethod, SetupAuthMethodsResponse,
+    AuthProviderSettingsRecord, PublicAuthMethod, PublicSignInMethod, SetupAuthMethodsResponse,
+    SetupSignInMethodsResponse,
 };
 pub use conversation::{
     ConversationContentPersistence, ConversationCreateRequest, ConversationMessageCreateRequest,

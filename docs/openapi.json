@@ -6355,6 +6355,59 @@
         ],
         "type": "object"
       },
+      "PublicSignInMethod": {
+        "description": "One renderable sign-in button, and nothing else.\n\nStrictly narrower than [`PublicAuthMethod`] — see [`SetupSignInMethodsResponse`] for the\nrule every field must satisfy. It is served anonymously, so a field added here is a field\npublished to the internet: add one only if the browser would already have seen it during a\nsign-in.",
+        "properties": {
+          "authorization_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "client_id": {
+            "description": "Non-secret, and specifically not confidential: a `client_id` appears in every OAuth\nredirect URL a browser sends. Moira stores no `client_secret` at all (D7).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "discovery_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "issuer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "method": {
+            "$ref": "#/components/schemas/AuthMethod"
+          },
+          "requested_scopes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "method",
+          "display_name",
+          "requested_scopes"
+        ],
+        "type": "object"
+      },
       "PublicSseEnvelope": {
         "properties": {
           "execution_id": {
@@ -7804,7 +7857,7 @@
         "type": "string"
       },
       "SetupAuthMethodsResponse": {
-        "description": "Response body of `GET /api/v1/admin/setup/auth-methods`.\n\nAuthenticated, not anonymous (decision D4): the response is identity *configuration* —\nwhich IdP, which issuer, which client id, which allowed domains — and that is\nreconnaissance-worthy even though D7 removed the secret. Plan 08's console calls it\nserver-side with the system key it already holds; the browser never sees it.",
+        "description": "Response body of `GET /api/v1/admin/setup/auth-methods`.\n\nAuthenticated, not anonymous (decision D4): the response is identity *configuration* —\nwhich IdP, which issuer, which client id, which allowed domains — and that is\nreconnaissance-worthy even though D7 removed the secret. Plan 08's console calls it\nserver-side with the system key it already holds; the browser never sees it.\n\nD4 stands. [`SetupSignInMethodsResponse`] is the anonymous surface a login screen calls\ninstead, and it is *narrower* than this one rather than the same thing with the gate\nremoved — most importantly it drops `allowed_email_domains`, the deny-by-default\nadmin-claim policy, which is the single field that makes this response unsafe to publish.",
         "properties": {
           "methods": {
             "items": {
@@ -7901,6 +7954,21 @@
           "production"
         ],
         "type": "string"
+      },
+      "SetupSignInMethodsResponse": {
+        "description": "Response body of the **anonymous** `GET /api/v1/admin/setup/sign-in-methods`.\n\n# Why this exists instead of relaxing `/setup/auth-methods` (finding F15)\n\nA console cannot render a sign-in button without knowing which methods a deployment\noffers, and it cannot hold a bearer JWT before someone has signed in. Plan 09's public\n`/invite/[token]` page makes that blocking: its visitor is unauthenticated by\nconstruction. An operator who removes `MOIRA_SYSTEM_KEY` after setup — the normal fate of\na bootstrap credential — would otherwise be locked out entirely.\n\nThe obvious fix, serving [`SetupAuthMethodsResponse`] anonymously, was **rejected**:\n[`PublicAuthMethod`] carries `allowed_email_domains`, which is not configuration a login\nscreen needs but *the* deny-by-default admin-claim policy (plan 07 decision D3). Publishing\nit anonymously would hand any unauthenticated caller the exact list of email domains that\ncan obtain Moira admin — a ready-made phishing target list — for no rendering benefit.\nDecision **D4** made `/setup/auth-methods` authenticated on information-content grounds and\nthat judgement stands unchanged for that endpoint.\n\n# The rule that defines this projection\n\n**Every field here is something the browser itself already transmits or receives while\nsigning in.** `client_id`, `issuer`, `authorization_url` and `requested_scopes` all appear\nin the OAuth authorization URL the browser is about to be redirected to; `discovery_url` is\nthe world-readable `.well-known` document derivable from `issuer`. Nothing here tells an\nanonymous caller anything it could not learn by clicking the button.\n\nAnything that fails that rule does not belong here. `allowed_email_domains` fails it\n(policy, never on the wire to a browser) and `jwks_url` fails it (machine token-verification\nconfiguration, irrelevant to a sign-in button).",
+        "properties": {
+          "methods": {
+            "items": {
+              "$ref": "#/components/schemas/PublicSignInMethod"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "methods"
+        ],
+        "type": "object"
       },
       "SetupStatus": {
         "enum": [
@@ -21522,7 +21590,7 @@
                 }
               }
             },
-            "description": "Enabled auth methods and their non-secret configuration. Authenticated on purpose: the response is identity configuration - which IdP, which issuer, which client id, which allowed domains - and that is reconnaissance-worthy even though Moira stores no client secret. Plan 08's console calls this server-side with the system key it already holds.",
+            "description": "Enabled auth methods and their non-secret configuration. Authenticated on purpose: the response includes allowed_email_domains - the deny-by-default admin-claim policy - alongside the issuer and client id, and that is reconnaissance-worthy even though Moira stores no client secret. Plan 08's console calls this server-side with the system key it already holds. A login screen that only needs to render sign-in buttons must call the anonymous GET /api/v1/admin/setup/sign-in-methods instead; it returns a strictly narrower projection with no policy in it.",
             "headers": {
               "X-Request-Id": {
                 "description": "Request correlation identifier",
@@ -21817,6 +21885,64 @@
               }
             },
             "description": "Whether an admin identity has been claimed. Intentionally returns a single boolean and nothing else - no count, timestamp, issuer, or subject - so that an unauthenticated caller learns nothing about the deployment beyond whether the setup wizard should be shown.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "PostgreSQL is unavailable",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "admin-setup"
+        ]
+      }
+    },
+    "/api/v1/admin/setup/sign-in-methods": {
+      "get": {
+        "description": "Lists the enabled methods a human can sign in with, so a login screen can render its buttons. Deliberately UNAUTHENTICATED: the credential a caller would present here is the one signing in produces, so requiring it makes the sign-in screen unrenderable on a deployment whose bootstrap system key has been removed. Every field returned is one the browser already transmits or receives during the sign-in it is about to start - client_id, issuer, authorization_url and requested_scopes all appear in the OAuth authorization URL. It carries NO allowed_email_domains: that is the deny-by-default admin-claim policy and stays behind GET /api/v1/admin/setup/auth-methods, which remains authenticated. Methods of kind jwks are omitted; they are machine token verification, not a sign-in button.",
+        "operationId": "get_setup_sign_in_methods",
+        "parameters": [
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetupSignInMethodsResponse"
+                }
+              }
+            },
+            "description": "Enabled sign-in methods, narrowed to what a login screen renders",
             "headers": {
               "X-Request-Id": {
                 "description": "Request correlation identifier",

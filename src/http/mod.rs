@@ -482,6 +482,11 @@ fn admin_routes() -> OpenApiRouter<AppState> {
         .routes(routes!(identity::get_setup_claim_status))
         .routes(routes!(identity::claim_admin_identity))
         .routes(routes!(auth_settings::get_setup_auth_methods))
+        // Also intentionally unauthenticated (finding F15), and registered here for the same
+        // reason as `get_setup_claim_status`: the admin prefix is what keeps it inside the
+        // admin strip, the admin body limit and the admin timeout. Moving it to a
+        // non-admin path to "make it visible in the public spec" would drop all three.
+        .routes(routes!(auth_settings::get_setup_sign_in_methods))
         .routes(routes!(
             auth_settings::list_auth_providers,
             auth_settings::create_auth_provider
@@ -647,6 +652,7 @@ mod tests {
             "/api/v1/admin/setup/claim-status",
             "/api/v1/admin/setup/claim",
             "/api/v1/admin/setup/auth-methods",
+            "/api/v1/admin/setup/sign-in-methods",
             "/api/v1/admin/auth/providers",
             "/api/v1/admin/auth/providers/{id}",
             "/api/v1/admin/auth/providers/{id}/enable",
@@ -733,7 +739,8 @@ mod tests {
                 );
             }
         }
-        assert_eq!(operation_count, 141);
+        // 141 + the anonymous `GET /api/v1/admin/setup/sign-in-methods` (finding F15).
+        assert_eq!(operation_count, 142);
     }
 
     #[test]
@@ -841,6 +848,32 @@ mod tests {
             // content, not endpoint category. Anyone adding a second unauthenticated
             // admin operation to this list must first explain why that line has moved.
             ("/api/v1/admin/setup/claim-status", "get"),
+            // The second one, added for finding F15. **The line has not moved — this
+            // operation was built to sit on the existing side of it.**
+            //
+            // The problem: a console cannot render a sign-in button without knowing which
+            // methods a deployment offers, and every read of that was gated behind a
+            // bearer JWT — the credential signing in *produces*. Circular. Plan 09's
+            // public `/invite/[token]` page makes it blocking (its visitor is
+            // unauthenticated by construction), and an operator who removes
+            // `MOIRA_SYSTEM_KEY` after setup, the normal fate of a bootstrap credential,
+            // is locked out.
+            //
+            // Serving `/setup/auth-methods` anonymously was considered and **rejected**:
+            // its `PublicAuthMethod` carries `allowed_email_domains`, which is not
+            // configuration a login screen needs but the deny-by-default admin-claim
+            // policy (plan 07 D3) — an anonymous caller would receive the exact list of
+            // email domains that can obtain Moira admin. So this is a *narrower* new
+            // operation rather than a relaxed old one, returning `PublicSignInMethod`,
+            // which drops the policy entirely.
+            //
+            // By the information-content test the comment above demands: every field it
+            // returns is one the browser already transmits or receives during the sign-in
+            // it is about to start — `client_id`, `issuer`, `authorization_url` and
+            // `requested_scopes` all appear in the OAuth authorization URL the browser is
+            // redirected to. An anonymous caller learns nothing it could not learn by
+            // clicking the button, which is precisely the standard `claim-status` set.
+            ("/api/v1/admin/setup/sign-in-methods", "get"),
         ];
 
         for (path, item) in paths {
