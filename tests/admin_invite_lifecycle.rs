@@ -792,6 +792,118 @@ async fn a_policy_denied_redemption_leaves_the_invite_pending_and_the_same_link_
     assert_eq!(grant_count(&fixture.pool).await, 1);
 }
 
+/// **The pre-envelope ordering, as an *observable* property.**
+///
+/// `redeem_invite`'s contract is that every validation runs before
+/// `AdminCommandRunner::execute`, and its doc comment forbids moving them inside "to make
+/// it atomic". Asserting that through `admin_invites.status` alone does not work, and this
+/// was measured rather than assumed: moving all three checks inside the envelope, *after*
+/// the statement that consumes the invite, changed **not one** of 869 tests. The reason is
+/// `AdminCommandRunner::execute`'s last arm — a 403 is not an
+/// `is_cacheable_admin_failure`, so the runner calls `transaction.rollback()` and the
+/// consume is undone with everything else. Ordering and rollback defend the same property,
+/// so the property cannot tell them apart.
+///
+/// What *is* observable is **which failure the caller is told about**. Inside the envelope,
+/// `insert_grant` runs first, so a caller whose identity already holds a grant gets
+/// `409 admin_identity_already_claimed` — before the invite has refused them and before
+/// policy has. That is an enumeration oracle: a stranger holding a leaked token learns
+/// whether an `(issuer, subject)` already has admin from a request the invite's own
+/// constraint should have refused outright.
+///
+/// So the assertion is: a refusal that belongs to the invite or to policy must be reported
+/// as such, and must not be pre-empted by anything that touches a table.
+#[tokio::test]
+async fn a_refusal_that_belongs_to_the_invite_is_not_pre_empted_by_the_grant_table() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let issuer = ConsoleIssuer::start(&fixture.pool).await;
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let (provider_id, version) = configure_and_enable_policy(
+        &router,
+        PolicyBinding::ByIssuerString(&issuer.issuer),
+        &["example.com"],
+    )
+    .await;
+    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+
+    // Premise — this identity already holds a grant, which is what makes `insert_grant`
+    // fail if it is ever reached. Without it both probes below would pass against the
+    // in-envelope arrangement too.
+    let (_, first_token) = create_invite(&router, "domain", "example.com").await;
+    let first = post_json(
+        router.clone(),
+        "/api/v1/admin/admin-invites/redeem",
+        issuer.bearer("returning-admin"),
+        redeem_body(&first_token, "returning@example.com"),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::CREATED, "{:?}", first.body);
+    assert_eq!(
+        grant_count(&fixture.pool).await,
+        1,
+        "the premise is an identity that already holds a grant"
+    );
+
+    // Probe 1 — the invite's own constraint refuses. The caller must be told that, not
+    // that their identity is already an admin.
+    let (mismatched_id, mismatched_token) =
+        create_invite(&router, "email", "someone-else@example.com").await;
+    let mismatch = post_json(
+        router.clone(),
+        "/api/v1/admin/admin-invites/redeem",
+        issuer.bearer("returning-admin"),
+        redeem_body(&mismatched_token, "returning@example.com"),
+    )
+    .await;
+    assert_eq!(
+        mismatch.code(),
+        "invite_email_mismatch",
+        "the invite's constraint must be evaluated before anything touches admin_identities"
+    );
+    assert_eq!(
+        mismatch.status,
+        StatusCode::FORBIDDEN,
+        "{:?}",
+        mismatch.body
+    );
+    assert_eq!(invite_status(&fixture.pool, mismatched_id).await, "pending");
+
+    // Probe 2 — the provider allow-list refuses. Same rule, one checkpoint later.
+    let narrowed = send_json(
+        router.clone(),
+        "PATCH",
+        &format!("/api/v1/admin/auth/providers/{provider_id}"),
+        HeaderMap::new(),
+        Some(version),
+        json!({ "allowed_email_domains": ["elsewhere.test"] }),
+    )
+    .await;
+    assert_eq!(narrowed.status, StatusCode::OK, "{:?}", narrowed.body);
+
+    let (denied_id, denied_token) = create_invite(&router, "domain", "example.com").await;
+    let denied = post_json(
+        router,
+        "/api/v1/admin/admin-invites/redeem",
+        issuer.bearer("returning-admin"),
+        redeem_body(&denied_token, "returning@example.com"),
+    )
+    .await;
+    assert_eq!(
+        denied.code(),
+        "admin_claim_domain_not_allowed",
+        "the domain policy must be evaluated before anything touches admin_identities"
+    );
+    assert_eq!(denied.status, StatusCode::FORBIDDEN, "{:?}", denied.body);
+    assert_eq!(invite_status(&fixture.pool, denied_id).await, "pending");
+    assert_eq!(
+        grant_count(&fixture.pool).await,
+        1,
+        "no refused redemption created a second grant"
+    );
+}
+
 /// **Plan 08's defect, as a test.**
 ///
 /// `governing_policy` matches `issuer = $1 or trusted_jwt_issuer_id = $2`. On a deployment
