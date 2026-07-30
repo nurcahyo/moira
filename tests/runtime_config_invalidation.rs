@@ -221,10 +221,7 @@ impl Listener {
     async fn start(fixture: &LifecycleFixture) -> Self {
         let task = moira::infra::db::spawn_runtime_config_listener(
             fixture.pool.clone(),
-            fixture.state.runtime_cache.clone(),
-            fixture.state.runtime_handles.clone(),
-            fixture.state.auth_settings_cache.clone(),
-            fixture.state.circuits.clone(),
+            moira::infra::db::RuntimeInvalidationTargets::from_state(&fixture.state),
         );
         // The listener loops forever, so nothing else will ever join it; aborting on
         // drop is the only teardown available and it must be the last thing to touch

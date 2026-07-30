@@ -4,9 +4,9 @@ mod runtime_cache;
 mod runtime_factory;
 
 pub use controls::{
-    CircuitBreakerRegistry, CircuitResetScope, CircuitState, ConcurrencyController,
-    ExecutionPermits, InMemoryRateLimiter, ProviderRuntimeCache, RuntimeCacheKey,
-    is_fallback_eligible, is_retryable,
+    CircuitBreakerRegistry, CircuitResetScope, CircuitState, ClusterCoordinator,
+    ClusterRateLimiter, ConcurrencyController, ExecutionPermits, InMemoryRateLimiter,
+    ProviderRuntimeCache, RateLimiterBackend, RuntimeCacheKey, is_fallback_eligible, is_retryable,
 };
 pub use provider_url::normalize_openai_base_url;
 pub use runtime_cache::{AuthProviderSettingsCache, RuntimeConfigCache};

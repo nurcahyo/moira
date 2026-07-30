@@ -12,6 +12,11 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         description: "Generic client-side request validation or shape errors.",
     },
     I18nEntry {
+        key: "moira.error.cluster_lease_denied",
+        default_message: "This replica does not hold a valid cluster admission lease.",
+        description: "Used by GET /health/ready when the replica's row in cluster_replica_leases has been lost or reclaimed mid-run, so the replica is outside the configured cluster.max_replicas ceiling and must stop receiving traffic. Denial at process startup is a fatal log and a non-zero exit, not a response, so it carries no key.",
+    },
+    I18nEntry {
         key: "moira.error.configuration_error",
         default_message: "The service configuration is invalid.",
         description: "Used when Moira cannot start or serve a request because a configuration value is missing or invalid (for example, telemetry export enabled without an endpoint).",
@@ -125,6 +130,11 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         key: "moira.error.validation_failed",
         default_message: "The request validation failed.",
         description: "Used when one or more fields fail schema or domain validation.",
+    },
+    I18nEntry {
+        key: "moira.error.worker_queue_capacity_exceeded",
+        default_message: "The background job queue is at capacity.",
+        description: "Used when WorkerQueue::enqueue refuses a job because the pending backlog has reached workers.queue_max_pending_jobs. Returned as 429 rather than 503 because it is backpressure: the request is well-formed and retrying later is the correct client behaviour. Plan 10 ships the queue with no synchronous producer, so this has no HTTP surface yet; it gains one the moment a request-path caller enqueues, which is why the entry lands with the code rather than after it.",
     },
     I18nEntry {
         key: "moira.error.context_required_content_too_large",

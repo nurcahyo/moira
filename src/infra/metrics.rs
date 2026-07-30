@@ -56,7 +56,10 @@ use sqlx::PgPool;
 
 use crate::{
     domain::{ExecutionFailureClass, ExecutionStatus, ProviderType},
-    infra::workers::retention::{TABLE_IDEMPOTENCY_RECORDS, TABLE_RESPONSES},
+    infra::workers::{
+        LEADER_GATED_WORKERS, WORKER_JOB_NAMES,
+        retention::{TABLE_IDEMPOTENCY_RECORDS, TABLE_RESPONSES},
+    },
 };
 
 // ---------------------------------------------------------------------------------------
@@ -82,6 +85,19 @@ const EXECUTION_DURATION_SECONDS: &str = "moira_execution_duration_seconds";
 const EXECUTION_TTFT_SECONDS: &str = "moira_execution_ttft_seconds";
 const PROVIDER_OUTCOME_TOTAL: &str = "moira_provider_outcome_total";
 const DB_POOL_CONNECTIONS: &str = "moira_db_pool_connections";
+
+// Plan 10 wave 2. Every one is seeded at zero below: the exporter renders only
+// families that have been registered, so an unseeded family is a *removal* from
+// the scrape body until the first observation, and an alert written against it
+// fires on "no data" rather than on the condition it was written for.
+const WORKER_JOBS_CLAIMED_TOTAL: &str = "moira_worker_jobs_claimed_total";
+const WORKER_JOBS_COMPLETED_TOTAL: &str = "moira_worker_jobs_completed_total";
+const WORKER_JOBS_FAILED_TOTAL: &str = "moira_worker_jobs_failed_total";
+const WORKER_JOBS_DEAD_LETTER_TOTAL: &str = "moira_worker_jobs_dead_letter_total";
+const WORKER_QUEUE_ENQUEUE_REJECTED_TOTAL: &str = "moira_worker_queue_enqueue_rejected_total";
+const WORKER_LEADER_HELD: &str = "moira_worker_leader_held";
+const REDIS_OPERATION_FAILURES_TOTAL: &str = "moira_redis_operation_failures_total";
+const RUNTIME_INVALIDATIONS_TOTAL: &str = "moira_runtime_invalidations_total";
 
 /// Route label used when a request matched no route (404s, and anything rejected before
 /// routing completed). Deliberately a constant: falling back to the raw URI here is exactly
@@ -230,8 +246,64 @@ impl MetricsRegistry {
             for table in [TABLE_IDEMPOTENCY_RECORDS, TABLE_RESPONSES] {
                 counter!(RETENTION_ROWS_DELETED_TOTAL, "table" => table).increment(0);
             }
+            describe_counter!(
+                WORKER_JOBS_CLAIMED_TOTAL,
+                "Durable worker-queue jobs claimed by this process, by job name."
+            );
+            describe_counter!(
+                WORKER_JOBS_COMPLETED_TOTAL,
+                "Durable worker-queue jobs completed successfully, by job name."
+            );
+            describe_counter!(
+                WORKER_JOBS_FAILED_TOTAL,
+                "Durable worker-queue job attempts that failed and were rescheduled, by job name."
+            );
+            describe_counter!(
+                WORKER_JOBS_DEAD_LETTER_TOTAL,
+                "Durable worker-queue jobs that exhausted max_attempts and were dead-lettered, \
+                 by job name."
+            );
+            describe_counter!(
+                WORKER_QUEUE_ENQUEUE_REJECTED_TOTAL,
+                "Enqueue attempts refused because the queue's pending-depth cap was reached."
+            );
+            describe_gauge!(
+                WORKER_LEADER_HELD,
+                "Whether this process currently holds the singleton-worker leader lock, by job \
+                 name. Per-process by construction — each process owns its own registry — so \
+                 there is deliberately no replica label."
+            );
+            describe_counter!(
+                REDIS_OPERATION_FAILURES_TOTAL,
+                "Redis coordination operations that failed, by operation. Always zero when \
+                 Redis is disabled, which is the default."
+            );
+            describe_counter!(
+                RUNTIME_INVALIDATIONS_TOTAL,
+                "Runtime-config cache invalidations applied by this process, by the channel \
+                 that delivered them. The postgres channel is authoritative; the redis \
+                 channel is an additive second signal and is absent unless Redis is enabled."
+            );
+
             gauge!(DB_POOL_CONNECTIONS, "state" => "total").set(0.0);
             gauge!(DB_POOL_CONNECTIONS, "state" => "idle").set(0.0);
+            for job_name in WORKER_JOB_NAMES {
+                counter!(WORKER_JOBS_CLAIMED_TOTAL, "job_name" => *job_name).increment(0);
+                counter!(WORKER_JOBS_COMPLETED_TOTAL, "job_name" => *job_name).increment(0);
+                counter!(WORKER_JOBS_FAILED_TOTAL, "job_name" => *job_name).increment(0);
+                counter!(WORKER_JOBS_DEAD_LETTER_TOTAL, "job_name" => *job_name).increment(0);
+            }
+            counter!(WORKER_QUEUE_ENQUEUE_REJECTED_TOTAL).increment(0);
+            for job_name in LEADER_GATED_WORKERS {
+                gauge!(WORKER_LEADER_HELD, "job_name" => *job_name).set(0.0);
+            }
+            for operation in RedisOperation::ALL {
+                counter!(REDIS_OPERATION_FAILURES_TOTAL, "operation" => operation.label())
+                    .increment(0);
+            }
+            for channel in InvalidationChannel::ALL {
+                counter!(RUNTIME_INVALIDATIONS_TOTAL, "channel" => channel.label()).increment(0);
+            }
         });
     }
 
@@ -404,6 +476,80 @@ impl MetricsRegistry {
         });
     }
 
+    // -----------------------------------------------------------------------------------
+    // Plan 10 wave 2 — durable queue, leadership, Redis coordination.
+    //
+    // Every `job_name` argument is checked against `WORKER_JOB_NAMES` before it becomes a
+    // label, exactly as `record_retention_deleted` checks its table name. An unrecognised
+    // name is dropped rather than folded into another job's total: a silently merged
+    // counter is a worse answer than a missing one, because it looks correct.
+    // -----------------------------------------------------------------------------------
+
+    pub fn record_worker_job_claimed(&self, job_name: &str, count: u64) {
+        self.record_worker_job(WORKER_JOBS_CLAIMED_TOTAL, job_name, count);
+    }
+
+    pub fn record_worker_job_completed(&self, job_name: &str) {
+        self.record_worker_job(WORKER_JOBS_COMPLETED_TOTAL, job_name, 1);
+    }
+
+    pub fn record_worker_job_failed(&self, job_name: &str) {
+        self.record_worker_job(WORKER_JOBS_FAILED_TOTAL, job_name, 1);
+    }
+
+    pub fn record_worker_job_dead_lettered(&self, job_name: &str) {
+        self.record_worker_job(WORKER_JOBS_DEAD_LETTER_TOTAL, job_name, 1);
+    }
+
+    fn record_worker_job(&self, family: &'static str, job_name: &str, count: u64) {
+        let Some(job_name) = known_job_name(job_name) else {
+            return;
+        };
+        with_local_recorder(&self.inner.recorder, || {
+            counter!(family, "job_name" => job_name).increment(count);
+        });
+    }
+
+    /// One enqueue refused by the pending-depth cap.
+    ///
+    /// Unlabelled on purpose: the job name is available at the call site, but a
+    /// rejection is a property of the *queue*, and an operator alerting on it wants
+    /// "the queue is full", not a per-job breakdown of who noticed first.
+    pub fn record_worker_queue_enqueue_rejected(&self) {
+        with_local_recorder(&self.inner.recorder, || {
+            counter!(WORKER_QUEUE_ENQUEUE_REJECTED_TOTAL).increment(1);
+        });
+    }
+
+    /// Whether this process holds the leader lock for `job_name`.
+    ///
+    /// A gauge rather than a counter because leadership is a *state*, and it is
+    /// already per-process: each process owns its own recorder, so summing the
+    /// family across a cluster's scrape targets gives the number of leaders — which
+    /// must be one — with no replica label needed. Adding one would put a pod UUID
+    /// in a label value, which `high_cardinality_identifiers_never_appear_as_label_values`
+    /// forbids.
+    pub fn record_worker_leadership(&self, job_name: &str, held: bool) {
+        let Some(job_name) = known_job_name(job_name) else {
+            return;
+        };
+        with_local_recorder(&self.inner.recorder, || {
+            gauge!(WORKER_LEADER_HELD, "job_name" => job_name).set(f64::from(u8::from(held)));
+        });
+    }
+
+    pub fn record_redis_operation_failure(&self, operation: RedisOperation) {
+        with_local_recorder(&self.inner.recorder, || {
+            counter!(REDIS_OPERATION_FAILURES_TOTAL, "operation" => operation.label()).increment(1);
+        });
+    }
+
+    pub fn record_runtime_invalidation(&self, channel: InvalidationChannel) {
+        with_local_recorder(&self.inner.recorder, || {
+            counter!(RUNTIME_INVALIDATIONS_TOTAL, "channel" => channel.label()).increment(1);
+        });
+    }
+
     /// Renders the Prometheus exposition body served by `GET /metrics`.
     ///
     /// The first parameter is retained purely to keep this signature — and therefore
@@ -425,6 +571,72 @@ impl MetricsRegistry {
         });
         self.inner.handle.render()
     }
+}
+
+/// The Redis coordination operations that can fail, as a closed label set.
+///
+/// An enum rather than a `&str` parameter because `operation` is a label key: a
+/// caller passing an ad-hoc string would open the label set one call site at a
+/// time, and nothing would fail until the scrape body did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedisOperation {
+    RateLimit,
+    PermitAcquire,
+    PermitRelease,
+    Publish,
+    Subscribe,
+}
+
+impl RedisOperation {
+    pub(crate) const ALL: [Self; 5] = [
+        Self::RateLimit,
+        Self::PermitAcquire,
+        Self::PermitRelease,
+        Self::Publish,
+        Self::Subscribe,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::RateLimit => "rate_limit",
+            Self::PermitAcquire => "permit_acquire",
+            Self::PermitRelease => "permit_release",
+            Self::Publish => "publish",
+            Self::Subscribe => "subscribe",
+        }
+    }
+}
+
+/// Which transport delivered a runtime-config invalidation.
+///
+/// Two arms and no third: Postgres `LISTEN/NOTIFY` is authoritative and always
+/// present, Redis pub/sub is an additive second signal that exists only when
+/// Redis is enabled. The pair is what lets an operator confirm the second channel
+/// is actually carrying traffic — and, more usefully, that the first one still is
+/// when the second is turned off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidationChannel {
+    Postgres,
+    Redis,
+}
+
+impl InvalidationChannel {
+    pub(crate) const ALL: [Self; 2] = [Self::Postgres, Self::Redis];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Postgres => "postgres",
+            Self::Redis => "redis",
+        }
+    }
+}
+
+/// `job_name` as a label value, or `None` if Moira has never declared that job.
+fn known_job_name(job_name: &str) -> Option<&'static str> {
+    WORKER_JOB_NAMES
+        .iter()
+        .find(|declared| **declared == job_name)
+        .copied()
 }
 
 // `set_buckets_for_metric` has exactly one failure mode: an empty bucket slice. These
@@ -557,6 +769,7 @@ fn failure_class_label(class: ExecutionFailureClass) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::infra::workers::RETENTION_CLEANUP_WORKER;
 
     /// Every label key any Moira metric family is permitted to carry. `le` and `quantile`
     /// are the exporter's own. A new call site introducing, say, `execution_id` or `path`
@@ -571,6 +784,12 @@ mod tests {
         "outcome",
         "model_key",
         "state",
+        // Plan 10 wave 2. All three are closed sets enforced in code rather than by
+        // convention: `job_name` against `WORKER_JOB_NAMES`, `operation` against
+        // `RedisOperation::ALL`, `channel` against `InvalidationChannel::ALL`.
+        "job_name",
+        "operation",
+        "channel",
         "le",
         "quantile",
     ];
@@ -1001,5 +1220,162 @@ mod tests {
         assert!(rendered.contains(&format!(
             "{RETENTION_ROWS_DELETED_TOTAL}{{service=\"moira-test\",table=\"{TABLE_RESPONSES}\"}} 0"
         )));
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Plan 10 wave 2 families.
+    // -----------------------------------------------------------------------------------
+
+    /// The seed is not optional. The exporter renders only families that have been
+    /// registered, so an unseeded family is a *removal* from the scrape body until its
+    /// first observation — and an alert written against it fires on "no data" rather
+    /// than on the condition it was written for.
+    #[test]
+    fn the_new_families_are_seeded_at_zero_before_any_observation() {
+        let rendered = registry().render_prometheus("moira-test", false, false);
+        for family in [
+            WORKER_JOBS_CLAIMED_TOTAL,
+            WORKER_JOBS_COMPLETED_TOTAL,
+            WORKER_JOBS_FAILED_TOTAL,
+            WORKER_JOBS_DEAD_LETTER_TOTAL,
+            WORKER_QUEUE_ENQUEUE_REJECTED_TOTAL,
+            WORKER_LEADER_HELD,
+            REDIS_OPERATION_FAILURES_TOTAL,
+            RUNTIME_INVALIDATIONS_TOTAL,
+        ] {
+            assert!(
+                rendered.contains(family),
+                "{family} is absent from a fresh scrape body:\n{rendered}"
+            );
+        }
+        // One series per declared job name, so a queue that has never run still
+        // reports zero rather than nothing.
+        for job_name in WORKER_JOB_NAMES {
+            assert!(
+                rendered.contains(&format!(
+                    "{WORKER_JOBS_CLAIMED_TOTAL}{{service=\"moira-test\",job_name=\"{job_name}\"}} 0"
+                )),
+                "no zero-seeded claim counter for {job_name}:\n{rendered}"
+            );
+        }
+    }
+
+    /// `job_name` is a metric label, so it must come from the closed set. An
+    /// unrecognised name is dropped rather than folded into another job's total,
+    /// for the same reason an unrecognised retention table is.
+    #[test]
+    fn unrecognised_job_names_are_dropped_rather_than_mislabelled() {
+        let metrics = registry();
+        metrics.record_worker_job_claimed("job-invented-at-runtime", 7);
+        metrics.record_worker_job_completed("job-invented-at-runtime");
+        metrics.record_worker_leadership("job-invented-at-runtime", true);
+        let rendered = metrics.render_prometheus("moira-test", false, false);
+
+        assert!(!rendered.contains("job-invented-at-runtime"), "{rendered}");
+        assert!(rendered.contains(&format!(
+            "{WORKER_JOBS_CLAIMED_TOTAL}{{service=\"moira-test\",job_name=\"{RETENTION_CLEANUP_WORKER}\"}} 0"
+        )));
+    }
+
+    #[test]
+    fn worker_job_counters_record_against_their_job_name() {
+        let metrics = registry();
+        metrics.record_worker_job_claimed(RETENTION_CLEANUP_WORKER, 3);
+        metrics.record_worker_job_completed(RETENTION_CLEANUP_WORKER);
+        metrics.record_worker_job_failed(RETENTION_CLEANUP_WORKER);
+        metrics.record_worker_job_dead_lettered(RETENTION_CLEANUP_WORKER);
+        metrics.record_worker_queue_enqueue_rejected();
+        let rendered = metrics.render_prometheus("moira-test", false, false);
+
+        let series = |family: &str| {
+            format!("{family}{{service=\"moira-test\",job_name=\"{RETENTION_CLEANUP_WORKER}\"}}")
+        };
+        assert!(rendered.contains(&format!("{} 3", series(WORKER_JOBS_CLAIMED_TOTAL))));
+        assert!(rendered.contains(&format!("{} 1", series(WORKER_JOBS_COMPLETED_TOTAL))));
+        assert!(rendered.contains(&format!("{} 1", series(WORKER_JOBS_FAILED_TOTAL))));
+        assert!(rendered.contains(&format!("{} 1", series(WORKER_JOBS_DEAD_LETTER_TOTAL))));
+        assert!(rendered.contains(&format!(
+            "{WORKER_QUEUE_ENQUEUE_REJECTED_TOTAL}{{service=\"moira-test\"}} 1"
+        )));
+    }
+
+    /// The gauge is per-process by construction — each process owns its own
+    /// registry — so summing it across a cluster's scrape targets counts leaders.
+    /// A replica label would put a pod UUID in a label value, which
+    /// `high_cardinality_identifiers_never_appear_as_label_values` forbids.
+    #[test]
+    fn leadership_is_a_zero_or_one_gauge_with_no_replica_dimension() {
+        let metrics = registry();
+        metrics.record_worker_leadership(RETENTION_CLEANUP_WORKER, true);
+        let rendered = metrics.render_prometheus("moira-test", false, false);
+        let series = format!(
+            "{WORKER_LEADER_HELD}{{service=\"moira-test\",job_name=\"{RETENTION_CLEANUP_WORKER}\"}}"
+        );
+        assert!(rendered.contains(&format!("{series} 1")), "{rendered}");
+
+        metrics.record_worker_leadership(RETENTION_CLEANUP_WORKER, false);
+        let rendered = metrics.render_prometheus("moira-test", false, false);
+        assert!(rendered.contains(&format!("{series} 0")), "{rendered}");
+        // `replica=`, not `replica`: the family's own HELP text explains *why*
+        // there is no replica dimension, and matching on the bare word would
+        // fail on the documentation rather than on a label.
+        assert!(!rendered.contains("replica="), "{rendered}");
+    }
+
+    /// A Redis outage turns every coordinated control into a refusal, so without
+    /// this counter it is indistinguishable from genuine saturation: a wall of
+    /// 429s and no way to tell which.
+    #[test]
+    fn redis_failures_are_counted_by_operation_from_a_closed_set() {
+        let metrics = registry();
+        metrics.record_redis_operation_failure(RedisOperation::RateLimit);
+        metrics.record_redis_operation_failure(RedisOperation::PermitAcquire);
+        let rendered = metrics.render_prometheus("moira-test", false, false);
+
+        assert!(rendered.contains(&format!(
+            "{REDIS_OPERATION_FAILURES_TOTAL}{{service=\"moira-test\",operation=\"rate_limit\"}} 1"
+        )));
+        assert!(rendered.contains(&format!(
+            "{REDIS_OPERATION_FAILURES_TOTAL}{{service=\"moira-test\",operation=\"permit_acquire\"}} 1"
+        )));
+        // Every arm seeded, so an operation that has never failed reads as zero.
+        assert!(rendered.contains(&format!(
+            "{REDIS_OPERATION_FAILURES_TOTAL}{{service=\"moira-test\",operation=\"subscribe\"}} 0"
+        )));
+    }
+
+    /// Both channels are seeded, which is what lets an operator confirm the
+    /// authoritative Postgres path is still carrying traffic when Redis is off —
+    /// the default.
+    #[test]
+    fn invalidations_are_counted_per_channel_and_both_channels_are_seeded() {
+        let metrics = registry();
+        metrics.record_runtime_invalidation(InvalidationChannel::Postgres);
+        let rendered = metrics.render_prometheus("moira-test", false, false);
+
+        assert!(rendered.contains(&format!(
+            "{RUNTIME_INVALIDATIONS_TOTAL}{{service=\"moira-test\",channel=\"postgres\"}} 1"
+        )));
+        assert!(rendered.contains(&format!(
+            "{RUNTIME_INVALIDATIONS_TOTAL}{{service=\"moira-test\",channel=\"redis\"}} 0"
+        )));
+    }
+
+    /// The label keys the new families introduce must pass the cardinality gate.
+    #[test]
+    fn the_new_families_use_only_allow_listed_label_keys() {
+        let metrics = registry();
+        metrics.record_worker_job_claimed(RETENTION_CLEANUP_WORKER, 1);
+        metrics.record_worker_leadership(RETENTION_CLEANUP_WORKER, true);
+        metrics.record_redis_operation_failure(RedisOperation::Publish);
+        metrics.record_runtime_invalidation(InvalidationChannel::Redis);
+        let rendered = metrics.render_prometheus("moira-test", true, true);
+
+        for key in label_keys(&rendered) {
+            assert!(
+                ALLOWED_LABEL_KEYS.contains(&key.as_str()),
+                "unexpected label key {key:?}:\n{rendered}"
+            );
+        }
     }
 }

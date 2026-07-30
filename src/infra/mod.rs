@@ -1,3 +1,4 @@
+pub mod coordination;
 pub mod db;
 pub mod metrics;
 pub mod pg_rows;
