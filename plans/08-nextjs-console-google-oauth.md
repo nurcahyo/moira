@@ -390,6 +390,238 @@ body, because they are single tokens that would otherwise be copied verbatim int
 
 ---
 
+### §0.6 Wave 2 implementation record (OAuth/session, `server-only`, deployment)
+
+Written after implementing Wave 2. Everything here is a *finding*, a *decision with its reversal
+condition*, or a *deferral* — the three things that are useless if they are not written down at the
+moment they are discovered. Wave 1 found three real §0 errors; this wave found six more, listed
+first.
+
+#### §0.6.1 New blockers and errors found in §0 / the body
+
+**B6 — the runtime-configuration design is CIRCULAR for the sign-in path.** Neither §0 nor the body
+records this, and it is the same class of defect as B1: everything works until the last step, and then
+never works again.
+
+§7.2 says the console reads its auth configuration at runtime from Moira's DB-backed settings rather
+than from build-time env. But *every* read of that configuration needs a credential. Verified against
+`docs/openapi.json`:
+
+| Operation | `security` |
+|---|---|
+| `GET /api/v1/admin/auth/providers` | `[bearerAuth, systemKeyAuth, consumerKeyAuth]` |
+| `GET /api/v1/admin/setup/auth-methods` | `[bearerAuth, systemKeyAuth]` |
+| `GET /api/v1/admin/setup/claim-status` | **absent — the only anonymous operation on the whole admin surface** |
+
+The console's `bearerAuth` is the JWT it mints for a signed-in operator; to sign that operator in it
+needs the auth configuration. So a console whose operator has removed `MOIRA_SYSTEM_KEY` after setup —
+exactly what one does with a bootstrap credential — can never again render a sign-in button. The body
+assumes `loadAuthSettings()` just works; it cannot.
+
+*Resolution (implemented, `console/lib/auth-runtime.ts`):* read live while the system key is present
+and snapshot the result; once it is gone, serve sign-in from the snapshot and refresh it on every
+request that carries an operator credential. Cost, stated rather than discovered: a provider changed
+in Moira while nobody is signed in keeps serving the old configuration until somebody signs in — with
+the old configuration, which is the only self-consistent behaviour available.
+*Rejected:* keeping `MOIRA_SYSTEM_KEY` set forever. It works, and it leaves the console permanently
+holding a credential that bypasses `admin_identities` entirely, so every admin call *could* be made as
+the bootstrap key and the audit trail would stop naming humans.
+**REVERSAL CONDITION:** if Moira makes `GET /api/v1/admin/setup/auth-methods` anonymous — which its
+narrowed `PublicAuthMethod` projection suggests was the intent, since every field in it is already
+safe to show an unauthenticated visitor — delete the snapshot and read it live. That is the better
+design; the snapshot is the one available without modifying Moira, which plan 08 does not do.
+
+**B7 — `sub` cannot be the Better Auth user id, and cannot come from `mapProfileToUser` either.**
+Moira's grant key is `(issuer, subject)`; `issuer` is the console's, so `subject` must equal the `sub`
+of the token the console mints. Better Auth's default `sub` is `session.user.id` — a value the console
+generates and stores in its own database. Using it keys every admin grant to a row in the console's
+database, and losing that database orphans every grant with no recovery, because a second claim is
+refused `409 admin_identity_already_claimed`.
+
+The obvious fix — a `user.additionalFields` entry populated by `genericOAuth`'s `mapProfileToUser` —
+**does not work**: Better Auth filters the mapped profile against the user schema before
+`createOAuthUser`, so an `input: false` field is dropped. Observed directly: the user row held only
+`name/email/emailVerified/createdAt/updatedAt/id`. Setting `input: true` would make it survive *and*
+make it settable through `update-user`, letting a signed-in operator rewrite their own `sub` and mint
+a token for somebody else's grant. Implemented instead: read `account.accountId`, which Better Auth
+itself populates from the provider's `sub` on every OAuth sign-in.
+
+**B8 — `nextCookies()` must NOT be in the plugin list.** CONVENTIONS points at Better Auth without
+saying which plugins; the obvious set includes `nextCookies()`. It exists for Next.js *server
+actions* and intercepts the cookies Better Auth wants to set. With it installed and Better Auth
+mounted as a route handler, the sign-in reply comes back with **no `Set-Cookie` at all** and the OAuth
+callback then fails `state_security_mismatch / State not persisted correctly` — which reads as a CSRF
+bug, or a cookie-jar bug, or a PKCE bug. Three wrong diagnoses before the right one.
+**REVERSAL CONDITION:** add it back only alongside a server action that calls `auth.api.*` to *mutate*
+the session. Read-only calls such as `auth.api.getToken` do not need it.
+
+**B9 — §0.3's `HEALTHCHECK` recommendation is right, but its stated reason is now wrong.** §0.3 says
+to drop it because `node:24-slim` ships neither `curl` nor `wget`. The image is distroless (see
+§0.6.3), which has no **shell**, so a `CMD`-form `HEALTHCHECK` cannot execute at all — it is not a
+question of which binaries are present. Same conclusion, stronger reason.
+
+**B10 — §0.3's uid analysis is correct but its conclusion inverted by the base-image change.** §0.3
+says `node:24-slim`'s non-root user is uid 1000 and the console chart must therefore state its own
+uid rather than copying `charts/moira`'s 65532. Since the runtime image had to move to distroless for
+the Trivy gate anyway, the console's uid **is** 65532 — the same number, for the same reason
+(distroless's only non-root user), not by copying. `charts/moira-console` ties the number to the base
+image in a comment rather than to "the moira baseline", so a future base-image swap has a visible
+trigger.
+
+**B11 — the plan's own e2e harness cannot boot the console any more.** `console/lib/env.ts` validates
+eagerly, and `playwright.config.ts`'s `webServer.env` supplied none of the required variables. Fixed
+in `console/e2e/support/console-env.ts`. The non-obvious part: the fixture must declare an **https**
+`CONSOLE_PUBLIC_ORIGIN` while listening on plain http, because `webServer.env` sets
+`NODE_ENV=production` and `CONSOLE_ALLOW_INSECURE_URLS` is a hard failure there (mirroring Moira's
+`auth.jwks.allow_insecure_dev_urls`). That is not a fudge — it is what a console behind a
+TLS-terminating ingress actually looks like.
+
+#### §0.6.2 Mock-first: what is covered, and what still needs a live Google credential
+
+**No Google client id or secret exists and none was requested.** The whole OAuth path is built and
+tested against `console/tests/support/mock-idp.ts`: a **real** OIDC provider on a real socket, TLS-
+terminated, with a real discovery document, a real JWKS, real ES256-signed ID tokens, an authorization
+endpoint that issues codes and 302s, a token endpoint that checks `client_id`/`client_secret`/
+`redirect_uri`/PKCE `code_verifier`, and a userinfo endpoint that checks the bearer token. Not a
+stubbed `fetch`.
+
+Both §0 constraints on the fixture were verified in the tree, and both hold:
+* `validate_https_url` (`src/application/auth_settings.rs`) checks scheme and non-empty host only, no
+  private-host check ⇒ `https://localhost:PORT` passes. Confirmed by reading the function.
+* the jwt-issuer path runs the SSRF policy, whose escape hatch is `auth.jwks.allow_insecure_dev_urls`,
+  and `Settings::validate` hard-fails production when it is set (`src/config/settings.rs:504-506`).
+  Confirmed. `console/lib/env.ts` deliberately mirrors that shape for the console's own flag.
+
+**MOCK-COVERED** (all asserted, all green):
+* the full authorization-code exchange across a real origin boundary, ending in a console session;
+* PKCE S256 challenge/verifier, checked by the provider;
+* **the D7 secret custody design**: hand the console the wrong client secret and `/token` answers
+  `401 invalid_client`, no session is created, and no userinfo call happens;
+* **the Moira-bound JWT verified exactly the way Moira verifies it** — `jose`'s `createRemoteJWKSet`
+  fetching the console's published JWKS over the network, resolving the key by `kid`, checking
+  `alg = ES256`, `iss` = the console's issuer (and *not* the IdP's), `aud`, and `sub` = the IdP's
+  subject;
+* the JWKS document contains no private half (`d` absent);
+* both identity branches — the ID-token branch and the userinfo fallback — reach the same `sub`;
+* a provider that supplies no `sub` cannot produce a session.
+
+**STILL NEEDS A LIVE GOOGLE CREDENTIAL** (deferred, not faked):
+* Google's real consent screen and its cookie/redirect behaviour;
+* Google-issued tokens: their exact claim set, `hd` handling, and key-rotation cadence;
+* Google-specific `authorizationUrlParams` (`access_type`, `prompt`, `hd`) and Google's reaction to
+  them;
+* end-to-end against a live Moira (no fixture Moira exists in this repo's test environment), which
+  means `POST /api/v1/admin/setup/claim` and the `admin_identities` grant union are exercised only
+  through `console/tests/unit/lib/setup-flow.test.ts`, never over the wire.
+
+**A security property worth recording, found while reading Better Auth.** `genericOAuth` does **not**
+verify the ID token's signature — `getUserInfo` calls `decodeJwt` and reads the claims, falling back
+to the userinfo endpoint only when `sub` or `email` is absent. This is standards-sanctioned rather
+than a bug: OIDC Core §3.1.3.7 permits skipping ID Token signature validation when the token came over
+a direct TLS connection to the token endpoint with client authentication, which is exactly this flow
+(TLS + `client_secret` + PKCE). **The trust anchor is the channel, not the signature.** Recorded
+because the mock IdP serves a real JWKS and a reader would otherwise reasonably assume the sign-in
+path exercises it. It does not; the verification path that *is* exercised is the console's own JWKS,
+on the Moira-bound token.
+
+#### §0.6.3 Trivy — measured, not assumed
+
+`console/Dockerfile`'s runtime stage moved from `node:24-slim` to
+`gcr.io/distroless/nodejs24-**debian13**:nonroot`. Measured with
+`--severity CRITICAL,HIGH --scanners vuln`:
+
+| Runtime base | CRITICAL | HIGH |
+|---|---|---|
+| `node:24-slim` (Wave 1's) | 6 | 22 |
+| `gcr.io/distroless/nodejs24-debian12:nonroot` | 1 | 5 |
+| `gcr.io/distroless/nodejs24-debian13:nonroot` (**shipped**) | **0** | **0** |
+
+**`debian12` does not pass the gate**, contrary to the obvious reading of "use the distroless
+analogue". It carries a stale `libssl3 3.0.18-1~deb12u2`: `CVE-2026-31789` (CRITICAL),
+`CVE-2026-28387`, `CVE-2026-28388`, `CVE-2026-28389`, `CVE-2026-28390`, `CVE-2026-45447`. Unreachable
+in practice — Node statically links its own OpenSSL — but Trivy scores from package metadata, not
+reachability. Trixie also ships Node v24.18.0, matching `console/.nvmrc` exactly (bookworm lags at
+v24.14.0).
+
+One application-level finding survived the base change and was **removed rather than suppressed**:
+`sharp` (an `optionalDependency` of `next@16`, traced into `.next/standalone` whether or not the app
+renders an `<Image>`) carries `GHSA-f88m-g3jw-g9cj`, fixed in 0.35.0 — a version this lockfile cannot
+reach while `next`'s own range caps at `^0.34.5`. The console renders no optimized images, so the
+Dockerfile deletes it, guarded by a `grep` that fails the **build** with instructions the day someone
+imports `next/image`. No `--ignore-unfixed`, no `.trivyignore`.
+
+**A gap in this gate, stated because it is real.** Next.js *bundles* server dependencies into
+`.next/server/chunks/**` rather than tracing them into `node_modules`, so `better-auth`, `jose` and
+their trees have no `package.json` in the image and Trivy's `node-pkg` scanner cannot see them. The
+image scan's 0/0 is therefore genuine for the OS layer and the traced packages, and *silent* about the
+bundled ones. `bun audit --production` covers the lockfile instead and today reports nothing against
+`better-auth` — only `postcss` and `sharp`, both transitive through `next`, neither present in the
+runtime image (`sharp` is deleted; `postcss` is build-time only). So the blind spot exists and is
+currently empty. It was **not** wired up as a hard CI gate, because a gate that is permanently red for
+findings absent from the shipped artifact teaches people to ignore it. **FOLLOW-UP:** add
+`bun audit --production` as a blocking step once `next` widens its `postcss` and `sharp` ranges, or
+generate an SBOM from the image and cross-reference `bun.lock`.
+
+#### §0.6.4 Deferrals — the two places this wave is deliberately incomplete
+
+Both are the same root cause: **no database is available to this wave**, and a persistence layer never
+exercised against real storage is a fake gate.
+
+1. **`InMemoryConsoleSecretStore`** (`console/lib/console-secrets.ts`). The envelope is real and fully
+   tested — AES-256-GCM, AAD-bound to `(providerId, clientId)`, so a copied record, an edited
+   `client_id`, a wrong key, or a flipped ciphertext byte all fail closed, and the failure message is
+   identical in every case so it is not an oracle. Only the *storage* is in-process.
+2. **Better Auth's `memoryAdapter`** (`console/lib/auth.ts`). The jwt plugin keeps its ES256 key pair
+   in this database, so the key pair is regenerated on every process start.
+
+**Consequences, so they are not discovered in production:** OAuth client secrets and the JWKS signing
+key do not survive a restart; a multi-replica deployment has per-replica secrets and per-replica
+signing keys, so sign-in works only on the replica that was set up and Moira's cached JWKS goes stale
+on every restart. **`charts/moira-console` must stay at one replica until a durable store lands.**
+**REVERSAL CONDITION:** supply a Kysely dialect over the `console_auth` database to
+`ConsoleAuthDeps.database` and implement `ConsoleSecretStore` over the same database. Neither the
+envelope functions nor any call site changes — they already produce a persistable record.
+
+#### §0.6.5 Test-harness findings (cost several hours; written so they cost nobody else any)
+
+* **happy-dom's `Headers` silently discards `Set-Cookie`.** It implements the *browser* contract,
+  where `Set-Cookie` is a forbidden response header. `@happy-dom/global-registrator` installs it
+  globally, so every server-side test in the same process loses cookies — presenting as
+  `state_security_mismatch`, not as a missing header. Proof: the identical handler under plain
+  `bun run`, with no preloads, returns `set-cookie: __Secure-better-auth.state=…`.
+* happy-dom also replaces `fetch` (ignoring Bun's per-request `tls` option, so a TLS fixture fails
+  with `DEPTH_ZERO_SELF_SIGNED_CERT` — which reads as a certificate problem) and `Response` (so
+  `Bun.serve` rejects a handler's reply by constructor identity).
+  ⇒ `console/tests/support/native-globals.ts` captures Bun's own globals in a preload that runs
+  *before* the registrar, and server-side suites install them for their duration.
+* **`NODE_EXTRA_CA_CERTS` is read once at process start**, so setting it from a preload is too late
+  (verified: still `self signed certificate`). `NODE_TLS_REJECT_UNAUTHORIZED=0` does work at runtime
+  and was **not** used — it disables chain validation for every origin in the process. The fixture
+  instead attaches its CA per-request, for its own origins only, via Bun's `tls.ca`, so the handshake
+  and the chain validation are both real.
+* **`memoryAdapter` does not create tables on demand.** `memoryAdapter({})` throws
+  `Model account not found` several redirects into the OAuth flow, reported as a database error. The
+  required set for this plugin list is `user, session, account, verification, jwks`
+  (`createConsoleMemoryDatabase`).
+
+#### §0.6.6 The `server-only` guard — what landed, and why Wave 1's test stays
+
+`import "server-only"` is now present in all seven credential-carrying modules, `server-only` is a
+real **dependency** (not a devDependency — a devDependency would be absent from the Docker build's
+production install and the guard would vanish from the shipped image), and
+`console/tests/support/server-only-shim.ts` is preloaded so the package's throwing `default` export
+condition does not take the whole suite with it.
+
+The shim is not a weakening. The guard's teeth are in `next build`, which is a CI step. Wave 1's
+`server-only-guards.test.ts` is kept because it catches a *different* class of mistake — an import
+that is server-legal but architecturally wrong — and a new `server-only-import.test.ts` asserts the
+import cannot silently disappear, which is the one hole a shim would otherwise open.
+**REVERSAL CONDITION:** if Bun ever supports per-run export conditions for the test runner, delete the
+shim and set `conditions = ["react-server"]` instead — that resolves the package's own `empty.js`
+rather than substituting a module for it.
+
+---
+
 ## Summary
 
 **Objective.** Ship the first Moira admin console: a Next.js application acting as a Backend-For-Frontend (BFF) in front of Moira. It gives a human operator a browser-based way to (1) complete first-run setup by configuring the auth provider and claiming the initial admin identity, and (2) sign in thereafter to manage providers, credentials, models, routing, and view the audit log — all by calling Moira's *existing* (and plan-07-added) admin APIs. No Moira source in this repository is modified by this plan; it adds a **new**, separately deployed Next.js project plus deployment assets.

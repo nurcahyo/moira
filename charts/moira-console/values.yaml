@@ -1,0 +1,328 @@
+# Moira admin console (Next.js BFF) — deployment values.
+#
+# Sibling of `charts/moira`, deliberately NOT a subchart: the console is a
+# separate deployable with its own image, its own database, its own release
+# cadence and its own public hostname (plans/08 §"Deployment implications").
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS CHART DOES NOT MIRROR FROM `charts/moira/templates/`
+# ---------------------------------------------------------------------------
+# `servicemonitor.yaml` — OMITTED. A ServiceMonitor is a scrape instruction and
+#   it is only ever correct when the workload actually serves a Prometheus
+#   exposition endpoint. Moira has one (`MOIRA_TELEMETRY__PROMETHEUS_ENABLED`,
+#   `/metrics`, plan 05). The console does not: it is a Next.js server with no
+#   metrics registry and no `/metrics` route, so a ServiceMonitor here would
+#   point Prometheus at a 404 forever and show up as a permanently-down target.
+#   The matching `prometheus.io/scrape` pod annotations are omitted for the same
+#   reason. REVERSE THIS when the console gains a real metrics endpoint (e.g. an
+#   `app/api/metrics/route.ts`); at that point copy `charts/moira/templates/
+#   servicemonitor.yaml` and add the `serviceMonitor.*` values back.
+#
+# Every other template in `charts/moira/templates/` is mirrored:
+#   _helpers.tpl, configmap.yaml, deployment.yaml, hpa.yaml, ingress.yaml,
+#   migration-job.yaml, networkpolicy.yaml, pdb.yaml, priorityclass.yaml,
+#   secret.yaml, service.yaml, serviceaccount.yaml.
+# `migration-job.yaml` IS present but ships disabled — see `migrationJob` below
+# for the exact reason and for what has to be supplied to enable it.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# ONE REPLICA. This is a correctness constraint, not a capacity choice.
+# ---------------------------------------------------------------------------
+# The design intends replicas to share no in-process authority: sessions, rate
+# limits and the Better Auth JWKS all belong in the console's own PostgreSQL
+# database, at which point `replicaCount > 1` is safe with no affinity
+# requirement, and that is the deliberate difference from `charts/moira` (which
+# pins 1 because its concurrency and rate limits are process-local).
+#
+# That is NOT what ships today. Per plans/08 §0.6.4, this wave has no database
+# available to it, so two things are in process memory:
+#
+#   * the OAuth client secret (`InMemoryConsoleSecretStore`), and
+#   * the Better Auth jwt plugin's ES256 signing key pair (`memoryAdapter`).
+#
+# With two replicas the operator completes setup against one pod and then gets
+# routed to the other, which holds no client secret and cannot start a code
+# exchange; and each pod publishes a DIFFERENT JWKS, so Moira's cached copy
+# verifies tokens from one pod and rejects the other's. Both failures are
+# intermittent and load-balancer-dependent, which is the worst way to find them.
+#
+# REVERSE THIS (to 2, and enable autoscaling below) in the same commit that
+# supplies a Kysely dialect over the `console_auth` database to
+# `ConsoleAuthDeps.database` and implements `ConsoleSecretStore` over it. No
+# other code changes are needed — see the reversal note in
+# `console/lib/console-secrets.ts`.
+replicaCount: 1
+
+image:
+  repository: ghcr.io/example/moira-console
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Container listen port. Also fed to the process as PORT/HOSTNAME by
+# `templates/deployment.yaml`, so there is exactly one number to change and no
+# way for the manifest and the process to disagree.
+containerPort: 3000
+
+serviceAccount:
+  create: true
+  name: moira-console
+
+service:
+  type: ClusterIP
+  port: 80
+
+# The console is the internet-facing half of the system (Moira's own API ingress
+# is separate and is normally not public at all). The defaults below therefore
+# assume TLS termination and an HTTPS redirect; `enabled` still defaults to
+# false so that installing the chart never publishes a hostname nobody asked
+# for.
+ingress:
+  enabled: false
+  className: ""
+  host: console.example.com
+  path: /
+  pathType: Prefix
+  tls:
+    enabled: true
+    secretName: moira-console-tls
+  # Merged over the template's own annotations, last write wins.
+  annotations: {}
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+# Disabled, and it must stay disabled until the console's state is durable —
+# see the `replicaCount` note above. `minReplicas: 2` is the value to restore
+# alongside it, not a value to enable on its own.
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 6
+  # CPU only, on purpose. A Node.js heap grows to its high-water mark and does
+  # not hand memory back, so a memory-utilisation target scales out and then
+  # never scales back in.
+  targetCPUUtilizationPercentage: 70
+
+# Disabled while `replicaCount` is 1: a PDB with `minAvailable: 1` over a single
+# replica blocks every voluntary eviction, so a node drain hangs instead of
+# rolling. Re-enable it together with the replica-count increase above.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+
+# Scheduling hint only. `whenUnsatisfiable: ScheduleAnyway` means a single-node
+# or tainted cluster still schedules; it never blocks a rollout.
+topologySpread:
+  enabled: true
+  maxSkew: 1
+  topologyKey: kubernetes.io/hostname
+
+# PriorityClass is cluster-scoped, so two releases of this chart in two
+# namespaces would collide on the name. `charts/moira` creates its one
+# unconditionally; here it is toggleable for that reason.
+priorityClass:
+  enabled: true
+  # Below Moira's 100000: if the cluster is evicting, the API that serves
+  # traffic should outrank the console that administers it.
+  value: 50000
+
+networkPolicy:
+  enabled: true
+  # Ingress. All legitimate traffic to an internet-facing app arrives via the
+  # ingress controller, so the tightest correct rule names the controller's
+  # namespace. The default stays open across namespaces because a wrong guess
+  # here makes the console unreachable at deploy time rather than failing in
+  # CI — narrow it to your controller, e.g.
+  #   - namespaceSelector:
+  #       matchLabels:
+  #         kubernetes.io/metadata.name: ingress-nginx
+  ingressFrom:
+    - namespaceSelector: {}
+  # Egress → Moira's admin API.
+  moira:
+    # Empty namespace means "same namespace as the console".
+    namespace: ""
+    podSelectorLabels:
+      app.kubernetes.io/name: moira
+    # Both the Service port and the container port. With iptables kube-proxy the
+    # Service DNAT happens before the egress policy is evaluated, so the packet
+    # the policy sees is usually already rewritten to the container port — but
+    # that is a proxy-implementation detail, not a guarantee. Allowing both
+    # avoids a policy that works on one CNI and silently blackholes on another.
+    ports:
+      - 8080
+      - 80
+  # Egress → the console's own PostgreSQL (CONSOLE_DATABASE_URL).
+  database:
+    port: 5432
+    cidrs:
+      - 0.0.0.0/0
+  # Egress → the IdP: OIDC discovery, the token endpoint, and JWKS. All HTTPS.
+  externalHttps:
+    enabled: true
+    port: 443
+    cidrs:
+      - 0.0.0.0/0
+    # The console fetches operator-supplied URLs (the generic-OIDC discovery
+    # URL), which is the classic SSRF-to-cloud-metadata shape. Moira has its own
+    # server-side SSRF guard for the URLs it stores; this is the network-layer
+    # backstop on the console side.
+    except:
+      - 169.254.0.0/16
+
+# Non-secret configuration, rendered into a ConfigMap and injected with
+# `envFrom`. NEVER put a secret here — `templates/_helpers.tpl` fails the render
+# if a secret-shaped key appears in this map (plans/08: "a rendered-manifest
+# assertion checks it is sourced from a Secret, never a ConfigMap").
+#
+# Key NAMES here are not free choices: `console/lib/env.ts` is the authority and
+# every required name below is the exact string it reads. `readConsoleEnv()`
+# throws `ConsoleConfigError` at boot on the first missing one, so a rename on
+# either side shows up as a crash-looping pod, not as a default.
+config:
+  NODE_ENV: "production"
+  NEXT_TELEMETRY_DISABLED: "1"
+  # Cluster-internal Moira admin API (env.ts: `moiraBaseUrl`). Not the public
+  # API hostname: console → Moira travels over service DNS and never leaves the
+  # cluster. Must still be https unless CONSOLE_ALLOW_INSECURE_URLS is on, which
+  # production forbids — so terminate TLS on the Moira service or front it with
+  # a mesh.
+  MOIRA_API_URL: "https://moira.default.svc.cluster.local"
+  # The console's own public origin (env.ts: `consoleOrigin`). Better Auth uses
+  # it as `baseURL` and as the sole `trustedOrigins` entry, which is its CSRF
+  # mechanism — so a wrong value here does not degrade gracefully, it breaks
+  # sign-in.
+  CONSOLE_PUBLIC_ORIGIN: "https://console.example.com"
+  # `iss` on every token the console mints, and the issuer registered in
+  # `trusted_jwt_issuers`. OPTIONAL in env.ts, where it defaults to
+  # CONSOLE_PUBLIC_ORIGIN; set here explicitly so the registered issuer is a
+  # written-down value rather than a derived one.
+  MOIRA_BFF_ISSUER_URL: "https://console.example.com"
+  # Must be non-empty: Moira skips audience validation entirely when a trusted
+  # issuer's `expected_audiences` is empty, so an empty value here silently
+  # turns off a check rather than failing loudly.
+  MOIRA_ADMIN_API_AUDIENCE: "moira-admin"
+  # Fixture-only knob; env.ts refuses it outright under NODE_ENV=production, and
+  # `_helpers.tpl` refuses that combination at render time so it never reaches a
+  # cluster.
+  CONSOLE_ALLOW_INSECURE_URLS: "false"
+  #
+  # DELIBERATELY ABSENT from this map:
+  #
+  # jwks_url — there is no environment variable for it. env.ts derives it as
+  #   `${consoleOrigin}/api/auth/.well-known/jwks.json` and comments that it is
+  #   "never independently configurable, because a jwks_url that does not point
+  #   at the document the console actually serves is a deployment that
+  #   authenticates nothing". Adding a MOIRA_BFF_JWKS_URL key here would create
+  #   exactly the drift that derivation exists to prevent. plans/08 Wave 0 still
+  #   requires the registered URL to be *observed* — verify with
+  #   `curl https://<CONSOLE_PUBLIC_ORIGIN>/api/auth/.well-known/jwks.json`.
+  #
+  # ALLOWED_CONSOLE_HOSTS — named in plans/08 §"Deployment implications", but
+  #   nothing in `console/` reads it today (grep: zero consumers outside the
+  #   plan text). Shipping a config key no code reads is how a chart teaches
+  #   operators to set values that do nothing. Add it back the moment a host
+  #   allow-list lands in middleware.
+  #
+  # MOIRA_ADMIN_MODE — Mode A (per-request Bearer token from the jwt plugin) is
+  #   the default and the only mode this chart configures. Setting
+  #   MOIRA_ADMIN_MODE=system_key makes the bootstrap system key the credential
+  #   for *every* admin call, which plans/08 §"Mode A vs Mode B" makes an
+  #   explicit, documented ops decision — opted into by hand, never inherited
+  #   from a chart default.
+
+# Reject a plain `http://` CONSOLE_PUBLIC_ORIGIN at render time. Only turn this
+# on for a local cluster: over plain HTTP the session cookie's `secure`
+# attribute cannot hold and the console's CSRF origin check is worth much less.
+# The console enforces the same rule again at boot via CONSOLE_ALLOW_INSECURE_URLS.
+allowInsecureConsoleOrigin: false
+
+# The chart does NOT create this Secret. It must already exist and must carry:
+#   BETTER_AUTH_SECRET             session/cookie signing key, 32+ bytes
+#   CONSOLE_SECRET_ENCRYPTION_KEY  32 raw bytes, base64 — encrypts the OAuth
+#                                  client secret at rest in the console DB
+#   CONSOLE_DATABASE_URL           the console's own PostgreSQL DSN
+#   MOIRA_SYSTEM_KEY               bootstrap system key, setup-time only
+#
+# The OAuth client secret itself is NOT here and is not a chart value at all: it
+# is entered in the setup wizard and stored encrypted in the console's database
+# (plans/08 D7). It must never appear in a Secret, a ConfigMap, an env var or
+# the image.
+#
+# `create: true` writes secret material into a values file in plaintext. It
+# exists for ephemeral test namespaces only.
+secret:
+  create: false
+  name: moira-console-secrets
+  data: {}
+
+# Better Auth schema migration, as a pre-install/pre-upgrade hook.
+#
+# DISABLED BY DEFAULT, and that is not an oversight. The migration is run by
+# `@better-auth/cli migrate`, which is a devDependency: it is not in
+# `.next/standalone`, and the runtime image is distroless — no shell, no package
+# manager, no `bunx`. So there is no command the *runtime* image can run to
+# perform this migration, and a job that defaults to the runtime image would
+# fail at deploy time, which is exactly the class of bug this chart is trying
+# not to ship.
+#
+# To enable, supply an image that contains the CLI and its dependencies (a build
+# stage of `console/Dockerfile` published under its own tag is the usual answer)
+# and an explicit command. The render FAILS rather than guessing if you enable
+# this without a command.
+migrationJob:
+  enabled: false
+  image:
+    repository: ""
+    tag: ""
+    pullPolicy: IfNotPresent
+  command: []
+  args: []
+  backoffLimit: 3
+
+# Writable mounts required by `readOnlyRootFilesystem: true` — see
+# `templates/deployment.yaml` for why each one is not optional.
+volumes:
+  nextCache:
+    sizeLimit: 512Mi
+  tmp:
+    sizeLimit: 64Mi
+
+probes:
+  # Both point at the same route today. They are separate values because they
+  # must be able to diverge without a template edit: `/api/health` also checks
+  # Moira reachability, and a *liveness* probe that fails when a downstream is
+  # down restarts a healthy pod for someone else's outage. `failureThreshold`
+  # below is generous for that reason.
+  #
+  # REVERSE THIS — split liveness onto a dependency-free route — the moment
+  # `console/app/api/health/route.ts` starts returning non-2xx when Moira is
+  # unreachable. Set `probes.liveness.path` to that route; no template change.
+  readiness:
+    path: /api/health
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  liveness:
+    path: /api/health
+    initialDelaySeconds: 15
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 6
+  startup:
+    enabled: true
+    path: /api/health
+    periodSeconds: 2
+    failureThreshold: 45
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}

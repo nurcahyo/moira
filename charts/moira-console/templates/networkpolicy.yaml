@@ -1,0 +1,85 @@
+{{- if .Values.networkPolicy.enabled }}
+# The console is the internet-facing half of the system, so this policy matters
+# more here than it does for Moira: it is the pod that an external attacker can
+# reach first, and it is the pod holding the console database credential, the
+# bootstrap system key and the key that decrypts the OAuth client secret.
+#
+# Egress is enumerated rather than opened, and the enumeration is exactly what
+# the console does: Moira's admin API, its own PostgreSQL, the IdP over HTTPS
+# (discovery, token, JWKS), and DNS. Nothing else — in particular no plaintext
+# HTTP egress at all, and no egress to the cloud metadata endpoint.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "moira-console.fullname" . }}
+  labels:
+    {{- include "moira-console.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "moira-console.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Every legitimate request arrives through the ingress controller, so the
+    # narrowest correct rule names that controller's namespace. See
+    # `networkPolicy.ingressFrom` in values.yaml for how to narrow it.
+    - from:
+        {{- toYaml .Values.networkPolicy.ingressFrom | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.containerPort }}
+  egress:
+    # DNS.
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Moira's admin API, by pod selector rather than by CIDR so that the rule
+    # keeps meaning something when pod IPs churn.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.moira.podSelectorLabels | nindent 14 }}
+          {{- if .Values.networkPolicy.moira.namespace }}
+          namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.moira.namespace }}
+          {{- end }}
+      ports:
+        {{- range .Values.networkPolicy.moira.ports }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+    # The console's own PostgreSQL (CONSOLE_DATABASE_URL). A separate database
+    # from Moira's, with no grants on Moira's tables.
+    - to:
+        {{- range .Values.networkPolicy.database.cidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.database.port }}
+    {{- if .Values.networkPolicy.externalHttps.enabled }}
+    # The IdP: OIDC discovery, the token endpoint, and the provider's JWKS.
+    # HTTPS only, with the link-local range excepted so that an SSRF through the
+    # operator-supplied discovery URL cannot reach cloud instance metadata.
+    - to:
+        {{- range .Values.networkPolicy.externalHttps.cidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+            {{- with $.Values.networkPolicy.externalHttps.except }}
+            except:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.externalHttps.port }}
+    {{- end }}
+{{- end }}

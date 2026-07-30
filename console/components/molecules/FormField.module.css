@@ -1,0 +1,28 @@
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.375rem;
+}
+
+.hint {
+  margin: 0;
+  font-size: 0.8125rem;
+  color: #6b7280;
+}
+
+.error {
+  margin: 0;
+  font-size: 0.8125rem;
+  color: #dc2626;
+  font-weight: 500;
+}
+
+@media (prefers-color-scheme: dark) {
+  .hint {
+    color: #9ca3af;
+  }
+
+  .error {
+    color: #f87171;
+  }
+}

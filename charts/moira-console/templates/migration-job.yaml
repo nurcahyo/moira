@@ -1,0 +1,84 @@
+{{- if .Values.migrationJob.enabled }}
+{{- include "moira-console.validate" . }}
+# Better Auth schema migration against CONSOLE_DATABASE_URL, as a
+# pre-install/pre-upgrade hook — the console-side equivalent of
+# charts/moira/templates/migration-job.yaml.
+#
+# DISABLED BY DEFAULT. `@better-auth/cli migrate` is a devDependency; it is not
+# traced into `.next/standalone` and the distroless runtime image has no shell
+# and no package manager to fetch it. So there is no command the shipped runtime
+# image can run to perform this migration, and defaulting to one would produce a
+# job that fails at deploy time — the same class of bug as a uid mismatch, and
+# equally invisible to CI. `migrationJob.command` is therefore required, and
+# `_helpers.tpl` fails the render without it rather than guessing.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "moira-console.fullname" . }}-migrate
+  labels:
+    {{- include "moira-console.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.migrationJob.backoffLimit }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "moira-console.name" . }}-migrate
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        # MUST match templates/deployment.yaml and the image this job actually
+        # runs. 65532 is the `nonroot` user of the distroless Node base image.
+        # If `migrationJob.image` points at a DIFFERENT image (the usual case —
+        # a build stage that still contains @better-auth/cli), confirm that
+        # image's non-root uid and override these three values together. A job
+        # asking for a uid its image does not define fails at container start,
+        # not in CI. Plan 07 shipped exactly this mismatch once.
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: {{ include "moira-console.migrationImage" . | quote }}
+          imagePullPolicy: {{ .Values.migrationJob.image.pullPolicy }}
+          command:
+            {{- toYaml .Values.migrationJob.command | nindent 12 }}
+          {{- with .Values.migrationJob.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          # CONSOLE_DATABASE_URL only — the migration needs the database and
+          # nothing else. It does not get MOIRA_SYSTEM_KEY or the encryption key.
+          env:
+            - name: CONSOLE_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secret.name }}
+                  key: CONSOLE_DATABASE_URL
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.volumes.tmp.sizeLimit }}
+{{- end }}
