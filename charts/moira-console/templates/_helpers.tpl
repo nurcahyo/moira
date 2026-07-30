@@ -144,7 +144,7 @@ key in a ConfigMap or points a PodDisruptionBudget at more replicas than exist.
 {{/* --- migration job ------------------------------------------------------ */}}
 {{- if .Values.migrationJob.enabled -}}
   {{- if not .Values.migrationJob.command -}}
-  {{- fail "migrationJob.enabled=true requires an explicit migrationJob.command: the runtime image is distroless and contains no shell and no @better-auth/cli, so there is nothing sensible to default to" -}}
+  {{- fail "migrationJob.enabled=true requires an explicit migrationJob.command: the runtime image is distroless and contains no shell and no bun, so there is nothing sensible to default to. Publish the build stage of console/Dockerfile and use [\"bun\", \"run\", \"db/migrate.ts\"]" -}}
   {{- end -}}
 {{- end -}}
 

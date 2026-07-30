@@ -58,10 +58,39 @@ import {
   type ResolvedAuthConfig,
 } from "./auth-config";
 import { createConsoleAuth, type ConsoleAuth, type ConsoleAuthDatabase } from "./auth";
+import { consoleDatabase, hasConsoleDatabase } from "./console-db";
 import { InMemoryConsoleSecretStore, type ConsoleSecretStore } from "./console-secrets";
+import { PostgresConsoleSecretStore } from "./console-secrets-postgres";
 import { consoleEnv, type ConsoleEnv } from "./env";
 import { MoiraClient } from "./moira-client";
 import { moiraClientForSetup } from "./moira-session";
+
+/* -------------------------------------------------------------------------- */
+/* Storage selection                                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Which storage the process is running on.
+ *
+ * Exported because it is the single thing an operator most needs to be able to
+ * ask, and because a health endpoint reporting "durable" is a much better
+ * signal than discovering after a restart that it was not.
+ */
+export type ConsoleStorageMode = "durable" | "ephemeral";
+
+/**
+ * The decision, in one place.
+ *
+ * `lib/env.ts` has already refused to boot a production process without a
+ * configured database, so `"ephemeral"` here is only ever a development or test
+ * process. Both halves — the Better Auth adapter and the secret store — are
+ * chosen from the SAME answer: a process with a durable session store but an
+ * in-memory secret store, or the reverse, is a configuration nobody asked for
+ * and every failure mode of both.
+ */
+export function consoleStorageMode(env: ConsoleEnv = consoleEnv()): ConsoleStorageMode {
+  return hasConsoleDatabase(env) ? "durable" : "ephemeral";
+}
 
 /* -------------------------------------------------------------------------- */
 /* Process singletons                                                         */
@@ -71,7 +100,13 @@ let secretStore: ConsoleSecretStore | undefined;
 
 /** The console's OAuth client-secret store (D7). */
 export function consoleSecretStore(env: ConsoleEnv = consoleEnv()): ConsoleSecretStore {
-  secretStore ??= new InMemoryConsoleSecretStore(env.secretEncryptionKey);
+  if (secretStore === undefined) {
+    const pool = consoleDatabase(env);
+    secretStore =
+      pool === null
+        ? new InMemoryConsoleSecretStore(env.secretEncryptionKey)
+        : new PostgresConsoleSecretStore(pool, env.secretEncryptionKey);
+  }
   return secretStore;
 }
 
@@ -81,7 +116,11 @@ let snapshot: ResolvedAuthConfig | undefined;
 /** The memoised instance, keyed by the configuration digest. */
 let cachedAuth: { readonly cacheKey: string; readonly auth: ConsoleAuth } | undefined;
 
-/** Injected by tests; `undefined` means Better Auth's in-memory adapter. */
+/**
+ * Injected by tests. `undefined` means "decide from the environment" — the
+ * console's own pool when `CONSOLE_DATABASE_URL` is set, Better Auth's
+ * in-memory adapter otherwise.
+ */
 let databaseOverride: ConsoleAuthDatabase | undefined;
 
 export interface ConsoleRuntimeOverrides {
@@ -152,10 +191,16 @@ export async function consoleRuntime(env: ConsoleEnv = consoleEnv()): Promise<Co
     return { ok: true, auth: cachedAuth.auth, config };
   }
 
+  // The pool doubles as Better Auth's `database`: `createKyselyAdapter` detects
+  // a `pg.Pool` by its `connect` method and wraps it in Kysely's
+  // `PostgresDialect`. One pool serves both the session tables and
+  // `console_provider_secret`, so the console holds one connection budget, not
+  // two.
+  const database = databaseOverride ?? consoleDatabase(env) ?? undefined;
   const auth = createConsoleAuth({
     env,
     config,
-    ...(databaseOverride === undefined ? {} : { database: databaseOverride }),
+    ...(database === undefined ? {} : { database: database as ConsoleAuthDatabase }),
   });
   // One instance only. A map keyed by digest would keep a rotated client secret
   // alive in memory after it was replaced.

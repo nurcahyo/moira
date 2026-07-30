@@ -27,10 +27,11 @@
 // Better Auth's default `sub` is `session.user.id`: a value this console
 // generates and stores in its OWN database. Using it would mean the grant is
 // keyed to a row in the console's database rather than to a human — and losing
-// that database (a restart, with the in-memory store this wave ships; a restore
-// from an older backup, with any store) would orphan every admin grant. There is
-// no recovery from that, because a second claim is refused
-// `409 admin_identity_already_claimed`.
+// that database (a restore from an older backup; a restart, on the ephemeral
+// development path) would orphan every admin grant. There is no recovery from
+// that, because a second claim is refused `409 admin_identity_already_claimed`.
+// Durable storage reduces how often that can happen; it does not change the
+// argument, which is why `sub` still comes from the IdP.
 //
 // So `sub` is the IDP's stable subject, read from `account.accountId` — the
 // column Better Auth itself populates from the provider's `sub` on every OAuth
@@ -92,12 +93,16 @@ export type ConsoleAuthDatabase = Parameters<typeof betterAuth>[0]["database"];
  *   user, session, account   Better Auth core
  *   verification             the OAuth `state`/PKCE record
  *   jwks                     the jwt plugin's ES256 key pair
+ *   rateLimit                required by `rateLimit.storage: "database"` below
  *
  * A durable adapter runs migrations instead and needs none of this; this
  * function exists solely because the in-memory path has no migration step.
+ * Adding a plugin or an option that introduces a table means adding it here as
+ * well, or the ephemeral path fails on first use with a database error several
+ * redirects into the OAuth flow.
  */
 export function createConsoleMemoryDatabase(): Record<string, unknown[]> {
-  return { user: [], session: [], account: [], verification: [], jwks: [] };
+  return { user: [], session: [], account: [], verification: [], jwks: [], rateLimit: [] };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -160,18 +165,25 @@ export interface ConsoleAuthDeps {
   readonly env: ConsoleEnv;
   readonly config: ResolvedAuthConfig;
   /**
-   * Defaults to Better Auth's in-memory adapter.
+   * The durable store, or omitted for Better Auth's in-memory adapter.
    *
-   * DELIBERATE SCOPE LIMIT. A durable adapter needs a database, and none is
-   * available to this wave — see `console-secrets.ts` for the same reasoning and
-   * the same consequences. The specific extra cost here is that the jwt plugin
-   * stores its ES256 key pair in this database: with the memory adapter the key
-   * pair is regenerated on every process start, so the JWKS document Moira
-   * fetched a minute ago stops verifying newly minted tokens until Moira
-   * re-fetches. That makes the memory path single-replica and restart-sensitive.
+   * `lib/auth-runtime.ts` supplies the console's own `pg.Pool` whenever
+   * `CONSOLE_DATABASE_URL` is set, which `lib/env.ts` makes mandatory under
+   * `NODE_ENV=production`. Better Auth's `createKyselyAdapter` recognises a
+   * `pg.Pool` by its `connect` method and wraps it in Kysely's
+   * `PostgresDialect`; no dialect has to be constructed here.
    *
-   * REVERSAL CONDITION: supply a Kysely dialect over the `console_auth`
-   * database here and the restriction disappears; no other code changes.
+   * WHY IT MATTERS THAT THIS IS DURABLE. The jwt plugin stores its ES256 key
+   * pair in this database. With the memory adapter the key pair is regenerated
+   * on every process start, so the JWKS document Moira fetched a minute ago
+   * stops verifying newly minted tokens until Moira re-fetches — a restart
+   * becomes an outage of unbounded length, and two replicas publish two
+   * different JWKS documents. `tests/integration/console-jwks-stability.test.ts`
+   * demonstrates both halves across genuinely separate processes.
+   *
+   * The in-memory path remains, and is the default for `bun test` and
+   * `next dev`: a durable store that cannot be substituted would make every
+   * test that touches auth need a database.
    */
   readonly database?: ConsoleAuthDatabase;
 }
@@ -215,6 +227,22 @@ export function createConsoleAuth(deps: ConsoleAuthDeps) {
       // bound on how long a stolen cookie is useful.
       expiresIn: 60 * 60 * 8,
       updateAge: 60 * 15,
+    },
+
+    rateLimit: {
+      // Better Auth's default storage is `"memory"` (verified in
+      // `@better-auth/core`'s `create-context.mjs`: `storage:
+      // options.rateLimit?.storage || (secondaryStorage ? ... : "memory")`),
+      // and `enabled` defaults to `isProduction`. So the shipped default is a
+      // rate limiter that IS on in production and IS per process — which means
+      // the effective limit on the sign-in endpoints multiplies by the replica
+      // count, and a limit that depends on how many pods happen to be running
+      // is not the limit anyone configured.
+      //
+      // `"database"` puts the counters in the `rateLimit` table, shared by every
+      // replica. It costs one row per key per window. On the memory adapter the
+      // same table exists as an array — see `createConsoleMemoryDatabase`.
+      storage: "database",
     },
 
     advanced: {

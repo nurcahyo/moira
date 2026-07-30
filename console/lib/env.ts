@@ -67,10 +67,43 @@ export interface ConsoleEnv {
   /** `aud`. Must be non-empty: an empty `expected_audiences` makes Moira skip
    *  audience validation entirely, which is strictly worse than no audience. */
   readonly adminApiAudience: string;
-  /** Better Auth's signing/encryption secret for session material. */
+  /**
+   * Better Auth's signing/encryption secret for session material.
+   *
+   * ALSO the key that encrypts the jwt plugin's ES256 PRIVATE key before it is
+   * written to the `jwks` table (better-auth 1.6.25 `plugins/jwt/utils.ts`:
+   * encryption is on unless `jwks.disablePrivateKeyEncryption` is set, and this
+   * console does not set it).
+   *
+   * ROTATING THIS AGAINST A DURABLE DATABASE IS NOT SAFE, and it fails in the
+   * worst available shape. `getJwks` serves the plaintext `publicKey` column,
+   * so the JWKS document is UNCHANGED and Moira's cached copy stays valid;
+   * `signJWT` has to decrypt the private half and raises "Failed to decrypt
+   * private key". It does not regenerate: a key that cannot be decrypted is not
+   * a missing key. The console keeps publishing a JWKS it can no longer sign
+   * for, sign-in still works, and every minted-token call fails with nothing
+   * pointing at the cause.
+   *
+   * Treat it as durable deployment state. Rotating it deliberately means
+   * deleting the `jwks` rows in the same operation — see
+   * `docs/console-storage.md`. Demonstrated by
+   * `tests/integration/console-jwks-stability.test.ts`.
+   */
   readonly betterAuthSecret: string;
   /** 32 raw bytes. Seals the console-owned OAuth client secret at rest (D7). */
   readonly secretEncryptionKey: Buffer;
+  /**
+   * The console's OWN PostgreSQL database. Never Moira's — see
+   * `lib/console-db.ts` for why sharing one database is not an option.
+   *
+   * `undefined` is permitted outside production and means the ephemeral path:
+   * Better Auth's `memoryAdapter` plus `InMemoryConsoleSecretStore`, which is
+   * what keeps `bun test` and `next dev` runnable without a database. Under
+   * `NODE_ENV=production` it is a hard boot failure, because the ephemeral path
+   * silently costs secret durability, a stable JWKS, and `replicaCount > 1` —
+   * none of which announces itself when it is missing.
+   */
+  readonly consoleDatabaseUrl: string | undefined;
   /**
    * Permits `http://` origins and loopback hosts. Dev fixtures only.
    *
@@ -157,6 +190,62 @@ function checkAbsoluteUrl(
   }
 }
 
+/**
+ * Validate `CONSOLE_DATABASE_URL`.
+ *
+ * Shape only — no connection is attempted, because boot-time validation must
+ * not depend on a database being reachable at that instant. A typo'd scheme or
+ * a DSN with no database name is caught here; an unreachable host surfaces on
+ * first use, where it can be retried.
+ *
+ * Every message below prints the *variable name*, never the value: a DSN
+ * carries its password inline, and a `ConsoleConfigError` is printed to a log.
+ */
+function checkDatabaseUrl(
+  value: string | undefined,
+  nodeEnv: ConsoleEnv["nodeEnv"],
+  problems: string[],
+): string | undefined {
+  if (value === undefined) {
+    if (nodeEnv === "production") {
+      problems.push(
+        "CONSOLE_DATABASE_URL is required in production. Without it the console runs on " +
+          "in-memory storage: the OAuth client secret and the Better Auth ES256 signing key " +
+          "are lost on every restart, and a second replica publishes a different JWKS. " +
+          "Point it at the console's OWN database (never Moira's) and apply " +
+          "`console/db/migrations` with `bun run db:migrate`.",
+      );
+    }
+    return undefined;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    problems.push("CONSOLE_DATABASE_URL is not a valid connection string URL");
+    return undefined;
+  }
+  if (parsed.protocol !== "postgres:" && parsed.protocol !== "postgresql:") {
+    problems.push(
+      `CONSOLE_DATABASE_URL must be a postgres:// or postgresql:// URL (got ${parsed.protocol}//)`,
+    );
+    return undefined;
+  }
+  if (parsed.hostname === "") {
+    problems.push("CONSOLE_DATABASE_URL has no host");
+    return undefined;
+  }
+  if (parsed.pathname.replace(/^\//, "") === "") {
+    problems.push(
+      "CONSOLE_DATABASE_URL names no database. It must be the console's own database, " +
+        "separate from Moira's — the two keep independent migration ledgers.",
+    );
+    return undefined;
+  }
+  return value;
+}
+
 function parseNodeEnv(value: string | undefined): ConsoleEnv["nodeEnv"] {
   if (value === "production" || value === "test") return value;
   return "development";
@@ -205,6 +294,11 @@ export const NEVER_PUBLIC_ENV_NAMES = [
   "BETTER_AUTH_SECRET",
   "CONSOLE_SECRET_ENCRYPTION_KEY",
   "CONSOLE_OAUTH_CLIENT_SECRET",
+  // A DSN carries the database password inline. Its name matches none of the
+  // SECRET/KEY/TOKEN patterns the leak harness harvests on, so it has to be
+  // named here explicitly — see `e2e/support/secrets.ts`, which extracts the
+  // password half as a needle for the same reason.
+  "CONSOLE_DATABASE_URL",
 ] as const;
 
 function checkNothingIsPublic(source: EnvSource, problems: string[]): void {
@@ -258,6 +352,12 @@ export function readConsoleEnv(source: EnvSource): ConsoleEnv {
     problems,
   );
 
+  const consoleDatabaseUrl = checkDatabaseUrl(
+    optional(source, "CONSOLE_DATABASE_URL"),
+    nodeEnv,
+    problems,
+  );
+
   checkNothingIsPublic(source, problems);
 
   if (problems.length > 0) throw new ConsoleConfigError(problems);
@@ -272,6 +372,7 @@ export function readConsoleEnv(source: EnvSource): ConsoleEnv {
     adminApiAudience,
     betterAuthSecret,
     secretEncryptionKey,
+    consoleDatabaseUrl,
     allowInsecureUrls,
   };
 }

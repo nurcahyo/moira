@@ -84,6 +84,18 @@ server-side call, because it carries `allowed_email_domains` — the
 deny-by-default admin-claim policy, which must not be published to an
 anonymous caller. See `docs/admin-identity-claiming.md`.
 
+## The console's own database (implemented)
+
+The console has a PostgreSQL database of its own, `CONSOLE_DATABASE_URL`, holding
+Better Auth's session tables, the `jwt` plugin's ES256 key pair, Better Auth's
+rate-limit counters, and the sealed OAuth client secret. It is separate from
+Moira's database and has its own migrations under `console/db/migrations/`.
+
+**See `docs/console-storage.md`** for the table inventory, the migration
+commands, and the rotation runbooks for the two keys the database depends on —
+in particular the non-obvious one: rotating `BETTER_AUTH_SECRET` against a
+durable database leaves the console publishing a JWKS it can no longer sign for.
+
 ## Client secret custody (design decision D7)
 
 The OAuth client secret is planned to be owned by the **console**, stored

@@ -1,16 +1,22 @@
 {{- if .Values.migrationJob.enabled }}
 {{- include "moira-console.validate" . }}
-# Better Auth schema migration against CONSOLE_DATABASE_URL, as a
+# Console schema migration against CONSOLE_DATABASE_URL, as a
 # pre-install/pre-upgrade hook — the console-side equivalent of
 # charts/moira/templates/migration-job.yaml.
 #
-# DISABLED BY DEFAULT. `@better-auth/cli migrate` is a devDependency; it is not
-# traced into `.next/standalone` and the distroless runtime image has no shell
-# and no package manager to fetch it. So there is no command the shipped runtime
-# image can run to perform this migration, and defaulting to one would produce a
-# job that fails at deploy time — the same class of bug as a uid mismatch, and
-# equally invisible to CI. `migrationJob.command` is therefore required, and
+# The migration is `bun run db/migrate.ts` (console/db/migrate.ts), NOT
+# `@better-auth/cli migrate`: there is no `@better-auth/cli` for the pinned
+# better-auth 1.6 line — see the note on `migrationJob` in values.yaml.
+#
+# DISABLED BY DEFAULT. The distroless runtime image has no shell, no package
+# manager and no `bun`, so there is no command the shipped runtime image can run
+# to perform this migration, and defaulting to one would produce a job that
+# fails at deploy time — the same class of bug as a uid mismatch, and equally
+# invisible to CI. `migrationJob.command` is therefore required, and
 # `_helpers.tpl` fails the render without it rather than guessing.
+#
+# The runner takes a `pg_advisory_lock`, so a hook that races another hook (or a
+# developer running the same command) serialises rather than double-applying.
 apiVersion: batch/v1
 kind: Job
 metadata:

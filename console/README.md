@@ -34,12 +34,36 @@ bun test                        # unit tests (bun:test) — includes the layerin
                                  # test at architecture.test.ts
 
 bun run e2e                     # Playwright end-to-end tests
+
+bun run db:migrate              # apply console/db/migrations to $CONSOLE_DATABASE_URL
+bun run db:check                # report pending migrations, exit 1, change nothing
+bun run db:generate             # emit the DDL better-auth wants and the database lacks
 ```
 
 All of the above run against Node 24.x (`.nvmrc`) and Bun 1.3.14
 (`packageManager` in `package.json`). CI must use `bun install
 --frozen-lockfile` — never a bare `bun install` that could silently drift
 the lockfile.
+
+## The console's own database
+
+`CONSOLE_DATABASE_URL` names a PostgreSQL database belonging to the console —
+**never Moira's**. It holds Better Auth's session tables, the `jwt` plugin's
+ES256 key pair, Better Auth's rate-limit counters, and the sealed OAuth client
+secret. `console/db/` owns its schema; `docs/console-storage.md` is the
+operator runbook, including the two key-rotation procedures.
+
+It is **required under `NODE_ENV=production`** and optional elsewhere. Omitting
+it selects the ephemeral path (Better Auth's `memoryAdapter` +
+`InMemoryConsoleSecretStore`), which is what lets `bun test` and `next dev` run
+with no database at all.
+
+The database-backed tests are **not** skipped when no URL is configured — they
+default to `postgres://postgres:postgres@127.0.0.1:5432/console_auth_test`
+(creating the database if needed) and fail loudly if PostgreSQL is unreachable.
+`CONSOLE_TEST_DATABASE_URL` overrides it. `CONSOLE_SKIP_DB_TESTS=1` disables
+them and **reds** `tests/integration/console-db-availability.test.ts` on
+purpose: a suite that silently disables itself is worse than one that is red.
 
 ## Atomic Design layering (mandatory — `plans/CONVENTIONS.md` §6)
 
