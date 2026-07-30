@@ -472,14 +472,24 @@ impl<'a> AdminIdentityService<'a> {
         ctx: &RequestContext,
         request: AdminInviteRedeemRequest,
     ) -> Result<(AdminIdentityRecord, bool), AppError> {
-        let invite = self.resolve_invite(&request.token).await?;
-        require_redeemable(&invite)?;
+        let invite = self
+            .resolve_invite(&request.token)
+            .await
+            .map_err(|error| self.denied(error))?;
+        // Every refusal on this path goes through `denied`, including these two.
+        // They previously returned with a bare `?`, which left five of the twelve
+        // `ADMIN_INVITE_OUTCOMES` label values — `expired`, `consumed`, `revoked`,
+        // `email_mismatch`, `domain_mismatch` — seeded at zero and unreachable by any
+        // code path. A label with no emitter is the metrics equivalent of a catalog key
+        // with none, and it fails in the direction that matters: an operator alerting on
+        // "invitations are being refused" would have watched a flat line.
+        require_redeemable(&invite).map_err(|error| self.denied(error))?;
 
         // Plan 07 decision D5: `email`/`email_verified` are required by the DTO, so an
         // omitted field is a schema violation the extractor rejects. What survives to
         // here is a present-but-unusable value, and the *invite's own* constraint.
         let email = request.email.trim();
-        evaluate_invite_constraint(&invite, email)?;
+        evaluate_invite_constraint(&invite, email).map_err(|error| self.denied(error))?;
 
         // The redeem token's issuer must be a registered, active trusted JWT issuer —
         // the same rule `claim` applies to its target issuer. `verify_trusted_jwt_identity`
@@ -507,10 +517,7 @@ impl<'a> AdminIdentityService<'a> {
             .governing_policy(&identity.issuer, trusted_jwt_issuer_id)
             .await?;
         if let Err(error) = evaluate_claim_policy(email, request.email_verified, policy.as_ref()) {
-            self.state
-                .metrics
-                .record_admin_invite_denied(denial_reason(&error));
-            return Err(error);
+            return Err(self.denied(error));
         }
 
         let grant_id = Uuid::now_v7();
@@ -794,12 +801,38 @@ impl<'a> AdminIdentityService<'a> {
         }
     }
 
+    /// Counts a refused redemption, then hands the error straight back.
+    ///
+    /// Every refusal on the redeem path funnels through here so that
+    /// `moira_admin_invite_outcomes_total` and the error catalog cannot drift: the label
+    /// is derived from the error **code** by [`denial_reason`], so a refusal that returns
+    /// through this function is counted under a bounded label or under `other`, and never
+    /// under a label value nothing emits.
+    ///
+    /// Takes and returns the error rather than borrowing it, so the call site reads
+    /// `Err(self.denied(error))` / `.map_err(|error| self.denied(error))` and a refusal
+    /// that skips it is visible as a bare `?` in review.
+    fn denied(&self, error: AppError) -> AppError {
+        self.state
+            .metrics
+            .record_admin_invite_denied(denial_reason(&error));
+        error
+    }
+
     /// Prefix-lookup-then-verify, the same shape `AuthService::verify_api_key` uses.
     ///
     /// The Argon2id hash is not searchable, so the indexed `token_prefix` selects at
     /// most one live row and the hash then proves the presented token really is that
     /// row's. A prefix match on its own proves nothing — the prefix is a plaintext
     /// substring of the token — which is why the verification is not optional here.
+    /// # It records nothing
+    ///
+    /// `moira_admin_invite_outcomes_total` counts **redemption** outcomes, and this
+    /// function serves the anonymous preview too. Counting here made a visitor opening a
+    /// stale link — or a scanner probing the endpoint — indistinguishable from a failed
+    /// redemption on the operator's dashboard. The redeem path wraps this call in
+    /// [`Self::denied`] instead, so the counter has exactly one increment per refused
+    /// redemption and none per preview.
     async fn resolve_invite(&self, token: &str) -> Result<AdminInviteRow, AppError> {
         let token = token.trim();
         if token.is_empty() {
@@ -807,13 +840,11 @@ impl<'a> AdminIdentityService<'a> {
         }
         let prefix = self.state.key_hasher.prefix(token);
         let Some(candidate) = self.identities.find_invite_by_prefix(&prefix).await? else {
-            self.state.metrics.record_admin_invite_denied("not_found");
             return Err(invite_not_found());
         };
         if self.state.key_hasher.verify(token, &candidate.token_hash)? {
             Ok(candidate.record)
         } else {
-            self.state.metrics.record_admin_invite_denied("not_found");
             Err(invite_not_found())
         }
     }

@@ -29,18 +29,23 @@
 
 mod support;
 
+use std::sync::Arc;
+
 use axum::{
     Router,
     body::{Body, to_bytes},
     http::{HeaderMap, Request, StatusCode},
 };
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use moira::{app::AppState, config::Settings};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use support::LifecycleFixture;
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{net::TcpListener, sync::Barrier, task::JoinHandle};
 use tower::ServiceExt;
 use uuid::Uuid;
+
+const INVITE_OUTCOMES: &str = "moira_admin_invite_outcomes_total";
 
 /// The same key material `tests/identity_claim.rs` uses.
 ///
@@ -190,6 +195,41 @@ impl Drop for ConsoleIssuer {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+/// Scrapes the Prometheus exposition body and returns one sample's value.
+///
+/// `0.0` for an absent series rather than a panic, so an assertion reads as "this counter
+/// did not move" instead of "the family is missing" — the two are the same defect here,
+/// and every series in this family is seeded at zero anyway.
+///
+/// Matches the label *inside* the brace group rather than pinning the whole label set:
+/// the exporter is free to order labels as it likes and a deployment may carry global
+/// ones, and a needle that assumed `{outcome="…"}` was the entire set would read every
+/// series as absent — which is indistinguishable from "the counter is stuck" and would
+/// make the zero-valued premise below vacuous instead of load-bearing.
+fn counter_value(exposition: &str, family: &str, label: &str, value: &str) -> f64 {
+    let selector = format!("{label}=\"{value}\"");
+    exposition
+        .lines()
+        .filter_map(|line| line.strip_prefix(family))
+        .filter_map(|rest| rest.strip_prefix('{'))
+        .find_map(|rest| {
+            let (labels, amount) = rest.split_once('}')?;
+            labels.contains(&selector).then_some(amount)
+        })
+        .and_then(|amount| amount.trim().parse().ok())
+        .unwrap_or(0.0)
+}
+
+/// Every exposition line belonging to `family`, for an assertion message that shows what
+/// was actually served instead of only what was expected.
+fn family_lines(exposition: &str, family: &str) -> String {
+    exposition
+        .lines()
+        .filter(|line| line.starts_with(family))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 async fn send(router: Router, request: Request<Body>) -> HttpResult {
@@ -398,6 +438,42 @@ async fn grant_count(pool: &PgPool) -> i64 {
 
 fn redeem_body(token: &str, email: &str) -> Value {
     json!({ "token": token, "email": email, "email_verified": true })
+}
+
+/// A second [`AppState`] on the fixture's own database, with Prometheus turned on.
+///
+/// [`LifecycleFixture`] leaves `telemetry.prometheus_enabled` at its hardened default of
+/// `false`, and flipping it there would change the state every other suite in the
+/// repository builds. This state is used by one test, drives every request that test
+/// makes, and therefore owns every counter that test reads — the recorder is per-`AppState`,
+/// so the counts cannot be contaminated by a neighbouring fixture.
+fn observable_state(pool: &PgPool) -> AppState {
+    let mut settings = Settings::default();
+    // The stub IdP lives on `http://127.0.0.1:0`, which the JWKS SSRF policy denies by
+    // design; the same dev-only escape hatch `LifecycleFixture` uses.
+    settings.auth.jwks.allow_insecure_dev_urls = true;
+    settings.telemetry.prometheus_enabled = true;
+    AppState::new(settings, Some(pool.clone())).expect("observable app state")
+}
+
+async fn scrape_metrics(router: Router) -> String {
+    let response = router
+        .oneshot(base("GET", "/metrics").body(Body::empty()).unwrap())
+        .await
+        .expect("HTTP response");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "/metrics is not enabled on this state"
+    );
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("metrics body");
+    String::from_utf8(bytes.to_vec()).expect("metrics body is UTF-8")
+}
+
+fn invite_outcome(exposition: &str, label: &str) -> f64 {
+    counter_value(exposition, INVITE_OUTCOMES, "outcome", label)
 }
 
 // ===========================================================================================
@@ -1102,4 +1178,499 @@ async fn an_invite_bound_to_another_address_is_refused_with_its_own_code_and_sta
         "pending",
         "a constraint mismatch consumed the invite"
     );
+}
+
+/// **Every refused redemption lands in the counter, and nothing else does.**
+///
+/// Five of the twelve `ADMIN_INVITE_OUTCOMES` label values — `expired`, `consumed`,
+/// `revoked`, `email_mismatch`, `domain_mismatch` — were seeded at zero and emitted by
+/// nothing: `require_redeemable` and `evaluate_invite_constraint` both returned with a
+/// bare `?`, before any recorder call. An operator alerting on "invitations are being
+/// refused" would have watched a flat line through every one of those refusals.
+///
+/// The zero-valued premise below is what makes the assertion mean something: a counter
+/// that is absent and a counter that is stuck both read as `0.0` through
+/// [`counter_value`], so the test first proves the family is registered and each series
+/// starts at zero, then proves each one moves by exactly one.
+///
+/// The preview half is the other direction. `resolve_invite` used to record `not_found`
+/// itself, and it serves the *anonymous* preview too — so a visitor opening a stale link,
+/// or a scanner probing the endpoint, was indistinguishable from a failed redemption on
+/// the dashboard.
+#[tokio::test]
+async fn every_refused_redemption_increments_a_bounded_counter_and_no_preview_does() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let issuer = ConsoleIssuer::start(&fixture.pool).await;
+    let router = moira::build_router(observable_state(&fixture.pool)).expect("router");
+    let (provider_id, _) = configure_and_enable_policy(
+        &router,
+        PolicyBinding::ByIssuerString(&issuer.issuer),
+        &["example.com"],
+    )
+    .await;
+    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+
+    const REASONS: &[&str] = &[
+        "not_found",
+        "expired",
+        "revoked",
+        "email_mismatch",
+        "domain_mismatch",
+    ];
+    let before = scrape_metrics(router.clone()).await;
+    assert!(
+        before.contains(INVITE_OUTCOMES),
+        "the family must be registered before a zero reading means anything"
+    );
+    for reason in REASONS {
+        assert_eq!(
+            invite_outcome(&before, reason),
+            0.0,
+            "{reason} must start at zero"
+        );
+    }
+
+    // A preview refusal is a lookup, not a redemption outcome.
+    let previewed = post_json(
+        router.clone(),
+        "/api/v1/admin/admin-invites/preview",
+        HeaderMap::new(),
+        json!({ "token": "moira_inv_this-token-matches-nothing" }),
+    )
+    .await;
+    assert_eq!(
+        previewed.status,
+        StatusCode::NOT_FOUND,
+        "{:?}",
+        previewed.body
+    );
+    assert_eq!(
+        invite_outcome(&scrape_metrics(router.clone()).await, "not_found"),
+        0.0,
+        "an anonymous preview must not be counted as a failed redemption"
+    );
+
+    // 1 — not_found.
+    let unknown = post_json(
+        router.clone(),
+        "/api/v1/admin/admin-invites/redeem",
+        issuer.bearer("stranger"),
+        redeem_body(
+            "moira_inv_this-token-matches-nothing",
+            "stranger@example.com",
+        ),
+    )
+    .await;
+    assert_eq!(unknown.status, StatusCode::NOT_FOUND, "{:?}", unknown.body);
+    assert_eq!(unknown.code(), "invite_not_found");
+
+    // 2 — expired.
+    let (expired_id, expired_token) = create_invite(&router, "domain", "example.com").await;
+    sqlx::query("update admin_invites set expires_at = now() - interval '1 hour' where id = $1")
+        .bind(expired_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("backdate the invite expiry");
+    let expired = post_json(
+        router.clone(),
+        "/api/v1/admin/admin-invites/redeem",
+        issuer.bearer("late"),
+        redeem_body(&expired_token, "late@example.com"),
+    )
+    .await;
+    assert_eq!(expired.code(), "invite_expired", "{:?}", expired.body);
+
+    // 3 — revoked.
+    let (revoked_id, revoked_token) = create_invite(&router, "domain", "example.com").await;
+    let revoked = post_json(
+        router.clone(),
+        &format!("/api/v1/admin/admin-invites/{revoked_id}/revoke"),
+        HeaderMap::new(),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(revoked.status, StatusCode::OK, "{:?}", revoked.body);
+    let refused = post_json(
+        router.clone(),
+        "/api/v1/admin/admin-invites/redeem",
+        issuer.bearer("withdrawn"),
+        redeem_body(&revoked_token, "withdrawn@example.com"),
+    )
+    .await;
+    assert_eq!(refused.code(), "invite_revoked", "{:?}", refused.body);
+
+    // 4 — email_mismatch.
+    let (_, bound_token) = create_invite(&router, "email", "intended@example.com").await;
+    let mismatch = post_json(
+        router.clone(),
+        "/api/v1/admin/admin-invites/redeem",
+        issuer.bearer("interloper"),
+        redeem_body(&bound_token, "other@example.com"),
+    )
+    .await;
+    assert_eq!(
+        mismatch.code(),
+        "invite_email_mismatch",
+        "{:?}",
+        mismatch.body
+    );
+
+    // 5 — domain_mismatch. The provider allow-list admits `example.com`, so the only
+    // thing that can refuse this is the invite's own domain constraint.
+    let (_, domain_token) = create_invite(&router, "domain", "invited.test").await;
+    let wrong_domain = post_json(
+        router.clone(),
+        "/api/v1/admin/admin-invites/redeem",
+        issuer.bearer("wrong-domain"),
+        redeem_body(&domain_token, "someone@example.com"),
+    )
+    .await;
+    assert_eq!(
+        wrong_domain.code(),
+        "invite_domain_mismatch",
+        "{:?}",
+        wrong_domain.body
+    );
+    assert_eq!(
+        wrong_domain.message_key(),
+        "moira.error.invite_domain_mismatch"
+    );
+
+    let after = scrape_metrics(router).await;
+    for reason in REASONS {
+        assert_eq!(
+            invite_outcome(&after, reason),
+            1.0,
+            "moira_admin_invite_outcomes_total{{outcome=\"{reason}\"}} has no emitter\n{}",
+            family_lines(&after, INVITE_OUTCOMES)
+        );
+    }
+    assert_eq!(
+        grant_count(&fixture.pool).await,
+        0,
+        "not one of these refusals may have created a grant"
+    );
+}
+
+/// The lifetime cap is a **refusal**, not a silent clamp: an operator who believes they
+/// issued a 30-day invitation and actually issued a 3-day one finds out at the worst
+/// possible moment.
+#[tokio::test]
+async fn an_invitation_longer_than_the_cap_is_refused_and_no_row_is_written() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+
+    let refused = post_json(
+        router,
+        "/api/v1/admin/admin-invites",
+        HeaderMap::new(),
+        json!({
+            "constraint": "email",
+            "value": "colleague@example.com",
+            // 30 days, well past the documented 72-hour ceiling.
+            "expires_in_seconds": 30 * 24 * 60 * 60
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        refused.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{:?}",
+        refused.body
+    );
+    assert_eq!(refused.code(), "admin_invite_expiry_too_long");
+    assert_eq!(
+        refused.message_key(),
+        "moira.error.admin_invite_expiry_too_long"
+    );
+    let invites: i64 = sqlx::query_scalar("select count(*) from admin_invites")
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count invites");
+    assert_eq!(
+        invites, 0,
+        "a refused request must not have been clamped and stored"
+    );
+}
+
+/// The two ownership codes plan 09 names with no specified emitter, pinned to a path and a
+/// status: `admin_identity_not_found` on `PATCH .../{id}` and `admin_identity_already_revoked`
+/// on a repeated `DELETE .../{id}`.
+///
+/// Both are exercised through the system-key-equivalent break-glass caller, which is the
+/// documented path when no primary exists — and, on a freshly migrated deployment, the
+/// *only* one, because nothing outside `0017`'s one-shot backfill ever sets `is_primary`.
+#[tokio::test]
+async fn the_grant_administration_conflicts_are_pinned_to_their_paths() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let issuer = ConsoleIssuer::start(&fixture.pool).await;
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let (provider_id, _) = configure_and_enable_policy(
+        &router,
+        PolicyBinding::ByIssuerString(&issuer.issuer),
+        &["example.com"],
+    )
+    .await;
+    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+
+    // admin_identity_not_found — premise: this id really is absent.
+    let absent = Uuid::now_v7();
+    let present: i64 = sqlx::query_scalar("select count(*) from admin_identities where id = $1")
+        .bind(absent)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count grants for the absent id");
+    assert_eq!(present, 0, "the premise is an id with no row");
+    let missing = send_json(
+        router.clone(),
+        "PATCH",
+        &format!("/api/v1/admin/admin-identities/{absent}"),
+        HeaderMap::new(),
+        Some(1),
+        json!({ "is_primary": true }),
+    )
+    .await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND, "{:?}", missing.body);
+    assert_eq!(missing.code(), "admin_identity_not_found");
+    assert_eq!(
+        missing.message_key(),
+        "moira.error.admin_identity_not_found"
+    );
+
+    let (_, token) = create_invite(&router, "domain", "example.com").await;
+    let redeemed = post_json(
+        router.clone(),
+        "/api/v1/admin/admin-invites/redeem",
+        issuer.bearer("departing"),
+        redeem_body(&token, "departing@example.com"),
+    )
+    .await;
+    assert_eq!(redeemed.status, StatusCode::CREATED, "{:?}", redeemed.body);
+    let grant_id: Uuid = redeemed.body["id"]
+        .as_str()
+        .expect("grant id")
+        .parse()
+        .expect("grant id is a uuid");
+
+    // admin_identity_already_revoked — the soft revoke leaves the row, so the second call
+    // has something to conflict with.
+    let first = send_json(
+        router.clone(),
+        "DELETE",
+        &format!("/api/v1/admin/admin-identities/{grant_id}"),
+        HeaderMap::new(),
+        None,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK, "{:?}", first.body);
+    let status: String = sqlx::query_scalar("select status from admin_identities where id = $1")
+        .bind(grant_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("read the revoked grant");
+    assert_eq!(
+        status, "revoked",
+        "the premise is a soft revoke that left the row in place"
+    );
+
+    let again = send_json(
+        router,
+        "DELETE",
+        &format!("/api/v1/admin/admin-identities/{grant_id}"),
+        HeaderMap::new(),
+        None,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(again.status, StatusCode::CONFLICT, "{:?}", again.body);
+    assert_eq!(again.code(), "admin_identity_already_revoked");
+    assert_eq!(
+        again.message_key(),
+        "moira.error.admin_identity_already_revoked"
+    );
+}
+
+/// The lockout guard. Clearing the last active primary would leave every remaining admin
+/// unable to manage admins, with system-key break-glass as the only re-entry path.
+///
+/// This is the concrete payoff of decision D1: the guard is expressible **as a query** only
+/// because ownership is row state. Under the scope design plan 09's body proposed, "who
+/// else can manage admins" answered *everyone, by implication*, so there was nothing to
+/// count.
+#[tokio::test]
+async fn clearing_the_only_primary_is_refused_with_the_last_primary_conflict() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let issuer = ConsoleIssuer::start(&fixture.pool).await;
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let (provider_id, _) = configure_and_enable_policy(
+        &router,
+        PolicyBinding::ByIssuerString(&issuer.issuer),
+        &["example.com"],
+    )
+    .await;
+    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+
+    let (_, token) = create_invite(&router, "domain", "example.com").await;
+    let redeemed = post_json(
+        router.clone(),
+        "/api/v1/admin/admin-invites/redeem",
+        issuer.bearer("owner-to-be"),
+        redeem_body(&token, "owner@example.com"),
+    )
+    .await;
+    assert_eq!(redeemed.status, StatusCode::CREATED, "{:?}", redeemed.body);
+    let grant_id: Uuid = redeemed.body["id"]
+        .as_str()
+        .expect("grant id")
+        .parse()
+        .expect("grant id is a uuid");
+
+    // Premise 1 — a redeemed grant is not primary, so the deployment starts with none.
+    let primaries: i64 = sqlx::query_scalar(
+        "select count(*) from admin_identities \
+         where deleted_at is null and status = 'active' and is_primary",
+    )
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count primaries");
+    assert_eq!(
+        primaries, 0,
+        "nothing outside 0017's one-shot backfill sets is_primary, so a fresh \
+         deployment has no primary until an operator transfers ownership"
+    );
+
+    // The break-glass caller promotes it. This is the documented path when no primary
+    // remains — and it is the only way a greenfield deployment gets its first one.
+    let promoted = send_json(
+        router.clone(),
+        "PATCH",
+        &format!("/api/v1/admin/admin-identities/{grant_id}"),
+        HeaderMap::new(),
+        redeemed.body["version"].as_i64(),
+        json!({ "is_primary": true }),
+    )
+    .await;
+    assert_eq!(promoted.status, StatusCode::OK, "{:?}", promoted.body);
+    assert_eq!(promoted.body["is_primary"], json!(true));
+
+    // Premise 2 — exactly one active primary, so clearing it is clearing the last.
+    let primaries: i64 = sqlx::query_scalar(
+        "select count(*) from admin_identities \
+         where deleted_at is null and status = 'active' and is_primary",
+    )
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count primaries");
+    assert_eq!(primaries, 1, "the premise is exactly one active primary");
+
+    let refused = send_json(
+        router,
+        "PATCH",
+        &format!("/api/v1/admin/admin-identities/{grant_id}"),
+        HeaderMap::new(),
+        Some(promoted.version()),
+        json!({ "is_primary": false }),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::CONFLICT, "{:?}", refused.body);
+    assert_eq!(refused.code(), "admin_identity_last_primary");
+    assert_eq!(
+        refused.message_key(),
+        "moira.error.admin_identity_last_primary"
+    );
+
+    let still_primary: bool =
+        sqlx::query_scalar("select is_primary from admin_identities where id = $1")
+            .bind(grant_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("re-read the grant");
+    assert!(
+        still_primary,
+        "the refused clear must not have taken effect"
+    );
+}
+
+/// **The single-winner gate, under a real race.**
+///
+/// `consume_invite` re-reads the row under `select … for update` inside the grant's own
+/// transaction, so two simultaneous valid redemptions serialise and exactly one wins. The
+/// pre-envelope validation cannot provide this — both requests pass it, because at the
+/// moment they run the invite really is pending.
+///
+/// Released by a barrier rather than a `sleep()` (CONVENTIONS §3): the two requests must
+/// overlap for the assertion to be about locking rather than about ordering. Both use
+/// distinct `(issuer, subject)` pairs, so a second grant is *possible* — which is what
+/// makes "exactly one" an assertion rather than a restatement of the uniqueness index.
+#[tokio::test]
+async fn two_simultaneous_redemptions_of_one_token_produce_exactly_one_grant() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let issuer = ConsoleIssuer::start(&fixture.pool).await;
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let (provider_id, _) = configure_and_enable_policy(
+        &router,
+        PolicyBinding::ByIssuerString(&issuer.issuer),
+        &["example.com"],
+    )
+    .await;
+    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+
+    let (invite_id, token) = create_invite(&router, "domain", "example.com").await;
+    assert_eq!(invite_status(&fixture.pool, invite_id).await, "pending");
+
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+    for subject in ["racer-one", "racer-two"] {
+        let router = router.clone();
+        let headers = issuer.bearer(subject);
+        let body = redeem_body(&token, &format!("{subject}@example.com"));
+        let barrier = Arc::clone(&barrier);
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            post_json(router, "/api/v1/admin/admin-invites/redeem", headers, body).await
+        }));
+    }
+    let mut results = Vec::new();
+    for handle in handles {
+        results.push(handle.await.expect("redeem task"));
+    }
+
+    let created = results
+        .iter()
+        .filter(|result| result.status == StatusCode::CREATED)
+        .count();
+    assert_eq!(
+        created,
+        1,
+        "exactly one redemption may win: {:?}",
+        results
+            .iter()
+            .map(|r| (r.status, r.code()))
+            .collect::<Vec<_>>()
+    );
+    let loser = results
+        .iter()
+        .find(|result| result.status != StatusCode::CREATED)
+        .expect("one loser");
+    assert_eq!(loser.status, StatusCode::CONFLICT, "{:?}", loser.body);
+    assert_eq!(loser.code(), "invite_already_consumed");
+
+    assert_eq!(
+        grant_count(&fixture.pool).await,
+        1,
+        "a single-use invitation produced two grants"
+    );
+    assert_eq!(invite_status(&fixture.pool, invite_id).await, "consumed");
 }
