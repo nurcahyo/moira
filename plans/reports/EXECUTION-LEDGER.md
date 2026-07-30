@@ -435,6 +435,48 @@ leaks nothing D4 was protecting. The authenticated endpoint keeps returning the 
 console iteration. Scheduled as a follow-up. Until then the snapshot workaround holds, with the
 failure mode above documented in the console's own notes.
 
+#### RESOLVED — `fix/f15-anonymous-auth-methods`. The recommendation above was wrong in one detail, and it was the load-bearing one.
+
+**`PublicAuthMethod` does carry policy.** The claim "no secrets, no policy" is false: its tenth field
+is `allowed_email_domains` (`src/domain/auth_settings.rs`), which is not rendering data but plan 07
+decision **D3** itself — the deny-by-default admin-claim allow-list. Serving it anonymously as
+recommended would have published, to any unauthenticated caller, the exact set of email domains that
+can obtain Moira admin: a ready-made phishing target list, for zero rendering benefit. Plan 07's own
+risk register anticipated this — §Risks item 10 lists *"`GET …/setup/auth-methods` is relaxed to
+anonymous"* as a failure mode to defend against.
+
+**So the fix is a narrower new operation, not a relaxed old one.**
+
+```
+GET /api/v1/admin/setup/sign-in-methods  ->  anonymous  (PublicSignInMethod)
+GET /api/v1/admin/setup/auth-methods     ->  unchanged, [{bearerAuth}, {systemKeyAuth}]
+```
+
+`PublicSignInMethod` is `PublicAuthMethod` minus `allowed_email_domains` (policy) and minus
+`jwks_url` (machine token verification, not a button), and `jwks` rows are filtered out entirely.
+D4 stands unamended for the endpoint it was about.
+
+**The rule that admits a field to the anonymous projection** — apply it to any future addition:
+*every field must be one the browser already transmits or receives during the sign-in it is about to
+start.* `client_id`, `issuer`, `authorization_url` and `requested_scopes` all appear in the OAuth
+authorization URL the browser is redirected to, so an anonymous caller learns nothing it could not
+learn by clicking the button. `allowed_email_domains` never appears on that wire, which is precisely
+why it fails the rule.
+
+The path stays under `/api/v1/admin/` — moving it out would also move it out of the admin strip, the
+admin body limit and the admin timeout (`src/http/identity.rs`).
+
+**Reversal condition:** if `PublicSignInMethod` is ever widened to a field that is *not* visible to
+the browser during sign-in, this endpoint must go back behind authentication — the anonymity is
+justified by the response's contents, not by the endpoint's purpose. Five gates enforce it, all
+mutation-verified against an injected `client_secret` field: two domain unit tests, two E2E tests,
+and the OpenAPI drift gate.
+
+**Test rename:** `claim_status_is_anonymous_while_auth_methods_is_not` →
+`the_anonymous_setup_surface_is_claim_status_and_sign_in_methods_but_never_auth_methods`. It pinned a
+two-way asymmetry that is now three-way. Plan 07's verification table (lines 1258, 1318, 1349) still
+names the old identifier; the invariant it described is preserved and strengthened, not dropped.
+
 ### F14 — memory dedupe silently stops matching after a pepper rotation
 
 `memory_records.content_hash` is written with `IdempotencyHasher::hash`
@@ -712,7 +754,7 @@ running steps.
 
 | | What | Where it lives |
 |---|---|---|
-| **F15** | Console cannot render a sign-in button without a credential it can only get by signing in. Fix: serve `PublicAuthMethod` anonymously | Moira API, unscheduled |
+| ~~**F15**~~ | ~~Console cannot render a sign-in button without a credential it can only get by signing in~~ **RESOLVED** — anonymous `GET /api/v1/admin/setup/sign-in-methods`. *Not* by serving `PublicAuthMethod` as recommended: that carries `allowed_email_domains`, the deny-by-default admin-claim policy | `fix/f15-anonymous-auth-methods` |
 | **F14** | Memory dedupe silently stops matching after a pepper rotation | plan 11 Sub-Phase F |
 | **F13** | Duplicate trusted JWT issuer returns 500, not 409 | plan 03 territory |
 | **F2** | Pre-auth query-field enumeration | user deferred |

@@ -32,8 +32,17 @@ A bypass would exist precisely during the setup window, when a deployment is lea
 |---|---|---|
 | `GET /api/v1/admin/setup/claim-status` | **none** | Returns `{"claimed": bool}` and nothing else. Anonymous because one bit is all it reveals, and a setup wizard needs it before any human holds a credential. |
 | `POST /api/v1/admin/setup/claim` | `X-Moira-System-Key` **only** | A bearer JWT is refused even if it verifies (`401 setup_claim_credential_required`). Supports `Idempotency-Key`: a keyed retry replays with `200`, an unkeyed retry conflicts with `409`. |
-| `GET /api/v1/admin/setup/auth-methods` | system key or trusted JWT, plus `moira:setup:read` | Authenticated on purpose: the response is identity *configuration*, which is reconnaissance-worthy. A console calls it server-side. |
+| `GET /api/v1/admin/setup/sign-in-methods` | **none** | The login-screen list: which enabled methods a human can sign in with. Anonymous by necessity — see below. Carries **no** `allowed_email_domains`, and omits `jwks` methods. |
+| `GET /api/v1/admin/setup/auth-methods` | system key or trusted JWT, plus `moira:setup:read` | Authenticated on purpose: it alone returns `allowed_email_domains`, the domain policy above, which is reconnaissance-worthy. A console calls it server-side. |
 | `/api/v1/admin/auth/providers…` | `moira:auth-settings:{read,write,delete}` | Seven operations. Every mutation requires `If-Match`. |
+
+### Why the sign-in list is anonymous and the auth-methods list is not
+
+A login screen cannot present a credential: the credential is what signing in *produces*. When every read of the auth configuration required a bearer token, a console could not render a sign-in button without one it could only obtain by signing in — and an operator who removed `MOIRA_SYSTEM_KEY` after setup, which is the normal fate of a bootstrap credential, had no way back in. A public invitation-acceptance page has the same problem by construction: its visitor is not signed in yet.
+
+The fix is a narrower endpoint, not a relaxed one. `sign-in-methods` returns only fields the browser **already transmits or receives during the sign-in it is about to start** — `client_id`, `issuer`, `authorization_url` and `requested_scopes` all appear in the OAuth authorization URL the browser is redirected to, and a `client_id` is not confidential. An anonymous caller learns nothing it could not learn by clicking the button.
+
+`allowed_email_domains` fails that test and is therefore absent from it. It is not rendering data; it is the deny-by-default admin-claim policy, and publishing it anonymously would hand any caller the exact list of email domains that can obtain Moira admin. It stays behind `auth-methods`, which stays authenticated. Widening `sign-in-methods` back towards `auth-methods` would reintroduce precisely that leak.
 
 `GET /api/v1/admin/setup/status` is a **different, pre-existing** endpoint answering "is the provider/routing configuration structurally complete", and is untouched by this surface.
 

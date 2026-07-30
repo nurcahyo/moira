@@ -12,7 +12,7 @@ Phase 3 invalidates:
 
 - runtime config cache
 - provider runtime handle cache
-- auth provider settings cache (the enabled auth methods behind `GET /api/v1/admin/setup/auth-methods`)
+- auth provider settings cache (the enabled auth methods behind `GET /api/v1/admin/setup/auth-methods` and, projected more narrowly, the anonymous `GET /api/v1/admin/setup/sign-in-methods` — one cache serves both, so the two reads cannot drift onto different snapshots of the same rows)
 - model candidate calculations
 - circuit-breaker configuration/state (scoped, as above)
 

@@ -1,6 +1,7 @@
 //! Runtime auth-provider settings over HTTP (plan 07, module 12).
 //!
-//! Eight handlers: `GET /api/v1/admin/setup/auth-methods` plus the seven
+//! Nine handlers: `GET /api/v1/admin/setup/auth-methods`, its anonymous narrow sibling
+//! `GET /api/v1/admin/setup/sign-in-methods` (finding F15), plus the seven
 //! `/api/v1/admin/auth/providers…` operations. They follow the trusted-JWT-issuer handlers
 //! in [`crate::http::admin`] as their template — the same `security(...)` triple, the same
 //! `params(PageQuery)` on list, the same `etag_headers` / `require_if_match` helpers, the
@@ -35,6 +36,7 @@ use crate::{
     domain::{
         AuthProviderSettingsCreateRequest, AuthProviderSettingsPatchRequest,
         AuthProviderSettingsRecord, ListResponse, PageQuery, SetupAuthMethodsResponse,
+        SetupSignInMethodsResponse,
     },
     error::{AppError, ErrorResponse},
 };
@@ -42,9 +44,30 @@ use crate::{
 use super::admin::{admin_actor, etag_headers, require_if_match};
 
 #[utoipa::path(
+    get, path = "/api/v1/admin/setup/sign-in-methods", tag = "admin-setup",
+    description = "Lists the enabled methods a human can sign in with, so a login screen can render its buttons. Deliberately UNAUTHENTICATED: the credential a caller would present here is the one signing in produces, so requiring it makes the sign-in screen unrenderable on a deployment whose bootstrap system key has been removed. Every field returned is one the browser already transmits or receives during the sign-in it is about to start - client_id, issuer, authorization_url and requested_scopes all appear in the OAuth authorization URL. It carries NO allowed_email_domains: that is the deny-by-default admin-claim policy and stays behind GET /api/v1/admin/setup/auth-methods, which remains authenticated. Methods of kind jwks are omitted; they are machine token verification, not a sign-in button.",
+    responses(
+        (status = 200, description = "Enabled sign-in methods, narrowed to what a login screen renders", body = SetupSignInMethodsResponse),
+        (status = 503, description = "PostgreSQL is unavailable", body = ErrorResponse)
+    )
+)]
+pub async fn get_setup_sign_in_methods(
+    State(state): State<AppState>,
+) -> Result<Json<SetupSignInMethodsResponse>, AppError> {
+    // No `HeaderMap`, no `Actor`, no `security(...)` annotation — the same shape as
+    // `get_setup_claim_status`, and for the same reason. The signature is the documentation:
+    // there is nothing here to authenticate *against*, because the response is confined to
+    // what the sign-in flow itself puts in front of the browser.
+    AuthProviderSettingsService::new(&state)?
+        .public_sign_in_methods()
+        .await
+        .map(Json)
+}
+
+#[utoipa::path(
     get, path = "/api/v1/admin/setup/auth-methods", tag = "admin-setup",
     responses(
-        (status = 200, description = "Enabled auth methods and their non-secret configuration. Authenticated on purpose: the response is identity configuration - which IdP, which issuer, which client id, which allowed domains - and that is reconnaissance-worthy even though Moira stores no client secret. Plan 08's console calls this server-side with the system key it already holds.", body = SetupAuthMethodsResponse),
+        (status = 200, description = "Enabled auth methods and their non-secret configuration. Authenticated on purpose: the response includes allowed_email_domains - the deny-by-default admin-claim policy - alongside the issuer and client id, and that is reconnaissance-worthy even though Moira stores no client secret. Plan 08's console calls this server-side with the system key it already holds. A login screen that only needs to render sign-in buttons must call the anonymous GET /api/v1/admin/setup/sign-in-methods instead; it returns a strictly narrower projection with no policy in it.", body = SetupAuthMethodsResponse),
         (status = 401, description = "Authentication failed", body = ErrorResponse),
         (status = 403, description = "Caller type or scope is not permitted", body = ErrorResponse),
         (status = 503, description = "PostgreSQL is unavailable", body = ErrorResponse)

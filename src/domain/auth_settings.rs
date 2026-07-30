@@ -146,6 +146,11 @@ pub struct AuthProviderSettingsPatchRequest {
 /// which IdP, which issuer, which client id, which allowed domains — and that is
 /// reconnaissance-worthy even though D7 removed the secret. Plan 08's console calls it
 /// server-side with the system key it already holds; the browser never sees it.
+///
+/// D4 stands. [`SetupSignInMethodsResponse`] is the anonymous surface a login screen calls
+/// instead, and it is *narrower* than this one rather than the same thing with the gate
+/// removed — most importantly it drops `allowed_email_domains`, the deny-by-default
+/// admin-claim policy, which is the single field that makes this response unsafe to publish.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SetupAuthMethodsResponse {
     pub methods: Vec<PublicAuthMethod>,
@@ -172,6 +177,85 @@ pub struct PublicAuthMethod {
     pub client_id: Option<String>,
     pub requested_scopes: Vec<String>,
     pub allowed_email_domains: Vec<String>,
+}
+
+/// Response body of the **anonymous** `GET /api/v1/admin/setup/sign-in-methods`.
+///
+/// # Why this exists instead of relaxing `/setup/auth-methods` (finding F15)
+///
+/// A console cannot render a sign-in button without knowing which methods a deployment
+/// offers, and it cannot hold a bearer JWT before someone has signed in. Plan 09's public
+/// `/invite/[token]` page makes that blocking: its visitor is unauthenticated by
+/// construction. An operator who removes `MOIRA_SYSTEM_KEY` after setup — the normal fate of
+/// a bootstrap credential — would otherwise be locked out entirely.
+///
+/// The obvious fix, serving [`SetupAuthMethodsResponse`] anonymously, was **rejected**:
+/// [`PublicAuthMethod`] carries `allowed_email_domains`, which is not configuration a login
+/// screen needs but *the* deny-by-default admin-claim policy (plan 07 decision D3). Publishing
+/// it anonymously would hand any unauthenticated caller the exact list of email domains that
+/// can obtain Moira admin — a ready-made phishing target list — for no rendering benefit.
+/// Decision **D4** made `/setup/auth-methods` authenticated on information-content grounds and
+/// that judgement stands unchanged for that endpoint.
+///
+/// # The rule that defines this projection
+///
+/// **Every field here is something the browser itself already transmits or receives while
+/// signing in.** `client_id`, `issuer`, `authorization_url` and `requested_scopes` all appear
+/// in the OAuth authorization URL the browser is about to be redirected to; `discovery_url` is
+/// the world-readable `.well-known` document derivable from `issuer`. Nothing here tells an
+/// anonymous caller anything it could not learn by clicking the button.
+///
+/// Anything that fails that rule does not belong here. `allowed_email_domains` fails it
+/// (policy, never on the wire to a browser) and `jwks_url` fails it (machine token-verification
+/// configuration, irrelevant to a sign-in button).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SetupSignInMethodsResponse {
+    pub methods: Vec<PublicSignInMethod>,
+}
+
+/// One renderable sign-in button, and nothing else.
+///
+/// Strictly narrower than [`PublicAuthMethod`] — see [`SetupSignInMethodsResponse`] for the
+/// rule every field must satisfy. It is served anonymously, so a field added here is a field
+/// published to the internet: add one only if the browser would already have seen it during a
+/// sign-in.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PublicSignInMethod {
+    pub id: Uuid,
+    pub method: AuthMethod,
+    pub display_name: String,
+    pub issuer: Option<String>,
+    pub discovery_url: Option<String>,
+    pub authorization_url: Option<String>,
+    /// Non-secret, and specifically not confidential: a `client_id` appears in every OAuth
+    /// redirect URL a browser sends. Moira stores no `client_secret` at all (D7).
+    pub client_id: Option<String>,
+    pub requested_scopes: Vec<String>,
+}
+
+impl PublicSignInMethod {
+    /// Narrows an enabled method to its login-screen projection, or `None` if it is not a
+    /// method a human signs in with.
+    ///
+    /// [`AuthMethod::Jwks`] is machine-to-machine token verification: it has no
+    /// `authorization_url` and no `client_id`, so a console that rendered it as a button would
+    /// produce a control that cannot work. Filtering here rather than in the caller keeps the
+    /// "is this a sign-in method" judgement in one place.
+    pub fn from_enabled_method(method: &PublicAuthMethod) -> Option<Self> {
+        match method.method {
+            AuthMethod::GoogleOauth | AuthMethod::GenericOidc => Some(Self {
+                id: method.id,
+                method: method.method,
+                display_name: method.display_name.clone(),
+                issuer: method.issuer.clone(),
+                discovery_url: method.discovery_url.clone(),
+                authorization_url: method.authorization_url.clone(),
+                client_id: method.client_id.clone(),
+                requested_scopes: method.requested_scopes.clone(),
+            }),
+            AuthMethod::Jwks => None,
+        }
+    }
 }
 
 fn default_requested_scopes() -> Vec<String> {
@@ -311,5 +395,97 @@ mod tests {
             serde_json::json!("console-client"),
             "client_id must survive the narrow bootstrap projection"
         );
+    }
+
+    fn enabled_method(method: AuthMethod) -> PublicAuthMethod {
+        PublicAuthMethod {
+            id: Uuid::nil(),
+            method,
+            display_name: "Google".to_string(),
+            issuer: Some("https://accounts.google.com".to_string()),
+            discovery_url: None,
+            authorization_url: Some("https://accounts.google.com/o/oauth2/v2/auth".to_string()),
+            jwks_url: Some("https://accounts.google.com/jwks".to_string()),
+            client_id: Some("console-client".to_string()),
+            requested_scopes: default_requested_scopes(),
+            allowed_email_domains: vec!["example.com".to_string()],
+        }
+    }
+
+    /// The whole reason `PublicSignInMethod` exists rather than `PublicAuthMethod` being
+    /// served anonymously (F15): the deny-by-default domain policy must not reach an
+    /// unauthenticated caller. Asserted as an exact key set, not a `contains` check, so a
+    /// field added to the anonymous projection fails here before it reaches the internet.
+    #[test]
+    fn the_anonymous_projection_drops_the_domain_policy_and_the_jwks_url() {
+        let method =
+            PublicSignInMethod::from_enabled_method(&enabled_method(AuthMethod::GoogleOauth))
+                .expect("google_oauth is a sign-in method");
+
+        let json = serde_json::to_value(&method).expect("projection serializes");
+        let object = json.as_object().expect("projection is an object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "authorization_url",
+                "client_id",
+                "discovery_url",
+                "display_name",
+                "id",
+                "issuer",
+                "method",
+                "requested_scopes",
+            ],
+            "the anonymous projection gained or lost a field"
+        );
+        assert!(
+            !object.contains_key("allowed_email_domains"),
+            "allowed_email_domains is the deny-by-default admin-claim policy; publishing it \
+             anonymously hands out a phishing target list"
+        );
+        // Every surviving field is one the browser already sees in the authorization URL, so
+        // each must actually carry its value — a projection that silently dropped `client_id`
+        // would render a button that cannot start a flow.
+        assert_eq!(object["client_id"], serde_json::json!("console-client"));
+    }
+
+    /// A `jwks` row is machine token-verification configuration with no `authorization_url`
+    /// and no `client_id`. Rendering it as a button would produce a control that cannot work,
+    /// so it is not a sign-in method at all.
+    #[test]
+    fn the_anonymous_projection_excludes_jwks_rows() {
+        assert!(
+            PublicSignInMethod::from_enabled_method(&enabled_method(AuthMethod::Jwks)).is_none()
+        );
+        assert!(
+            PublicSignInMethod::from_enabled_method(&enabled_method(AuthMethod::GenericOidc))
+                .is_some(),
+            "generic_oidc is a browser sign-in method and must survive the filter"
+        );
+    }
+
+    /// The same forward guard [`public_auth_method_never_exposes_secret_fields`] applies to
+    /// the bootstrap projection, applied here to the projection that is served with **no**
+    /// credential at all — where a secret-shaped field would be published to the internet.
+    #[test]
+    fn public_sign_in_method_never_exposes_secret_fields() {
+        let method =
+            PublicSignInMethod::from_enabled_method(&enabled_method(AuthMethod::GoogleOauth))
+                .expect("google_oauth is a sign-in method");
+
+        let json = serde_json::to_value(&method).expect("projection serializes");
+        let object = json.as_object().expect("projection is an object");
+
+        for key in object.keys() {
+            assert!(
+                !key.contains("secret")
+                    && !key.contains("encrypted")
+                    && !key.contains("nonce")
+                    && !key.contains("token"),
+                "PublicSignInMethod gained a secret-shaped field: {key}"
+            );
+        }
     }
 }
