@@ -360,6 +360,37 @@ the whole argument for the approach given that Debian had declined or deferred f
    package manager with which to create a second user. It would have failed at deploy time, not in
    CI. When an agent reports "verified", check the specific thing that could fail silently.
 
+### F14 — memory dedupe silently stops matching after a pepper rotation
+
+`memory_records.content_hash` is written with `IdempotencyHasher::hash`
+(`src/application/conversation.rs:580`), which produces `"{pepper_version}:{base64url(hmac(...))}"`.
+`IdempotencyHasher::verify` deliberately accepts **only the active pepper**
+(`src/security/idempotency.rs:24-40`).
+
+So after a pepper rotation, every stored `content_hash` becomes unmatchable and exact-match memory
+dedupe silently stops working — duplicates accumulate with no error and no log line. Not data loss,
+and not urgent, but it fails quietly, which is the worst failure mode for a dedupe mechanism.
+
+Found while deciding plan 11's `chunk_hash` question. It is now an explicit Sub-Phase F obligation
+in that plan rather than a production surprise, but the *existing* `memory_records` behaviour is
+unchanged and still has this property.
+
+**Decide when plan 11 reaches Sub-Phase F:** either re-hash on rotation, accept the duplicate window
+and document it, or move `content_hash` to the unkeyed `request_hash` on the same reasoning plan 11
+used for `chunk_hash` — peppering exists to protect digests of request bodies that carry provider
+API keys, and memory content is not that.
+
+### F13 — a duplicate trusted JWT issuer returns 500, not 409
+
+Every other uniqueness conflict in the tree maps to a 409 — `auth_provider_settings` has an
+`is_unique_violation` → `duplicate_auth_provider` mapping. `trusted_jwt_issuers` has none, so a
+duplicate falls through `AppError::Sqlx` to **500 `database_error`**.
+
+Consequence, found while building plan 08's console: an orphaned-issuer retry path cannot recover by
+catching a 409, because the 409 never comes. Plan 08 worked around it by listing-then-adopting
+rather than create-then-recover, which is the right client behaviour regardless — but the server
+shape is still wrong. Plan 03 territory; small, clearly correct, not yet scheduled.
+
 ### F11 — a retention batch could delete its whole table in one transaction — **FIXED** `9799826`
 
 **`limit $1` bounds one *evaluation* of a sub-query, not the statement.** The retention sweep used
