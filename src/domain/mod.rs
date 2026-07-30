@@ -44,7 +44,11 @@ pub use conversation::{
 };
 pub use i18n::{ResponseText, ResponseTextArgs};
 pub use identity::{
-    AdminIdentityRecord, AdminIdentityStatus, ClaimAdminIdentityRequest, SetupClaimStatusResponse,
+    AdminIdentityPatchRequest, AdminIdentityRecord, AdminIdentityStatus, AdminInviteConstraint,
+    AdminInviteCreateRequest, AdminInvitePreviewRequest, AdminInvitePreviewResponse,
+    AdminInviteRecord, AdminInviteRedeemRequest, AdminInviteSecretResponse, AdminInviteStatus,
+    ClaimAdminIdentityRequest, MAX_INVITE_EXPIRY_SECONDS, MIN_INVITE_EXPIRY_SECONDS,
+    SetupClaimStatusResponse,
 };
 pub use ids::{
     AgentProfileId, ApplicationId, ApplicationSlug, AttemptId, AuditEventId, ConsumerKeyId,
