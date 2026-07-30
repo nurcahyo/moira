@@ -376,6 +376,33 @@ the whole argument for the approach given that Debian had declined or deferred f
    package manager with which to create a second user. It would have failed at deploy time, not in
    CI. When an agent reports "verified", check the specific thing that could fail silently.
 
+### F16 — ESCALATED: `rig-core` logs the whole completion body, which now carries OTHER tenants' documents
+
+**`rig-core` 0.40 emits the entire completion request body — every message, verbatim — on the
+`rig::completions` target at TRACE.** Pre-existing, and until now it exposed only caller-supplied
+prompts: bad, but the caller typed it.
+
+**Plan 11 changes the severity class.** The assembled context now also contains retrieved RAG chunk
+text and memory content — material the caller never typed and, in a multi-tenant deployment, may
+have no right to see in a log stream. An operator raising a log level to debug routing would have
+been silently exporting other documents' contents.
+
+This is the same hazard as **F6** (OTel bridges every recorded span, so `env_filter` is the only
+barrier) arriving through a second channel. F6 remains open; this is its sibling.
+
+**Mitigated in plan 11 Wave 2**, and the shape of the mitigation matters: a hard suppression in
+`src/config/telemetry.rs` sitting **below** the `EnvFilter`, so it holds however the operator sets
+`env_filter` or `RUST_LOG`. Someone who wants `moira=trace` to debug routing must not have to accept
+every prompt and every retrieved chunk as the price. `INFO` and above still pass, so upstream
+warnings and errors are never hidden — the dropped events are exactly the ones whose *content* is
+the payload.
+
+Found by a canary test, not by review.
+
+**Reversal condition:** remove it the moment `rig-core` gains a way to disable or redact
+request-body logging at the source, which is where it belongs. Residual risk is documented in
+`docs/rag-security.md`. **The proper fix is upstream** — worth raising with the rig-core maintainers.
+
 ### F15 — ESCALATED: the console cannot render a sign-in button without already being signed in
 
 **Every read of the auth configuration requires a credential.** Verified against the frozen spec:
