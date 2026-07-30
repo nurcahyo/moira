@@ -425,11 +425,38 @@ again. Plan 08 works around it with a configuration snapshot taken while the key
 information-content grounds: one bit of "is setup done" is free, the identity configuration is not.
 That reasoning is sound for the *full* record and wrong for the projection a login screen needs.
 
-**Recommended fix (Moira-side, small): serve the public projection anonymously.**
-`PublicAuthMethod` already exists (`src/domain/auth_settings.rs:151`) and is exactly this — method
-name and `client_id`, no secrets, no policy. A `client_id` is not confidential; it appears in every
-OAuth redirect URL a browser sends. Serving that projection without a credential closes the loop and
-leaks nothing D4 was protecting. The authenticated endpoint keeps returning the full record.
+**⚠️ THE RECOMMENDED FIX BELOW WAS WRONG, AND IT WAS THE LOAD-BEARING CLAIM. Kept, struck, because
+the error is more instructive than the correction.**
+
+> ~~Serve the public projection anonymously. `PublicAuthMethod` is exactly this — method name and
+> `client_id`, **no secrets, no policy**.~~
+
+**`PublicAuthMethod` carries `allowed_email_domains`.** That field *is* decision D3 — the
+deny-by-default admin-claim policy. Serving it anonymously would have published, to any
+unauthenticated caller, the exact set of email domains that can obtain Moira admin: a ready-made
+phishing target list, for zero rendering benefit.
+
+It also fails the very test the recommendation used to justify itself. `client_id` is safe *because*
+it appears in every OAuth redirect URL a browser sends. `allowed_email_domains` never appears on that
+wire at all. And `plans/07-…md` already listed "relaxed to anonymous so the browser can call it
+directly" as a **risk to defend against**.
+
+**Actually fixed as:** a *narrower* anonymous endpoint,
+`GET /api/v1/admin/setup/sign-in-methods` → `PublicSignInMethod`, which is `PublicAuthMethod` minus
+the domain policy and minus `jwks_url`, with `jwks` rows filtered out (they have no
+`authorization_url` and would render a button that cannot work). `auth-methods` is **unchanged** and
+D4 stands. Stays under `/api/v1/admin/` so it keeps the admin strip, body limit and timeout.
+
+**The admitting rule, written onto the type so a future addition has a test rather than a judgement
+call:** *every field must be one the browser already transmits or receives during the sign-in it is
+about to start.* **Reversal condition:** if `PublicSignInMethod` is ever widened to a field failing
+that rule, the endpoint goes back behind authentication — the anonymity is justified by the
+response's *contents*, never by the endpoint's purpose.
+
+**Process note.** The agent was told to verify the premise before relaxing anything, and to stop and
+say so if it did not hold. It did not hold; it stopped. **An escalation is not evidence** — this one
+named a specific type as safe without reading its fields, and the recommendation would have shipped
+a security leak dressed as a usability fix.
 
 **Not fixed in plan 08** because it is a Moira API change, not a console change, and plan 08 is a
 console iteration. Scheduled as a follow-up. Until then the snapshot workaround holds, with the
