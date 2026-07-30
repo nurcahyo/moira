@@ -1,0 +1,36 @@
+Moira console {{ .Chart.AppVersion }} released as {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
+
+Before the pods can serve traffic, the Secret {{ .Values.secret.name | quote }} must exist in
+this namespace and must carry all four of:
+
+  BETTER_AUTH_SECRET             session/cookie signing key, 32+ bytes
+  CONSOLE_SECRET_ENCRYPTION_KEY  32 raw bytes, base64 — encrypts the OAuth client
+                                 secret at rest. The console fails closed at boot
+                                 without it.
+  CONSOLE_DATABASE_URL           the console's own PostgreSQL DSN
+  MOIRA_SYSTEM_KEY               bootstrap system key (setup-time use only)
+
+Check with:
+
+  kubectl -n {{ .Release.Namespace }} get secret {{ .Values.secret.name }} \
+    -o go-template='{{ "{{" }} range $k, $v := .data {{ "}}" }}{{ "{{" }} $k {{ "}}" }}{{ "{{" }} "\n" {{ "}}" }}{{ "{{" }} end {{ "}}" }}'
+
+The OAuth client secret is NOT one of these. It is entered in the setup wizard and
+stored encrypted in the console's database; it never belongs in a Secret, a
+ConfigMap, an env var or the image.
+
+Still to confirm on first deploy:
+
+  * The jwks_url registered with Moira must be the URL this console is OBSERVED
+    to serve. There is no chart value for it — console/lib/env.ts derives it —
+    so verify it rather than assuming:
+      curl -sS {{ get .Values.config "CONSOLE_PUBLIC_ORIGIN" }}/api/auth/.well-known/jwks.json
+{{- if not .Values.ingress.enabled }}
+  * ingress.enabled is false, so nothing is published yet.
+{{- end }}
+{{- if .Values.migrationJob.enabled }}
+  * The Better Auth migration job ran as a pre-upgrade hook — check it succeeded.
+{{- else }}
+  * migrationJob.enabled is false. The Better Auth schema must be migrated by
+    another route (see values.yaml for why the runtime image cannot do it).
+{{- end }}

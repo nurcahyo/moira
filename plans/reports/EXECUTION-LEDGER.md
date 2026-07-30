@@ -20,6 +20,22 @@ merge, self-paced cadence. Security findings escalate to the user immediately.
    private `CARGO_TARGET_DIR`s and run parallel when they touch disjoint trees (Rust vs console),
    series when they share files. Cargo takes an *exclusive* target-dir lock, so agents sharing one
    directory serialise no matter how many are spawned.
+
+   **A private target dir is NOT isolation. A private WORKTREE is.** Learned the hard way on
+   2026-07-31: plan 11's agent was working in the main checkout, and the coordinator ran
+   `git checkout main` in that same tree to commit an unrelated ledger entry. The agent's work then
+   committed onto `main` instead of its branch. It behaved correctly — it detected the drift, refused
+   to `reset --hard` a branch another writer was active on, and left a recovery recipe. The
+   coordinator caused the problem.
+
+   **Rule: any agent that will commit gets its own `git worktree`, not just its own target dir.** The
+   target dir prevents *build* contention; only a worktree prevents *branch* contention. And the
+   coordinator must never run `git checkout` in a tree an agent is using — do ledger commits from a
+   separate worktree, or wait.
+
+   Recovery when it happens anyway: if the stray commit is unpushed, `cherry-pick` it onto the right
+   branch and `reset --hard origin/<branch>`. Never force-push to fix this while another agent is
+   live.
 3. **Merge on green CI.** All three jobs green with steps executed → merge. A job that ran and
    failed is real and blocks; investigate rather than override. The old infrastructure override is
    **void** — CI works.
@@ -359,6 +375,38 @@ the whole argument for the approach given that Debian had declined or deferred f
    65532 while `migration-job.yaml` stayed at 10001 — same image, and distroless has no shell or
    package manager with which to create a second user. It would have failed at deploy time, not in
    CI. When an agent reports "verified", check the specific thing that could fail silently.
+
+### F15 — ESCALATED: the console cannot render a sign-in button without already being signed in
+
+**Every read of the auth configuration requires a credential.** Verified against the frozen spec:
+
+```
+GET  /api/v1/admin/setup/auth-methods  ->  [{bearerAuth}, {systemKeyAuth}]
+GET  /api/v1/admin/setup/claim-status  ->  anonymous  (returns one boolean)
+POST /api/v1/admin/setup/claim         ->  [{systemKeyAuth}]
+```
+
+`claim-status` is the **only** anonymous admin operation and it carries a single bit. So to learn
+which sign-in methods a deployment offers, the console needs a bearer token — which is the JWT it
+can only mint *after* a user signs in. **Circular.**
+
+The practical consequence: an operator who removes `MOIRA_SYSTEM_KEY` after setup — which is exactly
+what one does with a bootstrap credential — leaves a console that can never render a sign-in button
+again. Plan 08 works around it with a configuration snapshot taken while the key is still present.
+
+**This is a consequence of plan 07's decision D4**, which made `auth-methods` authenticated on
+information-content grounds: one bit of "is setup done" is free, the identity configuration is not.
+That reasoning is sound for the *full* record and wrong for the projection a login screen needs.
+
+**Recommended fix (Moira-side, small): serve the public projection anonymously.**
+`PublicAuthMethod` already exists (`src/domain/auth_settings.rs:151`) and is exactly this — method
+name and `client_id`, no secrets, no policy. A `client_id` is not confidential; it appears in every
+OAuth redirect URL a browser sends. Serving that projection without a credential closes the loop and
+leaks nothing D4 was protecting. The authenticated endpoint keeps returning the full record.
+
+**Not fixed in plan 08** because it is a Moira API change, not a console change, and plan 08 is a
+console iteration. Scheduled as a follow-up. Until then the snapshot workaround holds, with the
+failure mode above documented in the console's own notes.
 
 ### F14 — memory dedupe silently stops matching after a pepper rotation
 

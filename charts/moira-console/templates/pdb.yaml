@@ -1,0 +1,17 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+# Enabled by default, unlike charts/moira — the console runs more than one
+# replica, so a budget is meaningful rather than a drain deadlock.
+# `_helpers.tpl` refuses to render if minAvailable is not strictly below the
+# minimum replica count, which is the deadlock this would otherwise create.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "moira-console.fullname" . }}
+  labels:
+    {{- include "moira-console.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "moira-console.selectorLabels" . | nindent 6 }}
+{{- end }}

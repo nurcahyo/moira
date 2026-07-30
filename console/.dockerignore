@@ -1,0 +1,37 @@
+# Build context excludes for console/Dockerfile.
+#
+# Rule of thumb: exclude anything that is (a) regenerated inside the build,
+# (b) host-specific, or (c) a secret. Test sources are deliberately NOT
+# excluded — tsconfig.json globs them, and `next build` runs tsc, so dropping
+# them from the context can change type-checking behaviour.
+
+# Regenerated inside the image by `bun install` / `bun run build`.
+node_modules
+.next
+out
+
+# Host-only build + test artefacts.
+playwright-report
+test-results
+coverage
+# Incremental tsc state recorded against macOS host paths. Shipping it into the
+# build can make `next build` skip type-checking files it should re-check.
+tsconfig.tsbuildinfo
+
+.git
+
+# Secrets: never baked into a layer. The console is configured at runtime, so
+# no .env file is needed at build time. REVERSE (narrow this to `.env*.local`)
+# only if the app ever needs a build-time NEXT_PUBLIC_* value, and even then
+# prefer a --build-arg over a committed file.
+.env*
+
+# Editor / OS noise.
+.DS_Store
+.vscode
+.idea
+*.log
+
+*.md
+Dockerfile
+.dockerignore

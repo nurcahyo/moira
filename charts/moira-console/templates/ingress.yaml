@@ -1,0 +1,45 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "moira-console.fullname" . }}
+  labels:
+    {{- include "moira-console.labels" . | nindent 4 }}
+  annotations:
+    # This is the public entry point — Moira's own API ingress is separate and is
+    # usually not internet-facing at all — so the defaults are the ones an
+    # internet-facing app needs rather than the ones a cluster-internal API can
+    # get away with.
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    # A console posts forms, not payloads. Capping the body size removes a free
+    # amplification primitive from an unauthenticated endpoint.
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+    # NOTE the contrast with charts/moira, which sets
+    # `proxy-buffering: "off"` because it streams SSE. The console has no
+    # streaming responses; buffering stays ON here on purpose.
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- end }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host | quote }}
+      secretName: {{ .Values.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: {{ .Values.ingress.path }}
+            pathType: {{ .Values.ingress.pathType }}
+            backend:
+              service:
+                name: {{ include "moira-console.fullname" . }}
+                port:
+                  name: http
+{{- end }}
