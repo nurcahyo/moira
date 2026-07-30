@@ -380,7 +380,9 @@ impl<'a> AdminIdentityService<'a> {
         let outcome = AdminCommandRunner::new(self.repo.clone(), command_hasher(self.state))
             .execute(spec, move |transaction| {
                 Box::pin(async move {
-                    let row = identities.revoke_invite(transaction.connection(), id).await?;
+                    let row = identities
+                        .revoke_invite(transaction.connection(), id)
+                        .await?;
                     transaction
                         .insert_audit(success_audit(
                             &audit_actor,
@@ -476,7 +478,10 @@ impl<'a> AdminIdentityService<'a> {
         // the same rule `claim` applies to its target issuer. `verify_trusted_jwt_identity`
         // already required a registered row to verify the signature; this resolves that
         // row's **id**, which the policy lookup below cannot work without.
-        let trusted_jwt_issuer_id = self.identities.resolve_active_issuer(&identity.issuer).await?;
+        let trusted_jwt_issuer_id = self
+            .identities
+            .resolve_active_issuer(&identity.issuer)
+            .await?;
 
         // Plan 07 module 10, unchanged and unexempted (decision D3). An invitation
         // authorises its holder to *submit* a redemption; it is not a policy bypass, and
@@ -718,7 +723,9 @@ impl<'a> AdminIdentityService<'a> {
         let outcome = AdminCommandRunner::new(self.repo.clone(), command_hasher(self.state))
             .execute(spec, move |transaction| {
                 Box::pin(async move {
-                    let grant = identities.revoke_grant(transaction.connection(), id).await?;
+                    let grant = identities
+                        .revoke_grant(transaction.connection(), id)
+                        .await?;
                     transaction
                         .insert_audit(success_audit(
                             &audit_actor,
@@ -790,21 +797,13 @@ impl<'a> AdminIdentityService<'a> {
         }
         let prefix = self.state.key_hasher.prefix(token);
         let Some(candidate) = self.identities.find_invite_by_prefix(&prefix).await? else {
-            self.state
-                .metrics
-                .record_admin_invite_denied("not_found");
+            self.state.metrics.record_admin_invite_denied("not_found");
             return Err(invite_not_found());
         };
-        if self
-            .state
-            .key_hasher
-            .verify(token, &candidate.token_hash)?
-        {
+        if self.state.key_hasher.verify(token, &candidate.token_hash)? {
             Ok(candidate.record)
         } else {
-            self.state
-                .metrics
-                .record_admin_invite_denied("not_found");
+            self.state.metrics.record_admin_invite_denied("not_found");
             Err(invite_not_found())
         }
     }
@@ -927,9 +926,7 @@ pub(crate) fn validated_invite_lifetime(seconds: u32) -> Result<Duration, AppErr
     if seconds > MAX_INVITE_EXPIRY_SECONDS {
         return Err(AppError::unprocessable(
             "admin_invite_expiry_too_long",
-            format!(
-                "an invitation may not last longer than {MAX_INVITE_EXPIRY_SECONDS} seconds"
-            ),
+            format!("an invitation may not last longer than {MAX_INVITE_EXPIRY_SECONDS} seconds"),
         ));
     }
     if seconds < MIN_INVITE_EXPIRY_SECONDS {

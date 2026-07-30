@@ -948,22 +948,31 @@ mod tests {
         assert!(invite_status_from_db("expired".to_string()).is_err());
     }
 
+    /// Expiry is a comparison against `expires_at`, never a stored status — `0017`'s
+    /// CHECK has no `'expired'` value precisely because nothing sweeps for one. The
+    /// boundary is asserted too: `expires_at` is the first instant the invite is dead,
+    /// not the last instant it is alive, so a token cannot be redeemed on its deadline.
     #[test]
     fn expiry_is_derived_from_the_timestamp_not_from_a_status() {
+        let deadline = Utc::now();
         let row = AdminInviteRow {
             id: Uuid::nil(),
             constraint: AdminInviteConstraint::Domain,
             value: "example.com".to_string(),
             status: AdminInviteStatus::Pending,
-            expires_at: DateTime::<Utc>::MIN_UTC,
+            expires_at: deadline,
             created_by_subject: None,
             consumed_at: None,
             consumed_subject: None,
-            created_at: DateTime::<Utc>::MIN_UTC,
+            created_at: deadline - chrono::Duration::hours(1),
             version: 1,
         };
-        assert!(row.is_expired(Utc::now()));
-        assert!(!row.is_expired(DateTime::<Utc>::MIN_UTC - chrono::Duration::seconds(1)));
+        assert!(!row.is_expired(deadline - chrono::Duration::seconds(1)));
+        assert!(row.is_expired(deadline), "the deadline itself is expired");
+        assert!(row.is_expired(deadline + chrono::Duration::seconds(1)));
+        // The status is untouched by any of that: a pending row stays pending, which is
+        // why every read path derives rather than trusting the column.
+        assert_eq!(row.status, AdminInviteStatus::Pending);
     }
 
     /// The ownership lock is a shared constant, not a per-call-site number: two callers

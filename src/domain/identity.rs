@@ -414,7 +414,9 @@ mod tests {
     fn the_invite_expiry_bounds_are_the_documented_ones() {
         assert_eq!(MAX_INVITE_EXPIRY_SECONDS, 259_200, "72 hours");
         assert_eq!(MIN_INVITE_EXPIRY_SECONDS, 60);
-        assert!(MIN_INVITE_EXPIRY_SECONDS < MAX_INVITE_EXPIRY_SECONDS);
+        // The ordering is a `const` relation clippy can evaluate at compile time, so it
+        // is asserted through the pinned values above rather than as a runtime
+        // comparison clippy rejects as constant.
     }
 
     /// The preview response is the one body an **anonymous** caller can obtain from this

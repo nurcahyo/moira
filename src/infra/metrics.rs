@@ -751,7 +751,8 @@ impl MetricsRegistry {
     /// vanishes from the counter is worse than one in a catch-all bucket, because an
     /// operator watching the total would see the rate fall while denials rose.
     pub fn record_admin_invite_denied(&self, reason: &str) {
-        let reason = if ADMIN_INVITE_OUTCOMES.contains(&reason) && reason != "created"
+        let reason = if ADMIN_INVITE_OUTCOMES.contains(&reason)
+            && reason != "created"
             && reason != "redeemed"
         {
             reason
@@ -1040,6 +1041,13 @@ mod tests {
         "job_name",
         "operation",
         "channel",
+        // Plan 09 wave 2. Closed against `ADMIN_IDENTITY_GRANT_EVENTS`, enforced in
+        // `record_admin_identity_grant_event` rather than by convention. The invitation
+        // family reuses `outcome` instead of introducing a second name for the same
+        // idea; this one is `event` because a grant lifecycle transition is not an
+        // outcome of anything, and folding it into `outcome` would put two unrelated
+        // domains behind one label key.
+        "event",
         "le",
         "quantile",
     ];
@@ -1639,6 +1647,15 @@ mod tests {
         metrics.record_worker_leadership(RETENTION_CLEANUP_WORKER, true);
         metrics.record_redis_operation_failure(RedisOperation::Publish);
         metrics.record_runtime_invalidation(InvalidationChannel::Redis);
+        // Plan 09 wave 2. Driven through the public recorders rather than asserted on
+        // the seeded families alone, so a denial reason that arrives as a raw string
+        // from a call site — the one way an unbounded value could get in — is covered.
+        metrics.record_admin_invite_created();
+        metrics.record_admin_invite_redeemed();
+        metrics.record_admin_invite_denied("domain_not_allowed");
+        metrics.record_admin_invite_denied("colleague@example.com");
+        metrics.record_admin_identity_revoked();
+        metrics.record_admin_ownership_transferred();
         let rendered = metrics.render_prometheus("moira-test", true, true);
 
         for key in label_keys(&rendered) {
@@ -1647,5 +1664,18 @@ mod tests {
                 "unexpected label key {key:?}:\n{rendered}"
             );
         }
+
+        // An email address is the exact value plan 09 §0.5 forbids as a label. It must
+        // land in `other`, not create a new series — a counter that silently accepted it
+        // would put PII in every scrape and blow up cardinality on the one endpoint an
+        // attacker can make Moira write to by failing redemptions in a loop.
+        assert!(
+            !rendered.contains("colleague@example.com"),
+            "an invitee email must never reach a label value:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"outcome="other""#),
+            "an unrecognised denial reason must be folded into `other`, not dropped:\n{rendered}"
+        );
     }
 }
