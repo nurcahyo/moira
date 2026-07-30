@@ -9,8 +9,9 @@ use crate::{
         AgentProfileCreateRequest, AgentProfilePatchRequest, AgentProfileRecord, AttemptStatus,
         CredentialDecisionSource, CredentialRecord, CredentialType, ExecutionFailureClass,
         ListCursor, ModelCandidate, ProviderRuntimePolicyPutRequest, ProviderRuntimePolicyRecord,
-        RouteDefinitionCreateRequest, RouteDefinitionPatchRequest, RouteDefinitionRecord,
-        RoutingPolicyCreateRequest, RoutingPolicyPatchRequest, RoutingPolicyRecord, UsageSummary,
+        ResolvedProviderConfiguration, RouteDefinitionCreateRequest, RouteDefinitionPatchRequest,
+        RouteDefinitionRecord, RoutingPolicyCreateRequest, RoutingPolicyPatchRequest,
+        RoutingPolicyRecord, UsageSummary,
     },
     error::AppError,
     infra::pg_rows::{
@@ -1567,6 +1568,127 @@ async fn lock_and_match_version(
         return Err(version_conflict());
     }
     Ok(current_version)
+}
+
+/// Resolves the provider configuration and model key behind an embedding policy's
+/// `(embedding_provider_id, embedding_model_id)` pair.
+///
+/// Returns `None` when either row is missing, soft-deleted or inactive, or when the model does
+/// not belong to the provider — a policy that outlived the provider it names must degrade to an
+/// honest ingestion failure, never to a lookup against a deleted provider's credentials.
+///
+/// A free function rather than a `RuntimeRepository` trait method: it has exactly one caller,
+/// and `InMemoryRuntimeRepository` would have to stub a method no unit test drives.
+pub(crate) async fn find_embedding_model_target(
+    pool: &PgPool,
+    provider_id: Uuid,
+    provider_model_id: Uuid,
+) -> Result<Option<(ResolvedProviderConfiguration, String)>, AppError> {
+    let row = sqlx::query(
+        r#"
+            select p.id as provider_id,
+                   p.version as provider_version,
+                   p.provider_type,
+                   p.display_name as provider_display_name,
+                   p.base_url,
+                   pm.model_key
+            from providers p
+            join provider_models pm on pm.id = $2 and pm.provider_id = p.id
+            where p.id = $1
+              and p.status = 'active'
+              and p.deleted_at is null
+              and pm.status = 'active'
+              and pm.deleted_at is null
+            "#,
+    )
+    .bind(provider_id)
+    .bind(provider_model_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    Ok(Some((
+        ResolvedProviderConfiguration {
+            provider_id: row.try_get("provider_id")?,
+            provider_version: row.try_get("provider_version")?,
+            provider_type: provider_type_from_db(row.try_get::<String, _>("provider_type")?)?,
+            display_name: row.try_get("provider_display_name")?,
+            base_url: row.try_get("base_url")?,
+        },
+        row.try_get("model_key")?,
+    )))
+}
+
+/// Resolves and decrypts the credential an embedding call should use.
+///
+/// Reuses [`RuntimeRepository::resolve_runtime_credential`] rather than re-implementing the
+/// scope-precedence ladder (explicit id, then user, application, tenant, global): a second copy
+/// of that ordering would silently give embeddings different credential precedence from
+/// completions for the same provider.
+///
+/// Scoped to `application_id` with no tenant or user, because an embedding run belongs to the
+/// application that owns the collection, not to whoever happened to trigger the ingest.
+pub(crate) async fn resolve_embedding_credential(
+    pool: &PgPool,
+    cipher: &crate::security::LocalSecretCipher,
+    provider_id: Uuid,
+    provider_type: crate::domain::ProviderType,
+    application_id: Uuid,
+) -> Result<Option<crate::domain::ResolvedCredential>, AppError> {
+    use crate::security::SecretCipher;
+
+    let credential_types: &[CredentialType] = match provider_type {
+        crate::domain::ProviderType::AzureOpenAi => {
+            &[CredentialType::AzureOpenAi, CredentialType::ApiKey]
+        }
+        _ => &[CredentialType::ApiKey, CredentialType::BearerToken],
+    };
+    let Some(candidate) = PgRuntimeRepository::new(pool.clone())
+        .resolve_runtime_credential(
+            provider_id,
+            credential_types,
+            Some(application_id),
+            None,
+            None,
+            None,
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+
+    let record = candidate.record;
+    let aad = crate::security::credential_aad(crate::security::CredentialAadParts {
+        credential_id: record.id,
+        provider_id: record.provider_id,
+        credential_type: credential_type_to_db(&record.credential_type),
+        scope_type: crate::infra::pg_rows::scope_type_to_db(&record.scope_type),
+        external_tenant_id: record.external_tenant_id.as_deref(),
+        application_id: record.application_id,
+        external_user_id: record.external_user_id.as_deref(),
+        encryption_version: record.encryption_version,
+    });
+    let plaintext = cipher.decrypt(&candidate.encrypted, aad.as_bytes())?;
+    let config: Value = serde_json::from_slice(&plaintext)
+        .map_err(|_| AppError::Config("provider credential payload is invalid".to_string()))?;
+    let Some(field) = crate::security::credential_secret_field(record.credential_type) else {
+        return Ok(None);
+    };
+    let Some(secret) = config
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(crate::domain::ResolvedCredential {
+        credential_id: record.id,
+        credential_version: record.version,
+        credential_type: record.credential_type,
+        secret: secrecy::SecretString::new(secret.to_string()),
+        config,
+    }))
 }
 
 #[cfg(test)]

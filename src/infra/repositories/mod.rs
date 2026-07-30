@@ -43,8 +43,9 @@ pub use worker_jobs::{ClaimedJob, PgWorkerJobRepository, WorkerJobInsert, Worker
 // them in the admin-command runner. Exporting them from `moira::infra::repositories` would
 // publish an unauthenticated, unaudited write path around that envelope.
 pub(crate) use conversation::{
-    create_rag_collection_with_connection, create_rag_document_with_connection,
-    ingest_rag_document_with_connection,
+    RagIngestionContext, create_rag_collection_with_connection,
+    create_rag_document_with_connection, find_collection_ingestion_context,
+    find_document_ingestion_context, ingest_rag_document_with_connection,
 };
 pub use public::{
     IdempotencyClaim, PgPublicRepository, PublicAccess, PublicRepository, ResponseStartedInsert,
@@ -55,6 +56,7 @@ pub use runtime::{
     RuntimeCredentialCandidate, RuntimeRepository, UsageRecordInsert,
     execution_failure_class_to_db,
 };
+pub(crate) use runtime::{find_embedding_model_target, resolve_embedding_credential};
 pub use setup::{PgSetupRepository, SetupReadinessSnapshot, SetupRepository};
 // Test-only in-memory fakes (plan 06, Module 8 / P2-3). Exported `pub(crate)` under `cfg(test)`
 // so application-layer unit tests can drive a service without Postgres; they are compiled out of

@@ -77,7 +77,7 @@ use crate::{
         ListCursor, MemoryCreateRequest, MemoryPatchRequest, MemoryPolicyPutRequest,
         MemoryPolicyRecord, MemoryQuery, MemoryRecord, MemoryScope, RagCollectionCreateRequest,
         RagCollectionPatchRequest, RagCollectionQuery, RagCollectionRecord, RagCollectionStatus,
-        RagDocumentCreateRequest, RagDocumentIngestRequest, RagDocumentRecord, RagIngestionStatus,
+        RagDocumentCreateRequest, RagDocumentIngestRequest, RagDocumentRecord,
         RetrievalPolicyPutRequest, RetrievalPolicyRecord, SeqCursor,
     },
     error::AppError,
@@ -92,6 +92,7 @@ use crate::{
         rag_collection_visibility_to_db, rag_document_record_from_row, rag_ingestion_status_to_db,
         retrieval_policy_record_from_row,
     },
+    orchestration::{RagIngestionPlan, encode_vector_literal},
 };
 
 #[derive(Debug, Clone)]
@@ -455,6 +456,7 @@ pub trait ConversationRepository: Send + Sync {
     /// The SQL body lives in the free function so it can also run inside a caller-supplied
     /// transaction (the `AdminCommandRunner` idempotency envelope). This method owns the
     /// transaction lifecycle; the free function must never open one.
+    /// See [`ConversationRepository::ingest_rag_document`] on why `plan` is not optional.
     async fn create_rag_document(
         &self,
         id: Uuid,
@@ -462,6 +464,7 @@ pub trait ConversationRepository: Send + Sync {
         collection_public_id: &str,
         request: &RagDocumentCreateRequest,
         content_hash: Option<&str>,
+        plan: &RagIngestionPlan,
     ) -> Result<RagDocumentRecord, AppError>;
 
     /// Lists a collection's documents newest-created-first, resuming after `cursor`.
@@ -491,11 +494,17 @@ pub trait ConversationRepository: Send + Sync {
     /// transaction lifecycle; the free function must never open one — the `for update` row
     /// lock and the version supersession must belong to whatever transaction the caller
     /// already holds.
+    ///
+    /// `plan` is mandatory rather than optional so no implementation and no caller can write a
+    /// version without deciding what the pipeline produced. Passing
+    /// [`RagIngestionPlan::empty`] is a valid answer — it means "no content, nothing to
+    /// index", and it yields `'pending'`. What is not possible is forgetting.
     async fn ingest_rag_document(
         &self,
         public_id: &str,
         request: &RagDocumentIngestRequest,
         content_hash: &str,
+        plan: &RagIngestionPlan,
     ) -> Result<RagDocumentRecord, AppError>;
 }
 
@@ -1401,6 +1410,7 @@ impl ConversationRepository for PgConversationRepository {
         collection_public_id: &str,
         request: &RagDocumentCreateRequest,
         content_hash: Option<&str>,
+        plan: &RagIngestionPlan,
     ) -> Result<RagDocumentRecord, AppError> {
         let mut tx = self.pool.begin().await?;
         let record = create_rag_document_with_connection(
@@ -1410,6 +1420,7 @@ impl ConversationRepository for PgConversationRepository {
             collection_public_id,
             request,
             content_hash,
+            plan,
         )
         .await?;
         tx.commit().await?;
@@ -1474,10 +1485,12 @@ impl ConversationRepository for PgConversationRepository {
         public_id: &str,
         request: &RagDocumentIngestRequest,
         content_hash: &str,
+        plan: &RagIngestionPlan,
     ) -> Result<RagDocumentRecord, AppError> {
         let mut tx = self.pool.begin().await?;
         let record =
-            ingest_rag_document_with_connection(&mut tx, public_id, request, content_hash).await?;
+            ingest_rag_document_with_connection(&mut tx, public_id, request, content_hash, plan)
+                .await?;
         tx.commit().await?;
         Ok(record)
     }
@@ -1542,6 +1555,7 @@ pub(crate) async fn create_rag_document_with_connection(
     collection_public_id: &str,
     request: &RagDocumentCreateRequest,
     content_hash: Option<&str>,
+    plan: &RagIngestionPlan,
 ) -> Result<RagDocumentRecord, AppError> {
     let collection_id: Uuid = sqlx::query_scalar(
         "select id from rag_collections where public_id = $1 and deleted_at is null",
@@ -1579,7 +1593,11 @@ pub(crate) async fn create_rag_document_with_connection(
     .await?;
     if let (Some(content), Some(hash)) = (&request.content, content_hash) {
         let version_id = Uuid::now_v7();
-        // Honest status: no chunking/embedding pipeline exists yet (see plans/11-rag-memory-intelligence.md). Content is stored verbatim; ingestion_status reflects "not yet processed", not "indexed for retrieval".
+        // The status is *derived* from what the pipeline actually produced
+        // (`RagIngestionPlan::terminal_status`) and can never be passed in as a literal. That
+        // is the structural fix for P0-1: the old code bound `'indexed'` unconditionally, and
+        // its 02a replacement bound `'pending'` unconditionally. Both were constants; only one
+        // of them was honest, and neither was derived from work.
         sqlx::query(
             r#"
                 insert into rag_document_versions (
@@ -1594,10 +1612,12 @@ pub(crate) async fn create_rag_document_with_connection(
         .bind(content)
         .bind(hash)
         .bind(content.len() as i64)
-        .bind(rag_ingestion_status_to_db(RagIngestionStatus::Pending))
+        .bind(rag_ingestion_status_to_db(plan.terminal_status()))
         .bind(&request.metadata)
         .execute(&mut *connection)
         .await?;
+        write_rag_ingestion_artifacts(&mut *connection, id, version_id, collection_id, hash, plan)
+            .await?;
         sqlx::query("update rag_documents set current_version_id = $2 where id = $1")
             .bind(id)
             .bind(version_id)
@@ -1622,9 +1642,10 @@ pub(crate) async fn ingest_rag_document_with_connection(
     public_id: &str,
     request: &RagDocumentIngestRequest,
     content_hash: &str,
+    plan: &RagIngestionPlan,
 ) -> Result<RagDocumentRecord, AppError> {
-    let document_id: Uuid = sqlx::query_scalar(
-        "select id from rag_documents where public_id = $1 and deleted_at is null for update",
+    let target = sqlx::query(
+        "select id, collection_id from rag_documents where public_id = $1 and deleted_at is null for update",
     )
     .bind(public_id)
     .fetch_optional(&mut *connection)
@@ -1636,6 +1657,8 @@ pub(crate) async fn ingest_rag_document_with_connection(
             "RAG document not found",
         )
     })?;
+    let document_id: Uuid = target.try_get("id")?;
+    let collection_id: Uuid = target.try_get("collection_id")?;
     let version_number: i32 = sqlx::query_scalar(
         "select coalesce(max(version_number), 0) + 1 from rag_document_versions where document_id = $1",
     )
@@ -1655,7 +1678,7 @@ pub(crate) async fn ingest_rag_document_with_connection(
     .bind(document_id)
     .execute(&mut *connection)
     .await?;
-    // Honest status: no chunking/embedding pipeline exists yet (see plans/11-rag-memory-intelligence.md). Content is stored verbatim; ingestion_status reflects "not yet processed", not "indexed for retrieval".
+    // Derived, never a literal — see the matching comment on the create path.
     sqlx::query(
         r#"
             insert into rag_document_versions (
@@ -1674,9 +1697,18 @@ pub(crate) async fn ingest_rag_document_with_connection(
     .bind(content.len() as i64)
     .bind(&request.source_etag)
     .bind(request.source_last_modified)
-    .bind(rag_ingestion_status_to_db(RagIngestionStatus::Pending))
+    .bind(rag_ingestion_status_to_db(plan.terminal_status()))
     .bind(&request.metadata)
     .execute(&mut *connection)
+    .await?;
+    write_rag_ingestion_artifacts(
+        &mut *connection,
+        document_id,
+        version_id,
+        collection_id,
+        content_hash,
+        plan,
+    )
     .await?;
     sqlx::query("update rag_documents set current_version_id = $2 where id = $1")
         .bind(document_id)
@@ -1690,6 +1722,227 @@ pub(crate) async fn ingest_rag_document_with_connection(
     .fetch_one(&mut *connection)
     .await?;
     rag_document_record_from_row(&row)
+}
+
+// ---------------------------------------------------------------------------
+// RAG ingestion pipeline (plan 11, Sub-Phases A and B).
+//
+// Same INVARIANTS as the block above: no `begin`/`commit`/`rollback`, `pub(crate)` only.
+//
+// Nothing here attaches a `notify_moira_runtime_config_change()` trigger, and nothing here
+// should. `rag_chunks`, `rag_chunk_embeddings`, `rag_ingestion_runs` and
+// `rag_document_versions` carry no NOTIFY trigger today (`migrations/0007…` attaches one to
+// `rag_collections` and `rag_documents` only). Adding one would route every chunk write
+// through `circuit_reset_scope`'s `other =>` arm in `src/infra/db.rs`, which returns
+// `CircuitResetScope::All` — discarding every provider circuit-breaker on every replica, once
+// per chunk, with a `warn!` each time. If a later change ever does attach one, it must add the
+// table to `CIRCUIT_UNAFFECTED_RESOURCE_TYPES` and to `every_triggered_table_has_a_scope` in
+// the same commit.
+// ---------------------------------------------------------------------------
+
+/// Writes the chunks, embeddings and run row for one document version.
+///
+/// Called from both ingestion entry points so `/ingest`, `/reindex` and the inline-content
+/// create path cannot drift — `/reindex` is a literal alias of `/ingest` and the create path
+/// writes version 1, and a pipeline wired into only one of them would leave the others writing
+/// bare, chunk-less versions forever.
+async fn write_rag_ingestion_artifacts(
+    connection: &mut PgConnection,
+    document_id: Uuid,
+    document_version_id: Uuid,
+    collection_id: Uuid,
+    content_hash: &str,
+    plan: &RagIngestionPlan,
+) -> Result<(), AppError> {
+    for chunk in &plan.chunks {
+        let chunk_id = Uuid::now_v7();
+        sqlx::query(
+            r#"
+                insert into rag_chunks (
+                    id, public_id, document_version_id, collection_id, chunk_index,
+                    chunk_text_plain, chunk_hash, token_count, start_offset, end_offset,
+                    section_title, metadata
+                )
+                values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                "#,
+        )
+        .bind(chunk_id)
+        // `rag_chunks_public_id_valid` requires `^chunk_[0-9a-fA-F-]{36}$`, which is the
+        // hyphenated UUID form — not `simple()`.
+        .bind(format!("chunk_{chunk_id}"))
+        .bind(document_version_id)
+        .bind(collection_id)
+        .bind(chunk.chunk_index)
+        .bind(&chunk.text)
+        .bind(&chunk.chunk_hash)
+        .bind(chunk.token_estimate)
+        .bind(chunk.start_offset)
+        .bind(chunk.end_offset)
+        .bind(&chunk.section_title)
+        .bind(Value::Object(serde_json::Map::from_iter([(
+            "chunk_strategy".to_string(),
+            Value::String(plan.strategy.to_string()),
+        )])))
+        .execute(&mut *connection)
+        .await?;
+
+        if let Some(vector) = &chunk.embedding {
+            // The vector is bound as `text` and cast with `$4::vector` rather than through the
+            // `pgvector` crate — decision and reversal condition are recorded on
+            // `crate::orchestration::encode_vector_literal`.
+            sqlx::query(
+                r#"
+                    insert into rag_chunk_embeddings (
+                        chunk_id, embedding_model_id, embedding_version, dimension, embedding
+                    )
+                    values ($1, $2, 1, $3, $4::vector)
+                    "#,
+            )
+            .bind(chunk_id)
+            .bind(plan.embedding_model_id)
+            .bind(vector.len() as i32)
+            .bind(encode_vector_literal(vector))
+            .execute(&mut *connection)
+            .await?;
+        }
+    }
+
+    sqlx::query(
+        r#"
+            insert into rag_ingestion_runs (
+                id, document_id, document_version_id, status, content_hash,
+                chunk_count, embedded_chunk_count, completed_at, failure_class, metadata
+            )
+            values ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9)
+            "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(document_id)
+    .bind(document_version_id)
+    .bind(plan.run_status())
+    .bind(content_hash)
+    .bind(plan.chunk_count())
+    .bind(plan.embedded_chunk_count())
+    .bind(plan.failure_class)
+    .bind(Value::Object(serde_json::Map::from_iter([(
+        "chunk_strategy".to_string(),
+        Value::String(plan.strategy.to_string()),
+    )])))
+    .execute(&mut *connection)
+    .await?;
+    Ok(())
+}
+
+/// Everything the ingestion pipeline needs to know before it opens a transaction.
+#[derive(Debug, Clone)]
+pub(crate) struct RagIngestionContext {
+    /// The application that owns the collection. Embedding credentials resolve against this,
+    /// never against the acting admin's application.
+    pub application_id: Uuid,
+    pub mime_type: Option<String>,
+    /// `None` when the application has no embedding policy, or has one with
+    /// `rag_embeddings_enabled = false`. That is not a failure — it is an application that has
+    /// not asked for semantic indexing, and its documents are still chunked.
+    pub embedding: Option<RagEmbeddingTarget>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RagEmbeddingTarget {
+    pub provider_id: Option<Uuid>,
+    pub model_id: Option<Uuid>,
+    pub declared_dimension: Option<i32>,
+    pub batch_size: i32,
+    pub timeout_ms: i32,
+}
+
+fn ingestion_context_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<RagIngestionContext, AppError> {
+    let enabled: Option<bool> = row.try_get("rag_embeddings_enabled")?;
+    let embedding = if enabled == Some(true) {
+        Some(RagEmbeddingTarget {
+            provider_id: row.try_get("embedding_provider_id")?,
+            model_id: row.try_get("embedding_model_id")?,
+            declared_dimension: row.try_get("embedding_dimension")?,
+            batch_size: row.try_get::<Option<i32>, _>("batch_size")?.unwrap_or(32),
+            timeout_ms: row
+                .try_get::<Option<i32>, _>("timeout_ms")?
+                .unwrap_or(60_000),
+        })
+    } else {
+        None
+    };
+    Ok(RagIngestionContext {
+        application_id: row.try_get("application_id")?,
+        mime_type: row.try_get("mime_type")?,
+        embedding,
+    })
+}
+
+/// Ingestion context for `/ingest` and `/reindex`, keyed on the document's public id.
+///
+/// Returns `None` for a document that does not exist. The caller deliberately does **not**
+/// turn that into a `404` itself: the not-found error must keep being raised inside the
+/// command transaction, where it has always been raised, so the idempotency envelope's
+/// treatment of a failed ingest is unchanged by this plan.
+///
+/// This is a free function rather than a `ConversationRepository` trait method on purpose.
+/// `ConversationService` holds the concrete `PgConversationRepository`, the ingestion write
+/// bodies next to it are already free functions for the transaction-sharing reason documented
+/// above, and adding a method to the trait would oblige `InMemoryConversationRepository` to
+/// stub a method nothing calls.
+pub(crate) async fn find_document_ingestion_context(
+    pool: &PgPool,
+    document_public_id: &str,
+) -> Result<Option<RagIngestionContext>, AppError> {
+    let row = sqlx::query(
+        r#"
+            select c.application_id,
+                   d.mime_type,
+                   p.embedding_provider_id,
+                   p.embedding_model_id,
+                   p.embedding_dimension,
+                   p.batch_size,
+                   p.timeout_ms,
+                   p.rag_embeddings_enabled
+            from rag_documents d
+            join rag_collections c on c.id = d.collection_id
+            left join application_embedding_policies p on p.application_id = c.application_id
+            where d.public_id = $1 and d.deleted_at is null
+            "#,
+    )
+    .bind(document_public_id)
+    .fetch_optional(pool)
+    .await?;
+    row.as_ref().map(ingestion_context_from_row).transpose()
+}
+
+/// Ingestion context for the inline-content create path, keyed on the collection's public id.
+///
+/// The document does not exist yet, so the MIME type comes from the request rather than a row.
+pub(crate) async fn find_collection_ingestion_context(
+    pool: &PgPool,
+    collection_public_id: &str,
+) -> Result<Option<RagIngestionContext>, AppError> {
+    let row = sqlx::query(
+        r#"
+            select c.application_id,
+                   null::varchar as mime_type,
+                   p.embedding_provider_id,
+                   p.embedding_model_id,
+                   p.embedding_dimension,
+                   p.batch_size,
+                   p.timeout_ms,
+                   p.rag_embeddings_enabled
+            from rag_collections c
+            left join application_embedding_policies p on p.application_id = c.application_id
+            where c.public_id = $1 and c.deleted_at is null
+            "#,
+    )
+    .bind(collection_public_id)
+    .fetch_optional(pool)
+    .await?;
+    row.as_ref().map(ingestion_context_from_row).transpose()
 }
 
 // The outer `order by` in each of the three helpers below is load-bearing, for the reason
@@ -2306,6 +2559,7 @@ impl ConversationRepository for InMemoryConversationRepository {
         _collection_public_id: &str,
         _request: &RagDocumentCreateRequest,
         _content_hash: Option<&str>,
+        _plan: &RagIngestionPlan,
     ) -> Result<RagDocumentRecord, AppError> {
         Err(not_stubbed("create_rag_document"))
     }
@@ -2332,6 +2586,7 @@ impl ConversationRepository for InMemoryConversationRepository {
         _public_id: &str,
         _request: &RagDocumentIngestRequest,
         _content_hash: &str,
+        _plan: &RagIngestionPlan,
     ) -> Result<RagDocumentRecord, AppError> {
         Err(not_stubbed("ingest_rag_document"))
     }

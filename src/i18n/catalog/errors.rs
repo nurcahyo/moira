@@ -172,6 +172,21 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         description: "Used when a unique resource already exists.",
     },
     I18nEntry {
+        key: "moira.error.embedding_provider_unsupported",
+        default_message: "The configured embedding provider does not support embeddings.",
+        description: "Used when an application's embedding policy names a provider whose type exposes no embedding model in the configured Rig version. Anthropic and DeepSeek expose none in rig-core 0.40; OpenAI-compatible, Azure OpenAI and Gemini do.",
+    },
+    I18nEntry {
+        key: "moira.error.embedding_request_failed",
+        default_message: "The embedding request failed.",
+        description: "Used when a call to the embedding provider fails or exceeds the configured timeout. The provider's own response body is deliberately not propagated, because an embedding request body is document content.",
+    },
+    I18nEntry {
+        key: "moira.error.embedding_response_invalid",
+        default_message: "The embedding provider returned an invalid response.",
+        description: "Used when the embedding provider returns a different number of vectors than inputs, or vectors of a width the schema cannot store. Rejected rather than padded: a truncated embedding is a corrupt index entry that would degrade retrieval invisibly.",
+    },
+    I18nEntry {
         key: "moira.error.execution_failed",
         default_message: "The execution failed.",
         description: "Used when an execution attempt ends in failure.",
@@ -285,6 +300,11 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         key: "moira.error.rag_document_parse_failed",
         default_message: "The RAG document could not be parsed.",
         description: "Used when ingestion or parsing fails.",
+    },
+    I18nEntry {
+        key: "moira.error.rag_document_too_large",
+        default_message: "The RAG document is too large to ingest.",
+        description: "Used when chunking a document version would exceed rag.max_chunks_per_document. The request is refused rather than the document truncated, because a truncated document produces a retrieval index that is quietly incomplete.",
     },
     I18nEntry {
         key: "moira.error.rag_document_type_unsupported",

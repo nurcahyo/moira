@@ -1915,19 +1915,13 @@ fn secret_from_credential_payload(
     credential_type: crate::domain::CredentialType,
     value: &Value,
 ) -> Result<String, ExecutionFailure> {
-    let key = match credential_type {
-        crate::domain::CredentialType::ApiKey => "api_key",
-        crate::domain::CredentialType::BearerToken => "bearer_token",
-        crate::domain::CredentialType::AzureOpenAi => "api_key",
-        crate::domain::CredentialType::Oauth2 => "access_token",
-        crate::domain::CredentialType::BasicAuth
-        | crate::domain::CredentialType::CustomHeaders
-        | crate::domain::CredentialType::ServiceAccount => {
-            return Err(ExecutionFailure::new(
-                ExecutionFailureClass::ProviderConfigurationInvalid,
-                "credential type is not executable as a completion credential",
-            ));
-        }
+    // The field mapping lives in `crate::security::credential_secret_field` so the embedding
+    // path cannot grow a second, divergent copy of it.
+    let Some(key) = crate::security::credential_secret_field(credential_type) else {
+        return Err(ExecutionFailure::new(
+            ExecutionFailureClass::ProviderConfigurationInvalid,
+            "credential type is not executable as a completion credential",
+        ));
     };
     value
         .get(key)

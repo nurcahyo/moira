@@ -25,8 +25,17 @@ use crate::{
     infra::repositories::{
         AdminRepository, ConversationAccess, ConversationInsert, ConversationMessageInsert,
         ConversationRepository, MemoryInsert, PgAdminRepository, PgConversationRepository,
-        create_rag_collection_with_connection, create_rag_document_with_connection,
-        ingest_rag_document_with_connection,
+        RagIngestionContext, create_rag_collection_with_connection,
+        create_rag_document_with_connection, find_collection_ingestion_context,
+        find_document_ingestion_context, find_embedding_model_target,
+        ingest_rag_document_with_connection, resolve_embedding_credential,
+    },
+    orchestration::{
+        ChunkStrategy, ChunkingLimits, EmbeddingBatchPlan, EmbeddingFactory,
+        FAILURE_EMBEDDING_DIMENSION_UNSUPPORTED, FAILURE_EMBEDDING_FAILED,
+        FAILURE_EMBEDDING_NOT_CONFIGURED, RagIngestionPlan, RigEmbeddingFactory,
+        SUPPORTED_EMBEDDING_DIMENSION, embed_texts, prepare_chunks,
+        provider_type_supports_embeddings,
     },
     security::{Actor, ActorType},
 };
@@ -1038,6 +1047,26 @@ impl ConversationService {
         // deterministic, and a rejected request must never occupy an idempotency key.
         validate_metadata(&request.metadata)?;
         validate_document(&request)?;
+        // Same pre-transaction pipeline as `/ingest`: a document created with inline content is
+        // an ingestion entry point too, and a version written by this path with no chunks would
+        // be as dishonest as one written by `/ingest`.
+        let context = find_collection_ingestion_context(self.state.pool()?, collection_id).await?;
+        let plan = self
+            .plan_rag_ingestion(
+                context.as_ref(),
+                context
+                    .as_ref()
+                    .map(|context| context.application_id)
+                    .unwrap_or_default(),
+                request.content.as_deref(),
+                Some(request.mime_type.as_str()),
+            )
+            .await?;
+        self.state.metrics.record_rag_ingestion_run(
+            plan.chunk_count() as u64,
+            plan.embedded_chunk_count() as u64,
+            plan.failure_class.is_none(),
+        );
         let spec = conversation_command_spec(
             ctx,
             actor,
@@ -1069,6 +1098,7 @@ impl ConversationService {
                         &collection_id,
                         &request,
                         content_hash.as_deref(),
+                        &plan,
                     )
                     .await?;
                     transaction
@@ -1175,6 +1205,24 @@ impl ConversationService {
         })?;
         validate_content(content)?;
         validate_metadata(&request.metadata)?;
+        // Chunk and embed before the runner opens its transaction; see `plan_rag_ingestion`.
+        let context = find_document_ingestion_context(self.state.pool()?, document_id).await?;
+        let plan = self
+            .plan_rag_ingestion(
+                context.as_ref(),
+                context
+                    .as_ref()
+                    .map(|context| context.application_id)
+                    .unwrap_or_default(),
+                Some(content),
+                None,
+            )
+            .await?;
+        self.state.metrics.record_rag_ingestion_run(
+            plan.chunk_count() as u64,
+            plan.embedded_chunk_count() as u64,
+            plan.failure_class.is_none(),
+        );
         let spec = conversation_command_spec(
             ctx,
             actor,
@@ -1201,6 +1249,7 @@ impl ConversationService {
                         &document_id,
                         &request,
                         &content_hash,
+                        &plan,
                     )
                     .await?;
                     transaction
@@ -1218,6 +1267,189 @@ impl ConversationService {
             })
             .await?;
         Ok(outcome.response)
+    }
+
+    // -----------------------------------------------------------------------------------
+    // RAG ingestion pipeline (plan 11, Sub-Phases A and B).
+    // -----------------------------------------------------------------------------------
+
+    /// Builds the ingestion plan for one document version — chunks, hashes and embeddings —
+    /// **before** the command transaction opens.
+    ///
+    /// Ordering is the whole point. `ingest_rag_document_with_connection` runs inside the
+    /// `AdminCommandRunner` transaction, holding `select … for update` on the document row and
+    /// the idempotency advisory lock. Embedding is a network call, so doing it there would pin
+    /// a pooled connection and both locks across an unbounded await, once per batch. Everything
+    /// expensive therefore happens here, and the transaction only writes.
+    ///
+    /// Two consequences, both accepted deliberately:
+    ///
+    /// * Two concurrent requests carrying the same `Idempotency-Key` both embed, and only one
+    ///   of them wins the envelope. That wastes provider spend; it does not corrupt anything,
+    ///   because the loser's chunks are never written.
+    /// * A `422 rag_document_too_large` is raised before the key is claimed, which matches how
+    ///   every other validation on this surface already behaves — a rejected request must never
+    ///   occupy an idempotency key.
+    async fn plan_rag_ingestion(
+        &self,
+        context: Option<&RagIngestionContext>,
+        application_id: Uuid,
+        content: Option<&str>,
+        mime_type_hint: Option<&str>,
+    ) -> Result<RagIngestionPlan, AppError> {
+        let Some(content) = content.filter(|value| !value.trim().is_empty()) else {
+            return Ok(RagIngestionPlan::empty());
+        };
+        // A missing context means the document or collection does not exist. The 404 is left to
+        // the transaction, which is where it has always been raised — moving it here would
+        // change whether a not-found ingest claims its idempotency key.
+        let Some(context) = context else {
+            return Ok(RagIngestionPlan::empty());
+        };
+
+        let mime_type = context.mime_type.as_deref().or(mime_type_hint);
+        let strategy = ChunkStrategy::for_mime_type(mime_type);
+        let limits = ChunkingLimits {
+            max_chunk_chars: self.state.settings.rag.max_chunk_chars,
+            max_chunks_per_document: self.state.settings.rag.max_chunks_per_document,
+        };
+        let chunks = prepare_chunks(content, strategy, limits)?;
+        let strategy_label = strategy.as_str();
+        if chunks.is_empty() {
+            return Ok(RagIngestionPlan::empty());
+        }
+
+        // No embedding policy, or one with `rag_embeddings_enabled = false`. Not a failure:
+        // the application has not asked for semantic indexing, and the chunks it did ask for
+        // are stored. `embedded_chunk_count = 0` on the run row is how that stays visible.
+        let Some(target) = context.embedding.as_ref() else {
+            return Ok(RagIngestionPlan {
+                chunks,
+                strategy: strategy_label,
+                embedding_model_id: None,
+                embedding_dimension: None,
+                failure_class: None,
+            });
+        };
+
+        let (Some(provider_id), Some(model_id)) = (target.provider_id, target.model_id) else {
+            return Ok(RagIngestionPlan::failed(
+                chunks,
+                strategy_label,
+                FAILURE_EMBEDDING_NOT_CONFIGURED,
+            ));
+        };
+        if let Some(declared) = target.declared_dimension
+            && declared != SUPPORTED_EMBEDDING_DIMENSION as i32
+        {
+            return Ok(RagIngestionPlan::failed(
+                chunks,
+                strategy_label,
+                FAILURE_EMBEDDING_DIMENSION_UNSUPPORTED,
+            ));
+        }
+
+        let pool = self.state.pool()?;
+        let Some((provider, model_key)) =
+            find_embedding_model_target(pool, provider_id, model_id).await?
+        else {
+            return Ok(RagIngestionPlan::failed(
+                chunks,
+                strategy_label,
+                FAILURE_EMBEDDING_NOT_CONFIGURED,
+            ));
+        };
+        if !provider_type_supports_embeddings(provider.provider_type) {
+            return Ok(RagIngestionPlan::failed(
+                chunks,
+                strategy_label,
+                FAILURE_EMBEDDING_NOT_CONFIGURED,
+            ));
+        }
+        let Some(credential) = resolve_embedding_credential(
+            pool,
+            &self.state.cipher,
+            provider_id,
+            provider.provider_type,
+            application_id,
+        )
+        .await?
+        else {
+            return Ok(RagIngestionPlan::failed(
+                chunks,
+                strategy_label,
+                FAILURE_EMBEDDING_NOT_CONFIGURED,
+            ));
+        };
+
+        let handle = match RigEmbeddingFactory::new()
+            .build_embedding_model(
+                &provider,
+                &model_key,
+                &credential,
+                SUPPORTED_EMBEDDING_DIMENSION,
+            )
+            .await
+        {
+            Ok(handle) => handle,
+            // A provider that cannot embed, or a client that will not build, is a
+            // configuration problem — recorded on the run row, not raised at the caller, so
+            // the chunks that did succeed are still stored and the version is honestly
+            // `'failed'` rather than silently `'indexed'`.
+            Err(_) => {
+                return Ok(RagIngestionPlan::failed(
+                    chunks,
+                    strategy_label,
+                    FAILURE_EMBEDDING_NOT_CONFIGURED,
+                ));
+            }
+        };
+
+        let texts: Vec<String> = chunks.iter().map(|chunk| chunk.text.clone()).collect();
+        let plan = EmbeddingBatchPlan {
+            batch_size: target.batch_size.max(1) as usize,
+            deadline: std::time::Duration::from_millis(target.timeout_ms.max(1) as u64),
+            dimension: SUPPORTED_EMBEDDING_DIMENSION,
+        };
+        let started = std::time::Instant::now();
+        let vectors = match embed_texts(&handle, &texts, plan).await {
+            Ok(vectors) => vectors,
+            Err(_) => {
+                self.state
+                    .metrics
+                    .record_embedding_batch_latency(started.elapsed());
+                return Ok(RagIngestionPlan::failed(
+                    chunks,
+                    strategy_label,
+                    FAILURE_EMBEDDING_FAILED,
+                ));
+            }
+        };
+        self.state
+            .metrics
+            .record_embedding_batch_latency(started.elapsed());
+
+        // `embed_texts` guarantees one vector per input and the right width, so this zip
+        // cannot silently drop a chunk. Asserted rather than assumed: a mismatch here would
+        // store an embedding against the wrong chunk, which is undetectable downstream.
+        if vectors.len() != chunks.len() {
+            return Ok(RagIngestionPlan::failed(
+                chunks,
+                strategy_label,
+                FAILURE_EMBEDDING_FAILED,
+            ));
+        }
+        let mut chunks = chunks;
+        for (chunk, vector) in chunks.iter_mut().zip(vectors) {
+            chunk.embedding = Some(vector);
+        }
+        Ok(RagIngestionPlan {
+            chunks,
+            strategy: strategy_label,
+            embedding_model_id: Some(model_id),
+            embedding_dimension: Some(SUPPORTED_EMBEDDING_DIMENSION as i32),
+            failure_class: None,
+        })
     }
 
     async fn ensure_conversation_write(

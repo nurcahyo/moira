@@ -804,11 +804,23 @@ async fn repeated_ingest_with_the_same_key_replays_and_creates_exactly_one_versi
         first.current_version_id(),
         "a replay must not point at a newly created version"
     );
+    // 02a's honesty contract said `'pending'` because no pipeline existed. Plan 11 wave 1 builds
+    // it, so the truthful terminal state for a content-carrying ingest is `'indexed'`; the
+    // contract itself — the status must equal what actually happened — is unchanged, and its
+    // row-level enforcement lives in `tests/rag_ingestion_honesty.rs`. What this suite pins is
+    // narrower and still exactly right: whatever the status is, the replay must report the same
+    // one as the original, because it is the same version.
     assert_eq!(
         first.field("ingestion_status"),
-        &json!("pending"),
-        "02a's honesty contract must not regress: {}",
+        &json!("indexed"),
+        "the honesty contract must not regress: {}",
         first.body
+    );
+    assert_eq!(
+        replay.field("ingestion_status"),
+        first.field("ingestion_status"),
+        "a replay must report the original version's status: {}",
+        replay.body
     );
 
     assert_eq!(

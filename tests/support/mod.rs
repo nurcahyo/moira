@@ -18,10 +18,10 @@ use moira::{
     domain::{
         ApplicationCreateRequest, ApplicationExecutionPolicyPutRequest, ConsumerKeyCreateRequest,
         ConversationPolicyPutRequest, CredentialCreateRequest, CredentialScope, CredentialSecret,
-        CredentialType, DiagnosticExecutionRequest, ExecutionOptions, ProviderCreateRequest,
-        ProviderModelCreateRequest, ProviderRuntimePolicyPutRequest, ProviderType,
-        ResponsePersistenceMode, RouteDefinitionCreateRequest, RouteSelectionStrategy,
-        RoutingPolicyCreateRequest, RuntimePolicyStatus,
+        CredentialType, DiagnosticExecutionRequest, EmbeddingPolicyPutRequest, ExecutionOptions,
+        ProviderCreateRequest, ProviderModelCreateRequest, ProviderRuntimePolicyPutRequest,
+        ProviderType, ResponsePersistenceMode, RouteDefinitionCreateRequest,
+        RouteSelectionStrategy, RoutingPolicyCreateRequest, RuntimePolicyStatus,
     },
     security::{Actor, ActorType},
 };
@@ -318,6 +318,114 @@ impl LifecycleFixture {
             model_id: model.id,
             credential_id: credential.id,
         }
+    }
+
+    /// Points this fixture's application at an embedding-capable provider and turns RAG
+    /// embeddings on.
+    ///
+    /// Deliberately does **not** reuse [`Self::add_provider`]: that one also writes a routing
+    /// policy, which would make the embedding provider a completion candidate for this
+    /// fixture's route and quietly change what an unrelated execution test resolves.
+    ///
+    /// `base_url` is normally a [`mock_openai::MockOpenAiServer::base_url`]. There is no live
+    /// embedding credential anywhere in this repository and none is required: the mock serves
+    /// `/v1/embeddings` with deterministic vectors, so what is proven end to end is the
+    /// pipeline — chunk, call, persist, derive the status — not any particular provider's
+    /// embedding quality.
+    pub async fn enable_rag_embeddings(
+        &self,
+        base_url: String,
+        model_key: &str,
+    ) -> ProviderFixture {
+        let suffix = Uuid::now_v7().simple().to_string();
+        let admin = AdminService::new(&self.state).expect("admin service");
+        let provider = admin
+            .create_provider(
+                &self.actor,
+                &request_context(),
+                ProviderCreateRequest {
+                    provider_type: ProviderType::OpenAiCompatible,
+                    display_name: format!("Embedding provider {suffix}"),
+                    base_url: Some(base_url),
+                    metadata: json!({ "test_fixture": true, "purpose": "embeddings" }),
+                },
+            )
+            .await
+            .expect("create embedding provider");
+        let model = admin
+            .create_provider_model(
+                &self.actor,
+                &request_context(),
+                provider.id,
+                ProviderModelCreateRequest {
+                    model_key: model_key.to_string(),
+                    display_name: Some("Embedding model".to_string()),
+                    capabilities: json!({ "embeddings": true }),
+                },
+            )
+            .await
+            .expect("create embedding provider model");
+        let credential = admin
+            .create_credential(
+                &self.actor,
+                &request_context(),
+                CredentialCreateRequest {
+                    provider_id: provider.id,
+                    credential_type: CredentialType::ApiKey,
+                    scope: CredentialScope::Global,
+                    secret: CredentialSecret::ApiKey {
+                        api_key: "sk-embedding-secret".to_string(),
+                    },
+                    display_name: Some("Embedding credential".to_string()),
+                    priority: 100,
+                    expires_at: None,
+                    metadata: json!({ "test_fixture": true }),
+                },
+            )
+            .await
+            .expect("create embedding credential");
+
+        ConversationService::new(&self.state)
+            .expect("conversation service")
+            .put_embedding_policy(
+                &self.actor,
+                &request_context(),
+                self.application_id,
+                EmbeddingPolicyPutRequest {
+                    embedding_provider_id: Some(provider.id),
+                    embedding_model_id: Some(model.id),
+                    embedding_dimension: Some(1536),
+                    batch_size: Some(2),
+                    rag_embeddings_enabled: Some(true),
+                    ..EmbeddingPolicyPutRequest::default()
+                },
+            )
+            .await
+            .expect("enable RAG embeddings");
+
+        ProviderFixture {
+            provider_id: provider.id,
+            model_id: model.id,
+            credential_id: credential.id,
+        }
+    }
+
+    /// Turns RAG embeddings on with a policy that names no provider or model — the
+    /// misconfiguration whose honest outcome is a `'failed'` version, not an `'indexed'` one.
+    pub async fn enable_rag_embeddings_without_a_provider(&self) {
+        ConversationService::new(&self.state)
+            .expect("conversation service")
+            .put_embedding_policy(
+                &self.actor,
+                &request_context(),
+                self.application_id,
+                EmbeddingPolicyPutRequest {
+                    rag_embeddings_enabled: Some(true),
+                    ..EmbeddingPolicyPutRequest::default()
+                },
+            )
+            .await
+            .expect("enable RAG embeddings without a provider");
     }
 
     pub fn execution_service(&self) -> MoiraExecutionService {

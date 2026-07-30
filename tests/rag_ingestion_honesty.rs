@@ -12,6 +12,31 @@
 //!
 //! No `sleep()` and no concurrency test: 02a introduces no concurrent code path, so it warrants
 //! neither (`plans/CONVENTIONS.md` §3; finding P2-12).
+//!
+//! # Plan 11 wave 1 — what the honesty contract now says
+//!
+//! 02a's contract was `'pending'` everywhere, because there was no pipeline and `'pending'` was
+//! the only truthful thing a version row could say. Plan 11 wave 1 builds the pipeline, so the
+//! truthful terminal state changes — but the *contract* does not. It is still "the status must
+//! equal what actually happened", and it is still enforced against the database rather than
+//! against the API's opinion of it.
+//!
+//! Every assertion below that reads `'indexed'` is paired with an assertion about **rows**:
+//! `rag_chunks` for the version, `rag_chunk_embeddings` for those chunks, and the
+//! `rag_ingestion_runs` row's `chunk_count`/`embedded_chunk_count`. That pairing is the whole
+//! point. A status string is trivially forgeable by a regressed write site binding a literal —
+//! which is exactly the P0-1 defect, whose original form was `values (…, 'indexed', …)`. Row
+//! counts are not forgeable without doing the work.
+//!
+//! The three terminal states this surface can now produce, and what each one asserts:
+//!
+//! | Application configuration | Terminal status | What must also be true |
+//! |---|---|---|
+//! | content present, `rag_embeddings_enabled = false` (the default) | `'indexed'` | chunks > 0, embeddings == 0 |
+//! | content present, embeddings enabled and working | `'indexed'` | chunks > 0, embeddings == chunks |
+//! | content present, embeddings enabled but broken or unconfigured | `'failed'` | chunks > 0, embeddings == 0 |
+//! | no content | *(no version row at all)* | — |
+//! | content that is only whitespace | `'pending'` | chunks == 0 |
 
 mod support;
 
@@ -28,7 +53,10 @@ use tokio::time::timeout;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use support::LifecycleFixture;
+use support::{
+    LifecycleFixture,
+    mock_openai::{EmbeddingBehaviour, MockOpenAiServer, mock_embedding_for},
+};
 
 const WAIT: Duration = Duration::from_secs(10);
 const DOCUMENT_BODY: &str = "Moira stores this document verbatim. Nothing is chunked or embedded.";
@@ -70,6 +98,15 @@ impl HttpResult {
             .unwrap_or_else(|| panic!("current_version_id is not set: {}", self.body));
         Uuid::parse_str(raw).expect("current_version_id is a UUID")
     }
+}
+
+/// A `rag_ingestion_runs` row, read straight out of PostgreSQL.
+#[derive(Debug)]
+struct IngestionRunRow {
+    status: String,
+    chunk_count: i32,
+    embedded_chunk_count: i32,
+    failure_class: Option<String>,
 }
 
 /// A `rag_document_versions` row, read straight out of PostgreSQL.
@@ -282,6 +319,107 @@ impl RagFixture {
             .collect()
     }
 
+    /// How many `rag_chunks` rows exist for a version.
+    ///
+    /// The load-bearing counterpart to every `'indexed'` assertion in this file: the status is a
+    /// string a regressed write site could bind unconditionally, whereas a chunk row only exists
+    /// if the chunker ran and its output was persisted.
+    async fn chunk_count(&self, version_id: Uuid) -> i64 {
+        self.scalar(
+            "select count(*) from rag_chunks where document_version_id = $1",
+            version_id,
+        )
+        .await
+    }
+
+    /// How many of that version's chunks carry a non-null embedding vector.
+    async fn embedding_count(&self, version_id: Uuid) -> i64 {
+        self.scalar(
+            "select count(*) from rag_chunk_embeddings e
+             join rag_chunks c on c.id = e.chunk_id
+             where c.document_version_id = $1 and e.embedding is not null",
+            version_id,
+        )
+        .await
+    }
+
+    async fn scalar(&self, query: &str, id: Uuid) -> i64 {
+        timeout(
+            WAIT,
+            sqlx::query_scalar::<_, i64>(query)
+                .bind(id)
+                .fetch_one(&self.fixture.pool),
+        )
+        .await
+        .expect("count query timed out")
+        .expect("count query")
+    }
+
+    /// The chunk texts of a version, in `chunk_index` order.
+    async fn chunk_texts(&self, version_id: Uuid) -> Vec<String> {
+        timeout(
+            WAIT,
+            sqlx::query_scalar::<_, String>(
+                "select chunk_text_plain from rag_chunks
+                 where document_version_id = $1 order by chunk_index",
+            )
+            .bind(version_id)
+            .fetch_all(&self.fixture.pool),
+        )
+        .await
+        .expect("chunk text query timed out")
+        .expect("chunk text query")
+    }
+
+    /// The stored embedding for one chunk, decoded from pgvector's text output.
+    ///
+    /// Reads `embedding::text` rather than binding a vector type, mirroring the write side:
+    /// Moira encodes vectors as text and casts, and adds no `pgvector` crate.
+    async fn stored_embedding(&self, version_id: Uuid, chunk_index: i32) -> Vec<f32> {
+        let encoded: String = timeout(
+            WAIT,
+            sqlx::query_scalar::<_, String>(
+                "select e.embedding::text from rag_chunk_embeddings e
+                 join rag_chunks c on c.id = e.chunk_id
+                 where c.document_version_id = $1 and c.chunk_index = $2",
+            )
+            .bind(version_id)
+            .bind(chunk_index)
+            .fetch_one(&self.fixture.pool),
+        )
+        .await
+        .expect("embedding query timed out")
+        .expect("embedding row exists");
+        encoded
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .split(',')
+            .map(|part| part.trim().parse::<f32>().expect("vector component"))
+            .collect()
+    }
+
+    /// The `rag_ingestion_runs` row for a version — the table plan 11 exists to finally write.
+    async fn ingestion_run(&self, version_id: Uuid) -> IngestionRunRow {
+        let row = timeout(
+            WAIT,
+            sqlx::query(
+                "select status, chunk_count, embedded_chunk_count, failure_class
+                 from rag_ingestion_runs where document_version_id = $1",
+            )
+            .bind(version_id)
+            .fetch_one(&self.fixture.pool),
+        )
+        .await
+        .expect("ingestion run query timed out")
+        .expect("exactly one ingestion run row exists for this version");
+        IngestionRunRow {
+            status: row.get("status"),
+            chunk_count: row.get("chunk_count"),
+            embedded_chunk_count: row.get("embedded_chunk_count"),
+            failure_class: row.get("failure_class"),
+        }
+    }
+
     async fn indexed_version_count(&self, document_uuid: Uuid) -> i64 {
         timeout(
             WAIT,
@@ -298,9 +436,15 @@ impl RagFixture {
     }
 }
 
-/// Test 1 — the API and the audit trail must agree, and both must say `pending`.
+/// Test 1 — the API and the audit trail must agree, and `'indexed'` must be earned.
+///
+/// 02a's version of this test pinned `'pending'` on both surfaces, which was truthful while no
+/// pipeline existed. Plan 11 wave 1 gives `'pending'` somewhere to go, so the pin moves to the
+/// new terminal state — and gains the row-level assertions that make the new state mean
+/// something. The API/audit-trail agreement half is unchanged: it is still the defect P0-1
+/// actually was, an API reporting one thing while `rag_document_versions` recorded another.
 #[tokio::test]
-async fn ingest_rag_document_reports_pending_over_http_and_in_the_database() {
+async fn ingest_rag_document_reports_indexed_only_when_chunks_were_really_written() {
     let Some(fixture) = RagFixture::new().await else {
         return;
     };
@@ -325,26 +469,93 @@ async fn ingest_rag_document_reports_pending_over_http_and_in_the_database() {
     );
     assert_eq!(
         ingested.ingestion_status(),
-        &json!("pending"),
-        "HTTP ingest response must report pending, got: {}",
+        &json!("indexed"),
+        "HTTP ingest response must report the terminal status, got: {}",
         ingested.body
     );
 
     // Second half: the row itself, read with SQL. The API could be honest while the persisted
-    // audit trail still claims 'indexed' — that is exactly defect P0-1.
+    // audit trail still claims something else — that is exactly defect P0-1.
     let version_id = ingested.current_version_id();
     assert_eq!(
         fixture.version_status(version_id).await,
-        "pending",
-        "rag_document_versions.ingestion_status for the current version must be 'pending'"
+        "indexed",
+        "rag_document_versions.ingestion_status for the current version must be 'indexed'"
     );
+
+    // Third half, and the one that carries the weight. `'indexed'` is a string; a write site
+    // that regressed to binding it as a literal would satisfy both assertions above while doing
+    // nothing at all, which is precisely the shape of the original P0-1 defect. Chunk rows
+    // cannot be produced without running the chunker.
+    let chunks = fixture.chunk_count(version_id).await;
+    assert!(
+        chunks > 0,
+        "a version marked 'indexed' must have rag_chunks rows; found {chunks}"
+    );
+    let texts = fixture.chunk_texts(version_id).await;
+    assert_eq!(
+        texts.concat().replace(char::is_whitespace, ""),
+        DOCUMENT_BODY.replace(char::is_whitespace, ""),
+        "the stored chunks must reconstruct the ingested body, not arbitrary text: {texts:?}"
+    );
+
+    // This fixture's application has no embedding policy, so `rag_embeddings_enabled` is false
+    // and zero embeddings is the honest outcome — recorded on the run row rather than implied.
+    assert_eq!(
+        fixture.embedding_count(version_id).await,
+        0,
+        "no embedding policy is configured, so no embeddings may exist"
+    );
+    let run = fixture.ingestion_run(version_id).await;
+    assert_eq!(run.status, "completed", "ingestion run: {run:?}");
+    assert_eq!(
+        i64::from(run.chunk_count),
+        chunks,
+        "the run row's chunk_count must equal the chunks actually stored: {run:?}"
+    );
+    assert_eq!(run.embedded_chunk_count, 0, "ingestion run: {run:?}");
+    assert_eq!(run.failure_class, None, "ingestion run: {run:?}");
+}
+
+/// Test 1b — whitespace-only content indexes nothing, and says so.
+///
+/// The gap this closes: with the terminal status derived from "did we produce chunks", a body
+/// that chunks to nothing must not reach `'indexed'`. A pipeline that marked every accepted
+/// request `'indexed'` regardless of output would pass test 1 and fail here.
+#[tokio::test]
+async fn content_that_chunks_to_nothing_stays_pending_rather_than_claiming_indexed() {
+    let Some(fixture) = RagFixture::new().await else {
+        return;
+    };
+    let collection_id = fixture.create_collection("whitespace").await;
+    let created = fixture
+        .create_document(&collection_id, "whitespace", None)
+        .await;
+    let document_id = created.document_id();
+
+    let ingested = fixture.ingest(&document_id, "   \n\n\t  \n", None).await;
+    assert_eq!(
+        ingested.status,
+        StatusCode::OK,
+        "ingest failed: {}",
+        ingested.body
+    );
+    assert_eq!(
+        ingested.ingestion_status(),
+        &json!("pending"),
+        "content that produces no chunks must not claim to be indexed: {}",
+        ingested.body
+    );
+    let version_id = ingested.current_version_id();
+    assert_eq!(fixture.version_status(version_id).await, "pending");
+    assert_eq!(fixture.chunk_count(version_id).await, 0);
 }
 
 /// Test 2 — the create path's own write site, plus the in-transaction response-row re-select.
 /// Without that re-select the insert's `RETURNING` row predates the version insert and this
 /// response carries `null`; that is the trap this test exists to spring.
 #[tokio::test]
-async fn create_rag_document_with_inline_content_reports_pending_ingestion_status() {
+async fn create_rag_document_with_inline_content_runs_the_same_pipeline_as_ingest() {
     let Some(fixture) = RagFixture::new().await else {
         return;
     };
@@ -360,18 +571,27 @@ async fn create_rag_document_with_inline_content_reports_pending_ingestion_statu
     );
     assert_eq!(
         created.ingestion_status(),
-        &json!("pending"),
-        "inline-content create must report pending (a `null` here means the response-row \
-         re-select is missing): {}",
+        &json!("indexed"),
+        "inline-content create must report the terminal status (a `null` here means the \
+         response-row re-select is missing): {}",
         created.body
     );
 
     let version_id = created.current_version_id();
     assert_eq!(
         fixture.version_status(version_id).await,
-        "pending",
-        "the version written by the create path must be persisted as 'pending'"
+        "indexed",
+        "the version written by the create path must be persisted as 'indexed'"
     );
+    // Create-with-inline-content is a third ingestion entry point alongside `/ingest` and
+    // `/reindex`, and it is the one the plan's own scope table never mentions. A pipeline wired
+    // into only the other two would leave this path writing chunk-less versions forever, so it
+    // gets the same row-level proof rather than a status check.
+    assert!(
+        fixture.chunk_count(version_id).await > 0,
+        "the create path must run the chunker, not only the version insert"
+    );
+    assert_eq!(fixture.ingestion_run(version_id).await.status, "completed");
 
     // Pins a deliberate side effect of the response-row re-select. Setting
     // current_version_id fires the rag_documents_bump_version BEFORE UPDATE trigger, so
@@ -432,6 +652,16 @@ async fn create_rag_document_without_content_reports_null_ingestion_status() {
         fixture.versions(document_uuid).await.is_empty(),
         "no rag_document_versions row may exist for a content-less create"
     );
+    assert_eq!(
+        fixture
+            .scalar(
+                "select count(*) from rag_ingestion_runs where document_id = $1",
+                document_uuid
+            )
+            .await,
+        0,
+        "a content-less create ran no pipeline, so it must record no ingestion run"
+    );
 }
 
 /// Test 4 — every `rag_document_select(` call site must carry the `LEFT JOIN`, so the single-read
@@ -452,7 +682,7 @@ async fn rag_document_get_and_list_report_the_same_ingestion_status() {
         created.body
     );
     let document_id = created.document_id();
-    let expected = json!("pending");
+    let expected = json!("indexed");
     assert_eq!(
         created.ingestion_status(),
         &expected,
@@ -513,9 +743,33 @@ async fn rag_document_get_and_list_report_the_same_ingestion_status() {
     );
 }
 
-/// Test 5 — supersession still works, and no reachable path ever writes `'indexed'`.
+/// Test 5 — supersession still works, and `'indexed'` is reached only by doing the work.
+///
+/// # Why the old `indexed_version_count == 0` assertion could not simply be inverted
+///
+/// 02a's version of this test asserted that no row for the document ever holds `'indexed'`, and
+/// its own comment (kept below, updated) recorded why that assertion was weaker than it looked:
+/// the supersession `CASE` in `ingest_rag_document_with_connection` rewrites `'indexed'` into
+/// `'superseded'`, so a write site that regressed to binding `'indexed'` would have been
+/// laundered into `'superseded'` and the count would still have read zero.
+///
+/// The naive inversion — `indexed_version_count == 1` — has the mirror-image flaw. It is
+/// satisfied by *any* write site that binds the literal `'indexed'`, which is precisely the
+/// P0-1 defect in its original form. It would pass against a pipeline that does no work at all.
+///
+/// So this test asserts the two things a status string cannot fake, once each:
+///
+/// 1. **Version 2 is `'indexed'` *and* has chunk rows, an embedding-run row, and a
+///    `chunk_count` on that row equal to the chunks actually stored.** Rows require the
+///    chunker to have run.
+/// 2. **Version 1 is `'superseded'`.** That is stronger than it appears, and it is why the
+///    laundering `CASE` is now an asset rather than a hazard: the `CASE` rewrites *only*
+///    `'indexed'`. A version that never reached `'indexed'` stays at whatever it held — which
+///    is what 02a observed, and why that assertion read `'pending'`. So `'superseded'` on
+///    version 1 is positive evidence that version 1 genuinely reached `'indexed'` under its own
+///    ingestion, not an artefact of anything.
 #[tokio::test]
-async fn reindex_supersedes_the_previous_version_without_ever_writing_indexed() {
+async fn reindex_supersedes_the_previous_version_and_indexed_is_earned_not_laundered() {
     let Some(fixture) = RagFixture::new().await else {
         return;
     };
@@ -542,7 +796,7 @@ async fn reindex_supersedes_the_previous_version_without_ever_writing_indexed() 
     );
     assert_eq!(
         reindexed.ingestion_status(),
-        &json!("pending"),
+        &json!("indexed"),
         "reindex response: {}",
         reindexed.body
     );
@@ -564,17 +818,21 @@ async fn reindex_supersedes_the_previous_version_without_ever_writing_indexed() 
         versions[0].superseded,
         "version 1 must carry superseded_at after reindex: {versions:?}"
     );
-    // Pins the consequence of the supersession CASE becoming a no-op. It only rewrites
-    // 'indexed' into 'superseded', and nothing reaches 'indexed' any more, so a superseded
-    // version keeps 'pending' and RagIngestionStatus::Superseded is currently unreachable.
-    // superseded_at above remains the authoritative signal. Asserted explicitly because the
-    // count(*) = 0 check below is laundered by that same CASE: were a write site to regress
-    // to 'indexed', supersession would rewrite it to 'superseded' and the count would still
-    // read zero. Plan 11 is expected to change this line when a real pipeline lands.
+    // Point 2 of the doc comment. The supersession CASE rewrites *only* 'indexed', so this
+    // value is positive evidence that version 1 reached 'indexed' under its own ingestion. Under
+    // 02a this same assertion read 'pending', because nothing reached 'indexed' to convert.
     assert_eq!(
-        versions[0].ingestion_status, "pending",
-        "a superseded version keeps its stored status; nothing reaches 'indexed' to convert: {versions:?}"
+        versions[0].ingestion_status, "superseded",
+        "version 1 must have reached 'indexed' for the supersession CASE to convert it; \
+         'pending' here means the create path stopped chunking: {versions:?}"
     );
+    // The superseded version keeps its chunks. They are real rows describing real content, and
+    // deleting them here would destroy the only evidence that version 1's ingestion happened.
+    assert!(
+        fixture.chunk_count(first_version_id).await > 0,
+        "supersession must not delete the previous version's chunks"
+    );
+
     assert_eq!(versions[1].id, second_version_id);
     assert_eq!(versions[1].version_number, 2);
     assert!(
@@ -582,14 +840,35 @@ async fn reindex_supersedes_the_previous_version_without_ever_writing_indexed() 
         "the newly created version must not be superseded: {versions:?}"
     );
     assert_eq!(
-        versions[1].ingestion_status, "pending",
-        "the superseding version must be persisted as pending: {versions:?}"
+        versions[1].ingestion_status, "indexed",
+        "the superseding version must be persisted as indexed: {versions:?}"
     );
 
+    // Point 1. Exactly one live 'indexed' row, and it is backed by work — the assertion the
+    // naive `count(*) == 1` inversion would have skipped.
     assert_eq!(
         fixture.indexed_version_count(document_uuid).await,
-        0,
-        "no rag_document_versions row for this document may ever hold 'indexed': {versions:?}"
+        1,
+        "only the current version may hold 'indexed': {versions:?}"
+    );
+    let chunks = fixture.chunk_count(second_version_id).await;
+    assert!(
+        chunks > 0,
+        "the reindexed version claims 'indexed' with no chunk rows behind it"
+    );
+    let texts = fixture.chunk_texts(second_version_id).await;
+    assert_eq!(
+        texts.concat().replace(char::is_whitespace, ""),
+        REVISED_BODY.replace(char::is_whitespace, ""),
+        "the reindexed version's chunks must come from the revised body, not the original: \
+         {texts:?}"
+    );
+    let run = fixture.ingestion_run(second_version_id).await;
+    assert_eq!(run.status, "completed", "ingestion run: {run:?}");
+    assert_eq!(
+        i64::from(run.chunk_count),
+        chunks,
+        "the run row must report the chunks that were actually stored: {run:?}"
     );
 }
 
@@ -609,7 +888,7 @@ async fn reindex_supersedes_the_previous_version_without_ever_writing_indexed() 
 /// about which one a failure came from. (Cargo does apply the filter to every test target, so
 /// neither would be skipped — the cost is triage confusion, not lost coverage.)
 #[tokio::test]
-async fn repeated_ingest_with_the_same_key_replays_exactly_one_pending_version() {
+async fn repeated_ingest_with_the_same_key_replays_exactly_one_indexed_version() {
     let Some(fixture) = RagFixture::new().await else {
         return;
     };
@@ -665,8 +944,21 @@ async fn repeated_ingest_with_the_same_key_replays_exactly_one_pending_version()
     );
     assert_eq!(versions[0].version_number, 1);
     assert_eq!(
-        versions[0].ingestion_status, "pending",
+        versions[0].ingestion_status, "indexed",
         "02a's honesty contract must survive the move into the runner's transaction: {versions:?}"
+    );
+    // Replay must not run the pipeline twice. The chunks are written inside the same
+    // transaction the idempotency envelope owns, so a replayed call that re-executed the
+    // mutation would double them — and `rag_chunks_version_index_unique` would surface that as
+    // a constraint violation rather than as a silent duplicate, but only if a *new* version were
+    // created. Counting rows against the single version is what covers the in-place case.
+    let chunks = fixture.chunk_count(versions[0].id).await;
+    assert!(chunks > 0, "the ingested version must carry chunks");
+    let run = fixture.ingestion_run(versions[0].id).await;
+    assert_eq!(
+        i64::from(run.chunk_count),
+        chunks,
+        "one key, one ingestion run, one set of chunks: {run:?}"
     );
 }
 
@@ -799,4 +1091,243 @@ async fn list_rag_documents_stays_newest_first_after_reingestion() {
         "documents must be listed newest-first regardless of version heap order: {}",
         listed.body
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// Plan 11 wave 1 — the embedding half of the pipeline.
+//
+// There is no live embedding credential in this repository and none is required. The mock at
+// `tests/support/mock_openai.rs` serves `/v1/embeddings` with deterministic vectors, so these
+// tests prove the pipeline — resolve the policy, resolve the provider and credential, call,
+// persist the vectors against the right chunks, derive the status from the outcome — rather
+// than any provider's embedding quality.
+//
+// What is therefore NOT covered here, and would need a live provider: real vector semantics
+// (that similar text yields nearby vectors), real provider rate limiting, and real model
+// dimensions other than 1536.
+// ---------------------------------------------------------------------------------------
+
+/// Test 9 — with embeddings enabled and working, every chunk gets the vector the provider
+/// returned for *its own text*.
+#[tokio::test]
+async fn embeddings_enabled_stores_one_provider_vector_per_chunk() {
+    let Some(fixture) = RagFixture::new().await else {
+        return;
+    };
+    let provider = MockOpenAiServer::start(Vec::new()).await;
+    fixture
+        .fixture
+        .enable_rag_embeddings(provider.base_url(), "text-embedding-3-small")
+        .await;
+
+    let collection_id = fixture.create_collection("embedded").await;
+    let created = fixture
+        .create_document(&collection_id, "embedded", None)
+        .await;
+    let document_id = created.document_id();
+
+    // Three paragraphs, so the batch_size of 2 the fixture configures forces more than one
+    // provider call and the batching loop is actually exercised.
+    let body = "Alpha paragraph one.\n\nBeta paragraph two.\n\nGamma paragraph three.";
+    let ingested = fixture.ingest(&document_id, body, None).await;
+    assert_eq!(
+        ingested.status,
+        StatusCode::OK,
+        "ingest failed: {}",
+        ingested.body
+    );
+    assert_eq!(
+        ingested.ingestion_status(),
+        &json!("indexed"),
+        "ingest response: {}",
+        ingested.body
+    );
+
+    let version_id = ingested.current_version_id();
+    assert_eq!(fixture.chunk_count(version_id).await, 3);
+    assert_eq!(
+        fixture.embedding_count(version_id).await,
+        3,
+        "every chunk must carry an embedding when embeddings are enabled and working"
+    );
+
+    let run = fixture.ingestion_run(version_id).await;
+    assert_eq!(run.status, "completed", "ingestion run: {run:?}");
+    assert_eq!(run.chunk_count, 3, "ingestion run: {run:?}");
+    assert_eq!(run.embedded_chunk_count, 3, "ingestion run: {run:?}");
+    assert_eq!(run.failure_class, None, "ingestion run: {run:?}");
+
+    // Batching: three inputs at batch_size 2 is two calls, not one and not three.
+    let calls = provider.embedding_requests().await;
+    assert_eq!(
+        calls.len(),
+        2,
+        "three chunks at batch_size 2 must be two provider calls: {calls:?}"
+    );
+    assert_eq!(
+        calls[0].authorization.as_deref(),
+        Some("Bearer sk-embedding-secret"),
+        "the embedding call must carry the resolved provider credential"
+    );
+
+    // The assertion that proves vectors were not shuffled between chunks: each stored vector
+    // must be the one the provider produced for that chunk's own text. A zip that silently
+    // mis-aligned by one would pass every count assertion above and fail here.
+    let texts = fixture.chunk_texts(version_id).await;
+    for (index, text) in texts.iter().enumerate() {
+        let stored = fixture.stored_embedding(version_id, index as i32).await;
+        assert_eq!(
+            stored,
+            mock_embedding_for(text),
+            "chunk {index} ({text:?}) stored a vector belonging to different text"
+        );
+    }
+
+    provider.shutdown().await;
+}
+
+/// Test 10 — embeddings enabled with no provider configured must fail the version, not index it.
+///
+/// This is the honesty case that most easily regresses into a lie. The application has asked
+/// for semantic indexing and is not getting it; reporting `'indexed'` would tell an operator
+/// that retrieval will work when it cannot.
+#[tokio::test]
+async fn embeddings_enabled_without_a_provider_fails_the_version_rather_than_indexing_it() {
+    let Some(fixture) = RagFixture::new().await else {
+        return;
+    };
+    fixture
+        .fixture
+        .enable_rag_embeddings_without_a_provider()
+        .await;
+
+    let collection_id = fixture.create_collection("unconfigured").await;
+    let created = fixture
+        .create_document(&collection_id, "unconfigured", None)
+        .await;
+    let document_id = created.document_id();
+    let ingested = fixture.ingest(&document_id, DOCUMENT_BODY, None).await;
+
+    assert_eq!(
+        ingested.status,
+        StatusCode::OK,
+        "ingest failed: {}",
+        ingested.body
+    );
+    assert_eq!(
+        ingested.ingestion_status(),
+        &json!("failed"),
+        "an application that asked for embeddings and has no provider must not be told its \
+         document is indexed: {}",
+        ingested.body
+    );
+
+    let version_id = ingested.current_version_id();
+    assert_eq!(fixture.version_status(version_id).await, "failed");
+    // The chunks that did succeed are kept: they were really produced and really stored, and
+    // discarding them would lose the only work that completed.
+    assert!(
+        fixture.chunk_count(version_id).await > 0,
+        "a failed embedding stage must not discard the chunks it already produced"
+    );
+    assert_eq!(fixture.embedding_count(version_id).await, 0);
+    let run = fixture.ingestion_run(version_id).await;
+    assert_eq!(run.status, "failed", "ingestion run: {run:?}");
+    assert_eq!(
+        run.failure_class.as_deref(),
+        Some("embedding_not_configured"),
+        "ingestion run: {run:?}"
+    );
+}
+
+/// Test 11 — a provider that errors fails the version, and the failure is classified.
+#[tokio::test]
+async fn an_embedding_provider_error_fails_the_version_and_is_classified() {
+    let Some(fixture) = RagFixture::new().await else {
+        return;
+    };
+    let provider = MockOpenAiServer::start(Vec::new()).await;
+    provider
+        .set_embedding_behaviour(EmbeddingBehaviour::HttpError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: "{\"error\":{\"message\":\"upstream exploded\"}}".to_string(),
+        })
+        .await;
+    fixture
+        .fixture
+        .enable_rag_embeddings(provider.base_url(), "text-embedding-3-small")
+        .await;
+
+    let collection_id = fixture.create_collection("provider-error").await;
+    let created = fixture
+        .create_document(&collection_id, "provider-error", None)
+        .await;
+    let document_id = created.document_id();
+    let ingested = fixture.ingest(&document_id, DOCUMENT_BODY, None).await;
+
+    assert_eq!(ingested.status, StatusCode::OK, "{}", ingested.body);
+    assert_eq!(
+        ingested.ingestion_status(),
+        &json!("failed"),
+        "a failed embedding call must not produce an 'indexed' version: {}",
+        ingested.body
+    );
+    let version_id = ingested.current_version_id();
+    assert!(fixture.chunk_count(version_id).await > 0);
+    assert_eq!(fixture.embedding_count(version_id).await, 0);
+    let run = fixture.ingestion_run(version_id).await;
+    assert_eq!(run.failure_class.as_deref(), Some("embedding_failed"));
+
+    // The provider's response body must not reach the caller. It can echo the request, and an
+    // embedding request body is document content.
+    let serialised = ingested.body.to_string();
+    assert!(
+        !serialised.contains("upstream exploded"),
+        "the provider's error body leaked into the ingest response: {serialised}"
+    );
+
+    provider.shutdown().await;
+}
+
+/// Test 12 — a short provider response is refused rather than zip-truncated.
+///
+/// Without this, `chunks.zip(vectors)` would silently attach vectors to the wrong chunks and
+/// drop the tail, producing an index that is subtly wrong in a way no count assertion catches.
+#[tokio::test]
+async fn a_short_embedding_response_fails_the_version_rather_than_misaligning_vectors() {
+    let Some(fixture) = RagFixture::new().await else {
+        return;
+    };
+    let provider = MockOpenAiServer::start(Vec::new()).await;
+    provider
+        .set_embedding_behaviour(EmbeddingBehaviour::ShortResponse)
+        .await;
+    fixture
+        .fixture
+        .enable_rag_embeddings(provider.base_url(), "text-embedding-3-small")
+        .await;
+
+    let collection_id = fixture.create_collection("short-response").await;
+    let created = fixture
+        .create_document(&collection_id, "short-response", None)
+        .await;
+    let document_id = created.document_id();
+    let ingested = fixture
+        .ingest(&document_id, "One.\n\nTwo.\n\nThree.", None)
+        .await;
+
+    assert_eq!(
+        ingested.ingestion_status(),
+        &json!("failed"),
+        "a provider returning fewer vectors than inputs must fail the version: {}",
+        ingested.body
+    );
+    let version_id = ingested.current_version_id();
+    assert_eq!(
+        fixture.embedding_count(version_id).await,
+        0,
+        "a partially-embedded version must store no embeddings at all"
+    );
+
+    provider.shutdown().await;
 }

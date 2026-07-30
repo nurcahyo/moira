@@ -99,6 +99,26 @@ const WORKER_LEADER_HELD: &str = "moira_worker_leader_held";
 const REDIS_OPERATION_FAILURES_TOTAL: &str = "moira_redis_operation_failures_total";
 const RUNTIME_INVALIDATIONS_TOTAL: &str = "moira_runtime_invalidations_total";
 
+// Plan 11 wave 1. Seeded for the same reason as the wave-2 families above: an alert on
+// "chunks stopped being written" must fire on the condition, not on "no data".
+//
+// All three are label-free or closed-label by construction. There is deliberately no
+// `application_id`, `collection_id` or `document_id` label anywhere here — per-application
+// ingestion diagnostics belong in `rag_ingestion_runs` rows, which is what that table is
+// for, and an application id as a label value is the unbounded-cardinality scrape-path
+// memory-exhaustion vector this module's header describes.
+const RAG_CHUNKS_WRITTEN_TOTAL: &str = "moira_rag_chunks_written_total";
+const RAG_EMBEDDINGS_WRITTEN_TOTAL: &str = "moira_rag_embeddings_written_total";
+const RAG_INGESTION_RUNS_TOTAL: &str = "moira_rag_ingestion_runs_total";
+const EMBEDDING_BATCH_LATENCY_SECONDS: &str = "moira_embedding_batch_latency_seconds";
+
+/// The two `outcome` values a RAG ingestion run can carry.
+///
+/// Both are members of the existing closed outcome set produced by `execution_outcome_label`,
+/// so this family adds no new label *value* to the `outcome` key — only a new family that uses
+/// it. Introducing a third, ingestion-specific string would fork a shared label's domain.
+const RAG_INGESTION_OUTCOMES: &[&str] = &["succeeded", "failed"];
+
 /// Route label used when a request matched no route (404s, and anything rejected before
 /// routing completed). Deliberately a constant: falling back to the raw URI here is exactly
 /// the unbounded-label bug this module exists to prevent.
@@ -120,6 +140,12 @@ const EXECUTION_LATENCY_BUCKETS_SECONDS: &[f64] = &[
 /// Time-to-first-token is the latency an end user actually perceives on a stream, so the
 /// resolution is concentrated below one second.
 const TTFT_BUCKETS_SECONDS: &[f64] = &[0.025, 0.05, 0.1, 0.2, 0.4, 0.8, 1.5, 3.0, 5.0, 10.0, 20.0];
+
+/// An embedding run covers every batch for one document, so its tail is set by document size
+/// rather than by a single round trip — a 2000-chunk document at 32 chunks per batch is 63
+/// sequential provider calls.
+const EMBEDDING_BATCH_BUCKETS_SECONDS: &[f64] =
+    &[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0];
 
 #[derive(Clone, Debug)]
 pub struct MetricsRegistry {
@@ -285,6 +311,27 @@ impl MetricsRegistry {
                  channel is an additive second signal and is absent unless Redis is enabled."
             );
 
+            describe_counter!(
+                RAG_CHUNKS_WRITTEN_TOTAL,
+                "RAG document chunks written by the ingestion pipeline."
+            );
+            describe_counter!(
+                RAG_EMBEDDINGS_WRITTEN_TOTAL,
+                "RAG chunk embeddings written by the ingestion pipeline. Stays at zero for \
+                 applications that have not enabled rag_embeddings_enabled, which is the \
+                 default."
+            );
+            describe_counter!(
+                RAG_INGESTION_RUNS_TOTAL,
+                "RAG document ingestion runs, by outcome. A run is counted once per document \
+                 version that produced at least one chunk or recorded a failure."
+            );
+            describe_histogram!(
+                EMBEDDING_BATCH_LATENCY_SECONDS,
+                "Wall-clock time for one document's complete embedding run, across every \
+                 batch, in seconds. Recorded on failure as well as success."
+            );
+
             gauge!(DB_POOL_CONNECTIONS, "state" => "total").set(0.0);
             gauge!(DB_POOL_CONNECTIONS, "state" => "idle").set(0.0);
             for job_name in WORKER_JOB_NAMES {
@@ -303,6 +350,11 @@ impl MetricsRegistry {
             }
             for channel in InvalidationChannel::ALL {
                 counter!(RUNTIME_INVALIDATIONS_TOTAL, "channel" => channel.label()).increment(0);
+            }
+            counter!(RAG_CHUNKS_WRITTEN_TOTAL).increment(0);
+            counter!(RAG_EMBEDDINGS_WRITTEN_TOTAL).increment(0);
+            for outcome in RAG_INGESTION_OUTCOMES {
+                counter!(RAG_INGESTION_RUNS_TOTAL, "outcome" => *outcome).increment(0);
             }
         });
     }
@@ -401,6 +453,37 @@ impl MetricsRegistry {
                 "status_class" => class
             )
             .record(seconds);
+        });
+    }
+
+    /// Records one RAG document-version ingestion run (plan 11 Sub-Phases A and B).
+    ///
+    /// Called once per version that actually ran the pipeline. A version with no content
+    /// produces no chunks and no failure, and is deliberately **not** counted: nothing ran, and
+    /// inflating the `succeeded` series with no-ops would make "ingestion is working" true by
+    /// construction — the exact shape of dishonesty this pipeline exists to remove.
+    pub fn record_rag_ingestion_run(&self, chunks: u64, embeddings: u64, succeeded: bool) {
+        if chunks == 0 && succeeded {
+            return;
+        }
+        let outcome = if succeeded { "succeeded" } else { "failed" };
+        with_local_recorder(&self.inner.recorder, || {
+            counter!(RAG_INGESTION_RUNS_TOTAL, "outcome" => outcome).increment(1);
+            if chunks > 0 {
+                counter!(RAG_CHUNKS_WRITTEN_TOTAL).increment(chunks);
+            }
+            if embeddings > 0 {
+                counter!(RAG_EMBEDDINGS_WRITTEN_TOTAL).increment(embeddings);
+            }
+        });
+    }
+
+    /// Records how long one document's complete embedding run took, on success and failure
+    /// alike — a timeout is exactly the observation this histogram exists to show.
+    pub fn record_embedding_batch_latency(&self, latency: Duration) {
+        let seconds = latency.as_secs_f64();
+        with_local_recorder(&self.inner.recorder, || {
+            histogram!(EMBEDDING_BATCH_LATENCY_SECONDS).record(seconds);
         });
     }
 
@@ -645,6 +728,7 @@ fn known_job_name(job_name: &str) -> Option<&'static str> {
 const _: () = assert!(!HTTP_LATENCY_BUCKETS_SECONDS.is_empty());
 const _: () = assert!(!EXECUTION_LATENCY_BUCKETS_SECONDS.is_empty());
 const _: () = assert!(!TTFT_BUCKETS_SECONDS.is_empty());
+const _: () = assert!(!EMBEDDING_BATCH_BUCKETS_SECONDS.is_empty());
 
 fn build_recorder(service_name: &str) -> PrometheusRecorder {
     let mut builder =
@@ -659,6 +743,10 @@ fn build_recorder(service_name: &str) -> PrometheusRecorder {
             EXECUTION_LATENCY_BUCKETS_SECONDS,
         ),
         (EXECUTION_TTFT_SECONDS, TTFT_BUCKETS_SECONDS),
+        (
+            EMBEDDING_BATCH_LATENCY_SECONDS,
+            EMBEDDING_BATCH_BUCKETS_SECONDS,
+        ),
     ] {
         builder = builder
             .set_buckets_for_metric(Matcher::Full(name.to_string()), buckets)
@@ -1242,6 +1330,9 @@ mod tests {
             WORKER_LEADER_HELD,
             REDIS_OPERATION_FAILURES_TOTAL,
             RUNTIME_INVALIDATIONS_TOTAL,
+            RAG_CHUNKS_WRITTEN_TOTAL,
+            RAG_EMBEDDINGS_WRITTEN_TOTAL,
+            RAG_INGESTION_RUNS_TOTAL,
         ] {
             assert!(
                 rendered.contains(family),

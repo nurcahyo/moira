@@ -24,11 +24,19 @@ use std::path::{Path, PathBuf};
 /// - `src/orchestration/runtime_factory.rs` — builds Rig clients and completion models. This is
 ///   *the* boundary file; `src/orchestration/executor.rs` was often mistaken for it and is deleted.
 /// - `src/application/execution.rs` — assembles `CompletionRequest` and converts tool schemas.
+/// - `src/orchestration/embedding.rs` — the embedding twin of `runtime_factory.rs`, added by
+///   plan 11 Sub-Phase B. It builds Rig embedding clients and classifies `EmbeddingError`, and
+///   it is a *widening of the same seam*, not a second one: embeddings are an AI execution
+///   primitive, so Rig owns them and Moira must not grow its own. Everything above it —
+///   `chunking.rs`, `ingestion.rs`, the repository and the application service — names no Rig
+///   type, which is what keeps `Vec<f32>` rather than `rig_core::embeddings::Embedding` the
+///   currency of the ingestion pipeline.
 ///
 /// Adding an entry here is the deliberate act of widening the boundary. It should be rare and it
 /// should be argued for in review, which is the entire point of making it a diff.
 const RIG_BOUNDARY_FILES: &[&str] = &[
     "src/application/execution.rs",
+    "src/orchestration/embedding.rs",
     "src/orchestration/runtime_factory.rs",
 ];
 
