@@ -3,10 +3,15 @@
 // Typed client for the Moira admin endpoints the setup wizard needs.
 //
 // This module carries the bootstrap system key. It must never be imported from a
-// client component; `tests/unit/architecture/server-only-guards.test.ts` enforces
-// that statically. (The plan's eventual `import "server-only"` build guard lands
-// with the Next.js app wiring — see that test's header for why it is not here
-// yet.)
+// client component. Two independent mechanisms enforce that:
+//
+//   * `import "server-only"` below — a build-time guard. Next.js compiles server
+//     code with the `react-server` export condition, which resolves that package
+//     to an empty module; a browser bundle resolves the `default` condition,
+//     which is a bare `throw`, and `next build` fails.
+//   * `tests/unit/architecture/server-only-guards.test.ts` — a static scan that
+//     catches what the build guard cannot: an import that is server-legal but
+//     architecturally wrong.
 //
 // DESIGN NOTE — the operation registry is the point.
 //
@@ -27,6 +32,8 @@
 //
 // `tests/contract/openapi-contract.test.ts` re-derives the whole table from the
 // committed spec on every run.
+
+import "server-only";
 
 import { MoiraRequestError, toMoiraError, toTransportError } from "./errors";
 import type {

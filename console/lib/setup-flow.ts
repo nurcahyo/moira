@@ -3,6 +3,10 @@
 // The setup wizard's flow logic: the ordering of Moira writes, the gates between
 // wizard steps, and the partial-state handling between them.
 //
+// Carries the bootstrap system key transitively (through `MoiraClient`) and
+// receives a closure over the OAuth client secret, so it is server-only by the
+// same build guard as `moira-client.ts` — see the `import "server-only"` below.
+//
 // ============================================================================
 // WHY THE ORDER IS WHAT IT IS. Read before changing anything below.
 // ============================================================================
@@ -45,6 +49,8 @@
 //
 // `assertB1Invariant` below is what makes that non-negotiable, and
 // `tests/unit/lib/setup-flow.test.ts` is the regression test.
+
+import "server-only";
 
 import { MoiraClient, ifMatchFor, type MoiraOperationName } from "./moira-client";
 import { isMoiraRequestError, type MoiraError } from "./errors";

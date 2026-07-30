@@ -1,2 +1,18 @@
 [test]
-preload = ["./tests/support/dom-register.ts", "./tests/support/dom-setup.ts"]
+# Order matters and each entry runs to completion before the next starts.
+#
+#   native-globals    captures Bun's real `fetch` before happy-dom replaces it.
+#                     Must be before dom-register, or the capture is happy-dom's
+#                     own implementation, which silently drops Bun's per-request
+#                     `tls` option and breaks the TLS fixtures.
+#   server-only-shim  neutralises the `server-only` marker package, whose
+#                     `default` export condition is a bare `throw`. Must be
+#                     before any test file imports a credential-carrying module.
+#   dom-register      installs happy-dom globals.
+#   dom-setup         wires testing-library onto those globals.
+preload = [
+  "./tests/support/native-globals.ts",
+  "./tests/support/server-only-shim.ts",
+  "./tests/support/dom-register.ts",
+  "./tests/support/dom-setup.ts",
+]

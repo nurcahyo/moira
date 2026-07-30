@@ -19,9 +19,11 @@
     "format": "prettier --write ."
   },
   "dependencies": {
+    "better-auth": "1.6.25",
     "next": "16.2.11",
     "react": "19.2.8",
-    "react-dom": "19.2.8"
+    "react-dom": "19.2.8",
+    "server-only": "0.0.1"
   },
   "devDependencies": {
     "@axe-core/playwright": "4.12.1",
@@ -39,6 +41,7 @@
     "eslint-config-next": "16.2.11",
     "eslint-config-prettier": "10.1.8",
     "happy-dom": "20.11.1",
+    "jose": "6.2.5",
     "prettier": "3.9.6",
     "typescript": "5.9.3"
   }

@@ -1,6 +1,10 @@
 import { defineConfig, devices } from "@playwright/test";
 
+import { installConsoleE2eEnv } from "./e2e/support/console-env";
 import { SENTINEL_ENV } from "./e2e/support/secrets";
+
+// Must run before `forbiddenValues()` reads `process.env` — see console-env.ts.
+installConsoleE2eEnv();
 
 /**
  * Playwright configuration for the Moira console.
@@ -101,6 +105,24 @@ export default defineConfig({
             // `next start` honours PORT.
             PORT: String(port),
             NODE_ENV: "production",
+            // `lib/env.ts` validates eagerly and refuses to boot without
+            // these. The rest come from `installConsoleE2eEnv()` above, which
+            // the server inherits; only the origin is decided here.
+            //
+            // NOTE the deliberate mismatch: the server listens on plain http on
+            // loopback, but declares an https PUBLIC origin. That is not a
+            // fudge — it is what a real deployment looks like. The console runs
+            // behind a TLS-terminating ingress (`charts/moira-console`'s
+            // Ingress forces an https redirect), so the origin it advertises as
+            // its issuer and JWKS host is never the address it binds.
+            //
+            // The alternative — declaring `http://127.0.0.1:PORT` and setting
+            // `CONSOLE_ALLOW_INSECURE_URLS=true` — CANNOT work here, because
+            // `NODE_ENV` is `production` two lines above and `lib/env.ts` makes
+            // that flag a hard failure in production, exactly as Moira's
+            // `Settings::validate` does for `auth.jwks.allow_insecure_dev_urls`.
+            // Trying it fails the boot with `ConsoleConfigError`.
+            CONSOLE_PUBLIC_ORIGIN: "https://console.e2e.invalid",
             // Server-only sentinel secrets for the secret-leak gate.
             // Never prefixed NEXT_PUBLIC_ — see e2e/support/secrets.ts.
             ...SENTINEL_ENV,
