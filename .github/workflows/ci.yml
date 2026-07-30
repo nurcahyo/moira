@@ -108,3 +108,122 @@ jobs:
             "https://github.com/yannh/kubeconform/releases/download/${version}/kubeconform-linux-amd64.tar.gz" \
             | tar -xz -C "$RUNNER_TEMP/bin" kubeconform
           "$RUNNER_TEMP/bin/kubeconform" -ignore-missing-schemas -summary /tmp/moira-rendered.yaml
+
+  # Frontend gate for the Next.js admin console. Everything here is scoped to
+  # `console/` and shares nothing with the Rust jobs, so it runs in parallel with
+  # them rather than behind them.
+  console:
+    runs-on: ubuntu-latest
+    # Playwright can hang rather than fail; a job-level cap turns that into a red
+    # run instead of a runner held for six hours.
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: console
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned to the exact version in `console/package.json`'s `packageManager`
+      # field and in `console/Dockerfile`'s BUN_VERSION. Three places, one
+      # number: a bump that misses one of them produces a CI run that does not
+      # match the image it is gating.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - run: bun run lint
+      - run: bun run typecheck
+      - run: bun test
+      - run: bun run build
+      # Playwright IS run here. The suite qualifies for an unattended gate: the
+      # config's own header states it talks to no Moira instance and no auth
+      # provider, its `webServer` builds and starts the standalone server the
+      # image ships, and it already sets `retries: 2` and `workers: 1` under CI.
+      # The specs it runs — smoke, axe a11y, and the secret-leak tap — are
+      # exactly the checks that are worthless if they only ever run on a laptop.
+      #
+      # Browser install is its own step on purpose: an apt/CDN failure inside
+      # `playwright install` and a genuine test failure are different incidents,
+      # and folding them into one step makes the log the only way to tell them
+      # apart.
+      - name: Install Playwright browser
+        run: bunx playwright install --with-deps chromium
+      # `E2E_SKIP_BUILD=1` reuses the `bun run build` output from the step above
+      # instead of building a second time inside `webServer.command`. CI=true is
+      # set by the runner, which is what flips `forbidOnly`/`retries`/`workers`.
+      - name: Playwright e2e
+        env:
+          E2E_SKIP_BUILD: "1"
+        run: bun run e2e
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: console/playwright-report
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # A separate job from `container-and-helm`, not extra steps inside it.
+  #
+  # The two share no inputs: that job builds the Rust image from the repo root
+  # Dockerfile and validates `charts/moira`; this one builds the console image
+  # from `console/` and validates `charts/moira-console`. Appending these steps
+  # there would serialise two independent multi-minute image builds behind one
+  # another and collapse two unrelated failure causes into a single red check —
+  # "container-and-helm failed" would no longer say which half broke. Two jobs
+  # run concurrently and name their own failure. The only duplication is the
+  # kubeconform download, which is a two-second curl.
+  console-container-and-helm:
+    runs-on: ubuntu-latest
+    permissions:
+      # Deliberately narrower than `container-and-helm`'s. Trivy runs with
+      # `format: table` and uploads no SARIF, so `security-events: write` would
+      # be an unused write scope on a job that builds an internet-facing image.
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: azure/setup-helm@v4
+      # Build context is `console/`, matching the COPY paths in its Dockerfile.
+      - run: docker build -t moira-console:ci console
+      # Same action version, same exit-code and same severity floor as the Moira
+      # image. No `--ignore-unfixed` and no `.trivyignore`: the console is the
+      # internet-facing half, so it is the last place to start accepting a
+      # CRITICAL because no patch has shipped yet.
+      - uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: moira-console:ci
+          format: table
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+      - run: helm lint charts/moira-console
+      - run: helm template moira-console charts/moira-console > /tmp/moira-console-rendered.yaml
+      # Default values leave ingress, HPA, the created Secret and the migration
+      # job unrendered, so a syntax error in any of those four templates would
+      # ship green. This second render turns them all on — and doubles as a test
+      # of the chart's own `fail` guards, since an invalid combination here stops
+      # the job.
+      - name: Render every optional template
+        run: |
+          set -euo pipefail
+          helm template moira-console charts/moira-console \
+            --set ingress.enabled=true \
+            --set autoscaling.enabled=true \
+            --set secret.create=true \
+            --set secret.data.BETTER_AUTH_SECRET=ci-placeholder-not-a-real-secret \
+            --set networkPolicy.moira.namespace=moira-system \
+            --set migrationJob.enabled=true \
+            --set migrationJob.image.repository=ghcr.io/example/moira-console-migrate \
+            --set 'migrationJob.command={node,node_modules/@better-auth/cli/dist/index.js,migrate,--yes}' \
+            > /tmp/moira-console-rendered-all.yaml
+      - name: Validate rendered manifests with kubeconform
+        run: |
+          set -euo pipefail
+          version=v0.6.7
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            "https://github.com/yannh/kubeconform/releases/download/${version}/kubeconform-linux-amd64.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/bin" kubeconform
+          "$RUNNER_TEMP/bin/kubeconform" -ignore-missing-schemas -summary \
+            /tmp/moira-console-rendered.yaml \
+            /tmp/moira-console-rendered-all.yaml

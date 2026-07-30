@@ -1,0 +1,25 @@
+{{- if .Values.autoscaling.enabled }}
+# Unlike charts/moira, autoscaling is permitted here: the console keeps sessions,
+# rate-limit counters and its JWKS in PostgreSQL, so no replica holds authority
+# that another replica needs.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "moira-console.fullname" . }}
+  labels:
+    {{- include "moira-console.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "moira-console.fullname" . }}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}

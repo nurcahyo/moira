@@ -1,0 +1,16 @@
+{{- if .Values.priorityClass.enabled }}
+# Cluster-scoped, hence the toggle: two releases of this chart in two namespaces
+# would otherwise fight over one object. `charts/moira` creates its PriorityClass
+# unconditionally AND never references it from a pod spec; this one is actually
+# wired up via `priorityClassName` in templates/deployment.yaml, which is the
+# only thing that makes creating it worth anything.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: {{ include "moira-console.fullname" . }}
+  labels:
+    {{- include "moira-console.labels" . | nindent 4 }}
+value: {{ .Values.priorityClass.value }}
+globalDefault: false
+description: "Priority for Moira admin console pods (below the Moira API)."
+{{- end }}

@@ -1,0 +1,175 @@
+{{- include "moira-console.validate" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "moira-console.fullname" . }}
+  labels:
+    {{- include "moira-console.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "moira-console.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "moira-console.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Rolls the pods when non-secret config changes. The Secret is
+        # deliberately not checksummed: this chart does not own it, and hashing
+        # a value it only references by name would mean reading credentials
+        # into the release manifest.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      # The console never calls the Kubernetes API. Mounting a token would give
+      # an RCE in an internet-facing Next.js server a cluster credential for
+      # free.
+      automountServiceAccountToken: false
+      {{- if .Values.priorityClass.enabled }}
+      priorityClassName: {{ include "moira-console.fullname" . }}
+      {{- end }}
+      # Shorter than Moira's 45s: the console serves ordinary request/response
+      # HTTP with no long-lived streaming responses to drain.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        # uid/gid 65532 is the `nonroot` user of `gcr.io/distroless/nodejs24-debian12:nonroot`,
+        # the console runtime base image. That image ships exactly one non-root
+        # user and has no shell and no package manager with which to create
+        # another, so any other value here asks for a user the image does not
+        # contain and the pod fails at admission-time-plus-one — at container
+        # start, not in CI.
+        #
+        # This number is pinned to THAT base image, not copied from
+        # `charts/moira` (which happens to land on the same uid because
+        # `gcr.io/distroless/cc-debian12:nonroot` uses it too). If
+        # `console/Dockerfile` moves to a base image with a different non-root
+        # uid — a `node:*-slim` image, for instance, whose conventional app user
+        # is 1000 or a hand-created 1001 — this value MUST move with it, and so
+        # must the one in `migration-job.yaml`. Plan 07 shipped exactly that
+        # mismatch once (deployment at 65532, migration job left at 10001) and
+        # it is invisible until deploy.
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if .Values.topologySpread.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: {{ .Values.topologySpread.maxSkew }}
+          topologyKey: {{ .Values.topologySpread.topologyKey }}
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "moira-console.selectorLabels" . | nindent 14 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: console
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.containerPort }}
+          env:
+            # Derived from .Values.containerPort so the listen port and the
+            # containerPort cannot drift. `env` wins over `envFrom`, and
+            # `_helpers.tpl` rejects these two keys in `config` so nobody sets a
+            # value here that is silently discarded.
+            - name: PORT
+              value: {{ .Values.containerPort | quote }}
+            - name: HOSTNAME
+              value: "0.0.0.0"
+          envFrom:
+            - configMapRef:
+                name: {{ include "moira-console.fullname" . }}-config
+            - secretRef:
+                name: {{ .Values.secret.name }}
+          {{- if .Values.probes.startup.enabled }}
+          # Covers cold start (Next.js boot + first database connection) so the
+          # liveness probe's clock does not start against a process that is
+          # still coming up.
+          startupProbe:
+            httpGet:
+              path: {{ .Values.probes.startup.path }}
+              port: http
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+          {{- end }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          # `readOnlyRootFilesystem: true` above is not compatible with a
+          # Next.js standalone server unless both of these are writable. This is
+          # a requirement, not a tuning knob:
+          #
+          #   /app/.next/cache  the server writes the ISR/data cache and the
+          #                     fetch cache here on the FIRST render. WORKDIR in
+          #                     `console/Dockerfile` is /app, so this is the
+          #                     path — not /.next/cache. Without it the pod
+          #                     passes its startup probe and then crash-loops
+          #                     the moment a page is actually rendered.
+          #   /tmp              Node's os.tmpdir(); used by the runtime and by
+          #                     several transitive dependencies.
+          #
+          # emptyDir, not a PVC: both are per-pod scratch. The cache is a cache;
+          # losing it on restart costs one slow render, and sharing it across
+          # replicas would be wrong anyway.
+          volumeMounts:
+            - name: next-cache
+              mountPath: /app/.next/cache
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: next-cache
+          emptyDir:
+            sizeLimit: {{ .Values.volumes.nextCache.sizeLimit }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.volumes.tmp.sizeLimit }}
