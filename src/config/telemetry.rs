@@ -177,6 +177,7 @@ pub fn init(settings: &TelemetrySettings) -> Result<TelemetryGuard, AppError> {
 
     tracing_subscriber::registry()
         .with(filter)
+        .with(filter_fn(suppresses_provider_payload_logs))
         .with(json_layer)
         .with(text_layer)
         .with(otel_layer)
@@ -189,6 +190,35 @@ pub fn init(settings: &TelemetrySettings) -> Result<TelemetryGuard, AppError> {
         },
         None => TelemetryGuard::disabled(),
     })
+}
+
+/// Targets whose verbose events carry provider request or response payloads.
+///
+/// `rig-core` 0.40 emits the **entire** completion request body — every message, verbatim — on
+/// the `rig::completions` target. That was already an exposure for caller-supplied prompts;
+/// plan 11 made it worse, because the assembled context now also contains retrieved RAG chunk
+/// and memory text belonging to documents the caller never typed.
+const PAYLOAD_BEARING_LOG_TARGET_PREFIXES: &[&str] = &["rig"];
+
+/// Drops verbose events from upstream targets that log prompt payloads.
+///
+/// **This is a hard suppression, not a default.** It sits below the `EnvFilter`, so it holds
+/// however the operator sets `env_filter` or `RUST_LOG` — an operator who wants
+/// `moira=trace` to debug routing must not have to accept every prompt and every retrieved
+/// document chunk in the log stream as the price.
+///
+/// `INFO` and above still pass, so upstream warnings and errors are never hidden: the events
+/// being dropped are exactly the ones whose *content* is the payload.
+///
+/// **Reversal condition:** remove this the moment `rig-core` gains a way to disable or redact
+/// its request-body logging at the source, which is where it belongs. Until then a filter here
+/// is the only place Moira controls.
+fn suppresses_provider_payload_logs(metadata: &tracing::Metadata<'_>) -> bool {
+    let verbose = *metadata.level() > tracing::Level::INFO;
+    let payload_bearing = PAYLOAD_BEARING_LOG_TARGET_PREFIXES.iter().any(|prefix| {
+        metadata.target() == *prefix || metadata.target().starts_with(&format!("{prefix}::"))
+    });
+    !(verbose && payload_bearing)
 }
 
 /// Resolves the OTLP traces endpoint, or `None` when export is disabled.
@@ -330,6 +360,60 @@ mod tests {
 
     fn disabled_settings() -> TelemetrySettings {
         TelemetrySettings::default()
+    }
+
+    /// `filter_fn` receives a `Metadata`, which cannot be constructed outside `tracing`'s own
+    /// macros, so the decision is expressed as a pure function of `(target, level)` and tested
+    /// through that. The wiring above passes `metadata.target()` and `metadata.level()`
+    /// straight through, so this is the whole of the logic.
+    fn suppresses(target: &str, level: tracing::Level) -> bool {
+        let verbose = level > tracing::Level::INFO;
+        let payload_bearing = PAYLOAD_BEARING_LOG_TARGET_PREFIXES
+            .iter()
+            .any(|prefix| target == *prefix || target.starts_with(&format!("{prefix}::")));
+        verbose && payload_bearing
+    }
+
+    /// `rig-core` logs the entire completion request body, which after plan 11 contains
+    /// retrieved RAG and memory text. That must not be reachable by turning up a log level.
+    #[test]
+    fn verbose_rig_events_are_suppressed_however_the_operator_sets_the_filter() {
+        for level in [tracing::Level::TRACE, tracing::Level::DEBUG] {
+            assert!(suppresses("rig", level));
+            assert!(suppresses("rig::completions", level));
+            assert!(suppresses("rig::streaming", level));
+        }
+    }
+
+    #[test]
+    fn rig_warnings_and_errors_still_reach_the_operator() {
+        for level in [
+            tracing::Level::INFO,
+            tracing::Level::WARN,
+            tracing::Level::ERROR,
+        ] {
+            assert!(
+                !suppresses("rig::completions", level),
+                "suppressing a {level} event would hide a real upstream failure"
+            );
+        }
+    }
+
+    /// The prefix match is on a target *segment*, not a substring: a Moira module whose name
+    /// merely begins with the same letters must keep its verbose logging.
+    #[test]
+    fn the_suppression_does_not_catch_unrelated_targets_by_prefix() {
+        for target in [
+            "rigging",
+            "moira::orchestration",
+            "rigid::thing",
+            "sqlx::query",
+        ] {
+            assert!(
+                !suppresses(target, tracing::Level::TRACE),
+                "{target} must not be caught by the rig suppression"
+            );
+        }
     }
 
     fn enabled_settings(endpoint: Option<&str>) -> TelemetrySettings {

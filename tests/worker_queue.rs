@@ -389,6 +389,7 @@ async fn enqueue_beyond_the_depth_cap_returns_worker_queue_capacity_exceeded() {
         status,
         code,
         message,
+        ..
     } = &error
     else {
         panic!("expected a coded API error, got {error:?}");

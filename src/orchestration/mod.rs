@@ -3,6 +3,7 @@ mod controls;
 mod embedding;
 mod ingestion;
 mod provider_url;
+mod retrieval;
 mod runtime_cache;
 mod runtime_factory;
 
@@ -24,6 +25,11 @@ pub use ingestion::{
     prepare_chunks,
 };
 pub use provider_url::normalize_openai_base_url;
+pub use retrieval::{
+    CANDIDATE_OVERFETCH, MAX_CANDIDATE_ROWS, MemoryCandidate, RagChunkCandidate, RetrievalLimits,
+    RetrievalWeights, ScoreComponents, Scored, blend, lexical_overlap_score, rank_chunks,
+    rank_memories, recency_score, semantic_score,
+};
 pub use runtime_cache::{AuthProviderSettingsCache, RuntimeConfigCache};
 pub use runtime_factory::{
     RigRuntimeFactory, RuntimeCompletionOutput, RuntimeEventSeed, RuntimeFactory,

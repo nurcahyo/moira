@@ -42,3 +42,25 @@ appears in no SQL Moira runs today. The `EXPLAIN ANALYZE` work on whether the pl
 `memory_embeddings_active_hnsw_idx` / `rag_chunk_embeddings_active_hnsw_idx` under the added
 `application_id`/tenant/user equality filters belongs with the retrieval service that issues
 those queries, and is recorded here when it exists rather than guessed now.
+
+## Query plans (plan 11 Sub-Phase C) — NOT YET MEASURED
+
+The two candidate queries shipped by plan 11 wave 2 are in
+`src/infra/repositories/conversation.rs` (`find_memory_candidates`,
+`find_rag_chunk_candidates`). Both combine equality filters on application/tenant/user (and, for
+chunks, joins through `rag_collections` / `rag_document_versions` / `rag_documents`) with an
+`order by embedding <=> $1::vector` and a `limit`.
+
+**No `EXPLAIN ANALYZE` at realistic scale has been run.** The plan lists that as a deliverable;
+it is not done, and this section exists to say so rather than to imply otherwise. What is known:
+
+- The HNSW indexes are partial (`where superseded_at is null and embedding is not null`), and
+  both queries carry those predicates, so the indexes are at least applicable.
+- pgvector's HNSW does not pre-filter. Under a selective equality filter the planner may prefer a
+  sequential scan, or may over-fetch from the index and discard. Which one it picks at 100k+ rows
+  across multiple applications is exactly what has not been measured.
+- The over-fetch multiplier (`CANDIDATE_OVERFETCH = 4`) makes the `limit` larger than the policy
+  cap, which pushes in the direction of more index work per query.
+
+Until this is measured, treat retrieval latency at scale as unknown. `moira_retrieval_latency_seconds`
+is the histogram to watch; its buckets are sized for a response-path operation (5 ms to 30 s).

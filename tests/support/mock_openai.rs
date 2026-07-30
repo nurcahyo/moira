@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     convert::Infallible,
     io,
     net::SocketAddr,
@@ -168,6 +168,18 @@ pub enum EmbeddingBehaviour {
     ShortResponse,
     /// Returns vectors of the wrong width.
     WrongDimension { dimension: usize },
+    /// Returns a hand-chosen vector for an exact input string, falling back to
+    /// [`EmbeddingBehaviour::Deterministic`] for anything unlisted.
+    ///
+    /// [`mock_embedding_for`] is deterministic but pseudo-random, so two different texts are
+    /// near-orthogonal by construction and their cosine similarity is an accident of the
+    /// hash. That is fine for "was a vector stored", and useless for "does *this* row outrank
+    /// *that* one" — which is exactly the question the cross-tenant isolation suite has to ask.
+    ///
+    /// With hand-chosen vectors from [`planar_vector`] the distances are arithmetic, so an
+    /// assertion like "the other tenant's row is a strictly closer match and is still not
+    /// returned" is a fact about the SQL rather than a hope about a hash.
+    Fixed { vectors: HashMap<String, Vec<f32>> },
 }
 
 #[derive(Debug)]
@@ -205,6 +217,23 @@ pub fn mock_embedding_for(text: &str) -> Vec<f32> {
         let value = ((seed >> 40) as i32 - 8_388_608 / 8) as f32 / 8_388_608.0;
         vector.push(value);
     }
+    vector
+}
+
+/// A unit vector in the plane spanned by the first two basis axes, at `angle` radians from the
+/// first.
+///
+/// Two of these have cosine similarity `cos(a - b)` exactly, so pgvector's `<=>` between them
+/// is `1 - cos(a - b)` — a distance a test can compute in its head. `planar_vector(0.0)` is the
+/// natural query vector; a candidate at `0.0` is a perfect match, one at `PI / 3` sits at
+/// similarity `0.5`, and one at `PI / 2` is orthogonal.
+///
+/// Every component beyond the first two is zero, which keeps the vector exactly unit-length in
+/// `f32` and therefore keeps the arithmetic exact rather than approximately right.
+pub fn planar_vector(angle: f64) -> Vec<f32> {
+    let mut vector = vec![0.0f32; MOCK_EMBEDDING_DIMENSION];
+    vector[0] = angle.cos() as f32;
+    vector[1] = angle.sin() as f32;
     vector
 }
 
@@ -326,11 +355,17 @@ async fn handle_embeddings(
         EmbeddingBehaviour::HttpError { status, body } => {
             return (*status, body.clone()).into_response();
         }
-        EmbeddingBehaviour::Deterministic => (inputs.len(), MOCK_EMBEDDING_DIMENSION),
+        EmbeddingBehaviour::Deterministic | EmbeddingBehaviour::Fixed { .. } => {
+            (inputs.len(), MOCK_EMBEDDING_DIMENSION)
+        }
         EmbeddingBehaviour::ShortResponse => {
             (inputs.len().saturating_sub(1), MOCK_EMBEDDING_DIMENSION)
         }
         EmbeddingBehaviour::WrongDimension { dimension } => (inputs.len(), *dimension),
+    };
+    let fixed = match &behaviour {
+        EmbeddingBehaviour::Fixed { vectors } => Some(vectors),
+        _ => None,
     };
 
     let data: Vec<Value> = inputs
@@ -338,7 +373,9 @@ async fn handle_embeddings(
         .take(count)
         .enumerate()
         .map(|(index, text)| {
-            let vector: Vec<f32> = mock_embedding_for(text)
+            let vector: Vec<f32> = fixed
+                .and_then(|vectors| vectors.get(text).cloned())
+                .unwrap_or_else(|| mock_embedding_for(text))
                 .into_iter()
                 .take(dimension)
                 .collect();

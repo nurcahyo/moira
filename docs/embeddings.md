@@ -51,3 +51,19 @@ credential resolution, batching, per-chunk vector alignment, persistence, and st
 What it does not and cannot prove, and would need a live provider: real vector semantics (that
 semantically similar text yields nearby vectors), real provider rate limiting and quota
 behaviour, and any model dimension other than 1536.
+
+### Wave 2 addition: hand-chosen vectors
+
+`EmbeddingBehaviour::Fixed` maps an exact input string to a caller-supplied vector, and
+`planar_vector(angle)` builds unit vectors in the plane of the first two basis axes.
+
+This exists because the default `mock_embedding_for` is deterministic but *pseudo-random*: two
+different texts are near-orthogonal by construction and their cosine similarity is an accident of
+the hash. That is fine for "was a vector stored" and useless for "does this row outrank that
+one" — which is exactly the question the cross-tenant isolation suite has to ask. With
+`planar_vector`, two candidates have cosine similarity `cos(a - b)` exactly, so an assertion like
+"the other tenant's row is a strictly closer match and is still not returned" is a fact about the
+SQL rather than a hope about a hash.
+
+It does not change what the mock can prove about semantics. It makes the *distances* arithmetic,
+not the *meanings* real.

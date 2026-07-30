@@ -1647,11 +1647,13 @@ mod cluster_tests {
                 status: ls,
                 code: lc,
                 message: lm,
+                ..
             },
             AppError::Api {
                 status: rs,
                 code: rc,
                 message: rm,
+                ..
             },
         ) = (&local, &remote)
         else {

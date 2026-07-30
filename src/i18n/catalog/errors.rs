@@ -137,6 +137,11 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         description: "Used when WorkerQueue::enqueue refuses a job because the pending backlog has reached workers.queue_max_pending_jobs. Returned as 429 rather than 503 because it is backpressure: the request is well-formed and retrying later is the correct client behaviour. Plan 10 ships the queue with no synchronous producer, so this has no HTTP surface yet; it gains one the moment a request-path caller enqueues, which is why the entry lands with the code rather than after it.",
     },
     I18nEntry {
+        key: "moira.error.context_length_exceeded",
+        default_message: "The request context exceeds the available budget.",
+        description: "Used when the context planner cannot fit required content — the caller's current turn — within application_conversation_policies.maximum_history_tokens even after excluding every optional section (RAG chunks, memories, the summary, and finally history). Deliberately distinct from moira.error.context_required_content_too_large, which is about one oversized required item rather than the assembled budget; conflating them would lose the difference between 'this message is too big' and 'the budget is too small'. The envelope's details field carries the machine-readable reason and the numeric budget.",
+    },
+    I18nEntry {
         key: "moira.error.context_required_content_too_large",
         default_message: "Required content is too large to process.",
         description: "Used when mandatory context exceeds the allowed size.",
@@ -325,6 +330,11 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         key: "moira.error.responses_disabled",
         default_message: "Responses are disabled for this application.",
         description: "Used when the application policy disables responses.",
+    },
+    I18nEntry {
+        key: "moira.error.retrieval_unavailable",
+        default_message: "Retrieval is required for this request but is currently unavailable.",
+        description: "Used when the context planner's retrieval or embedding backend cannot serve a query AND the application's application_embedding_policies.failure_behavior is 'fail_request'. It must never fire under the default 'continue_without_semantic_retrieval', where a retrieval failure degrades silently to a 200 with empty citations — a broken vector index must not take down the execution path. Both branches are pinned by named tests.",
     },
     I18nEntry {
         key: "moira.error.routing_policy_provider_model_mismatch",

@@ -47,6 +47,17 @@ pub(crate) use conversation::{
     create_rag_document_with_connection, find_collection_ingestion_context,
     find_document_ingestion_context, ingest_rag_document_with_connection,
 };
+// Plan 11 wave 2, Sub-Phase C. Also `pub(crate)`, for a different reason: these are the
+// cross-tenant isolation boundary. The scope a candidate query runs under is a bound
+// parameter derived from the acting `Actor`, and every derivation lives in
+// `crate::application::conversation`. A `pub` export would let external code choose its own
+// scope, which is precisely the property the isolation tests exist to prevent.
+pub(crate) use conversation::{
+    ContextPlanInsert, HistoryMessage, RetrievalRunInsert, RetrievalScope,
+    find_application_embedding_target, find_conversation_context_anchor, find_memory_candidates,
+    find_rag_chunk_candidates, find_recent_messages, insert_context_plan, insert_memory_embedding,
+    insert_retrieval_run,
+};
 pub use public::{
     IdempotencyClaim, PgPublicRepository, PublicAccess, PublicRepository, ResponseStartedInsert,
     ResponseTerminalUpdate, default_application_execution_policy, idempotency_record,

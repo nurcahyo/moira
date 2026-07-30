@@ -112,6 +112,10 @@ const RAG_EMBEDDINGS_WRITTEN_TOTAL: &str = "moira_rag_embeddings_written_total";
 const RAG_INGESTION_RUNS_TOTAL: &str = "moira_rag_ingestion_runs_total";
 const EMBEDDING_BATCH_LATENCY_SECONDS: &str = "moira_embedding_batch_latency_seconds";
 
+// Plan 11 wave 2. Same rules: closed label set, counter seeded, histogram not.
+const RETRIEVAL_RUNS_TOTAL: &str = "moira_retrieval_runs_total";
+const RETRIEVAL_LATENCY_SECONDS: &str = "moira_retrieval_latency_seconds";
+
 /// The two `outcome` values a RAG ingestion run can carry.
 ///
 /// Both are members of the existing closed outcome set produced by `execution_outcome_label`,
@@ -146,6 +150,14 @@ const TTFT_BUCKETS_SECONDS: &[f64] = &[0.025, 0.05, 0.1, 0.2, 0.4, 0.8, 1.5, 3.0
 /// sequential provider calls.
 const EMBEDDING_BATCH_BUCKETS_SECONDS: &[f64] =
     &[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0];
+
+/// A retrieval pass sits directly in the response path, before the first token, so its
+/// resolution is concentrated well below one second — an operator's question is "is retrieval
+/// adding perceptible latency", and buckets sized for a provider round-trip could not answer it.
+/// The tail still reaches the embedding call's own timeout.
+const RETRIEVAL_LATENCY_BUCKETS_SECONDS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
 
 #[derive(Clone, Debug)]
 pub struct MetricsRegistry {
@@ -331,6 +343,17 @@ impl MetricsRegistry {
                 "Wall-clock time for one document's complete embedding run, across every \
                  batch, in seconds. Recorded on failure as well as success."
             );
+            describe_counter!(
+                RETRIEVAL_RUNS_TOTAL,
+                "Context-planner retrieval passes, by outcome. Under the default \
+                 failure_behavior a failed retrieval is invisible to the caller, so this \
+                 counter and the retrieval_runs table are the only places it surfaces."
+            );
+            describe_histogram!(
+                RETRIEVAL_LATENCY_SECONDS,
+                "Wall-clock time for one retrieval pass — query embedding plus both candidate \
+                 queries plus ranking — in seconds. Recorded on failure as well as success."
+            );
 
             gauge!(DB_POOL_CONNECTIONS, "state" => "total").set(0.0);
             gauge!(DB_POOL_CONNECTIONS, "state" => "idle").set(0.0);
@@ -355,6 +378,7 @@ impl MetricsRegistry {
             counter!(RAG_EMBEDDINGS_WRITTEN_TOTAL).increment(0);
             for outcome in RAG_INGESTION_OUTCOMES {
                 counter!(RAG_INGESTION_RUNS_TOTAL, "outcome" => *outcome).increment(0);
+                counter!(RETRIEVAL_RUNS_TOTAL, "outcome" => *outcome).increment(0);
             }
         });
     }
@@ -475,6 +499,24 @@ impl MetricsRegistry {
             if embeddings > 0 {
                 counter!(RAG_EMBEDDINGS_WRITTEN_TOTAL).increment(embeddings);
             }
+        });
+    }
+
+    /// Records one retrieval pass — plan 11 wave 2.
+    ///
+    /// Counted on failure as well as success, and *always* counted when retrieval was attempted:
+    /// under the default `failure_behavior` a retrieval failure is invisible to the caller, so
+    /// this counter and the `retrieval_runs` row are the only places it shows up at all.
+    ///
+    /// No per-application label, deliberately. `retrieval_runs` carries the application-level
+    /// detail; see `ALLOWED_LABEL_KEYS` and this module's header for why an application id may
+    /// never be a label value.
+    pub fn record_retrieval_run(&self, latency: Duration, succeeded: bool) {
+        let outcome = if succeeded { "succeeded" } else { "failed" };
+        let seconds = latency.as_secs_f64();
+        with_local_recorder(&self.inner.recorder, || {
+            counter!(RETRIEVAL_RUNS_TOTAL, "outcome" => outcome).increment(1);
+            histogram!(RETRIEVAL_LATENCY_SECONDS).record(seconds);
         });
     }
 
@@ -729,6 +771,7 @@ const _: () = assert!(!HTTP_LATENCY_BUCKETS_SECONDS.is_empty());
 const _: () = assert!(!EXECUTION_LATENCY_BUCKETS_SECONDS.is_empty());
 const _: () = assert!(!TTFT_BUCKETS_SECONDS.is_empty());
 const _: () = assert!(!EMBEDDING_BATCH_BUCKETS_SECONDS.is_empty());
+const _: () = assert!(!RETRIEVAL_LATENCY_BUCKETS_SECONDS.is_empty());
 
 fn build_recorder(service_name: &str) -> PrometheusRecorder {
     let mut builder =
@@ -747,6 +790,7 @@ fn build_recorder(service_name: &str) -> PrometheusRecorder {
             EMBEDDING_BATCH_LATENCY_SECONDS,
             EMBEDDING_BATCH_BUCKETS_SECONDS,
         ),
+        (RETRIEVAL_LATENCY_SECONDS, RETRIEVAL_LATENCY_BUCKETS_SECONDS),
     ] {
         builder = builder
             .set_buckets_for_metric(Matcher::Full(name.to_string()), buckets)
@@ -1333,12 +1377,29 @@ mod tests {
             RAG_CHUNKS_WRITTEN_TOTAL,
             RAG_EMBEDDINGS_WRITTEN_TOTAL,
             RAG_INGESTION_RUNS_TOTAL,
+            RETRIEVAL_RUNS_TOTAL,
         ] {
             assert!(
                 rendered.contains(family),
                 "{family} is absent from a fresh scrape body:\n{rendered}"
             );
         }
+        // Both outcome series, not just the one a happy path would produce: an alert on
+        // `rate(moira_retrieval_runs_total{outcome="failed"}[5m])` must have a series to
+        // evaluate on a process that has never failed a retrieval.
+        for outcome in RAG_INGESTION_OUTCOMES {
+            assert!(
+                rendered.contains(&format!(
+                    "{RETRIEVAL_RUNS_TOTAL}{{service=\"moira-test\",outcome=\"{outcome}\"}}"
+                )),
+                "{RETRIEVAL_RUNS_TOTAL} is missing its {outcome} series:\n{rendered}"
+            );
+        }
+        // The histogram is deliberately NOT seeded, matching every other latency family here.
+        assert!(
+            !rendered.contains(RETRIEVAL_LATENCY_SECONDS),
+            "histograms are not seeded; seeding one would publish a fabricated zero observation"
+        );
         // One series per declared job name, so a queue that has never run still
         // reports zero rather than nothing.
         for job_name in WORKER_JOB_NAMES {
