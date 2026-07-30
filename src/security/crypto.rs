@@ -81,6 +81,29 @@ impl SecretCipher for LocalSecretCipher {
     }
 }
 
+/// Which field of a decrypted credential payload holds the provider secret.
+///
+/// One mapping, one place. Both provider-facing execution paths — completion
+/// (`crate::application::execution`) and embedding (`crate::application::conversation`) — read
+/// through this, because two copies of a credential-field mapping that drift is a class of bug
+/// that presents as "the wrong secret was sent to the provider".
+///
+/// `None` means the credential type carries no single bearer-style secret and is therefore not
+/// usable as a provider credential at all.
+pub fn credential_secret_field(
+    credential_type: crate::domain::CredentialType,
+) -> Option<&'static str> {
+    use crate::domain::CredentialType;
+    match credential_type {
+        CredentialType::ApiKey | CredentialType::AzureOpenAi => Some("api_key"),
+        CredentialType::BearerToken => Some("bearer_token"),
+        CredentialType::Oauth2 => Some("access_token"),
+        CredentialType::BasicAuth
+        | CredentialType::CustomHeaders
+        | CredentialType::ServiceAccount => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CredentialAadParts<'a> {
     pub credential_id: uuid::Uuid,

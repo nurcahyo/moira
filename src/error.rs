@@ -24,6 +24,17 @@ pub enum AppError {
         status: StatusCode,
         code: &'static str,
         message: String,
+        /// Machine-readable diagnostic data for the envelope's existing `details` field.
+        ///
+        /// Added by plan 11 Sub-Phase D: `context_length_exceeded` has to tell the caller
+        /// *which* required section overflowed and by how much, and doing that in the English
+        /// `message` would put structured data in prose — exactly what `CONVENTIONS.md` §4.3
+        /// forbids. `ErrorDetail.details` already existed and was only ever populated on the
+        /// replay path; this is the channel that lets a live error use it too.
+        ///
+        /// Whatever goes in here is returned verbatim to the caller, so it must carry ids,
+        /// counts and enum-like reason strings only — never content, never a provider body.
+        details: Option<Box<Value>>,
     },
     #[error("{}: {}", .0.code, .0.message)]
     Replayed(Box<ReplayedError>),
@@ -80,6 +91,24 @@ impl AppError {
             status,
             code,
             message: message.into(),
+            details: None,
+        }
+    }
+
+    /// As [`Self::coded`], attaching machine-readable diagnostics to the envelope's `details`.
+    ///
+    /// `details` is echoed to the caller verbatim — ids, counts and reason strings only.
+    pub fn coded_with_details(
+        status: StatusCode,
+        code: &'static str,
+        message: impl Into<String>,
+        details: Value,
+    ) -> Self {
+        Self::Api {
+            status,
+            code,
+            message: message.into(),
+            details: Some(Box::new(details)),
         }
     }
 
@@ -246,11 +275,15 @@ impl From<(&AppError, Option<String>)> for ErrorDetail {
                 details: replay.details.clone(),
             };
         }
+        let details = match error {
+            AppError::Api { details, .. } => details.as_deref().cloned(),
+            _ => None,
+        };
         Self::new(
             error.code().to_string(),
             error.response_text(),
             request_id.unwrap_or_else(generate_request_id),
-            None,
+            details,
         )
     }
 }

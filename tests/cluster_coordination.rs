@@ -86,6 +86,7 @@ async fn the_cluster_rate_limit_refusal_carries_the_unchanged_wire_contract() {
         status,
         code,
         message,
+        ..
     } = &error
     else {
         panic!("expected a coded API error, got {error:?}");

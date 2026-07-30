@@ -204,3 +204,61 @@ async fn invalid_cursor_error_response_carries_message_key_and_message() {
         .await
         .expect("clean up the seeded route definition");
 }
+
+/// Plan 11 wave 2 added two catalog keys. Both must resolve, and neither may be a duplicate of
+/// a key that already covered the condition.
+///
+/// `is_known_key`/`default_message_for_key` are the resolution path `src/error.rs`'s
+/// `format!("moira.error.{}", code())` derivation ends at, so a key that is spelled right in
+/// the code and missing from the catalog produces an empty message rather than a failure —
+/// which is exactly why this assertion is worth making explicitly.
+#[test]
+fn the_new_retrieval_error_keys_resolve_through_the_catalog() {
+    for key in [
+        "moira.error.context_length_exceeded",
+        "moira.error.retrieval_unavailable",
+    ] {
+        assert!(
+            moira::i18n::is_known_key(key),
+            "{key} is missing from the Rust catalog"
+        );
+        let message = moira::i18n::default_message_for_key(key)
+            .unwrap_or_else(|| panic!("{key} resolves to no default message"));
+        assert!(!message.is_empty(), "{key} has an empty default message");
+    }
+}
+
+/// The naming trap §0 flagged: `context_required_content_too_large` already existed and is a
+/// *different* condition — one oversized required item, not an over-budget assembled context.
+/// Both must remain, and they must not share a message.
+#[test]
+fn the_two_context_size_keys_stay_distinct() {
+    let assembled = moira::i18n::default_message_for_key("moira.error.context_length_exceeded")
+        .expect("assembled-budget key");
+    let single_item =
+        moira::i18n::default_message_for_key("moira.error.context_required_content_too_large")
+            .expect("pre-existing single-item key");
+    assert_ne!(
+        assembled, single_item,
+        "two keys with the same message means one of them should not exist"
+    );
+}
+
+/// Keys plan 11 wave 2 deliberately reuses rather than duplicating.
+#[test]
+fn the_reused_retrieval_adjacent_keys_still_resolve() {
+    for key in [
+        "moira.error.conversation_archived",
+        "moira.error.conversation_not_found",
+        "moira.error.embedding_provider_unsupported",
+        "moira.error.embedding_request_failed",
+        "moira.error.embedding_response_invalid",
+        "moira.error.forbidden",
+        "moira.error.rag_document_too_large",
+    ] {
+        assert!(
+            moira::i18n::is_known_key(key),
+            "{key} was expected to already exist and be reused"
+        );
+    }
+}
