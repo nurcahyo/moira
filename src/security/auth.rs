@@ -55,6 +55,19 @@ pub struct Actor {
     pub api_key_id: Option<Uuid>,
 }
 
+/// A verified `(issuer, subject)` pair and **nothing else**.
+///
+/// Produced only by [`AuthService::verify_trusted_jwt_identity`], for the one caller
+/// that needs identity proof from a token that carries no authority: invite redemption.
+/// It deliberately has no `scopes` field — see that method for why omitting it is the
+/// control rather than a convenience.
+#[derive(Debug, Clone)]
+pub struct TrustedJwtIdentity {
+    /// The registered issuer row's value, not the token's `iss` claim.
+    pub issuer: String,
+    pub subject: String,
+}
+
 /// How long a successfully fetched JWKS stays *fresh*. An expired entry is not
 /// evicted: it is retained as a last-known-good fallback (see [`JwksCache::load`]).
 const JWKS_CACHE_TTL: Duration = Duration::from_secs(300);
@@ -311,6 +324,31 @@ impl AuthService {
         pool: &PgPool,
         headers: &HeaderMap,
     ) -> Result<Actor, AppError> {
+        self.authenticate_admin_with_issuer(pool, headers)
+            .await
+            .map(|(actor, _issuer)| actor)
+    }
+
+    /// [`Self::authenticate_admin`], additionally returning the **verified** issuer on
+    /// the bearer path (and `None` on every other credential, which has no issuer).
+    ///
+    /// Plan 09 wave 2 needs it because ownership is row state: answering "may this
+    /// caller manage other admins" means reading *the caller's own*
+    /// `admin_identities` row, and that row's key is `(issuer, subject)`.
+    /// [`Actor`] carries `subject` but leaves `trusted_jwt_issuer_id` unset on this
+    /// path, and looking a grant up by subject alone would let two issuers that mint
+    /// the same `sub` inherit each other's ownership.
+    ///
+    /// Deliberately a *widening of the return type* rather than a second
+    /// authenticator: `authenticate_admin` delegates here, so there is exactly one
+    /// transcription of "authenticate the admin plane" and one place the
+    /// admin-identity grant is applied. A parallel copy is how one surface silently
+    /// keeps accepting a credential another stopped accepting.
+    pub(crate) async fn authenticate_admin_with_issuer(
+        &self,
+        pool: &PgPool,
+        headers: &HeaderMap,
+    ) -> Result<(Actor, Option<String>), AppError> {
         let token = optional_bearer_token(headers)?;
         let system_key = header_string(headers, "x-moira-system-key");
         let consumer_key = header_string(headers, "x-consumer-key");
@@ -331,31 +369,94 @@ impl AuthService {
             let (actor, issuer) = self
                 .authenticate_trusted_jwt_with_issuer(pool, token)
                 .await?;
-            return apply_admin_identity_grant(pool, &issuer, actor).await;
+            let actor = apply_admin_identity_grant(pool, &issuer, actor).await?;
+            return Ok((actor, Some(issuer)));
         }
 
         if let Some(raw_key) = system_key {
-            return self.verify_api_key(pool, "system_api_keys", &raw_key).await;
+            return self
+                .verify_api_key(pool, "system_api_keys", &raw_key)
+                .await
+                .map(|actor| (actor, None));
         }
 
         if let Some(raw_key) = consumer_key {
             return self
                 .verify_api_key(pool, "consumer_api_keys", &raw_key)
-                .await;
+                .await
+                .map(|actor| (actor, None));
         }
 
         if !self.admin_settings.enabled {
-            return Ok(Actor {
-                actor_type: ActorType::DevAdmin,
-                subject: Some("dev-admin".to_string()),
-                scopes: vec!["moira:admin".to_string(), "moira.admin".to_string()],
-                ..Actor::default()
-            });
+            return Ok((
+                Actor {
+                    actor_type: ActorType::DevAdmin,
+                    subject: Some("dev-admin".to_string()),
+                    scopes: vec!["moira:admin".to_string(), "moira.admin".to_string()],
+                    ..Actor::default()
+                },
+                None,
+            ));
         }
 
         Err(AppError::Unauthorized(
             "missing bearer token or api key".to_string(),
         ))
+    }
+
+    /// Proves `(issuer, subject)` from a bearer token and returns **nothing else**.
+    ///
+    /// # This is the redeem endpoint's authenticator, and its narrowness is the control
+    ///
+    /// Redeeming an invitation is the one operation performed by an identity that holds
+    /// **zero** grants — that is the whole point, since the grant is what redemption
+    /// creates. It therefore must not route through [`Self::authenticate_admin`]:
+    /// that method applies the `admin_identities` grant, and reaching it by accident
+    /// would make the redeem handler's behaviour depend on authority the invitee does
+    /// not yet have.
+    ///
+    /// It returns a two-field struct rather than an [`Actor`] on purpose. An `Actor`
+    /// carries `scopes`, populated from the issuer's `scopes_claim` — a value the
+    /// *token* asserts. A console issuer is forbidden from mapping one
+    /// (`console_issuer_must_not_assert_scopes`, CONVENTIONS §7.5), but "forbidden by a
+    /// validation on another table" is a weaker guarantee than "not representable in
+    /// the type the handler receives". With no scopes in scope, the redeem path cannot
+    /// consult a self-asserted one even by mistake.
+    ///
+    /// The issuer returned is the **verified** one — the registered row's value that
+    /// `Validation::set_issuer` was pinned to — never the unverified `iss` claim, so
+    /// the grant this token goes on to create cannot be keyed to an issuer the caller
+    /// chose.
+    pub(crate) async fn verify_trusted_jwt_identity(
+        &self,
+        pool: &PgPool,
+        headers: &HeaderMap,
+    ) -> Result<TrustedJwtIdentity, AppError> {
+        // A system key or consumer key presented here is refused rather than ignored:
+        // neither carries an (issuer, subject) pair, so honouring one would mean
+        // guessing whom the grant is for.
+        if header_string(headers, "x-moira-system-key").is_some()
+            || header_string(headers, "x-consumer-key").is_some()
+        {
+            return Err(AppError::Unauthorized(
+                "redeeming an invitation requires the invitee's own bearer token".to_string(),
+            ));
+        }
+        let token = optional_bearer_token(headers)?.ok_or_else(|| {
+            AppError::Unauthorized(
+                "redeeming an invitation requires the invitee's own bearer token".to_string(),
+            )
+        })?;
+        let (actor, issuer) = self
+            .authenticate_trusted_jwt_with_issuer(pool, token)
+            .await?;
+        // `actor_from_trusted_claims` errors when the subject claim is missing, so this
+        // is unreachable; it is handled rather than unwrapped because an authentication
+        // path is the wrong place to learn that an invariant moved.
+        let subject = actor.subject.ok_or_else(|| {
+            AppError::Unauthorized("trusted JWT subject claim is required".to_string())
+        })?;
+        Ok(TrustedJwtIdentity { issuer, subject })
     }
 
     pub async fn authenticate_caller(

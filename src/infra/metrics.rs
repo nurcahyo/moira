@@ -116,6 +116,42 @@ const EMBEDDING_BATCH_LATENCY_SECONDS: &str = "moira_embedding_batch_latency_sec
 const RETRIEVAL_RUNS_TOTAL: &str = "moira_retrieval_runs_total";
 const RETRIEVAL_LATENCY_SECONDS: &str = "moira_retrieval_latency_seconds";
 
+// Plan 09 wave 2 — the admin-invitation surface, which grants full `moira:admin` on
+// redemption and had no operational signal at all before this.
+//
+// The label domain is closed by [`ADMIN_INVITE_OUTCOMES`] below. Note what is **not** a
+// label: the invitee's email address, their domain, the invite id, or the issuer. Each is
+// unbounded cardinality on a scrape path, and the first two are PII in an endpoint whose
+// whole job is to be scraped and retained. "Which invite" belongs in `audit_logs`, which
+// is the table that already records it.
+const ADMIN_INVITE_OUTCOMES_TOTAL: &str = "moira_admin_invite_outcomes_total";
+const ADMIN_IDENTITY_GRANT_EVENTS_TOTAL: &str = "moira_admin_identity_grant_events_total";
+
+/// The closed `outcome` label domain for `moira_admin_invite_outcomes_total`.
+///
+/// `created` and `redeemed` are the two successes; everything else is a denial reason
+/// derived from a catalogued error code by `application::identity::denial_reason`, plus
+/// `other` as the terminal bucket so an uncatalogued failure widens no label domain at
+/// runtime. Seeded at zero so an alert on "redemptions stopped succeeding" fires on the
+/// condition rather than on absent data.
+const ADMIN_INVITE_OUTCOMES: &[&str] = &[
+    "created",
+    "redeemed",
+    "not_found",
+    "expired",
+    "consumed",
+    "revoked",
+    "email_mismatch",
+    "domain_mismatch",
+    "domain_not_allowed",
+    "email_not_verified",
+    "email_required",
+    "other",
+];
+
+/// The closed `event` label domain for `moira_admin_identity_grant_events_total`.
+const ADMIN_IDENTITY_GRANT_EVENTS: &[&str] = &["granted", "revoked", "ownership_transferred"];
+
 /// The two `outcome` values a RAG ingestion run can carry.
 ///
 /// Both are members of the existing closed outcome set produced by `execution_outcome_label`,
@@ -354,6 +390,19 @@ impl MetricsRegistry {
                 "Wall-clock time for one retrieval pass — query embedding plus both candidate \
                  queries plus ranking — in seconds. Recorded on failure as well as success."
             );
+            describe_counter!(
+                ADMIN_INVITE_OUTCOMES_TOTAL,
+                "Admin-invitation outcomes, by a bounded outcome/denial-reason label. Carries \
+                 no invitee email, domain, invite id or issuer: those are unbounded \
+                 cardinality on a scrape path, and the first two are PII. Per-invite detail \
+                 lives in audit_logs."
+            );
+            describe_counter!(
+                ADMIN_IDENTITY_GRANT_EVENTS_TOTAL,
+                "Admin-identity grant lifecycle events, by event. A grant carries full \
+                 moira:admin, so a sudden change in this family's rate is the signal an \
+                 operator wants first."
+            );
 
             gauge!(DB_POOL_CONNECTIONS, "state" => "total").set(0.0);
             gauge!(DB_POOL_CONNECTIONS, "state" => "idle").set(0.0);
@@ -379,6 +428,12 @@ impl MetricsRegistry {
             for outcome in RAG_INGESTION_OUTCOMES {
                 counter!(RAG_INGESTION_RUNS_TOTAL, "outcome" => *outcome).increment(0);
                 counter!(RETRIEVAL_RUNS_TOTAL, "outcome" => *outcome).increment(0);
+            }
+            for outcome in ADMIN_INVITE_OUTCOMES {
+                counter!(ADMIN_INVITE_OUTCOMES_TOTAL, "outcome" => *outcome).increment(0);
+            }
+            for event in ADMIN_IDENTITY_GRANT_EVENTS {
+                counter!(ADMIN_IDENTITY_GRANT_EVENTS_TOTAL, "event" => *event).increment(0);
             }
         });
     }
@@ -672,6 +727,69 @@ impl MetricsRegistry {
     pub fn record_runtime_invalidation(&self, channel: InvalidationChannel) {
         with_local_recorder(&self.inner.recorder, || {
             counter!(RUNTIME_INVALIDATIONS_TOTAL, "channel" => channel.label()).increment(1);
+        });
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Plan 09 wave 2 — admin invitations and grant lifecycle.
+    // -----------------------------------------------------------------------------------
+
+    pub fn record_admin_invite_created(&self) {
+        self.record_admin_invite_outcome("created");
+    }
+
+    pub fn record_admin_invite_redeemed(&self) {
+        self.record_admin_invite_outcome("redeemed");
+        self.record_admin_identity_grant_event("granted");
+    }
+
+    /// One refused invitation, labelled by a **bounded** denial reason.
+    ///
+    /// The caller derives `reason` from the error *code*, never from the message and
+    /// never from the request, so a novel failure cannot inject a label value. An
+    /// unrecognised reason is folded into `other` rather than dropped: a denial that
+    /// vanishes from the counter is worse than one in a catch-all bucket, because an
+    /// operator watching the total would see the rate fall while denials rose.
+    pub fn record_admin_invite_denied(&self, reason: &str) {
+        let reason = if ADMIN_INVITE_OUTCOMES.contains(&reason) && reason != "created"
+            && reason != "redeemed"
+        {
+            reason
+        } else {
+            "other"
+        };
+        self.record_admin_invite_outcome(reason);
+    }
+
+    pub fn record_admin_identity_revoked(&self) {
+        self.record_admin_identity_grant_event("revoked");
+    }
+
+    pub fn record_admin_ownership_transferred(&self) {
+        self.record_admin_identity_grant_event("ownership_transferred");
+    }
+
+    fn record_admin_invite_outcome(&self, outcome: &str) {
+        let Some(outcome) = ADMIN_INVITE_OUTCOMES
+            .iter()
+            .find(|candidate| **candidate == outcome)
+        else {
+            return;
+        };
+        with_local_recorder(&self.inner.recorder, || {
+            counter!(ADMIN_INVITE_OUTCOMES_TOTAL, "outcome" => *outcome).increment(1);
+        });
+    }
+
+    fn record_admin_identity_grant_event(&self, event: &str) {
+        let Some(event) = ADMIN_IDENTITY_GRANT_EVENTS
+            .iter()
+            .find(|candidate| **candidate == event)
+        else {
+            return;
+        };
+        with_local_recorder(&self.inner.recorder, || {
+            counter!(ADMIN_IDENTITY_GRANT_EVENTS_TOTAL, "event" => *event).increment(1);
         });
     }
 

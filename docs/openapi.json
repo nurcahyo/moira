@@ -1,6 +1,20 @@
 {
   "components": {
     "schemas": {
+      "AdminIdentityPatchRequest": {
+        "additionalProperties": false,
+        "description": "Request body of `PATCH /api/v1/admin/admin-identities/{id}` — ownership transfer.\n\nOne field, deliberately. Everything else about a grant is either immutable\n(`issuer`/`subject`, the uniqueness key) or belongs to a different operation\n(`status`, which `DELETE` owns). A general-purpose patch surface here would be a\nsecond, weaker way to edit `granted_scopes`.",
+        "properties": {
+          "is_primary": {
+            "description": "Required, not `Option`: a `PATCH` that changes nothing is a request whose\n`If-Match` precondition and `Idempotency-Key` ledger entry describe a no-op, and\nthe console has no reason to send one.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "is_primary"
+        ],
+        "type": "object"
+      },
       "AdminIdentityRecord": {
         "description": "A granted admin identity, as returned by `POST /api/v1/admin/setup/claim`.",
         "properties": {
@@ -24,6 +38,10 @@
           "id": {
             "format": "uuid",
             "type": "string"
+          },
+          "is_primary": {
+            "description": "Ownership, as **row state** rather than as a capability (plan 09 decision D1).\n\nA primary admin may transfer ownership and revoke other grants. This is not a\nscope, and could not be one: `AuthorizationService::has_scope` grants a\n`moira:admin`-holding trusted-JWT actor every scope by implication with no\nper-scope opt-out, so a `moira:admins:manage` scope would be satisfied by every\nadmin Moira can currently grant — and the last-primary guard would have nothing\nto count.",
+            "type": "boolean"
           },
           "issuer": {
             "type": "string"
@@ -50,6 +68,7 @@
           "email",
           "email_verified",
           "granted_scopes",
+          "is_primary",
           "status",
           "created_at",
           "version",
@@ -60,6 +79,196 @@
       "AdminIdentityStatus": {
         "enum": [
           "active",
+          "revoked"
+        ],
+        "type": "string"
+      },
+      "AdminInviteConstraint": {
+        "description": "Which of the two mutually exclusive constraints an invite carries.",
+        "enum": [
+          "email",
+          "domain"
+        ],
+        "type": "string"
+      },
+      "AdminInviteCreateRequest": {
+        "additionalProperties": false,
+        "description": "Request body of `POST /api/v1/admin/admin-invites`.",
+        "properties": {
+          "constraint": {
+            "$ref": "#/components/schemas/AdminInviteConstraint"
+          },
+          "expires_in_seconds": {
+            "description": "Clamped server-side by [`MAX_INVITE_EXPIRY_SECONDS`], as a **hard cap** rather\nthan a UI default — a client that asks for a year is refused, not quietly\nhonoured.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "value": {
+            "description": "The email address (for `constraint = \"email\"`) or bare domain (for\n`constraint = \"domain\"`) the invite is bound to. Never \"anyone with the link\":\nan unbound invite would make a leaked URL equivalent to handing out admin.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "constraint",
+          "value",
+          "expires_in_seconds"
+        ],
+        "type": "object"
+      },
+      "AdminInvitePreviewRequest": {
+        "additionalProperties": false,
+        "description": "Request body of `POST /api/v1/admin/admin-invites/preview`.\n\n`POST` with the token in the **body**, never a `GET` with it in the path or query, so\nit cannot land in an access log, a proxy log, or a `Referer` chain.",
+        "properties": {
+          "token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "token"
+        ],
+        "type": "object"
+      },
+      "AdminInvitePreviewResponse": {
+        "description": "What an **unauthenticated** invitee is told about an invite they hold the token for.\n\nDeliberately minimal. It carries no inviter identity, no invite id, no deployment\ndetail and no policy: everything here is either something the holder of the token\nneeds in order to act (which address to sign in with, how long they have) or\nsomething they already know. Plan 09's body proposes a masked inviter email; that is\nnot built, because \"who invited you\" is information the invitee learns out of band\nwith the link itself, and adding it to an anonymous response buys nothing the flow\nneeds. Reversal condition: if product wants inviter attribution, it arrives with its\nown masking function and its own leak test.",
+        "properties": {
+          "constraint": {
+            "$ref": "#/components/schemas/AdminInviteConstraint"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "constraint",
+          "value",
+          "expires_at"
+        ],
+        "type": "object"
+      },
+      "AdminInviteRecord": {
+        "description": "The invite as it is safe to return **after** creation: no token, no hash, no prefix.",
+        "properties": {
+          "constraint": {
+            "$ref": "#/components/schemas/AdminInviteConstraint"
+          },
+          "consumed_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "consumed_subject": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by_subject": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expired": {
+            "description": "Derived, not stored: `status` has no `'expired'` value, because nothing sweeps\nfor it. A `pending` invite past `expires_at` reads as `expired = true` here and\nis refused at redemption.",
+            "type": "boolean"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/AdminInviteStatus"
+          },
+          "value": {
+            "type": "string"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "constraint",
+          "value",
+          "status",
+          "expired",
+          "expires_at",
+          "created_at",
+          "version"
+        ],
+        "type": "object"
+      },
+      "AdminInviteRedeemRequest": {
+        "additionalProperties": false,
+        "description": "Request body of `POST /api/v1/admin/admin-invites/redeem`.\n\nBound to plan 07's post-D5 [`ClaimAdminIdentityRequest`] shape: `email` and\n`email_verified` are **required and non-optional** — no `Option`, no\n`#[serde(default)]` — because redemption creates the same `admin_identities` grant,\nand a grant with no human-identifiable attribute makes the domain policy\nunenforceable on that path.",
+        "properties": {
+          "email": {
+            "description": "Asserted by the BFF from the just-verified session, on **every** redemption.\nThere is no optional-email path and no conditional branch that omits it.",
+            "type": "string"
+          },
+          "email_verified": {
+            "description": "Required, and with no `#[serde(default)]`, for the same reason\n[`ClaimAdminIdentityRequest::email_verified`] has none: a default would turn an\nomitted field into a misleading \"your email is not verified\" 403.",
+            "type": "boolean"
+          },
+          "token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "email",
+          "email_verified"
+        ],
+        "type": "object"
+      },
+      "AdminInviteSecretResponse": {
+        "description": "The once-only envelope for a freshly minted invite token.\n\nField-for-field the shape of [`crate::domain::ApiKeySecretResponse`] — `resource`,\n`secret`, `secret_retrievable` — so `once_only_key_responses_use_the_secret_envelope`\ncovers this operation with the same assertions it makes about API keys, rather than a\nsecond envelope that would have to be remembered separately.",
+        "properties": {
+          "notice": {
+            "$ref": "#/components/schemas/ResponseText",
+            "description": "i18n envelope for the success message (CONVENTIONS §4.2)."
+          },
+          "resource": {
+            "$ref": "#/components/schemas/AdminInviteRecord"
+          },
+          "secret": {
+            "description": "The raw token. Returned exactly once, at creation, and `None` on an idempotent\nreplay — the stored replay body is the sanitized record.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "secret_retrievable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "resource",
+          "secret_retrievable",
+          "notice"
+        ],
+        "type": "object"
+      },
+      "AdminInviteStatus": {
+        "enum": [
+          "pending",
+          "consumed",
           "revoked"
         ],
         "type": "string"
@@ -2676,6 +2885,161 @@
           "deleted"
         ],
         "type": "string"
+      },
+      "ListResponse_AdminIdentityRecord": {
+        "properties": {
+          "data": {
+            "items": {
+              "description": "A granted admin identity, as returned by `POST /api/v1/admin/setup/claim`.",
+              "properties": {
+                "created_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "email": {
+                  "description": "Always present — a grant cannot be created without a verified email (decision D5).\nThe `admin_identities.email` column stays nullable so a future anonymisation path\ncan clear it; the always-present invariant is an application invariant.",
+                  "type": "string"
+                },
+                "email_verified": {
+                  "type": "boolean"
+                },
+                "granted_scopes": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "is_primary": {
+                  "description": "Ownership, as **row state** rather than as a capability (plan 09 decision D1).\n\nA primary admin may transfer ownership and revoke other grants. This is not a\nscope, and could not be one: `AuthorizationService::has_scope` grants a\n`moira:admin`-holding trusted-JWT actor every scope by implication with no\nper-scope opt-out, so a `moira:admins:manage` scope would be satisfied by every\nadmin Moira can currently grant — and the last-primary guard would have nothing\nto count.",
+                  "type": "boolean"
+                },
+                "issuer": {
+                  "type": "string"
+                },
+                "notice": {
+                  "$ref": "#/components/schemas/ResponseText",
+                  "description": "i18n envelope for the success message (CONVENTIONS §4.2)."
+                },
+                "status": {
+                  "$ref": "#/components/schemas/AdminIdentityStatus"
+                },
+                "subject": {
+                  "type": "string"
+                },
+                "version": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "id",
+                "issuer",
+                "subject",
+                "email",
+                "email_verified",
+                "granted_scopes",
+                "is_primary",
+                "status",
+                "created_at",
+                "version",
+                "notice"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/Pagination"
+          }
+        },
+        "required": [
+          "data",
+          "pagination"
+        ],
+        "type": "object"
+      },
+      "ListResponse_AdminInviteRecord": {
+        "properties": {
+          "data": {
+            "items": {
+              "description": "The invite as it is safe to return **after** creation: no token, no hash, no prefix.",
+              "properties": {
+                "constraint": {
+                  "$ref": "#/components/schemas/AdminInviteConstraint"
+                },
+                "consumed_at": {
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "consumed_subject": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "created_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "created_by_subject": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "expired": {
+                  "description": "Derived, not stored: `status` has no `'expired'` value, because nothing sweeps\nfor it. A `pending` invite past `expires_at` reads as `expired = true` here and\nis refused at redemption.",
+                  "type": "boolean"
+                },
+                "expires_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "status": {
+                  "$ref": "#/components/schemas/AdminInviteStatus"
+                },
+                "value": {
+                  "type": "string"
+                },
+                "version": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "id",
+                "constraint",
+                "value",
+                "status",
+                "expired",
+                "expires_at",
+                "created_at",
+                "version"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/Pagination"
+          }
+        },
+        "required": [
+          "data",
+          "pagination"
+        ],
+        "type": "object"
       },
       "ListResponse_AgentProfileRecord": {
         "properties": {
@@ -8411,6 +8775,1644 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/v1/admin/admin-identities": {
+      "get": {
+        "description": "Lists admin-identity grants. Scope moira:admins:read. Revoked grants are included: 'who used to hold admin' is what an operator auditing an incident needs, and omitting them would make this list disagree with the audit log.",
+        "operationId": "list_admin_identities",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "external_application_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "application_slug",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_before",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_after",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "provider_id",
+            "required": false,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "credential_type",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/CredentialType"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scope_type",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ScopeType"
+            }
+          },
+          {
+            "in": "query",
+            "name": "application_id",
+            "required": false,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "external_user_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "external_tenant_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "expires_before",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "expires_after",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "request_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "actor_type",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "actor_subject",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "delegated_subject",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "resource_type",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "resource_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "action",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "result",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/AuditResult"
+            }
+          },
+          {
+            "in": "query",
+            "name": "occurred_before",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "occurred_after",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListResponse_AdminIdentityRecord"
+                }
+              }
+            },
+            "description": "Paginated admin identity grants",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Query, authentication, or authorization error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-identities"
+        ]
+      }
+    },
+    "/api/v1/admin/admin-identities/{id}": {
+      "delete": {
+        "description": "Revokes an admin-identity grant. This is plan 07's explicitly deferred revoke endpoint. The revocation is SOFT - status becomes 'revoked' and the row survives, so the (issuer, subject) uniqueness key keeps blocking a silent re-grant and the audit history stays intact - which is why the response carries the updated record rather than an empty 204. It does NOT reset setup_state.claimed: setup-required is a one-way transition, so revoking the last admin leaves system-key break-glass as the re-entry path rather than reopening the unauthenticated land-grab window. Requires a primary caller, and refuses to revoke the last active primary.",
+        "operationId": "delete_admin_identity",
+        "parameters": [
+          {
+            "description": "Admin identity identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional replay key. A repeated request with the same key and body replays the stored response.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminIdentityRecord"
+                }
+              }
+            },
+            "description": "Grant revoked",
+            "headers": {
+              "ETag": {
+                "description": "Current resource version",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "admin_identity_not_primary - the caller is not a primary admin",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "admin_identity_not_found",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "admin_identity_already_revoked, admin_identity_last_primary, idempotency_conflict, or idempotency_in_progress",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request or authentication error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-identities"
+        ]
+      },
+      "patch": {
+        "description": "Transfers ownership by setting or clearing `is_primary`. Ownership is ROW STATE, not a scope: Moira's authorization core grants a moira:admin-holding trusted-JWT actor every scope by implication with no per-scope opt-out, and every grant carries moira:admin by default, so a 'manage admins' scope would be held by every admin and could not express ownership at all. The caller must therefore itself be a primary admin - or present the bootstrap system key, which remains the documented break-glass path. Clearing the last active primary is refused with admin_identity_last_primary.",
+        "operationId": "patch_admin_identity",
+        "parameters": [
+          {
+            "description": "Admin identity identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required current resource version",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Optional replay key. A repeated request with the same key and body replays the stored response.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdminIdentityPatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminIdentityRecord"
+                }
+              }
+            },
+            "description": "Ownership updated",
+            "headers": {
+              "ETag": {
+                "description": "Current resource version",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "admin_identity_not_primary - the caller is not a primary admin",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "admin_identity_not_found",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "admin_identity_last_primary, admin_identity_already_revoked, resource_version_conflict, idempotency_conflict, or idempotency_in_progress",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request or authentication error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-identities"
+        ]
+      }
+    },
+    "/api/v1/admin/admin-invites": {
+      "get": {
+        "operationId": "list_admin_invites",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "external_application_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "application_slug",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_before",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_after",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "provider_id",
+            "required": false,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "credential_type",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/CredentialType"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scope_type",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ScopeType"
+            }
+          },
+          {
+            "in": "query",
+            "name": "application_id",
+            "required": false,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "external_user_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "external_tenant_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "expires_before",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "expires_after",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "request_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "actor_type",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "actor_subject",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "delegated_subject",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "resource_type",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "resource_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "action",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "result",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/AuditResult"
+            }
+          },
+          {
+            "in": "query",
+            "name": "occurred_before",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "occurred_after",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListResponse_AdminInviteRecord"
+                }
+              }
+            },
+            "description": "Paginated invitations. No token value is ever returned after creation, and the record type has no field for one.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Query, authentication, or authorization error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-invites"
+        ]
+      },
+      "post": {
+        "description": "Mints a single-use, time-limited, email- or domain-bound invitation token so an existing admin can onboard a colleague without the bootstrap system key. Scope moira:admins:invite. The token is returned EXACTLY ONCE, here; it is stored Argon2id-hashed with the deployment pepper and cannot be read back. There is no unbound 'anyone with the link' form, and the lifetime is capped server-side at 72 hours. An invitation authorises its holder to SUBMIT a redemption - it is never an exemption from the deny-by-default allowed_email_domains policy, which is enforced again at redemption.",
+        "operationId": "create_admin_invite",
+        "parameters": [
+          {
+            "description": "Optional replay key. A repeated request with the same key and body replays the stored response instead of minting a second invitation; the replayed body omits the token, because the token is shown exactly once.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdminInviteCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminInviteSecretResponse"
+                }
+              }
+            },
+            "description": "Invitation created. The `secret` field carries the token and is present only on this first response; a replay returns the same body with `secret` null and `secret_retrievable` false.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "idempotency_conflict or idempotency_in_progress",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "admin_invite_expiry_too_long, or invalid_request for a constraint value that is not a usable address or bare domain",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request, authentication, or authorization error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-invites"
+        ]
+      }
+    },
+    "/api/v1/admin/admin-invites/preview": {
+      "post": {
+        "description": "Describes the invitation a token belongs to, so an invite page can render before its visitor has signed in. Deliberately UNAUTHENTICATED, and credentialed by the invitation token in the request BODY: the visitor is unauthenticated by construction - they open the link before signing in - so the credential a scope check would demand is the one signing in produces. POST rather than GET, and body rather than path or query, so the token cannot land in an access log, a proxy log, or a Referer chain. The response is confined to the invitation's own constraint and expiry: no inviter, no identifier, no policy, no deployment detail. A token that matches nothing is refused at the indexed prefix lookup, before any password hashing runs.",
+        "operationId": "preview_admin_invite",
+        "parameters": [
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdminInvitePreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminInvitePreviewResponse"
+                }
+              }
+            },
+            "description": "The invitation's constraint and expiry",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "invite_expired or invite_revoked",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "invite_not_found - no live invitation matches this token",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "invite_already_consumed",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Malformed or schema-violating request body",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "PostgreSQL is unavailable",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "admin-invites"
+        ]
+      }
+    },
+    "/api/v1/admin/admin-invites/redeem": {
+      "post": {
+        "description": "Redeems an invitation into an admin_identities grant for the presenting identity. Requires BOTH the token in the body and a bearer JWT from a registered trusted issuer - the token says which invitation, the JWT says which (issuer, subject) the grant is for. A system key or consumer key is refused: neither carries an (issuer, subject) pair. The bearer token is verified for IDENTITY ONLY; no scope it asserts is read, and no existing grant is applied to it. `email` and `email_verified` are REQUIRED (plan 07 decision D5). Policy is enforced twice and reported separately: the invitation's own email/domain constraint yields invite_email_mismatch or invite_domain_mismatch, and the deny-by-default provider allowed_email_domains policy yields admin_claim_domain_not_allowed. An invitation grants NO exemption from the second. Every check runs before the transactional envelope, so a refused redemption does NOT consume the invitation and the same link still works once an operator widens the allow-list.",
+        "operationId": "redeem_admin_invite",
+        "parameters": [
+          {
+            "description": "Optional replay key. A repeated request with the same key and body replays the stored response instead of creating a second grant.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdminInviteRedeemRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminIdentityRecord"
+                }
+              }
+            },
+            "description": "Admin access granted and the invitation consumed",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "invite_expired, invite_revoked, invite_email_mismatch, invite_domain_mismatch, admin_claim_email_not_verified, or admin_claim_domain_not_allowed. On any of these the invitation is NOT consumed.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "invite_not_found",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "invite_already_consumed, admin_identity_already_claimed, idempotency_conflict, or idempotency_in_progress",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request or authentication error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "tags": [
+          "admin-invites"
+        ]
+      }
+    },
+    "/api/v1/admin/admin-invites/{id}": {
+      "get": {
+        "operationId": "get_admin_invite",
+        "parameters": [
+          {
+            "description": "Invitation identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminInviteRecord"
+                }
+              }
+            },
+            "description": "Invitation. `expired` is derived from `expires_at` on read, because `status` deliberately has no 'expired' value - nothing sweeps for one.",
+            "headers": {
+              "ETag": {
+                "description": "Current resource version",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Authentication, authorization, or invite_not_found error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-invites"
+        ]
+      }
+    },
+    "/api/v1/admin/admin-invites/{id}/revoke": {
+      "post": {
+        "description": "Withdraws a pending invitation. Scope moira:admins:invite. Distinct from expiry: a revocation is a deliberate withdrawal, and the invitee is told so.",
+        "operationId": "revoke_admin_invite",
+        "parameters": [
+          {
+            "description": "Invitation identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional replay key. A repeated request with the same key and body replays the stored response.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminInviteRecord"
+                }
+              }
+            },
+            "description": "Invitation revoked",
+            "headers": {
+              "ETag": {
+                "description": "Current resource version",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "invite_already_consumed, idempotency_conflict, or idempotency_in_progress",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Authentication, authorization, invite_not_found, or invite_revoked error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-invites"
+        ]
+      }
+    },
     "/api/v1/admin/agent-profiles": {
       "get": {
         "operationId": "list_agent_profiles",
@@ -26975,6 +28977,14 @@
     {
       "description": "Trusted JWT issuer administration",
       "name": "admin-jwt-issuers"
+    },
+    {
+      "description": "Admin invitation lifecycle",
+      "name": "admin-invites"
+    },
+    {
+      "description": "Admin identity grant administration",
+      "name": "admin-identities"
     },
     {
       "description": "Immutable audit event access",
