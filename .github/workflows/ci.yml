@@ -120,6 +120,34 @@ jobs:
     defaults:
       run:
         working-directory: console
+    # The console owns its own database (`console_auth`) — Better Auth's session,
+    # account and jwks tables plus the provider-secret store. It is deliberately
+    # separate from Moira's: different lifecycle, different secrets, and the console
+    # is the internet-facing half.
+    #
+    # Plain `postgres` rather than the `pgvector` image the `rust` job uses; the
+    # console stores no embeddings and pulling a larger image would buy nothing.
+    #
+    # Without this service the console's database suites fail **loudly** with
+    # "cannot reach PostgreSQL … Set CONSOLE_SKIP_DB_TESTS=1 to disable deliberately"
+    # — by design. That flag reds a separate availability test on purpose, so a CI
+    # run cannot quietly skip the durability guarantees this job exists to prove.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: console_auth_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      CONSOLE_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/console_auth_test
     steps:
       - uses: actions/checkout@v4
       # Pinned to the exact version in `console/package.json`'s `packageManager`
