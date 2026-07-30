@@ -51,19 +51,24 @@
 # WHAT IS STILL NOT SHARED, and why this stays at 1:
 #
 #   The auth-config SNAPSHOT in `console/lib/auth-runtime.ts` is per process. It
-#   exists because reading Moira's provider configuration needs a credential
-#   (finding F15), so each pod caches what it last managed to read and refreshes
-#   only on a request that carries one. Two pods can therefore hold DIFFERENT
-#   provider configurations — including different OAuth client secrets after a
-#   rotation — for an unbounded time. The symptom is an `invalid_client` from
-#   the IdP on some sign-ins and not others, depending on which pod the load
-#   balancer picked: intermittent and load-balancer-dependent, which is the
-#   worst way to find anything.
+#   exists because the console's FULL configuration read needs a credential, so
+#   each pod caches what it last managed to read and refreshes only on a request
+#   that carries one. Two pods can therefore hold DIFFERENT provider
+#   configurations — including different OAuth client secrets after a rotation —
+#   for an unbounded time. The symptom is an `invalid_client` from the IdP on
+#   some sign-ins and not others, depending on which pod the load balancer
+#   picked: intermittent and load-balancer-dependent, which is the worst way to
+#   find anything.
 #
-#   That divergence is not fixable from the console alone. The fix is F15 —
-#   Moira serving its existing non-secret `PublicAuthMethod` projection
-#   anonymously — at which point every pod can re-read the configuration on
-#   demand and the snapshot disappears.
+#   Finding F15 is FIXED (commit f0d8de7) and does not resolve this. That fix
+#   added an anonymous `GET /api/v1/admin/setup/sign-in-methods` serving
+#   `PublicSignInMethod` — deliberately `PublicAuthMethod` MINUS
+#   `allowed_email_domains` (which is plan 07 decision D3, the admin-claim
+#   policy, not configuration) and minus `jwks_url`. `resolveAuthConfig` needs
+#   both `allowed_email_domains` and `trusted_jwt_issuer_id`, and refuses a row
+#   carrying neither. So the anonymous projection is enough to RENDER a sign-in
+#   button and not enough to RESOLVE the configuration behind it, which is what
+#   the snapshot holds.
 #
 #   Lifting the replica count today would trade three demonstrated fixes for one
 #   undemonstrated failure mode, on a console that has no operator-facing screen

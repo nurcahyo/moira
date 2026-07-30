@@ -126,8 +126,15 @@ like a config change. Sessions are invalidated either way.
 `charts/moira-console/values.yaml` stays at `replicaCount: 1`. Secrets, the JWKS
 key pair, sessions and rate limits are now shared through this database — but the
 auth-config **snapshot** in `console/lib/auth-runtime.ts` is still per process,
-because reading Moira's provider configuration needs a credential (finding F15).
-Two pods can therefore hold different provider configurations, including
-different client secrets after a rotation, and the symptom is an `invalid_client`
-on some sign-ins and not others. The values file carries the full reasoning and
-the reversal condition.
+because the console's full configuration read still needs a credential. Two pods
+can therefore hold different provider configurations, including different client
+secrets after a rotation, and the symptom is an `invalid_client` on some sign-ins
+and not others.
+
+Finding F15 is fixed and does **not** resolve this: the anonymous
+`GET /api/v1/admin/setup/sign-in-methods` serves `PublicSignInMethod`, which is
+`PublicAuthMethod` minus `allowed_email_domains` and `jwks_url` —
+and `resolveAuthConfig` requires `allowed_email_domains` and
+`trusted_jwt_issuer_id`. Enough to render a sign-in button; not enough to resolve
+the configuration behind it. The values file carries the full reasoning and the
+reversal condition.

@@ -50,6 +50,25 @@
 // intent, since every field in it is already safe to show an unauthenticated
 // visitor — delete the snapshot and read it live. That is the better design;
 // this is the one available without modifying Moira, which plan 08 does not do.
+//
+// UPDATE (plan 09 Wave 1): finding F15 has been FIXED, and it does NOT satisfy
+// that reversal condition — do not read the fix and delete the snapshot.
+// Moira now serves `GET /api/v1/admin/setup/sign-in-methods` anonymously, but
+// the projection behind it (`PublicSignInMethod`) is deliberately
+// `PublicAuthMethod` MINUS `allowed_email_domains` — which is plan 07 decision
+// D3, the deny-by-default admin-claim policy, and publishing it anonymously
+// would hand any caller the list of domains that can obtain Moira admin — and
+// minus `jwks_url`. `resolveAuthConfig` refuses a row without
+// `allowed_email_domains` or `trusted_jwt_issuer_id`, and neither is in the
+// anonymous projection. So it is enough to RENDER a sign-in button and not
+// enough to RESOLVE the configuration behind it.
+//
+// The consequence this file owns: the snapshot is per process, so two replicas
+// can hold different provider configurations — including different client
+// secrets after a rotation — for an unbounded time. That is why
+// `charts/moira-console/values.yaml` still pins `replicaCount: 1` even though
+// secrets, the JWKS key pair, sessions and rate limits are now all shared
+// through the console's database.
 import "server-only";
 
 import {
