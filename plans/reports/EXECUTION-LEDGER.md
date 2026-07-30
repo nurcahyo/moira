@@ -20,6 +20,22 @@ merge, self-paced cadence. Security findings escalate to the user immediately.
    private `CARGO_TARGET_DIR`s and run parallel when they touch disjoint trees (Rust vs console),
    series when they share files. Cargo takes an *exclusive* target-dir lock, so agents sharing one
    directory serialise no matter how many are spawned.
+
+   **A private target dir is NOT isolation. A private WORKTREE is.** Learned the hard way on
+   2026-07-31: plan 11's agent was working in the main checkout, and the coordinator ran
+   `git checkout main` in that same tree to commit an unrelated ledger entry. The agent's work then
+   committed onto `main` instead of its branch. It behaved correctly — it detected the drift, refused
+   to `reset --hard` a branch another writer was active on, and left a recovery recipe. The
+   coordinator caused the problem.
+
+   **Rule: any agent that will commit gets its own `git worktree`, not just its own target dir.** The
+   target dir prevents *build* contention; only a worktree prevents *branch* contention. And the
+   coordinator must never run `git checkout` in a tree an agent is using — do ledger commits from a
+   separate worktree, or wait.
+
+   Recovery when it happens anyway: if the stray commit is unpushed, `cherry-pick` it onto the right
+   branch and `reset --hard origin/<branch>`. Never force-push to fix this while another agent is
+   live.
 3. **Merge on green CI.** All three jobs green with steps executed → merge. A job that ran and
    failed is real and blocks; investigate rather than override. The old infrastructure override is
    **void** — CI works.
