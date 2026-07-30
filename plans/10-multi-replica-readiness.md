@@ -26,10 +26,10 @@ now `0014`. Leaving a wrong migration number in prose is how a filename collisio
 | # | Body says | Reality | Required change |
 |---|---|---|---|
 | **B1** | `moira.error.capacity_exhausted` and `moira.error.idempotency_in_progress` are **"MISSING — this plan must add it"** (`:280`, `:281`, `:289`, `:426`, `:428`, `:466`, `:516`) | **Both already exist.** `capacity_exhausted` at `src/i18n/catalog/errors.rs:475`, `idempotency_in_progress` at `:50`, both mirrored in `docs/i18n-response-catalog.json` (`:52`, `:187`). Adding them again duplicates entries | Delete both "MISSING" rows. Only **`cluster_lease_denied`** and **`worker_queue_capacity_exceeded`** are genuinely new. Keep the *presence* assertions in `new_multi_replica_error_keys_exist_in_catalog` — asserting an existing key is free — but do not add the entries |
-| **B2** | `RedisCircuitBreakerRegistry` "mirrors `CircuitBreakerRegistry`'s public API (`before_call`, `on_success`, `on_failure`, `reset_all`)" (`:61`, `:194`) | **There are five methods.** Plan 04 added `reset_for_resource(CircuitResetScope)` (`src/orchestration/controls.rs:641-653`; the enum is at `:519-530`) and `src/infra/db.rs:95` calls **that**, not `reset_all`. A four-method mirror does not compile behind a backend enum | Mirror **five** methods. `reset_all` survives only for process startup and as `reset_for_resource`'s `All` arm (`controls.rs:625-629`) |
+| **B2** | ~~`RedisCircuitBreakerRegistry` must mirror five methods, not four~~ **STRUCK — §0.4b forbids building one at all.** Breaker state is earned by a replica observing its own transport failures; sharing it lets one replica's bad network path open the circuit for healthy replicas. The five-vs-four observation was correct and is now moot. Kept struck rather than deleted so nobody re-derives the four-method version from the body (`:61`, `:194`) | — | Build **no** Redis breaker backend. `AppState.circuits` carries a doc comment saying adding one would be a regression |
 | **B3** | (a) `src/infra/db.rs`'s LISTEN/NOTIFY code must stay **"byte-for-byte untouched"** (`:314(c)`, `:48`, `:482`, `:517`); (b) `AppState` holds the circuit registry behind a backend enum (`:195`, `:198`) | **These two requirements are mutually exclusive.** `spawn_runtime_config_listener` (`src/infra/db.rs:48-54`) takes a **concrete** `CircuitBreakerRegistry`, and plan 07 gave it a fifth parameter — `auth_settings: AuthProviderSettingsCache` (`:52`) — so the signature already moved. Wrapping the registry in an enum forces it to move again | **Drop requirement (a) as written.** Restate it as: *the invalidation semantics — unconditional cache invalidation, scoped breaker reset, the fail-safe fallbacks — must not change; the listener's parameter types may.* The read-only reviewer check `:314(c)` is unsatisfiable as literally worded |
 | **B4** | The Redis subscriber calls "the same `cache.invalidate_all()`/`runtime_handles.invalidate_all()`/`circuits.reset_all()` **triplet**" (`:74`, `:208`) | **It is four calls, and the last is scoped** (`src/infra/db.rs:92-95`): `cache.invalidate_all()`, `runtime_handles.invalidate_all()`, **`auth_settings.invalidate_all()`**, `circuits.reset_for_resource(scope)` | Implement **all four**. Omitting the third leaves plan 07's `AuthProviderSettingsCache` stale on every replica that learns of the change via Redis. Using `reset_all` reintroduces the exact defect `controls.rs:631-640` documents: one unrelated row write discarding every provider's earned breaker health |
-| **B5** | A Redis pub/sub channel carries invalidation "structurally parallel to `spawn_runtime_config_listener`" (`:208`), with a `payload` published from each mutation (`:209`) | **The plan never mentions the payload-to-scope mapping the Postgres path depends on.** `CIRCUIT_UNAFFECTED_RESOURCE_TYPES` (`src/infra/db.rs:144-164`) and `circuit_reset_scope` (`:173-209`) exist precisely so a config write does not nuke breaker state; unknown resource types, unparseable payloads and non-UUID ids all fail safe to `CircuitResetScope::All` **with a `warn!` per message**. A Redis payload that is not the same JSON shape lands in the `All` arm on every publish | The Redis channel **must carry the identical `{resource_type, resource_id}` payload** and run it through the **same** `circuit_reset_scope`. Factor that function so both listeners share it — do not transcribe a second copy. `db.rs:143` is explicit: *"Adding a table to the trigger means adding it here in the same change."* |
+| **B5** | A Redis pub/sub channel carries invalidation "structurally parallel to `spawn_runtime_config_listener`" (`:208`), with a `payload` published from each mutation (`:209`) | **The plan never mentions the payload-to-scope mapping the Postgres path depends on.** `CIRCUIT_UNAFFECTED_RESOURCE_TYPES` (`src/infra/db.rs:144-164`) and `circuit_reset_scope` (`:173-209`) exist precisely so a config write does not nuke breaker state; unknown resource types, unparseable payloads and non-UUID ids all fail safe to `CircuitResetScope::All` **with a `warn!` per message**. A Redis payload that is not the same JSON shape lands in the `All` arm on every publish | The Redis channel **must carry the identical `{resource_type, resource_id}` payload** and run it through the **same** `circuit_reset_scope`. Factor that function so both listeners share it — do not transcribe a second copy. `db.rs:143` is explicit: *"Adding a table to the trigger means adding it here in the same change."* **⚠️ AND THE TRAP THIS ROW ORIGINALLY MISSED, found while implementing:** *nothing in the tree constructs that payload* — the Postgres one is built by a **database trigger**, so a publisher has to reconstruct the table name at every call site. The obvious source is already in scope at each site: the `resource_type` string passed to `audit_success`. **Those are `"route"`, `"provider"`, `"credential"` — resource nouns, not table names.** None appears in `CIRCUIT_UNAFFECTED_RESOURCE_TYPES`, so a faithful-looking implementation of this row lands **every** publish in the unknown arm → `CircuitResetScope::All` → precisely the defect B5 exists to prevent, and visible only in deployments that turned Redis on. Guard it structurally: declare `PUBLISHABLE_RESOURCE_TYPES` *beside* the classifier in `db.rs`, reference those constants at the call sites, and gate it with `every_publishable_resource_type_is_classified` |
 | **B6** | "**verified layout:** `AtomicU64` counter fields live in `MetricsInner` at `src/infra/metrics.rs:19-27`; `MetricsSnapshot` (plain `u64`) at `:30-41`; `record_*` at `:43-92` … **Do not attempt histogram work here**" (`:219`, `:512`) | **Fiction — plan 05 rewrote the file** (1005 lines now). `MetricsInner` (`:114-121`) holds `recorder`, `handle`, `pool` and **no counters**. **`MetricsSnapshot` does not exist.** Counters are `metrics`-crate macros (`counter!`/`gauge!`/`histogram!`), and **histograms already shipped** (`describe_histogram!` at `:198`, `:203`, `:207`) | Adding a counter now means: a name `const`, a `describe_counter!` **and a zero-seed** `counter!(NAME).increment(0)` in `describe_and_seed_families` (`:154`), plus the `record_*` method. The seed is not optional — the doc comment at `:141-152` explains that an unseeded family is a *removal* from the scrape body, not an addition |
 | **B7** | `worker_leader_held` is a "gauge 0/1 **per job_name per replica**" (`:219`) | **A per-replica dimension fails an existing test.** `ALLOWED_LABEL_KEYS` (`src/infra/metrics.rs:564-576`) is enforced by `high_cardinality_identifiers_never_appear_as_label_values`, and a replica UUID is exactly the identifier it forbids (`:836` even names the remedy path). `job_name` is a bounded set and is acceptable — but it is **not** in the allow-list today | Drop the per-replica dimension: a gauge is already per-process because each process has its own registry. **Add `"job_name"` to `ALLOWED_LABEL_KEYS`** in the same change |
 | **B8** | Migration `0009_multi_replica_readiness.sql`; "highest existing is `0008_response_updated_at.sql`, so **0009 is free**" (`:32`, `:87`, `:221`, `:222`, `:433`, `:442`, `:503`) | **`0009` through `0013` are all taken** (`backfill_false_indexed_ingestion_status`, `list_cursor_indexes`, `retention_indexes`, `admin_identity_claims`, `auth_provider_settings`). Next free is **`0014`** | Renumbered to **`0014`** inline in the body at all seven sites, including the PR-description template (`:32`) and the CI gate text, now **"apply 0001→0014"** (`:442`). Re-confirm against `migrations/` at implementation time anyway |
@@ -90,6 +90,45 @@ is duplicated work at best and a regression at worst.
 | `.github/workflows/ci.yml` | **True.** pgvector `:13-25`, redis `:26-34`, `MOIRA_REDIS__ENABLED`/`__URL` `:38-40`. Also true: **still zero Redis tests** (`tests/metrics_endpoint.rs` only reads the `moira_redis_enabled` gauge) |
 | `docs/todo.md` | Phase 6 bullets **true** and still open |
 | `migrations/` | Only the *new* filename collides. See B8 |
+
+### §0.4b DECISION — Postgres is the default coordination backend; Redis ships behind a flag
+
+**Taken by the user, 2026-07-29.** Redis is implemented but **off by default**; the shipped path
+coordinates through Postgres and per-process memory. The reasoning is deployment scale: at a handful
+of users and a small replica count, an extra stateful dependency costs more than it returns.
+
+The flag already exists — `RedisSettings.enabled` (`src/config/settings.rs`), default `false`, with
+`redis_is_optional_by_default` (`src/infra/redis.rs`) pinning it. Wave 2 wires the Redis backends
+*behind* it and must not change that default.
+
+**What is genuinely cluster-correct without Redis:**
+
+| Concern | Backend | Correct across replicas? |
+|---|---|---|
+| Cluster admission lease | Postgres (`cluster_replica_leases`, `0014`) | **yes** |
+| Leader election / singleton workers | Postgres advisory lock | **yes** |
+| Runtime config + auth-settings invalidation | Postgres `LISTEN/NOTIFY` | **yes** — every replica already subscribes |
+| Idempotency / replay | Postgres, unique index + advisory lock | **yes** |
+| Rate limiting | in-process | **no** — see below |
+| Concurrency permits | in-process | **no** — see below |
+| Circuit breakers | in-process | **no**, and deliberately so |
+
+**The honest cost, stated plainly.** With Redis off, rate limits and concurrency caps are
+**per-replica**: N replicas admit up to N× the configured limit. That is not a bug to be fixed
+later — it is the trade being made, and it is only acceptable because the admission lease **bounds
+N**. The two decisions hold together: cap the replica count in the database, then accept an N× limit
+where N is small and known. Document the multiplier wherever a limit is configured, so an operator
+raising `cluster.maxReplicas` understands they are also raising every rate limit by the same factor.
+
+Circuit breakers are a different case and should stay per-process even with Redis available: breaker
+state is *earned* by a replica observing its own transport failures, and sharing it would let one
+replica's bad network path open the circuit for healthy ones.
+
+**Consequences for Wave 2.** The backend split must be a runtime choice behind `redis.enabled`, with
+the Postgres/in-memory path as the default arm and the Redis arm additive. Every Redis code path
+needs a test that the default build still behaves correctly with Redis absent — not merely that it
+compiles. And `publish_runtime_invalidation` must remain a *second* channel alongside `LISTEN/NOTIFY`,
+never a replacement: a deployment with Redis off must still invalidate.
 
 ### §0.5 What is genuinely still open — the honest scope of this plan
 

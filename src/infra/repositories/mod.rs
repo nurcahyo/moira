@@ -1,10 +1,12 @@
 mod admin;
 mod auth_settings;
+mod cluster;
 mod conversation;
 mod identity;
 mod public;
 mod runtime;
 mod setup;
+mod worker_jobs;
 
 pub use admin::{
     AdminIdempotencyClaim, AdminIdempotencyClaimOutcome, AdminRepository, KeyMaterial,
@@ -16,6 +18,13 @@ pub use admin::{
 pub use auth_settings::{
     AuthProviderSettingsRepository, GoverningAuthPolicy, PgAuthProviderSettingsRepository,
 };
+// Plan 10 wave 1. Same shape as the plan-07 modules above: a trait plus one Postgres
+// implementation from the first commit, so the startup gate in `src/app/cluster_lease.rs`
+// is testable without a database.
+pub use cluster::{
+    ClusterLeaseGrant, ClusterLeaseOutcome, ClusterLeaseRepository, PgClusterLeaseRepository,
+    is_undefined_table, pod_name, resolve_pod_name,
+};
 pub use conversation::{
     ConversationAccess, ConversationInsert, ConversationMessageInsert, ConversationRepository,
     MemoryInsert, PgConversationRepository,
@@ -24,6 +33,10 @@ pub use identity::{
     AdminIdentityGrant, AdminIdentityGrantInsert, AdminIdentityRepository,
     PgAdminIdentityRepository,
 };
+// Plan 10 wave 2. Trait plus one Postgres implementation, same convention as the
+// modules above — which is what lets `WorkerQueue`'s retry, dead-letter and
+// dispatch logic be tested against a fake with no database.
+pub use worker_jobs::{ClaimedJob, PgWorkerJobRepository, WorkerJobInsert, WorkerJobRepository};
 // Deliberately `pub(crate)`, not `pub`: these three free functions mutate RAG state with no
 // authorization check, no audit row and no idempotency envelope of their own — those are
 // supplied by their only legitimate caller, `crate::application::conversation`, which wraps

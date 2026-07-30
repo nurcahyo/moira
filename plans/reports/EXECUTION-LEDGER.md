@@ -4,8 +4,52 @@ Durable state for the continuous plan-execution loop. **Read this first on every
 recollection, is the source of truth for where the work stands. Update it at the end of every cycle
 in which anything changed, and commit it.
 
-Working agreement in force (granted 2026-07-26): full autonomy including merge, self-paced cadence.
-Console draft PR **#23 stays HELD**. Security findings escalate to the user immediately.
+Working agreement in force (granted 2026-07-26, **extended 2026-07-30**): full autonomy including
+merge, self-paced cadence. Security findings escalate to the user immediately.
+
+## STANDING AUTHORITY — unattended execution (granted 2026-07-30)
+
+**Run to completion without stopping for input.** The user is away. These rules replace asking:
+
+1. **Do not ask questions. Decide, and record the decision.** Where a question would have been
+   asked, research the tree first, pick the recommended option, and write it into the affected
+   plan's §0 with its reasoning and — this part is not optional — **the condition that would
+   reverse it**. A decision recorded that way is reviewable after the fact; a question asked into
+   an empty room just stalls.
+2. **Parallel vs series is the loop's call.** Rule of thumb established by measurement: agents get
+   private `CARGO_TARGET_DIR`s and run parallel when they touch disjoint trees (Rust vs console),
+   series when they share files. Cargo takes an *exclusive* target-dir lock, so agents sharing one
+   directory serialise no matter how many are spawned.
+3. **Merge on green CI.** All three jobs green with steps executed → merge. A job that ran and
+   failed is real and blocks; investigate rather than override. The old infrastructure override is
+   **void** — CI works.
+4. **PR #23 is no longer HELD** — the user chose to branch plan 08 from it, so it lands as part of
+   plan 08 rather than on its own.
+5. **OAuth / Google credentials: mock first.** No real Google client id or secret is available and
+   none is to be requested. Build against a mock IdP and a mock token issuer, with the seam drawn so
+   a real provider drops in later without reshaping the code. Anything genuinely requiring live
+   credentials is deferred with an explicit note, never faked into a green test.
+6. **Never fake a gate.** A skipped DB suite reporting green, an `--ignore-unfixed` added to silence
+   Trivy, a weakened assertion — all forbidden. If something cannot pass honestly, stop that thread,
+   record why, and move to the next.
+7. **Escalation still applies** for security findings, data-loss risks, and anything that would
+   need a credential or a spend decision. Escalate by writing it here and in the PR body, and keep
+   working — do not block on it.
+8. **Watch the disk every cycle. This is unattended — nobody is going to notice a full disk.**
+   Check `df -g .` **and** `du -sh ~/.cargo-targets/*` at the top of each cycle, not just the main
+   `target/`. Agents now hold *private* target dirs, so total usage is `main + N × ~2 GB` and grows
+   with every agent spawned — the number that mattered historically was never one directory.
+   - **Below 60 GB free:** run `scratchpad/reclaim.sh`, which escalates from the free-to-delete
+     `debug/incremental` cache upward and refuses to run while a build is live.
+   - **Below 30 GB free:** also delete `~/.cargo-targets/*` for agents that have finished. They
+     rebuild in ~2m21s; a stalled overnight run costs far more.
+   - **Delete finished agents' target dirs as a matter of routine**, not only under pressure.
+   - `cargo clean` is no longer catastrophic — `debug = 1` took a full build from 20 GB to **2.0 GB**
+     and a cold rebuild to **2m21s** — but still prefer the graduated script, because `deps` is the
+     expensive half and `incremental` is ~45% of the tree and free to drop.
+   - **Never delete a target dir while a build is running.** The script refuses; do the same by hand.
+
+**Plan order remaining:** `{08 ∥ 10} → 11 → 09`.
 
 ---
 
@@ -315,6 +359,69 @@ the whole argument for the approach given that Debian had declined or deferred f
    65532 while `migration-job.yaml` stayed at 10001 — same image, and distroless has no shell or
    package manager with which to create a second user. It would have failed at deploy time, not in
    CI. When an agent reports "verified", check the specific thing that could fail silently.
+
+### F15 — ESCALATED: the console cannot render a sign-in button without already being signed in
+
+**Every read of the auth configuration requires a credential.** Verified against the frozen spec:
+
+```
+GET  /api/v1/admin/setup/auth-methods  ->  [{bearerAuth}, {systemKeyAuth}]
+GET  /api/v1/admin/setup/claim-status  ->  anonymous  (returns one boolean)
+POST /api/v1/admin/setup/claim         ->  [{systemKeyAuth}]
+```
+
+`claim-status` is the **only** anonymous admin operation and it carries a single bit. So to learn
+which sign-in methods a deployment offers, the console needs a bearer token — which is the JWT it
+can only mint *after* a user signs in. **Circular.**
+
+The practical consequence: an operator who removes `MOIRA_SYSTEM_KEY` after setup — which is exactly
+what one does with a bootstrap credential — leaves a console that can never render a sign-in button
+again. Plan 08 works around it with a configuration snapshot taken while the key is still present.
+
+**This is a consequence of plan 07's decision D4**, which made `auth-methods` authenticated on
+information-content grounds: one bit of "is setup done" is free, the identity configuration is not.
+That reasoning is sound for the *full* record and wrong for the projection a login screen needs.
+
+**Recommended fix (Moira-side, small): serve the public projection anonymously.**
+`PublicAuthMethod` already exists (`src/domain/auth_settings.rs:151`) and is exactly this — method
+name and `client_id`, no secrets, no policy. A `client_id` is not confidential; it appears in every
+OAuth redirect URL a browser sends. Serving that projection without a credential closes the loop and
+leaks nothing D4 was protecting. The authenticated endpoint keeps returning the full record.
+
+**Not fixed in plan 08** because it is a Moira API change, not a console change, and plan 08 is a
+console iteration. Scheduled as a follow-up. Until then the snapshot workaround holds, with the
+failure mode above documented in the console's own notes.
+
+### F14 — memory dedupe silently stops matching after a pepper rotation
+
+`memory_records.content_hash` is written with `IdempotencyHasher::hash`
+(`src/application/conversation.rs:580`), which produces `"{pepper_version}:{base64url(hmac(...))}"`.
+`IdempotencyHasher::verify` deliberately accepts **only the active pepper**
+(`src/security/idempotency.rs:24-40`).
+
+So after a pepper rotation, every stored `content_hash` becomes unmatchable and exact-match memory
+dedupe silently stops working — duplicates accumulate with no error and no log line. Not data loss,
+and not urgent, but it fails quietly, which is the worst failure mode for a dedupe mechanism.
+
+Found while deciding plan 11's `chunk_hash` question. It is now an explicit Sub-Phase F obligation
+in that plan rather than a production surprise, but the *existing* `memory_records` behaviour is
+unchanged and still has this property.
+
+**Decide when plan 11 reaches Sub-Phase F:** either re-hash on rotation, accept the duplicate window
+and document it, or move `content_hash` to the unkeyed `request_hash` on the same reasoning plan 11
+used for `chunk_hash` — peppering exists to protect digests of request bodies that carry provider
+API keys, and memory content is not that.
+
+### F13 — a duplicate trusted JWT issuer returns 500, not 409
+
+Every other uniqueness conflict in the tree maps to a 409 — `auth_provider_settings` has an
+`is_unique_violation` → `duplicate_auth_provider` mapping. `trusted_jwt_issuers` has none, so a
+duplicate falls through `AppError::Sqlx` to **500 `database_error`**.
+
+Consequence, found while building plan 08's console: an orphaned-issuer retry path cannot recover by
+catching a 409, because the 409 never comes. Plan 08 worked around it by listing-then-adopting
+rather than create-then-recover, which is the right client behaviour regardless — but the server
+shape is still wrong. Plan 03 territory; small, clearly correct, not yet scheduled.
 
 ### F11 — a retention batch could delete its whole table in one transaction — **FIXED** `9799826`
 

@@ -7,6 +7,27 @@ metadata:
     {{- include "moira.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  {{- if .Values.cluster.admissionEnabled }}
+  # maxSurge MUST be 0 while the database enforces a replica ceiling.
+  #
+  # Kubernetes' default RollingUpdate surges 25% (at replicaCount: 1, one extra
+  # pod) *before* terminating the old one. With cluster.maxReplicas already met,
+  # the surge pod is denied a lease and crash-loops, so the Deployment never
+  # marks the rollout progressed and never terminates the old pod — whose lease
+  # therefore never expires. That is a permanent deadlock, not a slow rollout,
+  # and raising terminationGracePeriodSeconds does not fix it because the old pod
+  # is not terminating at all.
+  #
+  # maxSurge: 0 inverts the order: the old pod is terminated, releases its lease
+  # on SIGTERM, and only then is the replacement scheduled. The cost is a gap in
+  # availability during rollout, which is why this only applies when an operator
+  # has opted into database-enforced admission.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "moira.name" . }}
@@ -22,7 +43,7 @@ spec:
         prometheus.io/port: "8080"
     spec:
       serviceAccountName: {{ .Values.serviceAccount.name }}
-      terminationGracePeriodSeconds: 45
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -34,6 +55,15 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+          env:
+            # The only source `cluster_replica_leases.pod_name` has. Without it
+            # every lease row is written by the fallback chain in
+            # src/infra/repositories/cluster.rs, and an operator inspecting the
+            # table during an incident cannot tell which pod holds which lease.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
           envFrom:
             - configMapRef:
                 name: {{ include "moira.fullname" . }}-config

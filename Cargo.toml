@@ -65,7 +65,7 @@ opentelemetry = "0.32"
 # `experimental_trace_batch_span_processor_with_async_runtime` + `rt-tokio` features.
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "internal-logs", "reqwest-blocking-client", "reqwest-rustls", "trace"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["internal-logs", "trace"] }
-redis = { version = "0.32", default-features = false, features = ["tokio-comp"] }
+redis = { version = "0.32", default-features = false, features = ["tokio-comp", "script"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 rig-core = "0.40"
 secrecy = "0.8"
