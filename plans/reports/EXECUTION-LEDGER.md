@@ -672,7 +672,80 @@ default would have reported the `setup_state` race as "flaky" and shipped the is
 Rejected: `[profile.dev.package."*"] opt-level = 3`. It optimises 405 dependencies to speed up test
 *runtime*, but this suite is Postgres-I/O-bound, and the cost is repaid on every dependency rebuild.
 
+## STATE AT A GLANCE — update this before every compaction
+
+**Merged to `main` (11 plans):** 02a, 02b, 03, 04, 05, 06, 06b, 06c, **07** (`27b6e0c`),
+**10** (`671eadf`), **08** (`f0ecbbc`). All three of the last were CI-verified with every job
+running steps.
+
+**Remaining:** plan **11** (RAG/memory — §0 written, Wave 1 merged into branch, Wave 2 in flight on
+`plan/11-rag-memory-intelligence`), then plan **09** (generic OIDC + invitations — not yet audited).
+
+**Open findings, none blocking a merge:**
+
+| | What | Where it lives |
+|---|---|---|
+| **F15** | Console cannot render a sign-in button without a credential it can only get by signing in. Fix: serve `PublicAuthMethod` anonymously | Moira API, unscheduled |
+| **F14** | Memory dedupe silently stops matching after a pepper rotation | plan 11 Sub-Phase F |
+| **F13** | Duplicate trusted JWT issuer returns 500, not 409 | plan 03 territory |
+| **F2** | Pre-auth query-field enumeration | user deferred |
+| **F6** | OTel exports every span; `env_filter` is the sole barrier to Rig prompt spans | unscheduled |
+| — | Admin write + audit row still non-atomic | unscheduled |
+| — | ~986 leaked `trusted_jwt_issuers` rows in the shared test DB | hygiene |
+
+**Test baseline:** 779 passing on plan 11's branch (744 on `main` after plan 10).
+
+## COMPACTION DISCIPLINE — added 2026-07-31
+
+This run is unattended and long, so context *will* be summarised. **The rule: this file, the plan
+§0 sections, and git are the source of truth — never conversation memory.**
+
+A checkpoint is safe to compact at only when **all** of these hold:
+
+1. Working tree clean, everything committed **and pushed**.
+2. **This ledger reflects reality** — merges recorded, findings recorded, in-flight work named with
+   its branch. Checked on 2026-07-31 and it was *not*: two merged plans were missing. Verify, do not
+   assume.
+3. Every decision made since the last checkpoint is written into the affected plan's §0 **with its
+   reversal condition**, not just into a commit message.
+4. Running agents are named above with what they are doing, so a fresh context can pick up their
+   notifications without knowing why they were spawned.
+
+If any of those is false, **make it true first** — that is cheap, and re-deriving lost state is not.
+The "State at a glance" block above exists precisely so a compacted context can resume from one read.
+
 ## Cycle log
+
+### Cycle 10 — 2026-07-29 → 07-31 — plans 10 and 08 MERGED, plan 11 started
+
+**Plan 10 merged** `671eadf` — cluster admission lease, leader election, durable worker queue,
+Redis behind a flag. All three CI jobs green. 744 tests. Locks mutation-tested by neutering them
+and watching 7 fail.
+
+**Plan 08 merged** `f0ecbbc` — Next.js console, mock-first OAuth, B1-correct wizard, distroless
+image. **Five** CI jobs green (it adds `console` and `console-container-and-helm`). PR #23 closed
+as superseded; its scaffold shipped inside #33.
+
+**Plan 11** — §0 written (`85a3c08`), Wave 1 landed (`a641fa2`): real ingestion pipeline, 779 tests.
+
+**Findings raised:** F13, F14, F15 (see the table above). F15 is the one worth a human's attention.
+
+**Three things worth carrying forward:**
+
+1. **A private `CARGO_TARGET_DIR` is not isolation.** The coordinator ran `git checkout` in a tree an
+   agent was working in and its commit landed on `main`. Rule now: any agent that commits gets its
+   own **worktree**. Recorded in the standing authority.
+2. **Mutation testing keeps finding laundering.** Plan 11 Wave 1 faked an `'indexed'` status on the
+   create path; the status assertion **passed**, because the supersession `CASE` rewrote the fake
+   value. Only a row-level assertion caught it. A test that checks the field the code also writes is
+   not a test. The same trap is live for citations — counting them proves nothing about whether they
+   correspond to the chunks retrieved.
+3. **Briefs get the shape right and the specifics wrong.** Across four waves the agents corrected the
+   coordinator ~20 times, several load-bearing: `distroless/nodejs24-debian12` does *not* pass Trivy
+   (only debian13 reaches 0/0); the §0 Redis-payload guidance would have caused the exact defect it
+   warned against; "four `pending` pins" was really ten; a third RAG ingestion entry point was missed
+   entirely. **Expect the brief to be wrong in detail and ask agents to say so** — every wave that was
+   asked, found something.
 
 ### Cycle 9 — 2026-07-27 — plan 07 MERGED; plans 08 and 10 re-audited
 
