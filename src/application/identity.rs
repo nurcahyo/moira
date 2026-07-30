@@ -57,6 +57,13 @@ const ADMIN_IDENTITY_REVOKED_NOTICE: &str = "moira.notice.admin_identity_revoked
 /// from an API key in a paste buffer or a log line someone is about to redact.
 const ADMIN_INVITE_NAMESPACE: &str = "moira_inv";
 
+/// The value `admin_identities.granted_by_actor_type` carries for an invite-created grant.
+///
+/// A constant rather than an inline literal because the string is a **schema** value:
+/// `migrations/0018`'s CHECK is the other half of it, and a typo here would surface as a
+/// database constraint violation on the redeem path rather than as a compile error.
+const ADMIN_INVITE_ACTOR_TYPE: &str = "admin_invite";
+
 /// Separate cursor scopes, so a cursor issued for one list cannot be replayed against
 /// the other.
 const ADMIN_INVITES_CURSOR: CursorScope = CursorScope::new("admin.admin_invites");
@@ -519,12 +526,15 @@ impl<'a> AdminIdentityService<'a> {
             // would make an invite strictly more powerful than the transfer endpoint it
             // is supposed to sit beneath.
             granted_scopes: vec!["moira:admin".to_string()],
-            // Honest: `admin_identities.granted_by_actor_type`'s CHECK admits only
-            // 'system_key' and 'setup_token', and a redemption is neither. Widening that
-            // CHECK is a schema change this wave does not need — the invite id in the
-            // audit row and `admin_invites.consumed_admin_identity_id` both record the
-            // real provenance, and `consumed_admin_identity_id` is a hard FK link.
-            granted_by_actor_type: "system_key".to_string(),
+            // The credential that actually produced this grant. `migrations/0018` widened
+            // `admin_identities.granted_by_actor_type`'s CHECK to admit it.
+            //
+            // Wave 2 originally wrote `'system_key'` here because `0012`'s CHECK admitted
+            // nothing else. That was false in an audit column, and not harmlessly so:
+            // 'system_key' means the bootstrap break-glass credential was used, which is
+            // the event a deployment alerts on — so every redemption raised that signal,
+            // and a real break-glass grant was indistinguishable from routine onboarding.
+            granted_by_actor_type: ADMIN_INVITE_ACTOR_TYPE.to_string(),
             granted_by_subject: invite.created_by_subject.clone(),
         };
 

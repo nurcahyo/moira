@@ -64,9 +64,14 @@ pub struct AdminIdentityGrantInsert {
     pub email: String,
     pub email_verified: bool,
     pub granted_scopes: Vec<String>,
-    /// `'system_key'` or `'setup_token'` — recorded honestly. Under D1 only
-    /// `'system_key'` is ever written; the CHECK keeps the other value legal so reversing
-    /// D1 needs no further migration.
+    /// `'system_key'`, `'admin_invite'` or `'setup_token'` — recorded honestly, and the
+    /// CHECK in `migrations/0018` is the enforcement.
+    ///
+    /// The claim path writes `'system_key'` and the redeem path writes `'admin_invite'`.
+    /// They must stay distinguishable: `'system_key'` means the bootstrap break-glass
+    /// credential was presented, which is an event a deployment alerts on, so an invite
+    /// borrowing that value would raise the alarm on every routine onboarding *and* hide
+    /// the real thing among them. `'setup_token'` stays legal but unwritten under D1.
     pub granted_by_actor_type: String,
     pub granted_by_subject: Option<String>,
 }
