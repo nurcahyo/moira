@@ -376,6 +376,32 @@ the whole argument for the approach given that Debian had declined or deferred f
    package manager with which to create a second user. It would have failed at deploy time, not in
    CI. When an agent reports "verified", check the specific thing that could fail silently.
 
+### F17 — rotating `BETTER_AUTH_SECRET` makes the console publish a JWKS it cannot sign for
+
+**A new hazard created by durable storage; the in-memory path did not have it.**
+
+On rotation, `getJwks` serves the **plaintext `publicKey` column**, so the JWKS document is unchanged
+and Moira's cached copy stays valid. Meanwhile `signJWT` fails with `Failed to decrypt private key`
+— and it does **not** regenerate the pair. The console therefore advertises keys it can no longer
+sign with, and every token it mints is rejected. Silently: the JWKS endpoint looks healthy.
+
+Verified rather than reasoned about, in `console-jwks-stability.test.ts`. Runbook in
+`docs/console-storage.md`.
+
+**Why it is worth its own entry:** with the memory adapter, a rotation regenerated the pair and the
+next process simply published new keys. Making storage durable — which fixes three other problems —
+converts a self-healing restart into a silent, persistent outage. That is the shape of hazard worth
+looking for whenever ephemeral state is made persistent.
+
+### F18 — the sign-in rate limit was multiplying by replica count
+
+Better Auth's default `rateLimit.storage` is **per-process memory**. With N replicas the effective
+sign-in limit was N× the configured value, and the configured value only applied in production at
+all (`enabled: isProduction`). Set to `"database"` in plan 09 Wave 1, so the limit is now shared.
+
+Minor while `replicaCount` is pinned at 1, and exactly the kind of thing that stops being minor the
+moment someone lifts that pin.
+
 ### F16 — ESCALATED: `rig-core` logs the whole completion body, which now carries OTHER tenants' documents
 
 **`rig-core` 0.40 emits the entire completion request body — every message, verbatim — on the
