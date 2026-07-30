@@ -376,6 +376,29 @@ the whole argument for the approach given that Debian had declined or deferred f
    package manager with which to create a second user. It would have failed at deploy time, not in
    CI. When an agent reports "verified", check the specific thing that could fail silently.
 
+### METHOD NOTE — right conclusion, wrong mechanism, and the test that would have proved nothing
+
+Plan 09 §0 argued the redeem validation must sit **outside** the transactional envelope because,
+since `Idempotency-Key` is required, a denied redemption would write a ledger row and a later retry
+would **replay the stored 403** after the operator widened the allow-list.
+
+**The mechanism is wrong.** `AppError::is_cacheable_admin_failure` (`src/error.rs:209-225`) caches
+only 400/404/409/422 and explicitly excludes `Self::Forbidden(_)`. A 403 raised inside the closure
+takes the rollback arm and leaves **no** ledger row. There is no replay.
+
+The conclusion still holds — validating outside the envelope is what stops the invite being consumed
+and the advisory lock being taken — so the code is right. **But a test written against the stated
+mechanism would have passed in both the fixed and the broken arrangement**, because neither produces
+a replayed 403. It would have been a green test proving nothing, added specifically to guard the
+thing it does not touch.
+
+The ordering test must assert on the **invite row's `status`**, not on a replayed response.
+
+**This is the second time in this run that a mechanism I asserted was wrong in a way that would have
+produced a false-confidence test** — the first being F15, where a type was named as safe without
+reading its fields. Both were caught by an agent verifying rather than implementing. The pattern:
+*a conclusion can be right for a reason that is wrong, and the test follows the reason.*
+
 ### F17 — rotating `BETTER_AUTH_SECRET` makes the console publish a JWKS it cannot sign for
 
 **A new hazard created by durable storage; the in-memory path did not have it.**
