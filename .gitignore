@@ -1,5 +1,9 @@
 /target
 
+# cargo-mutants scratch tree and outcome report (scripts/mutants.sh)
+/mutants.out
+/mutants.out.old
+
 # console/ (Next.js workspace)
 node_modules/
 .next/

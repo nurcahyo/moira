@@ -644,7 +644,8 @@ impl PgAdminCommandTransaction {
         .bind(request.clock_skew_seconds)
         .bind(request.allow_delegation)
         .fetch_one(self.connection())
-        .await?;
+        .await
+        .map_err(duplicate_trusted_jwt_issuer_on_unique_violation)?;
         crate::infra::pg_rows::trusted_jwt_issuer_record_from_row(&row)
     }
 
@@ -1895,7 +1896,8 @@ impl AdminRepository for PgAdminRepository {
         .bind(request.clock_skew_seconds)
         .bind(request.allow_delegation)
         .fetch_one(&self.pool)
-        .await?;
+        .await
+        .map_err(duplicate_trusted_jwt_issuer_on_unique_violation)?;
         crate::infra::pg_rows::trusted_jwt_issuer_record_from_row(&row)
     }
 
@@ -2472,6 +2474,32 @@ fn ensure_affected(rows_affected: u64, resource: String) -> Result<(), AppError>
         Err(AppError::NotFound(resource))
     } else {
         Ok(())
+    }
+}
+
+/// The `409` that `trusted_jwt_issuers_issuer_active_unique` produces (finding F13).
+///
+/// Registering an issuer that already exists used to fall through to `AppError::Sqlx` and
+/// reach the caller as **`500 database_error`** — alone among Moira's uniqueness conflicts;
+/// `auth_provider_settings` has mapped its equivalent to `duplicate_auth_provider` since
+/// `0013`, and `admin_identities` maps its own to `admin_identity_already_claimed`.
+///
+/// The consequence was not cosmetic. A console recovering from a half-finished
+/// registration — the issuer row landed, the step after it did not — cannot adopt the
+/// existing issuer by catching a `409` when the `409` never arrives, so it has to
+/// list-then-adopt instead. And a `500` is indistinguishable from an outage: the operator
+/// is paged for a request that was simply a duplicate.
+///
+/// `issuer` is the only unique index on live `trusted_jwt_issuers` rows
+/// (`0003_security_foundation.sql`), so any unique violation reaching this insert is that
+/// one, and matching on the class rather than on the constraint name is exact here.
+fn duplicate_trusted_jwt_issuer_on_unique_violation(error: sqlx::Error) -> AppError {
+    match &error {
+        sqlx::Error::Database(database) if database.is_unique_violation() => AppError::conflict(
+            "duplicate_trusted_jwt_issuer",
+            "a trusted JWT issuer is already registered for this issuer",
+        ),
+        _ => AppError::from(error),
     }
 }
 

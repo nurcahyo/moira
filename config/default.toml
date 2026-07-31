@@ -38,6 +38,13 @@ dev_trust_headers = true
 pepper_base64 = ""
 pepper_version = "dev-local"
 allow_insecure_dev_pepper = true
+# Characters of the *plaintext* key kept as the indexed lookup prefix, namespace included.
+# The namespace eats the first 10-11 (`moira_sys_`, `moira_cons_`, `moira_inv_`), so 20
+# leaves 9-10 random base64url characters. Lowering it shortens the random part, and the
+# random part is what keeps prefixes from colliding on the unique index over live keys and
+# what bounds the anonymous invite preview's "no Argon2 work without a valid prefix" claim.
+# `Settings::validate` refuses anything below `MIN_API_KEY_PREFIX_LENGTH` at startup rather
+# than clamping it; see `src/security/api_keys.rs`.
 prefix_length = 20
 
 [provider_security]

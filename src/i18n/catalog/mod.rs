@@ -246,6 +246,11 @@ mod tests {
             "moira.error.setup_token_not_supported",
             "moira.error.auth_provider_not_found",
             "moira.error.duplicate_auth_provider",
+            // Finding F13. Listed here for the same reason the rest are: the emitter is
+            // pinned by `tests/auth_provider_settings.rs` beside the
+            // `duplicate_auth_provider` case it was missing, and this asserts the
+            // catalogued half.
+            "moira.error.duplicate_trusted_jwt_issuer",
             "moira.error.auth_provider_method_config_incomplete",
             "moira.error.auth_provider_url_not_allowed",
             "moira.error.console_issuer_must_not_assert_scopes",

@@ -593,6 +593,11 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         description: "Used when a create or patch would collide with the unique index over live auth_provider_settings rows on (method, issuer).",
     },
     I18nEntry {
+        key: "moira.error.duplicate_trusted_jwt_issuer",
+        default_message: "A trusted JWT issuer is already registered for this issuer.",
+        description: "Used when registering a trusted JWT issuer would collide with the unique index over live trusted_jwt_issuers rows on issuer. Finding F13: this condition used to fall through to a 500 database_error - alone among Moira's uniqueness conflicts - so a client recovering from a half-finished registration could not adopt the existing row by catching a 409, and an operator was paged for what was only a duplicate. The remedy is to read the existing issuer rather than to create a second one; issuer is the identity of the row and is deliberately not patchable.",
+    },
+    I18nEntry {
         key: "moira.error.auth_provider_method_config_incomplete",
         default_message: "The auth provider configuration is incomplete for this method.",
         description: "Used when a create or enable request leaves the method's required non-secret configuration incomplete - for example generic_oidc with neither issuer nor discovery_url, or jwks with no jwks_url. Moira never checks for an OAuth client secret: under decision D7 the client secret is owned by the console and Moira does not store it.",
