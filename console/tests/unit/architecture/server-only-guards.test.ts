@@ -31,6 +31,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
+import { extractInterfaces } from "../../support/secret-props-scan";
 import {
   allSourceFiles,
   deriveCredentialModulePaths,
@@ -72,6 +73,19 @@ const sourceFiles = allSourceFiles();
  * Three, not two — see the test that consumes this.
  */
 const CONNECTION_STRING_READERS = ["db/dsn.ts", "lib/console-db.ts", "lib/env.ts"] as const;
+
+/**
+ * Field names on a Moira DTO that would mean the console models a shape carrying
+ * a credential. Same vocabulary as `tests/support/secret-props-scan.ts`.
+ */
+const SECRET_DTO_FIELD_PATTERN =
+  /(secret|masked|fingerprint|token|password|api_?key|private_?key|credential)/i;
+
+/** The one interface permitted to model a raw secret. */
+const EXEMPT_DTO_INTERFACES = ["AdminInviteSecretResponse"] as const;
+
+/** Field names that match the pattern but are not credentials. Asserted live. */
+const EXEMPT_DTO_FIELDS = ["token_url", "setup_token"] as const;
 
 describe("credential-carrying modules are marked and contained", () => {
   test("the derived set is non-empty and covers the plaintext holders", () => {
@@ -202,10 +216,89 @@ describe("no rotate-secret anywhere", () => {
   });
 
   test("no Moira DTO in lib/types.ts declares a secret-shaped field", () => {
+    // THE VOCABULARY IS WIDER THAN IT WAS, because the narrow version did not
+    // catch its own mutation test. `(secret|masked|fingerprint)` let
+    // `AdminInviteRecord.token_prefix` through — a field name that would be a
+    // real leak on a record DTO, and one that CONVENTIONS §6 rule 5 already
+    // names. It now matches the same vocabulary as
+    // `tests/support/secret-props-scan.ts`.
+    //
+    // ONE INTERFACE IS EXEMPT, AND IT IS NAMED.
+    // `AdminInviteSecretResponse` is the once-only envelope: Moira genuinely
+    // returns a raw invitation token, exactly once, at creation. Modelling it is
+    // not a relaxation of the D7 rule — D7 removed the OAuth CLIENT SECRET from
+    // Moira, and `rotate-secret` still does not exist (asserted above). Refusing
+    // to model the field would mean typing the modal against
+    // `ApiKeySecretResponse`, which compiles and silently drops both the token
+    // and the required `notice`. The exemption is per-INTERFACE, so a `secret`
+    // on any other DTO still fails.
+    //
+    // TWO FIELD NAMES ARE EXEMPT, AND BOTH ARE ASSERTED TO STILL EXIST below.
+    // `token_url` is an OAuth endpoint, not a token. `setup_token` is the
+    // reserved-and-rejected field modelled solely so the shape matches the
+    // committed schema; `assertClaimRequestIsSafe` refuses to send it.
     const source = readFileSync(join(CONSOLE_ROOT, "lib/types.ts"), "utf8");
-    const codeOnly = source.replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "");
-    const fieldNames = [...codeOnly.matchAll(/^\s{2}(\w+)\??:/gm)].map((match) => match[1] ?? "");
-    const offenders = fieldNames.filter((name) => /(secret|masked|fingerprint)/i.test(name));
+    const interfaces = extractInterfaces("lib/types.ts", source, "[A-Za-z0-9_]+");
+
+    const offenders = interfaces
+      .filter((declared) => !(EXEMPT_DTO_INTERFACES as readonly string[]).includes(declared.name))
+      .flatMap((declared) =>
+        declared.members
+          .filter((member) => SECRET_DTO_FIELD_PATTERN.test(member))
+          .filter((member) => !(EXEMPT_DTO_FIELDS as readonly string[]).includes(member))
+          .map((member) => `${declared.name}.${member}`),
+      );
     expect(offenders).toEqual([]);
+  });
+
+  test("every DTO field exemption is still NEEDED", () => {
+    // Reverse direction. An exemption for a field that no longer exists is a
+    // carve-out waiting to cover the next field that takes the name.
+    const source = readFileSync(join(CONSOLE_ROOT, "lib/types.ts"), "utf8");
+    const members = new Set(
+      extractInterfaces("lib/types.ts", source, "[A-Za-z0-9_]+").flatMap(
+        (declared) => declared.members,
+      ),
+    );
+    const dead = EXEMPT_DTO_FIELDS.filter((field) => !members.has(field));
+    expect(dead, "these field exemptions match nothing in lib/types.ts — remove them").toEqual([]);
+  });
+
+  test("the DTO pattern covers the CONVENTIONS §6 rule 5 vocabulary", () => {
+    for (const name of ["secret", "token_prefix", "password", "api_key", "private_key"]) {
+      expect(SECRET_DTO_FIELD_PATTERN.test(name), `${name} is not matched`).toBe(true);
+    }
+    for (const name of ["value", "version", "expires_at", "constraint", "status"]) {
+      expect(SECRET_DTO_FIELD_PATTERN.test(name), `${name} is falsely matched`).toBe(false);
+    }
+  });
+
+  test("the parser reached lib/types.ts's interfaces at all", () => {
+    // The exemption above is only meaningful if the interfaces parsed. A parser
+    // that found nothing would exempt everything.
+    const source = readFileSync(join(CONSOLE_ROOT, "lib/types.ts"), "utf8");
+    const interfaces = extractInterfaces("lib/types.ts", source, "[A-Za-z0-9_]+");
+    expect(interfaces.length, "no interfaces parsed out of lib/types.ts").toBeGreaterThanOrEqual(
+      15,
+    );
+    const withMembers = interfaces.filter((declared) => declared.members.length > 0);
+    expect(withMembers.length).toBeGreaterThanOrEqual(15);
+  });
+
+  test("the exemption is still NEEDED", () => {
+    // Reverse direction: an exemption whose interface no longer declares a
+    // secret-shaped field is a stale carve-out that will silently cover the next
+    // interface to take that name.
+    const source = readFileSync(join(CONSOLE_ROOT, "lib/types.ts"), "utf8");
+    const envelope = extractInterfaces("lib/types.ts", source, "[A-Za-z0-9_]+").find(
+      (declared) => declared.name === "AdminInviteSecretResponse",
+    );
+    expect(envelope, "AdminInviteSecretResponse is exempt but was not found").toBeDefined();
+    expect([...envelope!.members].sort()).toEqual([
+      "notice",
+      "resource",
+      "secret",
+      "secret_retrievable",
+    ]);
   });
 });

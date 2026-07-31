@@ -84,8 +84,19 @@ function stripComments(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "");
 }
 
-/** `interface XProps { … }` / `type XProps = { … }` bodies and their members. */
-export function extractPropsInterfaces(file: string, rawSource: string): PropsInterface[] {
+/**
+ * `interface X { … }` / `type X = { … }` bodies and their member names.
+ *
+ * Generic over the declaration name so the same parser serves both the `*Props`
+ * scan here and the DTO scan in `server-only-guards.test.ts` — two guards
+ * reading interface members with two different parsers is two places for the
+ * parser to be subtly wrong.
+ */
+export function extractInterfaces(
+  file: string,
+  rawSource: string,
+  namePattern = "[A-Za-z0-9_]*Props",
+): PropsInterface[] {
   const source = stripComments(rawSource);
   const found: PropsInterface[] = [];
   // Anchored to the start of a line, and stopped by `;`. Without the anchor,
@@ -94,7 +105,15 @@ export function extractPropsInterfaces(file: string, rawSource: string): PropsIn
   // a phantom interface with zero members, i.e. an interface whose members were
   // never checked. The "parsed with zero members" assertion in the test is what
   // caught it.
-  const declaration = /^[ \t]*(?:export\s+)?(?:interface|type)\s+([A-Za-z0-9_]*Props)\b[^{;]*\{/gm;
+  // NOTE the doubled backslashes: this is a TEMPLATE LITERAL, not a regex
+  // literal. `\s` inside a template literal is just `s`, so a single-escaped
+  // version of this pattern silently matched nothing and the interface count
+  // dropped to zero — caught by the floor assertion, which is what floors are
+  // for.
+  const declaration = new RegExp(
+    `^[ \\t]*(?:export\\s+)?(?:interface|type)\\s+(${namePattern})\\b[^{;]*\\{`,
+    "gm",
+  );
 
   for (const match of source.matchAll(declaration)) {
     const name = match[1] ?? "";
@@ -120,6 +139,11 @@ export function extractPropsInterfaces(file: string, rawSource: string): PropsIn
     found.push({ file, name, members });
   }
   return found;
+}
+
+/** Every `*Props` interface in a rendering-layer file. */
+export function extractPropsInterfaces(file: string, rawSource: string): PropsInterface[] {
+  return extractInterfaces(file, rawSource);
 }
 
 /** Rule (a): secret-shaped members on a rendering layer's props. */

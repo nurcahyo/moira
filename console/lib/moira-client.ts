@@ -27,8 +27,19 @@
 //     gets its retry safety from `If-Match` plus `enable` being naturally
 //     idempotent, not from a key. Passing a key to an operation that does not
 //     declare one is a thrown contract error, not a silently ignored header.
-//   * `claim-status` is the only credential-free call, and it is credential-free
-//     because the table says so.
+//   * Which calls are credential-free is read off the table, never assumed.
+//     There are THREE as of plan 09 wave 3, and the number is deliberately not
+//     written into any rule here:
+//       - `GET  /api/v1/admin/setup/claim-status`     (wave 0)
+//       - `POST /api/v1/admin/admin-invites/preview`  (wave 2 — shipped with no
+//         `security` block at all, which nothing in this console noticed)
+//       - `GET  /api/v1/admin/setup/sign-in-methods`  (finding F15's fix)
+//     An earlier version of this note asserted "claim-status is the only
+//     credential-free call". It was already false in the tree when it was read,
+//     and a note that has to be edited every time Moira adds an anonymous
+//     operation is a note that will be wrong again. The registry below is the
+//     answer; `tests/contract/openapi-contract.test.ts` re-derives it from the
+//     committed spec on every run.
 //
 // `tests/contract/openapi-contract.test.ts` re-derives the whole table from the
 // committed spec on every run.
@@ -38,6 +49,8 @@ import "server-only";
 import { MoiraRequestError, toMoiraError, toTransportError } from "./errors";
 import type {
   AdminIdentityRecord,
+  AdminInviteCreateRequest,
+  AdminInviteSecretResponse,
   AuthProviderSettingsRecord,
   ConsoleAuthProviderCreateRequest,
   ConsoleClaimAdminIdentityRequest,
@@ -45,6 +58,7 @@ import type {
   ListResponse,
   SetupAuthMethodsResponse,
   SetupClaimStatusResponse,
+  SetupSignInMethodsResponse,
   TrustedJwtIssuerRecord,
 } from "./types";
 
@@ -98,11 +112,53 @@ export const MOIRA_OPERATIONS = {
     declaresIdempotencyKey: false,
     requiresIfMatch: false,
   }),
+  /**
+   * The ANONYMOUS sign-in projection (finding F15's fix, plan 09 wave 1).
+   *
+   * `PublicSignInMethod` is deliberately `PublicAuthMethod` MINUS
+   * `allowed_email_domains` (that is plan 07 decision D3 — the deny-by-default
+   * admin-claim policy, and publishing it anonymously would hand any caller the
+   * list of domains that can obtain Moira admin) and minus `jwks_url`.
+   *
+   * Consequence the console must respect: it is enough to RENDER a sign-in
+   * button and NOT enough to RESOLVE the configuration behind one.
+   * `resolveAuthConfig` refuses a row without `allowed_email_domains` or
+   * `trusted_jwt_issuer_id`, and neither is in this projection.
+   */
+  getSetupSignInMethods: op({
+    id: "get_setup_sign_in_methods",
+    method: "GET",
+    path: "/api/v1/admin/setup/sign-in-methods",
+    credential: "none",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: false,
+  }),
   claimAdminIdentity: op({
     id: "claim_admin_identity",
     method: "POST",
     path: "/api/v1/admin/setup/claim",
     credential: "system_key_only",
+    declaresIdempotencyKey: true,
+    requiresIfMatch: false,
+  }),
+
+  /**
+   * `POST /api/v1/admin/admin-invites` — the once-only token mint.
+   *
+   * `declaresIdempotencyKey: true` and `requiresIfMatch: false` are read OFF THE
+   * SPEC, not guessed: the operation declares an optional `Idempotency-Key`
+   * header parameter and no `If-Match` at all.
+   * `tests/contract/openapi-contract.test.ts:195-206` re-derives both.
+   *
+   * The idempotent-replay behaviour is what makes the key matter here: a replay
+   * returns the SANITIZED record with `secret: null`, not the token again. That
+   * is not an error — see `AdminInviteSecretResponse` in `lib/types.ts`.
+   */
+  createAdminInvite: op({
+    id: "create_admin_invite",
+    method: "POST",
+    path: "/api/v1/admin/admin-invites",
+    credential: "admin",
     declaresIdempotencyKey: true,
     requiresIfMatch: false,
   }),
@@ -379,6 +435,18 @@ export class MoiraClient {
   }
 
   /**
+   * `GET /api/v1/admin/setup/sign-in-methods`. ANONYMOUS.
+   *
+   * Enough to render a button, not enough to resolve the configuration behind
+   * it — see the registry entry. `/login` uses it for the provider's
+   * `display_name` only, and decides whether to render a button at all from
+   * `consoleRuntime()`.
+   */
+  async getSetupSignInMethods(): Promise<SetupSignInMethodsResponse> {
+    return this.#request<SetupSignInMethodsResponse>("getSetupSignInMethods", {});
+  }
+
+  /**
    * `POST /api/v1/admin/setup/claim`. System key only — a bearer JWT is refused
    * even if it verifies (`401 setup_claim_credential_required`).
    *
@@ -524,6 +592,33 @@ export class MoiraClient {
     return this.#request<AuthProviderSettingsRecord>("disableAuthProvider", {
       pathParams: { id },
       ifMatch,
+    });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* Admin invitations                                                      */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * `POST /api/v1/admin/admin-invites` — mint a once-only invitation token.
+   *
+   * The response is the ONLY time the raw token exists outside Moira's hash.
+   * Note what this method does NOT do: it does not log the response, does not
+   * pass it through `lib/errors.ts`, and does not cache it. `#request` returns a
+   * 2xx body raw — `toMoiraError` is called only under `if (!response.ok)` — so
+   * there is nothing between the JSON parse and whatever the caller does next.
+   *
+   * `idempotencyKey` should be derived from the invite's own identity
+   * `(constraint, value)`. A replay returns `secret: null` with the sanitized
+   * record, which is the correct and expected outcome, not a failure.
+   */
+  async createAdminInvite(
+    body: AdminInviteCreateRequest,
+    options: { readonly idempotencyKey?: string } = {},
+  ): Promise<AdminInviteSecretResponse> {
+    return this.#request<AdminInviteSecretResponse>("createAdminInvite", {
+      body,
+      idempotencyKey: options.idempotencyKey,
     });
   }
 
