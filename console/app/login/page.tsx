@@ -44,24 +44,30 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 /**
- * The provider's human-readable name, from the ANONYMOUS projection.
+ * Human-readable names by Moira row id, from the ANONYMOUS projection.
  *
  * Best-effort by design. By the time this runs the configuration has already
- * resolved, so a failure here costs a NAME, not a button — the caller falls back
- * to `console.signIn.button_generic`. Doing it the other way round (rendering a
- * button from this call alone) is the "button that 503s on click" failure.
+ * resolved, so a failure here costs NAMES, not buttons — `SignInPanel` falls
+ * back to `console.signIn.button_generic` for a lone provider and to the
+ * provider id when there are several (identical accessible names on several
+ * buttons would be worse than an ugly one). Doing it the other way round —
+ * rendering buttons from this call alone — is the "button that 503s on click"
+ * failure this whole page exists to avoid.
+ *
+ * ONE call for N providers, not one per provider: `getSetupSignInMethods`
+ * returns the whole list, and calling it per button would multiply an anonymous
+ * request by the provider count on every render of the sign-in page.
  */
-async function signInDisplayName(moiraProviderId: string): Promise<string | null> {
+async function signInDisplayNames(): Promise<ReadonlyMap<string, string>> {
   try {
     // No credential: `get_setup_sign_in_methods` declares no `security` block,
     // and the registry in `lib/moira-client.ts` is what makes that true of the
     // request rather than merely believed about the endpoint.
     const client = new MoiraClient({ baseUrl: consoleEnv().moiraBaseUrl });
     const response = await client.getSetupSignInMethods();
-    const method = response.methods.find((candidate) => candidate.id === moiraProviderId);
-    return method?.display_name ?? null;
+    return new Map(response.methods.map((method) => [method.id, method.display_name]));
   } catch {
-    return null;
+    return new Map();
   }
 }
 
@@ -101,8 +107,19 @@ async function resolveSignInState(): Promise<SignInPanelState> {
     return { kind: "unavailable", messageKey: refusalKey(resolution.messageKey, resolution.drift) };
   }
 
-  const displayName = await signInDisplayName(runtimeState.config.moiraProviderId);
-  return { kind: "ready", providerId: runtimeState.config.providerId, displayName };
+  // Per-provider problems are deliberately NOT rendered here. A resolved
+  // deployment with one drifted extra row must still show the working buttons,
+  // and the remedy for the drifted row belongs on the auth-settings screen where
+  // the operator can act on it — not on the page a locked-out human is looking
+  // at. `consoleRuntime()` carries them so that screen can, when it ships.
+  const names = await signInDisplayNames();
+  return {
+    kind: "ready",
+    providers: runtimeState.configs.map((config) => ({
+      providerId: config.providerId,
+      displayName: names.get(config.moiraProviderId) ?? null,
+    })),
+  };
 }
 
 export default async function LoginPage() {

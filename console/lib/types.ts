@@ -355,7 +355,7 @@ assertKeyContract<
  * fails that rule publishes it to the internet.
  *
  * CONSEQUENCE FOR THE CONSOLE: this is enough to RENDER a sign-in button and not
- * enough to RESOLVE the configuration behind one — `resolveAuthConfig` refuses a
+ * enough to RESOLVE the configuration behind one — `resolveAuthConfigs` refuses a
  * row with no `allowed_email_domains` and no `trusted_jwt_issuer_id`, and
  * neither is here.
  */

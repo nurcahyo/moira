@@ -55,13 +55,20 @@ export type SessionRejection =
   /** The address is outside `allowed_email_domains`. */
   | "email_domain_not_allowed"
   /** The IdP supplied no `sub`, so no `account.accountId` was recorded. */
-  | "idp_subject_missing";
+  | "idp_subject_missing"
+  /**
+   * The session carries no authenticating provider, or one this configuration
+   * does not contain (wave 4B). Every session live at deploy time is in the
+   * first state, because the column is nullable.
+   */
+  | "session_provider_unknown";
 
 export const SESSION_REJECTION_MESSAGE_KEYS: Readonly<Record<SessionRejection, string>> = {
   no_session: CONSOLE_MESSAGE_KEYS.session_required,
   email_not_verified: CONSOLE_MESSAGE_KEYS.email_not_verified,
   email_domain_not_allowed: CONSOLE_MESSAGE_KEYS.email_domain_not_allowed,
   idp_subject_missing: CONSOLE_MESSAGE_KEYS.idp_subject_missing,
+  session_provider_unknown: CONSOLE_MESSAGE_KEYS.session_provider_unknown,
 };
 
 export type SessionCheck =

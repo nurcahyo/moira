@@ -78,7 +78,7 @@ async function hasConsoleSession(): Promise<boolean> {
     if (!runtimeState.ok) return false;
     const check = await consoleSessionCheck(
       runtimeState.auth,
-      runtimeState.config,
+      runtimeState.configs,
       await headers(),
     );
     return check.ok;

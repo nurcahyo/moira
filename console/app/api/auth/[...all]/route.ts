@@ -134,10 +134,16 @@ export async function handleAuthRequest(
   // refusal. The two are not redundant: delete this and the endpoint still
   // refuses, but opaquely; delete `getSubject`'s and every other minting path
   // is open.
+  //
+  // From wave 4B the check resolves the AUTHENTICATING provider from the session
+  // itself and applies that provider's allow-list. Passing "the" configuration
+  // is no longer possible: there are N, each with its own trusted issuer row and
+  // therefore its own `admission_policy` lookup in Moira, and enforcing the
+  // wrong one here would disagree with the server that decides the claim.
   if (new URL(request.url).pathname === TOKEN_PATH) {
     const check = await consoleSessionCheck(
       runtimeState.auth,
-      runtimeState.config,
+      runtimeState.configs,
       request.headers,
     );
     if (!check.ok) return refused(check.rejection, check.messageKey);

@@ -179,8 +179,9 @@ describeDatabase("the schema matches what better-auth wants", () => {
       const runtimePool = new Pool({ connectionString: temporaryDsn, max: 1 });
       const auth = createConsoleAuth({
         env,
-        config: {
+        configs: [{
           providerId: "moira-console-idp",
+          consoleIssuer: "https://console.invalid",
           method: "generic_oidc",
           moiraProviderId: "p",
           moiraProviderVersion: 1,
@@ -194,8 +195,7 @@ describeDatabase("the schema matches what better-auth wants", () => {
           scopes: ["openid", "email"],
           allowedEmailDomains: ["example.com"],
           trustedJwtIssuerId: "00000000-0000-0000-0000-000000000000",
-          cacheKey: "k",
-        },
+        }],
         database: runtimePool,
       });
       const runtimeTables = await describe_(auth.options);

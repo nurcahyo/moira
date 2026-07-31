@@ -78,9 +78,21 @@ function envFor(consoleOrigin: string): ConsoleEnv {
   });
 }
 
-function configFor(idp: MockIdp, clientSecret: string): ResolvedAuthConfig {
+/**
+ * The INCUMBENT provider, as wave 4B resolves it.
+ *
+ * `consoleIssuer` is `env.bffIssuerUrl` — not a special case in the code, but
+ * the definition: the incumbent is the provider bound to the `bffIssuerUrl`
+ * trusted issuer, so it keeps that string and `moira-console-idp` automatically.
+ * Every assertion below that expects `iss === env.bffIssuerUrl` is asserting
+ * exactly that, and would still pass under a `definePayload` that omitted `iss`
+ * entirely — which is why the multi-provider file (`multi-provider.test.ts`)
+ * owns guard G8 and this one does not claim to.
+ */
+function configFor(idp: MockIdp, clientSecret: string, env: ConsoleEnv): ResolvedAuthConfig {
   return {
     providerId: CONSOLE_OAUTH_PROVIDER_ID,
+    consoleIssuer: env.bffIssuerUrl,
     method: "generic_oidc",
     moiraProviderId: "11111111-1111-4111-8111-111111111111",
     moiraProviderVersion: 3,
@@ -96,7 +108,6 @@ function configFor(idp: MockIdp, clientSecret: string): ResolvedAuthConfig {
     scopes: ["openid", "email", "profile"],
     allowedEmailDomains: ["example.com"],
     trustedJwtIssuerId: "22222222-2222-4222-8222-222222222222",
-    cacheKey: "fixture",
   };
 }
 
@@ -177,7 +188,7 @@ describe("OAuth sign-in against a real mock IdP", () => {
     consoleServer = startConsoleServer(
       {
         env,
-        config: configFor(idp, CLIENT_SECRET),
+        configs: [configFor(idp, CLIENT_SECRET, env)],
         database: memoryAdapter(createConsoleMemoryDatabase()),
       },
       port,
@@ -349,7 +360,7 @@ describe("the console-held client secret is load-bearing", () => {
         // The drift D7 makes possible: Moira's row is right, the console's
         // stored secret is stale. Nothing on the Moira side can detect this,
         // because Moira never held the secret.
-        config: configFor(idp, "the-wrong-secret"),
+        configs: [configFor(idp, "the-wrong-secret", envFor(consoleOrigin))],
         database: memoryAdapter(createConsoleMemoryDatabase()),
       },
       port,
@@ -405,7 +416,7 @@ describe("identity falls back to the userinfo endpoint when the ID token is thin
     consoleServer = startConsoleServer(
       {
         env,
-        config: configFor(idp, CLIENT_SECRET),
+        configs: [configFor(idp, CLIENT_SECRET, env)],
         database: memoryAdapter(createConsoleMemoryDatabase()),
       },
       port,
@@ -468,7 +479,7 @@ describe("a provider that supplies no subject cannot produce a console session",
     consoleServer = startConsoleServer(
       {
         env: envFor(consoleOrigin),
-        config: configFor(idp, CLIENT_SECRET),
+        configs: [configFor(idp, CLIENT_SECRET, envFor(consoleOrigin))],
         database: memoryAdapter(createConsoleMemoryDatabase()),
       },
       port,
@@ -561,12 +572,14 @@ describe("a session outside the allow-list cannot be exchanged for a Moira crede
     consoleServer = startConsoleServer(
       {
         env: envFor(consoleOrigin),
-        config: {
-          ...configFor(idp, CLIENT_SECRET),
-          // OPERATOR is `operator@example.com`. The deployment admits `corp.test`
-          // and nothing else, so sign-in succeeds and admission does not.
-          allowedEmailDomains: ["corp.test"],
-        },
+        configs: [
+          {
+            ...configFor(idp, CLIENT_SECRET, envFor(consoleOrigin)),
+            // OPERATOR is `operator@example.com`. The deployment admits `corp.test`
+            // and nothing else, so sign-in succeeds and admission does not.
+            allowedEmailDomains: ["corp.test"],
+          },
+        ],
         database: memoryAdapter(createConsoleMemoryDatabase()),
       },
       port,
@@ -632,7 +645,9 @@ describe("a session outside the allow-list cannot be exchanged for a Moira crede
     const permissive = startConsoleServer(
       {
         env: envFor(origin),
-        config: { ...configFor(idp, CLIENT_SECRET), allowedEmailDomains: ["example.com"] },
+        configs: [
+          { ...configFor(idp, CLIENT_SECRET, envFor(origin)), allowedEmailDomains: ["example.com"] },
+        ],
         database: memoryAdapter(createConsoleMemoryDatabase()),
       },
       port,

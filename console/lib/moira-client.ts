@@ -122,7 +122,7 @@ export const MOIRA_OPERATIONS = {
    *
    * Consequence the console must respect: it is enough to RENDER a sign-in
    * button and NOT enough to RESOLVE the configuration behind one.
-   * `resolveAuthConfig` refuses a row without `allowed_email_domains` or
+   * `resolveAuthConfigs` refuses a row without `allowed_email_domains` or
    * `trusted_jwt_issuer_id`, and neither is in this projection.
    */
   getSetupSignInMethods: op({
