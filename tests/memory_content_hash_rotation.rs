@@ -46,6 +46,7 @@ use moira::{
     security::{Actor, IdempotencyHasher, request_hash},
 };
 use serde_json::json;
+use sha2::Digest;
 use sqlx::Row;
 use tokio::time::timeout;
 
@@ -407,6 +408,18 @@ async fn migration_0021_rewrites_peppered_memory_hashes_into_content_addresses()
     // Multi-byte, combining marks, and an emoji: three different ways a byte-vs-character
     // mistake in the SQL would show up.
     let content = "mémoire — 記憶 🧠 f14";
+    // Dropping `translate(…, '+/', '-_')` from the migration is the classic silent mistake, and
+    // whether this test notices depends *entirely* on the literal above: roughly one digest in
+    // eight contains neither `+` nor `/`, and a future edit that innocently reworded the string
+    // could leave the alphabet unexercised and the guard green through the exact defect it was
+    // written for. So the literal's own suitability is asserted rather than assumed.
+    let standard_alphabet = STANDARD.encode(sha2::Sha256::digest(content.as_bytes()));
+    assert!(
+        standard_alphabet.contains('+') && standard_alphabet.contains('/'),
+        "this test's content must digest to a value using BOTH characters the base64url \
+         translation rewrites, or dropping that translation from the migration goes unnoticed. \
+         `{content}` gives {standard_alphabet}; pick a different literal."
+    );
     let hasher = IdempotencyHasher::new(vec![7; 32], "v1");
 
     let peppered = seed_memory_row(&fixture, Some(content), &hasher.hash(content.as_bytes())).await;
