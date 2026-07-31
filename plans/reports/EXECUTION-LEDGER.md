@@ -941,6 +941,136 @@ The reachable double-count is a **failure** replay — `admin_identity_already_c
 `AppError::Replayed` — which distorts an operator-facing denial rate rather than an invitation count.
 That is the one worth fixing, and it is not the one the sweep brief named.
 
+## F23 — ESCALATED: `governing_policy` can enforce the WRONG admin-admission policy, and cannot enforce a per-provider one at all
+
+**Raised by the wave-4 re-audit as W4-B1; six adversarial verifiers then corrected its scope, raised
+its severity, and found the audit had it partly wrong in four ways.** Verified empirically against
+the real schema in rolled-back transactions, not argued from reading SQL.
+
+```sql
+select id, allowed_email_domains from auth_provider_settings
+ where deleted_at is null and status = 'active' and enabled
+   and (issuer = $1 or trusted_jwt_issuer_id = $2)
+ order by (issuer is not distinct from $1) desc, created_at asc, id asc
+ limit 1
+```
+
+On a console deployment `$1` is the **console's** issuer while every provider row's `issuer` holds the
+**IdP's**, so rows match only through `$2`, tie on the first sort key, and the oldest row bound to
+that trusted issuer supplies `allowed_email_domains` for **every** claim and redemption — regardless
+of which provider authenticated the user. Three reachable shapes:
+
+- **(a)** ≥2 enabled rows share one `trusted_jwt_issuer_id` and none has `issuer = $1`. They tie;
+  `created_at asc` decides. Reproduced independently by three verifiers; flipping `created_at` flips
+  the governing policy.
+- **(b)** *Not in the audit.* Any enabled row whose own `issuer` equals `$1` outranks the correctly
+  linked row **at any age**, and need not be linked at all — plausible for a `jwks` row registered
+  against the console's own issuer string.
+- **(c)** The intended row is linked to a *different* trusted issuer, never enters the set, and a
+  single wrong row is returned.
+
+**Scope correction — the audit was wrong.** It is **not** "the oldest enabled row in the table". An
+unlinked row carrying the IdP's issuer returns **0 rows** (verified); rows on different trusted
+issuers never compete. It is the oldest enabled row *bound to that one `trusted_jwt_issuer_id`*.
+The audit also **misquotes the ORDER BY**, omitting `id asc` — the key that makes the result
+deterministic at all when `created_at` ties, which it does exactly for rows inserted in one
+transaction.
+
+**Severity: a defect gated behind a fully supported operator action — reachable TODAY, not
+wave-4-only.** The audit called it gated by the console's `ambiguous_enabled_providers` refusal.
+That is wrong three ways, all confirmed:
+1. `governing_policy`'s only callers are `AdminIdentityService::claim` (system-key auth) and
+   `redeem_invite` (any registered trusted JWT). **Neither reads any console state.**
+2. `consoleRuntime` resolves its snapshot **once per process**; a running console keeps minting
+   tokens after a second row is enabled. The file header's promise of per-request refresh is not
+   implemented.
+3. **Moira has no server-side refusal.** `create`/`set_enabled` do no cross-row check and the only
+   unique index is `(method, coalesce(issuer,''))`. Two enabled rows on one trusted issuer insert
+   cleanly.
+
+**Blast radius.** The deny-by-default gate is enforced from the wrong row in *both* directions,
+silently. The common failure is **availability** — a narrower or empty allow-list 403s every claim
+and redemption, and on a deployment that retired its system key that permanently blocks admin
+onboarding. It is **not** an unauthenticated path to admin: `claim` still needs the bootstrap system
+key and `redeem` still independently enforces the invitation's own email/domain constraint.
+**Medium overall; High on the lockout axis.**
+
+**The structural finding, which is bigger than the query bug: Moira cannot see which upstream IdP
+authenticated a user.** Confirmed on every surface — the console mints `iss: env.bffIssuerUrl`
+unconditionally (one issuer per console, never per provider) and forwards only
+`{iss, sub, email, email_verified}`; `trusted_jwt_issuers` has claim-mapping columns for
+subject/user/tenant/application/roles/scopes but **no slot a provider identifier could map into**;
+`TrustedJwtIdentity` is `{issuer, subject}`; `admin_identities` records no provider column. So
+per-provider `allowed_email_domains` is **unenforceable at Moira's layer by construction**. No
+ordering can select on information the query never receives — which means "fix the ORDER BY" is the
+wrong fix.
+
+**Mitigation wave 4 must ship regardless of which design it picks:** a partial unique index on
+`(trusted_jwt_issuer_id) where enabled and status='active' and deleted_at is null`, plus a coded 409
+in `create`/`set_enabled`. That turns a silent wrong-policy into a refusal at configure time and
+makes the ordering stop being load-bearing. **This is the opposite of plan 09 §0.1 B4's scheduled
+"remove the console's ambiguity guard": the guard may only be removed once Moira itself refuses the
+ambiguous state.**
+
+## F24 — ESCALATED: two IdPs returning the same `sub` collapse into ONE admin grant
+
+Surfaced by the synthesis, not by any single verifier, and it is worse than F23.
+
+`admin_identities`' uniqueness key is `(issuer, subject)` (`migrations/0012`), where `issuer` is the
+**console's** and is therefore identical for every provider. With N providers minting under one
+console issuer, two different IdPs returning the same `sub` string map to the **same admin grant**.
+GitHub subjects are short numeric strings; a generic-OIDC IdP returning a numeric `sub` collides.
+
+**Consequence:** an identity on provider B can land on an admin grant established for a different
+human on provider A. This is a cross-provider identity-confusion hazard, not merely a policy bug.
+
+**Wave 4 must not enable a second provider under one console issuer without resolving this.** It is
+the strongest argument for giving each provider its own console-minted issuer and its own
+`trusted_jwt_issuers` row, which would make `governing_policy`'s `$2` a real discriminator and close
+F23 and F24 together.
+
+## F25 — the console's email-domain enforcement is tested, passing, and DEAD CODE
+
+`checkSession` (`console/lib/moira-session.ts`) is the console's session-boundary gate and the only
+caller of `isEmailDomainAllowed`. **`checkSession` has no shipped caller.** Verified directly: every
+reference outside its own definition is in `console/tests/unit/lib/moira-session.test.ts`,
+`console/tests/integration/oauth-flow.test.ts`, or an i18n catalog *description*.
+
+**Not a hole today** — Moira enforces the same policy server-side in `evaluate_claim_policy`, so the
+deny-by-default admin-claim gate still holds. The failure is that a user passes console sign-in and
+is refused later by Moira.
+
+**Why it is worth a finding.** It is the exact shape §2.3 is about: *a guard nobody has seen fail is
+an assumption*, and here the guard is never even reached, while eleven green unit assertions say it
+works. It is also load-bearing for wave 4: the design option that moves per-provider enforcement into
+the console **must wire this**, not assume it. One verifier asserted the console "already runs the
+same allow-list at the session boundary" — the synthesis caught it, and it was verified again here.
+
+## F22 — a SECOND flake on `main`, distinct from F5, found because docs pushes run CI
+
+Run `30625512140` on `main` at `653461b` — a **docs-only ledger commit** — failed the `rust` job:
+
+```
+every_non_sse_route_group_is_governed_by_the_non_streaming_timeout ... FAILED
+tests/http_middleware_contract.rs:644
+assertion `left == right` failed: the admin route group is not layered with
+RouterPolicy::non_streaming_timeout
+  left: 200, right: 504
+```
+
+**This is not F5.** F5 is the same *file* but a different mechanism — `connections to
+moira_test_template were never released`. Here a request expected to exceed the non-streaming
+timeout returned `200` instead of `504`, i.e. the slow path completed before the deadline.
+
+**Why it matters more than one flaky test:** `main` is not reliably green, so "merge on green CI" has
+a reliability problem in both directions — a red PR run may be a known flake, and a green one proves
+less than it should. Two independent flakes are now known (F5, F22) plus the LISTEN/NOTIFY attach
+race just closed. **Do not paper over this by re-running until green** — that is faking a gate by
+attrition. Diagnose F22 the way the attach race was diagnosed: make it deterministic first.
+
+**Also worth carrying:** docs-only pushes to `main` run the full CI suite, which is what exposed this.
+That is accidental coverage worth keeping rather than optimising away.
+
 ## USER DECISIONS — 2026-07-31, taken interactively
 
 1. **Findings before waves 4–5.** F20, F13, F17 and the Wave 2 leftovers first. F20 is the reason:
