@@ -303,6 +303,15 @@ pub trait AdminRepository {
         id: Uuid,
         expected_version: i64,
     ) -> Result<(), AppError>;
+    /// How many live `admin_identities` grants were made through this trusted JWT issuer.
+    ///
+    /// Backs the `trusted_issuer_has_active_grants` refusal on delete and disable. Both
+    /// paths are **soft** (`status = 'deleted'` / `'disabled'`, `deleted_at` set), so
+    /// `admin_identities`' foreign key never fires — while `load_issuer` filters
+    /// `deleted_at is null`, so every grant made through the issuer stops resolving. One
+    /// button silently revokes every admin who signs in through that issuer, with no
+    /// warning and no error naming the cause.
+    async fn count_active_grants_for_trusted_issuer(&self, id: Uuid) -> Result<i64, AppError>;
 
     async fn insert_audit(&self, insert: AuditLogInsert) -> Result<(), AppError>;
     /// Note the sort key: `audit_logs` orders by `occurred_at`, not `created_at` (it has
@@ -2081,6 +2090,19 @@ impl AdminRepository for PgAdminRepository {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn count_active_grants_for_trusted_issuer(&self, id: Uuid) -> Result<i64, AppError> {
+        // The same predicate `authenticate_admin`'s grant lookup uses: a revoked or
+        // soft-deleted grant already authorises nobody, so it is not a reason to refuse.
+        let count = sqlx::query_scalar::<_, i64>(
+            "select count(*) from admin_identities \
+             where trusted_jwt_issuer_id = $1 and deleted_at is null and status = 'active'",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
     }
 
     async fn insert_audit(&self, insert: AuditLogInsert) -> Result<(), AppError> {

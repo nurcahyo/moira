@@ -143,6 +143,9 @@ impl<'a> JwtIssuerAdminService<'a> {
             .authz
             .require(actor, "moira:jwt-issuers:delete")?;
         let status = if enabled { "active" } else { "disabled" };
+        if !enabled {
+            self.reject_if_issuer_has_active_grants(id).await?;
+        }
         let record = self
             .repo
             .set_trusted_jwt_issuer_status(id, expected_version, status)
@@ -233,6 +236,7 @@ impl<'a> JwtIssuerAdminService<'a> {
         expected_version: i64,
     ) -> Result<(), AppError> {
         self.state.authz.require(actor, "moira:jwt-issuers:write")?;
+        self.reject_if_issuer_has_active_grants(id).await?;
         self.repo
             .soft_delete_trusted_jwt_issuer(id, expected_version)
             .await?;
@@ -246,5 +250,39 @@ impl<'a> JwtIssuerAdminService<'a> {
             json!({}),
         )
         .await
+    }
+
+    /// Refuse to retire a trusted JWT issuer that still authorises live admins.
+    ///
+    /// # Why a soft delete is a silent mass revocation
+    ///
+    /// `admin_identities.trusted_jwt_issuer_id` is a real foreign key, so a *hard* delete
+    /// would be refused by Postgres. Both retirement paths here are **soft** — they set
+    /// `status` and `deleted_at` and leave the row in place — so the FK never fires. But
+    /// `load_issuer` (`src/security/auth.rs`) filters `status = 'active' and deleted_at is
+    /// null`, so the moment the row is retired **every token minted under that issuer stops
+    /// verifying**, and every `admin_identities` grant made through it authorises nobody.
+    ///
+    /// Nothing warned. The operator pressed "delete issuer" and locked every admin out of a
+    /// deployment whose only other way in is the bootstrap system key — the credential the
+    /// invitation flow exists to let them retire. Under stage 4B, with one trusted issuer
+    /// per provider, the same button exists N times.
+    ///
+    /// Refusing is the right shape rather than cascading: revoking admin grants is an
+    /// `admin_identities` operation with its own endpoint, its own audit trail and its own
+    /// last-primary guard, and doing it as a side effect of an issuer write would bypass all
+    /// three. The remedy is explicit — revoke the grants, then retire the issuer.
+    async fn reject_if_issuer_has_active_grants(&self, id: Uuid) -> Result<(), AppError> {
+        let grants = self.repo.count_active_grants_for_trusted_issuer(id).await?;
+        if grants == 0 {
+            return Ok(());
+        }
+        Err(AppError::conflict(
+            "trusted_issuer_has_active_grants",
+            format!(
+                "{grants} active admin identity grant(s) were made through this trusted JWT \
+                 issuer; revoke them before retiring it"
+            ),
+        ))
     }
 }
