@@ -55,17 +55,16 @@ use moira::{
     app::AppState,
     config::Settings,
     http::{ADMIN_BODY_LIMIT_BYTES, RouterPolicy},
-    infra::db,
 };
 use reqwest::{Client, Response, StatusCode, header};
 use serde_json::{Value, json};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::PgPool;
 use tokio::{net::TcpListener, task::JoinHandle, time::timeout};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use support::{
-    LifecycleFixture, MoiraHttpServer, RuntimePolicy,
+    LifecycleFixture, MoiraHttpServer, RuntimePolicy, TestDatabase,
     mock_openai::{MockOpenAiServer, ProviderScript, ScriptGate},
     public_response_request,
 };
@@ -87,33 +86,23 @@ struct MiddlewareFixture {
     client: Client,
     public_limit: usize,
     suffix: String,
+    /// Declared last so it is dropped last: the database outlives every field that still
+    /// holds a connection to it.
+    database: TestDatabase,
 }
 
 impl MiddlewareFixture {
     async fn new() -> Option<Self> {
-        let database_url = match std::env::var("MOIRA_TEST_DATABASE_URL") {
-            Ok(value) if !value.trim().is_empty() => value,
-            _ if std::env::var("CI").is_ok_and(|value| value.eq_ignore_ascii_case("true")) => {
-                panic!("MOIRA_TEST_DATABASE_URL is required when CI=true for HTTP middleware tests")
-            }
-            _ => {
-                eprintln!("skipping HTTP middleware tests: MOIRA_TEST_DATABASE_URL is not set");
-                return None;
-            }
-        };
-        let pool = timeout(
-            WAIT,
-            PgPoolOptions::new()
-                .max_connections(8)
-                .connect(&database_url),
-        )
-        .await
-        .expect("database connection timed out")
-        .expect("connect middleware test database");
-        timeout(WAIT, db::migrate(&pool))
-            .await
-            .expect("migrations timed out")
-            .expect("run migrations");
+        // A private database cloned from the migrated template, torn down by
+        // `TestDatabase`'s `Drop` — on the panic path as well as the happy one. This
+        // suite previously opened its own pool on the shared `MOIRA_TEST_DATABASE_URL`
+        // database, and `once_only_secret_responses_carry_no_content_encoding` created an
+        // **active `moira:admin` system API key** on it per run that nothing ever revoked
+        // or deleted (finding F10 item 2, closed with F27). `TestDatabase::create` keeps
+        // the fail-closed skip contract: `None` when the variable is unset, a panic when
+        // `CI=true`.
+        let database = TestDatabase::create().await?;
+        let pool = database.pool.clone();
 
         let settings = Settings::default();
         let public_limit = usize::try_from(settings.public_api.maximum_request_bytes)
@@ -127,6 +116,7 @@ impl MiddlewareFixture {
             client: Client::new(),
             public_limit,
             suffix: Uuid::now_v7().simple().to_string(),
+            database,
         })
     }
 
@@ -495,6 +485,83 @@ async fn once_only_secret_responses_carry_no_content_encoding() {
     assert!(
         body["secret"].as_str().is_some_and(|s| !s.is_empty()),
         "this must be a real once-only-secret response: {body}"
+    );
+
+    fixture.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Anti-leak guard
+// ---------------------------------------------------------------------------
+
+/// Finding F10 item 2, closed with F27: `once_only_secret_responses_carry_no_content_encoding`
+/// mints a real system API key and cannot delete it — the response body is the *only* place
+/// the secret ever exists, and asserting on that is the whole point of the test. So the
+/// database it writes to has to be disposable.
+///
+/// **What this establishes.** That `MiddlewareFixture` is bound to a per-fixture clone owned
+/// by `support::TestDatabase`, whose `Drop` drops the database unconditionally — on a
+/// dedicated thread with its own runtime, so it runs while the test is unwinding from a
+/// panic. Before this, every run left one `active` `system_api_keys` row scoped
+/// `moira:admin` on the shared database; 42 of them had accumulated when it was measured.
+///
+/// **What it does not establish.** Not that `system_api_keys` is empty anywhere else —
+/// assertion (c) below is meaningful *only* because (a) and (b) have already established
+/// that this database is private and freshly cloned; "the table is empty" against a shared
+/// database another suite writes to would prove nothing. Not that teardown succeeds: a
+/// `SIGKILL`ed process never runs `Drop`, and leaves a whole database for
+/// `sweep_leaked_databases` to collect an hour later. And not that any other suite is
+/// leak-free — `tests/test_database_isolation.rs` carries that.
+#[tokio::test]
+async fn the_fixture_owns_a_disposable_database() {
+    let Some(fixture) = MiddlewareFixture::new().await else {
+        return;
+    };
+    let live = timeout(
+        WAIT,
+        sqlx::query_scalar::<_, String>("select current_database()").fetch_one(&fixture.pool),
+    )
+    .await
+    .expect("current_database timed out")
+    .expect("current_database");
+
+    // (a) Not the shared database. This is the assertion that turns red the moment the
+    //     fixture is pointed back at `MOIRA_TEST_DATABASE_URL`.
+    let shared = support::shared_database_name().expect("a fixture was built, so the URL parses");
+    assert_ne!(
+        live, shared,
+        "the middleware fixture is writing to the shared test database `{shared}`, so every \
+         run leaks an active `moira:admin` system API key that nothing revokes — finding \
+         F10 item 2, which was 42 rows when it was measured"
+    );
+
+    // (b) It is this fixture's own clone, named in the shape `TestDatabase::drop` tears
+    //     down and `sweep_leaked_databases` collects if the process dies first.
+    assert_eq!(
+        live,
+        fixture.database.name(),
+        "the fixture's pool must be connected to the database `TestDatabase` owns and \
+         drops; a pool pointing anywhere else outlives the teardown"
+    );
+    assert!(
+        live.starts_with("moira_test_") && !live.starts_with("moira_test_template_"),
+        "a fixture database must carry the disposable `moira_test_<unix>_<uuid>` name that \
+         teardown and the leak sweep both key on, found `{live}`"
+    );
+
+    // (c) Cloned from the empty template, so no key an earlier run minted is visible here.
+    let carried_over = timeout(
+        WAIT,
+        sqlx::query_scalar::<_, i64>("select count(*) from system_api_keys")
+            .fetch_one(&fixture.pool),
+    )
+    .await
+    .expect("system key count timed out")
+    .expect("system key count");
+    assert_eq!(
+        carried_over, 0,
+        "a freshly cloned fixture database must carry no `system_api_keys` rows at all; \
+         finding one means the template was polluted or this pool is on a reused database"
     );
 
     fixture.shutdown().await;

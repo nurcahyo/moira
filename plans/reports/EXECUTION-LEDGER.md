@@ -978,7 +978,15 @@ where a test fails *forever* until someone deletes a row by hand.
    test semantics is a larger, riskier change than belonged in a regression fix on the plan 07 branch.
 
 2. **`tests/http_middleware_contract.rs:469`** — creates a `system_api_keys` row per run and never
-   deletes it. Minor; no current assertion depends on the count.
+   deletes it. Minor; no current assertion depends on the count. — **CLOSED with F26**
+   `fix/test-row-leak`. It was the same shape as F26 and took the same one-line fix: the fixture now
+   owns a `support::TestDatabase`. Two corrections to the record above, both found by measuring:
+   the row is not merely a row but an **`active` API key scoped `moira:admin`**, and **42** had
+   accumulated. The test cannot delete it — the response body is the only place the secret ever
+   exists, and asserting on that *is* the test — so a disposable database, not a cleanup, is the
+   only fix available. Item 1 (`retention_worker.rs`) remains open and is now the **last** suite
+   leaking to the shared database; a private clone would scope `retention::run_once` to one database
+   and dissolve both its global advisory lock and its exact-equality hazard at once.
 
 **The general lesson.** `migrated_pool()`-style helpers hand every `#[cfg(test)]` module in `src/` the
 *same* database, and `cargo test --workspace` runs binaries concurrently against it. Any test writing
@@ -1216,7 +1224,8 @@ its own, and a signing failure is unremarkable on its own. Only together are the
 **The rule: when a test documents current behaviour, say so in its name, and never let a conjunction
 be asserted as two independent facts.**
 
-**Open, and the queue from here:** the leaked `trusted_jwt_issuers` test rows and F2 (user-deferred).
+**Open, and the queue from here:** ~~the leaked `trusted_jwt_issuers` test rows~~ (**closed as F27**)
+and F2 (user-deferred).
 **F6 `f31ff59`, F17 `d8aab3e` and F14 are closed**, and **admin-write/audit non-atomicity is closed as
 F26** — but F26 left a
 successor: `RuntimeAdminService::record_idempotency` is still non-atomic with its own write at 13
@@ -1318,7 +1327,7 @@ an "active sessions" screen over an in-memory store would be the appearance of a
 | **F2** | Pre-auth query-field enumeration | user deferred |
 | ~~**F6**~~ | ~~OTel exports every span; `env_filter` is the sole barrier to Rig prompt spans~~ **CLOSED** `f31ff59` — allow-list of Moira-owned targets on the bridge layer, below the `EnvFilter`. The recorded description understated it: Rig's prompt-bearing span is `INFO`, so a bare `info` was already enough | `fix/f6-otel-span-filter` |
 | ~~**F26**~~ | ~~Admin write + audit row still non-atomic~~ **FIXED** `3825fb0` — 36 sites, not all of them; 20 were already atomic inside the command envelope. Reachable from an over-long `x-request-id`, not only from a crash. See the F26 section at the end of this file | `fix/admin-audit-atomicity` |
-| — | ~986 leaked `trusted_jwt_issuers` rows in the shared test DB | hygiene |
+| ~~**F27**~~ | ~~~986 leaked `trusted_jwt_issuers` rows in the shared test DB~~ **CLOSED** `fix/test-row-leak` — the count was **160**, not 986; see F27 below | hygiene |
 
 **Test baseline:** 779 passing on plan 11's branch (744 on `main` after plan 10).
 
@@ -1535,6 +1544,69 @@ an assumption*, and here the guard is never even reached, while eleven green uni
 works. It is also load-bearing for wave 4: the design option that moves per-provider enforcement into
 the console **must wire this**, not assume it. One verifier asserted the console "already runs the
 same allow-list at the session boundary" — the synthesis caught it, and it was verified again here.
+
+## F27 — the leaked-row finding was recorded at 6× its real size, and the leak was the happy path — **CLOSED** `fix/test-row-leak`
+
+**The recorded number was wrong and had been for long enough that nobody rechecked it.** The ledger
+and the handoff both said *"~986 leaked `trusted_jwt_issuers` rows"*. Measured: **160**. Not an
+estimate — 10 distinct path labels × 16 runs, exactly, with zero rows outside the fixture's shape.
+The ten labels are precisely the ten `register_issuer` call sites in `tests/jwks_hardening.rs`
+(`scheme`, `ip-range`, `oversized`, `content-type`, `jwk-set`, `slow`, `first-failure`, `retention`,
+`oracle`, `warm-cache`). That symmetry is what identified the source beyond argument.
+
+**It was the happy path, not the panic path.** Every run leaked all ten rows whether or not anything
+failed: `register_issuer` inserts and nothing anywhere deletes. The panic path leaked the same ten
+for the same reason. F10's lesson — *"a test that leaks a row on the panic path is worse than a flaky
+one"* — turned out to understate this one, because there was no path on which it did **not** leak.
+
+**Nothing depended on the rows, in either direction — verified, not assumed.** The one test that
+counts the table (`jwks_url_resolving_to_a_private_address_is_rejected_at_issuer_registration`,
+asserting `0`) scopes by a per-fixture-suffixed `jwks_url`, so deleting the residue cannot satisfy or
+violate it. Nothing asserts a uniqueness or a non-empty count that a previous run's rows were quietly
+supplying. `trusted_jwt_issuers_issuer_active_unique` is keyed on `issuer`, which carries a
+`Uuid::now_v7()` suffix, so no run could ever collide with another.
+
+**The fix is the mechanism, not a cleanup.** Both leaking suites now build on
+`support::TestDatabase` — a database cloned from the migrated template per fixture, dropped in
+`Drop`. That holds on the panic path because `TestDatabase::drop` does its teardown on a **dedicated
+`std::thread` with its own current-thread runtime**: `Drop` is synchronous and `#[tokio::test]`
+defaults to a current-thread runtime, so `block_in_place` is unavailable, and this is the only
+construction that runs unconditionally while a test unwinds. `tests/support/mod.rs` had already
+documented these suites as deliberately excluded from that pattern on the grounds that they "assert
+only on rows they created" — true, and beside the point: asserting safely is not the same as leaving
+nothing behind.
+
+**Cleanup predicate**, three independent conjuncts, each alone sufficient to rule out real data:
+host `idp.invalid` (the `.invalid` reserved TLD, RFC 6761 §6.4 — it can never resolve, so it can
+never name a real IdP); a path label from the literal ten above; and a 32-hex-character
+`Uuid::now_v7().simple()` suffix. 160 rows matched, 0 rows did not, 0 were referenced by
+`admin_identities` or `auth_provider_settings`. No `DROP`, no `TRUNCATE`.
+
+**Left in place deliberately:** 180 `audit_logs` rows (112 `jwks_fetch`, 42 `system_key.create`, 26
+`admin_identity.claim`). They are the same residue and are now frozen — both suites write elsewhere —
+but `audit_logs` is append-only *by product design*, and deleting from it to tidy a test database is
+a precedent worth refusing.
+
+**The guard, and what it does not cover.** Each suite carries
+`the_fixture_owns_a_disposable_database`, asserting its pool is on a database that is (a) not the one
+`MOIRA_TEST_DATABASE_URL` names, (b) the very database its own `TestDatabase` will drop, and (c)
+carries zero pre-existing rows. **(c) alone would be worthless** — "the table is empty" proves nothing
+on a database another suite writes to — and is meaningful only because (a) and (b) have established
+the database is private and freshly cloned first.
+
+That guard is fixture-scoped, so the cheapest way to reintroduce the finding is to add a *new* suite,
+or a new test, that opens its own pool: no fixture-scoped assertion would ever see it. Hence
+`tests/test_database_isolation.rs`, which scans every source under `tests/` and fails on any file
+outside a documented allowlist that resolves the variable itself. Its allowlist can only shrink
+without review — `every_allowlist_entry_is_still_load_bearing` fails on an entry that has stopped
+being needed, because a stale exemption pre-authorises whatever file next takes that name. It
+assembles its own search pattern at runtime rather than as a literal, so that it is scanned on the
+same terms as every other file instead of special-casing itself.
+
+**It has teeth, demonstrated twice.** It caught a real violation before any deliberate mutation: the
+first draft of the per-suite guards read `MOIRA_TEST_DATABASE_URL` inline to learn the shared
+database's name, and the architecture guard failed them by name. That access now goes through
+`support::shared_database_name`.
 
 ## F22 — a SECOND flake on `main`, distinct from F5, found because docs pushes run CI
 
