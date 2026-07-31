@@ -16,7 +16,15 @@ import { extname, join, relative, resolve } from "node:path";
 const CONSOLE_ROOT = resolve(import.meta.dir, "../../..");
 
 /** Modules that hold or forward a Moira credential. */
-const SERVER_ONLY_MODULES = ["lib/moira-client.ts", "lib/setup-flow.ts"] as const;
+const SERVER_ONLY_MODULES = [
+  "lib/moira-client.ts",
+  "lib/setup-flow.ts",
+  // Plan 09 Wave 1: the durable store and the pool that reaches it. A client
+  // component importing either would drag the connection string — password
+  // included — and the plaintext-revealing `reveal()` into the browser bundle.
+  "lib/console-db.ts",
+  "lib/console-secrets-postgres.ts",
+] as const;
 
 /** Modules that must stay importable from a client component. */
 const CLIENT_SAFE_MODULES = ["lib/errors.ts", "lib/types.ts", "lib/moira-keys.ts"] as const;
@@ -50,6 +58,17 @@ const allSourceFiles = [
 ];
 
 const rel = (abs: string) => relative(CONSOLE_ROOT, abs).replace(/\\/g, "/");
+
+/**
+ * Drop comments before scanning.
+ *
+ * Every rule in this file is about what the CODE does. A guard that also fires
+ * on prose makes the prose unwritable — and the prose is where the reasons for
+ * these rules live, so a guard that punishes it is working against itself.
+ */
+function stripComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "");
+}
 
 function importsAny(source: string, moduleNames: readonly string[]): boolean {
   return moduleNames.some((moduleName) => {
@@ -122,6 +141,52 @@ describe("the error boundary is enforced in one place", () => {
     const offenders = allSourceFiles
       .filter((abs) => rel(abs) !== "lib/errors.ts")
       .filter((abs) => /\.\.\.\s*\w*[eE]rror\.error\b/.test(readFileSync(abs, "utf8")))
+      .map(rel);
+    expect(offenders).toEqual([]);
+  });
+});
+
+describe("the database layer stays on the server", () => {
+  test("no client component and nothing under components/** imports a database driver", () => {
+    // Distinct from the module rule above: a component could import `pg`
+    // directly rather than through `lib/console-db.ts`, and Next would then
+    // attempt to bundle a database driver — and the connection string it reads
+    // — for the browser.
+    const driverImport = /from\s+["']pg["']|require\(\s*["']pg["']\s*\)|import\(\s*["']pg["']\s*\)/;
+    const offenders = allSourceFiles
+      .filter((abs) => {
+        const source = readFileSync(abs, "utf8");
+        const isClient = /^\s*["']use client["']/m.test(source);
+        const isComponent = rel(abs).startsWith("components/");
+        return (isClient || isComponent) && driverImport.test(source);
+      })
+      .map(rel);
+    expect(offenders).toEqual([]);
+  });
+
+  test("the connection string is read in exactly two places", () => {
+    // `lib/env.ts` validates it and `lib/console-db.ts` consumes it — the
+    // latter also exports `hasConsoleDatabase` so that "am I durable?" can be
+    // asked without a third module touching the value. A third reader is a
+    // third chance to log it, embed it in an error, or pass it as a prop, and
+    // it carries the database password inline.
+    const offenders = allSourceFiles
+      .filter((abs) => !["lib/env.ts", "lib/console-db.ts"].includes(rel(abs)))
+      .filter((abs) => {
+        const codeOnly = stripComments(readFileSync(abs, "utf8"));
+        return codeOnly.includes("CONSOLE_DATABASE_URL") || /\bconsoleDatabaseUrl\b/.test(codeOnly);
+      })
+      .map(rel);
+    expect(offenders).toEqual([]);
+  });
+
+  test("the durable store is the only SQL against the secret table", () => {
+    // One place where a client secret is read out of storage. A second query
+    // would be a second decrypt path, and the AAD binding only protects the
+    // path that uses it.
+    const offenders = allSourceFiles
+      .filter((abs) => rel(abs) !== "lib/console-secrets-postgres.ts")
+      .filter((abs) => stripComments(readFileSync(abs, "utf8")).includes("console_provider_secret"))
       .map(rel);
     expect(offenders).toEqual([]);
   });

@@ -37,6 +37,11 @@ const MUST_IMPORT_SERVER_ONLY = [
   "lib/auth.ts",
   "lib/moira-session.ts",
   "lib/auth-runtime.ts",
+  // Plan 09 Wave 1. `console-db.ts` closes over the connection string, which
+  // carries the database password inline; `console-secrets-postgres.ts` holds
+  // the content-encryption key and returns plaintext client secrets.
+  "lib/console-db.ts",
+  "lib/console-secrets-postgres.ts",
 ] as const;
 
 /** Matches a real side-effect import, not a mention in a comment. */

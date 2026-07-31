@@ -376,6 +376,94 @@ the whole argument for the approach given that Debian had declined or deferred f
    package manager with which to create a second user. It would have failed at deploy time, not in
    CI. When an agent reports "verified", check the specific thing that could fail silently.
 
+### F19 — validating inside the envelope turns invite redemption into an enumeration oracle
+
+**Found by measuring a mutation that nothing caught, then asking what the guard is actually for.**
+
+Moving redeem's validation inside the transactional envelope was **caught by nothing** — 869 passed,
+0 failed, byte-identical to baseline. Neither the mechanism §0 claimed (a replayed 403 — impossible,
+`is_cacheable_admin_failure` excludes `Forbidden`) nor the correction to it (assert the invite's
+`status`) can see the difference: `AdminCommandRunner::execute` rolls back on any non-cacheable
+failure, so a denial inside the envelope has its `consume_invite` rolled back too. **Pre-envelope
+ordering and transaction rollback defend the same property**, which is why no assertion on that
+property distinguishes them.
+
+**What ordering uniquely buys is which failure the caller is told about.** Inside the envelope
+`insert_grant` runs first, so a caller whose `(issuer, subject)` already holds a grant receives
+`409 admin_identity_already_claimed` — *before* the invite's own constraint has refused them, and
+before policy has. A stranger holding a leaked invite token can therefore learn whether an arbitrary
+identity already has admin, from a request the invite should have refused outright.
+
+Pinned by `a_refusal_that_belongs_to_the_invite_is_not_pre_empted_by_the_grant_table`, which probes
+both checkpoints with an already-granted identity as an explicit premise. Verified failing under the
+mutation (`admin_identity_already_claimed` where `invite_email_mismatch` was due) and passing at HEAD.
+
+**The lesson is about how the guard was documented.** Its doc comment credited ordering with
+"never reaching the statement that marks the invite consumed" — something rollback would have done
+anyway. A guard justified by the wrong property is one refactor away from being removed as
+redundant, because *for that property it is*.
+
+### F20 — on any deployment created after `0017`, no admin is ever primary
+
+`claim` never sets `is_primary` — the shared `insert_grant` names no such column — and `0017`'s
+backfill is a one-shot migration-time `UPDATE` that finds an **empty table** on a greenfield deploy.
+So the ownership-transfer endpoint is unreachable by every JWT admin until an operator reaches for
+the system-key break-glass `PATCH`.
+
+`0017` says "the setup claimant is primary by default", which is true only for deployments that
+already had a claimant when `0017` ran. Not fixed — it is a design decision rather than a typo, and
+`clearing_the_only_primary_is_refused_with_the_last_primary_conflict` now asserts and documents the
+actual behaviour rather than the intended one.
+
+### METHOD NOTE — right conclusion, wrong mechanism, and the test that would have proved nothing
+
+Plan 09 §0 argued the redeem validation must sit **outside** the transactional envelope because,
+since `Idempotency-Key` is required, a denied redemption would write a ledger row and a later retry
+would **replay the stored 403** after the operator widened the allow-list.
+
+**The mechanism is wrong.** `AppError::is_cacheable_admin_failure` (`src/error.rs:209-225`) caches
+only 400/404/409/422 and explicitly excludes `Self::Forbidden(_)`. A 403 raised inside the closure
+takes the rollback arm and leaves **no** ledger row. There is no replay.
+
+The conclusion still holds — validating outside the envelope is what stops the invite being consumed
+and the advisory lock being taken — so the code is right. **But a test written against the stated
+mechanism would have passed in both the fixed and the broken arrangement**, because neither produces
+a replayed 403. It would have been a green test proving nothing, added specifically to guard the
+thing it does not touch.
+
+The ordering test must assert on the **invite row's `status`**, not on a replayed response.
+
+**This is the second time in this run that a mechanism I asserted was wrong in a way that would have
+produced a false-confidence test** — the first being F15, where a type was named as safe without
+reading its fields. Both were caught by an agent verifying rather than implementing. The pattern:
+*a conclusion can be right for a reason that is wrong, and the test follows the reason.*
+
+### F17 — rotating `BETTER_AUTH_SECRET` makes the console publish a JWKS it cannot sign for
+
+**A new hazard created by durable storage; the in-memory path did not have it.**
+
+On rotation, `getJwks` serves the **plaintext `publicKey` column**, so the JWKS document is unchanged
+and Moira's cached copy stays valid. Meanwhile `signJWT` fails with `Failed to decrypt private key`
+— and it does **not** regenerate the pair. The console therefore advertises keys it can no longer
+sign with, and every token it mints is rejected. Silently: the JWKS endpoint looks healthy.
+
+Verified rather than reasoned about, in `console-jwks-stability.test.ts`. Runbook in
+`docs/console-storage.md`.
+
+**Why it is worth its own entry:** with the memory adapter, a rotation regenerated the pair and the
+next process simply published new keys. Making storage durable — which fixes three other problems —
+converts a self-healing restart into a silent, persistent outage. That is the shape of hazard worth
+looking for whenever ephemeral state is made persistent.
+
+### F18 — the sign-in rate limit was multiplying by replica count
+
+Better Auth's default `rateLimit.storage` is **per-process memory**. With N replicas the effective
+sign-in limit was N× the configured value, and the configured value only applied in production at
+all (`enabled: isProduction`). Set to `"database"` in plan 09 Wave 1, so the limit is now shared.
+
+Minor while `replicaCount` is pinned at 1, and exactly the kind of thing that stops being minor the
+moment someone lifts that pin.
+
 ### F16 — ESCALATED: `rig-core` logs the whole completion body, which now carries OTHER tenants' documents
 
 **`rig-core` 0.40 emits the entire completion request body — every message, verbatim — on the

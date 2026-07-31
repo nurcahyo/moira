@@ -114,10 +114,34 @@ function isUsableNeedle(value: string): boolean {
 }
 
 /**
+ * Env vars that carry a credential INSIDE a URL rather than as the whole value.
+ *
+ * A DSN is the awkward case and the console now has one. `CONSOLE_DATABASE_URL`
+ * matches none of `SECRET_NAME_PATTERN`, so the ambient harvester never sees it;
+ * and even if it did, the DSN contains `/` and `isUsableNeedle` would discard
+ * it, because matching a whole connection string against a sourcemap full of
+ * paths is how a gate becomes noise. So the PASSWORD is extracted and used as
+ * the needle — that is the part whose disclosure matters.
+ */
+const CONNECTION_STRING_NAME_PATTERN = /(DATABASE_URL|DSN|CONNECTION_STRING)/i;
+
+/** The password half of a connection string, if it has one worth matching. */
+function connectionStringPassword(value: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return null;
+  }
+  const password = decodeURIComponent(url.password);
+  return password !== "" && isUsableNeedle(password) ? password : null;
+}
+
+/**
  * Every value that must not appear in client-visible output:
- * the seeded sentinels plus any ambient secret-shaped env var that the console
- * server process also inherits (this is the forward-compatibility hook for the
- * real secrets plan 08 introduces).
+ * the seeded sentinels, any ambient secret-shaped env var that the console
+ * server process also inherits, and the password half of any connection string
+ * it was given.
  */
 export function forbiddenValues(env: NodeJS.ProcessEnv = process.env): Needle[] {
   const needles = new Map<string, Needle>();
@@ -130,6 +154,16 @@ export function forbiddenValues(env: NodeJS.ProcessEnv = process.env): Needle[] 
     if (typeof value !== "string") continue;
     if (name.startsWith("NEXT_PUBLIC_")) continue; // handled by the name rule
     if (AMBIENT_NAME_DENYLIST.has(name)) continue;
+
+    if (CONNECTION_STRING_NAME_PATTERN.test(name)) {
+      const password = connectionStringPassword(value);
+      if (password !== null && !needles.has(password)) {
+        needles.set(password, { label: `${name} password (ambient server env)`, value: password });
+      }
+      // Fall through: a DSN-named variable may also match the secret-name
+      // pattern, and the whole value is still worth adding when it is usable.
+    }
+
     if (!SECRET_NAME_PATTERN.test(name)) continue;
     if (!isUsableNeedle(value)) continue;
     if (needles.has(value)) continue;
@@ -155,6 +189,16 @@ export const FORBIDDEN_PATTERNS: ReadonlyArray<{
   {
     label: "secret-shaped NEXT_PUBLIC_* identifier",
     pattern: /NEXT_PUBLIC_[A-Z0-9_]*(SECRET|KEY|TOKEN|PASSWORD|CREDENTIAL)/i,
+  },
+  {
+    // Value-independent, like the PEM rule: any PostgreSQL connection string
+    // carrying inline credentials is a leak regardless of whether this run
+    // happened to know the password. It fires on a DSN from a config file, from
+    // a stack trace, or from a database driver's own error message — all of
+    // which are how a connection string actually reaches a browser, and none of
+    // which the needle set would cover.
+    label: "PostgreSQL connection string with inline credentials",
+    pattern: /postgres(?:ql)?:\/\/[^\s:@/"'`]+:[^\s:@/"'`]+@/i,
   },
 ];
 

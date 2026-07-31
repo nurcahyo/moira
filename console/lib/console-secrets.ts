@@ -193,27 +193,24 @@ export interface ConsoleSecretStore {
 }
 
 /**
- * In-process store.
+ * In-process store. THE DEVELOPMENT AND TEST PATH ONLY.
  *
- * DELIBERATE SCOPE LIMIT — read this before deploying anything.
+ * `PostgresConsoleSecretStore` in `lib/console-secrets-postgres.ts` is the
+ * durable implementation of this same interface, and `lib/env.ts` makes
+ * `CONSOLE_DATABASE_URL` a hard boot failure under `NODE_ENV=production` — so a
+ * deployment cannot reach this class by omission. It stays because a durable
+ * store that cannot be substituted makes every test that touches auth need a
+ * database, and because `next dev` should not.
  *
- * This wave ships the envelope (real AES-256-GCM, real AAD binding, unit-tested
- * against tampering) and the interface, but only an in-memory implementation. A
- * durable implementation needs a database, and no database is available to this
- * wave's test suite; a persistence layer that is never exercised against real
- * storage is a fake gate, and writing one to look complete is worse than not
- * writing one.
- *
- * CONSEQUENCES, so they are not discovered in production:
- *   * secrets do not survive a pod restart — the operator must re-run the
+ * WHAT USING IT COSTS, so it is not discovered in production:
+ *   * secrets do not survive a restart — the operator must re-run the
  *     auth-settings step;
  *   * a multi-replica deployment has per-replica secrets, so sign-in works only
- *     on the replica that was set up. `charts/moira-console` must therefore stay
- *     at one replica until a durable store lands.
+ *     on the replica that was set up.
  *
- * REVERSAL CONDITION: when a `console_auth` database exists, implement this
- * interface over it and delete the replica-count restriction. The envelope
- * functions above need no change — they already produce a persistable record.
+ * The envelope functions above are shared by both implementations verbatim:
+ * there is exactly one place in this tree where a client secret is encrypted or
+ * decrypted, and it is here.
  */
 export class InMemoryConsoleSecretStore implements ConsoleSecretStore {
   readonly #key: Buffer;
