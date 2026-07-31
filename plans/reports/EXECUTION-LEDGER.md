@@ -959,6 +959,25 @@ Rejected: `[profile.dev.package."*"] opt-level = 3`. It optimises 405 dependenci
 **10** (`671eadf`), **08** (`f0ecbbc`), **11** (`e898f80`). The last four were CI-verified with every
 job running steps.
 
+**Plus the findings sweep — PR #39 MERGED `5206ffd` (2026-07-31), 27 files, +2471/−101.** F20
+(single-primary ownership), F13 (duplicate-issuer 409), F21 (replay double-count, closed here and
+nobody had noticed), the wave-2 leftovers, and `cargo-mutants` adoption. CI-verified on the exact
+merge commit: five jobs, steps executed (`rust` 13, `console` 16, `console-container-and-helm` 14,
+`container-and-helm` 13, `supply-chain` 10).
+
+**Migrations: `main` is now at `0019`. Next free is `0020`.** `0016` is a permanent gap.
+
+**Plan 09 is the only plan work left, and BOTH remaining waves are now re-audited:**
+
+| Wave | §0 | Drift | State |
+|---|---|---|---|
+| 4 — multi-provider | §0.7, `85b093d` on `plan/09-wave4-multi-provider` | ~70% | audited; **architecture decision required before code** — F24 rules out the naive design |
+| 5 — invitations + ownership UI | §0.8 on `plan/09-wave5-invitations-ui` | ~83% | audited; recovery **cut** (no backend), sessions **stay cut** |
+
+**Open findings after this merge:** F23, F24, F25, F22 (all raised 2026-07-31, see their sections),
+plus the carried-over F14, F17, F6, F2, admin-write/audit non-atomicity, and the leaked
+`trusted_jwt_issuers` test rows. **F21 is CLOSED.**
+
 **Remaining: plan 09 only — and it is much larger than it says.** §0 written (`13284f1`) recording
 **9 blockers**. Two are structural rather than citation drift:
 
