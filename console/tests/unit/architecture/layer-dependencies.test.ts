@@ -207,6 +207,7 @@ describe("the derivation is alive", () => {
       "lib/i18n/keys.ts",
       "lib/i18n/catalog.en.ts",
       "lib/i18n/index.ts",
+      "lib/invite-bounds.ts",
     ]) {
       expect(credentialPaths, `${path} was derived as credential-carrying`).not.toContain(path);
     }

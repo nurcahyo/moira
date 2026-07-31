@@ -48,8 +48,13 @@ import "server-only";
 
 import { MoiraRequestError, toMoiraError, toTransportError } from "./errors";
 import type {
+  AdminIdentityPatchRequest,
   AdminIdentityRecord,
   AdminInviteCreateRequest,
+  AdminInvitePreviewRequest,
+  AdminInvitePreviewResponse,
+  AdminInviteRecord,
+  AdminInviteRedeemRequest,
   AdminInviteSecretResponse,
   AuthProviderSettingsRecord,
   ConsoleAuthProviderCreateRequest,
@@ -74,9 +79,30 @@ export type HttpMethod = "GET" | "POST" | "PATCH" | "DELETE";
  * `system_key_only` is `[{ systemKeyAuth: [] }]` and nothing else — the claim
  * endpoint. A bearer JWT is refused there even if it verifies.
  * `admin` is the usual `[bearerAuth, systemKeyAuth, consumerKeyAuth]` triple.
+ * `bearer_only` is `[{ bearerAuth: [] }]` and nothing else — see below.
  * `none` is an absent `security` block.
+ *
+ * ============================================================================
+ * WHY `bearer_only` EXISTS AND WHY `admin` COULD NOT BE USED (plan 09 W5-D3)
+ * ============================================================================
+ *
+ * `redeem_admin_invite`'s committed security is `[{ "bearerAuth": [] }]` alone.
+ * Registering it as `admin` fails `openapi-contract.test.ts` outright (that
+ * branch asserts the scheme list CONTAINS `systemKeyAuth`), and — the part that
+ * matters — `#buildHeaders`' `admin` arm PREFERS the system key when one is
+ * present. On the redemption path that would send the console's bootstrap
+ * credential on an invitee's request, which is the console granting Moira admin
+ * to an identity of its own choosing.
+ *
+ * `none` is not an option either: redemption is what proves the invitee's
+ * `(issuer, subject)`, so a request with no `Authorization` header is a 401.
+ *
+ * So this variant carries the invariant rather than describing a shape: it
+ * REQUIRES a bearer token and REFUSES a system key, throwing
+ * `MoiraClientContractError` if one is configured — the mirror image of
+ * `system_key_only`'s refusal of a bearer.
  */
-export type MoiraCredentialRequirement = "none" | "system_key_only" | "admin";
+export type MoiraCredentialRequirement = "none" | "system_key_only" | "admin" | "bearer_only";
 
 export interface MoiraOperation {
   /** `operationId` in `docs/openapi.json`. */
@@ -158,6 +184,125 @@ export const MOIRA_OPERATIONS = {
     id: "create_admin_invite",
     method: "POST",
     path: "/api/v1/admin/admin-invites",
+    credential: "admin",
+    declaresIdempotencyKey: true,
+    requiresIfMatch: false,
+  }),
+
+  listAdminInvites: op({
+    id: "list_admin_invites",
+    method: "GET",
+    path: "/api/v1/admin/admin-invites",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: false,
+  }),
+  getAdminInvite: op({
+    id: "get_admin_invite",
+    method: "GET",
+    path: "/api/v1/admin/admin-invites/{id}",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: false,
+  }),
+  /**
+   * `POST .../admin-invites/{id}/revoke` — a POST to a sub-resource, not a
+   * `DELETE`. Transcribed, not guessed: `DELETE /admin-invites/{id}` is not in
+   * the spec at all, and the registry is what makes the difference a compile-time
+   * fact rather than a 404 in front of an operator.
+   *
+   * No `If-Match`. Revocation is idempotent in the direction that matters (a
+   * second revoke of a revoked invite is `409 invite_revoked`, not a silent
+   * overwrite), so the spec declares an optional `Idempotency-Key` and no
+   * version precondition.
+   */
+  revokeAdminInvite: op({
+    id: "revoke_admin_invite",
+    method: "POST",
+    path: "/api/v1/admin/admin-invites/{id}/revoke",
+    credential: "admin",
+    declaresIdempotencyKey: true,
+    requiresIfMatch: false,
+  }),
+  /**
+   * `POST .../admin-invites/preview` — ANONYMOUS, and the token goes in the BODY.
+   *
+   * `credential: "none"` is read off the spec: the operation declares no
+   * `security` block at all, and it is on the unauthenticated allow-list inside
+   * `every_operation_documents_request_ids_and_protected_operations_document_auth`
+   * with the explanation that comment demands.
+   *
+   * The invitee has no session yet when this runs — that is the whole point of
+   * the endpoint — so anything that required a credential here would make the
+   * invitation page unrenderable.
+   */
+  previewAdminInvite: op({
+    id: "preview_admin_invite",
+    method: "POST",
+    path: "/api/v1/admin/admin-invites/preview",
+    credential: "none",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: false,
+  }),
+  /**
+   * `POST .../admin-invites/redeem` — the ONLY `bearer_only` operation.
+   *
+   * See `MoiraCredentialRequirement`. The invitee's freshly minted, grantless
+   * JWT is the credential; the console's bootstrap system key must never be
+   * sent here, and `#buildHeaders` throws rather than silently preferring it.
+   */
+  redeemAdminInvite: op({
+    id: "redeem_admin_invite",
+    method: "POST",
+    path: "/api/v1/admin/admin-invites/redeem",
+    credential: "bearer_only",
+    declaresIdempotencyKey: true,
+    requiresIfMatch: false,
+  }),
+
+  /* --- admin identities (the ownership surface) --------------------------- */
+
+  listAdminIdentities: op({
+    id: "list_admin_identities",
+    method: "GET",
+    path: "/api/v1/admin/admin-identities",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: false,
+  }),
+  /**
+   * `PATCH .../admin-identities/{id}` — ownership transfer, in ONE call.
+   *
+   * `declaresIdempotencyKey: true` AND `requiresIfMatch: true`. Plan 09 §0.8.4
+   * step 6 describes this family as "`Idempotency-Key` on create, revoke, redeem
+   * and delete" — the committed spec ALSO declares it here, so the audit's list
+   * is incomplete and the registry follows the spec.
+   *
+   * `If-Match` is required and is the reason transfer cannot be two calls:
+   * `set_primary` demotes every other active primary inside the same
+   * transaction, so a follow-up "demote the actor" call would either demote the
+   * person just promoted or 409 on a version the actor no longer holds.
+   */
+  patchAdminIdentity: op({
+    id: "patch_admin_identity",
+    method: "PATCH",
+    path: "/api/v1/admin/admin-identities/{id}",
+    credential: "admin",
+    declaresIdempotencyKey: true,
+    requiresIfMatch: true,
+  }),
+  /**
+   * `DELETE .../admin-identities/{id}` — soft revoke. NO `If-Match`.
+   *
+   * Asserted rather than assumed, because the neighbouring `PATCH` requires one:
+   * `every_if_match_operation_declares_the_documented_precondition` covers the
+   * spec side and the contract test re-derives this flag on every run. Passing an
+   * `ifMatch` here throws.
+   */
+  deleteAdminIdentity: op({
+    id: "delete_admin_identity",
+    method: "DELETE",
+    path: "/api/v1/admin/admin-identities/{id}",
     credential: "admin",
     declaresIdempotencyKey: true,
     requiresIfMatch: false,
@@ -624,6 +769,114 @@ export class MoiraClient {
     });
   }
 
+  async listAdminInvites(
+    options: { readonly limit?: number; readonly cursor?: string; readonly status?: string } = {},
+  ): Promise<ListResponse<AdminInviteRecord>> {
+    return this.#request<ListResponse<AdminInviteRecord>>("listAdminInvites", {
+      query: { limit: options.limit, cursor: options.cursor, status: options.status },
+    });
+  }
+
+  async getAdminInvite(id: string): Promise<AdminInviteRecord> {
+    return this.#request<AdminInviteRecord>("getAdminInvite", { pathParams: { id } });
+  }
+
+  /** `POST .../admin-invites/{id}/revoke`. No `If-Match` — see the registry entry. */
+  async revokeAdminInvite(
+    id: string,
+    options: { readonly idempotencyKey?: string } = {},
+  ): Promise<AdminInviteRecord> {
+    return this.#request<AdminInviteRecord>("revokeAdminInvite", {
+      pathParams: { id },
+      idempotencyKey: options.idempotencyKey,
+    });
+  }
+
+  /**
+   * `POST .../admin-invites/preview`. Anonymous; the token travels in the BODY.
+   *
+   * The response carries `constraint`, `value` and `expires_at` and nothing
+   * else — no inviter, no invite id, no policy. Note what this method does NOT
+   * return: the token it was given. Nothing here echoes it.
+   */
+  async previewAdminInvite(token: string): Promise<AdminInvitePreviewResponse> {
+    const body: AdminInvitePreviewRequest = { token };
+    return this.#request<AdminInvitePreviewResponse>("previewAdminInvite", { body });
+  }
+
+  /**
+   * `POST .../admin-invites/redeem`. The invitee's own bearer token, never the
+   * system key — the client throws if one is configured.
+   *
+   * `email`/`email_verified` are BFF-asserted from the just-verified session by
+   * the caller; this method does not read them from anywhere else, and there is
+   * no branch that makes either omittable.
+   */
+  async redeemAdminInvite(
+    body: AdminInviteRedeemRequest,
+    options: { readonly idempotencyKey?: string } = {},
+  ): Promise<AdminIdentityRecord> {
+    return this.#request<AdminIdentityRecord>("redeemAdminInvite", {
+      body,
+      idempotencyKey: options.idempotencyKey,
+    });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* Admin identities — the ownership surface                               */
+  /* ---------------------------------------------------------------------- */
+
+  async listAdminIdentities(
+    options: { readonly limit?: number; readonly cursor?: string; readonly status?: string } = {},
+  ): Promise<ListResponse<AdminIdentityRecord>> {
+    return this.#request<ListResponse<AdminIdentityRecord>>("listAdminIdentities", {
+      query: { limit: options.limit, cursor: options.cursor, status: options.status },
+    });
+  }
+
+  /**
+   * `PATCH .../admin-identities/{id}` — ownership transfer, in ONE call.
+   *
+   * Use `ifMatchFor(record)` rather than a fabricated version: the precondition
+   * is what stops a transfer racing a concurrent revocation of the same row.
+   */
+  async patchAdminIdentity(
+    id: string,
+    body: AdminIdentityPatchRequest,
+    ifMatch: string,
+    options: { readonly idempotencyKey?: string } = {},
+  ): Promise<AdminIdentityRecord> {
+    return this.#request<AdminIdentityRecord>("patchAdminIdentity", {
+      pathParams: { id },
+      body,
+      ifMatch,
+      idempotencyKey: options.idempotencyKey,
+    });
+  }
+
+  /**
+   * `DELETE .../admin-identities/{id}` — soft revoke. Returns the revoked record.
+   *
+   * NOT a 204: the response is the `AdminIdentityRecord` in its revoked state,
+   * with the `admin_identity_revoked` notice. Typing it as `void` would drop the
+   * one string the operator is meant to be shown.
+   *
+   * THE SOLE ADMIN CANNOT BE REVOKED. `revoke_grant` clears `is_primary`, and the
+   * last-primary guard refuses that — so on a deployment with one admin this is a
+   * `409 admin_identity_last_primary` for that row, permanently. That is a stated
+   * consequence of decision D-F20, not an outage: the caller must render it as a
+   * rule with a remedy ("transfer ownership first"), never as a failed request.
+   */
+  async deleteAdminIdentity(
+    id: string,
+    options: { readonly idempotencyKey?: string } = {},
+  ): Promise<AdminIdentityRecord> {
+    return this.#request<AdminIdentityRecord>("deleteAdminIdentity", {
+      pathParams: { id },
+      idempotencyKey: options.idempotencyKey,
+    });
+  }
+
   /* ---------------------------------------------------------------------- */
   /* Transport                                                              */
   /* ---------------------------------------------------------------------- */
@@ -717,6 +970,36 @@ export class MoiraClient {
             `${operation.id} requires a credential: configure systemKey or bearerToken`,
           );
         }
+        break;
+      }
+      case "bearer_only": {
+        // THE REFUSAL IS THE POINT, and it is checked BEFORE the bearer is
+        // resolved so that a misconfigured client cannot mint a token on the way
+        // to being rejected.
+        //
+        // The `admin` arm above prefers the system key when one is present. If
+        // redemption went through that arm on a client that carries the
+        // bootstrap key — which `moiraClientForSetup` does — the console would
+        // present its own break-glass credential on a request that mints an
+        // `admin_identities` grant for whichever `(issuer, subject)` the body
+        // implies. That is not a leak of the key; it is the console granting
+        // admin to an identity of its own choosing, and no server-side check can
+        // distinguish it from a legitimate operator action.
+        if (this.#systemKey !== undefined && this.#systemKey !== "") {
+          throw new MoiraClientContractError(
+            `${operation.id} declares bearerAuth alone and must NEVER carry the bootstrap ` +
+              "system key: a system-key redemption would be the console granting admin to an " +
+              "identity of its own choosing. Build the client from the invitee's session " +
+              "(moiraClientForSession), not from moiraClientForSetup.",
+          );
+        }
+        if (this.#bearerToken === undefined) {
+          throw new MoiraClientContractError(
+            `${operation.id} requires the caller's own bearer token; there is no system-key ` +
+              "fallback on this operation",
+          );
+        }
+        headers["Authorization"] = `Bearer ${await this.#bearerToken()}`;
         break;
       }
     }

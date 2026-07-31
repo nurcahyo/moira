@@ -1040,17 +1040,50 @@ merge commit: five jobs, steps executed (`rust` 13, `console` 16, `console-conta
 
 **Migrations: `main` is now at `0019`. Next free is `0020`.** `0016` is a permanent gap.
 
-**Plan 09 is the only plan work left, and BOTH remaining waves are now re-audited:**
+## ✅ ALL PLAN WORK IS COMPLETE — plan 09 finished 2026-07-31. Only T11 remains, and it is the user's.
 
-| Wave | §0 | Drift | State |
-|---|---|---|---|
-| 4 — multi-provider | §0.7 + **§0.7.7** (the decision), `plan/09-wave4-multi-provider` | ~70% | decision taken (Option A′, staged 4A/4B); **stage 4A implemented and gated** — see below |
-| 5 — invitations + ownership UI | §0.8 on `plan/09-wave5-invitations-ui` | ~83% | audited; recovery **cut** (no backend), sessions **stay cut** |
+**Five PRs merged in one cycle**, each CI-verified with every job running steps:
 
-**Open findings after this merge:** F24, F22, plus the carried-over F14, F17, ~~F6~~ (closed
-`f31ff59`), F2,
-admin-write/audit non-atomicity, and the leaked `trusted_jwt_issuers` test rows. **F21 is CLOSED.**
-**F23 is closed in Moira's layer** and **F25 is CLOSED** — both by wave 4A, below.
+| PR | What | Merge |
+|---|---|---|
+| **#39** | findings sweep — F20, F13, F21, `cargo-mutants` | `5206ffd` |
+| **#40** | F22 — the non-streaming timeout probe raced a sub-millisecond deadline | `f3a9480` |
+| **#41** | wave 4A — deterministic `admission_policy`, `github_oauth` schema, F23/F24/F25/B2 | `c98aeb7` |
+| **#42** | wave 4B — per-provider console issuer, N sign-in buttons, GitHub-shaped mock | `da384c8` |
+| **#43** | wave 5 — invitations and ownership UI | `820a5a8` |
+
+**The forced plan order `02b → 03 → 04 → 05 → 06 → 07 → {08 ∥ 10} → 11 → 09` is now fully executed.**
+Migrations end at `0020`; `0016` is a permanent gap. OpenAPI is stable at **151 operations / 99
+paths / 178 schemas**.
+
+**The one piece of plan 09 the loop could not do is T11**, removing the console's
+`ambiguous_enabled_providers` guard. It is gated on stage 4A being **deployed**, not merged, and
+nothing here can deploy. **It must not be waved through** — until Moira's refusal is running in
+production that guard is the only thing in front of F23.
+
+### Findings state after this cycle
+
+**Closed:** F21 (already fixed in #39, unnoticed until an auditor checked), **F23**, **F24**
+(structurally, zero `admin_identities` change), **F25**, **F22**, and **B2**.
+
+**F6 is CLOSED** (`f31ff59`) — an allow-list `filter_fn` on the OTLP bridge layer. And closing it
+exposed a **fifth** laundering guard: **F16's own mitigation was never wired-tested.** Deleting
+`.with(filter_fn(suppresses_provider_payload_logs))` from `init` left **all 598 library tests
+green**, because F16's three tests exercised a `suppresses()` helper *re-implemented inside the test
+module* — they covered the predicate and never the stack it was meant to be installed in. Fixed in
+`8bbda15` by moving stack assembly to `build_subscriber`, which `with_default` can install, and
+asking the installed subscriber via `tracing::enabled!`.
+
+**The transferable rule: a predicate test and a wiring test are different tests — and every one of
+this project's laundering findings has had a correct predicate.**
+
+**Open, and the queue from here:** F17, F14, admin-write/audit non-atomicity, the
+leaked `trusted_jwt_issuers` test rows, and F2 (user-deferred).
+
+**Needs a human — recorded, not implied:** T11's deploy; the **rig-core issue for F16**, which should
+go under a person's name; and a **Google credential** if the OAuth mock/live seam ever needs closing —
+everything is verified against a real TLS mock IdP with real signed JWTs, and what cannot be proven
+without one is Google's own token claims, consent screen and key rotation.
 
 ### Plan 09 wave 4, stage 4A — landed on `plan/09-wave4-multi-provider` (2026-07-31)
 
@@ -1545,6 +1578,99 @@ Two general lessons, both worth more than the specific bug:
    *reachable* — a guard whose premise the schema now forbids asserts nothing.
 2. **"Verified by a panel" is not verification.** Three designs, three judges and a synthesis all
    passed this through. The mutation is the only step that touched reality.
+
+## D-W2-1 — recovery invites were deliberately NOT built in wave 2 (recorded 2026-07-31, retroactively)
+
+**This decision was taken in plan 09 wave 2 and recorded nowhere a planner would find it.** Its only
+written trace was a comment in `migrations/0017_admin_invites.sql` and two comments in the i18n
+catalogues:
+
+> *"a column no code writes is the schema equivalent of a catalog entry with no emitter."*
+
+Wave 2 shipped the invitation backend without `is_recovery` and without
+`replaces_admin_identity_id`. There is no column, no DTO field, no route, no service method, no error
+code, no notice (`src/i18n/catalog/notices.rs` says "deliberately no `admin_identity_recovered`
+notice"), no audit event (`ADMIN_IDENTITY_GRANT_EVENTS` is exactly
+`["granted","revoked","ownership_transferred"]`) and no test.
+
+**Why it belongs here rather than only in a migration comment.** It removes a *third of wave 5's
+stated scope*. `RecoveryPanel`, `recovery.e2e.ts`, `recovery_invite_gets_no_domain_policy_exemption`
+and the `admin_identity_recovered` event are all unbuildable, and a wave-5 implementer reading the
+plan body would have discovered that only by trying. The general rule this produces: **a decision
+that changes a later wave's scope must land in that wave's §0 and in this ledger, not only where it
+was taken.**
+
+## W5-D1 — recovery is CUT from plan 09 wave 5 (taken by the loop, 2026-07-31)
+
+Wave 5 ships **invitations and ownership only**. Per D-W2-1 above, recovery is a Moira backend slice
+— one migration (two columns plus a CHECK that `replaces_admin_identity_id` is set iff
+`is_recovery`), two DTO changes, an atomic revoke-and-grant swap inside the existing transactional
+envelope, a new error code and notice with pinned emitters, an OpenAPI regeneration, and a
+mid-transaction failure-injection test — with a thin UI on top. That is the size of wave 2's own
+grant-administration slice, and it is not UI work.
+
+Half of what recovery promises is **already achievable with what exists**: "revoke a locked-out
+admin's grant, then invite their replacement" is two ordinary operations, and `AdminTable` plus
+`InviteAdminForm` expose both. What is genuinely missing is the *atomicity* of the swap, and
+atomicity is a backend property. A `RecoveryPanel` performing two independent calls while the plan
+promises "never a window where both or neither exist" would be the appearance of a feature.
+
+*Reversal condition:* when a wave takes the Moira change end to end — `is_recovery`,
+`replaces_admin_identity_id`, the in-envelope swap, `admin_identity_recovered`, and the
+mid-transaction failure-injection test asserting neither half persists without the other. The UI is a
+follow-on to that, never its driver.
+
+## W5-D7′ — the a11y walker DECLARES its blind spot instead of failing forever (taken by the loop, 2026-07-31)
+
+Plan 09 §0.8.4 step 24 asked for the final-URL assertion plus a permanently red suite: *"expect `/`
+and `/admins` to fail it until an authenticated e2e path exists. Record that failure honestly."*
+
+A permanently red merge gate is not a gate. It blocks every later change for a reason unrelated to
+that change, and the pressure to weaken it is then constant — which is how the assertion gets lost
+rather than kept.
+
+**Taken instead:** the walker classifies each route as gated or public from its source path;
+a **public** route's final pathname is asserted to equal the one requested BEFORE axe runs; a
+**gated** route is asserted to redirect to `/login` and is NOT audited; and the unaudited set is
+pinned in **both directions** against a declared list. Same information visible, same drift fails,
+and it merges.
+
+Mutation-verified: a `redirect("/login")` injected into the public `/invite/[token]` fails the URL
+assertion naming both URLs; removing `/admins` from the declared list fails the set assertion.
+
+*Reversal condition:* when an authenticated Playwright project exists — which needs a mock IdP inside
+the e2e environment — delete the declared entries and KEEP the URL assertion. The assertion is what
+will prove the authenticated run is doing anything.
+
+## THE THIRD TOOTHLESS GUARD, CAUGHT BY ITS OWN MUTATION — 2026-07-31 (plan 09 wave 5)
+
+**`route-handler-session.test.ts`'s named mutation left it GREEN.** The guard is "every route handler
+under `app/api/**` re-checks the session itself" — necessary because route groups contribute no
+layout there, so a handler inherits no gate. It scanned each `route.ts` for `withConsoleSession(`.
+
+The mutation was to delete the guard from `DELETE` in `app/api/admins/identities/[id]/route.ts`,
+which exports **both** `PATCH` and `DELETE`. It passed: the file still contained the call, in the
+other handler.
+
+**A file-level scan can express "some handler is guarded", never "every handler is"** — and the
+second exported method in a file is exactly where an unguarded mutation endpoint would go.
+
+Rebuilt per exported method, with the body brace-matched. Two extractor bugs surfaced only by
+re-running the mutation, not by reading the code:
+
+1. the first `{` after `export async function POST` is inside the **second parameter's** type
+   annotation (`{ params: Promise<…> }`), so brace-matching from there ended the "body" before it
+   began, and a correctly guarded handler was reported as unguarded;
+2. `export const GET = handle;` has no body. Skipping it would have made the alias form a hole in the
+   rule, so it is recorded with an empty body — i.e. unguarded — which is the safe direction.
+
+Re-mutated after the fix: both the `DELETE`-only deletion and the alias rewrite fail, naming the
+method.
+
+**Third occurrence of the same shape** (after F19's enumeration oracle and G1's decoy-less fixture).
+The standing question is now: *after any change to what a guard measures, can its fixture still
+represent the defect it is named for?* Here the answer was no for a reason nothing in the code
+looked wrong about.
 
 ## D3 — wave 4 implements Option A′, staged 4A / 4B (taken by the loop, 2026-07-31)
 

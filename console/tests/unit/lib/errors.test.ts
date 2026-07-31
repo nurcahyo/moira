@@ -16,7 +16,7 @@ import {
 // deliberately client-safe. `bunfig.toml` preloads the shim that makes the marker
 // package importable under `bun test`.
 import { serverDiagnostics } from "@/lib/errors-server";
-import { MOIRA_SETUP_ERROR_CODES } from "@/lib/moira-keys";
+import { MOIRA_MIRRORED_ERROR_CODES } from "@/lib/moira-keys";
 import { errorEnvelope } from "../../support/moira-stub";
 
 /** Every string anywhere inside a value, however nested. */
@@ -250,7 +250,12 @@ describe("the union is exhaustively discriminated", () => {
 
 describe("coverage of the mirrored key list", () => {
   test("every mirrored error code has an explicit remedy", () => {
-    const unmapped = MOIRA_SETUP_ERROR_CODES.filter(
+    // `MOIRA_MIRRORED_ERROR_CODES`, not `MOIRA_SETUP_ERROR_CODES`. When plan 09
+    // wave 5 added the eleven invitation/ownership codes, keeping this on the
+    // setup half alone would have left the new family unmapped while the test
+    // stayed green — a coverage assertion that stops covering the new thing,
+    // which is the shape this project keeps rediscovering.
+    const unmapped = MOIRA_MIRRORED_ERROR_CODES.filter(
       (code) => MOIRA_CODE_REMEDIES[code] === undefined,
     );
     // An unmapped code would silently take the status default, which is exactly

@@ -865,6 +865,722 @@ Recorded for the same reason §0.7.6 exists.
   Eighteen fixtures in `tests/admin_invite_lifecycle.rs` and fourteen in `tests/identity_claim.rs`
   used the unbound shape and were rewritten to bind — which is what a real console deployment does
   and what `auth-config.ts` already requires.
+---
+
+## §0.8 — Wave 5 (invitations + ownership UI): drift against the tree (audit 2026-07-31, `main` at `0b7792b`, PR #39 read at `4ea484b`)
+
+**Scope of this section.** Waves 1–3 are merged and §0.7 audits wave 4. This section audits **wave 5
+only** — the invitation UI, the ownership-transfer / recovery UI, and session management — against
+the tree as it stands now **and against the tree as it will stand after PR #39 (`fix/findings-sweep`)
+merges**. Where §0.8 and any earlier §0 subsection disagree about the present tree, **§0.8 wins**;
+where §0.8 and the body disagree, §0.8 wins. §0.8 does not restate wave-4 findings; where a wave-4
+finding also binds wave 5 it is cited, not repeated.
+
+**Measured drift: ~83%** — 43 of 52 discrete, checkable wave-5 claims are wrong or materially
+incomplete (9 hold, 6 hold only in part, 1 could not be established). Counted the same way §0.7
+counted wave 4: by extracting every falsifiable assertion in the wave-5 surface of the body — the
+invitation-UI, session-management and ownership-transfer/recovery-UI implementation sections; the two
+data-flow blocks; the Atomic-Design placement rows for wave-5 files; the console-side i18n table; the
+wave-5 rows of the API and Interfaces tables; the Scopes/authz section; the named wave-5 Rust,
+console-unit and e2e tests; and the wave-5 Definition-of-Done and product-decision items — then
+checking each against the working tree, the committed `docs/openapi.json`, a shipped test, or PR #39's
+diff. Roughly half the drift is *"already shipped, in a different shape"* (waves 2 and 3 built more
+than this plan predicted, and named it differently); the other half is *"specified against something
+that does not exist"*. **The figure is unchanged by §0.8.7's amendment:** the adversarial
+verification of §0.7 added two blockers (**W5-B11**, **W5-B12**) and moved one claim from *holds* to
+*holds in part*, which leaves wrong-or-materially-incomplete at 43 of 52.
+
+**The one-paragraph version.** Wave 5 as written is three features. One of them —
+**invitations** — is genuinely a UI wave over a backend that is complete, better than specified, and
+already has eleven catalogued error codes and a sixteen-test integration suite. The second —
+**ownership** — is also a UI wave, but only after PR #39, which is what makes any admin primary at all
+and which changes transfer from two calls into one. The third — **recovery** — has **no backend
+whatsoever**: wave 2 deliberately omitted `is_recovery` and `replaces_admin_identity_id` under an
+unrecorded decision (D-W2-1), so `RecoveryPanel`, `recovery.e2e.ts` and the `admin_identity_recovered`
+audit event are specified over a migration nobody has written. Separately, four shipped console gates
+— the secret-leak modal tripwire, the dynamic-route coverage guard, the secret-shaped-DTO rule and the
+`"use client"` containment rule — will each go **red on the first commit of this wave**, by design;
+none is named in the plan. And the a11y gate is currently **vacuous for every route inside
+`(console)`**, which is the wave's entire surface.
+
+### §0.8.1 Drift table — wave-5 claims that no longer match the tree
+
+Grouped by area. "Body" means the wave-5 prose in this file unless another section is named.
+
+#### The Moira surface the wave-5 UI binds to
+
+| # | Body says | Reality (verified at `0b7792b`, and at `4ea484b` where marked **#39**) |
+|---|---|---|
+| 1 | `POST /api/v1/admin-invites/{preview,redeem}` sit **outside** the `/api/v1/admin/*` prefix | Both are `POST /api/v1/admin/admin-invites/{preview,redeem}`, registered in `admin_routes()`. §0.1 **B7** said so; the body's Interfaces & Contracts table still says otherwise. `preview` is on the unauthenticated allow-list inside `every_operation_documents_request_ids_and_protected_operations_document_auth`, with the explanation that comment demands |
+| 2 | Create body is `{ email_or_domain_type: "email"\|"domain", value, expires_in_seconds, is_recovery?, replaces_admin_identity_id? }` | `AdminInviteCreateRequest { constraint: AdminInviteConstraint, value: String, expires_in_seconds: u32 }`, `deny_unknown_fields`. The field is `constraint`, not `email_or_domain_type`, and **neither recovery field exists** |
+| 3 | `preview` returns "the inviter's display email with the local part masked, e.g. `j***@example.com`" | `AdminInvitePreviewResponse { constraint, value, expires_at }` and nothing else, pinned by `the_anonymous_preview_response_carries_only_constraint_and_expiry`. Masked inviter attribution was **considered and declined** in the DTO's own doc comment, with a reversal condition ("if product wants inviter attribution, it arrives with its own masking function and its own leak test") |
+| 4 | `PATCH /api/v1/admin/admin-identities/{id}` grants/revokes `moira:admins:manage` inside the target's `granted_scopes` | `AdminIdentityPatchRequest { is_primary: bool }` — one required field, `deny_unknown_fields`, pinned by `the_ownership_patch_request_has_exactly_one_field`. `granted_scopes` is never written by this path |
+| 5 | The caller scope for `PATCH`/`DELETE /admin-identities/{id}` is `moira:admins:manage` | The gate is `AdminIdentityService::require_primary_actor` — **row state, not a scope**. `is_known_scope("moira:admins:manage")` is asserted **false** in `src/security/authz.rs`. Only `moira:admins:{read,invite}` were added to `ADMIN_SCOPES` |
+| 6 | `moira:admins:manage` "is deliberately checked as an **explicit** scope (**not** implied by `moira:admin`)" and "must be implemented **and tested** as an explicit check" (Scopes/authz, Risks, DoD) | Settled against, in code, by §0.2 **D1**. The body still asserts it in four places and the DoD still requires it. `moira.error.admin_identity_not_primary`'s catalogue description states the reason in one sentence: *"a scope could not express 'not every admin'"* |
+| 7 | `AdminTable` renders a "primary" badge for rows whose `granted_scopes` include `moira:admins:manage` | Read `AdminIdentityRecord.is_primary`. `console/lib/types.ts` already carries the field, in `ADMIN_IDENTITY_RECORD_CONTRACT.required`, with an in-file warning not to render it as a capability the *signed-in* user has |
+| 8 | Recovery invites exist: `is_recovery: true`, `replaces_admin_identity_id`, an atomic revoke-and-grant swap in one transaction | **Nothing exists.** No column, no DTO field, no route, no service method, no error code, no notice, no test. Wave 2 recorded **decision D-W2-1** — "a column no code writes is the schema equivalent of a catalog entry with no emitter" — in `migrations/0017_admin_invites.sql` and in both i18n catalogues. See **W5-B1** |
+| 9 | Recovery-invite creation is gated on `moira:admins:manage`, "since recovery is a higher-privilege action" | Neither the scope nor the feature exists |
+| 10 | Recovery is "audited as a distinct `admin_identity_recovered` event" | `src/i18n/catalog/notices.rs` says "deliberately no `admin_identity_recovered` notice". `ADMIN_IDENTITY_GRANT_EVENTS` is exactly `["granted","revoked","ownership_transferred"]` |
+| 11 | Ten new Moira error codes are wave-5 work (`invite_expired`, `invite_already_consumed`, `invite_revoked`, `invite_email_mismatch`, `invite_domain_mismatch`, `invite_not_found`, `admin_identity_last_primary`, `admin_identity_not_found`, `admin_identity_already_revoked`, `admin_invite_expiry_too_long`) | **All ten shipped in wave 2**, each with a pinned emitter and status. Wave 5 adds none. The plan also never names the eleventh, `admin_identity_not_primary`, which is the one the ownership UI must actually render |
+| 12 | Four new notices are wave-5 work | Three shipped (`admin_invite_created`, `admin_invite_redeemed`, `admin_identity_revoked`); the fourth (`admin_identity_recovered`) is deliberately absent |
+| 13 | Wave 5 owns `migrations/0017_admin_invites.sql` | `0017` and `0018` shipped in wave 2; **#39** adds `0019_single_primary_admin.sql`. `0016` is a permanent gap. **Wave 5 as scoped needs no migration at all** |
+| 14 | "`admin_identities` gains **no** new column" | It gained `is_primary boolean not null default false` in `0017`, with a partial index and a two-step one-shot backfill |
+| 15 | This plan "changes the OpenAPI surface and must land **before** plan 05's gate freezes the spec" | The gate is live and wave 2 already regenerated the snapshot. Wave 5 as scoped adds **no route**, so `assert_eq!(operation_count, 151)` and the 99-path `BTreeSet` must both be **unchanged**. If either moves, a route was added by accident |
+| 16 | "the operation count still **10**", re-verified at Wave 0 | Three different numbers, none of them 10 in that sense: the auth-provider family is **7** operations; the invite/identity family is **9**; the committed document is **151** operations over **99** paths. Already recorded as §0.7 #23 and repeated here because the wave-5 Wave-0 checklist and the Interfaces table both still say 10 |
+| 17 | Ownership transfer is "two sequential calls, each with its own `Idempotency-Key` and `If-Match`" — promote the target, then demote the actor | **#39**: `set_primary` calls `demote_active_primaries_other_than` inside the same transaction, and `admin_identities_single_active_primary` refuses a second owner outright. **Transfer is ONE `PATCH`.** The second call would demote the operator just promoted, or 409 on a stale `If-Match`. Before #39 it is two calls — so this claim is wrong in one direction today and wrong in the other after #39. See **W5-B8** |
+| 18 | "revoking the last admin leaves system-key break-glass as the re-entry path" | **#39**: `revoke_grant` clears `is_primary`, and the last-primary guard refuses that, so **a deployment's sole admin cannot be revoked through the API at all** — `revoking_the_owner_is_refused_by_the_last_primary_guard`. The repository doc comment states it as a consequence of D-F20, not an oversight. The UI must say so, not surface a bare 409 |
+
+#### Console foundations wave 5 builds on
+
+| # | Body says | Reality |
+|---|---|---|
+| 19 | `middleware.ts`'s host allow-list covers the new callback URLs and is unchanged | **There is no `middleware.ts` anywhere in the repository.** The session gate is `hasConsoleSession()` in the `(console)` route-group layout, which redirects to `/login` and fails **closed** on a Moira outage. Confirms §0.7 #15 — wave 3 never shipped one, and there is no host allow-list to inherit |
+| 20 | The invite link is displayed in "plan 08's existing `console/components/molecules/OnceOnlySecretModal.tsx`" | It is `console/modules/secrets/OnceOnlySecretModal.tsx` — an **organism**, not a molecule, shipped in **wave 3**, not plan 08. Its props are already invite-shaped (`secret: string \| null`, `resource: AdminInviteRecord`, `notice: ResponseText`, `inviteBaseUrl`), and `secret === null` is the normal idempotent-replay case, not a failure |
+| 21 | `SignInPanel` is "reused from plan 08" | **Holds in part** — the organism exists and is reusable, but it shipped in wave 3 at `console/modules/signIn/SignInPanel.tsx`, and it takes a fully-resolved `SignInPanelState` prop rather than fetching. A public invite page must resolve that state server-side itself |
+| 22 | `layer-dependencies.test.ts` is "plan 08's" and "covers these files automatically" | **Holds in part.** The file exists — shipped in **wave 3** — and does cover new files automatically. But it is one of **five** guards, four of which the plan never names: `console/architecture.test.ts`, `tests/unit/architecture/{layer-dependencies,no-secret-props,server-only-guards,server-only-import}.test.ts`, plus `tests/unit/lib/no-hardcoded-copy.test.tsx`. Their combined rules are what actually shape this wave — see **W5-B3**, **W5-B7**, **W5-B10** |
+| 23 | `console/tests/unit/architecture/bundle-scan.test.ts` is new work owned by this plan | Superseded. `console/e2e/secret-leak.e2e.ts` already scans `.next/**` build output, rendered HTML, RSC flight data, console output and page errors, with a vacuity guard and an armed once-only needle. Already §0.7 #29; repeated because the wave-5 test list and the Verification section both still name the file |
+| 24 | `docs/admin-console.md` (created in plan 08) gains new sections | It does not exist. `docs/console-architecture.md` and `docs/console-storage.md` do; `docs/admin-identity-claiming.md` is the runbook the invitation runbook should sit beside |
+| 25 | `lib/provider-secrets.ts` is reused verbatim; `console_auth.authProviderSecret` is already N-row | Renamed and re-homed in wave 1: `lib/console-secrets.ts` + `lib/console-secrets-postgres.ts` over table `console_provider_secret`. Already §0.4; still asserted in the wave-5 security-boundary and DoD sections |
+| 26 | `loadAuthSettings()` / `invalidateAuthSettings()` | `loadAuthConfig()` / `resolveAuthConfig()` / `resetConsoleAuth()`. Already §0.4 |
+| 27 | The console can already call the invite/identity endpoints | **One of nine.** `MOIRA_OPERATIONS` registers `createAdminInvite` only. `listAdminInvites`, `getAdminInvite`, `revokeAdminInvite`, `previewAdminInvite`, `redeemAdminInvite`, `listAdminIdentities`, `patchAdminIdentity` and `deleteAdminIdentity` are all unregistered, and every one needs a registry entry that `openapi-contract.test.ts` re-derives from the spec |
+| 28 | The console types cover the invite/identity DTOs | **Holds in part.** `AdminInviteConstraint`, `AdminInviteStatus`, `AdminInviteRecord`, `AdminInviteCreateRequest`, `AdminInviteSecretResponse` and `AdminIdentityRecord` all shipped in wave 3 with their `*_CONTRACT` descriptors. **Four are missing:** `AdminInvitePreviewRequest`, `AdminInvitePreviewResponse`, `AdminInviteRedeemRequest`, `AdminIdentityPatchRequest` — each needing an interface, a descriptor, an `assertKeyContract<ExactKeys<…>>` line and a `SCHEMA_CONTRACTS` row |
+| 29 | §0.1 **B9**: `/invite/[token]` cannot render provider-agnostic sign-in buttons because every read of auth configuration needs a credential (finding F15) | **No longer true, and this is a correction to §0.1.** F15 was resolved by the anonymous `GET /api/v1/admin/setup/sign-in-methods` returning `PublicSignInMethod`. `MOIRA_OPERATIONS.getSetupSignInMethods` has `credential: "none"`. Its registry comment states the limit precisely: the projection is enough to **render** a button and not enough to **resolve** the configuration behind one — resolution still needs `allowed_email_domains` and `trusted_jwt_issuer_id`, which the server already holds. So `/invite/[token]` is unblocked |
+| 30 | The accept-invite intent is carried "in a signed, short-lived httpOnly cookie … mirroring 08's claim-intent pattern" | **There is no claim-intent pattern to mirror.** No cookie is set anywhere in `console/`; `lib/setup-flow.ts` implements provisioning but nothing under `app/` imports it, and there is no `/setup` route. This is greenfield design, not propagation |
+| 31 | New molecules `ExpiryPicker,CopyableLink,ScopeChipList,DangerConfirmDialog` and atoms `Tooltip,Avatar,Divider` | **Holds in part.** None exists — but two are already solved and one is obsolete. `CopyButton` (atom, wave 3) deliberately takes an element **id**, never the value, which is exactly what keeps the token in one place; `CopyableLink` taking a link that contains the token would re-open that. `Dialog` (atom, wave 3) is a native `<dialog>` with platform focus containment, which is what `DangerConfirmDialog` should compose rather than re-implement. `ScopeChipList` is obsolete: ownership is `is_primary`, not a scope. See **W5-D6** |
+| 32 | Pages carry `actions.ts` server actions (`app/(console)/admins/actions.ts`, `app/invite/[token]/actions.ts`) | **There is not one `actions.ts` in `console/`.** `nextCookies()` is deliberately absent from the Better Auth plugin list and there is no module-scope `auth` object to import; `SignInPanel` posts to the mounted route handler with `fetch` instead, and its header says why. The mutation transport for this wave is an **undecided design**, not an inherited one. See **W5-B7** and **W5-D5** |
+| 33 | The console i18n keys this wave needs exist or are reused ("no new i18n keys are needed for D7") | The catalogue has **45 keys** across `console.{error,a11y,meta,page,signIn,action,secret}`. There is **no** `console.admins.*`, `console.invite.*`, `console.sessions.*` or `console.authSettings.*` namespace. Every key the wave-5 tables name is new — and each must be added to **both** `lib/i18n/keys.ts` and `lib/i18n/catalog.en.ts` (the catalogue is typed `Record<ConsoleMessageKey, CatalogEntry>`, so a mismatch is a `tsc` failure before any test runs) |
+| 34 | "`i18n-catalog-coverage.test.ts` and `no-hardcoded-copy.test.tsx` extend to cover this plan's new files automatically; both must stay green" | **Holds** — both walk the tree from a derived root set, so `modules/admins/` and `app/(console)/admins/` are picked up with no edit. Two teeth the body never mentions: the coverage gate is **bidirectional** (a catalogue key nothing emits fails, and `tests/`/`e2e/`/`lib/i18n/**` are excluded from the emitter scan, so a key used only by its own test does not count), and **no two keys may share the same English message** |
+| 35 | "`@axe-core/playwright` on **every new page route** … zero critical/serious violations gates CI" | **Holds mechanically and is vacuous in practice.** `discoverPageRoutes` finds new routes with no edit, and the tags are `wcag2a/2aa/21a/21aa` with `critical`+`serious` blocking. But there is no authenticated Playwright state, so `page.goto("/admins")` follows the layout's redirect and audits `/login`. That is already true of `/` today. See **W5-B6** |
+| 36 | `authorization-denial.e2e.ts` and `i18n-message-key.e2e.ts` are "extended from 08" | Neither exists. `console/e2e/` holds exactly `a11y.e2e.ts`, `secret-leak.e2e.ts` and `smoke.e2e.ts` plus five support modules. Both are **new files** |
+
+#### Session management
+
+| # | Body says | Reality |
+|---|---|---|
+| 37 | Better Auth DB-backed sessions came from plan 08, which "gave the console its own `console_auth` schema" | Plan 08 shipped `memoryAdapter`. Durable storage shipped in **wave 1**. §0.1 **B3** recorded the old state; this is its resolution, not a confirmation of the body |
+| 38 | A real `session` table with created-at, last-updated, IP and user-agent exists | **Holds now.** `console/db/migrations/0001_better_auth_core.sql` creates `session(id, expiresAt, token unique, createdAt, updatedAt, ipAddress, userAgent, userId)` with `session_userId_idx`. `CONSOLE_DATABASE_URL` is **required in production**; the `memoryAdapter` fallback is reachable only outside production, which is where `bun test` and `next dev` run |
+| 39 | "revoke one session, or revoke all others" is available and genuine | **Could not be established.** `console/node_modules` is not installed in this worktree, so Better Auth 1.6.25's `listSessions` / `revokeSession` / `revokeOtherSessions` surface was not read. Recorded as unverified rather than assumed — this is exactly the class of claim §0.7 and the ledger's method note say to check before building on |
+| 40 | "Session lifetime/idle policy (`session.expiresIn`, `session.updateAge`) becomes an operator-editable auth setting persisted in Moira, applied at runtime" | No such field exists on `auth_provider_settings`, in any DTO, or in the committed spec. This is a **frozen-contract change** — a migration, DTO fields, a spec regeneration and a schema delta — hidden inside a sentence about a UI screen |
+| 41 | The "best-effort" caveat is removed from `docs/admin-console.md` | The file does not exist (see #24) |
+
+#### Tests, decisions and findings
+
+| # | Body says | Reality |
+|---|---|---|
+| 42 | The nine named Rust redeem tests are wave-5 deliverables, in a new `tests/admin_invite_lifecycle.rs` | The suite shipped in **wave 2** with sixteen tests, and **#39** adds ~786 lines more. Wave 5 writes no Rust test for the invite path |
+| 43 | Each of those nine named behaviours is covered | **Holds in part: seven of nine.** All nine are absent *by exact name*; seven have a semantically stronger equivalent (e.g. `a_policy_denied_redemption_leaves_the_invite_pending_and_the_same_link_still_works`, which asserts the invite **row's** `status` rather than a replayed response — the correction the ledger's METHOD NOTE demands). `redeem_denies_when_governing_provider_is_disabled` has **no equivalent on the redeem path**. `recovery_invite_gets_no_domain_policy_exemption` is unbuildable (#8) |
+| 44 | New console unit tests are needed for the new lib modules, organisms, molecules and atoms | **Holds.** Note the shipped standard: every organism test asserts rendered copy against `CONSOLE_CATALOG[key].message`, **never** an English literal, because "a literal assertion passes whether or not `t()` was ever called". Also note two shipped components with **no** unit test — `CopyButton` and `Dialog` — which wave 5 will lean on |
+| 45 | Product decision 1 — single primary vs. multiple `moira:admins:manage` holders — is open and "blocking before Wave 3" | **Resolved**, twice over: by the user on 2026-07-31 ("ownership is a SINGLE primary, set at claim time") and by **#39**'s decision **D-F20**, which is already written into §0.2 on that branch. The framing was also wrong — it is not a scope |
+| 46 | Product decision 2 — default invite expiry, recommend ≤72h enforced as a server-side hard cap | **Holds and is already shipped:** `MAX_INVITE_EXPIRY_SECONDS = 72 * 60 * 60`, refused rather than clamped (`admin_invite_expiry_too_long`, 422). The plan never mentions the **floor**, `MIN_INVITE_EXPIRY_SECONDS = 60`, which `ExpiryPicker` must respect |
+| 47 | Product decision 4 — which new admin screens are MVP-of-this-plan — needs product sign-off | **Holds as open.** Taken here as **W5-D9** under the standing decide-rather-than-ask authority |
+| 48 | Invite tokens are Argon2id+pepper hashed, single-use, time-capped, covered by `tests/admin_invite_lifecycle.rs` | **Holds**, shipped. `ApiKeyHasher` under namespace `moira_inv`, prefix-lookup-then-verify, `select … for update` single-winner, and a concurrent-redemption test |
+| 49 | Redeem validates outside the transactional envelope, so a denial does not consume the invite | **Holds**, shipped, and is load-bearing for finding **F19**: the ordering's real purpose is that `insert_grant` must not pre-empt the invite's own refusal, or a stranger with a leaked token learns whether an arbitrary identity already holds admin |
+| 50 | The redeem token carries no `scope`/`scp` claim and binds `sub` to the IdP subject | **Holds.** Redeem routes through `AuthService::verify_trusted_jwt_identity`, not `authenticate_admin`, and its spec `security` is `bearerAuth` alone |
+| 51 | D3 — an invite is never an exemption from `allowed_email_domains`, identically for routine and recovery invites | **Holds** for routine invites, shipped and tested. The recovery half is vacuous (#8) |
+| 52 | **F21** is plan 09's to fix — and §0.7's **W4-D6** reassigns it to wave 4 on cost grounds | **Both are wrong. F21 is already fixed, in PR #39, with a test.** `redeem_invite`'s `Err` arm on `fix/findings-sweep` reads `if !matches!(error, AppError::Replayed(_)) { … record_admin_invite_denied(…) }`, and `an_idempotent_replay_does_not_count_a_second_invitation_or_redemption` drives a cacheable 409 (`admin_identity_already_claimed`) twice under one `Idempotency-Key` and asserts `invite_outcome(…, "other") == 1.0` after the replay. That assertion would read `2.0` with the guard removed, so it is a test that works. **Neither wave 4 nor wave 5 may implement it** |
+
+**Holds as written (do not re-litigate):** the invite/ownership data-flow *shape* (create → share out of band → preview → sign in → redeem); D3 and D5 inheritance with no invitation carve-out; the token in request bodies only, never a query string; once-only display; the separation of `invite_*_mismatch` from `admin_claim_domain_not_allowed` on remedy grounds; `InviteAdminForm`'s pre-submit allow-list gate as the right *direction* for the stranding case (never a policy carve-out — but see **W5-B11**, which shows it cannot be the *guarantee* the body claims); `*.e2e.ts` under `console/e2e/`; Atomic-Design placement with organisms in `modules/`; no console-sent invite emails; and "the console's client-side capability check is UI gating only — Moira is the authority".
+
+### §0.8.2 Blockers, ranked
+
+Ranked by the stated severity on each heading, not by position: **W5-B11** and **W5-B12** were
+appended by §0.8.7's amendment and sit textually between W5-B7 and W5-B8, but W5-B11 is **high** and
+belongs to be read with W5-B2–W5-B4.
+
+**W5-B1 — the recovery UI is specified over a backend that does not exist, and building it is a Moira wave, not a UI wave. (Severity: highest — it is a third of the stated scope, and every artefact named for it is unbuildable.)**
+
+Wave 2 took **decision D-W2-1** and omitted `is_recovery` and `replaces_admin_identity_id` deliberately: *"a column no code writes is the schema equivalent of a catalog entry with no emitter."* There is no route, no DTO field, no service method, no error code, no notice, no audit event and no test. `RecoveryPanel`, `recovery.e2e.ts`, `recovery_invite_gets_no_domain_policy_exemption` and the `admin_identity_recovered` event therefore cannot be written at all.
+
+Doing it properly costs: one migration (two columns plus a CHECK that `replaces_admin_identity_id` is set iff `is_recovery`), two DTO changes, an atomic revoke-and-grant swap inside the existing envelope, a new error code and notice with pinned emitters, an OpenAPI regeneration, and a mid-transaction failure-injection test. That is the same size as wave 2's own grant-administration slice. It is not UI work and must not be smuggled into a UI wave. See **W5-D1**.
+
+*The D-W2-1 decision itself is an escalation:* it lives only in a migration comment and two catalogue comments. It is not in `plans/reports/EXECUTION-LEDGER.md` and was not in this plan's §0 until now. A decision that removes a third of a later wave's scope must be findable from the plan, not from `git log`.
+
+**W5-B2 — `redeem` cannot be registered in `MOIRA_OPERATIONS` under any credential requirement that exists. (Severity: high — nothing in the redemption path works until this is designed.)**
+
+`MoiraCredentialRequirement` is `"none" | "system_key_only" | "admin"`, and `openapi-contract.test.ts` asserts a branch per value: `none` ⇒ the operation declares **no** `security`; `system_key_only` ⇒ exactly `["systemKeyAuth"]`; anything else ⇒ the scheme list must **contain both** `systemKeyAuth` and `bearerAuth`. `redeem_admin_invite`'s committed security is `[{ "bearerAuth": [] }]` alone — deliberately, so no token-asserted scope and no bootstrap credential can reach a path that mints a grant.
+
+So `credential: "admin"` fails the contract test, and `credential: "none"` sends no `Authorization` header and 401s. Worse, `#buildHeaders`'s `admin` arm prefers the **system key when one is present**, which on the redeem path would send the console's bootstrap credential on an invitee's request. A fourth variant is required, with its own contract-test branch and its own refusal when a system key is supplied. See **W5-D3**.
+
+**W5-B3 — the two DTOs the redeem path needs fail a shipped architecture guard on the field name `token`. (Severity: high — reds `bun test` on the first commit, and the obvious fix weakens a real rule.)**
+
+`server-only-guards.test.ts` asserts that **no** Moira DTO in `lib/types.ts` declares a field matching `/(secret|masked|fingerprint|token|password|api_?key|private_?key|credential)/i`. Exactly one interface is exempt — `AdminInviteSecretResponse`, with its member set pinned to `["notice","resource","secret","secret_retrievable"]` — and exactly two field names are exempt: `token_url` and `setup_token`. **Every exemption is checked in reverse**, so an exemption that carves out nothing is itself a failure.
+
+`AdminInvitePreviewRequest.token` and `AdminInviteRedeemRequest.token` both match. Widening `SECRET_DTO_FIELD_PATTERN` would silently un-guard `secret`, `password` and `api_key` across every DTO. See **W5-D4**.
+
+**W5-B4 — mounting `OnceOnlySecretModal` on a page fails `secret-leak.e2e.ts`, by design. (Severity: high — deliberate, documented, and unscheduled.)**
+
+`no shipped route mounts OnceOnlySecretModal yet — and this fails when one does` walks `app/**` for the literal `modules/secrets/OnceOnlySecretModal` and asserts the result is `[]`. Its comment names this wave: *"The moment a page does mount it — plan 09's `/invite/[token]`, or an admin surface that creates one — this assertion FAILS, and whoever wrote that page has to arrange for the fixture token to flow through it. Without this, that author would inherit a gate that reads as covering the render and does not."*
+
+The fixture is already seeded: `ONCE_ONLY_SECRET_FIXTURE = "moira-invite-token-fixture-8c41ab07f2de9536"` is unconditionally in the needle set, and its length / whitespace / slash constraints are separately asserted so it cannot be silently dropped by `isUsableNeedle`. Wave 5 must replace the negative assertion with a positive one that renders the modal with that token on a real route and confirms it appears in **zero** captured response bodies, RSC payloads, build outputs and console messages — except the one intentional reveal.
+
+**W5-B5 — `/invite/[token]` is the repository's first dynamic route and reds the coverage guard until a fixture is registered. (Severity: medium-high — a one-line fix nobody has scheduled, with a design consequence.)**
+
+`DYNAMIC_ROUTE_FIXTURES` in `e2e/support/routes.ts` is empty, and `a11y.e2e.ts` asserts `uncoveredRoutes(routes)` is `[]` — a dynamic route with no fixture is a **failing** condition, not a skip. Adding an entry is trivial; the consequence is not. The a11y test asserts `response.status() < 400`, so the fixture token's page must **render**, which means an invalid or expired token must produce an accessible error state rather than a 404. That is the right design; it should be chosen, not discovered.
+
+**W5-B6 — the a11y gate is vacuous for every route inside `(console)`, which is this wave's entire surface. (Severity: medium-high — a green gate that audits the wrong page, and the exact signature the handoff warns about.)**
+
+There is no authenticated Playwright storage state anywhere in `console/e2e/`. The `(console)` layout redirects an unauthenticated visitor to `/login`, and `page.goto` follows redirects, so `no critical or serious axe violations on /` **currently audits `/login`**. The e2e environment makes this certain, not merely likely: `CONSOLE_PUBLIC_ORIGIN=https://console.e2e.invalid`, an unreachable DSN, and `smoke.e2e.ts` positively asserting the root route contacts no external origin — so `consoleRuntime()` always fails and the gate always redirects.
+
+Every screen this wave adds under `(console)` inherits that silence, and so would any `authorization-denial.e2e.ts` written the same way. This is the "leak suite passing a deliberately injected leak under `E2E_SKIP_BUILD=1`" pattern, one wave later. See **W5-D7**.
+
+**W5-B7 — a client organism cannot reach the Moira client, and there is no server-action precedent to follow. (Severity: medium-high — an architecture decision the plan assumes was already made.)**
+
+`layer-dependencies.test.ts` rule 5 forbids any `"use client"` module from importing a credential-carrying module, where that set is **derived** (reads `process.env`, imports `pg`, sends `X-Moira-System-Key` or `Authorization`, constructs an AEAD, handles a `clientSecret`, calls `betterAuth(`) and closed transitively over value imports. `lib/moira-client.ts` is in it by name. A client organism may import only `lib/errors.ts`, `lib/types.ts`, `lib/moira-keys.ts` and `lib/i18n/**`.
+
+So every mutation — create invite, revoke invite, transfer, revoke grant, redeem — needs a server-side transport. The plan says `actions.ts`; **there is no `actions.ts` in the repository**, `nextCookies()` is deliberately excluded from the Better Auth plugin list, and the one shipped interactive organism posts to a route handler instead. Choosing server actions means adopting `nextCookies()` — a change to the auth instance, in a wave that should not be touching it. See **W5-D5**.
+
+**W5-B11 — `InviteAdminForm`'s pre-submit gate cannot be as strong as the plan promises, and the projection it reads cannot be made to reproduce what redemption actually applies. (Severity: high — added by the §0.7 verification, see §0.8.7; it turns a stated guarantee into a best-effort hint.)**
+
+The body's rule is unambiguous: the gate blocks any invite that "would be refused at redemption", and "the client-side check is never more permissive than" Moira's. Redemption applies **exactly one** row. `redeem_invite` calls `governing_policy(&identity.issuer, trusted_jwt_issuer_id)`, whose `limit 1` selects the first enabled, active, non-deleted row matching `issuer = $1 or trusted_jwt_issuer_id = $2`, ordered `(issuer is not distinct from $1) desc, created_at asc, id asc`.
+
+The gate can only compute a **union** over `getSetupAuthMethods()`, and it cannot do better even in principle: `PublicAuthMethod` carries `id, method, display_name, issuer, discovery_url, authorization_url, client_id, jwks_url, requested_scopes, allowed_email_domains` — and **no `trusted_jwt_issuer_id`, no `created_at`, no enabled/ordering data**. So the console cannot tell which rows are in `governing_policy`'s candidate set, nor which of them wins.
+
+Consequences, both reachable:
+
+* With **one** enabled row the union equals the governing row and the gate is exactly right. That is today's state, and it is the strongest argument for shipping wave 5 before wave 4 (**W5-D10**).
+* With **two or more** enabled rows bound to the console's trusted issuer, the union is strictly wider than the governing row, so the gate passes invites that redemption refuses — the exact stranding it exists to prevent. Under **F23** it can also be narrower in the other direction: a row whose own `issuer` equals the console's outranks the correctly linked row at any age, so the gate may block an invite that would in fact have redeemed.
+
+Closing it properly is not wave-5 work. Either Moira's rule becomes the union (§0.7 **W4-D4**), or Moira refuses the ambiguous multi-row state outright (F23's mitigation), or `PublicAuthMethod` grows the resolution inputs — a frozen-contract change on a credentialed projection. See **W5-D11**.
+
+**W5-B12 — the admin list has no human-distinguishable identity column, and under F24 two people can be one row. (Severity: medium — a correct-looking screen that misattributes authority.)**
+
+`admin_identities` is keyed on `(issuer, subject)` where `issuer` is the **console's** and therefore identical on every row, for every provider. So `AdminTable` rendering an "issuer" column shows one constant value and disambiguates nothing; `subject` is an opaque IdP string; **`email` is the only human-identifiable attribute on the record**, which is exactly why D5 makes it required and non-nullable.
+
+**F24** makes that worse rather than merely inelegant: with two providers minting under one console issuer, two IdPs returning the same `sub` collapse onto **one grant**. The wave-5 surfaces that must answer for it: `AdminTable` must lead with `email`, not `issuer`; and `InviteAcceptPanel` must not word `admin_identity_already_claimed` as "you already have admin", because under F24 the holder may be someone else entirely. Note also that this is the one refusal raised **inside** the transactional envelope, which is why it is the cacheable 409 that F19's ordering keeps from pre-empting the invite's own constraint and that F21's guard stops double-counting — the same code, on three findings.
+
+**W5-B8 — transfer is one call after #39 and two before it, and the sole-admin row can no longer be revoked. (Severity: medium — ships a wrong action or a bare 409.)**
+
+After #39, `set_primary` demotes every other active primary in the same transaction and `admin_identities_single_active_primary` refuses a second owner; the plan's second "demote the actor" call would demote the person just promoted, or 409 on a version it no longer holds. And because `revoke_grant` clears `is_primary`, revoking the owner is refused — so on a fresh deployment with one admin, `DELETE /admin-identities/{id}` is unavailable for that row. `AdminTable` must render that as a stated rule with the remedy ("transfer ownership first"), not as a failed request.
+
+**W5-B9 — the `authorization-denial` case the plan names cannot be constructed. (Severity: medium — a test that would pass by never exercising anything.)**
+
+"an identity holding `moira:admin` but **not** `moira:admins:manage` can view `/admins` but cannot transfer or revoke" describes a scope that does not exist and, per §0.1 **B1**, could not be withheld if it did. The constructible case is an **active grant with `is_primary = false`**, which meets `require_primary_actor` and receives `403 moira.error.admin_identity_not_primary`. Assert that code, not the absence of a scope.
+
+**W5-B10 — new copy must land with its emitter, in two files, and may not reuse an existing English string. (Severity: medium — three separate ways to be red for reasons the plan never states.)**
+
+A key in `lib/i18n/keys.ts` without an entry in `catalog.en.ts` is a **typecheck** failure. An entry whose key nothing emits fails `i18n-catalog-coverage.test.ts`'s orphan check — and `tests/`, `e2e/` and `lib/i18n/**` are excluded from the emitter scan, so a key referenced only by its own test does not count as an emitter. Two keys sharing one English message fail. No key may match `/rotate.*secret/i`. `no-hardcoded-copy.test.tsx` additionally forbids literal `aria-label`, `title`, `placeholder`, `alt` and default-parameter copy, so every accessible name in every new component is a catalogue key too.
+
+One trap for any new scanner this wave writes: `lib/setup-flow.ts` contains a literal NUL byte, which makes `grep`/`rg` classify it as binary and skip it silently. Read files with `readFileSync(path, "utf8")`, as the shipped scanners do.
+
+### §0.8.3 Decisions taken for wave 5, each with its reversal condition
+
+Taken under the standing "decide rather than ask" authority. Each belongs in
+`plans/reports/EXECUTION-LEDGER.md` alongside the wave-1–4 decisions.
+
+**W5-D1 — recovery is CUT from wave 5. Wave 5 ships invitations and ownership only.**
+Per **W5-B1**, recovery is a Moira backend slice (migration, DTOs, atomic swap, code, notice, spec
+regeneration, failure-injection test) with a thin UI on top, and wave 2 removed it deliberately. Half
+of it — "revoke a locked-out admin's grant, then invite their replacement" — is **already achievable
+with what exists**, as two ordinary operations, and `AdminTable` plus `InviteAdminForm` expose both.
+What is genuinely missing is only the *atomicity* of the swap, and atomicity is a backend property.
+Building a `RecoveryPanel` that performs two independent calls while the plan promises "never a window
+where both or neither exist" would be the appearance of a feature — the same failure mode the session
+decision was taken to avoid.
+*Reversal condition:* when a wave takes the Moira change end to end — `is_recovery`,
+`replaces_admin_identity_id`, the in-envelope swap, `admin_identity_recovered`, and the
+mid-transaction failure-injection test asserting neither half persists without the other. The UI is a
+follow-on to that, never its driver.
+
+**W5-D2 — session management STAYS CUT, and the reversal condition is not yet met.**
+The recorded reversal condition has two halves: *durable storage ships* and *the invitation flow is
+green*. The first is now met — wave 1 (PR #36) shipped `console_auth`, the durable Better Auth
+adapter and the durable secret store. The second is what wave 5 builds, so it cannot be met at wave-5
+planning time. Three further reasons, each independent: the plan's session scope silently includes an
+operator-editable lifetime/idle policy **persisted in Moira** (#40), which is a frozen-contract change
+and must stay cut regardless; `bun test` and `next dev` default to `memoryAdapter`, so a sessions
+screen's unit tests would exercise a store the shipped feature does not use; and per **W5-B6** its
+a11y and e2e coverage would land behind the same silence as every other gated route. Finally, the
+capability it competes with already exists and is stronger: `DELETE /admin-identities/{id}` revokes
+*authorization*, where a session revocation only ends *authentication*.
+*Reversal condition:* restore it as its own small wave when all three hold — (a) the invitation flow is
+green on `main`, (b) the a11y gate is non-vacuous for routes inside `(console)`, and (c) Better Auth
+1.6.25's `listSessions`/`revokeSession`/`revokeOtherSessions` surface has been read and confirmed —
+drift-table row #39 records that it was **not** verified here, and building a revocation screen on an
+unread API is how the last four findings in this project started. The Moira-persisted lifetime policy
+(#40) stays out of scope even then, as its own decision.
+
+**W5-D3 — add a fourth `MoiraCredentialRequirement`, `"bearer_only"`, rather than registering redeem as `admin`.**
+It carries the invariant that matters: this operation accepts the invitee's freshly-minted, grantless
+JWT and **must not** accept the console's bootstrap system key, because a system-key redemption would
+be the console granting admin to an identity of its own choosing. `#buildHeaders` must throw
+`MoiraClientContractError` if a system key is supplied, mirroring `system_key_only`'s refusal of a
+bearer. `openapi-contract.test.ts` gains a branch asserting the declared scheme list is exactly
+`["bearerAuth"]`.
+*Reversal condition:* if the committed spec ever adds `systemKeyAuth` to `redeem_admin_invite`, this
+variant collapses back into `admin` — but that spec change is itself the decision, and it needs its
+own argument about why the console should be able to self-grant.
+
+**W5-D4 — carve out the two redeem/preview DTOs by name in `server-only-guards.test.ts`; do not widen `SECRET_DTO_FIELD_PATTERN`.**
+Add `AdminInvitePreviewRequest` and `AdminInviteRedeemRequest` to the interface exemption list with
+their member sets **pinned**, exactly as `AdminInviteSecretResponse` is, and keep the reverse check
+that every exemption still carves something out. Widening the pattern to drop `token` would un-guard
+every future DTO. Pin the member sets so a later field cannot ride in on the exemption.
+*Reversal condition:* if a third DTO needs `token`, stop exempting and introduce a typed
+`InviteToken` newtype whose name does not match the pattern — at three exemptions the list has become
+the thing it was guarding against.
+
+**W5-D5 — mutations go through route handlers under `app/api/**`, not server actions.**
+It is the shipped precedent (`SignInPanel` → `POST /api/auth/sign-in/oauth2`), it keeps
+`nextCookies()` out of the Better Auth plugin list in a wave that should not be touching the auth
+instance, and it keeps the credential graph on the server side of a boundary the architecture guards
+already understand. Route handlers under `app/api/**` sit outside every route group, so they are also
+outside the `(console)` session gate — each one must therefore re-check the session itself, which is
+explicit rather than inherited.
+*Reversal condition:* if a wave adopts `nextCookies()` deliberately, with its own tests for cookie
+propagation and CSRF, server actions become available and this collapses to a style preference.
+
+**W5-D6 — of the seven new molecules and atoms the plan names, build two: `ExpiryPicker` and `DangerConfirmDialog`. Drop `CopyableLink`, `ScopeChipList`, `Tooltip`, `Avatar` and `Divider`.**
+`CopyableLink` is actively harmful: `CopyButton` already takes an element **id** rather than a value,
+which is the design that keeps the token in one expression and one DOM node, and a prop named `link`
+carrying a token would also brush against `no-secret-props`. `ScopeChipList` is obsolete — ownership
+is `is_primary`, and `granted_scopes` is `["moira:admin"]` on every grant this plan creates.
+`Tooltip`, `Avatar` and `Divider` are decoration with no stated requirement; a tooltip in particular
+is an accessibility liability that the console's "every state has an ARIA counterpart" standard would
+have to earn. `DangerConfirmDialog` composes the shipped `Dialog` atom (native `<dialog>`,
+platform focus containment, no backdrop-click dismissal) rather than re-implementing focus management.
+`ExpiryPicker` must respect **both** documented bounds: `MIN_INVITE_EXPIRY_SECONDS = 60` and
+`MAX_INVITE_EXPIRY_SECONDS = 259200`.
+*Reversal condition:* each returns the moment a shipped screen needs it and a test can name the
+behaviour it adds. "The plan listed it" is not that.
+
+**W5-D7 — make the a11y walker assert it audited the route it asked for; do not ship an authenticated e2e storage state in this wave.**
+Add `expect(new URL(page.url()).pathname).toBe(route.pattern)` (or the fixture URL for a dynamic
+route) beside the existing `< 400` assertion. That converts **W5-B6**'s silence into a visible
+failure for `/`, `/admins` and every future gated route — which is the honest state, and is
+information the next wave needs. Building an authenticated storage state requires a mock IdP inside
+the Playwright environment, which the e2e harness does not have today (`tests/support/mock-idp.ts`
+serves the unit and integration suites, not `console/e2e/`); doing it properly is its own piece of
+work and doing it badly would produce exactly the green-but-empty gate this decision exists to expose.
+*Reversal condition:* when an authenticated Playwright project exists, keep the URL assertion **and**
+add the authenticated run — the assertion is what proves the authenticated run is doing anything.
+
+**W5-D8 — wave 5 makes no Moira change. `operation_count` stays 151 and the path `BTreeSet` stays at 99.**
+Every Moira capability this wave needs shipped in wave 2, and D-F20 shipped in #39. The correct
+outcome of `UPDATE_SNAPSHOTS=1 cargo test --lib http::tests::committed_openapi_matches_the_generated_document`
+in this wave is **no diff at all**; if `docs/openapi.json` moves, something was added by accident and
+must be found rather than regenerated over. The four spec gates
+(`every_if_match_operation_declares_the_documented_precondition`,
+`atomic_admin_idempotency_contract_is_explicit`, `once_only_key_responses_use_the_secret_envelope`,
+and the unauthenticated allow-list) already cover this surface and must stay untouched.
+*Reversal condition:* recovery (**W5-D1**) or the Moira-persisted session policy (#40). Both are
+separate waves with their own regeneration.
+
+**W5-D9 — the MVP screen set is `/admins` and `/invite/[token]`. `/settings/sessions` is cut; `/settings/auth` belongs to wave 4.**
+This resolves the body's open product decision 4. `/admins` carries the admin list, the invite form,
+the invite list, ownership transfer and grant revocation; `/invite/[token]` is the public redemption
+page. Wave 5 also owns the `(console)` chrome the layout deferred — its header says so in as many
+words: *"navigation, a header and a sign-out control arrive with the surfaces they navigate to."*
+Without navigation, `/admins` is reachable only by typing the URL.
+*Reversal condition:* none needed for the cut screens — they return with **W5-D1** / **W5-D2**. If
+product wants a different first screen, that is a scope call, not a correction.
+
+**W5-D10 — wave 5 sequences AFTER PR #39 merges, and is not implemented against `main` as it stands.**
+Three of this wave's findings invert depending on #39: transfer is one call or two (**W5-B8**), the
+sole admin is revocable or not (#18), and ownership is reachable by a JWT admin or only by
+break-glass (F20). Implementing the ownership UI against pre-#39 `main` means writing the two-call
+transfer and then deleting it. The migration number follows the same rule: wave 5 needs none, but if
+one is ever added it is `0020` after #39 and `0021` if wave 4 has also landed — **re-verify with
+`git ls-files migrations/` at branch time; two migrations with one number is a hard failure.**
+*Reversal condition:* if #39 is abandoned rather than merged, F20 reopens, F21 reopens with it, and
+wave 5's ownership half must be re-planned from the top — it would be building a transfer UI for a
+flag nothing sets. **Amended by §0.8.7:** wave 5 should also land **before** wave 4, not merely after
+#39 — F23 shows the multi-provider state is what breaks the invite gate (**W5-B11**) and the admin
+list (**W5-B12**), so every wave-5 screen is at its most correct while exactly one provider is
+enabled.
+
+**W5-D11 — `InviteAdminForm` WARNS rather than blocks whenever more than one provider is enabled, and says which it is doing. Do not claim a guarantee the projection cannot support.**
+Per **W5-B11** the console cannot reproduce `governing_policy`'s single-row resolution from
+`PublicAuthMethod`. Three ways to respond, and only one is honest. Blocking on the union is
+*under*-strict (it passes invites redemption refuses) and, under F23, also *over*-strict. Silently
+best-effort is the plan-08 B1 signature — a stated invariant nothing exercises. So: **block** when
+zero providers are enabled (unambiguous, and already the plan's rule); **block** when exactly one is
+enabled and the domain is uncovered (the union is provably the governing row, so the gate is exact);
+and **warn, with the reason, and allow submission** when two or more are enabled. The real safety net
+is shipped and stronger than the gate anyway: a policy-denied redemption does **not** consume the
+invite, so the same link works once the allow-list widens
+(`a_policy_denied_redemption_leaves_the_invite_pending_and_the_same_link_still_works`). Say that in
+the warning copy.
+*Reversal condition:* restore the hard block for N providers when **either** `governing_policy`
+becomes the union (§0.7 **W4-D4**) — at which point the console's union is exactly Moira's rule —
+**or** Moira refuses more than one enabled row per trusted issuer (F23's mitigation), which makes N
+unreachable. Do **not** close it by adding resolution inputs to `PublicAuthMethod` without arguing
+F15's admitting rule for a credentialed projection first.
+
+### §0.8.4 Ordered task list for the wave-5 implementation
+
+Sized for one agent. **Contract and guards first** — four shipped gates go red on the first commit,
+and finding that out after the screens are written is the expensive order.
+
+**Phase 0 — preconditions (do not start without these)**
+
+1. Confirm PR #39 is merged (**W5-D10**). Verify on `main`: `migrations/0019_single_primary_admin.sql`
+   exists; `set_primary` contains `demote_active_primaries_other_than`; `redeem_invite`'s `Err` arm
+   contains `!matches!(error, AppError::Replayed(_))`.
+2. Re-verify the migration inventory with `git ls-files migrations/` even though this wave adds none.
+3. Record **D-W2-1** (recovery deliberately unbuilt) and **W5-D1** in
+   `plans/reports/EXECUTION-LEDGER.md`. It currently exists only in a migration comment.
+
+**Phase 1 — the console↔Moira contract (no UI yet, and every gate stays green)**
+
+4. `console/lib/types.ts`: add `AdminInvitePreviewRequest`, `AdminInvitePreviewResponse`,
+   `AdminInviteRedeemRequest`, `AdminIdentityPatchRequest` — each with its interface, its
+   `*_CONTRACT` descriptor, its `assertKeyContract<ExactKeys<…>>` line, and a row in
+   `SCHEMA_CONTRACTS` (a descriptor missing from that array is checked by nothing).
+5. **Before step 4 can pass**, apply **W5-D4** to `server-only-guards.test.ts`: exempt the two `token`
+   DTOs by name with pinned member sets, keeping the reverse check.
+6. `console/lib/moira-client.ts`: add the eight missing `MOIRA_OPERATIONS` entries, transcribed from
+   `docs/openapi.json` and **not guessed** — `preview` is `credential: "none"`, `redeem` is the new
+   `"bearer_only"` (**W5-D3**), the rest are `"admin"`; `Idempotency-Key` is declared on create,
+   revoke, redeem and delete and **not** on the reads; `If-Match` is required on `patch` and forbidden
+   everywhere else in this family.
+7. Add the `"bearer_only"` arm to `#buildHeaders` (throw if a system key is supplied) and its branch
+   in `openapi-contract.test.ts` (declared schemes are exactly `["bearerAuth"]`). Verify the shipped
+   `"of the ten operations the console binds to, exactly two declare Idempotency-Key"` test is
+   unaffected — its `boundNames` list is hardcoded and excludes this family.
+8. Client methods: `listAdminInvites`, `getAdminInvite`, `revokeAdminInvite`, `previewAdminInvite`,
+   `redeemAdminInvite`, `listAdminIdentities`, `patchAdminIdentity`, `deleteAdminIdentity`. Use
+   `ifMatchFor(record)` for the patch. Remember `AdminInviteSecretResponse.secret === null` on replay
+   is the **normal** case, not an error.
+9. `console/lib/moira-keys.ts`: mirror the eleven wave-2 codes this wave renders —
+   `invite_not_found`, `invite_expired`, `invite_already_consumed`, `invite_revoked`,
+   `invite_email_mismatch`, `invite_domain_mismatch`, `admin_invite_expiry_too_long`,
+   `admin_identity_not_found`, `admin_identity_already_revoked`, `admin_identity_last_primary`,
+   `admin_identity_not_primary` — plus the notices `admin_invite_created`, `admin_invite_redeemed`,
+   `admin_identity_revoked`. Give each an entry in `MOIRA_CODE_REMEDIES` (`errors.test.ts` requires
+   one) and check `moira-keys.test.ts` still finds every mirrored key in
+   `docs/i18n-response-catalog.json`.
+10. `console/lib/invites.ts` (`// @server-only` **first line** and `import "server-only";` — the
+    derived-credential guard requires both): token handling, and the assertions the plan names
+    (the raw token is never logged, never serialised into a client payload, never placed in a query
+    string).
+
+**Phase 2 — i18n, before the components that emit it (they must land together)**
+
+11. Add every new key to **both** `lib/i18n/keys.ts` and `lib/i18n/catalog.en.ts`. Namespaces:
+    `console.admins.*` and `console.invite.*`. Minimum set implied by the screens —
+    page and section titles; the invite form's labels, hints and the two pre-submit refusals
+    (`invite_domain_not_in_allow_list`, `no_enabled_provider`); the invite list's status and
+    `expired` copy; the admin table's `primary` badge, transfer and revoke controls and their
+    confirmations; the "the owner cannot be revoked — transfer first" explanation (**W5-B8**);
+    the invitee-facing `domain_not_allowed` title/body/action; and an `aria-label` for every list,
+    dialog and live region, because `no-hardcoded-copy` forbids literal ones.
+12. Land keys and emitters in the **same commit** (orphan keys fail), give every entry a distinct
+    English message (duplicates fail), and add no key matching `/rotate.*secret/i`.
+
+**Phase 3 — organisms and the chrome**
+
+13. `(console)` chrome: navigation, header and sign-out, in `app/(console)/layout.tsx`. Without it
+    `/admins` is unreachable except by typing the URL, and the layout's own header schedules it here.
+14. `console/modules/admins/{AdminTable,InviteAdminForm,TransferPrimaryPanel}.tsx`. `AdminTable`
+    reads `is_primary` (**not** `granted_scopes`), disables revoke on the owner row with the keyed
+    explanation, and renders transfer as **one** `PATCH` (**W5-B8**).
+15. `console/modules/invite/InviteAcceptPanel.tsx`. Renders `admin_claim_domain_not_allowed` as an
+    actionable instruction — never the generic error banner — and never conflates it with
+    `invite_email_mismatch`/`invite_domain_mismatch`.
+16. Molecules per **W5-D6**: `ExpiryPicker` (honouring the 60 s floor and the 72 h cap) and
+    `DangerConfirmDialog` (composing the shipped `Dialog`). No `CopyableLink`, no `ScopeChipList`.
+17. Follow the shipped a11y standard rather than importing one: `role="alert"` for errors,
+    `role="status"` + `aria-live="polite"` for async updates with the region **present before** it is
+    populated, `aria-busy` on loading controls, `aria-invalid` + `aria-describedby` wired through
+    `FormField`, decoration `aria-hidden`, and every accessible name from the catalogue. Unit-test
+    rendered copy against `CONSOLE_CATALOG[key].message`, never an English literal.
+
+**Phase 4 — routes and transport**
+
+18. `app/(console)/admins/page.tsx` — thin: guard, fetch, render.
+19. Route handlers under `app/api/**` for every mutation (**W5-D5**), each re-checking the session
+    itself because `app/api/**` sits outside the `(console)` gate.
+20. `app/invite/[token]/page.tsx` — public, outside `(console)`. Server-side: `preview` with the
+    token in the **body**, then `getSetupSignInMethods()` (anonymous — #29) to render `SignInPanel`.
+    An invalid or expired token must render an accessible error **page**, not a 404 (**W5-B5**).
+21. `InviteAdminForm`'s pre-submit gate reads the enabled providers' `allowed_email_domains` through
+    `getSetupAuthMethods()` (credential `admin` — the inviting admin's bearer token). Disables
+    entirely when no provider is enabled. Per **W5-B11** and **W5-D11** it **warns** rather than
+    blocks when more than one provider is enabled, because the projection it reads cannot reproduce
+    what `governing_policy` resolves — and it must say which of the two it is doing. UI gating only:
+    Moira's redeem-time check remains the authority.
+
+**Phase 5 — the four gates that go red, closed deliberately**
+
+22. `e2e/support/routes.ts`: register `"/invite/[token]"` in `DYNAMIC_ROUTE_FIXTURES` (**W5-B5**).
+23. `secret-leak.e2e.ts`: replace `no shipped route mounts OnceOnlySecretModal yet` with a positive
+    assertion that renders the modal with `ONCE_ONLY_SECRET_FIXTURE` on a real route and confirms it
+    appears in **zero** captured bodies, RSC payloads, build outputs and console messages, with an
+    **empty** violation set (**W5-B4**).
+24. `a11y.e2e.ts`: add the final-URL assertion from **W5-D7**, and expect `/` and `/admins` to fail
+    it until an authenticated e2e path exists. Record that failure honestly; do not weaken the
+    assertion to make it pass.
+25. Confirm `layer-dependencies`, `no-secret-props`, `server-only-{guards,import}`,
+    `no-hardcoded-copy` and `i18n-catalog-coverage` are green with the new files.
+
+**Phase 6 — e2e and verification**
+
+26. `console/e2e/invite-redeem.e2e.ts`, `invite-negative.e2e.ts`, `invite-domain-policy.e2e.ts`,
+    `ownership-transfer.e2e.ts`, and **new** `authorization-denial.e2e.ts` / `i18n-message-key.e2e.ts`
+    (#36 — neither exists to extend). The denial case is a non-primary grant meeting
+    `admin_identity_not_primary`, not a missing scope (**W5-B9**). No `recovery.e2e.ts`, no
+    `sessions.e2e.ts`.
+27. `bun install --frozen-lockfile && bun run typecheck && bun run lint && bun test && bun run build && bun run e2e`.
+28. Rust: `scripts/gates.sh` with
+    `MOIRA_TEST_DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/moira'` **exactly** —
+    unchanged code, but the gate proves it. Expect `operation_count == 151` and no
+    `docs/openapi.json` diff (**W5-D8**).
+29. Docs: extend `docs/console-architecture.md` (**not** `docs/admin-console.md`) with the invitation
+    flow, ownership transfer, and the two consequences of D-F20 an operator will meet — a sole admin
+    cannot be revoked, and transfer moves the flag. Put the invitation runbook beside
+    `docs/admin-identity-claiming.md`.
+
+### §0.8.5 Escalations — written down, not blocking
+
+1. **TEST INTEGRITY — the a11y gate audits `/login` for every route inside `(console)`** (**W5-B6**).
+   Already true for `/` on `main`. It is not a wave-5 regression, but wave 5 is what makes it
+   material, and any `authorization-denial.e2e.ts` written without noticing would be green and empty.
+   **W5-D7** makes it visible rather than fixing it, deliberately.
+2. **SECURITY — nothing welds the `moira.*` keys the console actually renders to
+   `MIRRORED_MOIRA_KEYS`.** `t(notice.message_key, …)` and `t(state.messageKey, …)` pass arbitrary
+   server-supplied keys straight through; the mirror is hand-maintained and is imported by **no**
+   application module, only by two tests. Wave 5 renders eleven new Moira codes and three notices. The
+   failure mode is mild (an operator sees the server's English instead of the catalogue's) but the
+   gap is structural: it is a forward-only check over a hand-written list. A source scanner that
+   collects `moira.error.*` / `moira.notice.*` emissions the way `i18n-scan.ts` collects
+   `console.*` ones would close it. Unscheduled.
+3. **PRIVACY (low) — the invite list is a directory of pending invitees.** `AdminInviteRecord.value`
+   is the invited email address or domain and `consumed_subject` the redeemer's IdP subject; both are
+   returned to any `moira:admins:read` holder. That is the right audience, and it is worth stating
+   rather than discovering: `/admins` renders personal data, so its copy and any future export need
+   to be thought of that way.
+4. **PROCESS — decision D-W2-1 was recorded only in a migration comment and two catalogue comments.**
+   It removes a third of wave 5's scope, and nothing in the plan or the ledger says so. Fixed here;
+   the general lesson is that a decision which changes a *later wave's* scope must land in that
+   wave's §0, not only where it was taken.
+5. **F21 is fixed in PR #39** and **§0.7's W4-D6 is wrong** (#52). If wave 4 has already started, tell
+   it to skip that task. If #39 is abandoned, F21 reopens together with F20 and F13.
+5a. **SECURITY — F23 and F24 both land on the redeem path, which is wave 5's UI.** `redeem_invite` is
+   one of only two callers of `governing_policy`, so F23's wrong-policy resolution is enforced on
+   every redemption; and F24's `(issuer, subject)` collapse is what turns a second person's
+   redemption into `admin_identity_already_claimed`. Neither is wave 5's to fix — both are Moira-side
+   and both are prerequisites for *wave 4*, not wave 5 — but wave 5 is where an operator will meet
+   them, so **W5-B11** and **W5-B12** exist to make the UI honest about both rather than to repair
+   them. Full entries in the ledger.
+5b. **F25 — do not credit `checkSession` with anything.** It and `isEmailDomainAllowed` have no
+   shipped caller; the console's session-boundary domain gate is dead code with eleven green
+   assertions over it. Bears directly on **W5-D5**'s "each route handler re-checks the session
+   itself", which is where a wave-5 author would most plausibly assume it was already wired.
+6. **NO LIVE CREDENTIAL IS REQUESTED OR NEEDED.** Wave 5 touches no OAuth provider configuration; the
+   invitee signs in through whatever wave 3 and wave 4 already resolve, against the TLS mock IdP.
+   Nothing in this wave is deferred for want of a credential.
+7. **`replicaCount: 1` remains pinned** and wave 5 does not lift it. The reason is the per-process
+   auth-config snapshot in `auth-runtime.ts`, not storage — the chart's own note says the database
+   half of the work is done. Unchanged by this wave.
+8. **The `/invite/[token]` page is unauthenticated and takes a secret in a URL path.** Wave 2 already
+   bounded the server side (prefix lookup before any Argon2 work, so it is not a CPU-exhaustion
+   oracle; identical `invite_not_found` for a wrong prefix and a wrong hash, so it is not a guessing
+   oracle). The console side must not undo that: the token is exchanged server-side on first load and
+   must never reach client-visible state, a `Referer`, or an analytics call. There is no analytics in
+   `console/` today and `smoke.e2e.ts` asserts the root route contacts no foreign origin — extend
+   that assertion to `/invite/[token]`.
+
+### §0.8.6 Which findings depend on PR #39 merging
+
+**Depend on #39 — false or differently-true if it does not merge:**
+
+* **#17 / W5-B8** — transfer is one `PATCH`. On `main` today `set_primary` does **not** demote the
+  incumbent, so transfer really is two calls there. Implementing against pre-#39 `main` means writing
+  the two-call form and then deleting it.
+* **#18** — the sole admin is non-revocable. Introduced by #39's `revoke_grant`/last-primary
+  interaction plus `admin_identities_single_active_primary`. On `main` it is not true.
+* **#52 / F21** — the failure-replay double-count is fixed **only** on `fix/findings-sweep`. Without
+  #39 it is still live and returns to whichever wave takes it.
+* **W5-D10** and Phase 0 step 1 exist entirely because of this dependency.
+* Indirectly, the whole **ownership half of wave 5**: F20 means no admin is primary on any deployment
+  created after `0017`, so before #39 a transfer UI would be a control no JWT admin can ever use.
+  `insert_grant` setting `is_primary` on the first grant is #39's change, not `main`'s.
+
+**Do NOT depend on #39 — true either way:**
+
+* Every claim about the invite backend's shape (#1–#3, #11–#13, #48–#51) — wave 2.
+* Every console finding (#19–#36) and blockers **W5-B2** through **W5-B7**, **W5-B9**, **W5-B10**.
+* **W5-B1** (recovery has no backend) — D-W2-1 is wave 2's, and #39 does not touch it.
+* #14 (`is_primary` exists), #15/#16 (the spec is frozen at 151/99), #37/#38/#40 (session storage and
+  the absent lifetime policy), #45–#47 (product decisions).
+
+**One merge-mechanics note.** PR #39 edits this same file, inserting decision **D-F20** into §0.2.
+§0.8 appends after §0.7.6, so the two changes do not overlap and should merge without conflict — but
+verify rather than assume, and if a conflict appears, **keep both**: D-F20 is the decision and §0.8 is
+the audit that depends on it.
+
+### §0.8.7 Amendment — what changed when §0.7 was adversarially verified (F23, F24, F25)
+
+§0.8 was written against §0.7. Six independent verifiers then corrected §0.7 and raised **F23**,
+**F24** and **F25**, all now in `plans/reports/EXECUTION-LEDGER.md`. This subsection records exactly
+what that bought, so the value of the verification is visible rather than absorbed silently.
+
+**First, what did NOT change.** §0.8 rests on **no** corrected §0.7 claim. It never cites W4-B1,
+W4-B3, W4-B4, `PublicSignInMethod.provider_id`, or `governing_policy`'s scope. Its only reference to
+§0.7's conclusions is **W4-D6**, which it already overturns (#52). Checked mechanically, not by
+memory: the strings `W4-B1`, `W4-B3`, `W4-B4`, `provider_id` and `governing_policy` appeared nowhere
+in §0.8 before this amendment.
+
+**What changed — three additions, all in the direction of less confidence:**
+
+1. **W5-B11 is new**, at **Severity: high** — read it directly after W5-B4. The verification's finding that
+   `governing_policy` resolves one row *bound to one `trusted_jwt_issuer_id`*, and that this is
+   reachable today through Moira's admin API rather than gated by any console refusal, is what forced
+   the question "can the console's pre-submit gate reproduce that?". It cannot: `PublicAuthMethod`
+   carries neither `trusted_jwt_issuer_id` nor `created_at`, verified against the committed spec. The
+   plan's promise that the console "is never more permissive" than Moira is therefore unsatisfiable
+   for N > 1 providers. **W5-D11** takes the decision; the "Holds as written" list was amended, and
+   Phase 4 step 21 was rewritten from *block* to *block-or-warn, and say which*.
+2. **W5-B12 is new**, from **F24**. The wave-5 admin list is precisely the screen that has to answer
+   "which human is this row?", and the answer is `email` alone — `issuer` is the console's on every
+   row, and two IdPs returning one `sub` collapse onto a single grant. It also changed the required
+   copy for `admin_identity_already_claimed` on the invite path: it must not tell the reader they
+   already have admin, because they may not.
+3. **W5-D10 was amended** to prefer wave 5 **before** wave 4, not merely after #39. Every wave-5
+   screen is at its most correct while exactly one provider is enabled, which is the state F23 says
+   must be preserved until Moira itself refuses the ambiguous one.
+
+**F25 changes an instruction rather than a finding.** `checkSession` and `isEmailDomainAllowed` in
+`lib/moira-session.ts` have no shipped caller — confirmed here independently: every reference outside
+their definitions is a test or an i18n *description*. This matters for **W5-D5**, which puts each
+mutation behind a route handler under `app/api/**` that must re-check the session itself: a wave-5
+author will find `checkSession` sitting there under eleven green assertions and reasonably assume it
+is the shipped, wired guard. It is not. Wire it deliberately, with a test that fails when it is
+unwired, or leave it — but do not credit the console with enforcing anything at its session boundary.
+
+**F21's placement, restated with the verification's framing.** The verification agrees F21 is a
+**wave-2 backend defect by domain** — it lives in `redeem_invite`, which wave 2 wrote. §0.7's
+reassignment to wave 4 was on cost grounds only, and the reasoning is moot regardless: it is
+**already fixed in PR #39, with a test that would fail if the guard were removed** (#52). So the
+answer is neither "wave 4" nor "wave 5" — it is "wave 2's defect, already closed in #39". Neither
+wave implements it; both must be told so.
+
+**One correction back.** The claim that §0.7 "misquotes the ORDER BY, omitting `id asc`" is **wrong**,
+and F23's ledger entry repeats it. §0.7's drift row #7 quotes `(issuer is not distinct from $1) desc,
+created_at asc, id asc` in full, §0.7.2's W4-B1 prose says "leaving `created_at asc, id asc`", and
+§0.1 **B5** quotes the entire clause including `id asc`. Every other correction in the verification
+checks out against the tree, including the WHERE-clause scope, the `issuer = $1` outranking vector,
+and the reachability of the state through Moira's admin API without any console involvement.
+
+### §0.8.8 Amendment — what wave 5's implementation found, and what it changed
+
+Written during implementation, for the same reason §0.7.6 and §0.7.7.5 exist. Where this subsection
+and anything above it disagree, **this wins**.
+
+#### §0.8.8.1 Corrections to §0.8 itself
+
+1. **§0.8.4 step 6 is incomplete about `Idempotency-Key`.** It lists the header as declared on
+   "create, revoke, redeem and delete" for the invite/identity family. The committed spec ALSO
+   declares it on `patch_admin_identity`, alongside its required `If-Match`. The registry follows
+   `docs/openapi.json`; `moira-client.test.ts`'s exact-set assertion now names eight operations.
+2. **`revoke_admin_invite` is `POST /admin-invites/{id}/revoke`, not a `DELETE`.** There is no
+   `DELETE /admin-invites/{id}` in the spec at all. §0.8 never says otherwise, but the task list's
+   name (`revokeAdminInvite`) reads as one and a console that guessed would 404 in front of an
+   operator.
+3. **`delete_admin_identity` returns the record, not `204`.** Its 200 body is
+   `AdminIdentityRecord` carrying the `admin_identity_revoked` notice. Typing it `void` compiles and
+   silently drops the one string the operator is meant to see.
+4. **The ownership `PATCH` reuses `moira.notice.admin_identity_claimed`.** There is no
+   `admin_identity_ownership_transferred` notice; `set_primary` returns
+   `record_from_grant_with_notice(grant, claimed_notice())`. §0.8.4 step 9's list of three notices to
+   mirror is right, but the transfer's notice is a fourth key that was already mirrored.
+5. **§0.8.5 item 5b is stale.** It says `checkSession` "and `isEmailDomainAllowed` have no shipped
+   caller". Wave 4A closed F25: `checkSession` is wired at `jwt.getSubject`, at the token route and
+   at the `(console)` layout gate, and `guard-reachability.test.ts` fails if the call sites go. The
+   instruction it carries — *wire it deliberately, with a test that fails when it is unwired* — is
+   what `route-handler-session.test.ts` does for the new handlers.
+
+#### §0.8.8.2 W5-B11 re-read against the post-4A tree
+
+**The blocker holds, and one of its two consequences is now unreachable.**
+
+`governing_policy` is gone. `admission_policy` resolves the row bound to the caller's trusted issuer
+first and reaches the `issuer = $1` branch only when nothing is bound, refusing a duplicate set with
+`409 duplicate_enabled_provider_for_issuer` instead of taking the first of it. So:
+
+* **The under-strict consequence survives unchanged.** Redemption still applies exactly ONE row.
+  `PublicAuthMethod` still carries neither `trusted_jwt_issuer_id` nor `created_at`, so the console
+  still cannot tell which row wins and can still only compute a union. With N enabled providers the
+  union is strictly wider than the governing row.
+* **The over-strict consequence is closed.** §0.8 said "under F23 it can also be narrower in the
+  other direction: a row whose own `issuer` equals the console's outranks the correctly linked row at
+  any age". That shape (F23 shape (b)) is now refused at write time by
+  `auth_provider_issuer_shadows_trusted_issuer`, and shape (a) is unrepresentable after `0020`'s
+  partial unique index. The gate can no longer block an invitation that would in fact have redeemed.
+* **The reversal condition is closer but not met.** It fires when `admission_policy` becomes the
+  union (rejected — §0.7.7 chose the two-stage lookup instead, and W4-D4 is superseded) **or** when
+  Moira refuses more than one enabled row per trusted issuer. 4A refuses more than one per
+  *trusted issuer*, and 4B gives each provider its **own** trusted issuer — so N enabled providers
+  remain legal and the union remains wider than the governing row. **W5-D11 stands as taken.**
+
+Implemented exactly as W5-D11 specifies: block at zero providers, block on an uncovered domain at
+exactly one, warn with the reason above that, and say which of the two it is doing.
+
+#### §0.8.8.3 §0.8.4 step 24 was not implementable as written, and what replaced it
+
+Step 24 says to add the final-URL assertion and *"expect `/` and `/admins` to fail it until an
+authenticated e2e path exists. Record that failure honestly; do not weaken the assertion to make it
+pass."*
+
+A permanently red merge gate is not a gate. It blocks every later change for a reason unrelated to
+that change, and the pressure to weaken it is then constant — which is how the assertion would
+eventually be lost, not kept.
+
+**Taken instead (W5-D7′):** the walker classifies each route as gated or public from its source path,
+asserts a **public** route's final pathname equals the one it asked for before running axe, asserts a
+**gated** route redirects to `/login` and does not audit it, and pins the unaudited set in BOTH
+directions against a declared list. The same information is visible, the same drift fails, and the
+suite can be merged: a gated route added without an edit fails on one side, a stale entry fails on
+the other.
+
+Mutation-verified: injecting a `redirect("/login")` into `/invite/[token]` — a public route — fails
+the URL assertion naming both URLs; removing `/admins` from the declared list fails the set
+assertion. *Reversal condition:* when an authenticated Playwright project exists, delete the entries
+and keep the URL assertion, which is what will prove the authenticated run does anything.
+
+#### §0.8.8.4 The tripwire in §0.8.4 step 23 would have missed its own trigger
+
+`secret-leak.e2e.ts`'s "no shipped route mounts `OnceOnlySecretModal` yet" grepped `app/**` for the
+literal module path. The mount that arrived is `app/(console)/admins/page.tsx` importing
+`modules/admins/InviteAdminForm.tsx`, which imports the modal — the page's own source contains no
+such string. **Verified by mutation: with the modal mounted and the old walk restored, the tripwire
+is green.**
+
+Replaced with a transitive import walk (`e2e/support/module-graph.ts`) and two assertions: the
+mounting set is non-empty and names the page, and every mounting route is gated. The second is what
+W5-B4's render assertion becomes given no authenticated storage state — if anyone mounts the modal on
+a **public** route the render becomes reachable from Playwright and the assertion fails, which is the
+commit on which the fixture-token assertion can finally be written.
+
+#### §0.8.8.5 What wave 5 did NOT land, and why
+
+* **`invite-redeem.e2e.ts`, `invite-domain-policy.e2e.ts`, `ownership-transfer.e2e.ts`,
+  `authorization-denial.e2e.ts`** — all four need a live Moira **and** an authenticated session.
+  `MOIRA_API_URL` is `https://moira.invalid` in the e2e environment and there is no storage state, so
+  each could only be written as a spec that navigates, gets redirected, and asserts nothing about the
+  behaviour it is named for. That is §0.8.5 escalation 1 happening on purpose. The denial case
+  (`admin_identity_not_primary`, a live non-primary grant meeting `require_primary_actor` — W5-B9's
+  correction) is covered at unit level instead.
+* **`invite-negative.e2e.ts` and `i18n-message-key.e2e.ts` DID land**, because the unauthenticated
+  half is genuinely drivable.
+
+#### §0.8.8.6 One design point §0.8 did not anticipate
+
+`SECRET_PROP_PATTERN` matches `token`, so `InviteAcceptPanel` cannot receive the invitation token as
+a prop — and W5-D5's route handlers cannot be reached without knowing it. The resolution is the one
+the repository already chose for the once-only token: **`CopyButton` takes an element id and reads
+the value out of the DOM at click time**. `InviteAcceptPanel` reads the token out of
+`location.pathname` at click time, from the URL the browser already holds, so no prop and no
+serialised payload carries it. A `resolvePathname` seam exists for the unit test, because a test that
+passed the token in would be exercising a different component from the one that ships.
+
+Consequence worth recording: the token IS present in the RSC router state, because it is a dynamic
+route segment. An assertion that `page.content()` omits it was written, run, and **failed on a
+correct page**. The honest property — and what `invite-negative.e2e.ts` asserts — is that it never
+reaches VISIBLE COPY, with the no-foreign-origin assertion in `smoke.e2e.ts` covering the `Referer`
+half.
+
+---
 
 ---
 

@@ -546,6 +546,151 @@ assertKeyContract<
   >
 >();
 
+/**
+ * `#/components/schemas/AdminInvitePreviewRequest` — body of
+ * `POST /api/v1/admin/admin-invites/preview`.
+ *
+ * `POST` with the token in the **body**, never a `GET` with it in the path or
+ * the query string, so it cannot land in an access log, a proxy log, or a
+ * `Referer` chain. `lib/invites.ts` is the only module allowed to construct it.
+ *
+ * The field name `token` matches `SECRET_DTO_FIELD_PATTERN` in
+ * `tests/unit/architecture/server-only-guards.test.ts`. It is exempt BY NAME
+ * there with its member set pinned (decision W5-D4) — the pattern is not
+ * widened, because widening it would un-guard `secret`, `password` and
+ * `api_key` on every other DTO.
+ */
+export interface AdminInvitePreviewRequest {
+  token: string;
+}
+
+export const ADMIN_INVITE_PREVIEW_REQUEST_CONTRACT = {
+  schema: "AdminInvitePreviewRequest",
+  required: ["token"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    AdminInvitePreviewRequest,
+    (typeof ADMIN_INVITE_PREVIEW_REQUEST_CONTRACT)["required"][number],
+    (typeof ADMIN_INVITE_PREVIEW_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/AdminInvitePreviewResponse` — what an **unauthenticated**
+ * invitee is told about an invite they hold the token for.
+ *
+ * THREE FIELDS, AND THE ABSENCES ARE THE DESIGN. No inviter identity, no invite
+ * id, no deployment detail, no policy. Plan 09's body proposes "the inviter's
+ * display email with the local part masked, e.g. `j***@example.com`" — that is
+ * NOT built, and the schema's own doc comment records the reversal condition:
+ * *"if product wants inviter attribution, it arrives with its own masking
+ * function and its own leak test."*
+ * `the_anonymous_preview_response_carries_only_constraint_and_expiry` pins it
+ * server-side.
+ *
+ * There is deliberately no `expired` flag here (unlike `AdminInviteRecord`): an
+ * anonymous caller learns expiry from `expires_at` and nothing else, and a
+ * server-computed boolean would be one more bit of state to keep consistent for
+ * a reader who can subtract two timestamps.
+ */
+export interface AdminInvitePreviewResponse {
+  constraint: AdminInviteConstraint;
+  /** The email address or bare domain the invite is bound to. Never a token. */
+  value: string;
+  expires_at: string;
+}
+
+export const ADMIN_INVITE_PREVIEW_RESPONSE_CONTRACT = {
+  schema: "AdminInvitePreviewResponse",
+  required: ["constraint", "value", "expires_at"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    AdminInvitePreviewResponse,
+    (typeof ADMIN_INVITE_PREVIEW_RESPONSE_CONTRACT)["required"][number],
+    (typeof ADMIN_INVITE_PREVIEW_RESPONSE_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/AdminInviteRedeemRequest` — body of
+ * `POST /api/v1/admin/admin-invites/redeem`.
+ *
+ * Bound to plan 07's post-D5 `ClaimAdminIdentityRequest` shape: `email` and
+ * `email_verified` are **required and non-optional** — no `Option`, no
+ * `#[serde(default)]` — because redemption creates the same `admin_identities`
+ * grant, and a grant with no human-identifiable attribute makes the domain
+ * policy unenforceable on that path.
+ *
+ * BOTH ARE BFF-ASSERTED FROM THE JUST-VERIFIED SESSION, never from client input.
+ * There is no `issuer` and no `subject` field: the operation's declared security
+ * is `bearerAuth` **alone**, and Moira takes `(issuer, subject)` from the token
+ * it verified — which is why this is the only console operation whose credential
+ * requirement is `"bearer_only"` and why sending the system key here would be the
+ * console granting admin to an identity of its own choosing.
+ */
+export interface AdminInviteRedeemRequest {
+  token: string;
+  email: string;
+  email_verified: boolean;
+}
+
+export const ADMIN_INVITE_REDEEM_REQUEST_CONTRACT = {
+  schema: "AdminInviteRedeemRequest",
+  required: ["token", "email", "email_verified"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    AdminInviteRedeemRequest,
+    (typeof ADMIN_INVITE_REDEEM_REQUEST_CONTRACT)["required"][number],
+    (typeof ADMIN_INVITE_REDEEM_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/AdminIdentityPatchRequest` — the ownership transfer body
+ * of `PATCH /api/v1/admin/admin-identities/{id}`.
+ *
+ * ONE FIELD, and it is not `granted_scopes`. Plan 09's body says this endpoint
+ * "grants/revokes `moira:admins:manage` inside the target's `granted_scopes`";
+ * it does not, and `granted_scopes` is never written by this path.
+ * `the_ownership_patch_request_has_exactly_one_field` pins that server-side.
+ *
+ * `is_primary` is REQUIRED rather than optional: a `PATCH` that changes nothing
+ * is a request whose `If-Match` precondition and `Idempotency-Key` ledger entry
+ * describe a no-op.
+ *
+ * ONE CALL, NOT TWO (plan 09 §0.8 W5-B8). `set_primary` calls
+ * `demote_active_primaries_other_than` inside the same transaction and
+ * `admin_identities_single_active_primary` refuses a second owner outright, so
+ * the plan body's "promote the target, then demote the actor" pair would demote
+ * the person just promoted, or 409 on a version the actor no longer holds.
+ */
+export interface AdminIdentityPatchRequest {
+  is_primary: boolean;
+}
+
+export const ADMIN_IDENTITY_PATCH_REQUEST_CONTRACT = {
+  schema: "AdminIdentityPatchRequest",
+  required: ["is_primary"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    AdminIdentityPatchRequest,
+    (typeof ADMIN_IDENTITY_PATCH_REQUEST_CONTRACT)["required"][number],
+    (typeof ADMIN_IDENTITY_PATCH_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
 /* -------------------------------------------------------------------------- */
 /* Auth provider settings surface (SEVEN operations, not ten)                 */
 /* -------------------------------------------------------------------------- */
@@ -919,6 +1064,10 @@ export const SCHEMA_CONTRACTS: readonly SchemaContract[] = [
   ADMIN_INVITE_RECORD_CONTRACT,
   ADMIN_INVITE_CREATE_REQUEST_CONTRACT,
   ADMIN_INVITE_SECRET_RESPONSE_CONTRACT,
+  ADMIN_INVITE_PREVIEW_REQUEST_CONTRACT,
+  ADMIN_INVITE_PREVIEW_RESPONSE_CONTRACT,
+  ADMIN_INVITE_REDEEM_REQUEST_CONTRACT,
+  ADMIN_IDENTITY_PATCH_REQUEST_CONTRACT,
   AUTH_PROVIDER_SETTINGS_CREATE_REQUEST_CONTRACT,
   AUTH_PROVIDER_SETTINGS_RECORD_CONTRACT,
   TRUSTED_JWT_ISSUER_CREATE_REQUEST_CONTRACT,
