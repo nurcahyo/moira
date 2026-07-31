@@ -39,6 +39,43 @@
 //! care about `/v1/responses` and admin-command replay should avoid rotating this pepper
 //! during active traffic, exactly as recommended for the API-key pepper today.
 //!
+//! ## The retention argument does not transfer to the `content_hash` columns (finding F14)
+//!
+//! The 24-hour expiry above is what makes "verify only the active pepper" safe, and it is a
+//! property of `idempotency_records` alone. This hasher is also the writer for
+//! `conversation_messages.content_hash`, `rag_documents.content_hash` and
+//! `rag_document_versions.content_hash`, and those rows have no retention at all — nothing
+//! ages them out, so a rotation orphans their stored digests permanently rather than for a
+//! bounded window.
+//!
+//! `memory_records.content_hash` used to be written here too and no longer is: plan 11
+//! Sub-Phase F intends to compare it (exact-match memory dedupe), and a comparison over a
+//! long-lived row is exactly what this contract cannot serve. It moved to the unkeyed
+//! [`crate::security::request_hash`] — see `memory_content_hash` in
+//! `src/application/conversation.rs` for the decision and its reversal condition. The
+//! remaining three are **write-only fingerprints**: no code path recomputes and compares them,
+//! so an orphaned value costs nothing. Before adding a read that compares any `content_hash`
+//! written by this hasher, move that column to a content address first.
+//!
+//! ## Rotation changes a value the API returns (finding F14)
+//!
+//! `conversation_messages.content_hash` is **both** written by this hasher **and** returned to
+//! callers — it is a field on `ConversationMessageRecord` and appears in `docs/openapi.json`.
+//! It stays peppered on purpose: an unkeyed digest of message content, handed out, is an
+//! offline verifier against content the schema expects to be able to hold encrypted
+//! (`conversation_messages.content_encrypted`). The consequence is worth stating plainly
+//! because it is not a leak and is therefore easy to miss:
+//!
+//! **rotating the idempotency pepper changes the `content_hash` the API returns for a message
+//! whose content never changed.** The stored row is not rewritten; the same bytes simply hash
+//! to a different value under the new pepper, so messages written before and after a rotation
+//! report different digests for identical content. A client treating `content_hash` as a stable
+//! content identity — caching on it, diffing on it, deduplicating on it — is relying on
+//! something rotation is allowed to break. It is a version-prefixed integrity fingerprint, not
+//! a content address, and the `"{pepper_version}:"` prefix on every value is the visible signal
+//! that it is scoped to a pepper. `ConversationMessageRecord::content_hash` says so in the
+//! schema description; keep the two in step.
+//!
 //! # Legacy compatibility
 //!
 //! Values written before this change carry no `:` prefix. [`IdempotencyHasher::verify`]

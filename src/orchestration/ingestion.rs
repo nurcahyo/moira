@@ -63,15 +63,21 @@ pub struct PreparedChunk {
     /// `secret_fingerprint`. The name is a misnomer here: the bytes being hashed are a document
     /// chunk, not a request.
     ///
-    /// It is deliberately **not** `IdempotencyHasher::hash`, even though that is what the
-    /// neighbouring `content_hash` columns use. That hasher is peppered and version-prefixed and
-    /// verifies only against the *active* pepper, by design — so a pepper rotation would
+    /// It is deliberately **not** `IdempotencyHasher::hash`, even though that is what most of
+    /// the neighbouring `content_hash` columns use. That hasher is peppered and version-prefixed
+    /// and verifies only against the *active* pepper, by design — so a pepper rotation would
     /// invalidate every stored `chunk_hash` and force every document to re-chunk and re-embed.
     /// A chunk hash has to be content-addressable indefinitely; that is its whole job.
     ///
     /// Reversal condition: move to a keyed hash if `chunk_hash` ever becomes reachable across a
     /// trust boundary — returned on a caller-visible response, accepted as a caller-supplied
     /// lookup key, or used to dedupe *across* applications. None of those is true today.
+    ///
+    /// Finding F14 turned that reversal condition into an **admitting rule applied per table**,
+    /// and `memory_records.content_hash` passed all three clauses, so it moved here too
+    /// (`memory_content_hash`, `src/application/conversation.rs`).
+    /// `conversation_messages.content_hash` fails the first clause — it is returned on
+    /// `ConversationMessageRecord` — and stays keyed. The rule is per column, never per name.
     pub chunk_hash: String,
     pub token_estimate: i64,
     pub start_offset: i32,
