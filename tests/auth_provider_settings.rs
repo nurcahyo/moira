@@ -1106,6 +1106,78 @@ async fn a_second_trusted_jwt_issuer_for_the_same_issuer_returns_409_not_500() {
     assert_eq!(rows, 1, "a refused create must leave exactly the first row");
 }
 
+/// **Only a uniqueness conflict is a duplicate.**
+///
+/// Found by `cargo mutants`: replacing the `database.is_unique_violation()` match guard with
+/// `true` survived the suite, because the test above is the only thing that reaches the mapper
+/// and it only ever presents a duplicate. Under that mutation *every* database failure on this
+/// insert — a check violation, a truncation, a constraint the schema grows next year — comes
+/// back as `409 duplicate_trusted_jwt_issuer`, telling a client to go adopt an existing row
+/// that does not exist. `already_claimed_on_unique_violation` has carried the equivalent unit
+/// test since plan 07; this is the one that was missing.
+///
+/// `clock_skew_seconds` is `i32` in the DTO and `check (clock_skew_seconds >= 0)` in the
+/// schema, so a negative value is the reachable non-unique database failure on exactly this
+/// statement.
+///
+/// The assertion is deliberately **negative**. What this deployment currently does with a
+/// negative skew is return `500 database_error` — the value should be refused as a `422` by
+/// the service before it ever reaches SQL, which is a separate gap and not this test's
+/// subject. Pinning the 500 would cement it; pinning "this is not a duplicate" states only the
+/// property the mapper is responsible for.
+#[tokio::test]
+async fn a_non_unique_database_failure_is_not_reported_as_a_duplicate_issuer() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let issuer = format!("https://skew-issuer-{}.example", Uuid::now_v7());
+
+    let refused = request(
+        router.clone(),
+        "POST",
+        "/api/v1/admin/jwt-issuers",
+        HeaderMap::new(),
+        None,
+        Some(json!({
+            "issuer": issuer,
+            "jwks_url": "https://issuer.example/jwks",
+            "allowed_algorithms": ["RS256"],
+            "subject_claim": "sub",
+            "clock_skew_seconds": -1
+        })),
+    )
+    .await;
+
+    assert_ne!(
+        refused.status,
+        StatusCode::CREATED,
+        "the schema's check constraint must refuse a negative clock skew: {:?}",
+        refused.body
+    );
+    assert_ne!(
+        refused.code(),
+        "duplicate_trusted_jwt_issuer",
+        "a check violation is not a uniqueness conflict, and reporting it as one sends the \
+         client to adopt a row that was never created: {:?}",
+        refused.body
+    );
+    assert_ne!(
+        refused.status,
+        StatusCode::CONFLICT,
+        "nor is it any other kind of conflict: {:?}",
+        refused.body
+    );
+
+    let rows: i64 =
+        sqlx::query_scalar("select count(*) from trusted_jwt_issuers where issuer = $1")
+            .bind(&issuer)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("count issuers");
+    assert_eq!(rows, 0, "the premise is that no row was written");
+}
+
 #[tokio::test]
 async fn create_is_idempotent_under_an_idempotency_key() {
     let Some(fixture) = LifecycleFixture::new().await else {
