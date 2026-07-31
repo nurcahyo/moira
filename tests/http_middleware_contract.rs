@@ -36,9 +36,15 @@
 //! buffers a stream is exactly the regression `moira::http::router` alone cannot see.
 //!
 //! Concurrency discipline (`plans/CONVENTIONS.md` §3): no `sleep()`. Ordering is gated on
-//! the mock provider's `ScriptGate` acknowledgements, and on an already-elapsed
-//! (`Duration::ZERO`) timeout that resolves on a handler's first pend rather than on
-//! wall-clock racing.
+//! the mock provider's `ScriptGate` acknowledgements and on connection-pool starvation —
+//! never on a duration.
+//!
+//! It used to say that a `Duration::ZERO` ceiling "resolves on a handler's first pend rather
+//! than on wall-clock racing". That was wrong in both halves, and finding F22 is the bill:
+//! `tokio::time::sleep(Duration::ZERO)` rounds its deadline up to the next whole
+//! millisecond, so it is never ready on a first poll, and a warm loopback handler can beat
+//! it. See `every_non_sse_route_group_is_governed_by_the_non_streaming_timeout` for the
+//! measurements. **A duration is not an ordering primitive here, however small.**
 
 mod support;
 
@@ -583,19 +589,38 @@ impl RawServer {
 /// production layer's placement. A review mutation that deleted `.layer(timeout)` from the
 /// conversation and admin groups in `src/http/mod.rs` survived the entire suite.
 ///
-/// **Why the ceiling is zero.** The production value is
-/// `maximum_execution_timeout_seconds + 30`, i.e. never below 30 s and deliberately above
-/// every execution deadline — unreachable inside a test. A zero ceiling makes the
-/// assertion *deterministic* rather than merely fast: `tower_http`'s timeout polls the
-/// inner future first and only then the (already-elapsed) deadline, so any handler that
-/// suspends even once — all of these hit PostgreSQL — times out on its first pend, with no
-/// interleaving to race and no `sleep()` anywhere. Only the layer's presence is under
-/// test here; that the configured *value* is `maximum_execution_timeout_seconds + 30` is
-/// asserted by `the_non_streaming_timeout_sits_above_the_execution_deadline`
-/// (`src/lib.rs`).
+/// **Why the ceiling is zero, and why zero alone is not enough (finding F22).** The
+/// production value is `maximum_execution_timeout_seconds + 30`, i.e. never below 30 s and
+/// deliberately above every execution deadline — unreachable inside a test. So the test
+/// picks its own ceiling. It used to pick `Duration::ZERO` and stop there, on the reasoning
+/// that an "already-elapsed" deadline fires on the handler's first pend. **Two halves of
+/// that reasoning were false**, and together they made this assertion a sub-millisecond
+/// wall-clock race that lost on CI run `30625512140` (`main`, docs-only commit, `left: 200`):
+///
+/// * `tower_http` 0.6's `Timeout::ResponseFuture` polls its **sleep first** and the inner
+///   future second, not the other way round; and
+/// * `tokio::time::sleep(Duration::ZERO)` is **not** already elapsed. `TimeSource::
+///   deadline_to_tick` rounds every deadline *up* to the end of a whole millisecond, so a
+///   zero-duration sleep resolves at the next millisecond boundary — measured here at 0 out
+///   of 2000 first polls ready, p50 ≈ 1.3 ms. A zero ceiling is a real ~0–1 ms deadline.
+///
+/// A warm `GET /api/v1/admin/applications` — one `select` against a one-row table over
+/// loopback — completes in p50 ≈ 0.64 ms, i.e. *inside* that window. Measured on an
+/// otherwise idle machine, 6 of 60 identical probes returned `200`.
+///
+/// **What makes it deterministic now** is a precondition rather than a duration: the test
+/// holds every connection in the fixture's pool across the probe loop. Each probed route
+/// needs a pool connection to produce a response head, so no probe can complete until this
+/// test releases the guards — which it does only after the assertions. The ceiling can then
+/// be any value at all and `504` is the only reachable status; zero is chosen simply because
+/// it is the smallest. No `sleep()`, no retry, no widened timeout: the race is removed, not
+/// out-waited. Only the layer's presence is under test here; that the configured *value* is
+/// `maximum_execution_timeout_seconds + 30` is asserted by
+/// `the_non_streaming_timeout_sits_above_the_execution_deadline` (`src/lib.rs`).
 ///
 /// The control arm — the same requests against the same router built with the production
-/// policy — is what keeps this from degenerating into "everything is a 504".
+/// policy, with the pool released — is what keeps this from degenerating into "everything is
+/// a 504".
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_non_sse_route_group_is_governed_by_the_non_streaming_timeout() {
     let Some(fixture) = LifecycleFixture::new().await else {
@@ -611,13 +636,17 @@ async fn every_non_sse_route_group_is_governed_by_the_non_streaming_timeout() {
     let consumer_key = fixture.enable_public_streaming().await;
     let client = Client::new();
 
-    // One request per non-SSE route group. Every one of them reaches PostgreSQL — the
-    // admin listing queries it directly, and the two consumer-key routes hit it while
-    // authenticating — so every one of them suspends at least once, which is what makes
-    // the already-elapsed deadline fire deterministically. They are all `GET`s on
-    // purpose: a request body could in principle be extracted and rejected without ever
-    // suspending, and a `POST` that did survive would leave a side effect behind.
-    let probes: [(&str, &str, bool); 3] = [
+    // One request per non-SSE route group — all four of them, including `operational`,
+    // which nothing probed before F22 and whose `.layer(timeout)` was therefore free to be
+    // deleted. Every one of these routes needs a PostgreSQL *connection* to produce a
+    // response: `/health/ready` runs `select 1`, the admin listing queries directly, and the
+    // two consumer-key routes hit the pool while authenticating. That is exactly what the
+    // starvation gate below relies on, so a route added here that can answer without the
+    // pool would silently reintroduce F22's race. They are all `GET`s on purpose: a request
+    // body could in principle be extracted and rejected without ever reaching the pool, and
+    // a `POST` that did survive would leave a side effect behind.
+    let probes: [(&str, &str, bool); 4] = [
+        ("operational", "/health/ready", false),
         ("admin", "/api/v1/admin/applications", false),
         ("conversation", "/api/v1/conversations", true),
         ("public execution", "/api/v1/models", true),
@@ -630,6 +659,41 @@ async fn every_non_sse_route_group_is_governed_by_the_non_streaming_timeout() {
     let timed_out_server =
         serve(moira::http::router(expired).with_state(fixture.state.clone())).await;
 
+    // The gate that replaces F22's wall-clock race. With every connection held here, a
+    // probed handler cannot reach PostgreSQL, so it cannot produce a response head at all
+    // until this test drops the guards below — the timeout layer is the only thing that can
+    // answer, whatever the ceiling's value happens to be.
+    //
+    // Taking *every* permit is only possible because nothing else holds one for the
+    // fixture's lifetime — `tests/support/mod.rs` records that no fixture spawns
+    // `spawn_runtime_config_listener`, and `PgListener::connect_with` would keep a
+    // `PoolConnection` for as long as it listened. If that ever changes this loop is what
+    // notices, so it says so rather than hanging anonymously for `WAIT`.
+    let mut held_connections = Vec::new();
+    for slot in 0..fixture.pool.options().get_max_connections() {
+        held_connections.push(
+            timeout(WAIT, fixture.pool.acquire())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "fixture connection {slot} could not be acquired: something else is \
+                         holding a permit on the fixture pool for the fixture's lifetime (a \
+                         PgListener?), so the starvation gate below cannot be closed and the \
+                         probes must not run"
+                    )
+                })
+                .unwrap_or_else(|error| panic!("acquire fixture connection {slot}: {error}")),
+        );
+    }
+    // Asserted rather than assumed: a fixture pool that grew a spare connection would put
+    // the race back without changing a line of this test.
+    assert_eq!(
+        fixture.pool.num_idle(),
+        0,
+        "the starvation gate left a connection available, so the probes below could still \
+         race the ceiling"
+    );
+
     for (group, path, needs_key) in probes {
         let mut builder = client
             .get(format!("{}{path}", timed_out_server.base_url))
@@ -637,9 +701,19 @@ async fn every_non_sse_route_group_is_governed_by_the_non_streaming_timeout() {
         if needs_key {
             builder = builder.header("x-consumer-key", &consumer_key);
         }
+        // This, not the `assert_eq!` below, is what a deleted `.layer(timeout)` looks like
+        // now: with the pool starved the handler cannot answer at all, so an unlayered
+        // group produces no response rather than a fast one. Verified by injection on the
+        // admin and operational groups.
         let response = timeout(WAIT, builder.send())
             .await
-            .unwrap_or_else(|_| panic!("{group} probe timed out at the test level"))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the {group} probe never returned. With the fixture pool starved the \
+                     only response this route can produce is the timeout layer's, so this \
+                     is a {group} route group missing RouterPolicy::non_streaming_timeout"
+                )
+            })
             .unwrap_or_else(|_| panic!("{group} probe response"));
         assert_eq!(
             response.status(),
@@ -648,8 +722,18 @@ async fn every_non_sse_route_group_is_governed_by_the_non_streaming_timeout() {
         );
     }
 
-    // The SSE group must be exempt by construction: the same, already-elapsed ceiling
-    // must not touch it.
+    // Release the starvation gate: the SSE half and the control arm both have to reach
+    // PostgreSQL. `PoolConnection`'s return path is asynchronous, so dropping the guards is
+    // a request rather than a completion — the round trip below is the acknowledgement that
+    // a connection is genuinely back in the pool, and it is why nothing here needs a sleep.
+    drop(held_connections);
+    timeout(WAIT, sqlx::query("select 1").execute(&fixture.pool))
+        .await
+        .expect("the fixture pool never recovered after the starvation gate was released")
+        .expect("select 1 on the recovered fixture pool");
+
+    // The SSE group must be exempt by construction: the same expired ceiling must not
+    // touch it.
     let stream_response = timeout(
         WAIT,
         client
