@@ -25,11 +25,14 @@ skip_calls = ["with_capacity", "clone", "to_string", "to_owned", "to_vec"]
 #   sentence", which is true by design — the catalog gates assert *presence and
 #   non-emptiness*, and pinning prose would make every copy edit a test failure.
 # * `src/infra/metrics.rs`'s label tables have the same shape.
-# * `build.rs` and generated code are not behaviour.
+#
+# Nothing else is excluded, deliberately. A carve-out that matches no file is a stale
+# exemption hiding behind a passing run — the same failure the i18n catalog's
+# `COVERED_DYNAMIC_CODE_EXPRESSIONS` allowlist asserts against in the other direction. There
+# is no `build.rs` in this repo, so there is no entry for one.
 exclude_globs = [
     "src/i18n/catalog/errors.rs",
     "src/i18n/catalog/notices.rs",
-    "build.rs",
 ]
 
 # The default is 20× the baseline test time, which on a suite this size is measured in

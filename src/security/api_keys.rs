@@ -258,6 +258,36 @@ mod tests {
         }
     }
 
+    /// **`is_registered_key_namespace` must say no to something.**
+    ///
+    /// Found by `cargo mutants`: replacing the whole function with `true` survived the suite,
+    /// and so did replacing `const_str_eq` with `true`. The only caller is a `const` assertion
+    /// that a namespace *is* registered, so nothing anywhere exercised the negative — a
+    /// membership test that answers yes to everything passes an "is this a member" assertion
+    /// perfectly, and would silently stop protecting `MIN_API_KEY_PREFIX_LENGTH` from an
+    /// unregistered namespace.
+    ///
+    /// The equal-length case is separate and deliberate: `const_str_eq`'s loop bound is what
+    /// a mutation turned from `<` into `==`, which makes every same-length pair compare equal.
+    /// `"moira_xyz"` is exactly as long as `"moira_sys"` and `"moira_inv"`, so it is the input
+    /// that distinguishes a real comparison from a length check.
+    #[test]
+    fn an_unregistered_namespace_is_not_registered() {
+        for namespace in KEY_NAMESPACES {
+            assert!(
+                is_registered_key_namespace(namespace),
+                "{namespace} is in KEY_NAMESPACES and must be recognised"
+            );
+        }
+        // Same length as the registered nine-character namespaces, different content.
+        assert!(!is_registered_key_namespace("moira_xyz"));
+        // A prefix of a registered one, and a registered one extended.
+        assert!(!is_registered_key_namespace("moira_in"));
+        assert!(!is_registered_key_namespace("moira_invx"));
+        assert!(!is_registered_key_namespace(""));
+        assert!(!is_registered_key_namespace("moira_cons2"));
+    }
+
     /// The defect the floor now prevents, stated as a measurement rather than as prose.
     ///
     /// At the old `.max(12)` a `moira_inv` prefix retained two characters. Asserting the

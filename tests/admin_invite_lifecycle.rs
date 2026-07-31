@@ -1993,6 +1993,91 @@ async fn transferring_ownership_moves_the_flag_rather_than_adding_a_second_owner
     );
 }
 
+/// A replayed revocation is not a second revocation.
+///
+/// **Found by `cargo mutants`**, which deleted the `!` from `revoke_identity`'s
+/// `if !outcome.replayed` and watched the whole suite stay green: the guard was written in the
+/// same change as the ones for `create_invite` and `redeem_invite`, and unlike those two it
+/// had nothing asserting it. A retry under the same `Idempotency-Key` replays the stored
+/// success — the row is already `revoked`, so no second revocation happened — and counting it
+/// again would report two admins losing access when one did.
+#[tokio::test]
+async fn a_replayed_revocation_does_not_count_a_second_one() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let issuer = ConsoleIssuer::start(&fixture.pool).await;
+    let router = moira::build_router(observable_state(&fixture.pool)).expect("router");
+    let (provider_id, _) = configure_and_enable_policy(
+        &router,
+        PolicyBinding::ByIssuerString(&issuer.issuer),
+        &["example.com"],
+    )
+    .await;
+    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+
+    // The owner exists only so the target is revocable: revoking the owner is refused by the
+    // last-primary guard, which would make this test assert a conflict instead of a replay.
+    let (_, owner_token) = create_invite(&router, "domain", "example.com").await;
+    let owner = redeem(&router, &issuer, "owner", &owner_token).await;
+    assert_eq!(owner.status, StatusCode::CREATED, "{:?}", owner.body);
+    let (_, token) = create_invite(&router, "domain", "example.com").await;
+    let target = redeem(&router, &issuer, "departing", &token).await;
+    assert_eq!(target.status, StatusCode::CREATED, "{:?}", target.body);
+    assert!(!is_primary(&fixture.pool, grant_id(&target)).await);
+
+    let before = scrape_metrics(router.clone()).await;
+    assert!(before.contains(GRANT_EVENTS));
+    assert_eq!(
+        counter_value(&before, GRANT_EVENTS, "event", "revoked"),
+        0.0
+    );
+
+    let key = format!("revoke-{}", Uuid::now_v7());
+    let path = format!("/api/v1/admin/admin-identities/{}", grant_id(&target));
+    let revoked = send_json(
+        router.clone(),
+        "DELETE",
+        &path,
+        with_idempotency_key(HeaderMap::new(), &key),
+        None,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(revoked.status, StatusCode::OK, "{:?}", revoked.body);
+    assert_eq!(
+        counter_value(
+            &scrape_metrics(router.clone()).await,
+            GRANT_EVENTS,
+            "event",
+            "revoked"
+        ),
+        1.0
+    );
+
+    let replayed = send_json(
+        router.clone(),
+        "DELETE",
+        &path,
+        with_idempotency_key(HeaderMap::new(), &key),
+        None,
+        Value::Null,
+    )
+    .await;
+    // The premise: this is a *replay* of the stored success, not a second revocation reaching
+    // the repository — which would have produced `409 admin_identity_already_revoked`.
+    assert_eq!(replayed.status, StatusCode::OK, "{:?}", replayed.body);
+    assert_eq!(replayed.body["id"], revoked.body["id"]);
+
+    let after = scrape_metrics(router).await;
+    assert_eq!(
+        counter_value(&after, GRANT_EVENTS, "event", "revoked"),
+        1.0,
+        "one revocation counted twice\n{}",
+        family_lines(&after, GRANT_EVENTS)
+    );
+}
+
 /// The other side of the last-primary guard: a revocation clears `is_primary` too, so the
 /// guard refuses it for the owner just as it refuses an explicit clear.
 ///

@@ -1470,6 +1470,16 @@ mod tests {
             "the shipped api_keys.prefix_length must satisfy the floor it is validated against",
         );
 
+        // **Both sides of the boundary, not just the rejected side.** Found by `cargo mutants`:
+        // with only "the default passes" and "one below is refused", turning `<` into `<=`
+        // survived — the default is one *above* the floor, so a comparison that also rejected
+        // the floor itself went unnoticed. The floor has to be an accepted value or it is not
+        // the floor.
+        settings.api_keys.prefix_length = MIN_API_KEY_PREFIX_LENGTH;
+        settings
+            .validate(ProcessMode::Serve)
+            .expect("the floor itself must be an accepted configuration");
+
         settings.api_keys.prefix_length = MIN_API_KEY_PREFIX_LENGTH - 1;
         let error = settings
             .validate(ProcessMode::Serve)
