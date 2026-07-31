@@ -908,6 +908,39 @@ an "active sessions" screen over an in-memory store would be the appearance of a
 
 **Test baseline:** 779 passing on plan 11's branch (744 on `main` after plan 10).
 
+## MUTATION TESTING PAID FOR ITSELF ON ITS FIRST RUN — 2026-07-31
+
+`cargo-mutants` on the findings sweep: **63 mutants, 9 missed, 25 caught, 29 unviable**, 2 hours at
+`-j 2`. **All nine survivors were real gaps in code and tests written that same day**, by an agent
+that had already been told this project has six laundering findings.
+
+The worst one re-creates the finding the sweep existed to fix, through a different door:
+
+> `set_primary`'s `is_primary && !current.is_primary` → `||` means a `PATCH {"is_primary": false}`
+> on a grant that **never owned anything demotes the actual owner**. A `200 OK` that returns the
+> deployment to the ownerless state F20 is about — and it walks past the last-primary guard, because
+> that guard inspects only the row being written.
+
+**Nothing in 887 tests caught it.** All nine are now killed, each verified by re-applying its
+mutation by hand.
+
+**Not wired as a CI gate.** Two hours for a ten-file change is a reviewer's tool, not a PR blocker.
+Measurement and reversal condition in `docs/mutation-testing.md`.
+
+**The lesson is about scope, not tooling.** These were fresh, carefully-written tests for
+security-critical code, reviewed by an agent primed to look for exactly this. Mutation testing is
+not a backstop for careless work — it is the only thing that reliably distinguishes a test that
+passes from a test that would fail.
+
+## F21 — the OpenAPI claimed a successful redemption could replay; it cannot
+
+Pre-envelope validation refuses a consumed invite **before** the envelope is entered, so a
+successful redemption can never replay. The spec said otherwise. Corrected.
+
+The reachable double-count is a **failure** replay — `admin_identity_already_claimed` →
+`AppError::Replayed` — which distorts an operator-facing denial rate rather than an invitation count.
+That is the one worth fixing, and it is not the one the sweep brief named.
+
 ## USER DECISIONS — 2026-07-31, taken interactively
 
 1. **Findings before waves 4–5.** F20, F13, F17 and the Wave 2 leftovers first. F20 is the reason:
