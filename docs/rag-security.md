@@ -52,19 +52,34 @@ indexed) before asserting the isolation — otherwise the cases would be tautolo
 
 ## 3. Residual risk: upstream prompt logging
 
-**`rig-core` 0.40 logs the entire completion request body — every message, verbatim — on the
-`rig::completions` target at `TRACE`.** After plan 11 that body contains retrieved RAG chunk and
-memory text, not only what the caller typed.
+`rig-core` 0.40 puts Moira's assembled context — which after plan 11 contains retrieved RAG chunk
+and memory text, not only what the caller typed — into its own telemetry through **two** channels.
+Both are closed in `src/config/telemetry.rs`, and both filters sit *below* the `EnvFilter`, so they
+hold however the operator sets `env_filter` or `RUST_LOG`. Debugging Moira at `trace` does not cost
+you every prompt and every retrieved chunk.
 
-Mitigation: `src/config/telemetry.rs` layers a hard suppression *below* the `EnvFilter` that
-drops verbose events from `rig*` targets. It holds however the operator sets `env_filter` or
-`RUST_LOG`, so debugging Moira at `trace` does not cost you every prompt and every retrieved
-chunk in the log stream. `INFO` and above still pass, so upstream warnings and errors are not
-hidden.
+**Channel 1 — logs.** `rig-core` logs the entire completion request body, every message verbatim,
+on the `rig::completions` target at `TRACE`. A hard suppression drops verbose events from `rig*`
+targets. `INFO` and above still pass, so upstream warnings and errors are not hidden: level is
+what separates content from diagnostics here, and the payload is only ever at `TRACE`.
 
-What remains: an operator who installs their own subscriber, or who ships a build with that layer
-removed, gets the payloads back. The right fix is upstream — a way to disable or redact
-`rig-core`'s request-body logging at the source. Remove the filter when that exists.
+**Channel 2 — exported spans.** `rig-core` also opens an `info_span!` on `rig::completions`
+carrying `gen_ai.system_instructions` (the system preamble) as a span attribute, and
+`tracing-opentelemetry` bridges every span the subscriber records. With `otel_enabled=true` the log
+filter was the sole barrier between that attribute and a remote collector — and at `info_span!`,
+a bare `info` level was already enough to open it. The bridge layer now carries an **allow-list of
+Moira-owned target roots** (`moira`, `moira::*`); everything else is refused, at every level.
+
+Note the deliberate difference between the two: the span filter has **no `INFO`-and-above
+carve-out**, because in the span pipeline level does not separate content from diagnostics — the
+prompt-bearing span *is* an `INFO` span. Nothing is hidden from the operator by this, since the
+`fmt` layers are untouched and third-party warnings and errors still reach stdout unchanged; only
+the remote collector stops receiving them. See [`otel.md`](./otel.md).
+
+What remains: an operator who installs their own subscriber, or who ships a build with those layers
+removed, gets the payloads back. The right fix for channel 1 is upstream — a way to disable or
+redact `rig-core`'s request-body logging at the source. Remove that filter when it exists; the
+span allow-list is independent of it and stays.
 
 ## Ingestion
 
