@@ -20,9 +20,44 @@ crates. A whole-tree run is measured in hours and is **not** a gate a pull reque
 So the adopted scope is the diff against the merge base — the code a reviewer is being asked to
 trust. That is what `scripts/mutants.sh` runs.
 
-*Reversal condition:* wire it into CI as a blocking gate only once a scoped run is
-demonstrably inside the CI budget — measure it, do not assume it. Until then it is a
-documented local step and a reviewer's tool, and this file is the documentation.
+### Measured, so the CI question has an answer
+
+First real run, on the branch that adopted the tool (10 changed files, ~630 added lines under
+`src/`):
+
+```
+63 mutants tested in 2h: 9 missed, 25 caught, 29 unviable
+```
+
+`-j 2` on a laptop. Per mutant: **~50–100 s to build, ~450–880 s to test** — the test run dominates,
+because every mutant runs the whole DB-backed workspace suite. The unmutated baseline alone was
+227 s build + 340 s test.
+
+So a **scoped** run on a ten-file change is two hours. That is fine for a reviewer to start and come
+back to, and it is not a gate a pull request can block on. Wiring it into CI would need the test
+command narrowed per changed file, which trades away the DB-backed coverage that is the whole reason
+the findings below were findable.
+
+*Reversal condition:* make it a blocking gate only once a scoped run is demonstrably inside the CI
+budget — measure it on a real branch, do not assume it. Until then it is a documented local step and
+a reviewer's tool, and this file is the documentation.
+
+### What the first run found
+
+All nine survivors were real gaps in code written that same day, and every one of them was in a
+test **I believed covered it**:
+
+| Survivor | What it meant |
+|---|---|
+| `set_primary`'s `is_primary && !current.is_primary` → `\|\|` | A `PATCH {"is_primary": false}` on a grant that never owned anything would demote **the real owner** — a `200 OK` that leaves the deployment ownerless, around the last-primary guard, which only inspects the row being written |
+| `already_claimed_on_unique_violation`'s `&&` → `\|\|`, and the same guard in the duplicate-issuer mapper → `true` | Any database failure on those inserts reported as a uniqueness conflict, telling a client to adopt a row that was never created |
+| `revoke_identity`'s `if !outcome.replayed` → `if outcome.replayed` | The replay guard had no assertion at all; it was written beside two that did |
+| `validate_api_key_prefix`'s `<` → `<=` | The floor was tested at floor−1 and at the default (floor+1), never at the floor itself |
+| `is_registered_key_namespace` and `const_str_eq` → `true`, and the loop bound `<` → `==` | A membership test with no negative case answers yes to everything and still satisfies every "is this a member" assertion |
+
+The shape they share: **each test exercised only the side of the boundary the code was written
+for.** That is not a mistake mutation testing invents a name for — it is the mistake it makes
+visible, and reading the tests would not have shown it.
 
 ## Running it
 

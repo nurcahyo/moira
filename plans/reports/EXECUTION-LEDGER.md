@@ -1102,6 +1102,21 @@ above and in plan 09 §0.2 (decision D-F20). Four things worth carrying forward:
    merge base and passes `--in-diff`. Deliberately **not** wired as a blocking CI gate; see
    `docs/mutation-testing.md` for the measured reason and the reversal condition.
 
+   **First run: `63 mutants tested in 2h: 9 missed, 25 caught, 29 unviable`.** All nine survivors
+   were real gaps in code written the same day, in tests written the same day to cover exactly
+   that code. The worst was `set_primary`'s `is_primary && !current.is_primary` → `||`: a
+   `PATCH {"is_primary": false}` on a grant that never owned anything would demote **the actual
+   owner**, through a `200 OK`, around the last-primary guard — which inspects only the row being
+   written. That is the ownerless state F20 describes, re-created by the fix for F20, and nothing
+   in a 887-test suite noticed.
+
+   Every survivor shared one shape: **the test exercised only the side of the boundary the code was
+   written for.** A floor tested at floor−1 and at floor+1 but never at the floor; a membership
+   test with no non-member; an error mapper only ever handed the error it maps. All nine are now
+   killed, verified by re-applying each mutation by hand and watching the named test fail
+   (`scratchpad/verify-mutants.sh`), because re-running the tool costs two hours and answers the
+   same question.
+
 ### Cycle 10 — 2026-07-29 → 07-31 — plans 10 and 08 MERGED, plan 11 started
 
 **Plan 10 merged** `671eadf` — cluster admission lease, leader election, durable worker queue,
