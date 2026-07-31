@@ -100,6 +100,12 @@ Three related traps from the same session:
 
 - **`ps aux | grep` gives false negatives here — use `pgrep`.** An agent had *three* of its own gate
   runs stacked without seeing them.
+- **…but `pgrep -f "gates.sh"` matches the waiting shell's OWN command line.** A wait loop spelled
+  `until ! pgrep -f "gates.sh"; do sleep 20; done` contains the string `gates.sh`, so it matches
+  itself and **blocks forever**. Four such loops were found spinning on 2026-08-01, long after the
+  runs they were waiting on had finished. Anchor the pattern — `pgrep -f 'scripts/gates.sh$'` — or
+  match the cargo process instead. This is the self-referential cousin of the whole §2.2 family: the
+  check that reports on itself.
 - **Never edit a migration after any gate run** — `migration N was previously applied but has been
   modified`. Remedy: `delete from _sqlx_migrations where version = N` on the shared DB.
 - **The shared `moira` database is migrated by unit tests** in `src/**/tests` that connect to
