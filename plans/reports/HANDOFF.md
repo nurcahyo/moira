@@ -81,6 +81,33 @@ landing an agent's commit on the wrong branch — that happened twice.
 script.** Use `scripts/gates.sh`, which handles all of this and asserts log completeness against
 `ls tests/*.rs`.
 
+### 2.2b `scripts/gates.sh` CANNOT run concurrently with another gates run
+
+Found 2026-08-01, after two runs sat **wedged for 40+ minutes**.
+
+`sweep_leaked_databases` (`tests/support/mod.rs`) drops **any** `moira_test_template_*` other than its
+own digest. Two runs with different migration sets therefore sweep each other in a loop, producing
+`template database "…" does not exist` mid-run. Worse, it can **hard-deadlock**: one process holding
+shared template locks for live fixtures blocks another's exclusive request, while its own next
+fixture queues behind that exclusive request. Clear it with `pg_terminate_backend` on the idle lock
+holders.
+
+**Consequence for the loop: serialise gate runs.** Parallel agents are fine while they are reading,
+designing, or editing — but only one may be in `scripts/gates.sh` at a time. Stagger them, or give an
+agent its own database.
+
+Three related traps from the same session:
+
+- **`ps aux | grep` gives false negatives here — use `pgrep`.** An agent had *three* of its own gate
+  runs stacked without seeing them.
+- **Never edit a migration after any gate run** — `migration N was previously applied but has been
+  modified`. Remedy: `delete from _sqlx_migrations where version = N` on the shared DB.
+- **The shared `moira` database is migrated by unit tests** in `src/**/tests` that connect to
+  `MOIRA_TEST_DATABASE_URL` directly. So a *merged* migration leaves every branch **without** it
+  failing its shared-DB unit tests with `VersionMissing` until it rebases. Same one-line remedy.
+- **`sqlx::migrate!` is a proc macro** and does not reliably invalidate cargo's fingerprint when
+  migration files change, so a test binary can embed a stale migration digest. `cargo clean -p moira`.
+
 ### 2.3 A test that passes is not a test that works
 
 **Seven findings** where an assertion passed against broken code: a faked `'indexed'` status
