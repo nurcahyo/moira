@@ -816,8 +816,14 @@ async fn concurrent_claims_for_the_same_identity_yield_one_201_and_one_409() {
 
 /// **Barrier-gated**, the sibling assertion: the advisory-lock/unique-index machinery that
 /// serializes a race for *one* identity must not also serialize unrelated identities. Two
-/// different subjects on the same governing issuer, released together, must both succeed —
-/// the lock key is per-identity, not per-issuer or global.
+/// different subjects on the same governing issuer, released together, must both succeed.
+///
+/// Since finding F20, `insert_grant` also takes the deployment-wide `moiraown` ownership
+/// lock, which *does* serialise these two — so this test now asserts the property that
+/// actually matters and was always the point: serialising them must not make either of them
+/// **fail**, and exactly one of them must come out owning the deployment. A claim refused
+/// because someone else was claiming a different identity would be the regression; a claim
+/// that merely waited is not.
 #[tokio::test]
 async fn concurrent_claims_for_different_identities_both_succeed() {
     let Some(fixture) = LifecycleFixture::new().await else {
@@ -860,6 +866,93 @@ async fn concurrent_claims_for_different_identities_both_succeed() {
         .await
         .expect("count grants");
     assert_eq!(grants, 2, "independent identities proceed independently");
+
+    // Decision D-F20: two grants raced for one empty ownership slot. The advisory lock is
+    // what makes the loser *not primary* rather than *refused* — both bodies above are
+    // already asserted to be `201`, so a design that let
+    // `admin_identities_single_active_primary` decide the race would have failed there.
+    let primaries: i64 = sqlx::query_scalar(
+        "select count(*) from admin_identities \
+         where issuer = $1 and deleted_at is null and status = 'active' and is_primary",
+    )
+    .bind(&issuer.issuer)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count primaries");
+    assert_eq!(
+        primaries, 1,
+        "exactly one of two racing first claims may own the deployment"
+    );
+    let claimed = [&first, &second]
+        .iter()
+        .filter(|result| result.body["is_primary"] == serde_json::json!(true))
+        .count();
+    assert_eq!(
+        claimed, 1,
+        "exactly one response body may report ownership, and it must agree with the row"
+    );
+}
+
+/// **Only a uniqueness conflict is `admin_identity_already_claimed`.**
+///
+/// Found by `cargo mutants`, which turned `already_claimed_on_unique_violation`'s
+/// `is_unique_violation() && constraint() != …` into `||` and watched the suite stay green.
+/// Under that mutation *any* database failure on the grant insert — a truncation, a check
+/// violation, a constraint the schema grows later — comes back as `409` telling the operator
+/// the identity is already an admin, when no grant exists and none was created.
+///
+/// `only_a_unique_violation_becomes_already_claimed` in `src/infra/repositories/identity.rs`
+/// covers the non-`Database` arm with `sqlx::Error::RowNotFound`; it cannot reach the guard
+/// itself, because the guard only runs for `Database` errors. This does: `admin_identities.email`
+/// is `varchar(320)`, and the domain policy passes on the *domain*, so an over-long local part
+/// on an allowed domain reaches PostgreSQL and is truncated.
+///
+/// The assertion is **negative** on purpose. What this deployment does with a 400-character
+/// address today is `500 database_error` — it should be a `422` from the service, which is a
+/// separate gap; pinning the 500 would cement it. The property under test is only that a
+/// truncation is not a claim conflict.
+#[tokio::test]
+async fn a_non_unique_database_failure_is_not_reported_as_already_claimed() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let issuer = ConsoleIssuer::start(&fixture.pool).await;
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let secret = mint_system_key(&router, &fixture.state).await;
+    configure_and_enable_policy(&router, &issuer.issuer, &["example.com"]).await;
+
+    // `varchar(320)` in `0012`; the local part alone is longer than the whole column.
+    let oversized = format!("{}@example.com", "a".repeat(400));
+    let refused = post_json(
+        router,
+        "/api/v1/admin/setup/claim",
+        system_key_headers(&secret),
+        None,
+        None,
+        claim_body(&issuer.issuer, "oversized-email", &oversized),
+    )
+    .await;
+
+    assert_ne!(
+        refused.status,
+        StatusCode::CREATED,
+        "an address wider than the column cannot be stored: {:?}",
+        refused.body
+    );
+    assert_ne!(
+        refused.code(),
+        "admin_identity_already_claimed",
+        "a truncation is not a uniqueness conflict, and reporting it as one tells the operator \
+         a grant exists that does not: {:?}",
+        refused.body
+    );
+
+    let grants: i64 = sqlx::query_scalar("select count(*) from admin_identities where issuer = $1")
+        .bind(&issuer.issuer)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count grants");
+    assert_eq!(grants, 0, "the premise is that no grant was written");
 }
 
 #[tokio::test]

@@ -12,7 +12,7 @@
 
 mod support;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     Router,
@@ -45,6 +45,72 @@ const SECRET_SHAPED: [&str; 8] = [
 ];
 
 const WAIT: Duration = Duration::from_secs(10);
+
+/// The channel `listen_once` subscribes to (`src/infra/db.rs`) and every
+/// `notify_moira_runtime_config_change()` trigger publishes on (`migrations/0002`,
+/// `migrations/0013`). Repeated here rather than imported because it is not exported;
+/// a rename on either side makes [`wait_for_listener_attached`] fail loudly on its
+/// deadline rather than quietly stop gating.
+const RUNTIME_CONFIG_CHANNEL: &str = "moira_runtime_config";
+
+/// Paces [`wait_for_listener_attached`]. The first tick of a `tokio` interval completes
+/// immediately, so an already-attached listener costs nothing and only a genuine failure
+/// pays the deadline.
+const ATTACH_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Blocks until this database holds a session that has *committed*
+/// `LISTEN "moira_runtime_config"`.
+///
+/// # Why a write needs this before it can be observed
+///
+/// `spawn_runtime_config_listener` returns its `JoinHandle` the instant the task is
+/// created; only then does the task acquire a connection and execute its `LISTEN`.
+/// Postgres delivers a notification solely to sessions that were already listening when
+/// the notifying transaction committed, so a write that races the attach is not delivered
+/// late — it is **lost**, permanently, and no amount of polling afterwards recovers it.
+/// Waiting for the attach is therefore a missing precondition, not a tolerance: the
+/// assertion that follows it is unchanged, and a fixed sleep here would only be a guess
+/// at how long the attach takes (CONVENTIONS §3).
+///
+/// # Why this observation is sound
+///
+/// [`LifecycleFixture`] clones a database per test, so `datname = current_database()`
+/// cannot be satisfied by a concurrent suite's listener — this can only ever see the one
+/// this test spawned. `state = 'idle'` is what makes it an acknowledgement rather than a
+/// sighting: a backend reports idle only once the statement it was running has committed,
+/// which is exactly the point from which delivery is guaranteed. And sqlx's `PgListener`
+/// issues `LISTEN "moira_runtime_config"` (`PgListener::listen`, quoting the channel) and
+/// then executes nothing further while it blocks in `recv()`, so that text remains the
+/// session's `query` for as long as the listener lives — verified against
+/// `pg_stat_activity` on a live listener, both before and after a delivered notification.
+async fn wait_for_listener_attached(pool: &sqlx::PgPool) {
+    let mut ticker = tokio::time::interval(ATTACH_POLL_INTERVAL);
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let attached: bool = sqlx::query_scalar(
+            "select exists( \
+                 select 1 from pg_stat_activity \
+                 where datname = current_database() \
+                   and state = 'idle' \
+                   and query ilike 'listen%' \
+                   and strpos(query, $1) > 0 \
+             )",
+        )
+        .bind(RUNTIME_CONFIG_CHANNEL)
+        .fetch_one(pool)
+        .await
+        .expect("read pg_stat_activity");
+        if attached {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the runtime config listener never issued LISTEN \"{RUNTIME_CONFIG_CHANNEL}\" \
+             within {WAIT:?}; without it every NOTIFY this test emits is dropped on the floor"
+        );
+        ticker.tick().await;
+    }
+}
 
 struct HttpResult {
     status: StatusCode,
@@ -857,12 +923,16 @@ async fn an_auth_settings_write_invalidates_the_cache_via_listen_notify() {
     .await;
     assert_eq!(enabled.status, StatusCode::OK, "{:?}", enabled.body);
 
-    let listener = moira::infra::db::spawn_runtime_config_listener(
-        fixture.pool.clone(),
-        moira::infra::db::RuntimeInvalidationTargets::from_state(&fixture.state),
-    );
-
     // Populate the cache through the read path the console uses.
+    //
+    // Done *before* the listener exists, deliberately. The read used to sit between the
+    // spawn and the write, where its latency happened to give the listener time to attach —
+    // an accident, not a guarantee, and one that stopped holding under CI load (run
+    // 30617393166). With it moved here, the only thing standing between the spawn and the
+    // write is `wait_for_listener_attached`, so the gate is load-bearing and a regression in
+    // it cannot be papered over by incidental delay. The create and enable above commit
+    // before the listener attaches too, which means their notifications are lost rather than
+    // arriving later and clearing the cache for a reason this test is not asserting.
     let read = request(
         router,
         "GET",
@@ -882,6 +952,15 @@ async fn an_auth_settings_write_invalidates_the_cache_via_listen_notify() {
             .is_some(),
         "the read path must populate the cache, or this test proves nothing"
     );
+
+    let listener = moira::infra::db::spawn_runtime_config_listener(
+        fixture.pool.clone(),
+        moira::infra::db::RuntimeInvalidationTargets::from_state(&fixture.state),
+    );
+    // The precondition the write below depends on: Postgres routes a notification only to
+    // sessions already listening at commit time, so a write issued before the attach is
+    // silently discarded rather than delayed.
+    wait_for_listener_attached(&fixture.pool).await;
 
     // Write straight to the table rather than through the service, so the *only* thing that
     // can clear the cache is the NOTIFY trigger — the service's own local invalidation is
@@ -1032,6 +1111,150 @@ async fn a_second_provider_for_the_same_method_and_issuer_returns_409() {
 
     assert_eq!(second.status, StatusCode::CONFLICT, "{:?}", second.body);
     assert_eq!(second.code(), "duplicate_auth_provider");
+}
+
+/// **Finding F13.** Every uniqueness conflict in this tree is a `409` — except this one,
+/// which fell through `AppError::Sqlx` to `500 database_error` because
+/// `trusted_jwt_issuers` had no mapping to match `auth_provider_settings`'s
+/// `duplicate_auth_provider` above.
+///
+/// It lives beside that test on purpose: the two are the same condition on two tables, and
+/// the reason the gap survived is that nothing ever compared them. The consequence was
+/// found while building the console — a client recovering from a half-finished registration
+/// cannot adopt the existing issuer by catching a `409` when the `409` never arrives, and a
+/// `500` is indistinguishable from an outage worth paging someone for.
+///
+/// Asserted on the status, the code **and** the `message_key`: the code alone would pass
+/// against an uncatalogued literal, which is exactly the class of defect
+/// `every_coded_error_literal_in_src_has_a_catalog_entry` exists to prevent.
+#[tokio::test]
+async fn a_second_trusted_jwt_issuer_for_the_same_issuer_returns_409_not_500() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let issuer = format!("https://duplicate-issuer-{}.example", Uuid::now_v7());
+    let body = json!({
+        "issuer": issuer,
+        "jwks_url": "https://issuer.example/jwks",
+        "allowed_algorithms": ["RS256"],
+        "subject_claim": "sub"
+    });
+
+    let first = request(
+        router.clone(),
+        "POST",
+        "/api/v1/admin/jwt-issuers",
+        HeaderMap::new(),
+        None,
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::CREATED, "{:?}", first.body);
+
+    let second = request(
+        router.clone(),
+        "POST",
+        "/api/v1/admin/jwt-issuers",
+        HeaderMap::new(),
+        None,
+        Some(body),
+    )
+    .await;
+
+    assert_eq!(
+        second.status,
+        StatusCode::CONFLICT,
+        "a duplicate issuer must be a conflict the caller can act on, not a 500: {:?}",
+        second.body
+    );
+    assert_eq!(second.code(), "duplicate_trusted_jwt_issuer");
+    assert_eq!(
+        second.body["error"]["message_key"],
+        json!("moira.error.duplicate_trusted_jwt_issuer")
+    );
+
+    // The refusal must not have written a second row, and the recovery the `409` enables —
+    // find the existing issuer and adopt it — must actually be available.
+    let rows: i64 =
+        sqlx::query_scalar("select count(*) from trusted_jwt_issuers where issuer = $1")
+            .bind(&issuer)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("count issuers");
+    assert_eq!(rows, 1, "a refused create must leave exactly the first row");
+}
+
+/// **Only a uniqueness conflict is a duplicate.**
+///
+/// Found by `cargo mutants`: replacing the `database.is_unique_violation()` match guard with
+/// `true` survived the suite, because the test above is the only thing that reaches the mapper
+/// and it only ever presents a duplicate. Under that mutation *every* database failure on this
+/// insert — a check violation, a truncation, a constraint the schema grows next year — comes
+/// back as `409 duplicate_trusted_jwt_issuer`, telling a client to go adopt an existing row
+/// that does not exist. `already_claimed_on_unique_violation` has carried the equivalent unit
+/// test since plan 07; this is the one that was missing.
+///
+/// `clock_skew_seconds` is `i32` in the DTO and `check (clock_skew_seconds >= 0)` in the
+/// schema, so a negative value is the reachable non-unique database failure on exactly this
+/// statement.
+///
+/// The assertion is deliberately **negative**. What this deployment currently does with a
+/// negative skew is return `500 database_error` — the value should be refused as a `422` by
+/// the service before it ever reaches SQL, which is a separate gap and not this test's
+/// subject. Pinning the 500 would cement it; pinning "this is not a duplicate" states only the
+/// property the mapper is responsible for.
+#[tokio::test]
+async fn a_non_unique_database_failure_is_not_reported_as_a_duplicate_issuer() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let issuer = format!("https://skew-issuer-{}.example", Uuid::now_v7());
+
+    let refused = request(
+        router.clone(),
+        "POST",
+        "/api/v1/admin/jwt-issuers",
+        HeaderMap::new(),
+        None,
+        Some(json!({
+            "issuer": issuer,
+            "jwks_url": "https://issuer.example/jwks",
+            "allowed_algorithms": ["RS256"],
+            "subject_claim": "sub",
+            "clock_skew_seconds": -1
+        })),
+    )
+    .await;
+
+    assert_ne!(
+        refused.status,
+        StatusCode::CREATED,
+        "the schema's check constraint must refuse a negative clock skew: {:?}",
+        refused.body
+    );
+    assert_ne!(
+        refused.code(),
+        "duplicate_trusted_jwt_issuer",
+        "a check violation is not a uniqueness conflict, and reporting it as one sends the \
+         client to adopt a row that was never created: {:?}",
+        refused.body
+    );
+    assert_ne!(
+        refused.status,
+        StatusCode::CONFLICT,
+        "nor is it any other kind of conflict: {:?}",
+        refused.body
+    );
+
+    let rows: i64 =
+        sqlx::query_scalar("select count(*) from trusted_jwt_issuers where issuer = $1")
+            .bind(&issuer)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("count issuers");
+    assert_eq!(rows, 0, "the premise is that no row was written");
 }
 
 #[tokio::test]

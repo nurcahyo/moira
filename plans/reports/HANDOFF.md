@@ -161,8 +161,13 @@ rather than implied. F14 belongs to F.
   `UPDATE_SNAPSHOTS=1 cargo test --lib http::tests::committed_openapi_matches_the_generated_document`.
   Two gates enforce it, plus a hardcoded route list *and an exact operation count* in
   `generated_openapi_covers_every_registered_route`.
-- **Commits:** `git commit --only -- <paths>`, inline `-m`, never bare `git commit` — the index is
+- **Commits:** `git commit -m "…" --only -- <paths>`, never bare `git commit` — the index is
   shared. Commit **incrementally**; two stalls left real work uncommitted.
+  **`-m` must come BEFORE the `--`.** Everything after `--` is a pathspec, so
+  `git commit --only -- <paths> -m "…"` fails with *"did not match any file(s) known to git"* — and
+  if you chained `&& git push`, the push prints **`Everything up-to-date`**. A failed commit followed
+  by a reassuring push message is the eighth form of the §2.2 hazard: read the commit's own output,
+  not the pair.
 - **Stale worktrees** from this run can be pruned: `git worktree list`, then
   `git worktree remove <path>` for any whose branch is merged.
 
