@@ -186,7 +186,19 @@ Migrations end at **`0020`** (next free `0021`; `0016` is a permanent gap). Open
 |---|---|---|
 | **F16** | `rig-core` logs the whole completion body, now carrying other tenants' retrieved documents. Mitigated below the `EnvFilter` — **and that mitigation's own wiring test was missing until `8bbda15`** | **proper fix is upstream; needs an issue filed by a human** |
 | **F2** | Pre-auth query-field enumeration | user deferred |
-| — | Leaked `trusted_jwt_issuers` rows in the shared test DB. **The recorded "~986" was stale — measured 160**, all `idp.invalid`, all one day | in flight on `fix/test-row-leak`; the finding is the *leak*, not the rows |
+| ~~**F27**~~ | ~~Leaked `trusted_jwt_issuers` rows in the shared test DB~~ **CLOSED** `fix/test-row-leak`. **The recorded count was wrong**: it said ~986; the measurement was **160** — exactly ten rows (the ten `register_issuer` call sites in `tests/jwks_hardening.rs`) × sixteen runs, and it leaked them on the **happy** path, not only on a panic. `tests/http_middleware_contract.rs` was the same shape (F10 item 2) with **42** *active* `moira:admin` API keys. Both now use `support::TestDatabase`, whose `Drop` discards the whole database including while unwinding. Residue deleted by predicate; `audit_logs` residue (180 rows) left in place deliberately | hygiene |
+
+*Reversal condition for F27:* it reopens if any test source outside `SHARED_DATABASE_ALLOWLIST` in
+`tests/test_database_isolation.rs` resolves `MOIRA_TEST_DATABASE_URL` itself, or if either suite's
+`the_fixture_owns_a_disposable_database` is deleted or weakened. The three allowlisted files
+(`support/mod.rs`, `security_foundation.rs`, `retention_worker.rs`) are *not* covered — see F10 item 1,
+which a private clone would also fix and which remains open.
+
+**Finding IDs are being allocated concurrently and have collided three times.** `F22` names *two*
+unrelated findings (`api_keys.prefix_length`, and the second `main` flake); `F21` has two entries; and
+this work was written up as `F26` before `#47` merged claiming that number for admin-write/audit
+atomicity — hence `F27`. **Check `origin/main`'s ledger for the highest ID immediately before
+writing one down, not at the start of the task.**
 
 **Closed in the final cycle:** F6, F13, F14, F17, F20, F21, F22, F23, F24, F25, **F26**, B2 —
 **nine PRs, #39–#47**, each CI-verified with every job running steps.

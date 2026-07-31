@@ -24,9 +24,15 @@
 //! which is a latent lost-wakeup whenever the notifier can win the race against the
 //! waiter's first poll. Permits are never lost.
 //!
-//! **Cross-test and cross-*run* isolation.** These tests share one long-lived database
-//! with every other suite and with their own previous runs, and `audit_logs` rows are
-//! never deleted. Two dimensions therefore scope every audit assertion:
+//! **Cross-test and cross-*run* isolation.** Every fixture owns a private database cloned
+//! from the migrated template (`support::TestDatabase`), dropped when the fixture is
+//! dropped — including when the test panics. Nothing this suite writes survives the run.
+//!
+//! It did not always. This suite used to open its own pool straight onto the shared
+//! `MOIRA_TEST_DATABASE_URL` database, and every run left ten `trusted_jwt_issuers` rows
+//! behind for ever (finding F27); `audit_logs`, which is append-only and never swept,
+//! accumulated alongside them. Two dimensions were added to scope every audit assertion,
+//! and they are **kept** now that the database is private:
 //!
 //! 1. `metadata->>'jwks_url'` — every JWKS URL this fixture registers carries a
 //!    per-fixture `Uuid::now_v7()` suffix, **including the ones whose host must stay in a
@@ -35,9 +41,12 @@
 //! 2. `occurred_at > fixture_start`, read from the database clock before the fixture's
 //!    server is started.
 //!
-//! Both are required. Before this scoping existed, two tests asserted against
+//! Both are kept deliberately. Before this scoping existed, two tests asserted against
 //! unsuffixed URLs and matched audit rows written by *previous runs*, so they passed on
-//! the shared `moira_test` database even with the SSRF check mutated out entirely.
+//! the shared `moira_test` database even with the SSRF check mutated out entirely. A
+//! private database makes that impossible today, but the scoping costs nothing and is the
+//! only thing that would still hold if the fixture were ever moved back onto a shared
+//! pool. `the_fixture_owns_a_disposable_database` is the guard that says it has not been.
 //!
 //! **Singleflight is not asserted here.** The e2e shape this suite used to carry
 //! (N racers, hold the leader at the stub, assert `hits == 1`) cannot observe the
@@ -62,10 +71,10 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
-use moira::{app::AppState, config::Settings, infra::db};
+use moira::{app::AppState, config::Settings};
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::PgPool;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -74,7 +83,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use support::MoiraHttpServer;
+use support::{MoiraHttpServer, TestDatabase};
 
 const WAIT: Duration = Duration::from_secs(20);
 const JWKS_TIMEOUT_MS: u64 = 400;
@@ -233,9 +242,12 @@ struct JwksFixture {
     /// The database clock immediately before this fixture's server starts. Every audit
     /// assertion is scoped to rows newer than this, so a row written by a *previous run*
     /// of this suite can never satisfy an assertion made by this one. `audit_logs` is
-    /// append-only and the test database is reused, so without this a denial assertion
-    /// stays green forever once any run has recorded it.
+    /// append-only, so on a reused database a denial assertion would otherwise stay green
+    /// forever once any run had recorded it.
     started_at: DateTime<Utc>,
+    /// Declared last so it is dropped last: the database outlives every field that still
+    /// holds a connection to it.
+    database: TestDatabase,
 }
 
 impl JwksFixture {
@@ -244,29 +256,15 @@ impl JwksFixture {
     /// stub IdP is reachable at all — which is itself the proof that the hardening, not
     /// the transport, is what refuses loopback in the other tests.
     async fn new(dev_override: bool) -> Option<Self> {
-        let database_url = match std::env::var("MOIRA_TEST_DATABASE_URL") {
-            Ok(value) if !value.trim().is_empty() => value,
-            _ if std::env::var("CI").is_ok_and(|value| value.eq_ignore_ascii_case("true")) => {
-                panic!("MOIRA_TEST_DATABASE_URL is required when CI=true for JWKS hardening tests")
-            }
-            _ => {
-                eprintln!("skipping JWKS hardening tests: MOIRA_TEST_DATABASE_URL is not set");
-                return None;
-            }
-        };
-        let pool = timeout(
-            WAIT,
-            PgPoolOptions::new()
-                .max_connections(8)
-                .connect(&database_url),
-        )
-        .await
-        .expect("database connection timed out")
-        .expect("connect JWKS test database");
-        timeout(WAIT, db::migrate(&pool))
-            .await
-            .expect("migrations timed out")
-            .expect("run migrations");
+        // A private database cloned from the migrated template, torn down by
+        // `TestDatabase`'s `Drop` — on the panic path as well as the happy one. This
+        // suite previously opened its own pool on the shared `MOIRA_TEST_DATABASE_URL`
+        // database and every one of the ten `register_issuer` calls below leaked a row
+        // that nothing ever deleted (finding F27). `TestDatabase::create` keeps the
+        // fail-closed skip contract: `None` when the variable is unset, a panic when
+        // `CI=true`.
+        let database = TestDatabase::create().await?;
+        let pool = database.pool.clone();
 
         // Read the *database* clock, not the test process's: `occurred_at` is written by
         // PostgreSQL, so comparing against a locally-taken timestamp would depend on the
@@ -292,6 +290,7 @@ impl JwksFixture {
             client: Client::new(),
             suffix: Uuid::now_v7().simple().to_string(),
             started_at,
+            database,
         })
     }
 
@@ -451,6 +450,83 @@ fn assert_generic_unauthorized(status: StatusCode, body: &Value) {
         !error["request_id"].as_str().expect("request_id").is_empty(),
         "the envelope must carry a request id: {body}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Anti-leak guard
+// ---------------------------------------------------------------------------
+
+/// Finding F27: every row this suite writes must land in a database that is thrown away
+/// when the test ends, not in the long-lived one `MOIRA_TEST_DATABASE_URL` names.
+///
+/// **What this establishes.** That `JwksFixture` is bound to a per-fixture clone owned by
+/// `support::TestDatabase`, whose `Drop` drops the database unconditionally — on a
+/// dedicated thread with its own runtime, so it runs while the test is unwinding from a
+/// panic, which is exactly when a leak would otherwise be permanent. Ten of the tests
+/// below insert a `trusted_jwt_issuers` row and none of them deletes it; the disposable
+/// database, not any per-test cleanup, is what makes that safe.
+///
+/// **What it does not establish.** Not that `trusted_jwt_issuers` is empty anywhere else —
+/// on a shared database another suite writes to, "the table is empty" would prove nothing,
+/// and assertion (c) below is meaningful *only* because (a) and (b) have already
+/// established that this database is private and freshly cloned. Not that the teardown
+/// itself succeeds: a `SIGKILL`ed process never runs `Drop` at all, and leaves a whole
+/// database behind for `sweep_leaked_databases` to collect an hour later. And not that
+/// some *other* suite is leak-free — `tests/test_database_isolation.rs` carries that.
+#[tokio::test]
+async fn the_fixture_owns_a_disposable_database() {
+    let Some(fixture) = JwksFixture::new(false).await else {
+        return;
+    };
+    let live = timeout(
+        WAIT,
+        sqlx::query_scalar::<_, String>("select current_database()").fetch_one(&fixture.pool),
+    )
+    .await
+    .expect("current_database timed out")
+    .expect("current_database");
+
+    // (a) Not the shared database. This is the assertion that turns red the moment the
+    //     fixture is pointed back at `MOIRA_TEST_DATABASE_URL`.
+    let shared = support::shared_database_name().expect("a fixture was built, so the URL parses");
+    assert_ne!(
+        live, shared,
+        "the JWKS fixture is writing to the shared test database `{shared}`, so every \
+         `register_issuer` call in this suite leaks a `trusted_jwt_issuers` row that \
+         nothing ever deletes — finding F27, which was 160 rows when it was measured"
+    );
+
+    // (b) It is this fixture's own clone, named in the shape `TestDatabase::drop` tears
+    //     down and `sweep_leaked_databases` collects if the process dies first.
+    assert_eq!(
+        live,
+        fixture.database.name(),
+        "the fixture's pool must be connected to the database `TestDatabase` owns and \
+         drops; a pool pointing anywhere else outlives the teardown"
+    );
+    assert!(
+        live.starts_with("moira_test_") && !live.starts_with("moira_test_template_"),
+        "a fixture database must carry the disposable `moira_test_<unix>_<uuid>` name that \
+         teardown and the leak sweep both key on, found `{live}`"
+    );
+
+    // (c) Cloned from the empty template, so nothing an earlier run of this suite wrote is
+    //     visible to this one.
+    let carried_over = timeout(
+        WAIT,
+        sqlx::query_scalar::<_, i64>("select count(*) from trusted_jwt_issuers")
+            .fetch_one(&fixture.pool),
+    )
+    .await
+    .expect("issuer count timed out")
+    .expect("issuer count");
+    assert_eq!(
+        carried_over, 0,
+        "a freshly cloned fixture database must carry no `trusted_jwt_issuers` rows at all; \
+         finding one means the template was polluted or this pool is on a reused database"
+    );
+
+    fixture.shutdown().await;
 }
 
 // ---------------------------------------------------------------------------

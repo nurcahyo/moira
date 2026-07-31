@@ -730,14 +730,30 @@ pub fn admin_actor() -> Actor {
 // them (module 13 item 4 — no fixture spawns `spawn_runtime_config_listener` today,
 // and with per-fixture databases one that did would still only hear itself).
 //
-// What this does **not** cover: the four suites that build their own pool straight
-// against `MOIRA_TEST_DATABASE_URL` rather than through a fixture —
-// `tests/http_middleware_contract.rs`, `tests/jwks_hardening.rs`,
-// `tests/retention_worker.rs` and `tests/security_foundation.rs`. The last already
-// creates and force-drops its own database; the other three assert only on rows they
-// created, keyed by a per-run `Uuid`. They are left on the shared database
-// deliberately, and none of them mixes its own pool with a `LifecycleFixture` in the
-// same test.
+// This once excluded four suites that built their own pool straight against
+// `MOIRA_TEST_DATABASE_URL`, on the grounds that they "assert only on rows they created,
+// keyed by a per-run `Uuid`". That was true and beside the point: asserting *safely* on a
+// shared database is not the same as leaving nothing behind on it. Two of them —
+// `tests/jwks_hardening.rs` and `tests/http_middleware_contract.rs` — were leaking every
+// row they wrote, on the happy path, for as long as they had existed: 160
+// `trusted_jwt_issuers` rows and 42 `active` `moira:admin` API keys by the time anyone
+// counted (findings F27 and F10 item 2). Both now take a `TestDatabase`.
+//
+// Two suites remain on the shared database, and `tests/test_database_isolation.rs` is the
+// guard that keeps that list from growing silently:
+//
+// * `tests/security_foundation.rs` — asserts the migration contract itself, so it must
+//   migrate from nothing rather than clone an already-migrated template. It already
+//   creates and force-drops its own database per run.
+// * `tests/retention_worker.rs` — `retention::run_once` is a cluster-wide sweep whose
+//   delete counter it asserts exact equality on, serialised by a global advisory lock
+//   (finding F10 item 1, still open). A private clone would scope the sweep to one
+//   database and dissolve both the lock and the exact-equality hazard; that is a change of
+//   retention test semantics, deliberately left outside F27.
+//
+// No test mixes its own pool with a `LifecycleFixture`, and none takes two fixtures at
+// once — `FIXTURE_BUDGET` is a bounded semaphore, so a test holding two permits while
+// others wait for their first would be a deadlock rather than a slowdown.
 
 const MAINTENANCE_DATABASE: &str = "postgres";
 const TEMPLATE_PREFIX: &str = "moira_test_template_";
@@ -794,6 +810,24 @@ fn template_database() -> String {
         name.push_str(&format!("{byte:02x}"));
     }
     name
+}
+
+/// The database `MOIRA_TEST_DATABASE_URL` names — the one every suite would share if it
+/// opened its own pool on it.
+///
+/// Exposed so a suite can assert it is *not* connected to that database without resolving
+/// the variable itself. `tests/test_database_isolation.rs` permits exactly three files to
+/// make that lookup, and this module is the one that owns the mechanism; a suite doing it
+/// inline would be a new entry on that allowlist for no reason beyond a diagnostic.
+pub fn shared_database_name() -> Option<String> {
+    let url = env::var("MOIRA_TEST_DATABASE_URL").ok()?;
+    Some(
+        Url::parse(&url)
+            .ok()?
+            .path()
+            .trim_start_matches('/')
+            .to_string(),
+    )
 }
 
 /// `MOIRA_TEST_DATABASE_URL` with the database name factored out, so a URL can be
