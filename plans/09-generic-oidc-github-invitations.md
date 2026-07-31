@@ -163,7 +163,389 @@ attach to until Wave 3-new lands.
 
 ---
 
-## Summary
+## §0.7 — Wave 4 (multi-provider): drift against the tree (audit 2026-07-31, `main` at `1f5e3f7`)
+
+**Scope of this section.** Waves 1–3 are merged; §0.1–§0.6 above describe the tree as it was
+*before* them and remain the record of what those waves changed. This section audits **wave 4 only**
+— multi-provider sign-in, GitHub storage, and the auth-settings screen — against the tree as it
+actually stands now. Where §0.7 and any earlier §0 subsection disagree about the present tree,
+**§0.7 wins**; where §0.7 and the body disagree, §0.7 wins.
+
+**Measured drift: ~70%** — 31 of 44 discrete, checkable wave-4 claims are wrong or materially
+incomplete (12 hold, 2 hold only in part). Counted by extracting every falsifiable assertion in the
+wave-4 surface of the body (the D-1 dependency block, the multi-provider/GitHub/auth-settings-screen
+implementation sections, their named tests, the migration and deployment notes) and checking each
+against the tree, a live database, or a shipped test.
+
+**The one-paragraph version.** Wave 4 is not one redesign but **two**, and the second is not in the
+plan at all. Removing `ambiguous_enabled_providers` is real and roughly as described. But Moira's
+own `governing_policy` resolves **exactly one** provider row per claim — so the moment a second
+provider is enabled, the *oldest* enabled row's `allowed_email_domains` silently governs everyone,
+including users who signed in through a different provider. The console guard is the only thing
+that has been keeping that unreachable. **Removing the guard without fixing the query converts a
+console-side refusal into a silent, deployment-wide policy substitution.** Separately, a fourth
+`AuthMethod` variant is safe in Rust (three compile-time stops) and **unguarded in TypeScript**
+(zero), and one `github_oauth` row reaching the database before the Rust enum knows the value turns
+the anonymous login endpoint into a 500 for **every** provider.
+
+### §0.7.1 Drift table — wave-4 claims that no longer match the tree
+
+Grouped by area. "Body" means the wave-4 prose in this file unless another section is named.
+
+#### Moira data model
+
+| # | Body says | Reality (verified at `1f5e3f7`) |
+|---|---|---|
+| 1 | The auth-settings table supports N rows "keyed by `provider_id`" | **There is no `provider_id` column.** Rows are keyed by `id uuid`; the only uniqueness is `auth_provider_settings_method_issuer_active_unique` on `(method, coalesce(issuer,''))`. Every `provider_id` in the Moira tree belongs to the *AI-provider* side and is unrelated |
+| 2 | Each row carries `hosted_domain` | **No such column, anywhere in the tree.** Zero hits in SQL, Rust, TS or the committed spec |
+| 3 | Each row carries `required_org` (GitHub only) | **No such column, anywhere.** It exists only as prose in this plan |
+| 4 | GitHub's non-secret config is stored in `auth_provider_settings` | **Two CHECK constraints reject it, and the second is not the one §0.1 B6 emphasises.** Verified empirically against the live database: the unnamed inline method CHECK (Postgres auto-names it `auth_provider_settings_method_check`) rejects `github_oauth` first; with *only* that widened, `auth_provider_settings_method_shape` still rejects the row, because GitHub has neither `issuer` nor `discovery_url`. Both must be dropped and re-added |
+| 5 | The multi-provider migration "adds **non-secret columns only**" | **False on both halves.** No column is required to hold N rows — the table is already N-row. What is required is constraint surgery. Columns enter only through this section's decisions (`provider_id`) |
+| 6 | §0.1 **B6**: the migration must also drop the unique index, because GitHub's null issuer means "at most one row per method can have a null issuer" | **Right conclusion, wrong reason — and the real defect is worse.** A single null-issuer GitHub row is fine (one GitHub.com integration is the normal case). The index actually bites on **two `generic_oidc` providers configured by `discovery_url` with no `issuer`**: both collapse to `('generic_oidc','')`. Verified live — the second insert fails `duplicate key … Key (method, COALESCE(issuer, ''::text))=(generic_oidc, )`. That is a mainstream multi-provider configuration, refused with an opaque 409 `duplicate_auth_provider` |
+| 7 | Moira's claim/redeem policy is resolved **per provider** ("per-provider allowed-domain policy") | **`governing_policy` ends in `limit 1`.** It orders by `(issuer is not distinct from $1) desc, created_at asc, id asc`. In a real deployment `$1` is the *console's* issuer while every provider row's `issuer` holds the *IdP's*, so no row matches on issuer and the tiebreak is `created_at` — **the oldest enabled row governs every claim and every redemption, whichever provider the user actually used.** See W4-B1 |
+
+#### Console
+
+| # | Body says | Reality |
+|---|---|---|
+| 8 | `loadAuthSettings()` is extended to return an array | Named `loadAuthConfig` / `resolveAuthConfig` (already recorded in §0.4). The *shape* claim is the real work: `ResolvedAuthConfig` is a single flat object — one `providerId`, one `clientId`, one `clientSecret`, one `allowedEmailDomains`, one `trustedJwtIssuerId` |
+| 9 | `genericOAuth` accepts a `config` **array**, so N providers need no extra plumbing | **TRUE**, and better than claimed: the shipped call already passes an array — with exactly one element spread from the single `ResolvedAuthConfig`. The chokepoint is entirely upstream |
+| 10 | Secrets resolve via `getProviderSecret({moiraProviderId, providerId, moiraClientId})`, which fingerprints before decrypting | **The interface is `ConsoleSecretStore` — `put`/`read`/`reveal`/`remove`/`newestUpdatedAt`.** Drift is a separate `classifySecretDrift` (constant-time compare) returning `in_sync` / `console_secret_missing` / `client_id_mismatch` / `moira_client_id_missing`. There is deliberately **no `list()`/enumerate** — "an interface that cannot enumerate secrets is one an accidental debug endpoint cannot dump" |
+| 11 | The cache key is `` `${moiraSettingsVersion}:${maxConsoleSecretUpdatedAt}` `` | Already rejected in §0.3, and the shipped replacement **needs no wave-4 change**: `authConfigCacheKey` digests the sorted `(id, version)` set over **all** fetched rows plus the newest secret write. It is already N-row-shaped. Do not touch it |
+| 12 | `lib/provider-secrets.ts` is reused verbatim | The modules are `lib/console-secrets.ts` (envelope + interface + in-memory impl) and `lib/console-secrets-postgres.ts` (the durable impl over `console_provider_secret`). The *intent* — one and only one place that encrypts — is shipped and is guarded |
+| 13 | `requireIssuerValidation: true` is pinned on every entry ("the plugin's own default is `false`") | **The option does not appear anywhere in `console/`.** It was never set. `pkce: true` *is* set unconditionally. Pinning `requireIssuerValidation` is new work, not a per-entry propagation |
+| 14 | `mapProfileToUser` populates `idpIssuer`/`idpSubject` additional fields "plan 08 introduced" | Recorded as **proven broken and unsafe** in §0.3 and still true: the shipped mechanism is `readIdpSubject`, reading `account.accountId` filtered by `providerId`. Its doc comment already anticipates wave 4 — "the `providerId` filter matters because a future second provider would otherwise make the answer depend on row order" |
+| 15 | Callback URLs are covered because "`middleware.ts`'s host allow-list is unchanged" | **There is no `middleware.ts`.** §0.4 scheduled one for wave 3; wave 3 did not ship it. The session gate is the `(console)` **route-group layout** (`hasConsoleSession()` → `redirect("/login")`). Any wave-4 page placed inside `(console)` inherits that gate for free; there is no host allow-list to inherit |
+| 16 | The `databaseHooks.user.create.before` gate "from plan 08" is extended to resolve per-provider domains | **`databaseHooks` appears nowhere in `console/`.** That gate was never built. Domain enforcement lives in `lib/moira-session.ts`, which calls `isEmailDomainAllowed(email, config.allowedEmailDomains)` against the **single** resolved config |
+| 17 | GitHub arrives via Better Auth's built-in `socialProviders.github` | **`socialProviders` has zero occurrences in `console/`**; `emailAndPassword` is explicitly disabled with "An admin console has exactly one way in: the operator's IdP." This is greenfield, not an extension |
+| 18 | The auth-settings screen "extends plan 08's" | **No settings screen exists.** No path under `console/` matches `settings`; no `modules/authSettings/`; no provider CRUD UI at all. `SignInPanel`'s own header states the position: a provider picker "is not 'not built yet' — it is wrong in this wave" |
+| 19 | `ProviderSecretRotatePanel` and `ProviderDriftBanner` are "reused per provider row, not re-implemented" | **Neither component exists.** `console/modules/` holds exactly `secrets/OnceOnlySecretModal.tsx` and `signIn/SignInPanel.tsx` |
+| 20 | `OnceOnlySecretModal` and `SignInPanel` are reused from plan 08 | **TRUE** — both shipped in wave 3, under `console/modules/` |
+| 21 | "**No new i18n keys are needed for D7 in this plan**" — the named `console.error.auth_provider_*` and `console.authSettings.*` keys are reused verbatim | **Three of the named keys exist** (`auth_provider_create_failed`, `auth_provider_secret_write_failed`, `auth_provider_enable_failed`). **These do not:** `auth_provider_client_id_mismatch`, `auth_provider_secret_undecryptable`, `console.notice.orphaned_provider_secret`, `console.authSettings.rotate_secret.*`, `console.authSettings.secret_configured`. Drift is currently keyed through `CONSOLE_SECRET_DRIFT_MESSAGE_KEYS`. **And the coverage gate is bidirectional** — a key added without a shipped emitter fails `i18n-catalog-coverage.test.ts`, so keys and UI must land together |
+
+#### Migration, contract and deployment
+
+| # | Body says | Reality |
+|---|---|---|
+| 22 | The multi-provider extension rides in `migrations/0017_admin_invites.sql` | **`0017` and `0018` are shipped.** `0016` was reserved by plan 11 and never used — the sequence is permanently non-contiguous, which `sqlx::migrate!("./migrations")` tolerates. Next free **on `main` today is `0019`**; PR #39 (`fix/findings-sweep`, in flight) already carries `0019_single_primary_admin.sql`, so after it merges the next free is **`0020`**. HANDOFF's "`0020`" is right only once #39 lands. **Re-verify with `git ls-files migrations/` at branch time** |
+| 23 | Wave 0 must confirm "the operation count still **10**" | **Two different numbers, neither of which is 10 in the sense used.** The auth-provider family is **7** operations (4 paths); the committed document is **151** operations over **99** paths and **178** schemas. "10" was plan 07's identity-surface figure. The console pins the 7 in `openapi-contract.test.ts` |
+| 24 | Adding GitHub is a storage question | It is also an **enum** question the body never asks. `AuthMethod` is enumerated in `docs/openapi.json` as exactly `["google_oauth","generic_oidc","jwks"]`, and the TS mirror in `console/lib/types.ts` is hand-written with **no test and no compile-time link to the spec** |
+| 25 | `charts/moira-console/values.yaml` needs no new secret because "provider secrets live in Moira, encrypted" | **Contradicts D7** — they live in the *console's* database. The chart statement is right for the wrong reason. Separately `replicaCount: 1` **is still pinned**, because the auth-config snapshot is per-process; N providers multiply that divergence rather than introduce it |
+| 26 | Named test `auth-settings-multi.test.ts` covers `lib/auth-settings.ts` | No such module. The unit under test is `lib/auth-config.ts` (+ `lib/auth-runtime.ts`) |
+| 27 | Named test `only_provider_secrets_module_encrypts_or_fingerprints` | Right idea, wrong module name, and **already enforced**: `server-only-guards.test.ts` pins `console_provider_secret` to `lib/console-secrets-postgres.ts` alone and pins the connection string to exactly three named files |
+| 28 | Named test `there_is_no_rotate_secret_call_for_any_provider` is new work | **Already shipped and gated three ways**: the tree-wide `rotate-secret` literal ban in `server-only-guards.test.ts`, the no-`/rotate.*secret/i`-key rule in `i18n-catalog-coverage.test.ts`, and Moira-side `the_rotate_secret_path_is_genuinely_unrouted_not_merely_undocumented` |
+| 29 | New file `console/tests/unit/architecture/bundle-scan.test.ts` | Superseded — `console/e2e/secret-leak.e2e.ts` scans `.next/static/**` and sourcemaps as well as rendered HTML/RSC. Wave 3 closed the `E2E_SKIP_BUILD=1` hole it would have duplicated |
+
+**Holds as written (do not re-litigate):** the `genericOAuth` config array (#9); `OnceOnlySecretModal`/`SignInPanel` reuse (#20); D7 itself — Moira stores no client secret, returns none, and has no `rotate-secret` endpoint, all three gated; `console_provider_secret` being N-row by construction (one row per provider, `provider_id` primary key); per-provider fail-closed resolution as a *design*; deny-by-default domain policy with no invitation exemption; the Atomic-Design placement rules; `*.e2e.ts` under `console/e2e/`; `pkce: true`; the Better Auth callback pattern `${baseURL}/api/auth/oauth2/callback/:providerId`; and mandatory OpenAPI regeneration.
+
+### §0.7.2 Blockers, ranked
+
+**W4-B1 — Removing `ambiguous_enabled_providers` without fixing `governing_policy` ships a silent policy substitution. (Severity: highest — security, silent, and created by this wave.)**
+
+`governing_policy` selects `limit 1`. Its ordering prefers an exact `issuer` match, but on any console-mediated deployment the caller's issuer is the *console's* while each provider row's `issuer` is the *IdP's* — so nothing matches on issuer and rows tie, leaving `created_at asc, id asc`. With one enabled provider that is harmless. With two it means **the oldest enabled row's `allowed_email_domains` governs every claim and every invite redemption**, regardless of which provider the identity actually authenticated through.
+
+Consequences, both reachable: a permissive first provider silently widens a restrictive second one (a domain allowed for Google is accepted for a GitHub identity that no rule ever admitted); and a restrictive first provider silently denies a correctly-configured second one. Neither surfaces an error naming the cause.
+
+This is the plan-08 B1 signature: **the plan states an invariant — "per-provider allowed-domain policy" — that nothing in it exercises.** No named wave-4 test asserts that a redemption through provider B is judged by B's allow-list. The console's `ambiguous_enabled_providers` refusal is the only reason this has never fired, and wave 4's central task is to remove it. **Fix the query in the same wave that removes the guard, or do neither.**
+
+**W4-B2 — `auth_method_from_db` turns one unknown row into a 500 on the anonymous login endpoint. (Severity: high — availability, deploy-ordering, silent to the compiler.)**
+
+`auth_method_to_db` is an exhaustive match (the compiler stops you). Its inverse `auth_method_from_db` ends in a catch-all `_ => Err(AppError::Internal(...))`. `record_from_row` and `list_enabled_public` both call it **per row**, so a single `github_oauth` row that exists in the database while the binary does not know the value fails **the whole list** — including the unauthenticated `GET /api/v1/admin/setup/sign-in-methods`, i.e. the login screen goes to 500 for every provider, not just GitHub.
+
+The reachable path is ordinary: `charts/moira/templates/migration-job.yaml` runs migrations as a Helm hook **before** pods roll, so during any rolling deploy old replicas serve against the new schema. If the widened CHECK lands and any row is created before every replica is new, old replicas 500. The existing negative test does not catch the gap — it asserts `auth_method_from_db("github").is_err()`, using the string `"github"`, not `"github_oauth"`.
+
+**W4-B3 — Changing the console's `providerId` scheme orphans the shipped secret and locks out every existing admin. (Severity: high — data, irreversible without operator action.)**
+
+Today there is one hardcoded `CONSOLE_OAUTH_PROVIDER_ID = "moira-console-idp"`. Two durable stores are keyed on it:
+
+* `console_provider_secret.provider_id` is the **primary key**, and the AEAD's AAD is
+  `` `moira-console/v${SECRET_ENVELOPE_VERSION}/${providerId}/${clientId}` `` — so a renamed
+  providerId does not merely miss the row, it **cannot decrypt** it. The operator must re-enter the
+  client secret.
+* Better Auth's `account.providerId` records which provider each linked account came from, and
+  `readIdpSubject` filters on it. A renamed providerId makes `readIdpSubject` throw
+  `MissingIdpSubjectError` for **every existing admin**, so no Moira-bound token can be minted —
+  and `account.accountId` is precisely the IdP subject Moira's `admin_identities` grant is keyed on.
+
+Any wave-4 providerId scheme must therefore either preserve `moira-console-idp` for the pre-existing row or ship a console-DB data migration that re-seals every secret and rewrites `account.providerId`. See **W4-D2**, which chooses the former.
+
+**W4-B4 — The TypeScript `AuthMethod` union is the one unguarded seam in the whole contract. (Severity: medium-high — silent, and mis-reports its own cause.)**
+
+`console/lib/types.ts` hand-mirrors the spec enum. `console/tests/contract/openapi-contract.test.ts` re-derives required/optional **key sets and operation paths** and never inspects `enum`, so **nothing** links the union to `docs/openapi.json`. Worse, `isInteractiveMethod` is an allow-list of literals (`method === "google_oauth" || method === "generic_oidc"`), not a `switch`, so TypeScript raises no exhaustiveness error: a `github_oauth` row resolves to `fail("method_not_interactive")`, whose shipped catalog message tells the operator **"The enabled row's `method` is `jwks`"** — a false diagnosis of a provider they just configured.
+
+**W4-B5 — The `(method, coalesce(issuer,''))` unique index refuses two discovery-only OIDC providers. (Severity: medium — mainstream configuration, opaque error.)**
+
+Verified live. Two `generic_oidc` rows configured by `discovery_url` alone both key to `('generic_oidc','')` and the second is refused. `map_constraint_violation` renders that as `409 duplicate_auth_provider`, which is true but unhelpful — the rows are not duplicates in any sense the operator recognises. Distinct `issuer` values avoid it, so the failure is configuration-dependent and will look intermittent.
+
+**W4-B6 — The shared test database has one global null-issuer slot per method, and only one of them is locked. (Severity: medium — CI flake, and it leaks a permanently poisoning row.)**
+
+`ISSUERLESS_GENERIC_OIDC_LOCK_KEY` / `IssuerlessSlotLock::acquire` exist precisely because `('generic_oidc','')` is a single global slot on the shared database; the lock serialises tests that need it and deletes the row. `('github_oauth','')` is a **second** such slot with **no** lock. Any wave-4 test inserting an issuer-less GitHub row will collide across parallel runs, and a leaked row then feeds W4-B2. This is the same class as the ledger's "~986 leaked `trusted_jwt_issuers` rows".
+
+**W4-B7 — Wave-4 UI cannot enumerate configured secrets through the shipped interface. (Severity: low-medium — design constraint, not a defect.)**
+
+`ProviderList` wants a "secret configured" badge per row. `ConsoleSecretStore` deliberately has no `list()`. The resolution is to drive per-provider `read()` calls from Moira's row list (which the console already fetches) rather than to widen the interface — widening it would discard the stated rationale and is the kind of change that later reads as an oversight. Record the choice where the interface is defined.
+
+### §0.7.3 Decisions taken for wave 4, each with its reversal condition
+
+Taken under the standing "decide rather than ask" authority. Each belongs in
+`plans/reports/EXECUTION-LEDGER.md` alongside the wave-1–3 decisions.
+
+**W4-D1 — GitHub becomes a fourth `AuthMethod` variant, `github_oauth`. It does not become a `provider_id`-keyed generic row.**
+`AuthMethod` is already the discriminator in the SQL CHECK, the shape validator, the DB encoder, the
+sign-in projection filter and the committed spec. Adding a variant lights up **three compile-time
+stops** — `PublicSignInMethod::from_enabled_method`, `validate_method_shape`, `auth_method_to_db` —
+each of which forces an explicit GitHub decision at exactly the right place. A `provider_id`-keyed
+"generic OAuth" row would introduce a second discriminator alongside `method` and leave all three
+matches untouched, which is the same as having no forcing function at all. GitHub's shape branch is
+`client_id is not null and authorization_url is not null and token_url is not null` — not the OIDC
+issuer/discovery rule.
+*Reversal condition:* if a deployment must configure more than one non-OIDC OAuth provider that is
+not GitHub (GitLab, Bitbucket, a bespoke OAuth2 IdP), stop adding variants and introduce a generic
+`oauth2` method whose per-provider identity is carried by `provider_id`. One extra variant is
+cheaper than a second discriminator; three would not be.
+
+**W4-D2 — Add a `provider_id` slug column to `auth_provider_settings`, unique among live rows, and backfill the existing enabled row to `'moira-console-idp'`.**
+This is the only option that resolves **W4-B3** without a console-DB data migration. The backfill
+makes the pre-existing row's Better Auth `providerId` unchanged, so `console_provider_secret` still
+decrypts (the AAD is preserved) and every `account.providerId` still matches `readIdpSubject`. It
+also gives operators stable, readable callback URLs (`/api/auth/oauth2/callback/github`) that
+survive deleting and recreating a row — which the row `id` uuid would not, since the callback must
+be registered **exactly** at the IdP. The slug is immutable after creation; renaming one is
+equivalent to deleting and recreating the provider, and must be documented as such.
+*Reversal condition:* if Better Auth ever routes on something other than a caller-supplied
+`providerId`, or a slug collides with one of its reserved route segments, fall back to the row `id`
+uuid **plus** a console-DB migration that re-seals every `console_provider_secret` row under the new
+AAD and rewrites `account.providerId` in the same transaction. That migration is the cost this
+decision exists to avoid; do not pay it accidentally.
+
+**W4-D3 — `provider_id` is added to `PublicSignInMethod`; `required_org` is not, and neither is anything else.**
+Applying F15's admitting rule explicitly, as the brief requires: *every field in the anonymous
+projection must be one the browser already transmits or receives during the sign-in it is about to
+start.* `provider_id` **passes** — it is literally a path segment of the callback URL the browser is
+about to visit and a field of the sign-in POST body, so it discloses nothing a click would not.
+`required_org` **fails** — it is membership policy, never on the wire to the browser, and naming a
+company's GitHub org to anonymous callers is the same class of disclosure as
+`allowed_email_domains`, which is exactly why `sign-in-methods` exists instead of `auth-methods`.
+This deliberately breaks `the_anonymous_projection_drops_the_domain_policy_and_the_jwks_url`, which
+asserts an **exact key set**; that break is the gate working. Update it *with the rule written into
+the assertion*, so the next person adding a field meets the argument rather than the list.
+*Reversal condition:* if the console can render N buttons without knowing each provider's routing
+key — for example if Better Auth gains a lookup by opaque row id — drop the field again. The
+anonymous surface should shrink whenever it can.
+
+**W4-D4 — `governing_policy` becomes the union of `allowed_email_domains` across all enabled rows bound to the caller's trusted issuer. Moira is the deployment-wide backstop; the console keeps per-provider enforcement.**
+Moira **cannot** observe which upstream IdP a console-minted token came from — the token's issuer is
+the console's for every provider — so a genuinely per-provider decision is not available to it
+without a new console-asserted claim. The console *can*: it already knows the provider from
+`account.providerId`, and already enforces domains in `lib/moira-session.ts`. So the honest split is
+console = per-provider gate, Moira = deployment-wide backstop, and the union is the correct backstop
+semantics. With one enabled provider the union is identical to today's behaviour, so no existing
+deployment changes. Deny-by-default is preserved exactly: zero enabled rows, or rows whose lists are
+all empty, still deny everyone.
+*Reversal condition:* if an operator needs different allow-lists per provider enforced **at Moira**
+— for instance contractors admitted through GitHub only, under an org check the console cannot be
+trusted to apply alone — add an explicit `provider_id` to `ClaimAdminIdentityRequest` and
+`AdminInviteRedeemRequest` and resolve policy from that row. That is a frozen-DTO change and a new
+trust assertion (the console would be asserting *which* policy governs it), so it needs its own
+decision, not a silent widening of this one.
+
+**W4-D5 — `required_org` is deferred out of wave 4 entirely. GitHub ships with verified-primary-email hardening only.**
+The org check is optional by the plan's own product recommendation, and wave 4 is already two
+redesigns. Deferring it removes a column, three DTO changes, a spec regeneration and a live-GitHub
+dependency from the critical path, and loses nothing that blocks GitHub sign-in. The
+verified-primary-email lookup **is** in scope, because without it GitHub cannot satisfy the uniform
+verified-email requirement the grant path depends on (`profile.email` may be null, unverified, or a
+`noreply` address).
+*Reversal condition:* when org scoping is wanted, add a typed `required_org text` column — **not**
+`metadata`. `metadata` is opaque round-trip storage that nothing reads, and it is excluded from
+`list_enabled_public` and from both public projections, so policy parked there is invisible to every
+read path that matters and is validated by nothing.
+
+**W4-D6 — F21 is closed in wave 4, not wave 5.**
+F21 belongs to the invitation domain, which is wave 5's, so by ownership it is wave 5's. It is
+reassigned to wave 4 on cost grounds: wave 4 already opens `src/application/identity.rs` for
+**W4-D4**'s policy change, and the fix is a guard in one `match` arm plus one test. The defect: after
+the transactional envelope, the `Err` arm calls `record_admin_invite_denied(denial_reason(&error))`
+**unconditionally**, including when the error is `AppError::Replayed`. A cacheable failure (409
+`admin_identity_already_claimed` is 400/404/409/422) writes an idempotency record, so every retry
+under the same `Idempotency-Key` replays it and increments the denial counter again — inflating an
+operator's denial rate by the client's retry count. The success arm is unaffected and needs no
+guard: pre-envelope validation refuses a consumed invite before the envelope is entered, so a
+*successful* redemption can never replay. Skip the metric when the error is a replay; the original
+attempt already counted it.
+*Reversal condition:* if wave 4 ships without touching `src/application/identity.rs` (i.e. **W4-D4**
+is descoped), F21 returns to wave 5 rather than being carried alone.
+
+### §0.7.4 Ordered task list for the wave-4 implementation
+
+Sized for one agent. **Moira first** — the console cannot render a provider it cannot store, and the
+Rust enum must reach every replica before any `github_oauth` row can exist (W4-B2).
+
+**Phase 1 — Moira schema and domain (one migration, one commit)**
+
+1. Re-verify the migration number: `git ls-files migrations/`. `0019` if PR #39 has not merged,
+   `0020` if it has. **Two migrations with one number is a hard failure** — do not take HANDOFF's
+   number on trust.
+2. Write the migration: drop the auto-named `auth_provider_settings_method_check` and re-add it with
+   `github_oauth`; drop and re-add `auth_provider_settings_method_shape` with the GitHub branch
+   (`client_id not null and authorization_url not null and token_url not null`); add
+   `provider_id text` with a unique index over live rows; backfill `'moira-console-idp'` onto the
+   existing enabled row; re-key the issuer uniqueness to
+   `(method, coalesce(issuer, discovery_url, ''))` so W4-B5's two discovery-only OIDC rows are
+   admitted while genuine duplicates are still refused.
+3. `src/domain/auth_settings.rs`: add `AuthMethod::GithubOauth`; add `provider_id` to
+   `AuthProviderSettingsRecord`, both request DTOs, `PublicAuthMethod` and `PublicSignInMethod`.
+   Follow the three compile errors this produces (`from_enabled_method`, `validate_method_shape`,
+   `auth_method_to_db`) and give GitHub an explicit answer at each.
+4. **Fix `auth_method_from_db` (W4-B2)** — the compiler will not point at it. Decide deliberately
+   between a hard error and a skip-with-`warn!`; a skip keeps the login screen up for other
+   providers during a mixed-version roll, which is the failure this blocker is about.
+5. Update the tests that pass vacuously: `auth_method_round_trips_through_the_database_encoding`
+   (its negative literal is `"github"`, not `"github_oauth"`),
+   `oauth_methods_need_a_client_id_and_an_issuer_or_discovery_url` (an array literal, not a match),
+   `the_anonymous_projection_excludes_jwks_rows`, and the console's
+   `only google_oauth and generic_oidc are interactive`.
+6. Add the sibling advisory-lock key beside `ISSUERLESS_GENERIC_OIDC_LOCK_KEY` for
+   `('github_oauth','')` **before** writing any test that inserts an issuer-less GitHub row (W4-B6).
+
+**Phase 2 — Moira policy (W4-B1, the security fix)**
+
+7. Change `governing_policy` to union `allowed_email_domains` across all enabled, active,
+   non-deleted rows matching `issuer = $1 or trusted_jwt_issuer_id = $2` (per W4-D4). Keep
+   deny-by-default: no matching row, or an empty union, still denies.
+8. Test it against a real database with **two** enabled providers carrying **different** allow-lists,
+   asserting a domain in either is admitted and a domain in neither is refused — and assert the
+   premise (both rows are enabled and bound) so the test cannot pass vacuously. Mutation-test it:
+   revert to `limit 1` and confirm the test fails.
+9. Close **F21** (W4-D6): skip `record_admin_invite_denied` when the error is `AppError::Replayed`;
+   test that a retried failing redemption increments the counter exactly once.
+
+**Phase 3 — Contract**
+
+10. Regenerate:
+    `UPDATE_SNAPSHOTS=1 cargo test --lib http::tests::committed_openapi_matches_the_generated_document`.
+    Never hand-edit `docs/openapi.json` — the drift gate compares bytes.
+11. Expect **no operation-count change**: wave 4 adds no route, so `assert_eq!(operation_count, 151)`
+    and the 99-path `BTreeSet` both stand. If either moves, a route was added by accident — find it.
+    Schema churn (the `AuthMethod` enum, the new `provider_id` fields) is expected.
+12. Re-run `tests/openapi_drift.rs` and the console's `openapi-contract.test.ts`; the auth-provider
+    family must still be **7** operations.
+
+**Phase 4 — Console multi-provider (the `ambiguous_enabled_providers` removal)**
+
+13. `console/lib/types.ts`: widen the `AuthMethod` union **and** add `provider_id` to the affected
+    DTOs and their `*_CONTRACT` descriptors (every `*_CONTRACT` must appear in `SCHEMA_CONTRACTS`).
+14. **Add the missing guard (W4-B4)**: a contract test asserting the TS union equals
+    `docs/openapi.json`'s `components.schemas.AuthMethod.enum`. This seam is currently unguarded in
+    both directions; without it, step 13 can be half-done and nothing objects.
+15. `console/lib/auth-config.ts`: turn `ResolvedAuthConfig` into a per-provider record and
+    `resolveAuthConfig` into a per-provider resolution returning resolved providers **plus**
+    per-provider problems; delete the `enabled.length > 1` refusal and its comment; make
+    `loadAuthConfig` read one secret per enabled row. Add `github_oauth` to `isInteractiveMethod`.
+    **Leave `authConfigCacheKey` alone** — it is already correct.
+16. Keep resolution **fail-closed per provider**: a provider whose secret is missing,
+    fingerprint-mismatched or undecryptable is omitted from the array with its keyed condition
+    attached; the others are constructed normally.
+17. `console/lib/auth.ts`: map N resolved providers into the existing `genericOAuth({config: [...]})`
+    array; set `requireIssuerValidation: true` per entry (it is absent today — W4-#13); keep
+    `pkce: true`. **The single-instance memoisation stays correct** — one Better Auth instance holds
+    N configs and `cacheKey` already spans all rows. Resolve the `getConsoleAuth`/`resetConsoleAuth`
+    dead-code duplication against `lib/auth-runtime.ts` while here, and fix `SignInPanel`'s header,
+    which cites the dead symbol.
+18. Mirror the option set into `console/db/schema.ts` (its single-element placeholder array feeds the
+    migration drift test).
+19. `SignInPanel`: render N buttons from the anonymous `getSetupSignInMethods()`, keyed by
+    `provider_id`. Delete the "a provider picker is wrong in this wave" header comment — it is the
+    thing being changed, and leaving it would make the next reader think the change was accidental.
+20. `lib/moira-session.ts`: enforce the domain list of the provider the session actually came from
+    (`account.providerId` → that provider's config), not a single global list.
+
+**Phase 5 — GitHub**
+
+21. `console/lib/github.ts` (`// @server-only` first line **and** `import "server-only";` — the
+    derived-credential guard requires both): verified-primary-email lookup against `/user/emails`,
+    rejecting null / unverified / `noreply`-only. Build against a **mock GitHub**; no live
+    credential, per the standing constraint.
+22. Wire GitHub through the same generic path where possible. It is not OIDC, so it needs
+    `authorization_url`/`token_url` rather than discovery — which is exactly the shape branch added
+    in step 2.
+
+**Phase 6 — Auth-settings screen**
+
+23. `console/app/(console)/settings/auth/{page.tsx,actions.ts}` — inside `(console)`, so it inherits
+    the session gate; it is picked up automatically by the a11y route walker and the secret-leak
+    scanner, and must answer **< 400 on a cold, unconfigured console**.
+24. Organisms under `console/modules/authSettings/` — they may import only `lib/errors.ts`,
+    `lib/types.ts`, `lib/moira-keys.ts`, `lib/i18n/**` and atoms. No `fetch` in atoms or molecules.
+25. Per-provider dual write (Moira create/patch → console secret `put` → Moira enable as the commit
+    point), with partial states rendered per row and never as success. Drive the "secret configured"
+    badge from per-provider `read()` over Moira's row list — **do not add `list()` to
+    `ConsoleSecretStore`** (W4-B7); record that where the interface is defined.
+26. i18n: add the missing keys **with their emitters in the same commit** — the coverage gate is
+    bidirectional and an orphan key fails it. Do not add a key matching `/rotate.*secret/i`.
+
+**Phase 7 — Verification**
+
+27. `scripts/gates.sh` (six gates; asserts zero silently-skipped DB suites), with
+    `MOIRA_TEST_DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/moira'` **exactly**.
+28. Console: `bun install --frozen-lockfile && bun run typecheck && bun run lint && bun test &&
+    bun run build && bun run e2e`.
+29. `scripts/mutants.sh` over the touched Rust — mandatory for the `governing_policy` union and the
+    F21 guard. Both are new guards, and a guard nobody has seen fail is an assumption.
+30. e2e: two OIDC providers plus GitHub configured from the screen; three buttons render; disabling
+    one removes its button with no redeploy; a drifted provider is excluded while the others keep
+    working; and **a redemption through provider B is judged by B's allow-list** — the assertion
+    W4-B1 exists for.
+
+### §0.7.5 Escalations — written down, not blocking
+
+1. **SECURITY — W4-B1 is a silent authorization-policy substitution** and is the single item on this
+   list that can reach production as a wrong *grant* rather than a wrong error. It is latent today
+   only because a console-side guard makes it unreachable, and wave 4's stated purpose is to remove
+   that guard. If wave 4 is descoped, **descope the guard removal with it**; shipping multi-provider
+   sign-in against a single-provider policy resolver is worse than shipping neither.
+2. **SECURITY (lower) — `required_org` must never enter `PublicSignInMethod`** (W4-D3). It is
+   membership policy and belongs to the same class as `allowed_email_domains`, whose anonymous
+   exposure F15 explicitly rejected. Recorded here because the body proposes carrying it per provider
+   without saying on which surface.
+3. **AVAILABILITY — the migration/binary ordering in W4-B2 is a property of the Helm chart**, not of
+   this wave: `migration-job.yaml` runs as a hook before pods roll, so mixed-version windows are
+   normal. Wave 4 should choose the tolerant `auth_method_from_db` behaviour; the general question of
+   forward-compatible enum reads across a rolling deploy is **unscheduled** and affects every
+   DB-encoded enum in the tree, not just this one.
+4. **HYGIENE — W4-B6 adds a second unguarded global slot** on the shared test database, the same
+   class as the ~986 leaked `trusted_jwt_issuers` rows already recorded. Add the lock before the
+   first GitHub test, not after the first flake.
+5. **NO LIVE CREDENTIAL IS REQUESTED OR NEEDED.** GitHub is built against a mock exactly as Google
+   is; the seam is `console/lib/github.ts`. What cannot be proven without a real GitHub OAuth app —
+   GitHub's own token claims, its consent screen, and `/user/emails` behaviour on edge-case accounts
+   — is **deferred and recorded**, never faked into a green test.
+6. **`replicaCount: 1` remains pinned** and wave 4 does not lift it. The per-process auth-config
+   snapshot means two pods can hold different provider sets; with N providers the symptom broadens
+   from "some sign-ins get `invalid_client`" to "some providers are missing on some pods". Lifting it
+   needs the snapshot to become shared, which is out of scope here.
+
+### §0.7.6 Corrections to the wave-4 brief itself
+
+Recorded because the brief asked, and because two of these would have shaped the work wrongly:
+
+* **"Migrations: next free is `0020`"** — `0020` only after PR #39 merges; on `main` at this audit it
+  is `0019`. `0016` is a permanent gap. Verify at branch time.
+* **"Wave 3 shipped `middleware.ts`"** (implied by §0.4's wave-3 scope) — it did not. The session
+  gate is the `(console)` layout. There is no host allow-list for callback URLs to inherit.
+* **"The migration is unconditional, dropping and re-adding two CHECK constraints"** — correct, and
+  now verified empirically rather than by reading. But §0.1 B6's *reason* for also touching the
+  unique index is wrong: the real defect is two discovery-only OIDC providers, not GitHub's null
+  issuer.
+* **"`PublicSignInMethod` would have to carry something for a GitHub button"** — it already carries
+  everything GitHub needs (`authorization_url`, `client_id`, `requested_scopes`, with `issuer` and
+  `discovery_url` simply null). The only addition is `provider_id`, and that is required by
+  *multi-provider routing*, not by GitHub.
+* **"F21 lives in plan 09"** — true, but it is neither wave's by domain; it is a wave-2 backend
+  defect. Reassigned to wave 4 on cost grounds only (W4-D6).
+* **The brief's framing that wave 4 is "a redesign of a shipped safety decision"** is right, and
+  understated: the shipped decision is a *console-side* refusal standing in front of a *Moira-side*
+  defect nobody has recorded. Removing it is not one redesign but two.
 
 **Objective.** Extend the Moira admin console (shipped in plan 08 as a Better Auth BFF with Google sign-in and a working `genericOAuth` baseline) with **operator-facing provider extensibility** and **multi-admin lifecycle**: hardened generic-OIDC support managed from the console rather than from environment variables, a GitHub sign-in option, an invitation flow so an existing admin can grant a new `(issuer, subject)` admin identity **without touching Moira's bootstrap system key** — the actual gap, since Moira already grants N admins *via that key* (§0.5) — refined session management, and an ownership-transfer / account-recovery story that goes beyond the system-key break-glass that plans 07/08 already provide.
 
