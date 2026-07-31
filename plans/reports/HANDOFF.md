@@ -177,9 +177,9 @@ rather than implied. F14 belongs to F.
    The same now applies to **GitHub**, added in wave 4B and exercised only against a purpose-built
    mock (no discovery document, no `id_token`, `/user` + `/user/emails`).
 
-### 3.4 Five guards that could not detect the defect they were named for
+### 3.4 Six guards that failed — five toothless, one that pinned the defect
 
-**Read this before writing any guard.** Plan 09 produced **five**, every one found by *running the
+**Read this before writing any guard.** Plan 09 produced **six**, every one found by *running the*
 mutation* and none by reading the test. **Two were already shipped and trusted.**
 
 | Guard | Why it could not fire |
@@ -189,6 +189,17 @@ mutation* and none by reading the test. **Two were already shipped and trusted.*
 | wave 5, `secret-leak.e2e.ts` | grepped for a **literal import path**; the real mount is transitive (page → organism → modal). **Verified green with the modal mounted** — an armed tripwire that could not fire |
 | wave 5, route session guard | a **per-file** scan says "*some* handler is guarded", never "*every* handler" — and the second exported method is exactly where an unguarded endpoint goes |
 | **F16's own mitigation** | its tests exercised a predicate **re-implemented in the test module**. Deleting the filter from `init` left **all 598 tests green** |
+
+**A sixth, and it is a different failure — the test PINNED the defect.**
+`console-jwks-stability.test.ts` asserted the published JWKS was *unchanged* by a secret rotation and
+that signing raised the library's decrypt string. It went **red on the fix**, which is the opposite of
+what a guard does. Worse, it asked the two questions **separately**, and F17 is the *conjunction*: a
+200 JWKS is unremarkable alone, a signing failure is unremarkable alone — only together are they the
+outage.
+
+**Two more rules from that one:** when a test documents current behaviour rather than guarding a
+property, **say so in its name**; and **never let a conjunction be asserted as two independent
+facts.**
 
 **The common shape:** each was written against the *shape the author imagined the defect would take*
 — a direct import, one handler per file, a representable row, a changed subject, a correct predicate
