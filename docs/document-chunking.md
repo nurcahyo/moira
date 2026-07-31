@@ -34,13 +34,20 @@ The same `(content, strategy, limits)` triple always produces the same chunks, b
 `rag_chunks.chunk_hash` is `crate::security::request_hash` — a plain, unkeyed SHA-256 — over the
 exact chunk text bytes, so identical text re-ingested produces an identical hash indefinitely.
 
-It is deliberately **not** `IdempotencyHasher::hash`, which the neighbouring `content_hash`
-columns use. That hasher is peppered and version-prefixed and verifies only against the active
-pepper, so a pepper rotation would invalidate every stored `chunk_hash` and force every document
-to re-chunk and re-embed. A chunk hash must be content-addressable indefinitely; that is its
-whole job. The reversal condition is recorded on `PreparedChunk::chunk_hash` in
-`src/orchestration/ingestion.rs`: move to a keyed hash if `chunk_hash` ever becomes reachable
-across a trust boundary.
+It is deliberately **not** `IdempotencyHasher::hash`, which most of the neighbouring
+`content_hash` columns still use. That hasher is peppered and version-prefixed and verifies only
+against the active pepper, so a pepper rotation would invalidate every stored `chunk_hash` and
+force every document to re-chunk and re-embed. A chunk hash must be content-addressable
+indefinitely; that is its whole job. The reversal condition is recorded on
+`PreparedChunk::chunk_hash` in `src/orchestration/ingestion.rs`: move to a keyed hash if
+`chunk_hash` ever becomes reachable across a trust boundary.
+
+Finding F14 applied that same admitting rule per *table* rather than to `content_hash` as one
+thing, and `memory_records.content_hash` moved to `request_hash` for the same reason (it is not
+caller-visible, is never a caller-supplied lookup key, and is only ever compared within one
+application — see `memory_content_hash` in `src/application/conversation.rs`).
+`conversation_messages.content_hash` stays peppered because it fails the first clause outright:
+it is returned on `ConversationMessageRecord`.
 
 ## Limits
 
