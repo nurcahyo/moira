@@ -39,19 +39,46 @@ landing an agent's commit on the wrong branch — that happened twice.
 **Any agent that will commit gets its own `git worktree`.** The coordinator must never run
 `git checkout` in a tree an agent is using.
 
-### 2.2 Exit codes lie here, in seven observed forms
+### 2.2 Exit codes lie here, in TEN observed forms — and form 4's cause is now known
 
 1. `cmd | tail` reports `tail`'s status — hid a genuinely failed `docker build`
 2. `grep -c` returns 1 on **zero** matches — made a fully green gate run look failed
 3. `script; echo $?` reports `echo`'s status
 4. A redirected `cargo test` **dropped whole test binaries** while exiting 0 (875 / 779 / 861 on one
-   tree, all green)
-5. zsh `noclobber` silently no-op'd a re-run, and the file read was another worktree's
+   tree, all green) — **see form 9; this was almost certainly the same cause**
+5. zsh `noclobber` silently no-op'd a re-run, and the file read was another worktree's.
+   **Recurred 2026-07-31**: `> $(mktemp)` on an existing file was refused, `cargo` never ran, and
+   five runs reported `FAIL` with empty results. Use `>|`
 6. `bun run x 2>&1 | tail` — same as (1), different runtime
 7. A gate log naming a different worktree's path, losing every `test result` line
+8. `git commit --only -- <paths> -m "…"` puts the message **after** `--`, so git reads it as a
+   pathspec and aborts — and a chained `git push` then prints `Everything up-to-date`. The pair reads
+   as success. **`-m` must come before the `--`**
+9. **THE WORST ONE. A `PreToolUse` hook rewrites your `cargo` command and replaces the log with a
+   one-line summary — even when you redirect to a file.** `~/.claude/hooks/rtk-rewrite.sh` runs
+   `rtk rewrite` on every Bash command. Verified directly:
 
-**Redirect to a file, capture `$?` immediately, then read the file.** Use `scripts/gates.sh`, which
-handles this and asserts log completeness against `ls tests/*.rs`.
+   ```
+   $ rtk rewrite 'cargo test --workspace --all-features > /tmp/x.log 2>&1'
+   rtk cargo test --workspace --all-features > /tmp/x.log 2>&1     # exit 0 → rewritten
+   $ rtk rewrite 'bash scripts/gates.sh'
+   (nothing)                                                        # exit 1 → untouched
+   ```
+
+   The redirect survives; the **command** is replaced. So the file receives
+   `cargo test: 2 passed (1 suite, 1.39s)` instead of every `test result:` line and all
+   `--nocapture` output. An agent measuring anything this way silently measures nothing, and
+   "redirect to a file, then read the file" — the rule directly above — **does not save you**.
+
+   **`cargo` invoked from inside a script file is immune**, because the hook only sees the outer
+   command. That is why `scripts/gates.sh` has never been bitten by this, and it is the reason to
+   keep using it rather than hand-rolling.
+10. `pgrep -fc` is **not valid on macOS** — it prints usage to stderr and yields `0`, so a
+    concurrency check reports "no peers" during a busy run
+
+**Redirect to a file, capture `$?` immediately, then read the file — and run cargo from inside a
+script.** Use `scripts/gates.sh`, which handles all of this and asserts log completeness against
+`ls tests/*.rs`.
 
 ### 2.3 A test that passes is not a test that works
 
