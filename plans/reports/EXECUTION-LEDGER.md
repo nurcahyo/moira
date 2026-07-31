@@ -1311,6 +1311,24 @@ attrition. Diagnose F22 the way the attach race was diagnosed: make it determini
 **Also worth carrying:** docs-only pushes to `main` run the full CI suite, which is what exposed this.
 That is accidental coverage worth keeping rather than optimising away.
 
+## ⚠️ BLOCKED ON THE USER — T11 needs Stage 4A DEPLOYED, and this loop cannot deploy
+
+**Wave 4 cannot be finished by the loop.** Stage 4A merged (`c98aeb7`), but its last task — **T11,
+removing the console's `ambiguous_enabled_providers` guard** — is gated on 4A being **deployed**, not
+merely merged, and nothing in this loop can deploy.
+
+**Why the gate is real and must not be waved through.** Until Moira's own refusal (`0020`'s partial
+unique index and the coded 409) is *running in production*, the console guard is the only thing in
+front of F23. Remove it in the same release and any rollout that lands the console before Moira opens
+exactly the window 4A exists to close. The correct sequence is **4A in release N, T11 in release
+N+1**.
+
+**What the user needs to do:** deploy the release containing `c98aeb7`, then T11 can land. Until then
+Stage 4B ships the multi-provider plumbing with the guard still in place — the capability is built and
+tested but dormant, which is the honest way to stage a change whose safety depends on release order.
+
+This is recorded rather than worked around. Nothing here fakes the gate.
+
 ## THE JUDGED DESIGN PANEL SPECIFIED A TOOTHLESS GUARD, AND ONLY THE MUTATION CAUGHT IT — 2026-07-31
 
 **G1's named mutation left G1 GREEN.** The guard was "policy selection does not depend on row order",
