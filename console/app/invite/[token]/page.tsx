@@ -81,6 +81,23 @@ async function preview(token: string): Promise<PreviewOutcome> {
   }
 }
 
+/**
+ * Human-readable names by Moira row id, from the ANONYMOUS projection.
+ *
+ * `get_setup_sign_in_methods` declares no `security` block, so this client
+ * carries no credential — which is what makes it usable on a page reachable by
+ * anyone holding a link.
+ */
+async function signInDisplayNames(): Promise<ReadonlyMap<string, string>> {
+  try {
+    const client = new MoiraClient({ baseUrl: consoleEnv().moiraBaseUrl });
+    const response = await client.getSetupSignInMethods();
+    return new Map(response.methods.map((method) => [method.id, method.display_name]));
+  } catch {
+    return new Map();
+  }
+}
+
 /** Does the visitor already have a console session that may act? */
 async function hasSession(): Promise<boolean> {
   try {
@@ -109,11 +126,17 @@ async function signInState(): Promise<SignInPanelState> {
     if (!runtimeState.ok) {
       return { kind: "unavailable", messageKey: runtimeState.resolution.messageKey };
     }
+    // Names, best-effort, from the ANONYMOUS projection — the same call `/login`
+    // makes and for the same reason: by the time this runs the configuration has
+    // already resolved, so a failure here costs NAMES, not buttons. Without it an
+    // invitee is offered "Sign in with moira-console-idp-github" instead of
+    // "Sign in with GitHub".
+    const names = await signInDisplayNames();
     return {
       kind: "ready",
       providers: runtimeState.configs.map((config) => ({
         providerId: config.providerId,
-        displayName: null,
+        displayName: names.get(config.moiraProviderId) ?? null,
       })),
     };
   } catch (error) {
