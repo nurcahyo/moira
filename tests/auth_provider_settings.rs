@@ -1034,6 +1034,78 @@ async fn a_second_provider_for_the_same_method_and_issuer_returns_409() {
     assert_eq!(second.code(), "duplicate_auth_provider");
 }
 
+/// **Finding F13.** Every uniqueness conflict in this tree is a `409` — except this one,
+/// which fell through `AppError::Sqlx` to `500 database_error` because
+/// `trusted_jwt_issuers` had no mapping to match `auth_provider_settings`'s
+/// `duplicate_auth_provider` above.
+///
+/// It lives beside that test on purpose: the two are the same condition on two tables, and
+/// the reason the gap survived is that nothing ever compared them. The consequence was
+/// found while building the console — a client recovering from a half-finished registration
+/// cannot adopt the existing issuer by catching a `409` when the `409` never arrives, and a
+/// `500` is indistinguishable from an outage worth paging someone for.
+///
+/// Asserted on the status, the code **and** the `message_key`: the code alone would pass
+/// against an uncatalogued literal, which is exactly the class of defect
+/// `every_coded_error_literal_in_src_has_a_catalog_entry` exists to prevent.
+#[tokio::test]
+async fn a_second_trusted_jwt_issuer_for_the_same_issuer_returns_409_not_500() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let issuer = format!("https://duplicate-issuer-{}.example", Uuid::now_v7());
+    let body = json!({
+        "issuer": issuer,
+        "jwks_url": "https://issuer.example/jwks",
+        "allowed_algorithms": ["RS256"],
+        "subject_claim": "sub"
+    });
+
+    let first = request(
+        router.clone(),
+        "POST",
+        "/api/v1/admin/jwt-issuers",
+        HeaderMap::new(),
+        None,
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::CREATED, "{:?}", first.body);
+
+    let second = request(
+        router.clone(),
+        "POST",
+        "/api/v1/admin/jwt-issuers",
+        HeaderMap::new(),
+        None,
+        Some(body),
+    )
+    .await;
+
+    assert_eq!(
+        second.status,
+        StatusCode::CONFLICT,
+        "a duplicate issuer must be a conflict the caller can act on, not a 500: {:?}",
+        second.body
+    );
+    assert_eq!(second.code(), "duplicate_trusted_jwt_issuer");
+    assert_eq!(
+        second.body["error"]["message_key"],
+        json!("moira.error.duplicate_trusted_jwt_issuer")
+    );
+
+    // The refusal must not have written a second row, and the recovery the `409` enables —
+    // find the existing issuer and adopt it — must actually be available.
+    let rows: i64 =
+        sqlx::query_scalar("select count(*) from trusted_jwt_issuers where issuer = $1")
+            .bind(&issuer)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("count issuers");
+    assert_eq!(rows, 1, "a refused create must leave exactly the first row");
+}
+
 #[tokio::test]
 async fn create_is_idempotent_under_an_idempotency_key() {
     let Some(fixture) = LifecycleFixture::new().await else {

@@ -440,6 +440,57 @@ fn redeem_body(token: &str, email: &str) -> Value {
     json!({ "token": token, "email": email, "email_verified": true })
 }
 
+/// One redemption by `subject`, whose email is derived from the subject so two racers can
+/// never collide on the invite's own domain constraint.
+async fn redeem(router: &Router, issuer: &ConsoleIssuer, subject: &str, token: &str) -> HttpResult {
+    post_json(
+        router.clone(),
+        "/api/v1/admin/admin-invites/redeem",
+        issuer.bearer(subject),
+        redeem_body(token, &format!("{subject}@example.com")),
+    )
+    .await
+}
+
+/// How many active grants hold ownership.
+///
+/// Ownership under decision D-F20 is a property of the *set* — at most one holder — so
+/// every assertion about it counts rather than sampling one row. Read through SQL rather
+/// than through the list endpoint, because the endpoint is built by the layer under test.
+async fn active_primary_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "select count(*) from admin_identities \
+         where deleted_at is null and status = 'active' and is_primary",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("count active primaries")
+}
+
+async fn is_primary(pool: &PgPool, id: Uuid) -> bool {
+    sqlx::query_scalar("select is_primary from admin_identities where id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("read a grant's ownership flag")
+}
+
+fn grant_id(result: &HttpResult) -> Uuid {
+    result.body["id"]
+        .as_str()
+        .expect("grant id")
+        .parse()
+        .expect("grant id is a uuid")
+}
+
+fn with_idempotency_key(mut headers: HeaderMap, key: &str) -> HeaderMap {
+    headers.insert(
+        "idempotency-key",
+        key.parse().expect("an Idempotency-Key header value"),
+    );
+    headers
+}
+
 /// A second [`AppState`] on the fixture's own database, with Prometheus turned on.
 ///
 /// [`LifecycleFixture`] leaves `telemetry.prometheus_enabled` at its hardened default of
@@ -539,8 +590,11 @@ async fn create_preview_redeem_grants_admin_and_consumes_the_invite() {
     assert_eq!(redeemed.body["granted_scopes"], json!(["moira:admin"]));
     assert_eq!(
         redeemed.body["is_primary"],
-        json!(false),
-        "an invite grants base admin authority and never ownership"
+        json!(true),
+        "this is the deployment's first grant, so it takes ownership (finding F20). That an \
+         invite redeemed on a deployment which *already* has an owner does not mint a second \
+         one is the other half of the property, and is asserted by \
+         the_first_grant_on_a_deployment_owns_it_and_the_second_does_not"
     );
     assert_eq!(
         redeemed.body["notice"]["message_key"],
@@ -565,7 +619,12 @@ async fn create_preview_redeem_grants_admin_and_consumes_the_invite() {
     assert_eq!(grant.0, issuer.issuer);
     assert_eq!(grant.1, "colleague-subject");
     assert_eq!(grant.2.as_deref(), Some("Colleague@Example.com"));
-    assert!(!grant.3, "a redeemed grant is not primary");
+    assert!(
+        grant.3,
+        "the deployment's first grant owns it, and the row must agree with the response body \
+         asserted above — a service that reported ownership it had not stored would pass the \
+         body assertion alone"
+    );
     // The audit column names the credential that actually produced the grant. Writing
     // `'system_key'` here would be false in an audit column: no system key was presented,
     // and `admin_invites.consumed_admin_identity_id` points the other way.
@@ -1065,6 +1124,13 @@ async fn a_non_primary_admin_cannot_promote_itself_to_primary() {
     .await;
     assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
 
+    // The deployment needs an owner *other than* the caller under test: since finding F20
+    // the first grant takes ownership, so without this the "non-primary admin" would be the
+    // owner and the 403 below would never be due. This grant exists only to occupy the slot.
+    let (_, owner_token) = create_invite(&router, "email", "owner@example.com").await;
+    let owner = redeem(&router, &issuer, "owner", &owner_token).await;
+    assert_eq!(owner.status, StatusCode::CREATED, "{:?}", owner.body);
+
     let (_, token) = create_invite(&router, "email", "member@example.com").await;
     let redeemed = post_json(
         router.clone(),
@@ -1402,9 +1468,14 @@ async fn an_invitation_longer_than_the_cap_is_refused_and_no_row_is_written() {
 /// status: `admin_identity_not_found` on `PATCH .../{id}` and `admin_identity_already_revoked`
 /// on a repeated `DELETE .../{id}`.
 ///
-/// Both are exercised through the system-key-equivalent break-glass caller, which is the
-/// documented path when no primary exists — and, on a freshly migrated deployment, the
-/// *only* one, because nothing outside `0017`'s one-shot backfill ever sets `is_primary`.
+/// Both are exercised through the system-key-equivalent break-glass caller.
+///
+/// **The revocation target is deliberately the *second* grant.** Since finding F20 the first
+/// grant on a deployment is its owner, and revoking the owner is refused by the last-primary
+/// guard — so a test that revoked the first grant would now be asserting
+/// `admin_identity_already_revoked` against a path that never reaches a revocation at all.
+/// The premise that the target is not primary is asserted rather than assumed, because it is
+/// exactly the thing that changed underneath this test.
 #[tokio::test]
 async fn the_grant_administration_conflicts_are_pinned_to_their_paths() {
     let Some(fixture) = LifecycleFixture::new().await else {
@@ -1444,20 +1515,25 @@ async fn the_grant_administration_conflicts_are_pinned_to_their_paths() {
         "moira.error.admin_identity_not_found"
     );
 
+    // The first redemption takes ownership (finding F20), so it exists here only to give
+    // the second one something to be *not* the owner of.
+    let (_, owner_token) = create_invite(&router, "domain", "example.com").await;
+    let owner = redeem(&router, &issuer, "staying", &owner_token).await;
+    assert_eq!(owner.status, StatusCode::CREATED, "{:?}", owner.body);
+
     let (_, token) = create_invite(&router, "domain", "example.com").await;
-    let redeemed = post_json(
-        router.clone(),
-        "/api/v1/admin/admin-invites/redeem",
-        issuer.bearer("departing"),
-        redeem_body(&token, "departing@example.com"),
-    )
-    .await;
+    let redeemed = redeem(&router, &issuer, "departing", &token).await;
     assert_eq!(redeemed.status, StatusCode::CREATED, "{:?}", redeemed.body);
     let grant_id: Uuid = redeemed.body["id"]
         .as_str()
         .expect("grant id")
         .parse()
         .expect("grant id is a uuid");
+    assert_eq!(
+        redeemed.body["is_primary"],
+        json!(false),
+        "the premise is a revocable, non-owning grant; the owner cannot be revoked"
+    );
 
     // admin_identity_already_revoked — the soft revoke leaves the row, so the second call
     // has something to conflict with.
@@ -1521,13 +1597,7 @@ async fn clearing_the_only_primary_is_refused_with_the_last_primary_conflict() {
     assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
 
     let (_, token) = create_invite(&router, "domain", "example.com").await;
-    let redeemed = post_json(
-        router.clone(),
-        "/api/v1/admin/admin-invites/redeem",
-        issuer.bearer("owner-to-be"),
-        redeem_body(&token, "owner@example.com"),
-    )
-    .await;
+    let redeemed = redeem(&router, &issuer, "owner-to-be", &token).await;
     assert_eq!(redeemed.status, StatusCode::CREATED, "{:?}", redeemed.body);
     let grant_id: Uuid = redeemed.body["id"]
         .as_str()
@@ -1535,50 +1605,30 @@ async fn clearing_the_only_primary_is_refused_with_the_last_primary_conflict() {
         .parse()
         .expect("grant id is a uuid");
 
-    // Premise 1 — a redeemed grant is not primary, so the deployment starts with none.
-    let primaries: i64 = sqlx::query_scalar(
-        "select count(*) from admin_identities \
-         where deleted_at is null and status = 'active' and is_primary",
-    )
-    .fetch_one(&fixture.pool)
-    .await
-    .expect("count primaries");
+    // Premise — exactly one active primary, so clearing it is clearing the last.
+    //
+    // This premise used to read the other way: before finding F20 a redeemed grant was
+    // *not* primary, the deployment had none, and this test had to promote through
+    // break-glass first to have anything to clear. The guard it exercises is unchanged;
+    // what changed is that the state it guards is now reachable without a system key,
+    // which was the whole point of the finding.
     assert_eq!(
-        primaries, 0,
-        "nothing outside 0017's one-shot backfill sets is_primary, so a fresh \
-         deployment has no primary until an operator transfers ownership"
+        redeemed.body["is_primary"],
+        json!(true),
+        "the first grant on a deployment is its owner"
     );
-
-    // The break-glass caller promotes it. This is the documented path when no primary
-    // remains — and it is the only way a greenfield deployment gets its first one.
-    let promoted = send_json(
-        router.clone(),
-        "PATCH",
-        &format!("/api/v1/admin/admin-identities/{grant_id}"),
-        HeaderMap::new(),
-        redeemed.body["version"].as_i64(),
-        json!({ "is_primary": true }),
-    )
-    .await;
-    assert_eq!(promoted.status, StatusCode::OK, "{:?}", promoted.body);
-    assert_eq!(promoted.body["is_primary"], json!(true));
-
-    // Premise 2 — exactly one active primary, so clearing it is clearing the last.
-    let primaries: i64 = sqlx::query_scalar(
-        "select count(*) from admin_identities \
-         where deleted_at is null and status = 'active' and is_primary",
-    )
-    .fetch_one(&fixture.pool)
-    .await
-    .expect("count primaries");
-    assert_eq!(primaries, 1, "the premise is exactly one active primary");
+    assert_eq!(
+        active_primary_count(&fixture.pool).await,
+        1,
+        "the premise is exactly one active primary"
+    );
 
     let refused = send_json(
         router,
         "PATCH",
         &format!("/api/v1/admin/admin-identities/{grant_id}"),
         HeaderMap::new(),
-        Some(promoted.version()),
+        redeemed.body["version"].as_i64(),
         json!({ "is_primary": false }),
     )
     .await;
@@ -1673,4 +1723,488 @@ async fn two_simultaneous_redemptions_of_one_token_produce_exactly_one_grant() {
         "a single-use invitation produced two grants"
     );
     assert_eq!(invite_status(&fixture.pool, invite_id).await, "consumed");
+}
+
+// ===========================================================================================
+// Ownership — finding F20 and decision D-F20.
+//
+// `0017` made ownership row state and bootstrapped it with a migration-time `UPDATE` that,
+// on a greenfield deployment, ran against an empty `admin_identities`. Nothing else ever
+// wrote `is_primary` except the transfer endpoint, which requires a primary caller — so on
+// every deployment created after `0017` no admin was ever primary, the last-primary guard
+// protected an empty set, and ownership transfer was unreachable without the break-glass
+// system key the invitation flow exists to let an operator retire.
+//
+// `0019` plus `insert_grant` close it: the first grant on a deployment with no owner becomes
+// the owner, decided under the `moiraown` advisory lock and backstopped by
+// `admin_identities_single_active_primary`.
+// ===========================================================================================
+
+/// The pair, and only the pair, is the property.
+///
+/// "The first grant owns the deployment" on its own would pass equally well against an
+/// `insert_grant` that set the flag unconditionally — which is the bug on the other side, and
+/// a worse one: an invitation that mints an owner every time is strictly more powerful than
+/// the transfer endpoint it sits beneath. So the second half is asserted in the same test.
+#[tokio::test]
+async fn the_first_grant_on_a_deployment_owns_it_and_the_second_does_not() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let issuer = ConsoleIssuer::start(&fixture.pool).await;
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let (provider_id, _) = configure_and_enable_policy(
+        &router,
+        PolicyBinding::ByIssuerString(&issuer.issuer),
+        &["example.com"],
+    )
+    .await;
+    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+
+    // Premise: a deployment with no grant and therefore no owner. This is the state F20
+    // says every post-`0017` deployment was permanently stuck in.
+    assert_eq!(grant_count(&fixture.pool).await, 0);
+    assert_eq!(active_primary_count(&fixture.pool).await, 0);
+
+    let (_, first_token) = create_invite(&router, "domain", "example.com").await;
+    let first = redeem(&router, &issuer, "founder", &first_token).await;
+    assert_eq!(first.status, StatusCode::CREATED, "{:?}", first.body);
+    assert_eq!(
+        first.body["is_primary"],
+        json!(true),
+        "the first grant on an ownerless deployment must take ownership"
+    );
+    // The response is not taken on trust: `record_from_grant_with_notice` builds it from the
+    // row `insert_grant` returned, so asserting the body alone would still pass against a
+    // service that reported a flag the database never stored.
+    assert!(is_primary(&fixture.pool, grant_id(&first)).await);
+
+    let (_, second_token) = create_invite(&router, "domain", "example.com").await;
+    let second = redeem(&router, &issuer, "colleague", &second_token).await;
+    assert_eq!(second.status, StatusCode::CREATED, "{:?}", second.body);
+    assert_eq!(
+        second.body["is_primary"],
+        json!(false),
+        "an invitation redeemed on a deployment that already has an owner must not mint a \
+         second one — that would make an invite more powerful than the transfer endpoint"
+    );
+    assert!(!is_primary(&fixture.pool, grant_id(&second)).await);
+    assert_eq!(active_primary_count(&fixture.pool).await, 1);
+}
+
+/// **Exactly one owner, under a real race.**
+///
+/// Two *different* invitations redeemed by two *different* identities, so both requests
+/// genuinely succeed and two grants really are created — which is what makes "exactly one
+/// primary" an assertion about ownership rather than a restatement of the single-winner
+/// invite gate above. Released by a barrier rather than a `sleep()` (CONVENTIONS §3): the
+/// two must overlap for this to be about locking rather than about ordering.
+///
+/// The mechanism under test is the `moiraown` transaction advisory lock `insert_grant` takes.
+/// Without it, both inserts evaluate "does an owner exist?" against a snapshot taken before
+/// either committed, both answer no, and the loser is refused by
+/// `admin_identities_single_active_primary` — turning a legitimate second grant into a `500`.
+/// So the assertion is deliberately **not** "one of them failed": both must be `201`, and
+/// exactly one must own. A test that accepted a failing racer would pass against the
+/// index-only design this is specifically not.
+#[tokio::test]
+async fn two_simultaneous_first_grants_produce_exactly_one_owner_and_no_failure() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let issuer = ConsoleIssuer::start(&fixture.pool).await;
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let (provider_id, _) = configure_and_enable_policy(
+        &router,
+        PolicyBinding::ByIssuerString(&issuer.issuer),
+        &["example.com"],
+    )
+    .await;
+    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+    assert_eq!(
+        active_primary_count(&fixture.pool).await,
+        0,
+        "the premise is an ownerless deployment: both racers must be able to win"
+    );
+
+    // One invitation each, so the invite's own single-winner gate cannot decide this.
+    let mut tokens = Vec::new();
+    for _ in 0..2 {
+        tokens.push(create_invite(&router, "domain", "example.com").await.1);
+    }
+
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+    for (subject, token) in ["racer-one", "racer-two"].into_iter().zip(tokens) {
+        let router = router.clone();
+        let headers = issuer.bearer(subject);
+        let body = redeem_body(&token, &format!("{subject}@example.com"));
+        let barrier = Arc::clone(&barrier);
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            post_json(router, "/api/v1/admin/admin-invites/redeem", headers, body).await
+        }));
+    }
+    let mut results = Vec::new();
+    for handle in handles {
+        results.push(handle.await.expect("redeem task"));
+    }
+
+    for result in &results {
+        assert_eq!(
+            result.status,
+            StatusCode::CREATED,
+            "both redemptions are valid and must both succeed; a race for *ownership* must \
+             not fail a request: {:?}",
+            result.body
+        );
+    }
+    assert_eq!(grant_count(&fixture.pool).await, 2);
+    assert_eq!(
+        active_primary_count(&fixture.pool).await,
+        1,
+        "two grants raced for an empty ownership slot and both took it"
+    );
+    // The bodies must agree with the row: exactly one of the two responses claims ownership.
+    let claimed = results
+        .iter()
+        .filter(|result| result.body["is_primary"] == json!(true))
+        .count();
+    assert_eq!(
+        claimed,
+        1,
+        "exactly one response may report ownership: {:?}",
+        results
+            .iter()
+            .map(|result| result.body["is_primary"].clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Transfer **moves** the flag; it does not add a second holder.
+///
+/// Asserted on the incumbent as well as on the target, because "the target is now primary" is
+/// true of both designs and only the incumbent's demotion distinguishes them. The incumbent's
+/// `version` is checked too: a demotion that did not bump it would leave a console holding a
+/// stale `ETag` that still validates, and the next `If-Match` write would act on a record
+/// whose ownership had moved underneath it.
+#[tokio::test]
+async fn transferring_ownership_moves_the_flag_rather_than_adding_a_second_owner() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let issuer = ConsoleIssuer::start(&fixture.pool).await;
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let (provider_id, _) = configure_and_enable_policy(
+        &router,
+        PolicyBinding::ByIssuerString(&issuer.issuer),
+        &["example.com"],
+    )
+    .await;
+    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+
+    let (_, outgoing_token) = create_invite(&router, "domain", "example.com").await;
+    let outgoing = redeem(&router, &issuer, "outgoing", &outgoing_token).await;
+    assert_eq!(outgoing.status, StatusCode::CREATED, "{:?}", outgoing.body);
+    let (_, incoming_token) = create_invite(&router, "domain", "example.com").await;
+    let incoming = redeem(&router, &issuer, "incoming", &incoming_token).await;
+    assert_eq!(incoming.status, StatusCode::CREATED, "{:?}", incoming.body);
+
+    // Premise: `outgoing` owns it, `incoming` does not.
+    assert!(is_primary(&fixture.pool, grant_id(&outgoing)).await);
+    assert!(!is_primary(&fixture.pool, grant_id(&incoming)).await);
+    let outgoing_version_before = outgoing.body["version"].as_i64().expect("a version");
+
+    let transferred = send_json(
+        router.clone(),
+        "PATCH",
+        &format!("/api/v1/admin/admin-identities/{}", grant_id(&incoming)),
+        HeaderMap::new(),
+        incoming.body["version"].as_i64(),
+        json!({ "is_primary": true }),
+    )
+    .await;
+    assert_eq!(transferred.status, StatusCode::OK, "{:?}", transferred.body);
+    assert_eq!(transferred.body["is_primary"], json!(true));
+
+    assert!(
+        !is_primary(&fixture.pool, grant_id(&outgoing)).await,
+        "the incumbent must have been demoted, not left in place"
+    );
+    assert_eq!(
+        active_primary_count(&fixture.pool).await,
+        1,
+        "a transfer must leave exactly one owner"
+    );
+    let outgoing_version_after: i64 =
+        sqlx::query_scalar("select version from admin_identities where id = $1")
+            .bind(grant_id(&outgoing))
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("re-read the demoted grant");
+    assert!(
+        outgoing_version_after > outgoing_version_before,
+        "the demoted grant's version must move, or a stale ETag keeps validating"
+    );
+}
+
+/// The other side of the last-primary guard: a revocation clears `is_primary` too, so the
+/// guard refuses it for the owner just as it refuses an explicit clear.
+///
+/// This is a *consequence* of decision D-F20 worth pinning rather than discovering: since the
+/// first grant on a deployment is now its owner, a deployment's sole admin cannot be revoked
+/// through the API at all. Transfer first, then revoke. An admin plane with no owner is
+/// precisely the state finding F20 describes, so refusing to create one is the point.
+#[tokio::test]
+async fn revoking_the_owner_is_refused_by_the_last_primary_guard() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let issuer = ConsoleIssuer::start(&fixture.pool).await;
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let (provider_id, _) = configure_and_enable_policy(
+        &router,
+        PolicyBinding::ByIssuerString(&issuer.issuer),
+        &["example.com"],
+    )
+    .await;
+    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+
+    let (_, token) = create_invite(&router, "domain", "example.com").await;
+    let owner = redeem(&router, &issuer, "sole-admin", &token).await;
+    assert_eq!(owner.status, StatusCode::CREATED, "{:?}", owner.body);
+    assert!(is_primary(&fixture.pool, grant_id(&owner)).await);
+
+    let refused = send_json(
+        router,
+        "DELETE",
+        &format!("/api/v1/admin/admin-identities/{}", grant_id(&owner)),
+        HeaderMap::new(),
+        None,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::CONFLICT, "{:?}", refused.body);
+    assert_eq!(refused.code(), "admin_identity_last_primary");
+
+    let status: String = sqlx::query_scalar("select status from admin_identities where id = $1")
+        .bind(grant_id(&owner))
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("re-read the grant");
+    assert_eq!(
+        status, "active",
+        "the refused revocation must not have taken effect"
+    );
+    assert_eq!(active_primary_count(&fixture.pool).await, 1);
+}
+
+/// **An idempotent replay is not a second event.**
+///
+/// `create_invite` and `redeem_invite` incremented their counters immediately after
+/// `AdminCommandRunner::execute` returned — which a replay also does. So one invitation
+/// retried under the same `Idempotency-Key` was counted as two, in the direction that
+/// overstates activity, and `redeemed` drags
+/// `moira_admin_identity_grant_events_total{event="granted"}` along with it, putting the
+/// miscount on the grant ledger as well.
+///
+/// The premise that each second request really *is* a replay is asserted before the counter
+/// is read: same resource id, and — for the invitation — `secret` withheld, which is the
+/// observable that distinguishes a stored body from a fresh mint, since the token is returned
+/// exactly once.
+#[tokio::test]
+async fn an_idempotent_replay_does_not_count_a_second_invitation_or_redemption() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let issuer = ConsoleIssuer::start(&fixture.pool).await;
+    let router = moira::build_router(observable_state(&fixture.pool)).expect("router");
+    let (provider_id, _) = configure_and_enable_policy(
+        &router,
+        PolicyBinding::ByIssuerString(&issuer.issuer),
+        &["example.com"],
+    )
+    .await;
+    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+
+    let before = scrape_metrics(router.clone()).await;
+    assert!(
+        before.contains(INVITE_OUTCOMES),
+        "the family must be registered before a zero reading means anything"
+    );
+    assert_eq!(invite_outcome(&before, "created"), 0.0);
+    assert_eq!(invite_outcome(&before, "redeemed"), 0.0);
+
+    let create_key = format!("invite-create-{}", Uuid::now_v7());
+    let create_body = json!({
+        "constraint": "domain",
+        "value": "example.com",
+        "expires_in_seconds": 3600
+    });
+    let created = post_json(
+        router.clone(),
+        "/api/v1/admin/admin-invites",
+        with_idempotency_key(HeaderMap::new(), &create_key),
+        create_body.clone(),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+    let token = created.body["secret"]
+        .as_str()
+        .expect("the token is returned exactly once, at creation")
+        .to_string();
+    assert_eq!(
+        invite_outcome(&scrape_metrics(router.clone()).await, "created"),
+        1.0,
+        "one invitation, one increment"
+    );
+
+    let replayed = post_json(
+        router.clone(),
+        "/api/v1/admin/admin-invites",
+        with_idempotency_key(HeaderMap::new(), &create_key),
+        create_body,
+    )
+    .await;
+    assert_eq!(replayed.status, StatusCode::CREATED, "{:?}", replayed.body);
+    assert_eq!(
+        replayed.body["resource"]["id"], created.body["resource"]["id"],
+        "the premise is a replay of the same invitation, not a second one"
+    );
+    assert!(
+        replayed.body["secret"].is_null(),
+        "a replayed creation withholds the token — that absence is what proves this body \
+         came from the ledger rather than from a second mint"
+    );
+    let invites: i64 = sqlx::query_scalar("select count(*) from admin_invites")
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count invites");
+    assert_eq!(invites, 1, "a replay must not have written a second row");
+    assert_eq!(
+        invite_outcome(&scrape_metrics(router.clone()).await, "created"),
+        1.0,
+        "one invitation counted twice: the replay incremented moira_admin_invite_outcomes_total"
+    );
+
+    let redeem_key = format!("invite-redeem-{}", Uuid::now_v7());
+    let body = redeem_body(&token, "invitee@example.com");
+    let redeemed = post_json(
+        router.clone(),
+        "/api/v1/admin/admin-invites/redeem",
+        with_idempotency_key(issuer.bearer("invitee"), &redeem_key),
+        body.clone(),
+    )
+    .await;
+    assert_eq!(redeemed.status, StatusCode::CREATED, "{:?}", redeemed.body);
+    let after_success = scrape_metrics(router.clone()).await;
+    assert_eq!(invite_outcome(&after_success, "redeemed"), 1.0);
+    assert_eq!(
+        counter_value(
+            &after_success,
+            "moira_admin_identity_grant_events_total",
+            "event",
+            "granted"
+        ),
+        1.0,
+        "`redeemed` also drives the grant ledger"
+    );
+
+    // **A successful redemption cannot be replayed, and that is not what the endpoint
+    // documents.** `redeem_invite` validates the invite *before* the transactional envelope
+    // — deliberately, so a policy refusal never consumes it — and by the time the retry
+    // arrives the invite is `consumed`, so `require_redeemable` refuses it with
+    // `invite_already_consumed` and `AdminCommandRunner` is never entered. The
+    // `Idempotency-Key` is read but can never matter on the success path.
+    //
+    // Asserted rather than worked around, because the alternative reading — "the counter
+    // guard on the success path is what stops the double count here" — is false, and a test
+    // written to that reading would pass while proving nothing.
+    let retried = post_json(
+        router.clone(),
+        "/api/v1/admin/admin-invites/redeem",
+        with_idempotency_key(issuer.bearer("invitee"), &redeem_key),
+        body,
+    )
+    .await;
+    assert_eq!(
+        retried.status,
+        StatusCode::CONFLICT,
+        "a retried successful redemption is refused by the pre-envelope check, not replayed: \
+         {:?}",
+        retried.body
+    );
+    assert_eq!(retried.code(), "invite_already_consumed");
+    assert_eq!(
+        grant_count(&fixture.pool).await,
+        1,
+        "and no second grant was written"
+    );
+
+    // The refusal that *can* replay: one raised **inside** the envelope. A second identity
+    // that already holds a grant gets `admin_identity_already_claimed` from `insert_grant` —
+    // a cacheable `409`, so the ledger stores it, `consume_invite` never runs, and the invite
+    // stays pending. The retry therefore passes pre-envelope validation, reaches the ledger,
+    // and comes back as `AppError::Replayed`. That is the path where a refusal really was
+    // counted once per client retry.
+    let (second_invite_id, second_token) = create_invite(&router, "domain", "example.com").await;
+    let denied_key = format!("invite-denied-{}", Uuid::now_v7());
+    let denied_body = redeem_body(&second_token, "invitee@example.com");
+    let denied = post_json(
+        router.clone(),
+        "/api/v1/admin/admin-invites/redeem",
+        with_idempotency_key(issuer.bearer("invitee"), &denied_key),
+        denied_body.clone(),
+    )
+    .await;
+    assert_eq!(denied.status, StatusCode::CONFLICT, "{:?}", denied.body);
+    assert_eq!(
+        denied.code(),
+        "admin_identity_already_claimed",
+        "the premise is a refusal raised inside the envelope, not before it"
+    );
+    assert_eq!(
+        invite_status(&fixture.pool, second_invite_id).await,
+        "pending",
+        "the premise is that the invite survived, so the retry gets past require_redeemable \
+         and reaches the ledger where the stored failure lives"
+    );
+    let after_denial = scrape_metrics(router.clone()).await;
+    assert_eq!(
+        invite_outcome(&after_denial, "other"),
+        1.0,
+        "admin_identity_already_claimed is outside the bounded reason table, so it lands in \
+         `other`\n{}",
+        family_lines(&after_denial, INVITE_OUTCOMES)
+    );
+
+    let denied_replay = post_json(
+        router.clone(),
+        "/api/v1/admin/admin-invites/redeem",
+        with_idempotency_key(issuer.bearer("invitee"), &denied_key),
+        denied_body,
+    )
+    .await;
+    assert_eq!(
+        denied_replay.status,
+        StatusCode::CONFLICT,
+        "{:?}",
+        denied_replay.body
+    );
+    assert_eq!(denied_replay.code(), "admin_identity_already_claimed");
+
+    let after = scrape_metrics(router).await;
+    assert_eq!(
+        invite_outcome(&after, "other"),
+        1.0,
+        "one refused redemption counted twice: a replayed failure is the stored response of \
+         the refusal that already happened, so counting it again measures the client's retry \
+         policy rather than the denial rate\n{}",
+        family_lines(&after, INVITE_OUTCOMES)
+    );
+    assert_eq!(
+        invite_outcome(&after, "redeemed"),
+        1.0,
+        "and the success counter has not moved either"
+    );
 }

@@ -10027,7 +10027,7 @@
         "operationId": "redeem_admin_invite",
         "parameters": [
           {
-            "description": "Optional replay key. A repeated request with the same key and body replays the stored response instead of creating a second grant.",
+            "description": "Optional replay key. It protects a REFUSED redemption from being retried into a second attempt, not a successful one: because every check runs before the transactional envelope, a repeat of a redemption that SUCCEEDED finds the invitation already consumed and receives 409 invite_already_consumed rather than a replayed 200. A single-use invitation cannot produce a second grant either way.",
             "in": "header",
             "name": "Idempotency-Key",
             "required": false,
@@ -16010,7 +16010,7 @@
                 }
               }
             },
-            "description": "idempotency_conflict or idempotency_in_progress",
+            "description": "duplicate_trusted_jwt_issuer, idempotency_conflict or idempotency_in_progress. duplicate_trusted_jwt_issuer means the issuer is already registered: read the existing row rather than creating a second one, because issuer is the identity of the row and is not patchable.",
             "headers": {
               "X-Request-Id": {
                 "description": "Request correlation identifier",

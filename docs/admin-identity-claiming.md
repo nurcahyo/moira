@@ -48,9 +48,34 @@ The fix is a narrower endpoint, not a relaxed one. `sign-in-methods` returns onl
 
 ## After a grant
 
-The granted human's next trusted-JWT request to `/api/v1/admin/*` resolves to an actor carrying the granted scopes. The grant applies on the **admin plane only** — it never widens the public execution API (`/api/v1/responses` and friends), even though both paths verify the same token. Revoking a grant is a direct database operation today (`admin_identities.status`, `revoked_at`); a revoke endpoint is a deferred follow-up.
+The granted human's next trusted-JWT request to `/api/v1/admin/*` resolves to an actor carrying the granted scopes. The grant applies on the **admin plane only** — it never widens the public execution API (`/api/v1/responses` and friends), even though both paths verify the same token. `DELETE /api/v1/admin/admin-identities/{id}` soft-revokes a grant; the row survives, because it is audit history and because the `(issuer, subject)` uniqueness key must keep blocking a silent re-grant.
 
 `setup_state` records whether *any* identity has **ever** been claimed, independently of grant status, so revoking the sole admin cannot silently reopen the unauthenticated claim window. Re-opening it is a deliberate operator action, not an automatic side effect.
+
+## Ownership: exactly one primary, taken at the first grant
+
+Ownership is **row state** — `admin_identities.is_primary` — and not a scope. A scope could not express it: Moira grants a `moira:admin`-holding trusted-JWT actor every scope by implication with no per-scope opt-out, and every grant carries `moira:admin` by default, so a "may manage admins" scope would be held by every admin including the one whose ownership was being taken away.
+
+**A deployment gets its owner from its first admin, automatically.** Whichever grant arrives first — a system-key claim or a redeemed invitation — takes `is_primary`; every later grant does not. No operator step, and no break-glass credential, is involved.
+
+| Operation | Behaviour |
+|---|---|
+| First grant on a deployment with no owner | Becomes the owner. |
+| Any later grant | Ordinary admin. An invitation never mints a second owner. |
+| `PATCH /api/v1/admin/admin-identities/{id}` with `{"is_primary": true}` | **Transfers** ownership: the incumbent is demoted in the same transaction. The demoted grant's `version` changes, so a stale `ETag` stops validating. |
+| `PATCH …` with `{"is_primary": false}` on the owner | `409 admin_identity_last_primary`. |
+| `DELETE …` on the owner | `409 admin_identity_last_primary` — a revocation clears the flag too. Transfer first, then revoke. |
+
+Only a primary admin may perform those operations (`403 admin_identity_not_primary` otherwise). A system-key or dev-admin caller passes regardless: break-glass is the documented last resort and stays working.
+
+Two consequences worth knowing before you meet them:
+
+- **A deployment's sole admin cannot be revoked through the API.** They are the owner, and revoking the owner is refused. That is the lockout guard doing its job — an admin plane with nobody able to manage admins is the state this design exists to prevent — but it means "remove the last admin" is a deliberate database operation, not an API call.
+- **Going to several primaries is a schema change, not a setting.** `admin_identities_single_active_primary` is a unique index over live, active, primary rows; the last-primary guard and the transfer semantics are written against it. Widening the model means dropping that index and rewriting both, in one migration with its own tests.
+
+### Why it works this way
+
+Migration `0017` introduced `is_primary` and bootstrapped it with a one-shot `UPDATE`. On a deployment created *after* `0017`, that `UPDATE` ran against an empty `admin_identities`, and nothing else ever wrote the column except the transfer endpoint — which requires a primary caller. So no admin was ever primary, the last-primary guard protected an empty set, and ownership transfer was reachable only through the system-key break-glass path: the exact credential the invitation flow exists to let an operator retire. `0019` repairs existing deployments and moves the decision into the grant insert, where it happens under the same deployment-wide advisory lock every other ownership mutation takes — so two grants racing for an empty ownership slot both succeed and exactly one of them owns.
 
 ## What Moira does not store
 

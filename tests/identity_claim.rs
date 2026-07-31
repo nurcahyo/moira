@@ -816,8 +816,14 @@ async fn concurrent_claims_for_the_same_identity_yield_one_201_and_one_409() {
 
 /// **Barrier-gated**, the sibling assertion: the advisory-lock/unique-index machinery that
 /// serializes a race for *one* identity must not also serialize unrelated identities. Two
-/// different subjects on the same governing issuer, released together, must both succeed —
-/// the lock key is per-identity, not per-issuer or global.
+/// different subjects on the same governing issuer, released together, must both succeed.
+///
+/// Since finding F20, `insert_grant` also takes the deployment-wide `moiraown` ownership
+/// lock, which *does* serialise these two — so this test now asserts the property that
+/// actually matters and was always the point: serialising them must not make either of them
+/// **fail**, and exactly one of them must come out owning the deployment. A claim refused
+/// because someone else was claiming a different identity would be the regression; a claim
+/// that merely waited is not.
 #[tokio::test]
 async fn concurrent_claims_for_different_identities_both_succeed() {
     let Some(fixture) = LifecycleFixture::new().await else {
@@ -860,6 +866,31 @@ async fn concurrent_claims_for_different_identities_both_succeed() {
         .await
         .expect("count grants");
     assert_eq!(grants, 2, "independent identities proceed independently");
+
+    // Decision D-F20: two grants raced for one empty ownership slot. The advisory lock is
+    // what makes the loser *not primary* rather than *refused* — both bodies above are
+    // already asserted to be `201`, so a design that let
+    // `admin_identities_single_active_primary` decide the race would have failed there.
+    let primaries: i64 = sqlx::query_scalar(
+        "select count(*) from admin_identities \
+         where issuer = $1 and deleted_at is null and status = 'active' and is_primary",
+    )
+    .bind(&issuer.issuer)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count primaries");
+    assert_eq!(
+        primaries, 1,
+        "exactly one of two racing first claims may own the deployment"
+    );
+    let claimed = [&first, &second]
+        .iter()
+        .filter(|result| result.body["is_primary"] == serde_json::json!(true))
+        .count();
+    assert_eq!(
+        claimed, 1,
+        "exactly one response body may report ownership, and it must agree with the row"
+    );
 }
 
 #[tokio::test]

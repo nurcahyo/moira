@@ -6,7 +6,10 @@ mod idempotency;
 mod masking;
 mod ssrf;
 
-pub use api_keys::{ApiKeyHasher, GeneratedApiKey};
+pub use api_keys::{
+    ApiKeyHasher, GeneratedApiKey, KEY_NAMESPACES, MIN_API_KEY_PREFIX_LENGTH,
+    MIN_RANDOM_PREFIX_CHARS, is_registered_key_namespace,
+};
 /// Re-exported for `src/http/identity.rs` (plan 07 module 11), which reads
 /// `X-Moira-System-Key` directly instead of going through `authenticate_admin`. Mirroring
 /// the parsing there instead would be a second implementation of a one-line rule.

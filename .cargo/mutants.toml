@@ -1,0 +1,39 @@
+# cargo-mutants configuration. Run it through `scripts/mutants.sh`; see `docs/mutation-testing.md`.
+#
+# This file says *how* a mutant is judged. It deliberately does not say *what* to mutate:
+# that is chosen per run by `--in-diff`, because a whole-tree run over this workspace
+# rebuilds 400+ crates per surviving mutant and is not something a pull request can wait
+# for. The adopted scope is "code this change touches".
+
+# A mutant is caught only if the suite the gates run catches it. Restricting mutation
+# testing to `--lib` would be the more comfortable choice and the wrong one: every case
+# this technique has actually found in this project — plan 11's faked `'indexed'` status,
+# the enumeration oracle behind `redeem_invite`, the six laundering cases the hand-written
+# mutations caught — lived in code whose only honest test is DB-backed. `MOIRA_TEST_DATABASE_URL`
+# must therefore be exported for the run, and `scripts/mutants.sh` refuses to start without it.
+additional_cargo_test_args = ["--workspace", "--all-features"]
+
+# Mutating these produces "survivors" that say nothing about test quality: a test suite is
+# not expected to notice that a `clone()` was removed from an expression it never inspects,
+# and the noise buries the findings that matter.
+skip_calls = ["with_capacity", "clone", "to_string", "to_owned", "to_vec"]
+
+# Excluded because a surviving mutant in them is not a test-quality signal:
+#
+# * `src/i18n/catalog/**` is a data table. Mutating a `&'static str` in a catalog entry
+#   produces hundreds of mutants whose only meaning is "no test asserts this exact English
+#   sentence", which is true by design — the catalog gates assert *presence and
+#   non-emptiness*, and pinning prose would make every copy edit a test failure.
+# * `src/infra/metrics.rs`'s label tables have the same shape.
+# * `build.rs` and generated code are not behaviour.
+exclude_globs = [
+    "src/i18n/catalog/errors.rs",
+    "src/i18n/catalog/notices.rs",
+    "build.rs",
+]
+
+# The default is 20× the baseline test time, which on a suite this size is measured in
+# hours per hung mutant. A mutant that turns a bounded loop unbounded should be reported as
+# a timeout in minutes, not left to run.
+timeout_multiplier = 3.0
+minimum_test_timeout = 120

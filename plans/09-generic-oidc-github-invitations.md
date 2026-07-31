@@ -85,6 +85,47 @@ optional once a second provider or a second replica exists.
 
 **Reversal condition:** none. Without durable storage those features cannot exist.
 
+**D-F20 — ownership is a SINGLE primary, taken at the first grant. Taken by the user, 2026-07-31, in response to finding F20.**
+
+D1 made ownership row state but left nothing that ever *writes* it. `0017`'s backfill is a one-shot
+migration-time `UPDATE`, and on a greenfield deployment it runs against an empty
+`admin_identities`; the only other writer is the transfer endpoint, which requires a primary caller.
+So on **every deployment created after `0017`** no admin was ever primary, `admin_identity_last_primary`
+guarded a permanently empty set, and ownership transfer was reachable only through the system-key
+break-glass path — the credential this plan's invitation flow exists to let an operator retire.
+Wave 5 was to build the ownership UI on top of that.
+
+The decision: **whichever grant arrives first on a deployment with no owner becomes the owner** —
+system-key claim or redeemed invitation alike, because both flip `setup_state.claimed` and `0017`'s
+own backfill named the setup claimant. Transfer **moves** the flag (the incumbent is demoted in the
+same transaction); the last-primary guard prevents clearing it.
+
+Implementation notes that are part of the decision, not of the code:
+
+- The writer is `insert_grant`, which computes "no active primary exists" **in SQL** while holding
+  the existing `moiraown` transaction advisory lock. The lock is the *mechanism*: it is what makes
+  the loser of a race **not primary** rather than **refused**. `0019`'s partial unique index
+  `admin_identities_single_active_primary` is the *invariant* — the backstop that holds if a future
+  path forgets the lock, in exactly the sense `admin_identities_issuer_subject_active_unique` backs
+  the claim. Choosing the index *as* the mechanism would turn a legitimate second grant into a 500.
+- `0019` also repairs already-deployed instances: it collapses any pre-existing set of primaries to
+  one (reachable today, because `PATCH` set the flag without clearing anyone else's) and re-runs
+  `0017`'s two backfill steps, each still guarded by "no active primary exists".
+
+**Two consequences to state rather than discover.** A deployment's *sole* admin can no longer be
+revoked through the API — they are the owner, and revoking the owner clears the flag, which the
+guard refuses. And `create_preview_redeem_grants_admin_and_consumes_the_invite`,
+`clearing_the_only_primary_is_refused_with_the_last_primary_conflict`,
+`a_non_primary_admin_cannot_promote_itself_to_primary` and
+`the_grant_administration_conflicts_are_pinned_to_their_paths` all had premises that this makes
+false; each was rewritten to assert the new premise explicitly rather than adjusted until green.
+
+**Reversal condition:** going to *multiple* primaries is a **schema change, not a config toggle**.
+It means dropping `admin_identities_single_active_primary`, turning the last-primary guard into a
+last-any-primary guard, and changing transfer back from "move the flag" to "set the flag" — one
+deliberate migration with its own tests. Revisit only if a deployment genuinely needs several
+people able to manage admins independently.
+
 ### §0.3 Two designs plan 08 tried and REJECTED — do not re-do them
 
 | Design this plan proposes | Why plan 08 rejected it |

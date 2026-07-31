@@ -1330,7 +1330,7 @@ pub async fn delete_consumer_key(
     params(("Idempotency-Key" = Option<String>, Header, description = "Optional replay key")),
     responses(
         (status = 201, description = "Trusted JWT issuer created", body = TrustedJwtIssuerRecord, headers(("ETag" = String, description = "Current resource version"))),
-        (status = 409, description = "idempotency_conflict or idempotency_in_progress", body = ErrorResponse),
+        (status = 409, description = "duplicate_trusted_jwt_issuer, idempotency_conflict or idempotency_in_progress. duplicate_trusted_jwt_issuer means the issuer is already registered: read the existing row rather than creating a second one, because issuer is the identity of the row and is not patchable.", body = ErrorResponse),
         (status = "4XX", description = "Request, authentication, authorization, or conflict error", body = ErrorResponse),
         (status = "5XX", description = "Infrastructure or JWKS error", body = ErrorResponse)
     ),
