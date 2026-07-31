@@ -5,6 +5,13 @@ on:
   push:
     branches:
       - main
+  # Manual trigger against an arbitrary ref. Added 2026-07-31 because GitHub stopped
+  # producing runs for `pull_request` events on this repository while `push` runs kept
+  # working — PR #39 sat with zero check-runs across a synchronize, a close/reopen and a
+  # fresh commit. This is the honest way to get real CI on a branch when the event never
+  # arrives; the alternative is merging on local gates alone, which is exactly the
+  # "a gate you did not run is not a gate that passed" trap.
+  workflow_dispatch:
 
 jobs:
   rust:
