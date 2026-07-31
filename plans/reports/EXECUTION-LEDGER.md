@@ -376,6 +376,45 @@ the whole argument for the approach given that Debian had declined or deferred f
    package manager with which to create a second user. It would have failed at deploy time, not in
    CI. When an agent reports "verified", check the specific thing that could fail silently.
 
+### F19 — validating inside the envelope turns invite redemption into an enumeration oracle
+
+**Found by measuring a mutation that nothing caught, then asking what the guard is actually for.**
+
+Moving redeem's validation inside the transactional envelope was **caught by nothing** — 869 passed,
+0 failed, byte-identical to baseline. Neither the mechanism §0 claimed (a replayed 403 — impossible,
+`is_cacheable_admin_failure` excludes `Forbidden`) nor the correction to it (assert the invite's
+`status`) can see the difference: `AdminCommandRunner::execute` rolls back on any non-cacheable
+failure, so a denial inside the envelope has its `consume_invite` rolled back too. **Pre-envelope
+ordering and transaction rollback defend the same property**, which is why no assertion on that
+property distinguishes them.
+
+**What ordering uniquely buys is which failure the caller is told about.** Inside the envelope
+`insert_grant` runs first, so a caller whose `(issuer, subject)` already holds a grant receives
+`409 admin_identity_already_claimed` — *before* the invite's own constraint has refused them, and
+before policy has. A stranger holding a leaked invite token can therefore learn whether an arbitrary
+identity already has admin, from a request the invite should have refused outright.
+
+Pinned by `a_refusal_that_belongs_to_the_invite_is_not_pre_empted_by_the_grant_table`, which probes
+both checkpoints with an already-granted identity as an explicit premise. Verified failing under the
+mutation (`admin_identity_already_claimed` where `invite_email_mismatch` was due) and passing at HEAD.
+
+**The lesson is about how the guard was documented.** Its doc comment credited ordering with
+"never reaching the statement that marks the invite consumed" — something rollback would have done
+anyway. A guard justified by the wrong property is one refactor away from being removed as
+redundant, because *for that property it is*.
+
+### F20 — on any deployment created after `0017`, no admin is ever primary
+
+`claim` never sets `is_primary` — the shared `insert_grant` names no such column — and `0017`'s
+backfill is a one-shot migration-time `UPDATE` that finds an **empty table** on a greenfield deploy.
+So the ownership-transfer endpoint is unreachable by every JWT admin until an operator reaches for
+the system-key break-glass `PATCH`.
+
+`0017` says "the setup claimant is primary by default", which is true only for deployments that
+already had a claimant when `0017` ran. Not fixed — it is a design decision rather than a typo, and
+`clearing_the_only_primary_is_refused_with_the_last_primary_conflict` now asserts and documents the
+actual behaviour rather than the intended one.
+
 ### METHOD NOTE — right conclusion, wrong mechanism, and the test that would have proved nothing
 
 Plan 09 §0 argued the redeem validation must sit **outside** the transactional envelope because,
