@@ -170,7 +170,12 @@ export async function startMockIdp(options: MockIdpOptions): Promise<MockIdp> {
   const tls = fixtureTls();
   const { publicKey, privateKey } = await generateKeyPair("ES256", { extractable: true });
   const kid = randomToken("mockidp-key");
-  const publicJwk: JWK = { ...(await exportJWK(publicKey as KeyObject)), kid, alg: "ES256", use: "sig" };
+  const publicJwk: JWK = {
+    ...(await exportJWK(publicKey as KeyObject)),
+    kid,
+    alg: "ES256",
+    use: "sig",
+  };
 
   const codes = new Map<string, PendingAuthorization>();
   const accessTokens = new Map<string, MockIdpUser>();
@@ -283,8 +288,7 @@ export async function startMockIdp(options: MockIdpOptions): Promise<MockIdp> {
           if (verifier === null || verifier === "") {
             return oauthError("invalid_grant", 400, "code_verifier is required");
           }
-          const expected =
-            pending.codeChallengeMethod === "S256" ? await s256(verifier) : verifier;
+          const expected = pending.codeChallengeMethod === "S256" ? await s256(verifier) : verifier;
           if (expected !== pending.codeChallenge) {
             return oauthError("invalid_grant", 400, "PKCE verification failed");
           }

@@ -189,7 +189,9 @@ describeDatabase("the AAD binding still holds through the database", () => {
   });
 
   test("a wrong-length key is refused at construction, not at first sign-in", () => {
-    expect(() => new PostgresConsoleSecretStore(pool, randomBytes(16))).toThrow(SecretEnvelopeError);
+    expect(() => new PostgresConsoleSecretStore(pool, randomBytes(16))).toThrow(
+      SecretEnvelopeError,
+    );
   });
 
   test("an empty secret is refused before it reaches the database", async () => {

@@ -38,11 +38,37 @@ const ok = (body: unknown) => () => ({ status: 200, body });
 /* -------------------------------------------------------------------------- */
 
 describe("credential selection is driven by the operation registry", () => {
-  test("claim_status_is_the_only_anonymous_call", async () => {
-    const anonymous = (Object.keys(MOIRA_OPERATIONS) as MoiraOperationName[]).filter(
-      (name) => MOIRA_OPERATIONS[name].credential === "none",
-    );
-    expect(anonymous).toEqual(["getSetupClaimStatus"]);
+  test("the anonymous operations are exactly the two the console binds to", () => {
+    // WAS `claim_status_is_the_only_anonymous_call`. That stopped being true:
+    // finding F15's fix added `GET /api/v1/admin/setup/sign-in-methods` with no
+    // `security` block, and wave 2 added `POST /api/v1/admin/admin-invites/preview`
+    // as a third anonymous Moira operation (which this console does not bind to).
+    //
+    // The assertion is still an exact set rather than a count: "how many are
+    // anonymous" is not the interesting question, "which ones" is. A new entry
+    // here has to be a deliberate edit.
+    const anonymous = (Object.keys(MOIRA_OPERATIONS) as MoiraOperationName[])
+      .filter((name) => MOIRA_OPERATIONS[name].credential === "none")
+      .sort();
+    expect(anonymous).toEqual(["getSetupClaimStatus", "getSetupSignInMethods"]);
+  });
+
+  test("every anonymous operation really sends no credential", async () => {
+    // The registry saying `credential: "none"` and the client sending nothing
+    // are two different claims. `#buildHeaders` is what joins them, so it is
+    // exercised rather than trusted.
+    const { stub, client } = clientWith({
+      "GET /api/v1/admin/setup/claim-status": ok({ claimed: false }),
+      "GET /api/v1/admin/setup/sign-in-methods": ok({ methods: [] }),
+    });
+    await client.getSetupClaimStatus();
+    await client.getSetupSignInMethods();
+
+    expect(stub.requests).toHaveLength(2);
+    for (const request of stub.requests) {
+      expect(Object.keys(request.headers)).not.toContain("X-Moira-System-Key");
+      expect(Object.keys(request.headers)).not.toContain("Authorization");
+    }
   });
 
   test("the claim-status read sends no credential at all", async () => {
@@ -117,11 +143,21 @@ describe("Idempotency-Key is sent only where the spec declares it", () => {
     expect(stub.requests[0]?.headers["Idempotency-Key"]).toBe("idem-1");
   });
 
-  test("exactly three of the registry's operations declare a key", () => {
+  test("exactly four of the registry's operations declare a key", () => {
+    // `createAdminInvite` is the fourth (plan 09 wave 3). Read off the spec, not
+    // assumed: `POST /api/v1/admin/admin-invites` declares an optional
+    // `Idempotency-Key` header parameter and no `If-Match`.
+    // `tests/contract/openapi-contract.test.ts` re-derives both from
+    // `docs/openapi.json` on every run.
     const withKey = (Object.keys(MOIRA_OPERATIONS) as MoiraOperationName[])
       .filter((name) => MOIRA_OPERATIONS[name].declaresIdempotencyKey)
       .sort();
-    expect(withKey).toEqual(["claimAdminIdentity", "createAuthProvider", "createTrustedJwtIssuer"]);
+    expect(withKey).toEqual([
+      "claimAdminIdentity",
+      "createAdminInvite",
+      "createAuthProvider",
+      "createTrustedJwtIssuer",
+    ]);
   });
 });
 

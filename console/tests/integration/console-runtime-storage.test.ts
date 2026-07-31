@@ -9,7 +9,11 @@ import { randomBytes } from "node:crypto";
 
 import { Pool } from "pg";
 
-import { consoleSecretStore, consoleStorageMode, resetConsoleRuntime } from "../../lib/auth-runtime";
+import {
+  consoleSecretStore,
+  consoleStorageMode,
+  resetConsoleRuntime,
+} from "../../lib/auth-runtime";
 import { closeConsoleDatabase, hasConsoleDatabase } from "../../lib/console-db";
 import { InMemoryConsoleSecretStore } from "../../lib/console-secrets";
 import { PostgresConsoleSecretStore } from "../../lib/console-secrets-postgres";

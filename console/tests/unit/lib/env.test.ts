@@ -61,8 +61,7 @@ describe("a valid environment", () => {
   test("the issuer defaults to the console origin but is separable", () => {
     expect(readConsoleEnv(VALID).bffIssuerUrl).toBe("https://console.example.com");
     expect(
-      readConsoleEnv({ ...VALID, MOIRA_BFF_ISSUER_URL: "https://issuer.example.com" })
-        .bffIssuerUrl,
+      readConsoleEnv({ ...VALID, MOIRA_BFF_ISSUER_URL: "https://issuer.example.com" }).bffIssuerUrl,
     ).toBe("https://issuer.example.com");
   });
 
@@ -139,7 +138,11 @@ describe("URL scheme policy mirrors Moira's own", () => {
     // Moira's `validate_https_url` checks scheme and non-empty host only, with
     // no private-host check, so this form passes there too. Matching that
     // exactly is what makes a TLS fixture usable end to end.
-    const env = readConsoleEnv({ ...VALID, NODE_ENV: "test", MOIRA_API_URL: "https://localhost:8443" });
+    const env = readConsoleEnv({
+      ...VALID,
+      NODE_ENV: "test",
+      MOIRA_API_URL: "https://localhost:8443",
+    });
     expect(env.moiraBaseUrl).toBe("https://localhost:8443");
   });
 
@@ -153,15 +156,17 @@ describe("URL scheme policy mirrors Moira's own", () => {
 describe("the encryption key", () => {
   test("must decode to exactly 32 bytes", () => {
     expect(
-      problemsOf({ ...VALID, CONSOLE_SECRET_ENCRYPTION_KEY: Buffer.alloc(16, 1).toString("base64") })
-        .join(),
+      problemsOf({
+        ...VALID,
+        CONSOLE_SECRET_ENCRYPTION_KEY: Buffer.alloc(16, 1).toString("base64"),
+      }).join(),
     ).toContain("exactly 32 bytes");
   });
 
   test("the error tells the operator how to make one", () => {
-    expect(
-      problemsOf({ ...VALID, CONSOLE_SECRET_ENCRYPTION_KEY: "short" }).join(),
-    ).toContain("openssl rand -base64 32");
+    expect(problemsOf({ ...VALID, CONSOLE_SECRET_ENCRYPTION_KEY: "short" }).join()).toContain(
+      "openssl rand -base64 32",
+    );
   });
 });
 
@@ -210,9 +215,9 @@ describe("the console's own database", () => {
   test("a DSN naming no database is refused", () => {
     // The single most likely paste error, and the one that would silently put
     // the console in the `postgres` maintenance database next to nothing.
-    expect(problemsOf({ ...VALID, CONSOLE_DATABASE_URL: "postgres://c:p@db:5432" }).join()).toContain(
-      "names no database",
-    );
+    expect(
+      problemsOf({ ...VALID, CONSOLE_DATABASE_URL: "postgres://c:p@db:5432" }).join(),
+    ).toContain("names no database");
   });
 
   test("an unparseable value is refused", () => {

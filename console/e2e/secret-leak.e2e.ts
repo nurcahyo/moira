@@ -1,5 +1,8 @@
 import { expect, test } from "@playwright/test";
 
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { attachLeakTap, scanBuildOutput } from "./support/leak-tap";
 import { CONSOLE_E2E_ENV } from "./support/console-env";
 import { NEXT_BUILD_DIR, APP_DIR } from "./support/paths";
@@ -7,6 +10,7 @@ import { discoverPageRoutes, visitableRoutes } from "./support/routes";
 import {
   describeLeaks,
   forbiddenValues,
+  ONCE_ONLY_SECRET_FIXTURE,
   scanForLeaks,
   SENTINEL_ENV,
   type Leak,
@@ -94,12 +98,44 @@ import {
  * and the build-output scan failed, reporting "secret value from
  * CONSOLE_DATABASE_URL password (ambient server env)". The leak was reverted.
  *
- * ONE HARNESS PROPERTY THAT EXPERIMENT EXPOSED — worth knowing before trusting
- * a green run: with `E2E_SKIP_BUILD=1` the SAME injected leak passed. `/` is
- * statically prerendered, so a server-side `process.env` read is resolved at
- * BUILD time; reusing a `.next` produced without the e2e environment means the
- * value was never in the output to find. `E2E_SKIP_BUILD=1` is a local
- * iteration shortcut and must not be used for a gating run.
+ * ============================================================================
+ * THE `E2E_SKIP_BUILD` HOLE — CLOSED IN PLAN 09 WAVE 3
+ * ============================================================================
+ *
+ * The wave 1 experiment above exposed a harness property and recorded it as a
+ * warning: with `E2E_SKIP_BUILD=1` the SAME injected leak PASSED, because `/`
+ * was statically prerendered and a server-side `process.env` read is therefore
+ * resolved at BUILD time — reusing a `.next` produced without the e2e
+ * environment means the value was never in the output to find. The note ended
+ * "`E2E_SKIP_BUILD=1` … must not be used for a gating run".
+ *
+ * `.github/workflows/ci.yml` was using it for exactly that, on every run, since
+ * the step was written.
+ *
+ * REPRODUCED, wave 3, before the fix, with the current tree: `/` made static
+ * again and rendering `{process.env.MOIRA_E2E_SENTINEL_SYSTEM_KEY}`, built from
+ * a shell with no sentinels (the CI job env is `CONSOLE_TEST_DATABASE_URL` and
+ * nothing else) and then `E2E_SKIP_BUILD=1 bun run e2e`:
+ *
+ *     13 passed (2.9s)      exit 0
+ *
+ * Every assertion in this file was green while the sentinel was on the page.
+ * Note that the BROWSER-surface scan was green too, not just the build-output
+ * one: a static page resolves `process.env` at build time, so the running server
+ * never held the value either.
+ *
+ * The same leak under a full build fails loudly — verified in the same session:
+ * `bun run e2e` with the leak on the (dynamic) `/login` gave 2 failures naming
+ * "secret value from MOIRA_E2E_SENTINEL_SYSTEM_KEY (seeded sentinel)", exit 1.
+ * Worth reading carefully: on a DYNAMIC page only the browser-surface half
+ * fires, because there is nothing build-time to inline. `force-dynamic` is
+ * therefore not a fix for this — it repairs the response-body half and leaves
+ * the build-output scan reading a sentinel-free bundle.
+ *
+ * THE FIX: the flag is gone from `ci.yml`, and `playwright.config.ts` now
+ * REFUSES it under CI. Removing it from the workflow alone would be undone by
+ * one edit to that file, and what that edit reintroduces is a silently green
+ * gate.
  */
 
 const needles = forbiddenValues();
@@ -109,14 +145,80 @@ test.describe("secret leak", () => {
   test("the gate has needles and routes to scan", () => {
     // A gate with an empty needle set or an empty route set passes trivially.
     // Fail loudly instead of pretending to be green.
+    //
+    // The floor is BUMPED in the same commit that adds the once-only needle. If
+    // it were left at the sentinel count, the vacuity guard would no longer
+    // prove the new needle is present — which is how a needle set silently
+    // shrinks back to what it was.
     expect(
       needles.length,
       "no forbidden values configured — the secret-leak gate would be vacuous",
-    ).toBeGreaterThanOrEqual(Object.keys(SENTINEL_ENV).length);
+    ).toBeGreaterThanOrEqual(Object.keys(SENTINEL_ENV).length + 1);
     expect(
       routes.length,
       "no page-level routes discovered — the secret-leak gate would be vacuous",
     ).toBeGreaterThan(0);
+  });
+
+  test("the once-only invitation token is one of the needles", () => {
+    // Asserted directly, for the same reason the DSN-password assertion below
+    // exists: every OTHER assertion in this file stays green if the needle
+    // silently stops being included, because a needle that is not in the set is
+    // a value no scan is looking for.
+    //
+    // This one can never be harvested from the environment — Moira mints it at
+    // runtime and it is never a variable — so it is the needle most likely to be
+    // dropped by someone tidying `forbiddenValues()`.
+    expect(
+      needles.map((needle) => needle.value),
+      "the once-only invitation token is not in the needle set, so no scan in this file is " +
+        "looking for it",
+    ).toContain(ONCE_ONLY_SECRET_FIXTURE);
+  });
+
+  test("the once-only needle survives the usability filter", () => {
+    // `isUsableNeedle` discards anything under 12 characters, containing
+    // whitespace, or containing `/` or `\` — a needle that fails it is dropped
+    // SILENTLY. Wave 1 hit this with the DSN and solved it by choosing a
+    // `/`-free password; the same constraint applies here and is asserted rather
+    // than assumed.
+    expect(ONCE_ONLY_SECRET_FIXTURE.length).toBeGreaterThanOrEqual(12);
+    expect(/\s/.test(ONCE_ONLY_SECRET_FIXTURE)).toBe(false);
+    expect(ONCE_ONLY_SECRET_FIXTURE.includes("/")).toBe(false);
+    expect(ONCE_ONLY_SECRET_FIXTURE.includes("\\")).toBe(false);
+  });
+
+  test("no shipped route mounts OnceOnlySecretModal yet — and this fails when one does", () => {
+    // THE NEEDLE IS ARMED BUT NOT YET EXERCISED, and that is stated as an
+    // assertion rather than left as an omission.
+    //
+    // No page renders the modal in this wave, so no route scan below can
+    // possibly observe the token. The moment a page does mount it — plan 09's
+    // `/invite/[token]`, or an admin surface that creates one — this assertion
+    // FAILS, and whoever wrote that page has to arrange for the fixture token to
+    // flow through it. Without this, that author would inherit a gate that reads
+    // as covering the render and does not.
+    const reachable: string[] = [];
+    const walk = (dir: string): void => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (entry.name === "node_modules" || entry.name === ".next") continue;
+          walk(full);
+          continue;
+        }
+        if (!/\.(ts|tsx)$/.test(entry.name)) continue;
+        const source = readFileSync(full, "utf8");
+        if (source.includes("modules/secrets/OnceOnlySecretModal")) reachable.push(full);
+      }
+    };
+    walk(APP_DIR);
+
+    expect(
+      reachable,
+      "a route now mounts OnceOnlySecretModal. Point an e2e fixture at that route so the " +
+        "once-only needle is actually scanned on a rendered page, then update this assertion.",
+    ).toEqual([]);
   });
 
   test("no server-only secret is inlined in the built client bundle", () => {

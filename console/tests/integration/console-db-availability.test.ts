@@ -28,9 +28,8 @@ describe("the database-backed suite actually ran", () => {
     // `console/db/migrate.ts`; Moira's by its own binary from the
     // repository-root `migrations/`.
     const consoleDatabase = new URL(testDatabaseUrl()).pathname;
-    const moiraDatabase = new URL(
-      process.env["MOIRA_TEST_DATABASE_URL"] ?? "postgres://x/moira",
-    ).pathname;
+    const moiraDatabase = new URL(process.env["MOIRA_TEST_DATABASE_URL"] ?? "postgres://x/moira")
+      .pathname;
     expect(
       consoleDatabase,
       "CONSOLE_TEST_DATABASE_URL points at Moira's database. They may share a server; " +

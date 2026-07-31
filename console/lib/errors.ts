@@ -15,6 +15,7 @@
 // they are legitimately signed in to, mid-setup, and hide the actual cause. It
 // is mapped to its own remedy and `isSessionExpired()` returns false for it.
 
+import { CONSOLE_MESSAGE_KEYS } from "./i18n/keys";
 import type { JsonValue, MoiraErrorResponse } from "./types";
 
 /* -------------------------------------------------------------------------- */
@@ -98,8 +99,11 @@ export type MoiraError = MoiraApiError | MoiraTransportError | MoiraMalformedErr
 /* Console-originated keys used when the server gave us nothing usable        */
 /* -------------------------------------------------------------------------- */
 
-export const CONSOLE_TRANSPORT_ERROR_KEY = "console.error.moira_unreachable";
-export const CONSOLE_MALFORMED_ERROR_KEY = "console.error.moira_response_unreadable";
+// Re-exported, not redefined: `tests/unit/lib/errors.test.ts:184,197` imports
+// these two names from THIS module, and `lib/i18n/keys.ts` is the single place a
+// `console.*` key is spelled. Both halves matter — see the header of that file.
+export const CONSOLE_TRANSPORT_ERROR_KEY = CONSOLE_MESSAGE_KEYS.moira_unreachable;
+export const CONSOLE_MALFORMED_ERROR_KEY = CONSOLE_MESSAGE_KEYS.moira_response_unreadable;
 
 /* -------------------------------------------------------------------------- */
 /* The (code -> remedy) table                                                 */
@@ -282,30 +286,22 @@ function transportReason(cause: unknown): string {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Server-side-only diagnostics                                               */
+/* Server-side-only diagnostics — MOVED OUT OF THIS MODULE                    */
 /* -------------------------------------------------------------------------- */
-
-/** `request_id` and `details`. Log these; never return them to a caller. */
-export interface MoiraServerDiagnostics {
-  readonly requestId: string | null;
-  readonly details: JsonValue | null;
-}
-
-/**
- * Extract the fields that must stay on the server.
- *
- * Kept in this module, next to the mapper, so the two are read together: the
- * reason `toMoiraError` drops these is that this function exists to consume
- * them.
- */
-export function serverDiagnostics(body: unknown): MoiraServerDiagnostics {
-  if (!isMoiraErrorResponse(body)) return { requestId: null, details: null };
-  const error = body.error as MoiraErrorResponse["error"] & { details?: JsonValue };
-  return {
-    requestId: typeof error.request_id === "string" ? error.request_id : null,
-    details: error.details ?? null,
-  };
-}
+//
+// `MoiraServerDiagnostics` and `serverDiagnostics()` now live in
+// `lib/errors-server.ts`, which carries `import "server-only"`.
+//
+// They were here, and that was a hole with only a doc comment holding it shut.
+// This module deliberately carries NO `import "server-only"` — `MoiraError` has
+// to cross to the browser — so a client component could import
+// `serverDiagnostics` from here and Next would compile it happily. And that
+// function is the one thing in this file that returns UNFILTERED pass-through
+// data: `details: error.details ?? null`, typed `JsonValue`, with no allow-list.
+//
+// It was dead code in application paths (its only callers were two lines of
+// `errors.test.ts`), so nothing noticed. Wave 3 adds the first real caller, and
+// a one-line import edit turned the doc comment into a build failure.
 
 /* -------------------------------------------------------------------------- */
 /* Predicates the UI uses                                                     */

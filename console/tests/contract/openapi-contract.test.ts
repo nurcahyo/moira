@@ -83,6 +83,55 @@ const sorted = (values: readonly string[]): string[] => [...values].sort();
 
 /* -------------------------------------------------------------------------- */
 
+describe("SCHEMA_CONTRACTS is complete", () => {
+  // `SCHEMA_CONTRACTS` is a hand-maintained array. A `*_CONTRACT` declared in
+  // `lib/types.ts` but left out of it is checked by NOTHING: the interface still
+  // type-checks against its own descriptor via `assertKeyContract`, so the
+  // omission is invisible, and the claim this whole file rests on — "every
+  // descriptor is re-derived from the committed spec" — silently stops holding
+  // for that DTO.
+  //
+  // The probe that produced this wave's brief made exactly that claim about a
+  // newly added DTO ("gated automatically once added"). It is true only once the
+  // descriptor reaches the array.
+  const source = readFileSync(resolve(import.meta.dir, "../../lib/types.ts"), "utf8");
+  const declared = [...source.matchAll(/^export const ([A-Z0-9_]+_CONTRACT)\b/gm)]
+    .map((match) => match[1] ?? "")
+    .sort();
+  const registered = [...source.matchAll(/^ {2}([A-Z0-9_]+_CONTRACT),$/gm)]
+    .map((match) => match[1] ?? "")
+    .sort();
+
+  test("the scanner found the declarations at all", () => {
+    // Zero declarations found means the regex stopped matching, at which point
+    // "every declaration is registered" is vacuously true.
+    expect(declared.length, `found: ${declared.join(", ")}`).toBeGreaterThanOrEqual(13);
+  });
+
+  test("every declared *_CONTRACT appears in SCHEMA_CONTRACTS", () => {
+    const missing = declared.filter((name) => !registered.includes(name));
+    expect(
+      missing,
+      "these descriptors exist in lib/types.ts but are in no gate — add them to SCHEMA_CONTRACTS",
+    ).toEqual([]);
+  });
+
+  test("SCHEMA_CONTRACTS names nothing that is not declared", () => {
+    const phantom = registered.filter((name) => !declared.includes(name));
+    expect(phantom).toEqual([]);
+  });
+
+  test("the array's length matches both the source scan and the runtime value", () => {
+    expect(registered.length).toBe(declared.length);
+    expect(SCHEMA_CONTRACTS.length).toBe(declared.length);
+  });
+
+  test("no two descriptors name the same schema", () => {
+    const schemas = SCHEMA_CONTRACTS.map((contract) => contract.schema);
+    expect(new Set(schemas).size).toBe(schemas.length);
+  });
+});
+
 describe("DTO shapes match docs/openapi.json", () => {
   for (const contract of SCHEMA_CONTRACTS satisfies readonly SchemaContract[]) {
     test(`${contract.schema} required and optional fields match the committed schema`, () => {

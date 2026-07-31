@@ -328,6 +328,211 @@ assertKeyContract<
   >
 >();
 
+/**
+ * `#/components/schemas/PublicSignInMethod` — the ANONYMOUS projection.
+ *
+ * Strictly narrower than `PublicAuthMethod`, and the two omissions are the
+ * point. `allowed_email_domains` is absent because it is plan 07 decision D3 —
+ * the deny-by-default admin-claim policy — and publishing it anonymously would
+ * hand any caller the exact list of email domains that can obtain Moira admin.
+ * `jwks_url` is absent because it is machine token-verification configuration.
+ *
+ * The rule the spec states for this schema: every field here is something the
+ * browser already transmits or receives while signing in. Adding a field that
+ * fails that rule publishes it to the internet.
+ *
+ * CONSEQUENCE FOR THE CONSOLE: this is enough to RENDER a sign-in button and not
+ * enough to RESOLVE the configuration behind one — `resolveAuthConfig` refuses a
+ * row with no `allowed_email_domains` and no `trusted_jwt_issuer_id`, and
+ * neither is here.
+ */
+export interface PublicSignInMethod {
+  id: string;
+  method: AuthMethod;
+  display_name: string;
+  requested_scopes: string[];
+  authorization_url?: string | null;
+  /** Non-secret, and specifically not confidential: it appears in every OAuth
+   *  redirect URL a browser sends. Moira stores no `client_secret` at all (D7). */
+  client_id?: string | null;
+  discovery_url?: string | null;
+  issuer?: string | null;
+}
+
+export const PUBLIC_SIGN_IN_METHOD_CONTRACT = {
+  schema: "PublicSignInMethod",
+  required: ["id", "method", "display_name", "requested_scopes"],
+  optional: ["authorization_url", "client_id", "discovery_url", "issuer"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    PublicSignInMethod,
+    (typeof PUBLIC_SIGN_IN_METHOD_CONTRACT)["required"][number],
+    (typeof PUBLIC_SIGN_IN_METHOD_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/SetupSignInMethodsResponse` */
+export interface SetupSignInMethodsResponse {
+  methods: PublicSignInMethod[];
+}
+
+export const SETUP_SIGN_IN_METHODS_RESPONSE_CONTRACT = {
+  schema: "SetupSignInMethodsResponse",
+  required: ["methods"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    SetupSignInMethodsResponse,
+    (typeof SETUP_SIGN_IN_METHODS_RESPONSE_CONTRACT)["required"][number],
+    (typeof SETUP_SIGN_IN_METHODS_RESPONSE_CONTRACT)["optional"][number]
+  >
+>();
+
+/* -------------------------------------------------------------------------- */
+/* Admin invitations (plan 09 wave 2, Moira side)                             */
+/* -------------------------------------------------------------------------- */
+
+/** `#/components/schemas/AdminInviteConstraint` — mutually exclusive. */
+export type AdminInviteConstraint = "email" | "domain";
+
+/**
+ * `#/components/schemas/AdminInviteStatus`.
+ *
+ * There is NO `expired` value: nothing sweeps for it. Expiry is derived at read
+ * time — see `AdminInviteRecord.expired`.
+ */
+export type AdminInviteStatus = "pending" | "consumed" | "revoked";
+
+/**
+ * `#/components/schemas/AdminInviteRecord` — the invite as it is safe to return
+ * AFTER creation: no token, no hash, no prefix.
+ */
+export interface AdminInviteRecord {
+  id: string;
+  constraint: AdminInviteConstraint;
+  /** The email address or bare domain the invite is bound to. Never a token. */
+  value: string;
+  status: AdminInviteStatus;
+  /** Derived, not stored. A `pending` invite past `expires_at` reads `true`. */
+  expired: boolean;
+  expires_at: string;
+  created_at: string;
+  version: number;
+  consumed_at?: string | null;
+  consumed_subject?: string | null;
+  created_by_subject?: string | null;
+}
+
+export const ADMIN_INVITE_RECORD_CONTRACT = {
+  schema: "AdminInviteRecord",
+  required: [
+    "id",
+    "constraint",
+    "value",
+    "status",
+    "expired",
+    "expires_at",
+    "created_at",
+    "version",
+  ],
+  optional: ["consumed_at", "consumed_subject", "created_by_subject"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    AdminInviteRecord,
+    (typeof ADMIN_INVITE_RECORD_CONTRACT)["required"][number],
+    (typeof ADMIN_INVITE_RECORD_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/AdminInviteCreateRequest`.
+ *
+ * `additionalProperties: false`. All three fields are required — there is no
+ * "anyone with the link" invite, because an unbound invite would make a leaked
+ * URL equivalent to handing out admin. `expires_in_seconds` is clamped
+ * server-side as a HARD CAP: a client that asks for a year is refused, not
+ * quietly honoured.
+ */
+export interface AdminInviteCreateRequest {
+  constraint: AdminInviteConstraint;
+  value: string;
+  expires_in_seconds: number;
+}
+
+export const ADMIN_INVITE_CREATE_REQUEST_CONTRACT = {
+  schema: "AdminInviteCreateRequest",
+  required: ["constraint", "value", "expires_in_seconds"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    AdminInviteCreateRequest,
+    (typeof ADMIN_INVITE_CREATE_REQUEST_CONTRACT)["required"][number],
+    (typeof ADMIN_INVITE_CREATE_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/AdminInviteSecretResponse` — the once-only envelope.
+ *
+ * ============================================================================
+ * IT IS *NOT* FIELD-FOR-FIELD `ApiKeySecretResponse`, WHATEVER THE DOC SAYS
+ * ============================================================================
+ *
+ * Moira's own doc comment (`src/domain/identity.rs:169-174`) claims this shape
+ * is "field-for-field the shape of `ApiKeySecretResponse` — `resource`,
+ * `secret`, `secret_retrievable`". Verified against `docs/openapi.json`, it is
+ * not: this schema carries a FOURTH REQUIRED field, `notice: ResponseText`,
+ * which `ApiKeySecretResponse` does not have (`ApiKeySecretResponse.required`
+ * is `["resource", "secret_retrievable"]`).
+ *
+ * A modal typed against the latter compiles cleanly and silently drops the
+ * notice — the one string in the response that is meant to be rendered to the
+ * operator through `t()`.
+ *
+ * ============================================================================
+ * `secret === null` IS THE NORMAL CASE, NOT AN ERROR
+ * ============================================================================
+ *
+ * `secret` is `{"type": ["string", "null"]}` and is NOT required. It carries the
+ * raw token exactly once, at creation, and is `None` on an idempotent replay,
+ * where the stored replay body is the sanitized record. A UI that treats `null`
+ * as a failure reports a successful, correct operation as broken.
+ *
+ * NOTHING REDACTS THIS. `lib/errors.ts` never sees it: `moira-client.ts` calls
+ * `toMoiraError` only under `if (!response.ok)`, and a 201 body is returned raw.
+ */
+export interface AdminInviteSecretResponse {
+  resource: AdminInviteRecord;
+  secret_retrievable: boolean;
+  /** i18n envelope for the success message. Render through `t()`, never as
+   *  hardcoded English. Absent from `ApiKeySecretResponse` — see above. */
+  notice: ResponseText;
+  /** The raw token. Present exactly once; `null` on an idempotent replay. */
+  secret?: string | null;
+}
+
+export const ADMIN_INVITE_SECRET_RESPONSE_CONTRACT = {
+  schema: "AdminInviteSecretResponse",
+  required: ["resource", "secret_retrievable", "notice"],
+  optional: ["secret"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    AdminInviteSecretResponse,
+    (typeof ADMIN_INVITE_SECRET_RESPONSE_CONTRACT)["required"][number],
+    (typeof ADMIN_INVITE_SECRET_RESPONSE_CONTRACT)["optional"][number]
+  >
+>();
+
 /* -------------------------------------------------------------------------- */
 /* Auth provider settings surface (SEVEN operations, not ten)                 */
 /* -------------------------------------------------------------------------- */
@@ -674,15 +879,29 @@ assertKeyContract<
   >
 >();
 
-/** Every schema descriptor, for the contract test to iterate. */
+/**
+ * Every schema descriptor, for the contract test to iterate.
+ *
+ * HAND-MAINTAINED, AND THAT IS A HAZARD WITH A GUARD. A `*_CONTRACT` declared
+ * above but missing from this array is checked by NOTHING — the interface still
+ * type-checks against its own descriptor, and the claim that "the contract test
+ * re-derives everything from the spec" quietly stops being true for that one
+ * DTO. `tests/contract/openapi-contract.test.ts` source-scans this file for
+ * `export const *_CONTRACT` and asserts every one appears here, with a count.
+ */
 export const SCHEMA_CONTRACTS: readonly SchemaContract[] = [
   RESPONSE_TEXT_CONTRACT,
   PAGINATION_CONTRACT,
   SETUP_CLAIM_STATUS_RESPONSE_CONTRACT,
   PUBLIC_AUTH_METHOD_CONTRACT,
   SETUP_AUTH_METHODS_RESPONSE_CONTRACT,
+  PUBLIC_SIGN_IN_METHOD_CONTRACT,
+  SETUP_SIGN_IN_METHODS_RESPONSE_CONTRACT,
   CLAIM_ADMIN_IDENTITY_REQUEST_CONTRACT,
   ADMIN_IDENTITY_RECORD_CONTRACT,
+  ADMIN_INVITE_RECORD_CONTRACT,
+  ADMIN_INVITE_CREATE_REQUEST_CONTRACT,
+  ADMIN_INVITE_SECRET_RESPONSE_CONTRACT,
   AUTH_PROVIDER_SETTINGS_CREATE_REQUEST_CONTRACT,
   AUTH_PROVIDER_SETTINGS_RECORD_CONTRACT,
   TRUSTED_JWT_ISSUER_CREATE_REQUEST_CONTRACT,

@@ -26,6 +26,7 @@ import "server-only";
 import { MoiraClient } from "./moira-client";
 import type { ConsoleEnv } from "./env";
 import { isEmailDomainAllowed, type ResolvedAuthConfig } from "./auth-config";
+import { CONSOLE_MESSAGE_KEYS } from "./i18n/keys";
 
 /* -------------------------------------------------------------------------- */
 /* The session as this module needs it                                        */
@@ -57,10 +58,10 @@ export type SessionRejection =
   | "idp_subject_missing";
 
 export const SESSION_REJECTION_MESSAGE_KEYS: Readonly<Record<SessionRejection, string>> = {
-  no_session: "console.error.session_required",
-  email_not_verified: "console.error.email_not_verified",
-  email_domain_not_allowed: "console.error.email_domain_not_allowed",
-  idp_subject_missing: "console.error.idp_subject_missing",
+  no_session: CONSOLE_MESSAGE_KEYS.session_required,
+  email_not_verified: CONSOLE_MESSAGE_KEYS.email_not_verified,
+  email_domain_not_allowed: CONSOLE_MESSAGE_KEYS.email_domain_not_allowed,
+  idp_subject_missing: CONSOLE_MESSAGE_KEYS.idp_subject_missing,
 };
 
 export type SessionCheck =

@@ -68,10 +68,7 @@ describe("checkSession", () => {
   });
 
   test("a session with no IdP subject is refused", () => {
-    const result = checkSession(
-      { email: "operator@example.com", emailVerified: true },
-      ALLOW,
-    );
+    const result = checkSession({ email: "operator@example.com", emailVerified: true }, ALLOW);
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.rejection).toBe("idp_subject_missing");

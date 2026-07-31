@@ -47,7 +47,8 @@ const isCI = process.env.CI === "true" || process.env.CI === "1";
  * The `rm -rf` avoids the `static/static` nesting you get from re-copying onto
  * an existing directory.
  *
- * `E2E_SKIP_BUILD=1` reuses an existing `.next` for fast local iteration.
+ * `E2E_SKIP_BUILD=1` reuses an existing `.next` for fast local iteration, and is
+ * REFUSED UNDER CI — see `assertGatingRunBuildsItsOwnOutput()` below.
  */
 const assembleAndStart = [
   "rm -rf .next/standalone/.next/static .next/standalone/public",
@@ -55,6 +56,51 @@ const assembleAndStart = [
   "(cp -R public .next/standalone/public || true)",
   "node .next/standalone/server.js",
 ].join(" && ");
+
+/**
+ * ============================================================================
+ * WHY `E2E_SKIP_BUILD=1` IS A HARD ERROR UNDER CI
+ * ============================================================================
+ *
+ * `e2e/secret-leak.e2e.ts` scans two surfaces: what the BROWSER receives, and
+ * the BUILD OUTPUT under `.next`. The second one is only meaningful if the build
+ * it scans was produced with the sentinel environment in scope — a value that
+ * was never in the environment at build time cannot be inlined into the output,
+ * so the scan finds nothing and reports success.
+ *
+ * `.github/workflows/ci.yml` used to set this flag on the Playwright step to
+ * reuse the `bun run build` from an earlier step — a step whose job env contains
+ * only `CONSOLE_TEST_DATABASE_URL`. The gating run therefore scanned a
+ * sentinel-free bundle on every CI run.
+ *
+ * REPRODUCED, plan 09 wave 3, before the fix: a statically prerendered `/`
+ * rendering `{process.env.MOIRA_E2E_SENTINEL_SYSTEM_KEY}`, built from a shell
+ * with no sentinels (exactly the CI job env) and then run with
+ * `E2E_SKIP_BUILD=1` (exactly the CI step) produced **13 passed, exit 0**. The
+ * injected leak was invisible to every assertion in the suite, including the
+ * browser-surface scan — because a static page resolves `process.env` at BUILD
+ * time, so the running server never had the value either.
+ *
+ * The same leak under a full build fails loudly. So the flag is refused here,
+ * rather than merely removed from the workflow: removing it from one file is
+ * undone by one edit to that file, and the failure it reintroduces is a silently
+ * green gate.
+ *
+ * It remains available locally, where a fast iteration loop is worth more than a
+ * gate nobody is currently relying on.
+ */
+function assertGatingRunBuildsItsOwnOutput(): void {
+  if (isCI && process.env.E2E_SKIP_BUILD === "1") {
+    throw new Error(
+      "E2E_SKIP_BUILD=1 is refused under CI. The secret-leak gate's build-output scan is " +
+        "vacuous against a `.next` produced without the sentinel environment: a value that was " +
+        "never in the build's env cannot be found in its output. Drop the flag so " +
+        "`webServer.command` builds with the e2e environment in scope.",
+    );
+  }
+}
+
+assertGatingRunBuildsItsOwnOutput();
 
 const startCommand =
   process.env.E2E_SKIP_BUILD === "1" ? assembleAndStart : `bun run build && ${assembleAndStart}`;
