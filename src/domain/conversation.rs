@@ -222,6 +222,13 @@ pub struct ConversationMessageRecord {
     pub message_type: ConversationMessageType,
     pub sequence_number: i64,
     pub content: Option<String>,
+    /// Keyed integrity fingerprint of the message content, **not a content address**.
+    ///
+    /// Formatted `"{pepper_version}:{base64url}"`. The digest is an HMAC under a
+    /// deployment-held pepper, so identical content hashes differently once that pepper is
+    /// rotated: **an operator rotating the idempotency pepper changes this value for a message
+    /// whose content never changed.** The version prefix is the signal that the value is scoped
+    /// to a pepper. Do not cache, diff, or deduplicate on it across time — use the message `id`.
     pub content_hash: String,
     pub content_size_bytes: i64,
     pub token_count: Option<i64>,

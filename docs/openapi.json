@@ -1458,6 +1458,7 @@
             ]
           },
           "content_hash": {
+            "description": "Keyed integrity fingerprint of the message content, **not a content address**.\n\nFormatted `\"{pepper_version}:{base64url}\"`. The digest is an HMAC under a\ndeployment-held pepper, so identical content hashes differently once that pepper is\nrotated: **an operator rotating the idempotency pepper changes this value for a message\nwhose content never changed.** The version prefix is the signal that the value is scoped\nto a pepper. Do not cache, diff, or deduplicate on it across time — use the message `id`.",
             "type": "string"
           },
           "content_size_bytes": {
@@ -3560,6 +3561,7 @@
                   ]
                 },
                 "content_hash": {
+                  "description": "Keyed integrity fingerprint of the message content, **not a content address**.\n\nFormatted `\"{pepper_version}:{base64url}\"`. The digest is an HMAC under a\ndeployment-held pepper, so identical content hashes differently once that pepper is\nrotated: **an operator rotating the idempotency pepper changes this value for a message\nwhose content never changed.** The version prefix is the signal that the value is scoped\nto a pepper. Do not cache, diff, or deduplicate on it across time — use the message `id`.",
                   "type": "string"
                 },
                 "content_size_bytes": {

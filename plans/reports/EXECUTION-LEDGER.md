@@ -776,25 +776,72 @@ and the OpenAPI drift gate.
 two-way asymmetry that is now three-way. Plan 07's verification table (lines 1258, 1318, 1349) still
 names the old identifier; the invariant it described is preserved and strengthened, not dropped.
 
-### F14 — memory dedupe silently stops matching after a pepper rotation
+### F14 — memory dedupe silently stops matching after a pepper rotation — **FIXED** `74262ad`
 
-`memory_records.content_hash` is written with `IdempotencyHasher::hash`
-(`src/application/conversation.rs:580`), which produces `"{pepper_version}:{base64url(hmac(...))}"`.
-`IdempotencyHasher::verify` deliberately accepts **only the active pepper**
-(`src/security/idempotency.rs:24-40`).
+`memory_records.content_hash` was written with `IdempotencyHasher::hash`, which produces
+`"{pepper_version}:{base64url(hmac(...))}"`. `IdempotencyHasher::verify` deliberately accepts
+**only the active pepper** (`src/security/idempotency.rs`). So after a pepper rotation every stored
+`content_hash` became unmatchable and exact-match memory dedupe would silently stop working.
 
-So after a pepper rotation, every stored `content_hash` becomes unmatchable and exact-match memory
-dedupe silently stops working — duplicates accumulate with no error and no log line. Not data loss,
-and not urgent, but it fails quietly, which is the worst failure mode for a dedupe mechanism.
+**The finding's own framing conflated two tables, and the distinction turned out to be decisive.**
+The hasher's narrow verify contract is justified in its own module doc by a *retention* argument —
+every `idempotency_records` row expires within 24 hours, so old-pepper rows age out on their own.
+`memory_records` has no retention: a nullable `valid_until` and a `status` that stays `'active'`
+indefinitely. The hasher is correct for its namesake table and was reused for one with a
+fundamentally different lifetime. Meanwhile the *same* call in `src/application/conversation.rs`
+also writes `conversation_messages.content_hash`, which **is** served to callers
+(`ConversationMessageRecord`, and in `docs/openapi.json`) where the memory hash is not.
 
-Found while deciding plan 11's `chunk_hash` question. It is now an explicit Sub-Phase F obligation
-in that plan rather than a production surprise, but the *existing* `memory_records` behaviour is
-unchanged and still has this property.
+So plan 11's `chunk_hash` admitting rule was applied **per table**, not to "content_hash" as one
+thing:
 
-**Decide when plan 11 reaches Sub-Phase F:** either re-hash on rotation, accept the duplicate window
-and document it, or move `content_hash` to the unkeyed `request_hash` on the same reasoning plan 11
-used for `chunk_hash` — peppering exists to protect digests of request bodies that carry provider
-API keys, and memory content is not that.
+- `memory_records.content_hash` → unkeyed `request_hash`. Verified against all three clauses: not
+  on any caller-visible DTO or OpenAPI schema; never a caller-supplied lookup key
+  (`MemoryCreateRequest`/`MemoryPatchRequest`/`MemoryQuery` are all `deny_unknown_fields` and carry
+  no hash field — the only caller-supplied key is the `mem_…` public id); and every read is bound
+  by `application_id` (`find_memory_authorized`, `list_memories_authorized`,
+  `find_memory_candidates`).
+- `conversation_messages.content_hash` **stays keyed** — it fails clause (a) outright, and an
+  unkeyed digest handed to callers is an offline verifier against content the schema expects to be
+  able to hold encrypted (`content_encrypted`).
+
+**Migration `0021` re-hashes** rather than accepting a one-time dedupe reset. The reset would be
+nearly free *today* — Sub-Phase F is deferred, so no read path compares this column yet — and that
+is exactly why it is the wrong choice: it would leave the column holding two incomparable formats
+forever, so the first dedupe reader to ship would silently miss every pre-F14 row. That is F14's
+failure mode re-created from a format split, arriving later, with more data and nobody left who
+remembers. Only rows with `content_plain` are recomputed; `content_encrypted` has no writer
+anywhere in the tree today, and if it ever gains one no SQL migration could recompute those rows.
+Rows the migration skips keep their `"v1:"`-prefixed value, which is self-describing: a `:` can
+never appear in a base64url content address, so a future reader misses such a row rather than
+matching it wrongly.
+
+**Reversal condition** (recorded on `memory_content_hash` in `src/application/conversation.rs` and
+in the migration): back to a keyed hash — paired with a re-hash-on-rotation procedure, because the
+lifetime problem does not go away — the moment `content_hash` appears on `MemoryRecord` or any
+caller-visible DTO, a filter or lookup accepts a caller-supplied hash, or a dedupe query drops the
+`application_id` predicate.
+
+**A consequence nobody had recorded, now documented.** Because `conversation_messages.content_hash`
+is **both** peppered **and** caller-visible, rotating the idempotency pepper changes the
+`content_hash` the API returns **for the same unchanged message**. Not a leak — a contract surprise
+on an operational action. It is now stated in the hasher's rotation contract, in the field's
+OpenAPI description, and pinned by
+`conversation_message_content_hash_stays_peppered_and_changes_on_rotation`.
+
+Guards in `tests/memory_content_hash_rotation.rs`, all three mutation-verified: the rotation proof
+builds a second `AppState` on the same database with a different pepper and asserts the dedupe
+lookup still matches across it; the negative proof asserts the message hash is still keyed and
+*does* change on rotation; and a third executes migration `0021` verbatim against PostgreSQL and
+asserts its SQL digest equals Rust's `request_hash`. **The mutation that mattered was not a code
+edit at all** — the migration guard only catches a dropped `translate(…, '+/', '-_')` if its
+content literal happens to digest to a value using those characters, so an innocent reword of the
+string would have left it green through the exact defect it exists to catch. The literal's
+suitability is now asserted (`23f8687`).
+
+**Correction to the earlier record:** the finding cited one memory call site. There were **two** —
+`create_memory` *and* `patch_memory` — and reverting only the second is the cheapest way back to
+F14. Both are covered.
 
 ### F13 — a duplicate trusted JWT issuer returns 500, not 409 — **FIXED** `a6d2984`
 

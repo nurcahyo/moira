@@ -1030,10 +1030,7 @@ impl ConversationService {
         let public_id = format!("mem_{id}");
         let external_tenant_id = effective_tenant(actor);
         let external_user_id = effective_user(actor);
-        let content_hash = self
-            .state
-            .idempotency_hasher
-            .hash(request.content.as_bytes());
+        let content_hash = memory_content_hash(&request.content);
         let record = self
             .repo
             .create_memory(&MemoryInsert {
@@ -1174,10 +1171,11 @@ impl ConversationService {
         if let Some(metadata) = &request.metadata {
             validate_metadata(metadata)?;
         }
-        let hash = request
-            .content
-            .as_ref()
-            .map(|content| self.state.idempotency_hasher.hash(content.as_bytes()));
+        // Same content address `create_memory` writes — see `memory_content_hash`. A patch that
+        // wrote a different *kind* of digest would leave one table holding two incomparable
+        // formats, which is F14's silent-mismatch failure re-created from a format split
+        // instead of a pepper rotation.
+        let hash = request.content.as_deref().map(memory_content_hash);
         let record = self
             .repo
             .patch_memory(memory_id, &request, hash.as_deref())
@@ -2062,6 +2060,52 @@ pub(crate) fn conversation_audit(
         user_agent: ctx.user_agent.clone(),
         metadata,
     }
+}
+
+/// The content address stored in `memory_records.content_hash`.
+///
+/// **Decision (finding F14).** This is [`crate::security::request_hash`] — a plain, unkeyed
+/// SHA-256 aliasing `secret_fingerprint` — and deliberately **not**
+/// `IdempotencyHasher::hash`, which is what it used to be and what the neighbouring
+/// `conversation_messages.content_hash` still is.
+///
+/// # Why the two tables diverge
+///
+/// `IdempotencyHasher`'s rotation contract (`src/security/idempotency.rs`) accepts only the
+/// *active* pepper, and justifies that narrowness with a retention argument: every
+/// `idempotency_records` row expires within 24 hours, so old-pepper rows age out on their own.
+/// **`memory_records` has no such retention.** Its rows are long-lived by design — a nullable
+/// `valid_until` and a `status` that stays `'active'` indefinitely — so a pepper rotation would
+/// not produce a bounded window, it would permanently orphan every stored hash. Exact-match
+/// memory dedupe would then stop matching, silently, with no error and no log line. The hasher
+/// is right for its namesake table and was reused for one with a fundamentally different
+/// lifetime.
+///
+/// The same admitting rule plan 11 wrote for `rag_chunks.chunk_hash`
+/// (`src/orchestration/ingestion.rs`) is applied here per *table*, and `memory_records` passes
+/// all three clauses where `conversation_messages` fails the first:
+///
+/// * **(a) not caller-visible.** [`MemoryRecord`] has no `content_hash` field and no schema in
+///   `docs/openapi.json` carries one for a memory. `ConversationMessageRecord` does, which is
+///   why *that* column stays peppered: an unkeyed digest of message content, handed to the
+///   caller, is an offline verifier for content the schema otherwise expects to hold encrypted.
+/// * **(b) never a caller-supplied lookup key.** `MemoryCreateRequest`, `MemoryPatchRequest`
+///   and `MemoryQuery` all carry `deny_unknown_fields` and none of them has a hash field; the
+///   only caller-supplied memory lookup key is the `mem_…` public id.
+/// * **(c) never a cross-application comparison.** Every `memory_records` read is bound by
+///   `application_id` — `find_memory_authorized`, `list_memories_authorized` and
+///   `find_memory_candidates` all require it in every arm — so a dedupe built on this value
+///   cannot become an existence oracle over another application's memories.
+///
+/// # Reversal condition
+///
+/// Go back to a keyed hash — and pair it with a re-hash-on-rotation procedure, because the
+/// lifetime problem above does not go away — the moment any one of those three clauses stops
+/// holding: `content_hash` appears on `MemoryRecord` or any other caller-visible DTO, a filter
+/// or lookup accepts a caller-supplied hash, or a dedupe/similarity query drops the
+/// `application_id` predicate.
+fn memory_content_hash(content: &str) -> String {
+    request_hash(content.as_bytes())
 }
 
 fn required_application_id(actor: &Actor) -> Result<Uuid, AppError> {
