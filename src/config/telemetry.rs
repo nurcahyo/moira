@@ -26,6 +26,10 @@
 //!   Moira-supplied value is `service.name` (`telemetry.service_name`);
 //! * never places request or response bodies, prompt text, credential material,
 //!   or raw secrets on a span — it only bridges spans other modules create;
+//! * exports **only** spans and events whose `tracing` target Moira owns. See
+//!   [`exports_only_moira_owned_telemetry`]: an allow-list, applied to the
+//!   bridge layer itself, so no third-party crate's instrumentation can leave
+//!   the process whatever the operator sets `env_filter` or `RUST_LOG` to;
 //! * keeps the configured OTLP endpoint out of every error string it produces.
 //!   An endpoint may legitimately carry an auth token in userinfo or a query
 //!   parameter, and `opentelemetry_otlp`'s own `InvalidUri` error echoes the URI
@@ -34,18 +38,19 @@
 //!
 //! # Known gap: span coverage under the shipped `env_filter`
 //!
-//! `tracing-opentelemetry` bridges every span the subscriber records, so no
-//! redundant instrumentation is added here. The two spans constructed in `src/`
-//! are `redacted_request_span` (`http_request`, in `src/lib.rs`) and
-//! `execution_attempt` (in `src/application/execution.rs`); both are
-//! `debug_span!` on target `moira`. The shipped default `env_filter` is
-//! `moira=info,tower_http=info`, which disables `DEBUG`, so a stock deployment
-//! that merely flips `MOIRA_TELEMETRY__OTEL_ENABLED=true` exports an empty trace
-//! stream. Enabling OTel today therefore also requires widening the filter, e.g.
-//! `MOIRA_TELEMETRY__ENV_FILTER=moira=debug,tower_http=debug`. Promoting those
-//! spans to `info_span!` (owned by their own modules) or adding a dedicated OTel
-//! filter setting would remove the footgun; both are out of scope for this
-//! module.
+//! `tracing-opentelemetry` bridges every span the subscriber records *and* the
+//! export layer allows, so no redundant instrumentation is added here. The two
+//! spans constructed in `src/` are `redacted_request_span` (`http_request`, in
+//! `src/lib.rs`) and `execution_attempt` (in `src/application/execution.rs`);
+//! both are `debug_span!` on a `moira` target. The shipped default `env_filter`
+//! is `moira=info,tower_http=info`, which disables `DEBUG`, so a stock
+//! deployment that merely flips `MOIRA_TELEMETRY__OTEL_ENABLED=true` exports an
+//! empty trace stream. Enabling OTel today therefore also requires widening the
+//! filter, e.g. `MOIRA_TELEMETRY__ENV_FILTER=moira=debug,tower_http=debug`.
+//! Promoting those spans to `info_span!` (owned by their own modules) or adding
+//! a dedicated OTel filter setting would remove the footgun; both are out of
+//! scope for this module. Widening the filter is now safe to do: the export
+//! allow-list, not the filter, is what keeps third-party spans off the wire.
 
 use std::{fmt::Display, time::Duration};
 
@@ -55,7 +60,7 @@ use opentelemetry_sdk::{
     Resource,
     trace::{BatchSpanProcessor, SdkTracerProvider, SpanProcessor},
 };
-use tracing_subscriber::{EnvFilter, filter::filter_fn, fmt, prelude::*};
+use tracing_subscriber::{EnvFilter, filter::filter_fn, fmt, prelude::*, registry::LookupSpan};
 use url::Url;
 
 use crate::{config::TelemetrySettings, error::AppError};
@@ -153,23 +158,41 @@ pub fn init(settings: &TelemetrySettings) -> Result<TelemetryGuard, AppError> {
         None => None,
     };
 
+    build_subscriber(filter, settings.json, provider.as_ref())
+        .try_init()
+        .map_err(|err| AppError::Config(format!("initialize tracing: {err}")))?;
+
+    Ok(match provider {
+        Some(provider) => TelemetryGuard {
+            provider: Some(provider),
+        },
+        None => TelemetryGuard::disabled(),
+    })
+}
+
+/// Assembles the whole subscriber stack: the operator's `EnvFilter`, the two
+/// hard suppressions that sit below it, the log layers, and the OTLP bridge.
+///
+/// **Split out from [`init`] so the stack is testable.** [`init`] installs the
+/// result globally, which a test process can only do once and cannot undo, so a
+/// test that reached through `init` could not exist. The consequence — measured,
+/// not assumed — was that deleting
+/// `.with(filter_fn(suppresses_provider_payload_logs))` from `init` left all 598
+/// library tests green: F16's mitigation had tests for its *predicate* and none
+/// for its *wiring*. `tracing::subscriber::with_default` can install what this
+/// function returns, so the wiring is now reachable from a test.
+fn build_subscriber(
+    filter: EnvFilter,
+    json: bool,
+    provider: Option<&SdkTracerProvider>,
+) -> impl tracing::Subscriber + Send + Sync + use<> {
     // `Option<L>` is itself a `Layer`, and its `max_level_hint` for `None` is
     // `LevelFilter::OFF`, so the disabled arms cost nothing and cannot widen the
     // subscriber's static max level. This keeps the `otel_enabled = false` path
     // behaviourally identical to the pre-OTel implementation.
-    let otel_layer = provider.as_ref().map(|provider| {
-        tracing_opentelemetry::layer()
-            .with_tracer(provider.tracer(INSTRUMENTATION_SCOPE))
-            // The SDK's `internal-logs` feature reports exporter progress and
-            // failures through `tracing`. Feeding those back into the exporter
-            // would let one failed export generate the events that trigger the
-            // next one.
-            .with_filter(filter_fn(|metadata| {
-                !metadata.target().starts_with("opentelemetry")
-            }))
-    });
+    let otel_layer = provider.map(otel_export_layer);
 
-    let (json_layer, text_layer) = if settings.json {
+    let (json_layer, text_layer) = if json {
         (Some(fmt::layer().json()), None)
     } else {
         (None, Some(fmt::layer()))
@@ -181,15 +204,97 @@ pub fn init(settings: &TelemetrySettings) -> Result<TelemetryGuard, AppError> {
         .with(json_layer)
         .with(text_layer)
         .with(otel_layer)
-        .try_init()
-        .map_err(|err| AppError::Config(format!("initialize tracing: {err}")))?;
+}
 
-    Ok(match provider {
-        Some(provider) => TelemetryGuard {
-            provider: Some(provider),
-        },
-        None => TelemetryGuard::disabled(),
-    })
+/// Target roots whose spans and events Moira owns and is therefore willing to
+/// export to a collector.
+///
+/// **An allow-list, not a denylist, and that is the whole point.** The previous
+/// filter here excluded one known-bad prefix (`opentelemetry`) and exported
+/// everything else, which means every dependency that *starts* emitting spans is
+/// opted in by default — `rig-core` 0.40 already does, at `INFO`, with the
+/// system preamble on the span. This project has been bitten by exactly that
+/// shape before (F8: an authorization check written as a negated equality, so a
+/// new `ActorType` variant silently inherited admin). The fix there and here is
+/// the same: enumerate what is permitted, so a new emitter is denied until
+/// somebody adds it deliberately.
+const EXPORTABLE_TARGET_ROOTS: &[&str] = &["moira"];
+
+/// Whether a `tracing` target belongs to Moira.
+///
+/// Matched on target *segments*, never as a substring: `moira` and `moira::…`
+/// are Moira's, `moirage` and `not_moira` are not.
+fn is_moira_owned_target(target: &str) -> bool {
+    EXPORTABLE_TARGET_ROOTS
+        .iter()
+        .any(|root| target == *root || target.starts_with(&format!("{root}::")))
+}
+
+/// Per-layer filter that refuses to export any span or event Moira did not emit.
+///
+/// **This sits on the OTLP bridge layer, below the `EnvFilter`.** A global filter
+/// can only ever *narrow* what reaches a layer, so no value of `env_filter` or
+/// `RUST_LOG` — including a bare `trace` — can widen this back open. That is the
+/// same guarantee, and for the same reason, as
+/// [`suppresses_provider_payload_logs`]: the operator who needs `moira=trace` to
+/// debug routing must not have to pay for it with other people's prompts.
+///
+/// **Why no `INFO`-and-above carve-out, unlike the log suppression.** In the log
+/// pipeline, level separates content from diagnostics: `rig-core` dumps the
+/// request body at `TRACE` and reports failures at `WARN`, so keeping `INFO`+
+/// costs nothing. In the *span* pipeline that separation does not exist —
+/// `rig-core`'s `rig::completions` span is an `info_span!` and carries
+/// `gen_ai.system_instructions` (the preamble) as an attribute. An `INFO` carve-out
+/// here would therefore export precisely the thing this guard exists to stop.
+/// Nothing is hidden from the operator by this: the `fmt` layers are untouched, so
+/// third-party warnings and errors still reach stdout exactly as before. Only the
+/// remote collector stops receiving them, and Moira's own `execution_attempt` span
+/// is what carries provider outcome into the trace anyway.
+///
+/// **Why a layer filter and not a `SpanProcessor` or a `Sampler`.** Every bridged
+/// span is created through the single tracer named [`INSTRUMENTATION_SCOPE`], so a
+/// processor filtering by instrumentation scope cannot tell a Rig span from a Moira
+/// one — they share a scope. A `Sampler` sees the span *name* and attributes but
+/// never the `tracing` target, so it would have to pattern-match names like `chat`,
+/// which is a denylist wearing a different hat. A processor could match on the
+/// `target` attribute `tracing-opentelemetry` adds, but it only sees whole spans:
+/// third-party *events* are attached to whichever OTel span is current, so a Rig
+/// event fired inside Moira's `execution_attempt` would ride out on a span the
+/// processor has no reason to drop. The layer filter is the only one of the three
+/// that is applied to spans and events alike, and it is applied before the
+/// attribute values are ever copied into a span builder.
+///
+/// It also subsumes the `opentelemetry`-prefix exclusion this filter used to be.
+/// The SDK's `internal-logs` feature reports exporter progress and failures
+/// through `tracing`; feeding those back into the exporter would let one failed
+/// export generate the events that trigger the next one. `opentelemetry*` is not
+/// a Moira target, so the allow-list already refuses it.
+///
+/// **Reversal condition:** this becomes wrong the moment Moira wants a third
+/// party's spans in its traces — an HTTP-client or `sqlx` span, say. That is a
+/// legitimate future want, and the answer is to add that target root to
+/// [`EXPORTABLE_TARGET_ROOTS`] after reading what the crate puts on the span,
+/// not to relax the predicate. It becomes unnecessary only if Moira stops
+/// exporting spans at all, or if every dependency in the tree gains a
+/// content-free instrumentation guarantee — neither is in prospect.
+fn exports_only_moira_owned_telemetry(metadata: &tracing::Metadata<'_>) -> bool {
+    is_moira_owned_target(metadata.target())
+}
+
+/// Builds the `tracing` → OTLP bridge layer with the export allow-list attached.
+///
+/// **The only place the bridge layer is constructed.** Keeping construction and
+/// filtering in one expression is what makes the guard hard to lose: a caller
+/// cannot obtain an unfiltered bridge without editing this function, and
+/// `the_otlp_bridge_layer_is_constructed_in_exactly_one_place` fails if a second
+/// construction site appears.
+fn otel_export_layer<S>(provider: &SdkTracerProvider) -> impl tracing_subscriber::Layer<S> + use<S>
+where
+    S: tracing::Subscriber + for<'span> LookupSpan<'span>,
+{
+    tracing_opentelemetry::layer()
+        .with_tracer(provider.tracer(INSTRUMENTATION_SCOPE))
+        .with_filter(filter_fn(exports_only_moira_owned_telemetry))
 }
 
 /// Targets whose verbose events carry provider request or response payloads.
@@ -355,6 +460,7 @@ mod tests {
         error::OTelSdkResult,
         trace::{SpanData, SpanExporter as SpanExporterTrait},
     };
+    use tracing_subscriber::{Registry, layer::Layered};
 
     use super::*;
 
@@ -443,6 +549,12 @@ mod tests {
         }
     }
 
+    impl RecordingExporter {
+        fn snapshot(&self) -> Vec<SpanData> {
+            self.spans.lock().expect("recording exporter mutex").clone()
+        }
+    }
+
     impl SpanExporterTrait for RecordingExporter {
         async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
             self.spans
@@ -451,6 +563,333 @@ mod tests {
                 .extend(batch);
             Ok(())
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // F6: the export allow-list.
+    // ---------------------------------------------------------------------
+
+    /// Stands in for prompt content. No exported span may contain it anywhere —
+    /// attribute value, event field, or span name.
+    const PROMPT_CANARY: &str = "f6-prompt-canary-system-instructions-must-not-be-exported";
+
+    /// The subscriber the export tests build: a global `EnvFilter` with the
+    /// bridge layer underneath it, which is the production arrangement.
+    type TestRegistry = Layered<EnvFilter, Registry>;
+
+    /// Runs `emit` under a subscriber built from `filter` plus whatever layer
+    /// `make_layer` returns, then flushes and returns everything exported.
+    ///
+    /// The guarded and unguarded cases below differ **only** in `make_layer`, so
+    /// the difference in what reaches the exporter is attributable to the filter
+    /// and to nothing else.
+    fn exported_spans<L>(
+        filter: &str,
+        make_layer: impl FnOnce(&SdkTracerProvider) -> L,
+        emit: impl FnOnce(),
+    ) -> Vec<SpanData>
+    where
+        L: tracing_subscriber::Layer<TestRegistry> + Send + Sync + 'static,
+    {
+        let exporter = RecordingExporter::default();
+        let provider = tracer_provider_with_processor(
+            "moira-f6-test",
+            BatchSpanProcessor::builder(exporter.clone()).build(),
+        );
+
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new(filter))
+            .with(make_layer(&provider));
+
+        tracing::subscriber::with_default(subscriber, emit);
+
+        provider
+            .shutdown_with_timeout(SHUTDOWN_TIMEOUT)
+            .expect("flush the batch processor");
+        exporter.snapshot()
+    }
+
+    /// The bridge layer **without** the allow-list.
+    ///
+    /// Exists only so the tests can assert their own premise: that the spans the
+    /// guard drops would otherwise have been exported, prompt and all. Production
+    /// code has no way to build this — `otel_export_layer` is the only
+    /// construction site outside `#[cfg(test)]`, and
+    /// `the_otlp_bridge_layer_is_constructed_in_exactly_one_place` keeps it that
+    /// way.
+    fn unguarded_export_layer<S>(
+        provider: &SdkTracerProvider,
+    ) -> impl tracing_subscriber::Layer<S> + use<S>
+    where
+        S: tracing::Subscriber + for<'span> LookupSpan<'span>,
+    {
+        tracing_opentelemetry::layer().with_tracer(provider.tracer(INSTRUMENTATION_SCOPE))
+    }
+
+    /// Emits the spans a real request produces, at their real targets and levels.
+    ///
+    /// * `http_request` / `execution_attempt` are Moira's, reproduced from
+    ///   `src/lib.rs` and `src/application/execution.rs`; plan 05 captured both
+    ///   live and they are the whole of Moira's trace today.
+    /// * `chat` on `rig::completions` is `rig-core` 0.40's completion span,
+    ///   copied field-for-field from `providers/openai/completion/mod.rs` and
+    ///   `providers/anthropic/completion.rs`. Note the level: it is an
+    ///   `info_span!`, not a `debug_span!`, and it carries the preamble.
+    /// * the `rig::completions` event fires *inside* `execution_attempt`, which is
+    ///   where a third-party event actually happens. `tracing-opentelemetry`
+    ///   attaches events to the current OTel span, so without the layer filter
+    ///   this rides out on a span that is Moira's own.
+    fn emit_a_requests_worth_of_spans() {
+        let http = tracing::debug_span!(
+            target: "moira",
+            "http_request",
+            method = "POST",
+            path = "/v1/responses",
+        );
+        let _http = http.enter();
+
+        let attempt = tracing::debug_span!(
+            target: "moira::application::execution",
+            "execution_attempt",
+            attempt_number = 1_i64,
+            provider_type = "openai",
+        );
+        let _attempt = attempt.enter();
+
+        {
+            let rig = tracing::info_span!(
+                target: "rig::completions",
+                "chat",
+                gen_ai.operation.name = "chat",
+                gen_ai.provider.name = "openai",
+                gen_ai.request.model = "gpt-4.1",
+                gen_ai.system_instructions = PROMPT_CANARY,
+            );
+            let _rig = rig.enter();
+        }
+
+        tracing::info!(
+            target: "rig::completions",
+            body = PROMPT_CANARY,
+            "completion request",
+        );
+    }
+
+    fn names(spans: &[SpanData]) -> Vec<String> {
+        spans.iter().map(|span| span.name.to_string()).collect()
+    }
+
+    /// **The premise.** Without the allow-list the Rig span is exported and the
+    /// preamble goes with it. Every assertion in the guarded test below is
+    /// vacuous unless this passes.
+    #[test]
+    fn without_the_allow_list_the_rig_span_and_its_preamble_reach_the_exporter() {
+        let exported = exported_spans(
+            "trace",
+            unguarded_export_layer,
+            emit_a_requests_worth_of_spans,
+        );
+
+        assert!(
+            names(&exported).contains(&"chat".to_string()),
+            "premise failed: the unguarded bridge did not export Rig's span, so the guarded \
+             assertions prove nothing. Exported: {:?}",
+            names(&exported)
+        );
+        assert!(
+            format!("{exported:?}").contains(PROMPT_CANARY),
+            "premise failed: the preamble never reached the exporter even unguarded, so the \
+             guarded assertions prove nothing"
+        );
+
+        // And the second half of the premise, which decides the mechanism: the Rig
+        // *event* fired inside `execution_attempt` is attached to **Moira's own**
+        // span. A `SpanProcessor` dropping foreign spans would have passed that
+        // span — it is Moira's — and exported the payload riding on it. Only a
+        // filter on the layer sees the event at all.
+        let attempt = exported
+            .iter()
+            .find(|span| span.name == "execution_attempt")
+            .expect("premise failed: Moira's own span was not exported unguarded");
+        assert!(
+            format!("{:?}", attempt.events).contains(PROMPT_CANARY),
+            "premise failed: the third-party event did not land on Moira's span, so the \
+             layer-filter-over-SpanProcessor argument is unsupported"
+        );
+    }
+
+    /// Why the mechanism is a layer filter and not a `SpanProcessor` keyed on
+    /// instrumentation scope: **there is only one scope.** `tracing-opentelemetry`
+    /// bridges every span through the single tracer named [`INSTRUMENTATION_SCOPE`],
+    /// so Rig's span and Moira's are indistinguishable by scope at the processor.
+    #[test]
+    fn every_bridged_span_shares_one_instrumentation_scope() {
+        let exported = exported_spans(
+            "trace",
+            unguarded_export_layer,
+            emit_a_requests_worth_of_spans,
+        );
+
+        let scopes: Vec<&str> = exported
+            .iter()
+            .map(|span| span.instrumentation_scope.name())
+            .collect();
+        assert!(
+            scopes.len() > 1 && scopes.iter().all(|scope| *scope == INSTRUMENTATION_SCOPE),
+            "expected every span under one scope named {INSTRUMENTATION_SCOPE}, got {scopes:?}"
+        );
+    }
+
+    /// F6. `env_filter` / `RUST_LOG` must not be the thing standing between a
+    /// prompt and a remote collector.
+    ///
+    /// Note `"info"` in the list. The ledger recorded this as needing "a bare
+    /// `debug` or `trace` level"; `rig-core` 0.40's completion span is an
+    /// `info_span!`, so a bare `info` — a thoroughly ordinary thing to set — was
+    /// already enough.
+    #[test]
+    fn no_third_party_span_is_exported_however_permissive_the_filter_is() {
+        for filter in [
+            "trace",
+            "debug",
+            "info",
+            "moira=trace,rig=trace",
+            "rig::completions=trace",
+        ] {
+            let exported =
+                exported_spans(filter, otel_export_layer, emit_a_requests_worth_of_spans);
+
+            assert!(
+                !names(&exported).contains(&"chat".to_string()),
+                "env_filter={filter:?} exported Rig's completion span: {:?}",
+                names(&exported)
+            );
+            assert!(
+                !format!("{exported:?}").contains(PROMPT_CANARY),
+                "env_filter={filter:?} leaked prompt content onto an exported span"
+            );
+        }
+    }
+
+    /// The other half of the same guard, and the one that stops "drop everything"
+    /// from looking like a pass. Plan 05 established these two spans as
+    /// load-bearing and captured them live; the filter must not cost them.
+    #[test]
+    fn moiras_own_spans_are_still_exported_with_the_guard_on() {
+        for filter in ["trace", "debug", "moira=debug"] {
+            let exported =
+                exported_spans(filter, otel_export_layer, emit_a_requests_worth_of_spans);
+            let exported_names = names(&exported);
+
+            for expected in ["http_request", "execution_attempt"] {
+                assert!(
+                    exported_names.contains(&expected.to_string()),
+                    "env_filter={filter:?} dropped Moira's own {expected} span: {exported_names:?}"
+                );
+            }
+        }
+    }
+
+    /// Segment match, not substring: the mutation `target.contains("moira")`
+    /// leaves every end-to-end assertion above green.
+    #[test]
+    fn target_ownership_is_decided_by_segment_not_by_substring() {
+        for owned in [
+            "moira",
+            "moira::application::execution",
+            "moira::config::telemetry",
+        ] {
+            assert!(is_moira_owned_target(owned), "{owned} is Moira's");
+        }
+
+        for foreign in [
+            "rig",
+            "rig::completions",
+            "moirage",
+            "moira_extra",
+            "not_moira",
+            "vendor::moira::shim",
+            "opentelemetry_sdk",
+            "sqlx::query",
+            "tower_http::trace::on_response",
+            "",
+        ] {
+            assert!(
+                !is_moira_owned_target(foreign),
+                "{foreign} is not Moira's and must not be exported"
+            );
+        }
+    }
+
+    /// A new dependency that starts emitting spans is denied by default. This is
+    /// the F8 lesson — a negated equality let a new `ActorType` variant inherit
+    /// admin — applied to span targets.
+    #[test]
+    fn an_unknown_new_dependency_is_denied_by_default() {
+        for future_crate in [
+            "some_crate_that_does_not_exist_yet",
+            "some_crate_that_does_not_exist_yet::inner",
+        ] {
+            assert!(
+                !is_moira_owned_target(future_crate),
+                "the allow-list opted a new emitter in; it must be opted in deliberately"
+            );
+        }
+    }
+
+    /// **The wiring, not the predicate — and this one was missing.** Deleting
+    /// `.with(filter_fn(suppresses_provider_payload_logs))` from the subscriber
+    /// stack left all 598 library tests green: F16's mitigation had tests for its
+    /// decision function and nothing that looked at the stack it was supposed to
+    /// be in. Measured on this branch, not inferred. This is the test that fails.
+    ///
+    /// `tracing::enabled!` asks the installed subscriber, so it sees the global
+    /// filters exactly as a real call site would. It cannot see the OTLP bridge's
+    /// per-layer filter — `Layered::enabled` is true if *any* layer wants the
+    /// event, and the `fmt` layer always does — which is precisely the difference
+    /// between the two guards, and why F6's has its own end-to-end test above.
+    #[test]
+    fn the_payload_log_suppression_is_wired_into_the_subscriber_stack() {
+        // The most permissive filter an operator could set. Nothing below it may
+        // be relaxed by it.
+        let subscriber = build_subscriber(EnvFilter::new("trace"), false, None);
+
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(
+                !tracing::enabled!(target: "rig::completions", tracing::Level::TRACE),
+                "the rig payload suppression is not in the installed stack: RUST_LOG=trace \
+                 would log every completion request body, retrieved chunks included"
+            );
+            assert!(
+                tracing::enabled!(target: "rig::completions", tracing::Level::WARN),
+                "upstream warnings must still reach the operator"
+            );
+            assert!(
+                tracing::enabled!(target: "moira::application::execution", tracing::Level::TRACE),
+                "the suppression must not cost Moira its own verbose logging"
+            );
+        });
+    }
+
+    /// The guard is only as good as its being wired up, and the cheapest way to
+    /// lose it is to construct the bridge layer somewhere else. Split on
+    /// `#[cfg(test)]` so this module's deliberately unguarded premise helper does
+    /// not count.
+    #[test]
+    fn the_otlp_bridge_layer_is_constructed_in_exactly_one_place() {
+        // Split so this literal does not match itself.
+        const BRIDGE: &str = concat!("tracing_opentelemetry", "::layer()");
+        let source = include_str!("telemetry.rs");
+        let (production, _tests) = source
+            .split_once("#[cfg(test)]")
+            .expect("telemetry.rs has a #[cfg(test)] module");
+
+        assert_eq!(
+            production.matches(BRIDGE).count(),
+            1,
+            "the OTLP bridge layer must be built only by otel_export_layer, which is what \
+             attaches the export allow-list"
+        );
     }
 
     #[test]

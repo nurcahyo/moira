@@ -129,48 +129,82 @@ found something.
 
 ## 3. What remains
 
-### 3.1 In flight
+### 3.1 ALL PLAN WORK IS COMPLETE (2026-07-31)
 
-- **PR #39** — findings sweep (F20 single-primary ownership, F13 409, `cargo-mutants` adoption).
-  891 tests, six gates green. **Awaiting CI. Merge when green.**
+The forced order `02b → 03 → 04 → 05 → 06 → 07 → {08 ∥ 10} → 11 → 09` is **fully executed**. Six PRs
+merged in the final cycle, each CI-verified with every job running steps:
 
-### 3.2 Plan 09, waves 4–5 (the only plan work left)
-
-Read `plans/09-generic-oidc-github-invitations.md` §0 first — 9 blockers, re-sequenced into five
-waves, waves 1–3 merged.
-
-- **Wave 4 — multi-provider.** Its central task is **removing `ambiguous_enabled_providers`**.
-  `auth-config.ts` currently refuses to guess when more than one provider is enabled, *deliberately*
-  — so **enabling a second provider today breaks sign-in**. This is a redesign of a shipped safety
-  decision, not an extension. Also needs GitHub storage: `auth_provider_settings`'s CHECK admits only
-  `google_oauth`/`generic_oidc`/`jwks`, and GitHub is not OIDC (no issuer, no discovery). The
-  migration is **unconditional** and must drop and re-add two CHECK constraints.
-- **Wave 5 — invitations + ownership UI.** Session management is **cut** (user decision) unless
-  waves 1–4 land comfortably; it needs durable storage *and* delivers nothing the invitation flow
-  requires.
-
-### 3.3 Open findings
-
-| | What | Where it lives |
+| PR | What | Merge |
 |---|---|---|
-| **F14** | Memory dedupe silently stops matching after a pepper rotation | plan 11 Sub-Phase F |
-| **F16** | `rig-core` logs the whole completion body — now carrying other tenants' retrieved documents. Mitigated below the `EnvFilter`; **proper fix is upstream** | needs an issue filed against rig-core, by a human |
-| **F17** | Rotating `BETTER_AUTH_SECRET` makes the console publish a JWKS it cannot sign for — endpoint healthy, every token rejected | runbook in `docs/console-storage.md` |
-| **F21** | A *failure* replay double-counts, distorting an operator's denial rate | plan 09 |
+| #39 | findings sweep — F20, F13, F21, `cargo-mutants` | `5206ffd` |
+| #40 | F22 — a timeout probe racing a sub-millisecond deadline | `f3a9480` |
+| #41 | wave 4A — deterministic `admission_policy`, F23/F24/F25/B2 | `c98aeb7` |
+| #42 | wave 4B — per-provider console issuer, N sign-in buttons | `da384c8` |
+| #43 | wave 5 — invitations and ownership UI | `820a5a8` |
+| #44 | F6 — allow-list on the OTLP bridge | `f2c24a8` |
+
+Migrations end at **`0020`** (next free `0021`; `0016` is a permanent gap). OpenAPI is stable at
+**151 operations / 99 paths / 178 schemas**.
+
+### 3.2 Open findings
+
+| | What | State |
+|---|---|---|
+| **F14** | Memory dedupe silently stops matching after a pepper rotation | open — plan 11 Sub-Phase F, which is deferred. Needs a **decision**, not a fix: re-hash on rotation, accept and document the duplicate window, or move `content_hash` to the unkeyed `request_hash` |
+| **F16** | `rig-core` logs the whole completion body, now carrying other tenants' retrieved documents. Mitigated below the `EnvFilter` — **and that mitigation's own wiring test was missing until `8bbda15`** | **proper fix is upstream; needs an issue filed by a human** |
 | **F2** | Pre-auth query-field enumeration | user deferred |
-| **F6** | OTel bridges every recorded span; `env_filter` is the sole barrier to Rig prompt spans | unscheduled |
-| — | Admin write + audit row still non-atomic | unscheduled |
 | — | ~986 leaked `trusted_jwt_issuers` rows in the shared test DB | hygiene |
 
-**Plan 11 Sub-Phases E (summarization) and F (memory extraction) are deferred**, stated in its PR
+**Closed in the final cycle:** F6, F13, F20, F21, F22, F23, F24, F25, B2. **In flight at handoff:**
+F17 (`fix/f17-jwks-rotation`) and admin-write/audit atomicity (`fix/admin-audit-atomicity`) — check
+whether those branches merged before assuming either is still open.
+
+**Plan 11 Sub-Phases E (summarization) and F (memory extraction) remain deferred**, stated in its PR
 rather than implied. F14 belongs to F.
 
-### 3.4 Two things only the user can do
+### 3.3 Three things only the user can do
 
-1. **File the rig-core issue** for F16. Draftable, but it should go under a human's name.
-2. **Supply a Google credential** if the OAuth mock/live seam ever needs closing. Everything is
+1. **Deploy the release containing `c98aeb7`, then land T11** — removing the console's
+   `ambiguous_enabled_providers` guard. **Do not wave this through.** It is gated on stage 4A being
+   *deployed*, not merged: until Moira's own refusal (`0020`'s partial unique index and coded 409) is
+   running in production, that console guard is the only thing in front of **F23**. A rollout that
+   lands the console before Moira reopens exactly the window 4A closed. Correct order is 4A in
+   release N, T11 in release N+1.
+2. **File the rig-core issue** for F16. Draftable, but it should go under a human's name.
+3. **Supply a Google credential** if the OAuth mock/live seam ever needs closing. Everything is
    verified against a real TLS mock IdP with real signed JWTs — what cannot be proven without a
    credential is Google's own token claims, consent screen and key rotation. Recorded, not implied.
+   The same now applies to **GitHub**, added in wave 4B and exercised only against a purpose-built
+   mock (no discovery document, no `id_token`, `/user` + `/user/emails`).
+
+### 3.4 Five guards that could not detect the defect they were named for
+
+**Read this before writing any guard.** Plan 09 produced **five**, every one found by *running the
+mutation* and none by reading the test. **Two were already shipped and trusted.**
+
+| Guard | Why it could not fire |
+|---|---|
+| wave 4A, policy ordering | migration `0020` made the target state **unrepresentable**, so a fixture of legal rows could not reach it |
+| wave 4B, G9's minted-`sub` | the mutation creates a fresh account row with the **same** IdP subject — `sub` stays correct while every grant is orphaned |
+| wave 5, `secret-leak.e2e.ts` | grepped for a **literal import path**; the real mount is transitive (page → organism → modal). **Verified green with the modal mounted** — an armed tripwire that could not fire |
+| wave 5, route session guard | a **per-file** scan says "*some* handler is guarded", never "*every* handler" — and the second exported method is exactly where an unguarded endpoint goes |
+| **F16's own mitigation** | its tests exercised a predicate **re-implemented in the test module**. Deleting the filter from `init` left **all 598 tests green** |
+
+**The common shape:** each was written against the *shape the author imagined the defect would take*
+— a direct import, one handler per file, a representable row, a changed subject, a correct predicate
+— rather than against the property.
+
+**Ask of every guard: what is the cheapest edit that breaks the property while leaving the guard
+green?** That question found all five; reading the tests found none.
+
+Three corollaries earned the hard way:
+
+1. **A fix that makes a defect unrepresentable can silently disarm its own guard.** After any
+   constraint that narrows what can exist, re-check the guard's fixture is still *reachable*.
+2. **A source-scanning guard must scan the closure, not the file** — the transitive import graph, and
+   per-export granularity.
+3. **A predicate test and a wiring test are different tests.** Every laundering finding here has had
+   a *correct predicate*.
 
 ## 4. Mechanics
 

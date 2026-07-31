@@ -310,23 +310,79 @@ This is a new flake introduced while fixing the old one, which is worth stating 
 counting module 13 as done. Its owner must widen or serialise that wait. **Do not treat plan 06 as
 green until a full-workspace run passes twice consecutively from cold.**
 
-### F6 — OTel exports every recorded span, so `env_filter` is the only thing holding prompts back
+### F6 — OTel exports every recorded span, so `env_filter` is the only thing holding prompts back — **CLOSED** `f31ff59`
 
-Plan 05 wired a ~590-line OTel pipeline that bridges **every recorded span** to OTLP. Rig emits spans
-carrying `gen_ai.system_instructions` and related fields. So with `otel_enabled=true`, the log filter
-is the sole barrier between prompt content and a remote collector: a bare `debug` or `trace` level —
-rather than target-scoped `moira=debug` — would start exporting Rig's spans, prompts included.
+**Mechanism.** `src/config/telemetry.rs` now applies an **allow-list of Moira-owned target roots**
+(`EXPORTABLE_TARGET_ROOTS = ["moira"]`, matched on target *segments*) to the `tracing`→OTLP bridge
+layer itself, in `otel_export_layer`. A global filter can only ever *narrow* what reaches a layer,
+so the allow-list sits below the `EnvFilter` and no value of `env_filter` or `RUST_LOG` — including
+a bare `trace` — can widen it back open. Same placement, and the same reasoning, as F16's log
+suppression. It replaces a denylist (`!target.starts_with("opentelemetry")`), which is the F8 shape:
+every future dependency opted in by default.
 
-**Not currently a leak.** The shipped default is `otel_enabled=false`, and plan 05's live capture
-reviewed every exported attribute against a denylist and found nothing (prompt text, credentials,
-response bodies — zero hits). This is a *configuration* hazard, not a present defect: it needs an
-operator to enable OTel and widen the filter.
+**Two corrections to the description above, which was written months ago.**
 
-Mitigated for agents in `c546f08` — the errors-testing skill now documents target-scoped `moira=debug`
-as the way to get spans and keeps bare levels forbidden, so an agent chasing an empty trace stream
-does not reach for the dangerous knob. **Worth considering for a later plan:** a filter guard that
-refuses to export third-party spans regardless of level, so the safety does not rest on operator
-discipline.
+1. **It was not a `debug`/`trace` hazard.** `rig-core` 0.40's completion span is an **`info_span!`**
+   on target `rig::completions`, carrying `gen_ai.system_instructions` — the preamble — as a span
+   attribute (`providers/openai/completion/mod.rs:1929`, `providers/anthropic/completion.rs:2467`,
+   and the gemini/xai/ollama equivalents). A bare `info` filter, which is an ordinary thing for an
+   operator to set, was already enough. The bar was one notch lower than recorded.
+
+   Worth knowing precisely, because it is unintuitive: those call sites read
+   `if tracing::Span::current().is_disabled() { info_span!(…) } else { Span::current() }`. So when
+   Moira's own `execution_attempt` span is live, Rig **reuses it** and its `gen_ai.*` recordings
+   no-op against a span that never declared those fields. The exposure window is therefore
+   *`rig` enabled while Moira's `DEBUG` spans are not* — i.e. exactly a bare `info`, and exactly the
+   configuration an operator reaches for. The guard does not rely on that upstream branch either
+   way: it asserts the property, not Rig's current control flow, which can change in any release.
+2. **The mitigation deliberately has no `INFO`-and-above carve-out**, unlike F16's. In the log
+   pipeline level separates content from diagnostics — the body dump is at `TRACE`, failures at
+   `WARN` — so keeping `INFO`+ costs nothing. In the span pipeline that separation does not exist:
+   the prompt-bearing span *is* the `INFO` span, so an `INFO` carve-out would export precisely what
+   the guard exists to stop. Verified as mutation M3 below. The constraint it was meant to serve is
+   still met: the `fmt` layers are untouched, so third-party warnings and errors reach stdout exactly
+   as before. Only the collector stops receiving them, and provider outcome reaches it on Moira's own
+   `execution_attempt` span.
+
+**Why a layer filter and not the two alternatives.** A `SpanProcessor` keyed on instrumentation
+scope cannot work: `tracing-opentelemetry` 0.33 bridges every span through a *single* tracer, so
+Rig's span and Moira's share the scope `moira` — asserted, not assumed, in
+`every_bridged_span_shares_one_instrumentation_scope`. A `Sampler` never sees the `tracing` target,
+only the span name, so it would be a denylist on names like `chat`. And any processor-level filter
+sees whole spans only: a third-party *event* is attached to whichever OTel span is current, so a Rig
+event fired inside `execution_attempt` rides out on a span the processor has no reason to drop —
+also asserted, in the premise test. The layer filter is the only one of the three that governs spans
+and events alike, and it acts before attribute values are copied into a span builder.
+
+**Verified by injection, not by reading.** Six mutations, each caught by exactly one test:
+
+| | Mutation | Test that failed |
+|---|---|---|
+| M1 | delete `.with_filter(...)` from `otel_export_layer` | `no_third_party_span_is_exported_however_permissive_the_filter_is` — `env_filter="trace" exported Rig's completion span: ["chat", "execution_attempt", "http_request"]` |
+| M2 | restore the old `opentelemetry`-prefix denylist | same |
+| M3 | add F16's `INFO`-and-above carve-out | same |
+| M4 | `target.contains(root)` instead of segment match | `target_ownership_is_decided_by_segment_not_by_substring` |
+| M5 | drop every span (`false`) | `moiras_own_spans_are_still_exported_with_the_guard_on` — M5 is the mutation that passes points 1 and 2 by destroying the observability plan 05 built |
+| M6 | `init()` builds the bridge layer itself, bypassing the seam | `the_otlp_bridge_layer_is_constructed_in_exactly_one_place` |
+| M7 | delete F16's `.with(filter_fn(suppresses_provider_payload_logs))` | *nothing* — 598/598 green. See F16: that gap was found here and closed in `8bbda15` |
+
+The tests also assert their own premise — an unguarded bridge layer, reachable only from
+`#[cfg(test)]`, *does* export `chat`, its preamble, and a Rig event's payload on Moira's own span —
+so a future change that makes the emitting side stop producing the dangerous span turns the suite
+red rather than silently vacuous. Everything runs in-process against a recording `SpanExporter`; no
+collector, no network.
+
+**Reversal condition.** The allow-list becomes *wrong* the day Moira wants a third party's spans in
+its traces — `sqlx`, an HTTP client, a worker crate. That is a legitimate want, and the answer is to
+add that target root to `EXPORTABLE_TARGET_ROOTS` after reading what the crate puts on its spans,
+not to relax the predicate. It becomes *unnecessary* only if Moira stops exporting spans altogether,
+or if every crate in the tree gains a content-free instrumentation guarantee — neither is in
+prospect. Unlike F16's filter, this one does not go away when `rig-core` fixes its logging: it is
+about every dependency, not about Rig.
+
+**Also fixed in passing:** `docs/otel.md` and `.env.example` advertised port **4317** for an
+exporter that speaks OTLP/**HTTP**. Every operator following either would have configured a
+collector's gRPC port and got nothing.
 
 ### F12 — the shipped container image carries 5 CRITICAL and 31 HIGH CVEs — hardening in progress
 
@@ -587,7 +643,9 @@ have no right to see in a log stream. An operator raising a log level to debug r
 been silently exporting other documents' contents.
 
 This is the same hazard as **F6** (OTel bridges every recorded span, so `env_filter` is the only
-barrier) arriving through a second channel. F6 remains open; this is its sibling.
+barrier) arriving through a second channel. This is its sibling. **F6 is now closed too** (`f31ff59`),
+by a filter of the same shape in the same file — with one deliberate difference: no
+`INFO`-and-above carve-out, because Rig's prompt-bearing *span* is itself an `info_span!`. See F6.
 
 **Mitigated in plan 11 Wave 2**, and the shape of the mitigation matters: a hard suppression in
 `src/config/telemetry.rs` sitting **below** the `EnvFilter`, so it holds however the operator sets
@@ -597,6 +655,21 @@ warnings and errors are never hidden — the dropped events are exactly the ones
 the payload.
 
 Found by a canary test, not by review.
+
+**Its guard was untested where it mattered — the fifth of these, and it was shipped and trusted.**
+Found while closing F6, by injection: deleting `.with(filter_fn(suppresses_provider_payload_logs))`
+from `init` left **all 598 library tests green**. F16's three tests all exercise a `suppresses()`
+helper *re-implemented inside the test module*, because `filter_fn` receives a `Metadata` that
+cannot be constructed outside `tracing`'s macros — so they tested the decision and never the stack
+the decision was supposed to be installed in. The reason no test could reach it was structural:
+`init` installs a global subscriber, which a test process can set once and never undo. Fixed in
+`8bbda15` — stack assembly moved into `build_subscriber`, which `with_default` can install, and
+`the_payload_log_suppression_is_wired_into_the_subscriber_stack` asks the installed subscriber via
+`tracing::enabled!`. Verified failing under the same deletion.
+
+**The transferable rule:** a predicate test and a wiring test are different tests, and "the filter
+function is correct" says nothing about whether anything calls it. Every one of this project's
+laundering findings has had a correct predicate.
 
 **Reversal condition:** remove it the moment `rig-core` gains a way to disable or redact
 request-body logging at the source, which is where it belongs. Residual risk is documented in
@@ -1075,8 +1148,28 @@ production that guard is the only thing in front of F23.
 **Closed:** F21 (already fixed in #39, unnoticed until an auditor checked), **F23**, **F24**
 (structurally, zero `admin_identities` change), **F25**, **F22**, and **B2**.
 
-**Open, and the queue from here:** F6 (in flight), ~~F17~~ (**closed** on
-`fix/f17-jwks-rotation` — see its entry), F14, admin-write/audit non-atomicity, the
+**F6 is CLOSED** (`f31ff59`) — an allow-list `filter_fn` on the OTLP bridge layer. And closing it
+exposed a **fifth** laundering guard: **F16's own mitigation was never wired-tested.** Deleting
+`.with(filter_fn(suppresses_provider_payload_logs))` from `init` left **all 598 library tests
+green**, because F16's three tests exercised a `suppresses()` helper *re-implemented inside the test
+module* — they covered the predicate and never the stack it was meant to be installed in. Fixed in
+`8bbda15` by moving stack assembly to `build_subscriber`, which `with_default` can install, and
+asking the installed subscriber via `tracing::enabled!`.
+
+**The transferable rule: a predicate test and a wiring test are different tests — and every one of
+this project's laundering findings has had a correct predicate.**
+
+**F17 is CLOSED** (`7640829`) — see its entry. And it exposed a **sixth** bad-guard category, distinct
+from the five above: `console-jwks-stability.test.ts` was not toothless, it **pinned the defect**. It
+asserted the published JWKS was *unchanged* by a rotation and that signing raised the library's
+decrypt string — so it went **red on the fix**, which is the opposite of what a guard does. Worse, it
+asked the two questions **separately**, and F17 is the *conjunction*: a 200 JWKS is unremarkable on
+its own, and a signing failure is unremarkable on its own. Only together are they the outage.
+
+**The rule: when a test documents current behaviour, say so in its name, and never let a conjunction
+be asserted as two independent facts.**
+
+**Open, and the queue from here:** F14, admin-write/audit non-atomicity, the
 leaked `trusted_jwt_issuers` test rows, and F2 (user-deferred).
 
 **Needs a human — recorded, not implied:** T11's deploy; the **rig-core issue for F16**, which should
@@ -1172,7 +1265,7 @@ an "active sessions" screen over an in-memory store would be the appearance of a
 | **F14** | Memory dedupe silently stops matching after a pepper rotation | plan 11 Sub-Phase F |
 | ~~**F13**~~ | ~~Duplicate trusted JWT issuer returns 500, not 409~~ **FIXED** `a6d2984` | `fix/findings-sweep` |
 | **F2** | Pre-auth query-field enumeration | user deferred |
-| **F6** | OTel exports every span; `env_filter` is the sole barrier to Rig prompt spans | unscheduled |
+| ~~**F6**~~ | ~~OTel exports every span; `env_filter` is the sole barrier to Rig prompt spans~~ **CLOSED** `f31ff59` — allow-list of Moira-owned targets on the bridge layer, below the `EnvFilter`. The recorded description understated it: Rig's prompt-bearing span is `INFO`, so a bare `info` was already enough | `fix/f6-otel-span-filter` |
 | — | Admin write + audit row still non-atomic | unscheduled |
 | — | ~986 leaked `trusted_jwt_issuers` rows in the shared test DB | hygiene |
 
