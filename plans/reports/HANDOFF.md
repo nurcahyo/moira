@@ -4,7 +4,8 @@
 work resumes. Read it, then read `plans/reports/EXECUTION-LEDGER.md` — the ledger is the source of
 truth for state; this file is the source of truth for *how to work here*.
 
-Written 2026-07-31, `main` at `d709ed7`. **Not finished.** What remains is in §3.
+Written 2026-07-31. **All plan work is complete** — the forced order `02b → … → 09` is fully
+executed. What remains is a short findings queue and three things only the user can do, both in §3.
 
 ---
 
@@ -26,7 +27,7 @@ Unattended, full autonomy including merge. The user is away for long stretches.
 - **OAuth stays mock-first.** No Google credential exists and none is to be requested. Build against
   the TLS mock IdP; defer anything genuinely needing live credentials with an explicit note.
 
-## 2. The five rules that cost the most to learn
+## 2. The rules that cost the most to learn
 
 Each of these was learned by losing time to it. They are not style preferences.
 
@@ -179,7 +180,7 @@ rather than implied. F14 belongs to F.
 
 ### 3.4 Six guards that failed — five toothless, one that pinned the defect
 
-**Read this before writing any guard.** Plan 09 produced **six**, every one found by *running the*
+**Read this before writing any guard.** Plan 09 produced **six**, every one found by *running the
 mutation* and none by reading the test. **Two were already shipped and trusted.**
 
 | Guard | Why it could not fire |
