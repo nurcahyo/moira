@@ -207,7 +207,7 @@ atomicity — hence `F27`. **Check `origin/main`'s ledger for the highest ID imm
 writing one down, not at the start of the task.**
 
 **Closed in the final cycle:** F6, F13, F14, F17, F20, F21, F22, F23, F24, F25, **F26**, B2 —
-**nine PRs, #39–#47**, each CI-verified with every job running steps.
+**ten PRs, #39–#49**, each CI-verified with every job running steps.
 
 Two closures corrected the finding that named them, which is the reason to re-derive rather than
 implement from a one-liner:
