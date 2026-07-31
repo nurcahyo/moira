@@ -941,6 +941,32 @@ The reachable double-count is a **failure** replay — `admin_identity_already_c
 `AppError::Replayed` — which distorts an operator-facing denial rate rather than an invitation count.
 That is the one worth fixing, and it is not the one the sweep brief named.
 
+## STANDING RISK (2026-07-31) — GitHub stopped firing `pull_request` runs; use `workflow_dispatch`
+
+**`pull_request` events stopped producing workflow runs on this repository** some time after
+08:44 UTC on 2026-07-31, while `push` runs on `main` kept working normally throughout.
+
+PR #39 accumulated **zero check-runs** (`/commits/<sha>/check-runs` → `total_count: 0`) across all
+three of: a `synchronize` from a real push, a close/reopen, and a fresh empty commit. The PR timeline
+records every one of those events, so GitHub received them and produced nothing.
+
+**Everything that could explain it was checked and ruled out:** the workflow is `active`;
+`actions/permissions` is `enabled: true, allowed_actions: all`; `ci.yml` is **byte-identical** on
+`main` and the branch (`git diff` empty), with no `paths` filter and no blocking job-level `if`; no
+commit message carries a skip directive; the repo is public, so Actions minutes are unmetered; and
+`pull_request` runs demonstrably worked on this same workflow as recently as 08:44.
+
+**Resolved honestly, not worked around.** `64d44ec` adds `workflow_dispatch:` to `ci.yml`, so the same
+six jobs can be run against an arbitrary ref: `gh workflow run ci --ref <branch>`. The dispatch uses
+the workflow file **from the target ref**, so the change must exist on the branch too — cherry-picked
+as `3093c3c`.
+
+**The alternative was merging PR #39 on local gates alone, and that was refused.** The old
+infrastructure override is void because CI works; here CI *does* work, just not through the event that
+normally reaches a PR. A dispatched run executes the identical jobs against the identical tree, so it
+is real verification rather than an override. **Never merge this PR on local gates because the event
+did not arrive** — dispatch instead.
+
 ## F23 — ESCALATED: `governing_policy` can enforce the WRONG admin-admission policy, and cannot enforce a per-provider one at all
 
 **Raised by the wave-4 re-audit as W4-B1; six adversarial verifiers then corrected its scope, raised
