@@ -2392,3 +2392,40 @@ backend" cannot distinguish a leak from a live run; that check needs a different
 an owning-run marker) before it can safely drop a template it does not recognise. Sweeping
 `moira_test_building_*` and aged fixture clones stays correct as it is.
 
+
+## AN UNMERGED MIGRATION IN ONE WORKTREE BLOCKS EVERY OTHER WORKTREE'S LIB TESTS — including `main`'s — 2026-08-01
+
+Worse than the template sweep above, and a different mechanism. **Integration** suites clone a private
+database from a template built out of the *calling* tree's migrations, so they are isolated. **Lib
+unit tests are not**: `src/**/tests` run `MIGRATOR.run` against `MOIRA_TEST_DATABASE_URL` — the shared
+`moira` database — directly.
+
+`fix/f14-memory-content-hash`, in a sibling worktree, carries
+`migrations/0021_memory_content_hash_is_content_addressed.sql` and its test run applied it. The
+shared database's `_sqlx_migrations` now holds version 21. Every tree that does **not** have that
+file — this branch, and `origin/main` itself, which is still at `0020` — now fails every
+database-backed lib unit test with:
+
+```text
+migrate: Internal("run migrations: migration 21 was previously applied but is missing in the
+resolved migrations")
+```
+
+`cargo test` fails on the lib target and stops, so `scripts/gates.sh` reports both `test` and
+`test:incomplete-log` with **0 of 36** integration targets logged — the whole suite never runs.
+
+**This is not repairable from the affected side.** Deleting the row would break the branch that owns
+it, and the standing instruction on the shared database is not to destroy state other agents depend
+on. It clears when `0021` merges to `main`, or when the shared database is rebuilt by someone who
+owns both.
+
+**The rule that follows: an unmerged migration must not be applied to the shared test database.** A
+branch that adds one needs its own database (`MOIRA_TEST_DATABASE_URL` pointing somewhere private) for
+as long as it is unmerged, because the cost of getting this wrong is not borne by the branch that adds
+the migration — it is borne by every *other* agent, silently, in a failure whose message names a
+migration they have never heard of. The template-clone path already gets this right; the lib unit
+tests are the hole.
+
+**Verified this way on `fix/admin-audit-atomicity`:** the six gates run green end to end against a
+byte-identical database that simply has not had `0021` applied to it, and red against the shared
+`moira` on the same commit, with nothing else changed.
