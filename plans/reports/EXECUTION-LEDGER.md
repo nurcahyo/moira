@@ -967,16 +967,39 @@ merge commit: five jobs, steps executed (`rust` 13, `console` 16, `console-conta
 
 **Migrations: `main` is now at `0019`. Next free is `0020`.** `0016` is a permanent gap.
 
-**Plan 09 is the only plan work left, and BOTH remaining waves are now re-audited:**
+## ✅ ALL PLAN WORK IS COMPLETE — plan 09 finished 2026-07-31. Only T11 remains, and it is the user's.
 
-| Wave | §0 | Drift | State |
-|---|---|---|---|
-| 4 — multi-provider | §0.7 + **§0.7.7** (the decision), `plan/09-wave4-multi-provider` | ~70% | decision taken (Option A′, staged 4A/4B); **stage 4A implemented and gated** — see below |
-| 5 — invitations + ownership UI | §0.8 on `plan/09-wave5-invitations-ui` | ~83% | audited; recovery **cut** (no backend), sessions **stay cut** |
+**Five PRs merged in one cycle**, each CI-verified with every job running steps:
 
-**Open findings after this merge:** F24, F22, plus the carried-over F14, F17, F6, F2,
-admin-write/audit non-atomicity, and the leaked `trusted_jwt_issuers` test rows. **F21 is CLOSED.**
-**F23 is closed in Moira's layer** and **F25 is CLOSED** — both by wave 4A, below.
+| PR | What | Merge |
+|---|---|---|
+| **#39** | findings sweep — F20, F13, F21, `cargo-mutants` | `5206ffd` |
+| **#40** | F22 — the non-streaming timeout probe raced a sub-millisecond deadline | `f3a9480` |
+| **#41** | wave 4A — deterministic `admission_policy`, `github_oauth` schema, F23/F24/F25/B2 | `c98aeb7` |
+| **#42** | wave 4B — per-provider console issuer, N sign-in buttons, GitHub-shaped mock | `da384c8` |
+| **#43** | wave 5 — invitations and ownership UI | `820a5a8` |
+
+**The forced plan order `02b → 03 → 04 → 05 → 06 → 07 → {08 ∥ 10} → 11 → 09` is now fully executed.**
+Migrations end at `0020`; `0016` is a permanent gap. OpenAPI is stable at **151 operations / 99
+paths / 178 schemas**.
+
+**The one piece of plan 09 the loop could not do is T11**, removing the console's
+`ambiguous_enabled_providers` guard. It is gated on stage 4A being **deployed**, not merged, and
+nothing here can deploy. **It must not be waved through** — until Moira's refusal is running in
+production that guard is the only thing in front of F23.
+
+### Findings state after this cycle
+
+**Closed:** F21 (already fixed in #39, unnoticed until an auditor checked), **F23**, **F24**
+(structurally, zero `admin_identities` change), **F25**, **F22**, and **B2**.
+
+**Open, and the queue from here:** F6 (in flight), F17, F14, admin-write/audit non-atomicity, the
+leaked `trusted_jwt_issuers` test rows, and F2 (user-deferred).
+
+**Needs a human — recorded, not implied:** T11's deploy; the **rig-core issue for F16**, which should
+go under a person's name; and a **Google credential** if the OAuth mock/live seam ever needs closing —
+everything is verified against a real TLS mock IdP with real signed JWTs, and what cannot be proven
+without one is Google's own token claims, consent screen and key rotation.
 
 ### Plan 09 wave 4, stage 4A — landed on `plan/09-wave4-multi-provider` (2026-07-31)
 
