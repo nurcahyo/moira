@@ -175,12 +175,28 @@ jobs:
       # apart.
       - name: Install Playwright browser
         run: bunx playwright install --with-deps chromium
-      # `E2E_SKIP_BUILD=1` reuses the `bun run build` output from the step above
-      # instead of building a second time inside `webServer.command`. CI=true is
-      # set by the runner, which is what flips `forbidOnly`/`retries`/`workers`.
+      # NO `E2E_SKIP_BUILD`. It used to be set here, to reuse the `bun run build`
+      # output from the step above — and that made the secret-leak gate's
+      # BUILD-OUTPUT scan vacuous on every CI run.
+      #
+      # The build step above runs under this job's `env:`, which contains only
+      # `CONSOLE_TEST_DATABASE_URL`. The e2e sentinels live in
+      # `console/e2e/support/secrets.ts` and reach the server through
+      # `webServer.env`, so a `.next` produced by that step never contained them.
+      # A scan for a value that was never in the build's environment finds
+      # nothing and reports success.
+      #
+      # REPRODUCED before removing it (plan 09 wave 3): a statically prerendered
+      # `/` rendering `{process.env.MOIRA_E2E_SENTINEL_SYSTEM_KEY}`, built from a
+      # sentinel-free shell and run with `E2E_SKIP_BUILD=1`, gave 13 passed /
+      # exit 0. `console/e2e/secret-leak.e2e.ts:96-102` had recorded this hazard
+      # in prose and stated the flag "must not be used for a gating run"; this
+      # workflow was using it for exactly that.
+      #
+      # `playwright.config.ts` now refuses the flag under CI outright, so
+      # re-adding this line fails loudly instead of quietly going green. The cost
+      # is one extra Next build (~3s on this project).
       - name: Playwright e2e
-        env:
-          E2E_SKIP_BUILD: "1"
         run: bun run e2e
       - name: Upload Playwright report
         if: failure()

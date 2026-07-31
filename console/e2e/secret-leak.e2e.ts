@@ -94,12 +94,44 @@ import {
  * and the build-output scan failed, reporting "secret value from
  * CONSOLE_DATABASE_URL password (ambient server env)". The leak was reverted.
  *
- * ONE HARNESS PROPERTY THAT EXPERIMENT EXPOSED — worth knowing before trusting
- * a green run: with `E2E_SKIP_BUILD=1` the SAME injected leak passed. `/` is
- * statically prerendered, so a server-side `process.env` read is resolved at
- * BUILD time; reusing a `.next` produced without the e2e environment means the
- * value was never in the output to find. `E2E_SKIP_BUILD=1` is a local
- * iteration shortcut and must not be used for a gating run.
+ * ============================================================================
+ * THE `E2E_SKIP_BUILD` HOLE — CLOSED IN PLAN 09 WAVE 3
+ * ============================================================================
+ *
+ * The wave 1 experiment above exposed a harness property and recorded it as a
+ * warning: with `E2E_SKIP_BUILD=1` the SAME injected leak PASSED, because `/`
+ * was statically prerendered and a server-side `process.env` read is therefore
+ * resolved at BUILD time — reusing a `.next` produced without the e2e
+ * environment means the value was never in the output to find. The note ended
+ * "`E2E_SKIP_BUILD=1` … must not be used for a gating run".
+ *
+ * `.github/workflows/ci.yml` was using it for exactly that, on every run, since
+ * the step was written.
+ *
+ * REPRODUCED, wave 3, before the fix, with the current tree: `/` made static
+ * again and rendering `{process.env.MOIRA_E2E_SENTINEL_SYSTEM_KEY}`, built from
+ * a shell with no sentinels (the CI job env is `CONSOLE_TEST_DATABASE_URL` and
+ * nothing else) and then `E2E_SKIP_BUILD=1 bun run e2e`:
+ *
+ *     13 passed (2.9s)      exit 0
+ *
+ * Every assertion in this file was green while the sentinel was on the page.
+ * Note that the BROWSER-surface scan was green too, not just the build-output
+ * one: a static page resolves `process.env` at build time, so the running server
+ * never held the value either.
+ *
+ * The same leak under a full build fails loudly — verified in the same session:
+ * `bun run e2e` with the leak on the (dynamic) `/login` gave 2 failures naming
+ * "secret value from MOIRA_E2E_SENTINEL_SYSTEM_KEY (seeded sentinel)", exit 1.
+ * Worth reading carefully: on a DYNAMIC page only the browser-surface half
+ * fires, because there is nothing build-time to inline. `force-dynamic` is
+ * therefore not a fix for this — it repairs the response-body half and leaves
+ * the build-output scan reading a sentinel-free bundle.
+ *
+ * THE FIX: the flag is gone from `ci.yml`, and `playwright.config.ts` now
+ * REFUSES it under CI. Removing it from the workflow alone would be undone by
+ * one edit to that file, and what that edit reintroduces is a silently green
+ * gate.
  */
 
 const needles = forbiddenValues();
