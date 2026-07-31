@@ -158,13 +158,41 @@ pub fn init(settings: &TelemetrySettings) -> Result<TelemetryGuard, AppError> {
         None => None,
     };
 
+    build_subscriber(filter, settings.json, provider.as_ref())
+        .try_init()
+        .map_err(|err| AppError::Config(format!("initialize tracing: {err}")))?;
+
+    Ok(match provider {
+        Some(provider) => TelemetryGuard {
+            provider: Some(provider),
+        },
+        None => TelemetryGuard::disabled(),
+    })
+}
+
+/// Assembles the whole subscriber stack: the operator's `EnvFilter`, the two
+/// hard suppressions that sit below it, the log layers, and the OTLP bridge.
+///
+/// **Split out from [`init`] so the stack is testable.** [`init`] installs the
+/// result globally, which a test process can only do once and cannot undo, so a
+/// test that reached through `init` could not exist. The consequence — measured,
+/// not assumed — was that deleting
+/// `.with(filter_fn(suppresses_provider_payload_logs))` from `init` left all 598
+/// library tests green: F16's mitigation had tests for its *predicate* and none
+/// for its *wiring*. `tracing::subscriber::with_default` can install what this
+/// function returns, so the wiring is now reachable from a test.
+fn build_subscriber(
+    filter: EnvFilter,
+    json: bool,
+    provider: Option<&SdkTracerProvider>,
+) -> impl tracing::Subscriber + Send + Sync + use<> {
     // `Option<L>` is itself a `Layer`, and its `max_level_hint` for `None` is
     // `LevelFilter::OFF`, so the disabled arms cost nothing and cannot widen the
     // subscriber's static max level. This keeps the `otel_enabled = false` path
     // behaviourally identical to the pre-OTel implementation.
-    let otel_layer = provider.as_ref().map(otel_export_layer);
+    let otel_layer = provider.map(otel_export_layer);
 
-    let (json_layer, text_layer) = if settings.json {
+    let (json_layer, text_layer) = if json {
         (Some(fmt::layer().json()), None)
     } else {
         (None, Some(fmt::layer()))
@@ -176,15 +204,6 @@ pub fn init(settings: &TelemetrySettings) -> Result<TelemetryGuard, AppError> {
         .with(json_layer)
         .with(text_layer)
         .with(otel_layer)
-        .try_init()
-        .map_err(|err| AppError::Config(format!("initialize tracing: {err}")))?;
-
-    Ok(match provider {
-        Some(provider) => TelemetryGuard {
-            provider: Some(provider),
-        },
-        None => TelemetryGuard::disabled(),
-    })
 }
 
 /// Target roots whose spans and events Moira owns and is therefore willing to
@@ -816,6 +835,40 @@ mod tests {
                 "the allow-list opted a new emitter in; it must be opted in deliberately"
             );
         }
+    }
+
+    /// **The wiring, not the predicate — and this one was missing.** Deleting
+    /// `.with(filter_fn(suppresses_provider_payload_logs))` from the subscriber
+    /// stack left all 598 library tests green: F16's mitigation had tests for its
+    /// decision function and nothing that looked at the stack it was supposed to
+    /// be in. Measured on this branch, not inferred. This is the test that fails.
+    ///
+    /// `tracing::enabled!` asks the installed subscriber, so it sees the global
+    /// filters exactly as a real call site would. It cannot see the OTLP bridge's
+    /// per-layer filter — `Layered::enabled` is true if *any* layer wants the
+    /// event, and the `fmt` layer always does — which is precisely the difference
+    /// between the two guards, and why F6's has its own end-to-end test above.
+    #[test]
+    fn the_payload_log_suppression_is_wired_into_the_subscriber_stack() {
+        // The most permissive filter an operator could set. Nothing below it may
+        // be relaxed by it.
+        let subscriber = build_subscriber(EnvFilter::new("trace"), false, None);
+
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(
+                !tracing::enabled!(target: "rig::completions", tracing::Level::TRACE),
+                "the rig payload suppression is not in the installed stack: RUST_LOG=trace \
+                 would log every completion request body, retrieved chunks included"
+            );
+            assert!(
+                tracing::enabled!(target: "rig::completions", tracing::Level::WARN),
+                "upstream warnings must still reach the operator"
+            );
+            assert!(
+                tracing::enabled!(target: "moira::application::execution", tracing::Level::TRACE),
+                "the suppression must not cost Moira its own verbose logging"
+            );
+        });
     }
 
     /// The guard is only as good as its being wired up, and the cheapest way to
