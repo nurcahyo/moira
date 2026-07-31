@@ -941,6 +941,16 @@ The reachable double-count is a **failure** replay — `admin_identity_already_c
 `AppError::Replayed` — which distorts an operator-facing denial rate rather than an invitation count.
 That is the one worth fixing, and it is not the one the sweep brief named.
 
+**CLOSED — already fixed in PR #39, which nobody had noticed.** `redeem_invite`'s `Err` arm carries
+`if !matches!(error, AppError::Replayed(_))`, and
+`an_idempotent_replay_does_not_count_a_second_invitation_or_redemption` asserts the counter reads
+`1.0` after a replayed cacheable 409. **That test works** — it reads `2.0` with the guard removed.
+
+Found by the wave-5 auditor while checking whose wave F21 belonged to. It belongs to **neither**: it
+is a wave-2 defect by domain and was closed by the findings sweep. §0.7's W4-D6 would have
+**double-implemented it**, which is the cost of routing a finding by "which file is already open"
+rather than by checking whether it is still open at all.
+
 ## STANDING RISK (2026-07-31) — GitHub stopped firing `pull_request` runs; use `workflow_dispatch`
 
 **`pull_request` events stopped producing workflow runs on this repository** some time after
@@ -998,9 +1008,24 @@ of which provider authenticated the user. Three reachable shapes:
 **Scope correction — the audit was wrong.** It is **not** "the oldest enabled row in the table". An
 unlinked row carrying the IdP's issuer returns **0 rows** (verified); rows on different trusted
 issuers never compete. It is the oldest enabled row *bound to that one `trusted_jwt_issuer_id`*.
-The audit also **misquotes the ORDER BY**, omitting `id asc` — the key that makes the result
-deterministic at all when `created_at` ties, which it does exactly for rows inserted in one
-transaction.
+
+> **RETRACTED — this entry originally accused the audit of misquoting the ORDER BY by omitting
+> `id asc`. That was false, and the error was the coordinator's.** §0.7 quotes all three keys
+> correctly in at least three places (its drift row 7, W4-B1's prose, and §0.1 B5). The truncation
+> was introduced by **the coordinator's own brief to the verifiers**, which quoted the clause as
+> `(issuer is not distinct from $1) desc, created_at asc`. Three verifiers correctly noticed the
+> missing key and reasonably attributed it to the audit; the coordinator then propagated that into
+> this finding. Caught by the wave-5 auditor, which read §0.7's actual text instead of trusting the
+> correction it was sent.
+>
+> `id asc` is real and load-bearing — `created_at` ties exactly for rows inserted in one transaction,
+> and `id asc` is what makes the result deterministic. The audit had it right all along.
+>
+> **The lesson is about verification inputs, not about verification.** A verifier can only falsify
+> what it is shown. Quoting a claim *into* a brief is itself a transcription step, and an error there
+> is laundered into a confident, multiply-confirmed finding — three independent lenses agreed
+> precisely because all three were reading the same corrupted quote. **Point verifiers at the
+> artefact, not at a paraphrase of it.**
 
 **Severity: a defect gated behind a fully supported operator action — reachable TODAY, not
 wave-4-only.** The audit called it gated by the console's `ambiguous_enabled_providers` refusal.
@@ -1271,13 +1296,53 @@ the session gate is the `(console)` route-group layout. `PublicSignInMethod` alr
 GitHub button needs; only `provider_id` is missing. F21 is a **wave-2 backend** defect by domain,
 reassigned to wave 4 only because another wave-4 task already opens that file.
 
-**In flight:**
+**Wave 5 re-audited — §0.8 on `plan/09-wave5-invitations-ui`. Drift ~83% (43 of 52)** — the highest
+measured in this project, beating plan 11's 85% only narrowly. 9 hold, 6 partly, 1 unestablished,
+**36 wrong**. Roughly half is "already shipped, differently" (waves 2–3 built more than predicted);
+half is "specified against something that does not exist".
 
-| Agent | Branch | Worktree | Doing |
-|---|---|---|---|
-| A | `fix/findings-sweep` | `…/1b00aa10-…/scratchpad/fsweep` | close the LISTEN/NOTIFY attach race, teeth-check by injection, 5 consecutive suite runs, push → then merge #39 |
-| ~~B~~ | `plan/09-wave4-multi-provider` | `…/3f147114-…/scratchpad/p09w4` | **done** — §0.7 committed `85b093d` |
-| verify | read-only | — | `wf_f1c8b6c2-5b7`, six verifiers over W4-B1…B4 |
+**Wave 5's headline: it is not three UI features.** As written it is two UI features and one
+**backend** feature disguised as a third.
+
+- **Recovery has no backend at all.** Wave 2 took an undocumented decision (D-W2-1) to omit
+  `is_recovery` / `replaces_admin_identity_id`, **recorded only in a migration comment and two
+  catalog comments** — not in this ledger, not in the plan. So `RecoveryPanel`, `recovery.e2e.ts`,
+  `recovery_invite_gets_no_domain_policy_exemption` and `admin_identity_recovered` are all
+  unbuildable. **Cut.** *This is the finding to learn from:* a decision recorded only in code
+  comments silently removed a third of a later wave's scope, and nothing surfaced it until an
+  auditor went looking. The standing authority requires decisions in a plan's §0 **with a reversal
+  condition** precisely so this cannot happen.
+- **`redeem` cannot be registered under any existing `MoiraCredentialRequirement`.** Its spec
+  security is `bearerAuth` alone. `admin` fails the contract test *and* `#buildHeaders`' `admin` arm
+  **prefers the system key**, which would send the bootstrap credential on an invitee's redemption.
+  `none` 401s. Needs a fourth variant (`bearer_only`).
+- **Two DTO fields fail a shipped guard**: `SECRET_DTO_FIELD_PATTERN` matches `token`, so
+  `AdminInvitePreviewRequest.token` / `AdminInviteRedeemRequest.token` red `server-only-guards.test.ts`.
+- **Mounting `OnceOnlySecretModal` reds `secret-leak.e2e.ts` by design** — an armed tripwire that
+  names this wave.
+- **The a11y gate is vacuous for every route inside `(console)`.** There is no authenticated
+  Playwright state, so `page.goto` follows the redirect and audits `/login` instead. Already true of
+  `/` today — so the gate has been passing while auditing the wrong page.
+
+**Session management stays cut.** Durable storage shipped in wave 1, which satisfies half the
+recorded reversal condition — but the other half is what wave 5 builds, and three independent reasons
+stand against it: the plan's session scope silently includes an operator-editable lifetime policy
+**persisted in Moira** (a frozen-contract change); `bun test`/`next dev` default to `memoryAdapter`,
+so unit tests would exercise a store the feature does not use; and its coverage lands behind the same
+a11y silence as every gated route. `DELETE /admin-identities/{id}` already revokes *authorization*,
+which is strictly stronger than revoking a session. The auditor **could not read Better Auth
+1.6.25's `listSessions`/`revokeSession` surface** (`node_modules` absent) and recorded that as
+unverified rather than assuming it — correctly.
+
+**In flight / done this cycle:**
+
+| Agent | Branch | Doing |
+|---|---|---|
+| A | `fix/findings-sweep` | **done** — attach race closed `4ea484b`; CI dispatched as run `30628522675` |
+| B | `plan/09-wave4-multi-provider` | **done** — §0.7 committed `85b093d` |
+| C | `plan/09-wave5-invitations-ui` | **done** — §0.8 committed |
+| verify | read-only | **done** — `wf_f1c8b6c2-5b7`, six verifiers; raised F23/F24/F25 |
+| design | read-only | `wf_05ebcb68-1b2` — three wave-4 designs, three judge lenses, one decision |
 
 ### Cycle 10 — 2026-07-29 → 07-31 — plans 10 and 08 MERGED, plan 11 started
 
