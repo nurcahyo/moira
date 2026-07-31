@@ -95,31 +95,76 @@ Signs session cookies **and** encrypts the ES256 private key in the `jwks` table
 `jwks.disablePrivateKeyEncryption` is set, and the console does not set it).
 
 * **Absent** — the console does not boot.
-* **Rotated against a durable database** — this is the dangerous one, and it
-  fails in the worst available shape:
-  * `getJwks` serves the plaintext `publicKey` column, so **the JWKS document is
-    unchanged** and Moira's cached copy stays valid;
-  * `signJWT` must decrypt the private half and raises `Failed to decrypt private
-    key`;
-  * it does **not** regenerate — a key that cannot be decrypted is not a missing
-    key, and `signJWT` only mints a new pair when there is none or it has
-    expired.
+* **Rotated against a durable database** — the console **refuses to publish**,
+  loudly, instead of failing silently. This is finding F17 and it is now closed
+  by a mechanism, not by this runbook.
 
-  So the console keeps publishing a JWKS it can no longer sign for, sign-in still
-  works, and every minted-token call into Moira fails with nothing pointing at
-  the cause. Verified in
-  `tests/integration/console-jwks-stability.test.ts` ("BETTER_AUTH_SECRET is a
-  SECOND key the durable pair depends on").
+#### What you will see
 
-**To rotate:** delete the `jwks` rows in the same operation.
+The console answers `503` on `GET /api/auth/.well-known/jwks.json` with
+
+```json
+{ "code": "JWKS_KEY_UNSIGNABLE",
+  "message": "The console cannot sign with its stored JWKS key pair and is refusing to publish it." }
+```
+
+and writes one line to its log naming the affected key ids, the variable, and
+both remedies. Minting a Moira-bound token fails with the same refusal. Sign-in
+through the IdP still works — the session cookie does not need the JWKS — but no
+admin call to Moira will succeed until this is resolved.
+
+#### Why it refuses rather than healing itself
+
+Without the mechanism, `getJwks` served the plaintext `publicKey` column while
+`signJWT` could no longer decrypt the private half, and better-auth does **not**
+regenerate in that state (`sign.mjs` mints a new pair only when there is no key
+or it has expired; an undecryptable row is neither). So the console published an
+unchanged, `200`-ing JWKS that Moira's cached copy still matched, while every
+token it minted was rejected — a total admin outage that no health check could
+see. Since wave 4B that is **every provider issuer at once**: N `iss` values
+share one key pair and one JWKS URL.
+
+`console/lib/jwks-signable.ts` closes it at the one seam both halves read
+through, so *published ⊆ signable* holds by construction. Regenerating instead
+was considered and rejected: it cannot tell a deliberate rotation from a **wrong
+secret supplied by mistake**, and in the second case it destroys a fully
+recoverable state by silently minting a new console identity — the new key would
+then have to propagate to Moira, and the old, correct one would be gone.
+
+#### Recovery — pick one
+
+**A. It was a mistake.** Put the previous `BETTER_AUTH_SECRET` back and restart.
+This is a **complete** recovery: the stored pair is untouched, the same `kid`
+comes back, Moira's cached JWKS was never invalidated and nothing in flight was
+orphaned. Nothing else is required.
+
+**B. You meant to rotate.** Delete the `jwks` rows in the same operation:
 
 ```sql
 delete from "jwks";
 ```
 
-Better Auth mints a fresh pair on the next JWKS read. Moira will keep rejecting
-tokens until it re-fetches the document, so schedule it like a key rotation, not
-like a config change. Sessions are invalidated either way.
+Better Auth mints a fresh pair on the next JWKS read. **This is the one step
+that is still manual**, deliberately: it is the point at which an operator
+asserts that a new console signing identity is intended. Moira will keep
+rejecting tokens until it re-fetches the document, so schedule it like a key
+rotation, not like a config change. Sessions are invalidated either way.
+
+Both paths, and the refusal itself, are exercised against a real PostgreSQL
+database in `console/tests/integration/console-jwks-stability.test.ts` — over a
+real socket, with the minted token verified against the served document the way
+Moira verifies it.
+
+#### Not yet done: rotation with no window at all
+
+better-auth 1.6.25 supports a **versioned** secret (`options.secrets` →
+`SecretConfig`, with `$ba$<version>$…` envelopes and a `legacySecret` fallback
+for bare-hex rows). That is the shape in which the private half could be
+re-encrypted under a new secret with both briefly available, making rotation a
+supported operation with no outage and no new `kid`. The console does not use it
+today; it passes a single `secret` string. Adopting it would make case **B**
+disappear. It would **not** replace the refusal above, which is what catches the
+wrong-secret case.
 
 ## Replica count
 
