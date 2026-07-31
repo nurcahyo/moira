@@ -1311,6 +1311,76 @@ attrition. Diagnose F22 the way the attach race was diagnosed: make it determini
 **Also worth carrying:** docs-only pushes to `main` run the full CI suite, which is what exposed this.
 That is accidental coverage worth keeping rather than optimising away.
 
+## FOUR TOOTHLESS GUARDS IN ONE PLAN — the pattern, and the rule that comes out of it
+
+Plan 09 produced **four** guards that could not detect the defect they were named for. Every one was
+found by *running the mutation*; not one was visible by reading the test. Two were specified by a
+judged design panel, and two were **already shipped and trusted**.
+
+| | Guard | Why it could not fire |
+|---|---|---|
+| 4A | G1, policy ordering | migration `0020` made the target state **unrepresentable**, so a fixture of legal rows could not reach it |
+| 4B | G9's minted-`sub` assertion | the mutation creates a **fresh account row with the same IdP subject**, so `sub` stays correct while every grant is orphaned |
+| 5 | `secret-leak.e2e.ts` | grepped for a literal import path; the real mount is **transitive** (page → organism → modal), so the page's own source never contains the string |
+| 5 | route-handler session guard | a **per-file** scan can express "*some* handler is guarded", never "*every* handler" — and the second exported method is exactly where an unguarded endpoint goes |
+
+**The `secret-leak` one is the most alarming.** It was an armed tripwire, named in the plan as the
+thing that would stop wave 5 if it mounted the modal — and it was **verified green with the modal
+mounted**. A guard that everyone believed was protecting them, that had never been asked to fire.
+
+**The common shape, worth carrying into every future guard:** each was written against the *shape the
+author imagined the defect would take* — a direct import, one handler per file, a representable row,
+a changed subject — rather than against the property. **Ask of every guard: what is the cheapest
+edit that breaks the property while leaving the guard green?** That question found all four; reading
+the tests found none.
+
+Two corollaries already earned:
+
+1. **A fix that makes a defect unrepresentable can silently disarm its own guard.** After any
+   constraint that narrows what can exist, re-check that the guard's fixture is still *reachable*.
+2. **A source-scanning guard must scan the closure, not the file.** Both wave-5 failures are this:
+   one needed the transitive import graph, the other needed per-export granularity. Rebuilding the
+   second immediately exposed two further extractor bugs (a type annotation's `{` mistaken for a
+   body; `export const GET = handle;` having no body at all) — **which only re-mutating revealed.**
+
+## WAVE 5 COMPLETE — PR #43. Plan 09 is finished except T11.
+
+29 tasks; all but three landed. **No Moira change** — OpenAPI unchanged at 151/99/178.
+
+**`/admins` ships per-grant and says so.** F24 means one human across two providers holds two grants
+with no linking column, so the screen deliberately does **not** group by email: email is required but
+is not the key and is not unique across grants, and grouping on it would manufacture person-level
+identity from a non-key attribute — the misattribution W5-B12 warns about, wearing a helpful face.
+A test asserts two grants with one email render as two rows. **D3's tertiary reversal condition does
+not fire.**
+
+**The a11y gate was vacuous for every route inside `(console)`** — no authenticated Playwright state,
+so `page.goto` followed the redirect and audited `/login`. It had been passing while auditing the
+wrong page. Now `/login` and `/invite/<fixture>` are genuinely audited behind an explicit
+final-URL assertion, and the unaudited set is pinned in both directions.
+
+**W5-D7′ — the a11y gate declares its blind spot instead of failing forever.** §0.8.4 step 24 asked
+for a permanently red suite. Rejected: a permanently red merge gate blocks every later change for an
+unrelated reason and makes weakening the assertion the path of least resistance — it *loses* the
+assertion rather than keeping it. The declared-exemption form fails on the same drift (verified by
+two mutations) and merges. *Reversal:* when an authenticated Playwright project exists, delete the
+entries and keep the URL assertion.
+
+**Four e2e specs deferred honestly** — `invite-redeem`, `invite-domain-policy`, `ownership-transfer`,
+`authorization-denial`. All need a live Moira **and** an authenticated session; with
+`MOIRA_API_URL=https://moira.invalid` and no storage state each could only navigate, get redirected,
+and assert nothing about the behaviour it names. The denial case is covered at unit level.
+*Reversal:* an authenticated storage state with a mock IdP inside the Playwright environment.
+
+**Corrections to §0.8 found while implementing:** `revoke_admin_invite` is `POST …/{id}/revoke` (there
+is no `DELETE /admin-invites/{id}`); `delete_admin_identity` returns the record, not 204, so a `void`
+typing drops the notice; the ownership `PATCH` reuses `moira.notice.admin_identity_claimed` — there is
+no ownership-transfer notice; `patch_admin_identity` also declares `Idempotency-Key`; and
+**`SECRET_PROP_PATTERN` matches `token`**, so the invite panel cannot take the token as a prop. An
+assertion that `page.content()` omits the token was written, run, and **failed on a correct page** —
+Next serialises the dynamic segment into the RSC router state — so the honest property is "never in
+visible copy".
+
 ## WAVE 4 IS ENGINEERING-COMPLETE — 4A `c98aeb7`, 4B `da384c8`. Only T11 remains, and it is the user's.
 
 **Stage 4B merged** (PR #42, `da384c8`) — per-provider console issuer, N sign-in buttons, a
