@@ -327,6 +327,14 @@ every future dependency opted in by default.
    attribute (`providers/openai/completion/mod.rs:1929`, `providers/anthropic/completion.rs:2467`,
    and the gemini/xai/ollama equivalents). A bare `info` filter, which is an ordinary thing for an
    operator to set, was already enough. The bar was one notch lower than recorded.
+
+   Worth knowing precisely, because it is unintuitive: those call sites read
+   `if tracing::Span::current().is_disabled() { info_span!(…) } else { Span::current() }`. So when
+   Moira's own `execution_attempt` span is live, Rig **reuses it** and its `gen_ai.*` recordings
+   no-op against a span that never declared those fields. The exposure window is therefore
+   *`rig` enabled while Moira's `DEBUG` spans are not* — i.e. exactly a bare `info`, and exactly the
+   configuration an operator reaches for. The guard does not rely on that upstream branch either
+   way: it asserts the property, not Rig's current control flow, which can change in any release.
 2. **The mitigation deliberately has no `INFO`-and-above carve-out**, unlike F16's. In the log
    pipeline level separates content from diagnostics — the body dump is at `TRACE`, failures at
    `WARN` — so keeping `INFO`+ costs nothing. In the span pipeline that separation does not exist:
