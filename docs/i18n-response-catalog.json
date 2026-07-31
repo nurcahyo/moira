@@ -24,6 +24,31 @@
       "description": "Used when a claim targets an (issuer, subject) pair that already holds a grant. Raised by the unique index on admin_identities, so it holds even if the command runner's advisory-lock window is raced."
     },
     {
+      "key": "moira.error.admin_identity_already_revoked",
+      "default_message": "This admin identity has already been revoked.",
+      "description": "Used by DELETE /api/v1/admin/admin-identities/{id} when the target grant is already revoked, and by PATCH when it would change ownership on a revoked grant. A repeat revoke under a fresh Idempotency-Key is the path that reaches it: answering 409 rather than 204 tells the caller their view of the world is stale instead of pretending an action occurred."
+    },
+    {
+      "key": "moira.error.admin_identity_last_primary",
+      "default_message": "This is the last admin identity that can manage other admins.",
+      "description": "Used when clearing is_primary, or revoking a primary grant, would leave zero active primary admins - locking every remaining admin out of admin management and leaving system-key break-glass as the only re-entry path. Transfer ownership to another identity first. This guard is expressible only because ownership is row state: as a scope it would have been implied by moira:admin and held by everyone, leaving nothing to count."
+    },
+    {
+      "key": "moira.error.admin_identity_not_found",
+      "default_message": "The admin identity was not found.",
+      "description": "Used by PATCH and DELETE /api/v1/admin/admin-identities/{id} when no live admin_identities row has that id. Follows the per-resource not-found convention already set by auth_provider_not_found, credential_not_found and route_not_found."
+    },
+    {
+      "key": "moira.error.admin_identity_not_primary",
+      "default_message": "Only a primary admin identity may manage other admin identities.",
+      "description": "Used when a caller who is not a primary admin attempts an ownership transfer or a grant revocation. Ownership is admin_identities.is_primary, not a scope: AuthorizationService::has_scope grants a moira:admin-holding trusted-JWT actor every scope by implication, so a scope could not express 'not every admin'. System-key callers pass this check, because break-glass remains the documented last resort."
+    },
+    {
+      "key": "moira.error.admin_invite_expiry_too_long",
+      "default_message": "The requested invitation lifetime exceeds the maximum allowed.",
+      "description": "Used when a create-invitation request asks for a lifetime above the server-side hard cap of 72 hours. The request is refused rather than clamped: an operator who believes they issued a long-lived invitation and silently received a short one would discover the difference at the worst possible moment."
+    },
+    {
       "key": "moira.error.application_unavailable",
       "default_message": "The application is not available to serve this request.",
       "description": "Used when the request targets an application the caller is not bound to, or one that is not currently active. Retrying will not help until the binding or the application's status is corrected."
@@ -262,6 +287,36 @@
       "key": "moira.error.invalid_request",
       "default_message": "The request is invalid.",
       "description": "Used when the request cannot be parsed or violates a basic contract rule."
+    },
+    {
+      "key": "moira.error.invite_already_consumed",
+      "default_message": "This invitation has already been redeemed.",
+      "description": "Used when an invitation has already produced a grant. Invitations are single-use: the redeeming transaction re-checks the row under select-for-update, so two simultaneous redemptions of the same valid invitation produce exactly one grant and the loser receives this code."
+    },
+    {
+      "key": "moira.error.invite_domain_mismatch",
+      "default_message": "This invitation was issued for a different email domain.",
+      "description": "Used when a domain-constrained invitation is redeemed by a verified address outside that domain. Matching is exact - a parent domain does not admit its subdomains. This is the INVITATION's own constraint and must not be conflated with admin_claim_domain_not_allowed, whose remedy is different."
+    },
+    {
+      "key": "moira.error.invite_email_mismatch",
+      "default_message": "This invitation was issued for a different email address.",
+      "description": "Used when an email-constrained invitation is redeemed by a verified address that is not the one it names. This is the INVITATION's own constraint, never the provider allow-list: the remedy is a reissued invitation, not a widened allow-list, which is why it must not be conflated with admin_claim_domain_not_allowed."
+    },
+    {
+      "key": "moira.error.invite_expired",
+      "default_message": "This invitation has expired.",
+      "description": "Used when an invitation is past its expires_at. Expiry is derived from the timestamp on every read rather than stored as a status, because nothing sweeps for it. The invitation cannot be extended; an admin issues a new one."
+    },
+    {
+      "key": "moira.error.invite_not_found",
+      "default_message": "No invitation matches this token.",
+      "description": "Used when a preview or redemption presents a token that matches no live admin_invites row - either because no row has that prefix, or because the row's Argon2id hash does not verify against the presented token. The two are deliberately indistinguishable on the wire: telling a caller their prefix was right would turn the endpoint into a guessing oracle."
+    },
+    {
+      "key": "moira.error.invite_revoked",
+      "default_message": "This invitation has been revoked.",
+      "description": "Used when an invitation was revoked by an admin before it was redeemed. Distinct from invite_expired because the remedy differs: an expiry is a deadline that passed, a revocation is a deliberate withdrawal."
     },
     {
       "key": "moira.error.jwks_url_rejected",
@@ -591,7 +646,22 @@
     {
       "key": "moira.notice.admin_identity_claimed",
       "default_message": "Admin access has been granted to this identity.",
-      "description": "Used on both the 201 of a fresh admin-identity claim and the 200 of an idempotent replay, which returns the stored body verbatim. The status code, not the notice, distinguishes the two."
+      "description": "Used on both the 201 of a fresh admin-identity claim and the 200 of an idempotent replay, which returns the stored body verbatim. The status code, not the notice, distinguishes the two. Also carried by the admin-identity list and by an ownership transfer, whose response is the same grant record."
+    },
+    {
+      "key": "moira.notice.admin_identity_revoked",
+      "default_message": "Admin access has been revoked for this identity.",
+      "description": "Used on the 200 of DELETE /api/v1/admin/admin-identities/{id}. The revocation is a soft one - status becomes 'revoked' and the row stays - so the response carries the updated record rather than an empty 204, and this notice is what makes that record readable to a human."
+    },
+    {
+      "key": "moira.notice.admin_invite_created",
+      "default_message": "An admin invitation has been created.",
+      "description": "Used on the 201 of POST /api/v1/admin/admin-invites, and on its idempotent replay - which returns the stored body with the token omitted, since the token is shown exactly once."
+    },
+    {
+      "key": "moira.notice.admin_invite_redeemed",
+      "default_message": "The invitation has been redeemed and admin access granted.",
+      "description": "Used on the 201 of POST /api/v1/admin/admin-invites/redeem. Distinct from admin_identity_claimed so a console can tell an invited admin from one granted with the bootstrap system key - the two paths differ in who authorised them."
     },
     {
       "key": "moira.notice.response_accepted",

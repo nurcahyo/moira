@@ -22,7 +22,10 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool, Row};
 use uuid::Uuid;
 
-use crate::{domain::AdminIdentityStatus, error::AppError};
+use crate::{
+    domain::{AdminIdentityStatus, AdminInviteConstraint, AdminInviteStatus, ListCursor},
+    error::AppError,
+};
 
 /// One row of `admin_identities`.
 ///
@@ -40,6 +43,10 @@ pub struct AdminIdentityGrant {
     pub email: Option<String>,
     pub email_verified: bool,
     pub granted_scopes: Vec<String>,
+    /// Ownership as row state (plan 09 decision D1). Read on every ownership mutation
+    /// to answer "may this caller manage other admins", a question a scope could not
+    /// answer because `moira:admin` implies every scope for a trusted-JWT actor.
+    pub is_primary: bool,
     pub status: AdminIdentityStatus,
     pub created_at: DateTime<Utc>,
     pub version: i64,
@@ -57,12 +64,85 @@ pub struct AdminIdentityGrantInsert {
     pub email: String,
     pub email_verified: bool,
     pub granted_scopes: Vec<String>,
-    /// `'system_key'` or `'setup_token'` — recorded honestly. Under D1 only
-    /// `'system_key'` is ever written; the CHECK keeps the other value legal so reversing
-    /// D1 needs no further migration.
+    /// `'system_key'`, `'admin_invite'` or `'setup_token'` — recorded honestly, and the
+    /// CHECK in `migrations/0018` is the enforcement.
+    ///
+    /// The claim path writes `'system_key'` and the redeem path writes `'admin_invite'`.
+    /// They must stay distinguishable: `'system_key'` means the bootstrap break-glass
+    /// credential was presented, which is an event a deployment alerts on, so an invite
+    /// borrowing that value would raise the alarm on every routine onboarding *and* hide
+    /// the real thing among them. `'setup_token'` stays legal but unwritten under D1.
     pub granted_by_actor_type: String,
     pub granted_by_subject: Option<String>,
 }
+
+/// One row of `admin_invites`, with **no** secret material in it.
+///
+/// The token, its Argon2id hash, its prefix and its fingerprint are all deliberately
+/// absent: this is the shape a list, a get, an idempotent replay and the audit metadata
+/// all share, and the only way to keep the token out of every one of them is for the
+/// type they are built from not to carry it. [`AdminInviteCandidate`] is the one place
+/// the hash is read, and it exists solely to verify a presented token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminInviteRow {
+    pub id: Uuid,
+    pub constraint: AdminInviteConstraint,
+    pub value: String,
+    pub status: AdminInviteStatus,
+    pub expires_at: DateTime<Utc>,
+    pub created_by_subject: Option<String>,
+    pub consumed_at: Option<DateTime<Utc>>,
+    pub consumed_subject: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub version: i64,
+}
+
+impl AdminInviteRow {
+    /// Expiry is **derived**, never stored: `admin_invites.status` has no `'expired'`
+    /// value because nothing sweeps for one, so a status column claiming otherwise would
+    /// be a fact no code maintains.
+    pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at <= now
+    }
+}
+
+/// A prefix-matched invite plus the hash needed to verify a presented token.
+///
+/// Separate from [`AdminInviteRow`] so that reading the hash is a distinct, greppable
+/// act rather than a field that travels everywhere the record does.
+#[derive(Debug, Clone)]
+pub struct AdminInviteCandidate {
+    pub record: AdminInviteRow,
+    pub token_hash: String,
+}
+
+/// Everything `insert_invite` needs, gathered so the call site reads as a record.
+#[derive(Debug, Clone)]
+pub struct AdminInviteInsert {
+    pub id: Uuid,
+    pub token_prefix: String,
+    pub token_hash: String,
+    pub fingerprint: String,
+    pub pepper_version: String,
+    pub constraint: AdminInviteConstraint,
+    pub value: String,
+    pub created_by_issuer: Option<String>,
+    pub created_by_subject: Option<String>,
+    /// `'system_key'`, `'trusted_jwt'` or `'dev_admin'` — recorded honestly, so an audit
+    /// can tell a break-glass invite from one an existing admin issued.
+    pub created_by_actor_type: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Serialises every ownership mutation deployment-wide.
+///
+/// The last-primary guard is a *set* predicate ("is there another active primary?"), so
+/// two concurrent clears of two different primaries could each observe the other and
+/// both succeed, leaving zero primaries — the exact lockout the guard exists to prevent.
+/// Row-level `for update` cannot close it without a lock ordering that deadlocks under
+/// the symmetric case, so a single transaction-scoped advisory lock is taken instead.
+/// Ownership transfers are rare operator actions; serialising them costs nothing.
+const OWNERSHIP_LOCK_KEY: i64 = i64::from_be_bytes(*b"moiraown");
 
 #[async_trait]
 pub trait AdminIdentityRepository: Send + Sync {
@@ -125,6 +205,99 @@ pub trait AdminIdentityRepository: Send + Sync {
         conn: &mut PgConnection,
         admin_identity_id: Uuid,
     ) -> Result<(), AppError>;
+
+    // -------------------------------------------------------------------------------
+    // Plan 09 wave 2 — grant administration (plan 07 deferred these three).
+    // -------------------------------------------------------------------------------
+
+    /// Descending `(created_at, id)` keyset over live grants, over-fetching by one — the
+    /// same contract every other admin list follows. Revoked grants are **included**:
+    /// "who used to hold admin" is exactly what an operator auditing an incident needs,
+    /// and hiding them would make the list disagree with the audit log.
+    async fn list_grants(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<AdminIdentityGrant>, AppError>;
+
+    /// Sets or clears ownership, in the caller's transaction, under the ownership lock.
+    ///
+    /// Returns `admin_identity_last_primary` rather than succeeding when clearing the
+    /// flag would leave zero active primaries — the lockout guard, expressible as a
+    /// query only because ownership is row state (decision D1).
+    async fn set_primary(
+        &self,
+        conn: &mut PgConnection,
+        id: Uuid,
+        expected_version: i64,
+        is_primary: bool,
+    ) -> Result<AdminIdentityGrant, AppError>;
+
+    /// **Soft** revoke: `status = 'revoked'`, `revoked_at = now()`. Never a row delete —
+    /// the grant is audit history, and the `(issuer, subject)` uniqueness key must keep
+    /// blocking a silent re-grant.
+    ///
+    /// Deliberately does **not** touch `setup_state.claimed`: setup-required is a
+    /// one-way transition (plan 07), so revoking the last admin leaves system-key
+    /// break-glass as the re-entry path rather than reopening the land-grab window.
+    async fn revoke_grant(
+        &self,
+        conn: &mut PgConnection,
+        id: Uuid,
+    ) -> Result<AdminIdentityGrant, AppError>;
+
+    // -------------------------------------------------------------------------------
+    // Plan 09 wave 2 — invitations.
+    // -------------------------------------------------------------------------------
+
+    async fn insert_invite(
+        &self,
+        conn: &mut PgConnection,
+        insert: &AdminInviteInsert,
+    ) -> Result<AdminInviteRow, AppError>;
+
+    /// The prefix half of prefix-lookup-then-verify.
+    ///
+    /// A pool read, and the **only** query that returns a token hash. Callers must feed
+    /// the result to `ApiKeyHasher::verify`; a prefix match alone proves nothing, since
+    /// the prefix is a plaintext substring of the token.
+    ///
+    /// This is also what bounds the anonymous preview endpoint's cost: a caller with no
+    /// valid prefix gets `Ok(None)` without any Argon2 work.
+    async fn find_invite_by_prefix(
+        &self,
+        token_prefix: &str,
+    ) -> Result<Option<AdminInviteCandidate>, AppError>;
+
+    async fn list_invites(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<AdminInviteRow>, AppError>;
+
+    async fn get_invite(&self, id: Uuid) -> Result<AdminInviteRow, AppError>;
+
+    async fn revoke_invite(
+        &self,
+        conn: &mut PgConnection,
+        id: Uuid,
+    ) -> Result<AdminInviteRow, AppError>;
+
+    /// The single-winner gate: `select … for update`, re-check, then a conditional
+    /// update, all inside the caller's transaction.
+    ///
+    /// The re-check is **not** redundant with the service's pre-envelope validation.
+    /// That validation exists so a *policy* rejection never consumes the invite; this
+    /// one exists so two simultaneous redemptions of the same valid invite produce
+    /// exactly one grant. Removing either reintroduces a different bug.
+    async fn consume_invite(
+        &self,
+        conn: &mut PgConnection,
+        id: Uuid,
+        consumed_issuer: &str,
+        consumed_subject: &str,
+        admin_identity_id: Uuid,
+    ) -> Result<AdminInviteRow, AppError>;
 }
 
 #[derive(Debug, Clone)]
@@ -139,7 +312,18 @@ impl PgAdminIdentityRepository {
 }
 
 const GRANT_COLUMNS: &str = "id, trusted_jwt_issuer_id, issuer, subject, email, email_verified, \
-                             granted_scopes, status, created_at, version";
+                             granted_scopes, is_primary, status, created_at, version";
+
+/// Every column of `admin_invites` that leaves this module, and deliberately none of the
+/// four secret-storage columns. [`INVITE_CANDIDATE_COLUMNS`] is the single exception.
+const INVITE_COLUMNS: &str = "id, email_constraint, domain_constraint, status, expires_at, \
+                              created_by_subject, consumed_at, consumed_subject, created_at, \
+                              version";
+
+/// [`INVITE_COLUMNS`] plus the Argon2id hash, used by exactly one query.
+const INVITE_CANDIDATE_COLUMNS: &str = "id, email_constraint, domain_constraint, status, \
+                                        expires_at, created_by_subject, consumed_at, \
+                                        consumed_subject, created_at, version, token_hash";
 
 #[async_trait]
 impl AdminIdentityRepository for PgAdminIdentityRepository {
@@ -233,6 +417,413 @@ impl AdminIdentityRepository for PgAdminIdentityRepository {
         .await?;
         Ok(())
     }
+
+    async fn list_grants(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<AdminIdentityGrant>, AppError> {
+        let (keyset, limit_param) = match cursor {
+            Some(_) => ("and (created_at, id) < ($1::timestamptz, $2::uuid)", "$3"),
+            None => ("", "$1"),
+        };
+        let sql = format!(
+            "select {GRANT_COLUMNS} from admin_identities \
+             where deleted_at is null {keyset} \
+             order by created_at desc, id desc limit {limit_param}"
+        );
+        let query = sqlx::query(&sql);
+        let query = match cursor {
+            Some(cursor) => query.bind(cursor.ts).bind(cursor.id),
+            None => query,
+        };
+        let rows = query
+            .bind(limit.saturating_add(1))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(grant_from_row).collect()
+    }
+
+    async fn set_primary(
+        &self,
+        conn: &mut PgConnection,
+        id: Uuid,
+        expected_version: i64,
+        is_primary: bool,
+    ) -> Result<AdminIdentityGrant, AppError> {
+        take_ownership_lock(conn).await?;
+        let current = lock_grant(conn, id).await?;
+        if current.status != AdminIdentityStatus::Active {
+            // Promoting a revoked identity would create an owner who cannot authenticate;
+            // demoting one is a no-op dressed as an action. Both are the same conflict.
+            return Err(already_revoked(id));
+        }
+        if current.version != expected_version {
+            return Err(version_conflict());
+        }
+        if current.is_primary && !is_primary {
+            require_another_active_primary(conn, id).await?;
+        }
+
+        let row = sqlx::query(&format!(
+            "update admin_identities set is_primary = $2 \
+             where id = $1 and deleted_at is null and version = $3 \
+             returning {GRANT_COLUMNS}"
+        ))
+        .bind(id)
+        .bind(is_primary)
+        .bind(expected_version)
+        .fetch_optional(conn)
+        .await?
+        .ok_or_else(version_conflict)?;
+        grant_from_row(&row)
+    }
+
+    async fn revoke_grant(
+        &self,
+        conn: &mut PgConnection,
+        id: Uuid,
+    ) -> Result<AdminIdentityGrant, AppError> {
+        take_ownership_lock(conn).await?;
+        let current = lock_grant(conn, id).await?;
+        if current.status != AdminIdentityStatus::Active {
+            // The pinned emitter for `admin_identity_already_revoked` (plan 09 §0.5): a
+            // repeat revoke under a fresh `Idempotency-Key` is exactly this path. A `204`
+            // here would leave the code with no emitter at all, which §0.5 says is a
+            // reason to drop it rather than to keep it uncovered.
+            return Err(already_revoked(id));
+        }
+        if current.is_primary {
+            require_another_active_primary(conn, id).await?;
+        }
+
+        let row = sqlx::query(&format!(
+            "update admin_identities \
+             set status = 'revoked', revoked_at = now(), is_primary = false \
+             where id = $1 and deleted_at is null and status = 'active' \
+             returning {GRANT_COLUMNS}"
+        ))
+        .bind(id)
+        .fetch_optional(conn)
+        .await?
+        .ok_or_else(|| already_revoked(id))?;
+        grant_from_row(&row)
+    }
+
+    async fn insert_invite(
+        &self,
+        conn: &mut PgConnection,
+        insert: &AdminInviteInsert,
+    ) -> Result<AdminInviteRow, AppError> {
+        let (email_constraint, domain_constraint) = match insert.constraint {
+            AdminInviteConstraint::Email => (Some(insert.value.as_str()), None),
+            AdminInviteConstraint::Domain => (None, Some(insert.value.as_str())),
+        };
+        let row = sqlx::query(&format!(
+            r#"
+            insert into admin_invites
+                (id, token_prefix, token_hash, fingerprint, pepper_version,
+                 email_constraint, domain_constraint, created_by_issuer, created_by_subject,
+                 created_by_actor_type, expires_at)
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            returning {INVITE_COLUMNS}
+            "#
+        ))
+        .bind(insert.id)
+        .bind(&insert.token_prefix)
+        .bind(&insert.token_hash)
+        .bind(&insert.fingerprint)
+        .bind(&insert.pepper_version)
+        .bind(email_constraint)
+        .bind(domain_constraint)
+        .bind(&insert.created_by_issuer)
+        .bind(&insert.created_by_subject)
+        .bind(&insert.created_by_actor_type)
+        .bind(insert.expires_at)
+        .fetch_one(conn)
+        .await?;
+        invite_from_row(&row)
+    }
+
+    async fn find_invite_by_prefix(
+        &self,
+        token_prefix: &str,
+    ) -> Result<Option<AdminInviteCandidate>, AppError> {
+        let row = sqlx::query(&format!(
+            "select {INVITE_CANDIDATE_COLUMNS} from admin_invites \
+             where token_prefix = $1 and deleted_at is null"
+        ))
+        .bind(token_prefix)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref()
+            .map(|row| {
+                Ok(AdminInviteCandidate {
+                    record: invite_from_row(row)?,
+                    token_hash: row.try_get("token_hash")?,
+                })
+            })
+            .transpose()
+    }
+
+    async fn list_invites(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<AdminInviteRow>, AppError> {
+        let (keyset, limit_param) = match cursor {
+            Some(_) => ("and (created_at, id) < ($1::timestamptz, $2::uuid)", "$3"),
+            None => ("", "$1"),
+        };
+        let sql = format!(
+            "select {INVITE_COLUMNS} from admin_invites \
+             where deleted_at is null {keyset} \
+             order by created_at desc, id desc limit {limit_param}"
+        );
+        let query = sqlx::query(&sql);
+        let query = match cursor {
+            Some(cursor) => query.bind(cursor.ts).bind(cursor.id),
+            None => query,
+        };
+        let rows = query
+            .bind(limit.saturating_add(1))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(invite_from_row).collect()
+    }
+
+    async fn get_invite(&self, id: Uuid) -> Result<AdminInviteRow, AppError> {
+        let row = sqlx::query(&format!(
+            "select {INVITE_COLUMNS} from admin_invites where id = $1 and deleted_at is null"
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(invite_not_found)?;
+        invite_from_row(&row)
+    }
+
+    async fn revoke_invite(
+        &self,
+        conn: &mut PgConnection,
+        id: Uuid,
+    ) -> Result<AdminInviteRow, AppError> {
+        let row = sqlx::query(&format!(
+            "update admin_invites set status = 'revoked', revoked_at = now() \
+             where id = $1 and deleted_at is null and status = 'pending' \
+             returning {INVITE_COLUMNS}"
+        ))
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        match row {
+            Some(row) => invite_from_row(&row),
+            // Distinguish "no such invite" from "already consumed/revoked" rather than
+            // collapsing both onto 404, because the operator's next action differs.
+            None => {
+                let existing = sqlx::query_scalar::<_, String>(
+                    "select status from admin_invites where id = $1 and deleted_at is null",
+                )
+                .bind(id)
+                .fetch_optional(conn)
+                .await?;
+                Err(match existing.as_deref() {
+                    Some("consumed") => already_consumed(),
+                    Some("revoked") => invite_revoked(),
+                    _ => invite_not_found(),
+                })
+            }
+        }
+    }
+
+    async fn consume_invite(
+        &self,
+        conn: &mut PgConnection,
+        id: Uuid,
+        consumed_issuer: &str,
+        consumed_subject: &str,
+        admin_identity_id: Uuid,
+    ) -> Result<AdminInviteRow, AppError> {
+        let locked = sqlx::query(&format!(
+            "select {INVITE_COLUMNS} from admin_invites \
+             where id = $1 and deleted_at is null for update"
+        ))
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(invite_not_found)?;
+        let locked = invite_from_row(&locked)?;
+        match locked.status {
+            AdminInviteStatus::Consumed => return Err(already_consumed()),
+            AdminInviteStatus::Revoked => return Err(invite_revoked()),
+            AdminInviteStatus::Pending => {}
+        }
+        if locked.is_expired(Utc::now()) {
+            return Err(invite_expired());
+        }
+
+        let row = sqlx::query(&format!(
+            "update admin_invites \
+             set status = 'consumed', consumed_at = now(), consumed_issuer = $2, \
+                 consumed_subject = $3, consumed_admin_identity_id = $4 \
+             where id = $1 and deleted_at is null and status = 'pending' \
+             returning {INVITE_COLUMNS}"
+        ))
+        .bind(id)
+        .bind(consumed_issuer)
+        .bind(consumed_subject)
+        .bind(admin_identity_id)
+        .fetch_optional(conn)
+        .await?
+        .ok_or_else(already_consumed)?;
+        invite_from_row(&row)
+    }
+}
+
+/// Serialises every ownership decision; see [`OWNERSHIP_LOCK_KEY`].
+async fn take_ownership_lock(conn: &mut PgConnection) -> Result<(), AppError> {
+    sqlx::query("select pg_advisory_xact_lock($1)")
+        .bind(OWNERSHIP_LOCK_KEY)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// Reads the target grant under `for update`, so the version check and the
+/// last-primary count both see a row nobody else can move underneath them.
+async fn lock_grant(conn: &mut PgConnection, id: Uuid) -> Result<AdminIdentityGrant, AppError> {
+    let row = sqlx::query(&format!(
+        "select {GRANT_COLUMNS} from admin_identities \
+         where id = $1 and deleted_at is null for update"
+    ))
+    .bind(id)
+    .fetch_optional(conn)
+    .await?
+    .ok_or_else(|| grant_not_found(id))?;
+    grant_from_row(&row)
+}
+
+/// The last-primary guard, as a query.
+///
+/// This is the concrete payoff of decision D1. Under plan 09's original scope design the
+/// question "who else is primary" answered *"everyone, by implication"*, because
+/// `moira:admin` implies every scope for a trusted-JWT actor — so there was nothing to
+/// count and no guard to write.
+async fn require_another_active_primary(
+    conn: &mut PgConnection,
+    excluding: Uuid,
+) -> Result<(), AppError> {
+    let other = sqlx::query_scalar::<_, Uuid>(
+        "select id from admin_identities \
+         where deleted_at is null and status = 'active' and is_primary and id <> $1 limit 1",
+    )
+    .bind(excluding)
+    .fetch_optional(conn)
+    .await?;
+    if other.is_some() {
+        Ok(())
+    } else {
+        Err(AppError::conflict(
+            "admin_identity_last_primary",
+            "this is the last admin identity that can manage other admins",
+        ))
+    }
+}
+
+fn version_conflict() -> AppError {
+    AppError::conflict(
+        "resource_version_conflict",
+        "resource version does not match If-Match",
+    )
+}
+
+fn grant_not_found(id: Uuid) -> AppError {
+    AppError::coded(
+        StatusCode::NOT_FOUND,
+        "admin_identity_not_found",
+        format!("admin identity {id} was not found"),
+    )
+}
+
+fn already_revoked(id: Uuid) -> AppError {
+    AppError::conflict(
+        "admin_identity_already_revoked",
+        format!("admin identity {id} has already been revoked"),
+    )
+}
+
+fn invite_not_found() -> AppError {
+    AppError::coded(
+        StatusCode::NOT_FOUND,
+        "invite_not_found",
+        "no invitation matches this token",
+    )
+}
+
+fn already_consumed() -> AppError {
+    AppError::conflict(
+        "invite_already_consumed",
+        "this invitation has already been redeemed",
+    )
+}
+
+fn invite_revoked() -> AppError {
+    AppError::coded(
+        StatusCode::FORBIDDEN,
+        "invite_revoked",
+        "this invitation has been revoked",
+    )
+}
+
+fn invite_expired() -> AppError {
+    AppError::coded(
+        StatusCode::FORBIDDEN,
+        "invite_expired",
+        "this invitation has expired",
+    )
+}
+
+fn invite_from_row(row: &sqlx::postgres::PgRow) -> Result<AdminInviteRow, AppError> {
+    let email_constraint: Option<String> = row.try_get("email_constraint")?;
+    let domain_constraint: Option<String> = row.try_get("domain_constraint")?;
+    // `admin_invites_exactly_one_constraint` makes the both-null and both-set cases
+    // unrepresentable, so reaching the error arm means the CHECK was dropped. Saying so
+    // beats inventing a default that would silently widen an invite's audience.
+    let (constraint, value) = match (email_constraint, domain_constraint) {
+        (Some(email), None) => (AdminInviteConstraint::Email, email),
+        (None, Some(domain)) => (AdminInviteConstraint::Domain, domain),
+        _ => {
+            return Err(AppError::Internal(
+                "admin_invites row carries neither exactly one constraint".to_string(),
+            ));
+        }
+    };
+    Ok(AdminInviteRow {
+        id: row.try_get("id")?,
+        constraint,
+        value,
+        status: invite_status_from_db(row.try_get::<String, _>("status")?)?,
+        expires_at: row.try_get("expires_at")?,
+        created_by_subject: row.try_get("created_by_subject")?,
+        consumed_at: row.try_get("consumed_at")?,
+        consumed_subject: row.try_get("consumed_subject")?,
+        created_at: row.try_get("created_at")?,
+        version: row.try_get("version")?,
+    })
+}
+
+/// `'expired'` is deliberately not handled, because `0017`'s CHECK makes it illegal:
+/// expiry is derived from `expires_at`. Mapping an unknown value onto `Pending` would
+/// make an unredeemable invite look redeemable.
+fn invite_status_from_db(value: String) -> Result<AdminInviteStatus, AppError> {
+    match value.as_str() {
+        "pending" => Ok(AdminInviteStatus::Pending),
+        "consumed" => Ok(AdminInviteStatus::Consumed),
+        "revoked" => Ok(AdminInviteStatus::Revoked),
+        _ => Err(AppError::Internal(format!(
+            "unknown admin invite status {value}"
+        ))),
+    }
 }
 
 /// The `409` that `admin_identities_issuer_subject_active_unique` produces.
@@ -259,17 +850,19 @@ fn grant_from_row(row: &sqlx::postgres::PgRow) -> Result<AdminIdentityGrant, App
         email: row.try_get("email")?,
         email_verified: row.try_get("email_verified")?,
         granted_scopes: row.try_get("granted_scopes")?,
+        is_primary: row.try_get("is_primary")?,
         status: admin_identity_status_from_db(row.try_get::<String, _>("status")?)?,
         created_at: row.try_get("created_at")?,
         version: row.try_get("version")?,
     })
 }
 
-/// `'deleted'` is a legal column value that no query in this module can return —
-/// `find_active_grant` filters `status = 'active'`, and `insert_grant` returns a row that
-/// has just taken the `'active'` default. Mapping it onto `Revoked` would be a lie about
-/// what the database says, so it is an internal error instead of a plausible-looking
-/// answer.
+/// `'deleted'` is a legal column value that nothing writes: `find_active_grant` filters
+/// `status = 'active'`, `insert_grant` returns a row that has just taken the `'active'`
+/// default, and `revoke_grant` writes `'revoked'`. `list_grants` is the one query that
+/// projects the column unfiltered, so a hand-written `'deleted'` row would reach here —
+/// and erroring is the right answer. Mapping it onto `Revoked` would be a lie about what
+/// the database says, and mapping it onto `Active` would show a stripped grant as live.
 fn admin_identity_status_from_db(value: String) -> Result<AdminIdentityStatus, AppError> {
     match value.as_str() {
         "active" => Ok(AdminIdentityStatus::Active),
@@ -310,6 +903,89 @@ mod tests {
                 "the grant projection must not select {forbidden}"
             );
         }
+    }
+
+    /// The invite projection every read path shares must never carry the token, its
+    /// hash, its prefix or its fingerprint. `INVITE_CANDIDATE_COLUMNS` is the single
+    /// deliberate exception, and it exists only so a presented token can be verified.
+    #[test]
+    fn invite_columns_never_select_secret_material() {
+        for forbidden in [
+            "token_hash",
+            "token_prefix",
+            "fingerprint",
+            "pepper_version",
+        ] {
+            assert!(
+                !INVITE_COLUMNS.contains(forbidden),
+                "the invite projection must not select {forbidden}"
+            );
+        }
+        assert!(
+            INVITE_CANDIDATE_COLUMNS.contains("token_hash"),
+            "the verification projection is the one place the hash is read"
+        );
+        for forbidden in ["token_prefix", "fingerprint", "pepper_version"] {
+            assert!(
+                !INVITE_CANDIDATE_COLUMNS.contains(forbidden),
+                "even the verification projection must not select {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn invite_status_parsing_rejects_a_status_no_migration_allows() {
+        assert_eq!(
+            invite_status_from_db("pending".to_string()).expect("pending parses"),
+            AdminInviteStatus::Pending
+        );
+        assert_eq!(
+            invite_status_from_db("consumed".to_string()).expect("consumed parses"),
+            AdminInviteStatus::Consumed
+        );
+        assert_eq!(
+            invite_status_from_db("revoked".to_string()).expect("revoked parses"),
+            AdminInviteStatus::Revoked
+        );
+        // `0017` deliberately omits `'expired'`: expiry is derived from `expires_at`,
+        // because nothing sweeps for it. A silent mapping onto `Pending` here would make
+        // an unredeemable invite read as redeemable.
+        assert!(invite_status_from_db("expired".to_string()).is_err());
+    }
+
+    /// Expiry is a comparison against `expires_at`, never a stored status — `0017`'s
+    /// CHECK has no `'expired'` value precisely because nothing sweeps for one. The
+    /// boundary is asserted too: `expires_at` is the first instant the invite is dead,
+    /// not the last instant it is alive, so a token cannot be redeemed on its deadline.
+    #[test]
+    fn expiry_is_derived_from_the_timestamp_not_from_a_status() {
+        let deadline = Utc::now();
+        let row = AdminInviteRow {
+            id: Uuid::nil(),
+            constraint: AdminInviteConstraint::Domain,
+            value: "example.com".to_string(),
+            status: AdminInviteStatus::Pending,
+            expires_at: deadline,
+            created_by_subject: None,
+            consumed_at: None,
+            consumed_subject: None,
+            created_at: deadline - chrono::Duration::hours(1),
+            version: 1,
+        };
+        assert!(!row.is_expired(deadline - chrono::Duration::seconds(1)));
+        assert!(row.is_expired(deadline), "the deadline itself is expired");
+        assert!(row.is_expired(deadline + chrono::Duration::seconds(1)));
+        // The status is untouched by any of that: a pending row stays pending, which is
+        // why every read path derives rather than trusting the column.
+        assert_eq!(row.status, AdminInviteStatus::Pending);
+    }
+
+    /// The ownership lock is a shared constant, not a per-call-site number: two callers
+    /// hashing "ownership" differently would each hold a lock the other ignores, and the
+    /// last-primary guard would be back to racing.
+    #[test]
+    fn the_ownership_lock_key_is_a_single_stable_constant() {
+        assert_eq!(OWNERSHIP_LOCK_KEY, i64::from_be_bytes(*b"moiraown"));
     }
 
     #[test]

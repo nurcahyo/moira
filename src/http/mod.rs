@@ -481,6 +481,27 @@ fn admin_routes() -> OpenApiRouter<AppState> {
         // authenticates in its own body.
         .routes(routes!(identity::get_setup_claim_status))
         .routes(routes!(identity::claim_admin_identity))
+        // Plan 09 wave 2. Registered here, in `admin_routes`, for the reason stated
+        // above and restated as a prohibition in `src/http/identity.rs`: plan 09's body
+        // puts `admin-invites/{preview,redeem}` outside `/api/v1/admin/*`, which would
+        // drop the admin strip, the admin body limit and the admin timeout. `preview` is
+        // anonymous — credentialed by the invitation token in its body — and stays under
+        // the prefix for exactly the reason `claim-status` and `sign-in-methods` do.
+        .routes(routes!(
+            identity::list_admin_invites,
+            identity::create_admin_invite
+        ))
+        // Registered before the `{id}` routes so the static segments are unambiguous to
+        // a reader; `matchit` prioritises statics regardless of insertion order.
+        .routes(routes!(identity::preview_admin_invite))
+        .routes(routes!(identity::redeem_admin_invite))
+        .routes(routes!(identity::get_admin_invite))
+        .routes(routes!(identity::revoke_admin_invite))
+        .routes(routes!(identity::list_admin_identities))
+        .routes(routes!(
+            identity::patch_admin_identity,
+            identity::delete_admin_identity
+        ))
         .routes(routes!(auth_settings::get_setup_auth_methods))
         // Also intentionally unauthenticated (finding F15), and registered here for the same
         // reason as `get_setup_claim_status`: the admin prefix is what keeps it inside the
@@ -657,6 +678,13 @@ mod tests {
             "/api/v1/admin/auth/providers/{id}",
             "/api/v1/admin/auth/providers/{id}/enable",
             "/api/v1/admin/auth/providers/{id}/disable",
+            "/api/v1/admin/admin-invites",
+            "/api/v1/admin/admin-invites/preview",
+            "/api/v1/admin/admin-invites/redeem",
+            "/api/v1/admin/admin-invites/{id}",
+            "/api/v1/admin/admin-invites/{id}/revoke",
+            "/api/v1/admin/admin-identities",
+            "/api/v1/admin/admin-identities/{id}",
             "/api/v1/admin/applications",
             "/api/v1/admin/applications/{id}",
             "/api/v1/admin/applications/{id}/enable",
@@ -739,8 +767,9 @@ mod tests {
                 );
             }
         }
-        // 141 + the anonymous `GET /api/v1/admin/setup/sign-in-methods` (finding F15).
-        assert_eq!(operation_count, 142);
+        // 142 + plan 09 wave 2's nine: create/list/get/revoke an admin invitation,
+        // preview and redeem one, and list/patch/delete an admin identity grant.
+        assert_eq!(operation_count, 151);
     }
 
     #[test]
@@ -874,6 +903,34 @@ mod tests {
             // redirected to. An anonymous caller learns nothing it could not learn by
             // clicking the button, which is precisely the standard `claim-status` set.
             ("/api/v1/admin/setup/sign-in-methods", "get"),
+            // The third, added for plan 09 wave 2's invitation preview. **The line has
+            // moved, and this is the explanation the comment above demands.**
+            //
+            // The two operations above it are unauthenticated because their *response*
+            // is public by inference. This one is not: it describes a specific
+            // invitation. It is on this list because it is credentialed by something
+            // OpenAPI's `security` vocabulary cannot express — a 32-byte `OsRng` bearer
+            // secret carried in the request **body**. There is no `securityScheme` for
+            // "a secret in a JSON field", so declaring one here would be a false
+            // statement about how the operation is protected; an empty `security` array
+            // plus this note is the honest encoding.
+            //
+            // Why the token must be the credential rather than a scope: the visitor
+            // opens `/invite/<token>` *before* signing in, so the credential a scope
+            // check would demand is the one signing in produces. That is finding F15's
+            // circularity, in the one place plan 09 makes it blocking.
+            //
+            // What an anonymous caller can obtain, applying the information-content test
+            // the comment above establishes: the invitation's own constraint (the
+            // address or domain it was issued for) and its expiry — and only for the
+            // invitation whose secret they already hold. No inviter, no identifier, no
+            // deployment detail, no `allowed_email_domains`, nothing about any other
+            // invitation. A caller without a valid token is refused at the indexed
+            // prefix lookup before any Argon2 verification runs, so this is not an
+            // unauthenticated CPU-exhaustion oracle either.
+            //
+            // Anyone adding a fourth entry must still explain themselves here.
+            ("/api/v1/admin/admin-invites/preview", "post"),
         ];
 
         for (path, item) in paths {
@@ -919,6 +976,13 @@ mod tests {
                         // accepting a bearer JWT here would make "the first successful
                         // admin JWT wins" possible on a fresh deployment.
                         "/api/v1/admin/setup/claim" => BTreeSet::from(["systemKeyAuth"]),
+                        // Bearer only, and that narrowness is again the security
+                        // property. Redemption binds a grant to a concrete
+                        // `(issuer, subject)`, and neither a system key nor a consumer
+                        // key carries one — accepting either would mean guessing whom
+                        // the grant is for. `verify_trusted_jwt_identity` refuses both
+                        // explicitly rather than ignoring them.
+                        "/api/v1/admin/admin-invites/redeem" => BTreeSet::from(["bearerAuth"]),
                         _ => BTreeSet::from(["bearerAuth", "consumerKeyAuth", "systemKeyAuth"]),
                     };
                     assert_eq!(
@@ -964,27 +1028,91 @@ mod tests {
         }
     }
 
+    /// Every operation that returns a secret exactly once, and the envelope schema it
+    /// returns it in.
+    ///
+    /// Plan 09's invitation token joins the API keys here rather than getting an envelope
+    /// of its own shape: `AdminInviteSecretResponse` carries the same `resource` /
+    /// `secret` / `secret_retrievable` triple, so the assertions below apply unchanged
+    /// and a future once-only secret has one pattern to copy rather than two.
+    const ONCE_ONLY_SECRET_OPERATIONS: [(&str, &str, &str, &str); 5] = [
+        (
+            "/api/v1/admin/system-keys",
+            "post",
+            "201",
+            "ApiKeySecretResponse",
+        ),
+        (
+            "/api/v1/admin/system-keys/{id}/rotate",
+            "post",
+            "200",
+            "ApiKeySecretResponse",
+        ),
+        (
+            "/api/v1/admin/consumer-keys",
+            "post",
+            "201",
+            "ApiKeySecretResponse",
+        ),
+        (
+            "/api/v1/admin/consumer-keys/{id}/rotate",
+            "post",
+            "200",
+            "ApiKeySecretResponse",
+        ),
+        (
+            "/api/v1/admin/admin-invites",
+            "post",
+            "201",
+            "AdminInviteSecretResponse",
+        ),
+    ];
+
     #[test]
     fn once_only_key_responses_use_the_secret_envelope() {
         let value = serde_json::to_value(documented_router(RouterPolicy::default()).into_openapi())
             .unwrap();
-        for (path, method, status) in [
-            ("/api/v1/admin/system-keys", "post", "201"),
-            ("/api/v1/admin/system-keys/{id}/rotate", "post", "200"),
-            ("/api/v1/admin/consumer-keys", "post", "201"),
-            ("/api/v1/admin/consumer-keys/{id}/rotate", "post", "200"),
-        ] {
+        let mut envelopes = BTreeSet::new();
+        for (path, method, status, schema) in ONCE_ONLY_SECRET_OPERATIONS {
             assert_eq!(
                 value["paths"][path][method]["responses"][status]["content"]["application/json"]["schema"]
                     ["$ref"],
-                "#/components/schemas/ApiKeySecretResponse",
-                "unexpected once-only key response for {method} {path}"
+                format!("#/components/schemas/{schema}"),
+                "unexpected once-only secret response for {method} {path}"
+            );
+            envelopes.insert(schema);
+        }
+
+        for envelope in envelopes {
+            let secret_schema = &value["components"]["schemas"][envelope];
+            assert!(
+                secret_schema["properties"]["secret"].is_object(),
+                "{envelope} must carry the once-only `secret` field"
+            );
+            assert!(
+                secret_schema["properties"]["secret_retrievable"].is_object(),
+                "{envelope} must carry `secret_retrievable`"
             );
         }
 
-        let secret_schema = &value["components"]["schemas"]["ApiKeySecretResponse"];
-        assert!(secret_schema["properties"]["secret"].is_object());
-        assert!(secret_schema["properties"]["secret_retrievable"].is_object());
+        // The invitation record embedded in that envelope — and returned on its own by
+        // list, get, revoke and every idempotent replay — must never carry the token or
+        // anything derived from it. This is the schema-level half of
+        // `invite_columns_never_select_secret_material`.
+        let invite_record = &value["components"]["schemas"]["AdminInviteRecord"]["properties"];
+        for forbidden in [
+            "token",
+            "secret",
+            "token_hash",
+            "token_prefix",
+            "fingerprint",
+            "pepper_version",
+        ] {
+            assert!(
+                invite_record[forbidden].is_null(),
+                "AdminInviteRecord must not publish {forbidden}"
+            );
+        }
     }
 
     #[test]
@@ -1034,6 +1162,39 @@ mod tests {
             ("/api/v1/admin/jwt-issuers", "post", "201", false, false),
             ("/api/v1/admin/setup/claim", "post", "201", false, false),
             ("/api/v1/admin/auth/providers", "post", "201", false, false),
+            // Plan 09 wave 2. `Idempotency-Key` matters more here than on most admin
+            // writes: without replay, a retried create mints a second live invitation
+            // whose token the operator never saw, and a retried redeem would race a
+            // second grant against the invite's single-use gate.
+            ("/api/v1/admin/admin-invites", "post", "201", false, true),
+            (
+                "/api/v1/admin/admin-invites/{id}/revoke",
+                "post",
+                "200",
+                false,
+                false,
+            ),
+            (
+                "/api/v1/admin/admin-invites/redeem",
+                "post",
+                "201",
+                false,
+                false,
+            ),
+            (
+                "/api/v1/admin/admin-identities/{id}",
+                "patch",
+                "200",
+                true,
+                false,
+            ),
+            (
+                "/api/v1/admin/admin-identities/{id}",
+                "delete",
+                "200",
+                false,
+                false,
+            ),
         ];
 
         for (path, method, success_status, requires_if_match, once_only_secret) in operations {
@@ -1115,7 +1276,12 @@ mod tests {
     ///
     /// `false` is reserved for preconditions that are genuinely advisory: the provider
     /// runtime-policy `PUT` reads the header through `optional_if_match`.
-    const IF_MATCH_OPERATIONS: [(&str, &str, bool); 40] = [
+    const IF_MATCH_OPERATIONS: [(&str, &str, bool); 41] = [
+        // Plan 09 wave 2. Ownership transfer takes a required precondition and grant
+        // revocation deliberately does not: a `PATCH` that flips a flag is a lost-update
+        // hazard, while a soft revoke is idempotent in intent and answers a repeat with
+        // `admin_identity_already_revoked` rather than silently re-applying.
+        ("/api/v1/admin/admin-identities/{id}", "patch", true),
         ("/api/v1/admin/agent-profiles/{id}", "delete", true),
         ("/api/v1/admin/agent-profiles/{id}", "patch", true),
         ("/api/v1/admin/agent-profiles/{id}/disable", "post", true),

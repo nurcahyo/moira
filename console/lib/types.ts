@@ -287,6 +287,19 @@ export interface AdminIdentityRecord {
   created_at: string;
   version: number;
   notice: ResponseText;
+  /**
+   * Ownership, as **row state rather than a scope** (plan 09 wave 2).
+   *
+   * `moira:admins:manage` was specified as a scope `moira:admin` must not imply, and that
+   * is unimplementable: `AuthorizationService::has_scope` has no per-scope opt-out, and every
+   * admin identity is granted `moira:admin`, so such a scope would have been satisfied by
+   * everyone and the ownership model built on it would have been decorative.
+   *
+   * **Do not render this as a capability the signed-in user has.** It is a property of the
+   * row, and the transfer endpoint checks it server-side; a console that treats it as a
+   * permission will disagree with Moira the moment a non-primary admin looks at the screen.
+   */
+  is_primary: boolean;
 }
 
 export const ADMIN_IDENTITY_RECORD_CONTRACT = {
@@ -302,6 +315,7 @@ export const ADMIN_IDENTITY_RECORD_CONTRACT = {
     "created_at",
     "version",
     "notice",
+    "is_primary",
   ],
   optional: [],
 } as const satisfies SchemaContract;

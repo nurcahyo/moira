@@ -15,6 +15,8 @@
 use std::sync::Arc;
 
 use axum::http::StatusCode;
+use chrono::{Duration, Utc};
+use secrecy::ExposeSecret;
 use serde_json::json;
 use uuid::Uuid;
 
@@ -22,21 +24,50 @@ use crate::{
     app::AppState,
     application::{
         AdminCommandMutation, AdminCommandRunner, RequestContext,
-        admin::shared::{admin_command_spec, command_hasher, require_non_empty, success_audit},
+        admin::shared::{
+            PageRequest, admin_command_spec, command_hasher, paginate, require_non_empty,
+            success_audit,
+        },
     },
     domain::{
-        AdminIdentityRecord, ClaimAdminIdentityRequest, ResponseText, SetupClaimStatusResponse,
+        AdminIdentityPatchRequest, AdminIdentityRecord, AdminInviteConstraint,
+        AdminInviteCreateRequest, AdminInvitePreviewRequest, AdminInvitePreviewResponse,
+        AdminInviteRecord, AdminInviteRedeemRequest, AdminInviteSecretResponse, AdminInviteStatus,
+        ClaimAdminIdentityRequest, CursorScope, ListCursor, ListResponse,
+        MAX_INVITE_EXPIRY_SECONDS, MIN_INVITE_EXPIRY_SECONDS, ResponseText,
+        SetupClaimStatusResponse,
     },
     error::AppError,
     infra::repositories::{
-        AdminIdentityGrant, AdminIdentityGrantInsert, AdminIdentityRepository,
-        AuthProviderSettingsRepository, GoverningAuthPolicy, PgAdminIdentityRepository,
-        PgAdminRepository, PgAuthProviderSettingsRepository,
+        AdminIdentityGrant, AdminIdentityGrantInsert, AdminIdentityRepository, AdminInviteInsert,
+        AdminInviteRow, AuthProviderSettingsRepository, GoverningAuthPolicy,
+        PgAdminIdentityRepository, PgAdminRepository, PgAuthProviderSettingsRepository,
     },
-    security::{Actor, ActorType, AuthorizationService},
+    security::{Actor, ActorType, AuthorizationService, TrustedJwtIdentity},
 };
 
 const ADMIN_IDENTITY_CLAIMED_NOTICE: &str = "moira.notice.admin_identity_claimed";
+const ADMIN_INVITE_CREATED_NOTICE: &str = "moira.notice.admin_invite_created";
+const ADMIN_INVITE_REDEEMED_NOTICE: &str = "moira.notice.admin_invite_redeemed";
+const ADMIN_IDENTITY_REVOKED_NOTICE: &str = "moira.notice.admin_identity_revoked";
+
+/// The token namespace, in the same shape as `moira_sys` / `moira_cons`.
+///
+/// It is a *prefix on the plaintext*, so an invite token is visually distinguishable
+/// from an API key in a paste buffer or a log line someone is about to redact.
+const ADMIN_INVITE_NAMESPACE: &str = "moira_inv";
+
+/// The value `admin_identities.granted_by_actor_type` carries for an invite-created grant.
+///
+/// A constant rather than an inline literal because the string is a **schema** value:
+/// `migrations/0018`'s CHECK is the other half of it, and a typo here would surface as a
+/// database constraint violation on the redeem path rather than as a compile error.
+const ADMIN_INVITE_ACTOR_TYPE: &str = "admin_invite";
+
+/// Separate cursor scopes, so a cursor issued for one list cannot be replayed against
+/// the other.
+const ADMIN_INVITES_CURSOR: CursorScope = CursorScope::new("admin.admin_invites");
+const ADMIN_IDENTITIES_CURSOR: CursorScope = CursorScope::new("admin.admin_identities");
 
 /// The credential a claim was submitted under.
 ///
@@ -204,6 +235,880 @@ impl<'a> AdminIdentityService<'a> {
 
         Ok((outcome.response, outcome.replayed))
     }
+
+    // ===================================================================================
+    // Plan 09 wave 2 — invitations.
+    //
+    // The gap this closes is **not** "Moira only supports one admin": `claim` above has
+    // no `setup_claimed` precondition and `mark_setup_claimed` is a no-op on the second
+    // call, so an operator holding the bootstrap system key can already grant N admins.
+    // The gap is that there is no **non-system-key** path to a grant, which means the
+    // break-glass credential can never be retired.
+    // ===================================================================================
+
+    /// Mints a single-use, time-limited, email- or domain-bound invite token.
+    ///
+    /// The token is hashed with [`crate::security::ApiKeyHasher`] — Argon2id with the
+    /// deployment pepper — exactly as system and consumer keys are, and deliberately
+    /// **not** with a bare SHA-256 (finding P1-1). Reusing the hasher rather than adding
+    /// a second scheme is the point: there is one place in Moira where a bearer secret
+    /// is hashed.
+    pub async fn create_invite(
+        &self,
+        actor: &Actor,
+        issuer: Option<&str>,
+        ctx: &RequestContext,
+        request: AdminInviteCreateRequest,
+    ) -> Result<(AdminInviteSecretResponse, bool), AppError> {
+        self.state.authz.require(actor, "moira:admins:invite")?;
+        let value = normalize_invite_constraint(request.constraint, &request.value)?;
+        let expires_at = Utc::now() + validated_invite_lifetime(request.expires_in_seconds)?;
+
+        let generated = self.state.key_hasher.generate(ADMIN_INVITE_NAMESPACE)?;
+        let insert = AdminInviteInsert {
+            id: Uuid::now_v7(),
+            token_prefix: generated.key_prefix.clone(),
+            token_hash: generated.key_hash.clone(),
+            fingerprint: generated.fingerprint.clone(),
+            pepper_version: generated.pepper_version.clone(),
+            constraint: request.constraint,
+            value: value.clone(),
+            created_by_issuer: issuer.map(str::to_string),
+            created_by_subject: actor.subject.clone(),
+            created_by_actor_type: invite_creator_actor_type(actor)?.to_string(),
+            expires_at,
+        };
+
+        // The command envelope hashes the *request*, not the generated token, so two
+        // requests with the same `Idempotency-Key` and the same body replay the first
+        // invite instead of minting a second one the operator would never see.
+        let spec = admin_command_spec(
+            ctx,
+            actor,
+            "admin_invite.create",
+            json!({ "constraint": constraint_label(request.constraint) }),
+            &request,
+        )?;
+        let identities = Arc::clone(&self.identities);
+        let audit_actor = actor.clone();
+        let audit_ctx = ctx.clone();
+        // Moved into the closure so the plaintext is not read anywhere outside it.
+        let secret = generated.raw_key.expose_secret().to_string();
+        let outcome = AdminCommandRunner::new(self.repo.clone(), command_hasher(self.state))
+            .execute(spec, move |transaction| {
+                Box::pin(async move {
+                    let row = identities
+                        .insert_invite(transaction.connection(), &insert)
+                        .await?;
+                    transaction
+                        .insert_audit(success_audit(
+                            &audit_actor,
+                            &audit_ctx,
+                            "admin_invite.create",
+                            "admin_invite",
+                            Some(row.id.to_string()),
+                            // The constraint value is the invitee's address or domain,
+                            // which the audit trail needs. The token, its hash, its
+                            // prefix and its fingerprint are all absent, and
+                            // `AdminInviteRow` has no field for any of them.
+                            json!({
+                                "constraint": constraint_label(row.constraint),
+                                "value": row.value,
+                                "expires_at": row.expires_at,
+                                "created_by_actor_type": insert.created_by_actor_type,
+                            }),
+                        ))
+                        .await?;
+                    let record = invite_record(row);
+                    let id = record.id.to_string();
+                    let sanitized = AdminInviteSecretResponse {
+                        resource: record.clone(),
+                        secret: None,
+                        secret_retrievable: false,
+                        notice: invite_created_notice(),
+                    };
+                    AdminCommandMutation::with_replay_response(
+                        AdminInviteSecretResponse {
+                            resource: record,
+                            secret: Some(secret),
+                            secret_retrievable: true,
+                            notice: invite_created_notice(),
+                        },
+                        sanitized,
+                        201,
+                        Some(id),
+                    )
+                })
+            })
+            .await?;
+        self.state.metrics.record_admin_invite_created();
+        Ok((outcome.response, outcome.replayed))
+    }
+
+    pub async fn list_invites(
+        &self,
+        actor: &Actor,
+        page: impl Into<PageRequest>,
+    ) -> Result<ListResponse<AdminInviteRecord>, AppError> {
+        self.state.authz.require(actor, "moira:admins:read")?;
+        let page = page.into();
+        let rows = self
+            .identities
+            .list_invites(page.decode(ADMIN_INVITES_CURSOR)?, page.limit())
+            .await?;
+        let records: Vec<AdminInviteRecord> = rows.into_iter().map(invite_record).collect();
+        Ok(paginate(records, &page, ADMIN_INVITES_CURSOR, |row| {
+            ListCursor::new(row.created_at, row.id)
+        }))
+    }
+
+    pub async fn get_invite(&self, actor: &Actor, id: Uuid) -> Result<AdminInviteRecord, AppError> {
+        self.state.authz.require(actor, "moira:admins:read")?;
+        self.identities.get_invite(id).await.map(invite_record)
+    }
+
+    pub async fn revoke_invite(
+        &self,
+        actor: &Actor,
+        ctx: &RequestContext,
+        id: Uuid,
+    ) -> Result<(AdminInviteRecord, bool), AppError> {
+        self.state.authz.require(actor, "moira:admins:invite")?;
+        let spec = admin_command_spec(
+            ctx,
+            actor,
+            "admin_invite.revoke",
+            json!({ "invite_id": id }),
+            &json!({}),
+        )?;
+        let identities = Arc::clone(&self.identities);
+        let audit_actor = actor.clone();
+        let audit_ctx = ctx.clone();
+        let outcome = AdminCommandRunner::new(self.repo.clone(), command_hasher(self.state))
+            .execute(spec, move |transaction| {
+                Box::pin(async move {
+                    let row = identities
+                        .revoke_invite(transaction.connection(), id)
+                        .await?;
+                    transaction
+                        .insert_audit(success_audit(
+                            &audit_actor,
+                            &audit_ctx,
+                            "admin_invite.revoke",
+                            "admin_invite",
+                            Some(row.id.to_string()),
+                            json!({ "value": row.value }),
+                        ))
+                        .await?;
+                    let record = invite_record(row);
+                    let id = record.id.to_string();
+                    AdminCommandMutation::new(record, 200, Some(id))
+                })
+            })
+            .await?;
+        Ok((outcome.response, outcome.replayed))
+    }
+
+    /// What an **unauthenticated** invitee is told about the invite they hold.
+    ///
+    /// # No actor, and no authorization check — the token is the credential
+    ///
+    /// The invitee is unauthenticated by construction: they open the link *before*
+    /// signing in, and the credential a scope check would demand is the one signing in
+    /// produces. That is the same circularity finding F15 records for the sign-in
+    /// methods endpoint.
+    ///
+    /// Two properties keep that safe. First, the response is confined to the invite's
+    /// own constraint and expiry — no inviter, no id, no deployment detail, and nothing
+    /// about policy. Second, the caller must present a 32-byte `OsRng` token; a caller
+    /// who does not hold one gets `invite_not_found` from the **prefix** lookup, before
+    /// any Argon2 verification runs, so this endpoint cannot be used as a CPU-exhaustion
+    /// oracle by an attacker with no valid prefix.
+    pub async fn preview_invite(
+        &self,
+        request: &AdminInvitePreviewRequest,
+    ) -> Result<AdminInvitePreviewResponse, AppError> {
+        let invite = self.resolve_invite(&request.token).await?;
+        require_redeemable(&invite)?;
+        Ok(AdminInvitePreviewResponse {
+            constraint: invite.constraint,
+            value: invite.value,
+            expires_at: invite.expires_at,
+        })
+    }
+
+    /// Redeems an invite into an `admin_identities` grant for the presenting identity.
+    ///
+    /// # Every check runs BEFORE the transactional envelope
+    ///
+    /// This mirrors [`Self::claim`]'s rule, and here it carries a second, stronger
+    /// obligation: **a rejected redemption must not consume the invite.** The plan's own
+    /// ordering requirement is that an invitee refused by the deny-by-default domain
+    /// policy can redeem the *same* link once an operator widens the allow-list.
+    ///
+    /// So the invite lookup, its state checks, the D5 email checks, the invite's own
+    /// constraint and plan 07's provider allow-list all run here, outside
+    /// [`AdminCommandRunner::execute`]. A request that fails any of them takes no
+    /// advisory lock, writes no idempotency record, and — crucially — never reaches the
+    /// statement that marks the invite consumed.
+    ///
+    /// **Do not move any of these inside the closure "to make it atomic".** Atomicity is
+    /// already provided for the part that needs it: `consume_invite` re-checks state
+    /// under `select … for update` in the same transaction as the grant insert, so two
+    /// simultaneous valid redemptions still produce exactly one grant.
+    ///
+    /// # Which authenticator this uses, and why it is not `authenticate_admin`
+    ///
+    /// The caller is [`AuthService::verify_trusted_jwt_identity`]'s
+    /// [`TrustedJwtIdentity`] — a verified `(issuer, subject)` and nothing else.
+    /// `authenticate_admin` would apply the `admin_identities` grant (plan 07 decision
+    /// D2 puts it there and only there), which is meaningless for an identity whose
+    /// grant does not exist yet, and it would hand this method an `Actor` carrying
+    /// token-asserted `scopes`. The narrow type is what makes a self-asserted scope
+    /// unreadable from here.
+    pub async fn redeem_invite(
+        &self,
+        identity: &TrustedJwtIdentity,
+        ctx: &RequestContext,
+        request: AdminInviteRedeemRequest,
+    ) -> Result<(AdminIdentityRecord, bool), AppError> {
+        let invite = self
+            .resolve_invite(&request.token)
+            .await
+            .map_err(|error| self.denied(error))?;
+        // Every refusal on this path goes through `denied`, including these two.
+        // They previously returned with a bare `?`, which left five of the twelve
+        // `ADMIN_INVITE_OUTCOMES` label values — `expired`, `consumed`, `revoked`,
+        // `email_mismatch`, `domain_mismatch` — seeded at zero and unreachable by any
+        // code path. A label with no emitter is the metrics equivalent of a catalog key
+        // with none, and it fails in the direction that matters: an operator alerting on
+        // "invitations are being refused" would have watched a flat line.
+        require_redeemable(&invite).map_err(|error| self.denied(error))?;
+
+        // Plan 07 decision D5: `email`/`email_verified` are required by the DTO, so an
+        // omitted field is a schema violation the extractor rejects. What survives to
+        // here is a present-but-unusable value, and the *invite's own* constraint.
+        let email = request.email.trim();
+        evaluate_invite_constraint(&invite, email).map_err(|error| self.denied(error))?;
+
+        // The redeem token's issuer must be a registered, active trusted JWT issuer —
+        // the same rule `claim` applies to its target issuer. `verify_trusted_jwt_identity`
+        // already required a registered row to verify the signature; this resolves that
+        // row's **id**, which the policy lookup below cannot work without.
+        let trusted_jwt_issuer_id = self
+            .identities
+            .resolve_active_issuer(&identity.issuer)
+            .await?;
+
+        // Plan 07 module 10, unchanged and unexempted (decision D3). An invitation
+        // authorises its holder to *submit* a redemption; it is not a policy bypass, and
+        // there is deliberately no `invite.is_some()` short-circuit anywhere in this
+        // path — `evaluate_claim_policy` cannot branch on a credential it never receives.
+        //
+        // The second argument is load-bearing and is the defect plan 09 §0.1 B5 records:
+        // `governing_policy` matches `issuer = $1 or trusted_jwt_issuer_id = $2`, and in
+        // a real deployment `$1` is the *console's* issuer while the provider row's
+        // `issuer` column holds the *IdP's*. The row therefore matches only through
+        // `trusted_jwt_issuer_id`. Passing a nil UUID here — or dropping the argument —
+        // makes every redemption 403 forever on exactly the deployments that are
+        // configured correctly.
+        let policy = self
+            .auth_settings
+            .governing_policy(&identity.issuer, trusted_jwt_issuer_id)
+            .await?;
+        if let Err(error) = evaluate_claim_policy(email, request.email_verified, policy.as_ref()) {
+            return Err(self.denied(error));
+        }
+
+        let grant_id = Uuid::now_v7();
+        let insert = AdminIdentityGrantInsert {
+            id: grant_id,
+            trusted_jwt_issuer_id,
+            issuer: identity.issuer.clone(),
+            subject: identity.subject.clone(),
+            email: email.to_string(),
+            email_verified: request.email_verified,
+            // An invite grants base admin authority and never ownership: `is_primary`
+            // takes its column default of `false`. A redemption that could mint an owner
+            // would make an invite strictly more powerful than the transfer endpoint it
+            // is supposed to sit beneath.
+            granted_scopes: vec!["moira:admin".to_string()],
+            // The credential that actually produced this grant. `migrations/0018` widened
+            // `admin_identities.granted_by_actor_type`'s CHECK to admit it.
+            //
+            // Wave 2 originally wrote `'system_key'` here because `0012`'s CHECK admitted
+            // nothing else. That was false in an audit column, and not harmlessly so:
+            // 'system_key' means the bootstrap break-glass credential was used, which is
+            // the event a deployment alerts on — so every redemption raised that signal,
+            // and a real break-glass grant was indistinguishable from routine onboarding.
+            granted_by_actor_type: ADMIN_INVITE_ACTOR_TYPE.to_string(),
+            granted_by_subject: invite.created_by_subject.clone(),
+        };
+
+        let spec = admin_command_spec(
+            ctx,
+            // The idempotency actor fingerprint is the *invitee's*, built from a
+            // synthetic actor carrying the verified issuer id — so two different issuers
+            // minting the same `sub` cannot replay each other's redemption.
+            &redeem_actor(identity, trusted_jwt_issuer_id),
+            "admin_invite.redeem",
+            json!({ "issuer": identity.issuer, "subject": identity.subject }),
+            // **The raw token is deliberately absent from the command envelope.** That
+            // envelope is HMAC'd and its digest written to `idempotency_records`, and a
+            // keyed digest of a live bearer secret is still a derivation of that secret
+            // sitting in a table the admin API can list. `invite_id` discriminates
+            // exactly as well — it is derived from the token by the lookup above — and is
+            // not itself a credential.
+            &json!({
+                "invite_id": invite.id,
+                "email": email,
+                "email_verified": request.email_verified,
+            }),
+        )?;
+
+        let identities = Arc::clone(&self.identities);
+        let audit_actor = redeem_actor(identity, trusted_jwt_issuer_id);
+        let audit_ctx = ctx.clone();
+        let invite_id = invite.id;
+        let redeem_issuer = identity.issuer.clone();
+        let redeem_subject = identity.subject.clone();
+        let outcome = AdminCommandRunner::new(self.repo.clone(), command_hasher(self.state))
+            .execute(spec, move |transaction| {
+                Box::pin(async move {
+                    let grant = identities
+                        .insert_grant(transaction.connection(), &insert)
+                        .await?;
+                    // The single-winner gate. It re-reads the invite under
+                    // `select … for update` and refuses a non-pending or expired row, so
+                    // two concurrent redemptions serialise and the loser sees
+                    // `invite_already_consumed` rather than creating a second grant.
+                    identities
+                        .consume_invite(
+                            transaction.connection(),
+                            invite_id,
+                            &redeem_issuer,
+                            &redeem_subject,
+                            grant.id,
+                        )
+                        .await?;
+                    // A grant now exists, so the setup singleton is true whether or not
+                    // it already was. Self-idempotent (`… and claimed = false`), so this
+                    // never rewrites the original claimant.
+                    identities
+                        .mark_setup_claimed(transaction.connection(), grant.id)
+                        .await?;
+                    transaction
+                        .insert_audit(success_audit(
+                            &audit_actor,
+                            &audit_ctx,
+                            "admin_invite.redeem",
+                            "admin_identity",
+                            Some(grant.id.to_string()),
+                            json!({
+                                "issuer": grant.issuer,
+                                "subject": grant.subject,
+                                "email": grant.email,
+                                "granted_scopes": grant.granted_scopes,
+                                "admin_invite_id": invite_id,
+                            }),
+                        ))
+                        .await?;
+                    let id = grant.id.to_string();
+                    AdminCommandMutation::new(
+                        record_from_grant_with_notice(grant, redeemed_notice()),
+                        201,
+                        Some(id),
+                    )
+                })
+            })
+            .await;
+
+        match outcome {
+            Ok(outcome) => {
+                self.state.metrics.record_admin_invite_redeemed();
+                Ok((outcome.response, outcome.replayed))
+            }
+            Err(error) => {
+                self.state
+                    .metrics
+                    .record_admin_invite_denied(denial_reason(&error));
+                Err(error)
+            }
+        }
+    }
+
+    // ===================================================================================
+    // Plan 09 wave 2 — grant administration. Plan 07 deferred all three.
+    // ===================================================================================
+
+    pub async fn list_identities(
+        &self,
+        actor: &Actor,
+        page: impl Into<PageRequest>,
+    ) -> Result<ListResponse<AdminIdentityRecord>, AppError> {
+        self.state.authz.require(actor, "moira:admins:read")?;
+        let page = page.into();
+        let rows = self
+            .identities
+            .list_grants(page.decode(ADMIN_IDENTITIES_CURSOR)?, page.limit())
+            .await?;
+        let records: Vec<AdminIdentityRecord> = rows
+            .into_iter()
+            .map(|grant| record_from_grant_with_notice(grant, claimed_notice()))
+            .collect();
+        Ok(paginate(records, &page, ADMIN_IDENTITIES_CURSOR, |row| {
+            ListCursor::new(row.created_at, row.id)
+        }))
+    }
+
+    /// Ownership transfer: sets or clears `admin_identities.is_primary`.
+    pub async fn set_identity_primary(
+        &self,
+        actor: &Actor,
+        issuer: Option<&str>,
+        ctx: &RequestContext,
+        id: Uuid,
+        expected_version: i64,
+        request: AdminIdentityPatchRequest,
+    ) -> Result<(AdminIdentityRecord, bool), AppError> {
+        self.require_primary_actor(actor, issuer).await?;
+        let spec = admin_command_spec(
+            ctx,
+            actor,
+            "admin_identity.set_primary",
+            json!({ "admin_identity_id": id }),
+            &request,
+        )?
+        .with_expected_version(Some(expected_version));
+
+        let identities = Arc::clone(&self.identities);
+        let audit_actor = actor.clone();
+        let audit_ctx = ctx.clone();
+        let is_primary = request.is_primary;
+        let outcome = AdminCommandRunner::new(self.repo.clone(), command_hasher(self.state))
+            .execute(spec, move |transaction| {
+                Box::pin(async move {
+                    let grant = identities
+                        .set_primary(transaction.connection(), id, expected_version, is_primary)
+                        .await?;
+                    transaction
+                        .insert_audit(success_audit(
+                            &audit_actor,
+                            &audit_ctx,
+                            "admin_identity.set_primary",
+                            "admin_identity",
+                            Some(grant.id.to_string()),
+                            json!({
+                                "issuer": grant.issuer,
+                                "subject": grant.subject,
+                                "is_primary": grant.is_primary,
+                            }),
+                        ))
+                        .await?;
+                    let resource_id = grant.id.to_string();
+                    AdminCommandMutation::new(
+                        record_from_grant_with_notice(grant, claimed_notice()),
+                        200,
+                        Some(resource_id),
+                    )
+                })
+            })
+            .await?;
+        self.state.metrics.record_admin_ownership_transferred();
+        Ok((outcome.response, outcome.replayed))
+    }
+
+    /// Soft revoke. Plan 07 explicitly deferred this endpoint; it lands here.
+    pub async fn revoke_identity(
+        &self,
+        actor: &Actor,
+        issuer: Option<&str>,
+        ctx: &RequestContext,
+        id: Uuid,
+    ) -> Result<(AdminIdentityRecord, bool), AppError> {
+        self.require_primary_actor(actor, issuer).await?;
+        let spec = admin_command_spec(
+            ctx,
+            actor,
+            "admin_identity.revoke",
+            json!({ "admin_identity_id": id }),
+            &json!({}),
+        )?;
+        let identities = Arc::clone(&self.identities);
+        let audit_actor = actor.clone();
+        let audit_ctx = ctx.clone();
+        let outcome = AdminCommandRunner::new(self.repo.clone(), command_hasher(self.state))
+            .execute(spec, move |transaction| {
+                Box::pin(async move {
+                    let grant = identities
+                        .revoke_grant(transaction.connection(), id)
+                        .await?;
+                    transaction
+                        .insert_audit(success_audit(
+                            &audit_actor,
+                            &audit_ctx,
+                            "admin_identity.revoke",
+                            "admin_identity",
+                            Some(grant.id.to_string()),
+                            json!({ "issuer": grant.issuer, "subject": grant.subject }),
+                        ))
+                        .await?;
+                    let resource_id = grant.id.to_string();
+                    AdminCommandMutation::new(
+                        record_from_grant_with_notice(grant, revoked_notice()),
+                        200,
+                        Some(resource_id),
+                    )
+                })
+            })
+            .await?;
+        self.state.metrics.record_admin_identity_revoked();
+        Ok((outcome.response, outcome.replayed))
+    }
+
+    /// **The ownership check.** Decision D1's enforcement point.
+    ///
+    /// It reads the caller's *own* `admin_identities` row and requires `is_primary`.
+    /// It is not a scope check, and it cannot be replaced by one:
+    /// `AuthorizationService::has_scope` grants a `moira:admin`-holding trusted-JWT
+    /// actor every scope by implication, and every grant Moira writes carries
+    /// `moira:admin` by default — so a `moira:admins:manage` scope would be satisfied by
+    /// every admin, including the one whose ownership is being taken away.
+    ///
+    /// The actor-type arm is an **allow-list**, matching
+    /// `ADMIN_IMPLYING_ACTOR_TYPES`'s reasoning: a type absent from it is denied, which
+    /// is the safe direction to be wrong in. System-key and dev-admin callers pass
+    /// because break-glass must keep working — that is the documented last resort when
+    /// no primary remains, and this wave does not remove it.
+    async fn require_primary_actor(
+        &self,
+        actor: &Actor,
+        issuer: Option<&str>,
+    ) -> Result<(), AppError> {
+        match actor.actor_type {
+            ActorType::SystemKey | ActorType::DevAdmin => return Ok(()),
+            ActorType::TrustedJwt => {}
+            ActorType::Anonymous | ActorType::ConsumerKey => return Err(not_primary()),
+        }
+        let (Some(issuer), Some(subject)) = (issuer, actor.subject.as_deref()) else {
+            return Err(not_primary());
+        };
+        let grant = self.identities.find_active_grant(issuer, subject).await?;
+        if grant.is_some_and(|grant| grant.is_primary) {
+            Ok(())
+        } else {
+            Err(not_primary())
+        }
+    }
+
+    /// Counts a refused redemption, then hands the error straight back.
+    ///
+    /// Every refusal on the redeem path funnels through here so that
+    /// `moira_admin_invite_outcomes_total` and the error catalog cannot drift: the label
+    /// is derived from the error **code** by [`denial_reason`], so a refusal that returns
+    /// through this function is counted under a bounded label or under `other`, and never
+    /// under a label value nothing emits.
+    ///
+    /// Takes and returns the error rather than borrowing it, so the call site reads
+    /// `Err(self.denied(error))` / `.map_err(|error| self.denied(error))` and a refusal
+    /// that skips it is visible as a bare `?` in review.
+    fn denied(&self, error: AppError) -> AppError {
+        self.state
+            .metrics
+            .record_admin_invite_denied(denial_reason(&error));
+        error
+    }
+
+    /// Prefix-lookup-then-verify, the same shape `AuthService::verify_api_key` uses.
+    ///
+    /// The Argon2id hash is not searchable, so the indexed `token_prefix` selects at
+    /// most one live row and the hash then proves the presented token really is that
+    /// row's. A prefix match on its own proves nothing — the prefix is a plaintext
+    /// substring of the token — which is why the verification is not optional here.
+    /// # It records nothing
+    ///
+    /// `moira_admin_invite_outcomes_total` counts **redemption** outcomes, and this
+    /// function serves the anonymous preview too. Counting here made a visitor opening a
+    /// stale link — or a scanner probing the endpoint — indistinguishable from a failed
+    /// redemption on the operator's dashboard. The redeem path wraps this call in
+    /// [`Self::denied`] instead, so the counter has exactly one increment per refused
+    /// redemption and none per preview.
+    async fn resolve_invite(&self, token: &str) -> Result<AdminInviteRow, AppError> {
+        let token = token.trim();
+        if token.is_empty() {
+            return Err(invite_not_found());
+        }
+        let prefix = self.state.key_hasher.prefix(token);
+        let Some(candidate) = self.identities.find_invite_by_prefix(&prefix).await? else {
+            return Err(invite_not_found());
+        };
+        if self.state.key_hasher.verify(token, &candidate.token_hash)? {
+            Ok(candidate.record)
+        } else {
+            Err(invite_not_found())
+        }
+    }
+}
+
+/// Refuses an invite that is consumed, revoked, or past its expiry.
+///
+/// Shared by preview and redeem so the two cannot drift: an invite preview that says
+/// "valid" for a link redemption will refuse is worse than no preview at all.
+fn require_redeemable(invite: &AdminInviteRow) -> Result<(), AppError> {
+    match invite.status {
+        AdminInviteStatus::Consumed => {
+            return Err(AppError::conflict(
+                "invite_already_consumed",
+                "this invitation has already been redeemed",
+            ));
+        }
+        AdminInviteStatus::Revoked => {
+            return Err(AppError::coded(
+                StatusCode::FORBIDDEN,
+                "invite_revoked",
+                "this invitation has been revoked",
+            ));
+        }
+        AdminInviteStatus::Pending => {}
+    }
+    if invite.is_expired(Utc::now()) {
+        return Err(AppError::coded(
+            StatusCode::FORBIDDEN,
+            "invite_expired",
+            "this invitation has expired",
+        ));
+    }
+    Ok(())
+}
+
+/// The **invite's own** constraint, checked separately from plan 07's provider
+/// allow-list and never collapsed into it.
+///
+/// The two failures have different remedies — reissue the invite versus widen the
+/// allow-list — so they carry different codes, and a console that merged them would
+/// send the operator to the wrong screen.
+pub(crate) fn evaluate_invite_constraint(
+    invite: &AdminInviteRow,
+    email: &str,
+) -> Result<(), AppError> {
+    let email_lower = email.trim().to_ascii_lowercase();
+    let domain = email_domain(email).ok_or_else(|| {
+        AppError::coded(
+            StatusCode::BAD_REQUEST,
+            "admin_claim_email_required",
+            "a usable email address is required to redeem an invitation",
+        )
+    })?;
+    match invite.constraint {
+        AdminInviteConstraint::Email => {
+            if email_lower == invite.value.trim().to_ascii_lowercase() {
+                Ok(())
+            } else {
+                Err(AppError::coded(
+                    StatusCode::FORBIDDEN,
+                    "invite_email_mismatch",
+                    "this invitation was issued for a different email address",
+                ))
+            }
+        }
+        AdminInviteConstraint::Domain => {
+            // Exact match on the domain, mirroring `evaluate_claim_policy`: admitting
+            // `sub.example.com` because `example.com` was written would hand the inviter
+            // a subtree they never named.
+            if domain == invite.value.trim().to_ascii_lowercase() {
+                Ok(())
+            } else {
+                Err(AppError::coded(
+                    StatusCode::FORBIDDEN,
+                    "invite_domain_mismatch",
+                    "this invitation was issued for a different email domain",
+                ))
+            }
+        }
+    }
+}
+
+/// Normalises and validates the constraint an invite is bound to.
+///
+/// There is no unbound ("anyone with the link") form, and this is where that is
+/// enforced: an empty value is refused rather than stored as a match-everything.
+pub(crate) fn normalize_invite_constraint(
+    constraint: AdminInviteConstraint,
+    value: &str,
+) -> Result<String, AppError> {
+    require_non_empty("value", value)?;
+    let normalized = value.trim().to_ascii_lowercase();
+    match constraint {
+        AdminInviteConstraint::Email => {
+            if email_domain(&normalized).is_none() {
+                return Err(AppError::unprocessable(
+                    "invalid_request",
+                    "an email-constrained invitation requires a usable email address",
+                ));
+            }
+        }
+        AdminInviteConstraint::Domain => {
+            if normalized.contains('@') || !normalized.contains('.') {
+                return Err(AppError::unprocessable(
+                    "invalid_request",
+                    "a domain-constrained invitation requires a bare domain, not an address",
+                ));
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+/// The server-side **hard cap** on an invite's lifetime.
+///
+/// Refused rather than clamped: an operator who believes they issued a 30-day invite and
+/// silently received a 3-day one discovers the difference at the worst possible moment.
+pub(crate) fn validated_invite_lifetime(seconds: u32) -> Result<Duration, AppError> {
+    if seconds > MAX_INVITE_EXPIRY_SECONDS {
+        return Err(AppError::unprocessable(
+            "admin_invite_expiry_too_long",
+            format!("an invitation may not last longer than {MAX_INVITE_EXPIRY_SECONDS} seconds"),
+        ));
+    }
+    if seconds < MIN_INVITE_EXPIRY_SECONDS {
+        return Err(AppError::unprocessable(
+            "invalid_request",
+            format!("an invitation must last at least {MIN_INVITE_EXPIRY_SECONDS} seconds"),
+        ));
+    }
+    Ok(Duration::seconds(i64::from(seconds)))
+}
+
+/// Which credential minted an invite, recorded honestly on the row.
+///
+/// An allow-list, for the same reason `ADMIN_IMPLYING_ACTOR_TYPES` is one: a new
+/// [`ActorType`] must be considered deliberately rather than inheriting the ability to
+/// mint an admin invitation by default.
+fn invite_creator_actor_type(actor: &Actor) -> Result<&'static str, AppError> {
+    match actor.actor_type {
+        ActorType::SystemKey => Ok("system_key"),
+        ActorType::TrustedJwt => Ok("trusted_jwt"),
+        ActorType::DevAdmin => Ok("dev_admin"),
+        ActorType::Anonymous | ActorType::ConsumerKey => Err(AppError::Forbidden(
+            "this credential type may not create admin invitations".to_string(),
+        )),
+    }
+}
+
+/// The invitee, as an [`Actor`], for the idempotency fingerprint and the audit row.
+///
+/// `scopes` is empty and stays empty: the redemption is performed by an identity that
+/// holds no grant, and writing anything here would misdescribe it in the audit log.
+/// `trusted_jwt_issuer_id` **is** populated, because it is a field of
+/// `actor_fingerprint` and omitting it would let two issuers minting the same `sub`
+/// replay each other's stored redemption.
+fn redeem_actor(identity: &TrustedJwtIdentity, trusted_jwt_issuer_id: Uuid) -> Actor {
+    Actor {
+        actor_type: ActorType::TrustedJwt,
+        subject: Some(identity.subject.clone()),
+        external_user_id: Some(identity.subject.clone()),
+        trusted_jwt_issuer_id: Some(trusted_jwt_issuer_id),
+        scopes: Vec::new(),
+        ..Actor::default()
+    }
+}
+
+/// The bounded denial-reason label set for `moira_admin_invite_outcomes_total`.
+///
+/// Derived from the error **code**, never from the message and never from the invitee's
+/// address: an email or a domain as a label value is unbounded cardinality and PII in a
+/// metrics endpoint. Anything unrecognised collapses to `other` rather than widening the
+/// label domain at runtime.
+pub(crate) fn denial_reason(error: &AppError) -> &'static str {
+    let rendered = error.to_string();
+    for (code, label) in ADMIN_INVITE_DENIAL_REASONS {
+        if rendered.starts_with(&format!("{code}:")) {
+            return label;
+        }
+    }
+    "other"
+}
+
+/// The closed mapping from error code to metric label. Kept as a table so the label set
+/// is enumerable by a test rather than scattered across match arms.
+pub(crate) const ADMIN_INVITE_DENIAL_REASONS: &[(&str, &str)] = &[
+    ("invite_not_found", "not_found"),
+    ("invite_expired", "expired"),
+    ("invite_already_consumed", "consumed"),
+    ("invite_revoked", "revoked"),
+    ("invite_email_mismatch", "email_mismatch"),
+    ("invite_domain_mismatch", "domain_mismatch"),
+    ("admin_claim_domain_not_allowed", "domain_not_allowed"),
+    ("admin_claim_email_not_verified", "email_not_verified"),
+    ("admin_claim_email_required", "email_required"),
+];
+
+fn constraint_label(constraint: AdminInviteConstraint) -> &'static str {
+    match constraint {
+        AdminInviteConstraint::Email => "email",
+        AdminInviteConstraint::Domain => "domain",
+    }
+}
+
+fn invite_record(row: AdminInviteRow) -> AdminInviteRecord {
+    let expired = row.is_expired(Utc::now());
+    AdminInviteRecord {
+        id: row.id,
+        constraint: row.constraint,
+        value: row.value,
+        status: row.status,
+        expired,
+        expires_at: row.expires_at,
+        created_by_subject: row.created_by_subject,
+        consumed_at: row.consumed_at,
+        consumed_subject: row.consumed_subject,
+        created_at: row.created_at,
+        version: row.version,
+    }
+}
+
+fn invite_not_found() -> AppError {
+    AppError::coded(
+        StatusCode::NOT_FOUND,
+        "invite_not_found",
+        "no invitation matches this token",
+    )
+}
+
+fn not_primary() -> AppError {
+    AppError::coded(
+        StatusCode::FORBIDDEN,
+        "admin_identity_not_primary",
+        "only a primary admin identity may manage other admin identities",
+    )
+}
+
+fn invite_created_notice() -> ResponseText {
+    catalog_notice(
+        ADMIN_INVITE_CREATED_NOTICE,
+        "An admin invitation has been created.",
+    )
+}
+
+fn redeemed_notice() -> ResponseText {
+    catalog_notice(
+        ADMIN_INVITE_REDEEMED_NOTICE,
+        "The invitation has been redeemed and admin access granted.",
+    )
+}
+
+fn revoked_notice() -> ResponseText {
+    catalog_notice(
+        ADMIN_IDENTITY_REVOKED_NOTICE,
+        "Admin access has been revoked for this identity.",
+    )
+}
+
+fn catalog_notice(key: &'static str, fallback: &'static str) -> ResponseText {
+    ResponseText::new(
+        key,
+        crate::i18n::default_message_for_key(key).unwrap_or(fallback),
+    )
 }
 
 /// The deny-by-default verified-email and allowed-domain policy (plan 07, module 10).
@@ -294,6 +1199,17 @@ fn email_domain(email: &str) -> Option<String> {
 }
 
 fn record_from_grant(grant: AdminIdentityGrant) -> AdminIdentityRecord {
+    record_from_grant_with_notice(grant, claimed_notice())
+}
+
+/// The notice is a parameter because the same row is returned by four operations that
+/// mean different things to a human: a first claim, an invitation redeemed, an ownership
+/// transfer, and a revocation. The **status code** distinguishes fresh from replayed;
+/// the notice distinguishes what happened.
+fn record_from_grant_with_notice(
+    grant: AdminIdentityGrant,
+    notice: ResponseText,
+) -> AdminIdentityRecord {
     AdminIdentityRecord {
         id: grant.id,
         issuer: grant.issuer,
@@ -304,10 +1220,11 @@ fn record_from_grant(grant: AdminIdentityGrant) -> AdminIdentityRecord {
         email: grant.email.unwrap_or_default(),
         email_verified: grant.email_verified,
         granted_scopes: grant.granted_scopes,
+        is_primary: grant.is_primary,
         status: grant.status,
         created_at: grant.created_at,
         version: grant.version,
-        notice: claimed_notice(),
+        notice,
     }
 }
 

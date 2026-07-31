@@ -61,6 +61,8 @@ use crate::{
         (name = "admin-credentials", description = "Provider credential administration"),
         (name = "admin-api-keys", description = "System and consumer API key administration"),
         (name = "admin-jwt-issuers", description = "Trusted JWT issuer administration"),
+        (name = "admin-invites", description = "Admin invitation lifecycle"),
+        (name = "admin-identities", description = "Admin identity grant administration"),
         (name = "admin-audit", description = "Immutable audit event access"),
         (name = "admin-routes", description = "Route definition administration"),
         (name = "admin-routing-policies", description = "Routing policy administration"),

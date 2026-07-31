@@ -11,7 +11,10 @@ pub use api_keys::{ApiKeyHasher, GeneratedApiKey};
 /// `X-Moira-System-Key` directly instead of going through `authenticate_admin`. Mirroring
 /// the parsing there instead would be a second implementation of a one-line rule.
 pub(crate) use auth::header_string;
-pub use auth::{Actor, ActorType, AdminAuthenticator, AuthService, CallerAuthenticator, JwksCache};
+pub use auth::{
+    Actor, ActorType, AdminAuthenticator, AuthService, CallerAuthenticator, JwksCache,
+    TrustedJwtIdentity,
+};
 pub use authz::AuthorizationService;
 pub use crypto::{
     CredentialAadParts, ENVELOPE_VERSION_V1, EncryptedSecret, LOCAL_AES_256_GCM, LocalSecretCipher,

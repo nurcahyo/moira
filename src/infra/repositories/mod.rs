@@ -30,8 +30,8 @@ pub use conversation::{
     MemoryInsert, PgConversationRepository,
 };
 pub use identity::{
-    AdminIdentityGrant, AdminIdentityGrantInsert, AdminIdentityRepository,
-    PgAdminIdentityRepository,
+    AdminIdentityGrant, AdminIdentityGrantInsert, AdminIdentityRepository, AdminInviteCandidate,
+    AdminInviteInsert, AdminInviteRow, PgAdminIdentityRepository,
 };
 // Plan 10 wave 2. Trait plus one Postgres implementation, same convention as the
 // modules above — which is what lets `WorkerQueue`'s retry, dead-letter and

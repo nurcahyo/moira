@@ -43,6 +43,22 @@ pub const ADMIN_SCOPES: &[&str] = &[
     "moira:auth-settings:read",
     "moira:auth-settings:write",
     "moira:auth-settings:delete",
+    // Plan 09 wave 2 — the admin-invitation and admin-grant surface. Named against the
+    // `moira:jwt-issuers:{read,write,delete}` and `moira:auth-settings:{read,write,delete}`
+    // precedents, and, like every scope above, **implied by `moira:admin`** for the actor
+    // types on `ADMIN_IMPLYING_ACTOR_TYPES`.
+    //
+    // That implication is deliberate and is why there is no `moira:admins:manage` here.
+    // Plan 09's body specified one as an *explicit* scope that `moira:admin` must not
+    // imply; `has_scope` below has no per-scope opt-out, so such a scope would have been
+    // satisfied by every admin this deployment can grant, and the ownership model built
+    // on it would have been decorative. Ownership is `admin_identities.is_primary`
+    // instead (decision D1) — row state, checked in the handler, countable by the
+    // last-primary guard. **Do not add a never-implied-scope mechanism here** to
+    // resurrect it: that is a change to the authorization core, with its own plan and
+    // its own tests, not a side effect of an invitation feature.
+    "moira:admins:read",
+    "moira:admins:invite",
     "moira:identity:delegate",
     "moira:routes:read",
     "moira:routes:write",
@@ -234,6 +250,45 @@ mod tests {
                 "{actor_type:?} must not be able to mint scopes it only holds by implication"
             );
         }
+    }
+
+    /// **Plan 09 decision D1, asserted rather than described.**
+    ///
+    /// This test exists to make the *reason* ownership is a column impossible to forget.
+    /// `has_scope` is `contains(required) || (implying_actor && contains(ADMIN_SCOPE))`,
+    /// so any scope added to `ADMIN_SCOPES` is automatically held by every trusted-JWT
+    /// actor carrying `moira:admin` — which is every grant `admin_identities` writes by
+    /// default. A `moira:admins:manage` scope would therefore have been satisfied by
+    /// everyone, and the last-primary guard would have had nothing to count.
+    ///
+    /// If a future change adds a per-scope opt-out, this test turns red, which is the
+    /// signal that the D1 decision can be revisited — not that the assertion is stale.
+    #[test]
+    fn the_admins_scopes_are_implied_by_moira_admin_which_is_why_ownership_is_row_state() {
+        let authz = AuthorizationService::new();
+        let granted_admin = Actor {
+            actor_type: ActorType::TrustedJwt,
+            // Exactly what `admin_identities.granted_scopes` defaults to, and what
+            // `ClaimAdminIdentityRequest.scopes` defaults to.
+            scopes: vec![ADMIN_SCOPE.to_string()],
+            ..Actor::default()
+        };
+        for scope in ["moira:admins:read", "moira:admins:invite"] {
+            assert!(
+                AuthorizationService::is_known_scope(scope),
+                "{scope} must be a known scope or `require` returns a 500"
+            );
+            assert!(
+                authz.has_scope(&granted_admin, scope),
+                "{scope} is implied by moira:admin — this is the fact decision D1 rests on"
+            );
+        }
+        assert!(
+            !AuthorizationService::is_known_scope("moira:admins:manage"),
+            "ownership is `admin_identities.is_primary`, not a scope: a scope here would \
+             be implied by moira:admin and would authorise every admin to transfer \
+             ownership away from every other admin"
+        );
     }
 
     #[test]
