@@ -908,6 +908,29 @@ an "active sessions" screen over an in-memory store would be the appearance of a
 
 **Test baseline:** 779 passing on plan 11's branch (744 on `main` after plan 10).
 
+## USER DECISIONS — 2026-07-31, taken interactively
+
+1. **Findings before waves 4–5.** F20, F13, F17 and the Wave 2 leftovers first. F20 is the reason:
+   Wave 5 is meant to build the ownership UI, and ownership is currently unreachable on any
+   greenfield deployment.
+2. **Ownership is a SINGLE primary, set at claim time.** The setup claimant becomes primary
+   automatically, so a fresh deployment has one without operator intervention — that is the direct
+   F20 fix. Transfer moves the flag; the last-primary guard prevents clearing it.
+   *Reversal condition:* if a deployment ever needs several people able to manage admins
+   independently, this becomes a set rather than a flag, and the last-primary guard becomes a
+   last-any-primary guard. That is a schema change, not a config toggle.
+3. **`cargo-mutants` on code a PR touches**, not the whole tree — a full run over 400+ crates is too
+   slow to gate on. Rationale: hand-written mutations found **6 of 6** cases where a test passed
+   against broken code, including one nothing caught, which is how F19's enumeration oracle
+   surfaced. Reading a test does not tell you whether it works.
+4. **Ban `file.rs:123` citations in plans**; cite symbol names, which do not rot. Measured staleness
+   across five re-audited plans: **40%, 45%, 65%, 70%, 85%** — every one needed a rewrite before it
+   could be implemented.
+   **Keep the re-audit step regardless.** It is what caught plan 08's wizard being unable to ever
+   succeed, plan 11 contradicting a committed test suite, and plan 09 extending a UI that did not
+   exist. No citation format would have caught any of those — the ban removes drift *volume*, not
+   the danger in it.
+
 ## COMPACTION DISCIPLINE — added 2026-07-31
 
 This run is unattended and long, so context *will* be summarised. **The rule: this file, the plan
