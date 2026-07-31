@@ -80,6 +80,8 @@ impl<'a> AuthProviderSettingsService<'a> {
             request.method,
             request.issuer.as_deref(),
             request.discovery_url.as_deref(),
+            request.authorization_url.as_deref(),
+            request.token_url.as_deref(),
             request.jwks_url.as_deref(),
             request.client_id.as_deref(),
         )?;
@@ -98,6 +100,20 @@ impl<'a> AuthProviderSettingsService<'a> {
         // property of a *different* row and a rejected request must not take the lock.
         self.reject_self_asserting_console_issuer(request.trusted_jwt_issuer_id)
             .await?;
+        // Finding F23's two configure-time refusals. Same placement, same reason: both are
+        // properties of *other* rows, and a request that cannot succeed must not enter the
+        // envelope.
+        self.reject_issuer_shadowing_a_trusted_issuer(
+            request.issuer.as_deref(),
+            request.trusted_jwt_issuer_id,
+        )
+        .await?;
+        self.reject_duplicate_enabled_provider(
+            request.trusted_jwt_issuer_id,
+            request.enabled,
+            None,
+        )
+        .await?;
 
         let spec = admin_command_spec(ctx, actor, "auth_provider.create", json!({}), &request)?;
         let settings = Arc::clone(&self.settings);
@@ -188,6 +204,32 @@ impl<'a> AuthProviderSettingsService<'a> {
         }
         self.reject_self_asserting_console_issuer(request.trusted_jwt_issuer_id)
             .await?;
+        // `patch` `coalesce`s every absent field, so the two F23 guards have to run against
+        // the row as it will BE, not against the fragment the caller sent. Enabling a row
+        // that is already bound, or binding a row that is already enabled, are both the
+        // duplicate condition and neither carries both values in its request body.
+        //
+        // The read is skipped entirely when the patch touches none of the three inputs, so
+        // an ordinary `display_name` change still costs one statement and still surfaces a
+        // stale `If-Match` as `resource_version_conflict` rather than as anything from here.
+        if request.issuer.is_some()
+            || request.trusted_jwt_issuer_id.is_some()
+            || request.enabled == Some(true)
+        {
+            let current = self.settings.get(id).await?;
+            let effective_issuer = request.issuer.as_deref().or(current.issuer.as_deref());
+            let effective_binding = request
+                .trusted_jwt_issuer_id
+                .or(current.trusted_jwt_issuer_id);
+            let effective_enabled = request.enabled.unwrap_or(current.enabled);
+            self.reject_issuer_shadowing_a_trusted_issuer(effective_issuer, effective_binding)
+                .await?;
+            // `Some(id)`: the row is allowed to remain the enabled provider on its own
+            // binding. Without the exclusion a no-op patch on an enabled provider would
+            // refuse itself.
+            self.reject_duplicate_enabled_provider(effective_binding, effective_enabled, Some(id))
+                .await?;
+        }
         // The version check happens inside the repository's transaction, on a row locked by
         // `select … for update` — never against a version read on a separate connection,
         // which is the lost update the `expected_version` parameter exists to close.
@@ -235,9 +277,16 @@ impl<'a> AuthProviderSettingsService<'a> {
                 current.method,
                 current.issuer.as_deref(),
                 current.discovery_url.as_deref(),
+                current.authorization_url.as_deref(),
+                current.token_url.as_deref(),
                 current.jwks_url.as_deref(),
                 current.client_id.as_deref(),
             )?;
+            // The path G4 exercises: A is already enabled on trusted issuer X, and this is
+            // the request that would enable B on X too. Refused with a code here; refused
+            // by `0020`'s index if two of these race.
+            self.reject_duplicate_enabled_provider(current.trusted_jwt_issuer_id, true, Some(id))
+                .await?;
         }
         let record = self
             .settings
@@ -391,6 +440,96 @@ impl<'a> AuthProviderSettingsService<'a> {
         }
         Ok(())
     }
+
+    /// Refuse a second enabled provider on a trusted issuer that already has one.
+    ///
+    /// # Why this exists when `migrations/0020` already has an index
+    ///
+    /// The index is the invariant and it is what makes
+    /// [`AuthProviderSettingsRepository::admission_policy`]'s first stage single-valued.
+    /// This is the *coded* refusal on the common path: without it the operator's request
+    /// travels through a unique violation, and a unique violation that nothing maps by name
+    /// renders as `500 database_error`. That is finding F13 verbatim, one table over, and
+    /// it is why the guard test asserts on the code string rather than on the status.
+    ///
+    /// The two are not redundant. This check and the write are not atomic, so two
+    /// concurrent enables can both pass here and race into the index; that request gets the
+    /// same code through `map_constraint_violation`. Removing either one leaves a reachable
+    /// path to the wrong answer.
+    ///
+    /// Runs **before** the transactional envelope, following the rule stated in
+    /// `src/application/identity.rs`: a request that was never going to succeed must not
+    /// take the advisory lock or write an idempotency record.
+    async fn reject_duplicate_enabled_provider(
+        &self,
+        trusted_jwt_issuer_id: Option<Uuid>,
+        enabled: bool,
+        exclude_row: Option<Uuid>,
+    ) -> Result<(), AppError> {
+        if !enabled {
+            return Ok(());
+        }
+        let Some(issuer_id) = trusted_jwt_issuer_id else {
+            // Unbound rows do not compete: `0020`'s index treats NULLs as distinct, on
+            // purpose — several `jwks` rows and several not-yet-bound providers are all
+            // legitimate simultaneously.
+            return Ok(());
+        };
+        let existing = self
+            .settings
+            .enabled_providers_on_trusted_issuer(issuer_id, exclude_row)
+            .await?;
+        if existing.is_empty() {
+            return Ok(());
+        }
+        Err(AppError::conflict(
+            "duplicate_enabled_provider_for_issuer",
+            "more than one enabled auth provider is bound to this trusted JWT issuer",
+        ))
+    }
+
+    /// Refuse a provider row whose own `issuer` string belongs to a registered trusted
+    /// issuer it is not bound to.
+    ///
+    /// # The shape this closes (F23 shape (b))
+    ///
+    /// `admission_policy`'s second stage matches `issuer = $1 and trusted_jwt_issuer_id is
+    /// null` — CONVENTIONS §7.3 mode 3, where the caller genuinely is the IdP. A row that
+    /// carries a *console-owned* issuer string in that column is claiming to be the issuer
+    /// the console mints under, which it is not. Before the two-stage lookup such a row
+    /// outranked the correctly-bound provider at any age and applied its own
+    /// `allowed_email_domains` — with an empty list, a 403 on every claim and every
+    /// redemption for that provider, and no error naming the cause.
+    ///
+    /// The two-stage lookup already makes that unreachable (stage 2 runs only when stage 1
+    /// matched nothing). This guard refuses to *store* the collision as well, because the
+    /// shape is confusing to read and because stage 2 is genuinely reachable on a
+    /// deployment with no bound provider — where the rogue row would then govern.
+    ///
+    /// A row bound to the very issuer whose string it carries is exempt: that is mode 3
+    /// configured explicitly, and it is the one arrangement in which the two values
+    /// *should* agree.
+    async fn reject_issuer_shadowing_a_trusted_issuer(
+        &self,
+        issuer: Option<&str>,
+        trusted_jwt_issuer_id: Option<Uuid>,
+    ) -> Result<(), AppError> {
+        let Some(issuer) = issuer else {
+            return Ok(());
+        };
+        let colliding = self
+            .settings
+            .trusted_issuer_ids_for_issuer(issuer, trusted_jwt_issuer_id)
+            .await?;
+        if colliding.is_empty() {
+            return Ok(());
+        }
+        Err(AppError::conflict(
+            "auth_provider_issuer_shadows_trusted_issuer",
+            "this issuer is already registered as a trusted JWT issuer that the provider is \
+             not bound to",
+        ))
+    }
 }
 
 /// The method's required **non-secret** configuration.
@@ -401,10 +540,13 @@ impl<'a> AuthProviderSettingsService<'a> {
 ///
 /// It deliberately does not — and cannot — check for an OAuth client secret: under D7 Moira
 /// does not store one.
+#[allow(clippy::too_many_arguments)]
 fn validate_method_shape(
     method: AuthMethod,
     issuer: Option<&str>,
     discovery_url: Option<&str>,
+    authorization_url: Option<&str>,
+    token_url: Option<&str>,
     jwks_url: Option<&str>,
     client_id: Option<&str>,
 ) -> Result<(), AppError> {
@@ -412,6 +554,19 @@ fn validate_method_shape(
         AuthMethod::Jwks => jwks_url.is_some() && client_id.is_none(),
         AuthMethod::GoogleOauth | AuthMethod::GenericOidc => {
             client_id.is_some() && (issuer.is_some() || discovery_url.is_some())
+        }
+        // GitHub OAuth is not OIDC: no discovery document, no `id_token`, no issuer. Its
+        // endpoints are fixed and must be supplied directly. `issuer` and `discovery_url`
+        // are required to be **absent** rather than merely optional, mirroring
+        // `auth_provider_settings_method_shape` in `migrations/0020` — a GitHub row
+        // carrying an `issuer` would enter `admission_policy`'s mode-3 branch, which is for
+        // deployments where the caller IS the IdP, under a value nothing verifies against.
+        AuthMethod::GithubOauth => {
+            client_id.is_some()
+                && authorization_url.is_some()
+                && token_url.is_some()
+                && issuer.is_none()
+                && discovery_url.is_none()
         }
     };
     if complete {
@@ -512,22 +667,54 @@ mod tests {
         );
     }
 
+    /// Named arguments by construction: `validate_method_shape` takes seven `Option<&str>`
+    /// in a row, and a positional call in a test is one transposition away from asserting
+    /// something else entirely while still compiling.
+    #[derive(Default, Clone, Copy)]
+    struct Shape {
+        issuer: Option<&'static str>,
+        discovery_url: Option<&'static str>,
+        authorization_url: Option<&'static str>,
+        token_url: Option<&'static str>,
+        jwks_url: Option<&'static str>,
+        client_id: Option<&'static str>,
+    }
+
+    fn check(method: AuthMethod, shape: Shape) -> Result<(), AppError> {
+        validate_method_shape(
+            method,
+            shape.issuer,
+            shape.discovery_url,
+            shape.authorization_url,
+            shape.token_url,
+            shape.jwks_url,
+            shape.client_id,
+        )
+    }
+
     #[test]
     fn jwks_needs_a_jwks_url_and_refuses_a_client_id() {
-        validate_method_shape(AuthMethod::Jwks, None, None, Some("https://idp/jwks"), None)
-            .expect("a jwks method with a jwks url is complete");
+        check(
+            AuthMethod::Jwks,
+            Shape {
+                jwks_url: Some("https://idp/jwks"),
+                ..Shape::default()
+            },
+        )
+        .expect("a jwks method with a jwks url is complete");
         assert_coded(
-            &validate_method_shape(AuthMethod::Jwks, None, None, None, None).unwrap_err(),
+            &check(AuthMethod::Jwks, Shape::default()).unwrap_err(),
             StatusCode::BAD_REQUEST,
             "auth_provider_method_config_incomplete",
         );
         assert_coded(
-            &validate_method_shape(
+            &check(
                 AuthMethod::Jwks,
-                None,
-                None,
-                Some("https://idp/jwks"),
-                Some("cid"),
+                Shape {
+                    jwks_url: Some("https://idp/jwks"),
+                    client_id: Some("cid"),
+                    ..Shape::default()
+                },
             )
             .unwrap_err(),
             StatusCode::BAD_REQUEST,
@@ -538,27 +725,129 @@ mod tests {
     #[test]
     fn oauth_methods_need_a_client_id_and_an_issuer_or_discovery_url() {
         for method in [AuthMethod::GoogleOauth, AuthMethod::GenericOidc] {
-            validate_method_shape(method, Some("https://idp"), None, None, Some("cid"))
-                .expect("issuer plus client id is complete");
-            validate_method_shape(
+            check(
                 method,
-                None,
-                Some("https://idp/.well-known/openid-configuration"),
-                None,
-                Some("cid"),
+                Shape {
+                    issuer: Some("https://idp"),
+                    client_id: Some("cid"),
+                    ..Shape::default()
+                },
+            )
+            .expect("issuer plus client id is complete");
+            check(
+                method,
+                Shape {
+                    discovery_url: Some("https://idp/.well-known/openid-configuration"),
+                    client_id: Some("cid"),
+                    ..Shape::default()
+                },
             )
             .expect("discovery url plus client id is complete");
             assert_coded(
-                &validate_method_shape(method, Some("https://idp"), None, None, None).unwrap_err(),
+                &check(
+                    method,
+                    Shape {
+                        issuer: Some("https://idp"),
+                        ..Shape::default()
+                    },
+                )
+                .unwrap_err(),
                 StatusCode::BAD_REQUEST,
                 "auth_provider_method_config_incomplete",
             );
             assert_coded(
-                &validate_method_shape(method, None, None, None, Some("cid")).unwrap_err(),
+                &check(
+                    method,
+                    Shape {
+                        client_id: Some("cid"),
+                        ..Shape::default()
+                    },
+                )
+                .unwrap_err(),
                 StatusCode::BAD_REQUEST,
                 "auth_provider_method_config_incomplete",
             );
         }
+    }
+
+    /// GitHub's shape, and the four ways it is *not* the OIDC shape.
+    ///
+    /// Mirrors `auth_provider_settings_method_shape` in `migrations/0020` field for field.
+    /// If this validator and that CHECK ever disagree, the API returns `400` where the
+    /// database returns `400` for a *different* reason — or worse, accepts a row the CHECK
+    /// then refuses as an opaque constraint violation.
+    #[test]
+    fn github_needs_its_endpoints_and_refuses_an_issuer_or_a_discovery_url() {
+        let complete = Shape {
+            authorization_url: Some("https://github.com/login/oauth/authorize"),
+            token_url: Some("https://github.com/login/oauth/access_token"),
+            client_id: Some("cid"),
+            ..Shape::default()
+        };
+        check(AuthMethod::GithubOauth, complete).expect("client id + both endpoints is complete");
+
+        for (label, shape) in [
+            (
+                "no authorization_url",
+                Shape {
+                    authorization_url: None,
+                    ..complete
+                },
+            ),
+            (
+                "no token_url",
+                Shape {
+                    token_url: None,
+                    ..complete
+                },
+            ),
+            (
+                "no client_id",
+                Shape {
+                    client_id: None,
+                    ..complete
+                },
+            ),
+            (
+                "an issuer GitHub does not have",
+                Shape {
+                    issuer: Some("https://github.com"),
+                    ..complete
+                },
+            ),
+            (
+                "a discovery document GitHub does not publish",
+                Shape {
+                    discovery_url: Some("https://github.com/.well-known/openid-configuration"),
+                    ..complete
+                },
+            ),
+        ] {
+            let error = check(AuthMethod::GithubOauth, shape)
+                .expect_err(&format!("github with {label} must be refused"));
+            assert_coded(
+                &error,
+                StatusCode::BAD_REQUEST,
+                "auth_provider_method_config_incomplete",
+            );
+        }
+
+        // The OIDC shape is not accepted under `github_oauth`, and GitHub's is not accepted
+        // under the OIDC methods. Asserted in both directions because W4-D1's whole argument
+        // for a fourth variant is that the shapes are genuinely different.
+        assert!(
+            check(
+                AuthMethod::GenericOidc,
+                Shape {
+                    authorization_url: Some("https://github.com/login/oauth/authorize"),
+                    token_url: Some("https://github.com/login/oauth/access_token"),
+                    client_id: Some("cid"),
+                    ..Shape::default()
+                }
+            )
+            .is_err(),
+            "generic_oidc still needs an issuer or a discovery url"
+        );
     }
 
     /// The completeness check must never grow a secret condition: D7 means Moira has no
@@ -566,12 +855,13 @@ mod tests {
     /// lives in another system entirely.
     #[test]
     fn completeness_is_decided_without_any_secret_material() {
-        validate_method_shape(
+        check(
             AuthMethod::GoogleOauth,
-            Some("https://accounts.google.com"),
-            None,
-            None,
-            Some("cid"),
+            Shape {
+                issuer: Some("https://accounts.google.com"),
+                client_id: Some("cid"),
+                ..Shape::default()
+            },
         )
         .expect("no secret participates in this decision");
     }

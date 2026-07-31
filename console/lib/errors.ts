@@ -148,9 +148,20 @@ export const MOIRA_CODE_REMEDIES: Readonly<Record<string, MoiraRemedy>> = {
   auth_provider_url_not_allowed: "fix_form_input",
   duplicate_auth_provider: "fix_form_input",
   auth_provider_not_found: "missing_resource",
+  // 409, finding F23. NOT `fix_form_input`: nothing in the submitted body is wrong. Another
+  // row is already the enabled provider on this trusted issuer, and the operator has to
+  // decide which one governs admission — a configuration decision, not a typo.
+  duplicate_enabled_provider_for_issuer: "fix_setup_configuration",
+  // 409, F23 shape (b). The `issuer` field names a registered trusted JWT issuer the row is
+  // not bound to. That IS a field the operator can correct in the form — either by removing
+  // the issuer or by binding the row — so it is form input rather than configuration.
+  auth_provider_issuer_shadows_trusted_issuer: "fix_form_input",
 
   // --- jwt-issuer path ----------------------------------------------------
   jwks_url_rejected: "fix_form_input",
+  // 409. Live admin grants were made through this issuer; retiring it would revoke every
+  // one of them. Revoke the grants first — a configuration sequence, not a bad field.
+  trusted_issuer_has_active_grants: "fix_setup_configuration",
 
   // --- shared -------------------------------------------------------------
   if_match_required: "report_bug",

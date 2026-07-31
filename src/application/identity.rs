@@ -184,9 +184,28 @@ impl<'a> AdminIdentityService<'a> {
             .await?;
 
         // Module 10. Runs on every credential path, and can deny a system-key claim.
+        //
+        // Both arguments are load-bearing and they are NOT interchangeable — this is the
+        // `$1`/`$2` asymmetry finding F23 turned on, restated for the two-stage lookup that
+        // replaced `governing_policy`:
+        //
+        //   `$2` (`trusted_jwt_issuer_id`) is the row `resolve_active_issuer` just proved
+        //   registered and active. It selects the **bound** provider, and that stage is
+        //   tried first. On a console-mediated deployment this is the only stage that ever
+        //   matches, because every provider row's `issuer` column holds the *IdP's* issuer
+        //   while `$1` here is the *console's*.
+        //
+        //   `$1` (`issuer`) reaches only the second stage, which is restricted to rows with
+        //   NO trusted-issuer binding — CONVENTIONS §7.3 mode 3, where the caller IS the
+        //   IdP and the row's `issuer` legitimately equals the token's. Passing a nil UUID
+        //   for `$2` would silently fall through to that branch on a deployment where it
+        //   does not apply, and admit or deny under a row nobody bound.
+        //
+        // A duplicate match is a `409 duplicate_enabled_provider_for_issuer`, never a
+        // silent pick. See `AuthProviderSettingsRepository::admission_policy`.
         let policy = self
             .auth_settings
-            .governing_policy(&request.issuer, trusted_jwt_issuer_id)
+            .admission_policy(&request.issuer, trusted_jwt_issuer_id)
             .await?;
         evaluate_claim_policy(&request.email, request.email_verified, policy.as_ref())?;
 
@@ -534,16 +553,28 @@ impl<'a> AdminIdentityService<'a> {
         // there is deliberately no `invite.is_some()` short-circuit anywhere in this
         // path — `evaluate_claim_policy` cannot branch on a credential it never receives.
         //
-        // The second argument is load-bearing and is the defect plan 09 §0.1 B5 records:
-        // `governing_policy` matches `issuer = $1 or trusted_jwt_issuer_id = $2`, and in
-        // a real deployment `$1` is the *console's* issuer while the provider row's
-        // `issuer` column holds the *IdP's*. The row therefore matches only through
-        // `trusted_jwt_issuer_id`. Passing a nil UUID here — or dropping the argument —
-        // makes every redemption 403 forever on exactly the deployments that are
-        // configured correctly.
+        // The second argument is load-bearing, and the reason is the `$1`/`$2` asymmetry
+        // plan 09 §0.1 B5 half-recorded and finding F23 corrected. `$1` is the *console's*
+        // issuer — the one that signed this redemption's token — while every provider row's
+        // `issuer` column holds the *IdP's*, so the row that governs is reached through
+        // `trusted_jwt_issuer_id` and through nothing else.
+        //
+        // B5 read that as "the redeem path never passes `$2`, so every redemption 403s
+        // forever". It does pass it, and always has (`resolve_active_issuer`, just above).
+        // The real defect was a **wrong-policy** bug, not a total-denial one: under the old
+        // single-query `governing_policy`, every legitimately-bound row tied on the first
+        // sort key and `created_at asc` handed the policy to the oldest row bound to that
+        // trusted issuer — regardless of which provider authenticated the human — and an
+        // enabled row whose *own* `issuer` happened to equal `$1` outranked all of them at
+        // any age, without being bound to anything.
+        //
+        // `admission_policy` resolves the bound row first and reaches the `issuer = $1`
+        // branch only for **unbound** rows (mode 3). Passing a nil UUID here, or dropping
+        // the argument, would skip straight to that branch and evaluate under a row nobody
+        // bound to this issuer.
         let policy = self
             .auth_settings
-            .governing_policy(&identity.issuer, trusted_jwt_issuer_id)
+            .admission_policy(&identity.issuer, trusted_jwt_issuer_id)
             .await?;
         if let Err(error) = evaluate_claim_policy(email, request.email_verified, policy.as_ref()) {
             return Err(self.denied(error));

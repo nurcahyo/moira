@@ -73,6 +73,21 @@ function reject(rejection: SessionRejection): SessionCheck {
 }
 
 /**
+ * A refusal as a value, for a caller that learned the verdict by catching it.
+ *
+ * The jwt plugin mints a token on `/get-session` as well as on `/token`
+ * (`better-auth/dist/plugins/jwt/index.mjs`: `matcher: context.path === "/get-session"`,
+ * then `ctx.setHeader("set-auth-jwt", jwt)`), so `jwt.getSubject` runs on a *read* too and
+ * its refusal arrives as a thrown [`SessionNotAdmissibleError`]. That is fail-closed and
+ * correct — but a caller holding the verdict as an exception needs to put it back into the
+ * shape every other caller uses, and must not re-derive it, or two spellings of the same
+ * rule appear.
+ */
+export function rejectedSession(rejection: SessionRejection): SessionCheck {
+  return reject(rejection);
+}
+
+/**
  * Decide whether a session may act against Moira.
  *
  * Runs the SAME allow-list Moira applies at claim time. Duplicating the check is
@@ -94,6 +109,69 @@ export function checkSession(
   }
   if (typeof idpSubject !== "string" || idpSubject === "") return reject("idp_subject_missing");
   return { ok: true, identity: { email, emailVerified: true, idpSubject } };
+}
+
+/**
+ * A session that exists but may not be exchanged for a Moira-bound credential.
+ *
+ * Carries the machine-readable `rejection` and its i18n key so the surfaces that catch it —
+ * the token route and the console layout — render a named condition rather than "something
+ * went wrong". Never the email address: this error reaches a log, and the log is not the
+ * place to accumulate the addresses of people who failed the allow-list.
+ */
+export class SessionNotAdmissibleError extends Error {
+  readonly rejection: SessionRejection;
+  readonly messageKey: string;
+
+  constructor(rejection: SessionRejection, messageKey: string) {
+    super(
+      `the console session is not admissible (${rejection}). Refusing to mint a Moira-bound ` +
+        "JWT: Moira would refuse the claim anyway, and a token issued here would be a " +
+        "credential the holder can do nothing with.",
+    );
+    this.name = "SessionNotAdmissibleError";
+    this.rejection = rejection;
+    this.messageKey = messageKey;
+  }
+}
+
+/**
+ * [`checkSession`], as a guard rather than a value — **finding F25's fix**.
+ *
+ * # Why this exists at all
+ *
+ * `checkSession` shipped with eleven green unit assertions and **no shipped caller**. Every
+ * reference outside its own definition was a test or an i18n catalog *description*. It is
+ * the console's session-boundary gate and the only caller of `isEmailDomainAllowed`, and it
+ * had never once run against a real session. That is the exact shape of the project's
+ * standing rule — *a guard nobody has seen fail is an assumption* — with the additional
+ * twist that this one was never even reached.
+ *
+ * # Where it is wired, and why not only on the page
+ *
+ * The call site that matters is `jwt.getSubject` in `lib/auth.ts`: it is the single
+ * function every minted token passes through, it already fails closed by throwing, and a
+ * token is the only thing a console session can be turned into that Moira will look at.
+ * Wiring the check into a page layout instead would let the *page* redirect while the
+ * `/api/auth/token` endpoint kept minting — the browser would be refused and a `curl` with
+ * the same cookie would not. The layout gate exists too, for the UX half (a human refused
+ * at sign-in rather than by a bare 403 several screens later), and it delegates here.
+ *
+ * # This is not a security control
+ *
+ * Moira remains the enforcer: `evaluate_claim_policy` applies the same `allowed_email_domains`
+ * server-side on the claim and the redemption, and it is the copy that governs the grant.
+ * This one governs the console session. A deployment where the two disagree is one where
+ * somebody holds a console session they can do nothing with — which reads to them as a
+ * broken console rather than as a denied identity.
+ */
+export function assertAdmissibleSession(
+  session: Partial<ConsoleSessionIdentity> | null | undefined,
+  config: Pick<ResolvedAuthConfig, "allowedEmailDomains">,
+): ConsoleSessionIdentity {
+  const check = checkSession(session, config);
+  if (!check.ok) throw new SessionNotAdmissibleError(check.rejection, check.messageKey);
+  return check.identity;
 }
 
 /* -------------------------------------------------------------------------- */

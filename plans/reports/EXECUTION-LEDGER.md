@@ -971,12 +971,60 @@ merge commit: five jobs, steps executed (`rust` 13, `console` 16, `console-conta
 
 | Wave | §0 | Drift | State |
 |---|---|---|---|
-| 4 — multi-provider | §0.7, `85b093d` on `plan/09-wave4-multi-provider` | ~70% | audited; **architecture decision required before code** — F24 rules out the naive design |
+| 4 — multi-provider | §0.7 + **§0.7.7** (the decision), `plan/09-wave4-multi-provider` | ~70% | decision taken (Option A′, staged 4A/4B); **stage 4A implemented and gated** — see below |
 | 5 — invitations + ownership UI | §0.8 on `plan/09-wave5-invitations-ui` | ~83% | audited; recovery **cut** (no backend), sessions **stay cut** |
 
-**Open findings after this merge:** F23, F24, F25, F22 (all raised 2026-07-31, see their sections),
-plus the carried-over F14, F17, F6, F2, admin-write/audit non-atomicity, and the leaked
-`trusted_jwt_issuers` test rows. **F21 is CLOSED.**
+**Open findings after this merge:** F24, F22, plus the carried-over F14, F17, F6, F2,
+admin-write/audit non-atomicity, and the leaked `trusted_jwt_issuers` test rows. **F21 is CLOSED.**
+**F23 is closed in Moira's layer** and **F25 is CLOSED** — both by wave 4A, below.
+
+### Plan 09 wave 4, stage 4A — landed on `plan/09-wave4-multi-provider` (2026-07-31)
+
+The decision, both its reversal conditions and corrections C1–C9 to §0.1's blockers are written into
+**plan 09 §0.7.7**, which supersedes §0.1's B3/B4/B5/B6/B9 and §0.7.3's W4-D2/W4-D3/W4-D4 without
+editing them — the record of what was believed is worth keeping. Read that section, not this entry,
+for the reasoning.
+
+**What 4A ships.** `migrations/0020` (the `github_oauth` method + shape CHECK swaps, which must move
+together, and the partial unique index `auth_provider_settings_one_enabled_per_trusted_issuer`);
+`admission_policy` replacing `governing_policy` with a deterministic two-stage lookup;
+`AuthMethod::GithubOauth` through the encoder, the shape validator and the anonymous sign-in
+projection; the W4-B2 fix so one undecodable row cannot 500 the anonymous login endpoint during a
+rolling deploy; a `trusted_issuer_has_active_grants` guard on the issuer delete/disable paths; and
+`checkSession` wired at `jwt.getSubject` — F25's fix.
+
+**What 4A deliberately does NOT ship.** `ambiguous_enabled_providers` stays. The console guard may be
+removed only after `0020` and the coded 409 are **deployed**, not merely merged — C5's ordering, and
+it is load-bearing. No per-provider issuer, no N buttons, no `provider_id` column.
+
+**No migration contains an unattended `update … set enabled = false`.** An already-ambiguous
+deployment fails index creation, the Helm pre-upgrade Job fails, the upgrade aborts and the old pods
+keep serving. That is the correct outcome; the operator remedy is in the migration comment. Auto-repair
+would be a silent change to who can obtain admin, run with nobody present, that a binary rollback
+cannot undo.
+
+**Three lessons worth more than the code.**
+
+1. **A named mutation is a hypothesis, not a result.** G1 was specified as "two bound providers,
+   permute `created_at`, restore the old query → the runs disagree". Applied, the test stayed
+   **green**: once every provider owns its own trusted issuer the old query and the new one agree,
+   because there is nothing left to order. The guard was rewritten with decoy rows and re-verified
+   red. Every guard in this wave had its mutation applied by hand and observed; that is the only
+   reason this one was caught.
+2. **A test harness that reimplements the code under test proves the harness works.**
+   `tests/support/console-server.ts` bound `auth.handler` to a socket directly, so every wire-level
+   console test bypassed `app/api/auth/[...all]/route.ts` — including the token-endpoint refusal
+   those tests exist to exercise. Only the runtime *resolution* is stubbed now.
+3. **`auth.api.getSession` mints a token.** better-auth's jwt plugin has an `after` hook on
+   `/get-session` that sets `set-auth-jwt`, so `getSubject` runs on a session **read** and a policy
+   refusal surfaces as a throw from a getter. Verified in `dist/plugins/jwt/index.mjs`, not assumed.
+
+**Carried into 4B, explicitly:** the T0 spike (can better-auth bind the authenticating
+`account.providerId` to the session?) gates everything; `admission_policy`'s stage 2 is now the
+legacy/compat path only, because `auth_provider_issuer_shadows_trusted_issuer` steers new
+configuration to binding; and one human signing in through two providers will hold **two**
+`admin_identities` grants with no column linking them — revocation and `is_primary` become per-grant.
+
 
 **Remaining: plan 09 only — and it is much larger than it says.** §0 written (`13284f1`) recording
 **9 blockers**. Two are structural rather than citation drift:
@@ -1093,7 +1141,22 @@ normally reaches a PR. A dispatched run executes the identical jobs against the 
 is real verification rather than an override. **Never merge this PR on local gates because the event
 did not arrive** — dispatch instead.
 
-## F23 — ESCALATED: `governing_policy` can enforce the WRONG admin-admission policy, and cannot enforce a per-provider one at all
+## F23 — ESCALATED: `governing_policy` can enforce the WRONG admin-admission policy, and cannot enforce a per-provider one at all — **QUERY-SIDE CLOSED** by plan 09 wave 4A
+
+> **Status (2026-07-31).** All three reachable shapes are closed in Moira's layer.
+> `governing_policy` is **deleted**; `admission_policy` resolves the bound provider first and
+> reaches the `issuer = $1` branch only for *unbound* rows, refusing a duplicate set with
+> `409 duplicate_enabled_provider_for_issuer` rather than taking the first of it.
+> `migrations/0020` makes shape (a) unrepresentable and
+> `auth_provider_issuer_shadows_trusted_issuer` refuses to store shape (b). The mitigation this
+> finding mandated — a partial unique index plus a coded 409 in `create`/`set_enabled` — shipped
+> as specified, and the console's `ambiguous_enabled_providers` guard **stays** until 4A is
+> deployed, per this finding's own ordering rule.
+>
+> **The structural half is NOT closed and is not closable at this layer:** Moira still cannot see
+> which upstream IdP authenticated a user. Plan 09 §0.7.7's Option A′ routes around it by giving
+> each provider its own console-minted issuer (stage 4B); it does not make Moira an independent
+> observer. F24 remains open for the same reason.
 
 **Raised by the wave-4 re-audit as W4-B1; six adversarial verifiers then corrected its scope, raised
 its severity, and found the audit had it partly wrong in four ways.** Verified empirically against
@@ -1196,7 +1259,17 @@ the strongest argument for giving each provider its own console-minted issuer an
 `trusted_jwt_issuers` row, which would make `governing_policy`'s `$2` a real discriminator and close
 F23 and F24 together.
 
-## F25 — the console's email-domain enforcement is tested, passing, and DEAD CODE
+## F25 — the console's email-domain enforcement is tested, passing, and DEAD CODE — **CLOSED** by plan 09 wave 4A
+
+> **Status (2026-07-31).** `checkSession` is wired at `jwt.getSubject` in
+> `console/lib/auth.ts` — the single function every minted Moira-bound token passes through,
+> including every server-side `mintMoiraToken` — plus a keyed 403 on the token route and the
+> `(console)` layout gate. Guarded two ways, both mutation-verified: an architecture test
+> (`guard-reachability.test.ts`) that fails when the call site is deleted **while every
+> assertion in `moira-session.test.ts` stays green** — that divergence *is* the finding — and a
+> wire-level test in which a human outside the allow-list completes OAuth and then gets 403 with
+> no token. A page-level-only wiring was verified to fail both: the token endpoint returned
+> **200 with a working credential** for exactly the session the page would have redirected.
 
 `checkSession` (`console/lib/moira-session.ts`) is the console's session-boundary gate and the only
 caller of `isEmailDomainAllowed`. **`checkSession` has no shipped caller.** Verified directly: every

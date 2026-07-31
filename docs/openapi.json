@@ -981,10 +981,12 @@
         "type": "string"
       },
       "AuthMethod": {
+        "description": "How a deployment authenticates the humans who may hold Moira admin.\n\n# `github_oauth` is a fourth variant, not a `provider_id`-keyed generic row (plan 09 W4-D1)\n\n`AuthMethod` is already the discriminator in `0013`'s SQL CHECK, in the shape validator,\nin the DB encoder and in the committed spec, so adding a variant lights up three\ncompile-time stops — [`PublicSignInMethod::from_enabled_method`],\n`validate_method_shape` and `auth_method_to_db` — each of which forces an explicit\nGitHub answer at exactly the right place. A second discriminator alongside `method`\nwould have left all three matches untouched, which is the same as having no forcing\nfunction at all.\n\nGitHub OAuth is **not** OIDC: no discovery document, no `id_token`, no issuer. Its shape\nbranch is `client_id` + `authorization_url` + `token_url`, with `issuer` and\n`discovery_url` required to be absent.",
         "enum": [
           "google_oauth",
           "generic_oidc",
-          "jwks"
+          "jwks",
+          "github_oauth"
         ],
         "type": "string"
       },

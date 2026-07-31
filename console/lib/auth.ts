@@ -62,6 +62,14 @@ import { memoryAdapter } from "better-auth/adapters/memory";
 
 import { AUTH_BASE_PATH, AUTH_JWKS_PATH, type ConsoleEnv } from "./env";
 import type { ResolvedAuthConfig } from "./auth-config";
+import {
+  assertAdmissibleSession,
+  checkSession,
+  rejectedSession,
+  SessionNotAdmissibleError,
+  type ConsoleSessionIdentity,
+  type SessionCheck,
+} from "./moira-session";
 
 /** How long a minted Moira-bound JWT lives. */
 export const MOIRA_JWT_LIFETIME = "5m";
@@ -292,7 +300,39 @@ export function createConsoleAuth(deps: ConsoleAuthDeps) {
             // is `session.user.id`, which would produce a token that verifies
             // against the console's JWKS and then matches no `admin_identities`
             // grant — a 403 from Moira with nothing locally to explain it.
-            return readIdpSubject(await context, config.providerId, session.user.id);
+            const idpSubject = await readIdpSubject(
+              await context,
+              config.providerId,
+              session.user.id,
+            );
+            // ----------------------------------------------------------------
+            // FINDING F25 — the credential boundary, and the ONLY place the
+            // console's own allow-list is load-bearing.
+            // ----------------------------------------------------------------
+            //
+            // `checkSession` shipped in wave 3 with eleven green unit
+            // assertions and no shipped caller at all. This is the call site.
+            //
+            // It is HERE and not in a page because this function is what every
+            // minted token passes through — the browser's `GET /api/auth/token`
+            // and every server-side `mintMoiraToken` alike. A page-level gate
+            // would redirect the browser while the token endpoint kept minting
+            // for the same cookie, which is a redirect, not a gate.
+            //
+            // `verify.mjs`/`sign.mjs` give no way to signal a policy refusal, so
+            // this throws — the same shape `MissingIdpSubjectError` already uses
+            // a line above, and the reason both fail closed. The route handler
+            // turns the throw into a keyed 403 so the caller sees a named
+            // condition rather than a 500.
+            assertAdmissibleSession(
+              {
+                email: session.user.email,
+                emailVerified: session.user.emailVerified,
+                idpSubject,
+              },
+              config,
+            );
+            return idpSubject;
           },
           definePayload: (session) => ({
             // Non-authoritative, and Moira treats them as such: authority comes
@@ -331,6 +371,70 @@ export function createConsoleAuth(deps: ConsoleAuthDeps) {
 
   resolveContext((auth as unknown as { $context: Promise<ConsoleAuthContext> }).$context);
   return auth;
+}
+
+/* -------------------------------------------------------------------------- */
+/* The request-level session check                                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Run [`checkSession`] against the session on this request, resolving the IdP subject the
+ * same way `getSubject` does.
+ *
+ * # One resolution, two surfaces
+ *
+ * The token route needs the *rejection* so it can answer with a keyed 403; `getSubject`
+ * needs the *subject* and throws. Both must reach the same verdict for the same cookie, so
+ * neither re-implements the rule: this reads the session and delegates, `getSubject`
+ * delegates, and `checkSession` is the only thing that decides.
+ *
+ * A missing `account` row is folded into the check rather than rethrown, so
+ * `idp_subject_missing` reaches the caller as an ordinary rejection with its own key
+ * instead of as a `MissingIdpSubjectError` the route would have to special-case.
+ */
+export async function consoleSessionCheck(
+  auth: ConsoleAuth,
+  config: ResolvedAuthConfig,
+  headers: Headers,
+): Promise<SessionCheck> {
+  let session: Awaited<ReturnType<typeof auth.api.getSession>>;
+  try {
+    session = await auth.api.getSession({ headers });
+  } catch (error) {
+    // ----------------------------------------------------------------------
+    // `getSession` MINTS. Verified in better-auth 1.6.25, not assumed.
+    // ----------------------------------------------------------------------
+    //
+    // `dist/plugins/jwt/index.mjs` registers an `after` hook whose matcher is
+    // `context.path === "/get-session"`, and it calls `getJwtToken` to populate a
+    // `set-auth-jwt` response header. So `getSubject` — and therefore the admissibility
+    // check inside it — runs on a session READ, and a refusal arrives here as a throw
+    // rather than as a `null` session.
+    //
+    // That is the correct failure direction and it is why this is a `catch` rather than a
+    // reordering: every path that reads a session for a human who may not act now fails
+    // closed, including ones this file does not know about. What it must not do is reach
+    // the caller as a 500.
+    if (error instanceof SessionNotAdmissibleError) return rejectedSession(error.rejection);
+    if (error instanceof MissingIdpSubjectError) return rejectedSession("idp_subject_missing");
+    throw error;
+  }
+  if (session === null || session === undefined) return checkSession(null, config);
+
+  const context = await (auth as unknown as { $context: Promise<ConsoleAuthContext> }).$context;
+  let idpSubject: string | undefined;
+  try {
+    idpSubject = await readIdpSubject(context, config.providerId, session.user.id);
+  } catch (error) {
+    if (!(error instanceof MissingIdpSubjectError)) throw error;
+  }
+
+  const identity: Partial<ConsoleSessionIdentity> = {
+    email: session.user.email,
+    emailVerified: session.user.emailVerified,
+    ...(idpSubject === undefined ? {} : { idpSubject }),
+  };
+  return checkSession(identity, config);
 }
 
 /* -------------------------------------------------------------------------- */

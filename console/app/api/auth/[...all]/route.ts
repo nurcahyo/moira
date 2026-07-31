@@ -14,7 +14,9 @@
 // The handler's own `Response` carries `Set-Cookie` directly. `nextCookies()` is
 // deliberately absent from the plugin list — see the note in `lib/auth.ts`.
 
+import { consoleSessionCheck } from "@/lib/auth";
 import { consoleRuntime } from "@/lib/auth-runtime";
+import { AUTH_BASE_PATH } from "@/lib/env";
 import { isMoiraRequestError } from "@/lib/errors";
 
 /**
@@ -43,10 +45,62 @@ function unavailable(code: string, messageKey: string): Response {
   );
 }
 
-async function handle(request: Request): Promise<Response> {
-  let runtimeState: Awaited<ReturnType<typeof consoleRuntime>>;
+/**
+ * The jwt plugin's token endpoint.
+ *
+ * `GET`, not `POST` — `better-auth/plugins/jwt`'s `getToken` is
+ * `createAuthEndpoint("/token", { method: "GET", ... })`. Matched on the path alone anyway,
+ * so a future verb change cannot slip the gate.
+ */
+const TOKEN_PATH = `${AUTH_BASE_PATH}/token`;
+
+/**
+ * A refusal whose body carries an i18n KEY and, deliberately, **no `token` field**.
+ *
+ * `401` for "there is no session" and `403` for "there is a session and it may not act" —
+ * the ordinary distinction, and the one a client needs to decide between "sign in" and
+ * "ask your operator to add your domain".
+ */
+function refused(rejection: string, messageKey: string): Response {
+  const status = rejection === "no_session" ? 401 : 403;
+  return Response.json(
+    { error: { code: rejection, message_key: messageKey } },
+    { status, headers: { "cache-control": "no-store" } },
+  );
+}
+
+/**
+ * How the handler obtains the current configuration.
+ *
+ * Injectable for one reason: `tests/support/console-server.ts` used to bind
+ * `auth.handler` to a socket directly, so every wire-level test in
+ * `tests/integration/oauth-flow.test.ts` bypassed this file entirely — including
+ * the token-endpoint refusal below, which is precisely what those tests exist to
+ * exercise. A harness that reimplements the handler proves the harness works.
+ *
+ * The seam is the runtime resolution and nothing else: the harness supplies an
+ * already-resolved `{ auth, config }`, and every line of policy below is the
+ * shipped one.
+ */
+type ConsoleRuntimeState = Awaited<ReturnType<typeof consoleRuntime>>;
+
+// Declared as a call-signature interface rather than as `type R = () => Promise<S>`.
+// `tests/support/copy-scan.ts` looks for `>text<` and would read the `>` of the fat arrow
+// followed by ` Promise` followed by `<` as a JSX text node — "Promise" is capitalised and
+// long enough to satisfy `looksLikeCopy`, and none of the keywords in `CODE_TOKENS` appears
+// between the brackets. Worked around here rather than by adding `Promise` to that list:
+// widening a copy gate so that new code fits through it is how a gate stops holding.
+export interface ConsoleRuntimeResolver {
+  (): Promise<ConsoleRuntimeState>;
+}
+
+export async function handleAuthRequest(
+  request: Request,
+  resolveRuntime: ConsoleRuntimeResolver = consoleRuntime,
+): Promise<Response> {
+  let runtimeState: ConsoleRuntimeState;
   try {
-    runtimeState = await consoleRuntime();
+    runtimeState = await resolveRuntime();
   } catch (error) {
     // Resolving the configuration means calling Moira, so a Moira outage lands
     // here. Without this catch it escapes as an unhandled rejection and Next
@@ -65,8 +119,34 @@ async function handle(request: Request): Promise<Response> {
     return unavailable(runtimeState.resolution.problem, runtimeState.resolution.messageKey);
   }
 
+  // ------------------------------------------------------------------------
+  // FINDING F25 — the token endpoint is a credential boundary, so it gets the
+  // console's own allow-list before Better Auth ever reaches the signer.
+  // ------------------------------------------------------------------------
+  //
+  // `jwt.getSubject` (`lib/auth.ts`) enforces the same rule and is the backstop
+  // that covers every OTHER route to a token, including server-side
+  // `mintMoiraToken`. But `getSubject` can only signal by throwing, and an
+  // uncaught throw inside a Better Auth endpoint renders as a 500 with no code
+  // — an operator outside the allow-list would be told the console is broken.
+  //
+  // So the check runs here as well, before delegating, to produce a NAMED
+  // refusal. The two are not redundant: delete this and the endpoint still
+  // refuses, but opaquely; delete `getSubject`'s and every other minting path
+  // is open.
+  if (new URL(request.url).pathname === TOKEN_PATH) {
+    const check = await consoleSessionCheck(
+      runtimeState.auth,
+      runtimeState.config,
+      request.headers,
+    );
+    if (!check.ok) return refused(check.rejection, check.messageKey);
+  }
+
   return runtimeState.auth.handler(request);
 }
+
+const handle = (request: Request): Promise<Response> => handleAuthRequest(request);
 
 export const GET = handle;
 export const POST = handle;
