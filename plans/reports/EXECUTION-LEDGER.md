@@ -2379,10 +2379,16 @@ Observed on `fix/admin-audit-atomicity`, whose `migrations/` is byte-identical t
    failure**, because `cargo test` stops scheduling further targets after the first one fails. It is
    a second symptom of one problem, not a second problem. Do not go looking for a truncated capture.
 
-The fix, when someone takes it: the sweep should spare templates other than its own. A template with
-no client backends is exactly what an idle-between-fixtures neighbour looks like, so "no client
-backend" cannot distinguish a leak from a live run. Sweeping `moira_test_building_*` and aged fixture
-clones stays correct. Until then, **two agents running the suite against one Postgres with different
-migration sets will intermittently red each other**, and the honest response is to re-run once and
-read the message rather than to bisect.
+**Mitigated, not cured, on `fix/admin-audit-atomicity`.** `TestDatabase::create_with_max_connections`
+now goes through `clone_template`, which on `3D000` rebuilds the template under the exclusive lock
+and retries the clone **once**. Retrying once and no more is deliberate: a second `3D000` means a
+neighbour is sweeping faster than a template can be built, which is a real environmental problem and
+should fail loudly rather than spin. The sweep's semantics are untouched, so a genuine schema drift
+still surfaces — the rebuild runs the same `MIGRATOR`.
+
+The cure, when someone takes it, is for the sweep to spare templates other than its own. A template
+with no client backends is exactly what an idle-between-fixtures neighbour looks like, so "no client
+backend" cannot distinguish a leak from a live run; that check needs a different signal (an age, or
+an owning-run marker) before it can safely drop a template it does not recognise. Sweeping
+`moira_test_building_*` and aged fixture clones stays correct as it is.
 
