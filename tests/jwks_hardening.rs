@@ -238,6 +238,53 @@ struct JwksFixture {
     started_at: DateTime<Utc>,
 }
 
+/// How long a leaked issuer row is left alone before the sweep reclaims it.
+///
+/// **This is not a tidiness margin — it is what keeps concurrent runs from destroying each
+/// other.** A sweep with no age bound deletes rows a *live* peer is mid-assertion on. The
+/// same shape already cost this project two 40-minute wedges in
+/// `sweep_leaked_databases`, where two runs swept each other in a loop. An hour is far
+/// longer than any run of this suite and far shorter than the interval that let 160 rows
+/// accumulate.
+const STALE_ISSUER_AGE: &str = "1 hour";
+
+/// Reclaims `trusted_jwt_issuers` rows left by **earlier** runs of this suite.
+///
+/// This fixture writes to the shared `MOIRA_TEST_DATABASE_URL` rather than a cloned
+/// database, and it had no cleanup at all: every run leaked one row per `register_issuer`
+/// call, unnoticed because the suffix makes each unique so nothing ever collided. Measured
+/// at 160 rows from a single day.
+///
+/// **Sweeping on construction rather than cleaning up at the end is deliberate.** A test
+/// that panics never reaches its own cleanup, and a panicking test is exactly when a run
+/// leaks — so end-of-test cleanup is absent precisely when it is needed. Reclaiming at
+/// start is self-healing: it collects whatever the last run left, however it ended.
+///
+/// Scoped to `https://idp.invalid/%`, which only this suite writes, so a real fixture's
+/// issuers are never touched.
+async fn sweep_stale_issuers(pool: &sqlx::PgPool) {
+    let swept = timeout(
+        WAIT,
+        sqlx::query(
+            "delete from trusted_jwt_issuers
+             where issuer like 'https://idp.invalid/%'
+               and created_at < clock_timestamp() - $1::interval",
+        )
+        .bind(STALE_ISSUER_AGE)
+        .execute(pool),
+    )
+    .await
+    .expect("stale issuer sweep timed out")
+    .expect("sweep stale trusted_jwt_issuers");
+
+    if swept.rows_affected() > 0 {
+        eprintln!(
+            "jwks_hardening: reclaimed {} leaked trusted_jwt_issuers row(s) from earlier runs",
+            swept.rows_affected()
+        );
+    }
+}
+
 impl JwksFixture {
     /// `dev_override == false` is the production posture (https-only, denied ranges
     /// refused). `true` is the documented dev escape hatch, and the only way a loopback
@@ -278,6 +325,8 @@ impl JwksFixture {
         .await
         .expect("database clock read timed out")
         .expect("database clock");
+
+        sweep_stale_issuers(&pool).await;
 
         let mut settings = Settings::default();
         settings.auth.jwks.allow_insecure_dev_urls = dev_override;
@@ -885,6 +934,85 @@ async fn concurrent_authentications_against_a_warm_cache_make_no_further_upstrea
         fixture.denial_reasons(&stub.url).await,
         Vec::<String>::new()
     );
+
+    fixture.shutdown().await;
+}
+
+/// The sweep reclaims a leaked row **and spares a fresh one**.
+///
+/// Both halves are the test. Reclaiming is the point; sparing is what stops this fix
+/// becoming the defect it replaces — an unbounded `delete` would take rows a concurrently
+/// running peer is mid-assertion on, which is exactly how `sweep_leaked_databases` wedged
+/// two runs for forty minutes.
+///
+/// Written against the shared database on purpose: that is where the leak happens, and a
+/// sweep proven only against a private clone would prove nothing about it.
+#[tokio::test]
+async fn the_sweep_reclaims_stale_issuers_and_spares_fresh_ones() {
+    let Some(fixture) = JwksFixture::new(false).await else {
+        return;
+    };
+
+    // A row backdated past the age bound, and one written now. Distinct suffixes so this
+    // test cannot collide with a peer.
+    let run = Uuid::now_v7().simple().to_string();
+    let stale = format!("https://idp.invalid/sweep-stale-{run}");
+    let fresh = format!("https://idp.invalid/sweep-fresh-{run}");
+
+    for (issuer, age) in [(&stale, "2 hours"), (&fresh, "0 seconds")] {
+        sqlx::query(
+            "insert into trusted_jwt_issuers (id, issuer, jwks_url, allowed_algorithms, status, created_at)
+             values ($1, $2, 'https://idp.invalid/jwks.json', array['RS256'], 'active',
+                     clock_timestamp() - $3::interval)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(issuer)
+        .bind(age)
+        .execute(&fixture.pool)
+        .await
+        .expect("seed issuer");
+    }
+
+    // Premise: without this, "the stale row is gone" would pass against a failed insert.
+    for issuer in [&stale, &fresh] {
+        let seeded: i64 =
+            sqlx::query_scalar("select count(*) from trusted_jwt_issuers where issuer = $1")
+                .bind(issuer)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("count seeded issuer");
+        assert_eq!(seeded, 1, "{issuer} must exist before the sweep runs");
+    }
+
+    sweep_stale_issuers(&fixture.pool).await;
+
+    let stale_left: i64 =
+        sqlx::query_scalar("select count(*) from trusted_jwt_issuers where issuer = $1")
+            .bind(&stale)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("count stale issuer");
+    assert_eq!(
+        stale_left, 0,
+        "the sweep must reclaim a row older than the age bound"
+    );
+
+    let fresh_left: i64 =
+        sqlx::query_scalar("select count(*) from trusted_jwt_issuers where issuer = $1")
+            .bind(&fresh)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("count fresh issuer");
+    assert_eq!(
+        fresh_left, 1,
+        "the sweep must spare a fresh row — a concurrent run is mid-assertion on rows like this one"
+    );
+
+    sqlx::query("delete from trusted_jwt_issuers where issuer = $1")
+        .bind(&fresh)
+        .execute(&fixture.pool)
+        .await
+        .expect("clean up the fresh issuer");
 
     fixture.shutdown().await;
 }
