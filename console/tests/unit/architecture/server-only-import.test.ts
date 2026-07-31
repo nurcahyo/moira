@@ -18,31 +18,29 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
+import { deriveCredentialModulePaths } from "../../support/server-only-derivation";
+
 const CONSOLE_ROOT = resolve(import.meta.dir, "../../..");
 
 /**
  * Every module that holds, forwards, or closes over a Moira credential or the
- * OAuth client secret.
+ * OAuth client secret — DERIVED, not listed (plan 09 Wave 3).
  *
- * Adding a module here without adding the import is a failing test; adding the
- * import without adding the module here is silently fine, which is the right way
- * round.
+ * The old prose here said "adding the import without adding the module here is
+ * silently fine, which is the right way round". It was not the right way round:
+ * a credential module added in a later wave was covered by NOTHING until
+ * somebody remembered to edit this array and the other one in
+ * `server-only-guards.test.ts` — two arrays that disagreed on six of ten
+ * entries, with nothing asserting they agreed.
+ *
+ * `deriveCredentialModulePaths()` derives the set from credential SHAPE (reads
+ * `process.env`, imports `pg`, sends a credential header, constructs an AEAD,
+ * handles a `clientSecret`) plus the transitive closure over value imports. It
+ * deliberately does NOT derive from `import "server-only"` itself, which would
+ * make deleting the marker remove the module from the set. See
+ * `tests/support/server-only-derivation.ts`.
  */
-const MUST_IMPORT_SERVER_ONLY = [
-  "lib/moira-client.ts",
-  "lib/setup-flow.ts",
-  "lib/env.ts",
-  "lib/console-secrets.ts",
-  "lib/auth-config.ts",
-  "lib/auth.ts",
-  "lib/moira-session.ts",
-  "lib/auth-runtime.ts",
-  // Plan 09 Wave 1. `console-db.ts` closes over the connection string, which
-  // carries the database password inline; `console-secrets-postgres.ts` holds
-  // the content-encryption key and returns plaintext client secrets.
-  "lib/console-db.ts",
-  "lib/console-secrets-postgres.ts",
-] as const;
+const MUST_IMPORT_SERVER_ONLY = deriveCredentialModulePaths();
 
 /** Matches a real side-effect import, not a mention in a comment. */
 function hasServerOnlyImport(source: string): boolean {
@@ -51,6 +49,12 @@ function hasServerOnlyImport(source: string): boolean {
 }
 
 describe("the server-only build guard is present where it must be", () => {
+  test("the derived set is not empty", () => {
+    // A derivation that returns nothing turns every loop below into zero tests
+    // and reports a green run.
+    expect(MUST_IMPORT_SERVER_ONLY.length).toBeGreaterThanOrEqual(10);
+  });
+
   for (const moduleName of MUST_IMPORT_SERVER_ONLY) {
     test(`${moduleName} imports "server-only"`, () => {
       const source = readFileSync(join(CONSOLE_ROOT, moduleName), "utf8");
@@ -70,10 +74,7 @@ describe("the server-only build guard is present where it must be", () => {
   test("the package still resolves its `default` condition to a throwing module", () => {
     // If upstream ever makes `index.js` inert, the build guard silently stops
     // guarding and only this test would notice.
-    const index = readFileSync(
-      join(CONSOLE_ROOT, "node_modules/server-only/index.js"),
-      "utf8",
-    );
+    const index = readFileSync(join(CONSOLE_ROOT, "node_modules/server-only/index.js"), "utf8");
     expect(index).toContain("throw new Error");
 
     const manifest = JSON.parse(
