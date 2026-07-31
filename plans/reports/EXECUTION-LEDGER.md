@@ -2269,7 +2269,10 @@ transaction against a real Postgres, through the installed HTTP stack, and both 
 asserted absent. Each test states its premise (`500`, i.e. the injection fired) before asserting the
 property, because "no audit row" is also satisfied by a `PATCH` that never ran.
 
-**Verified failing under mutation, twice, and reverted:**
+**Verified failing under mutation, twice, and reverted.** By *reproducing* the `cdb2f46`
+arrangement, not by checking `cdb2f46` out — at `cdb2f46` these tests do not compile, because the
+write methods took no `audit` argument. That distinction is the honest one and is written into the
+test's own module docs.
 
 * `patch_application`'s `commit_with_audit` replaced by `tx.commit()` + a second `pool.acquire()`:
 
@@ -2342,4 +2345,44 @@ reason written down, not left `#[ignore]`d.
    (`"SystemKey"`); `admin::shared` lowercases it (`"systemkey"`). Deployed rows carry both.
    Preserved exactly, and now documented at `runtime_audit`: unifying them is a data change, not a
    refactor, and does not belong in an atomicity fix.
+
+
+## THE SHARED TEST DATABASE CANNOT HOLD TWO MIGRATION SETS AT ONCE — it reds a gate run that has nothing wrong with it — 2026-08-01
+
+`tests/support/mod.rs::sweep_leaked_databases` drops **every** `moira_test_template_*` that is not
+the calling process's own. The template's name is a SHA-256 over the migration set
+(`template_database`, `tests/support/mod.rs:785`), so two worktrees whose migrations differ by a
+single file have different template names — and each one's `prepare_template` destroys the other's.
+
+That is worse than a wasted rebuild. `prepare_template` runs **once** per process, under the
+*exclusive* advisory lock. Every fixture afterwards takes only the **shared** lock, and only for the
+duration of its own `create database … template …`. Nothing holds the template alive *between* the
+prepare and the last fixture, so a neighbouring worktree that sweeps inside that window leaves the
+running suite cloning from a database that no longer exists:
+
+```text
+clone the migrated template database: Database(PgDatabaseError { severity: Error, code: "3D000",
+message: "template database \"moira_test_template_9a2ad893dabfee7b\" does not exist" … })
+```
+
+Observed on `fix/admin-audit-atomicity`, whose `migrations/` is byte-identical to `main`: three
+`tests/secret_leak_snapshots.rs` tests failed this way and `scripts/gates.sh` reported
+`FAILED: test`. The immediate re-run was green, with no code change between them.
+
+**Two things to carry forward.**
+
+1. **A red gate run here is not automatically a code failure.** Read the panic before concluding
+   anything. `3D000` naming a template is a neighbouring worktree, not a regression — and it is
+   otherwise indistinguishable from one, which is precisely the failure mode this ledger keeps
+   warning about.
+2. **The gate's `log holds N of M integration targets` line fires as a *consequence* of any test
+   failure**, because `cargo test` stops scheduling further targets after the first one fails. It is
+   a second symptom of one problem, not a second problem. Do not go looking for a truncated capture.
+
+The fix, when someone takes it: the sweep should spare templates other than its own. A template with
+no client backends is exactly what an idle-between-fixtures neighbour looks like, so "no client
+backend" cannot distinguish a leak from a live run. Sweeping `moira_test_building_*` and aged fixture
+clones stays correct. Until then, **two agents running the suite against one Postgres with different
+migration sets will intermittently red each other**, and the honest response is to re-run once and
+read the message rather than to bisect.
 

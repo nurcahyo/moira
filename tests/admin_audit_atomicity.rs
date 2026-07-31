@@ -27,14 +27,21 @@
 //! `version` is advanced, and `audit_logs` holds nothing for it. The admin action happened
 //! and nobody can tell.
 //!
-//! Observed at `cdb2f46`, before the fix:
+//! Observed by **reproducing** the `cdb2f46` arrangement — `PgAdminRepository::patch_application`
+//! reverted to `tx.commit()` followed by a second `pool.acquire()` — rather than by checking
+//! `cdb2f46` out, because at `cdb2f46` these tests do not compile: the write methods took no
+//! `audit` argument. The mutation was applied, run, and reverted:
 //!
 //! ```text
 //! the write must be rolled back with its audit row: at cdb2f46 the UPDATE commits and the
 //! audit INSERT does not, which is the finding
 //!   left: "audit-suppressed"
-//!  right: "Lifecycle …"
+//!  right: "Lifecycle 019fb91151147c128c5c8dc0c507cd6e"
 //! ```
+//!
+//! The same mutation applied to all thirteen `PgRuntimeRepository` sites fails
+//! [`a_runtime_patch_is_rolled_back_with_its_audit_row`] and
+//! [`a_runtime_create_leaves_no_row_when_its_audit_fails`] the same way.
 //!
 //! # Why the assertions are shaped the way they are
 //!
