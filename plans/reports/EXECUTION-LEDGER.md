@@ -1272,9 +1272,61 @@ and enum, the B2 fix, a trusted-issuer deletion guard, and wires `checkSession` 
 **deployed**, not merely merged, because until Moira itself refuses the ambiguous state the guard is
 the only thing standing in front of it.
 
+### T0 SPIKE — PASSED. 4B's primary reversal condition does not fire.
+
+`spike/w4-t0-provider-session`, `plans/reports/W4-T0-SPIKE.md`. **`context.params.providerId` is
+populated when `createSession(user.id)` runs**, so the token minter can know which provider
+authenticated the current session. Chain observed in the installed `console/node_modules` (which was
+**absent** — the agent ran `bun install --frozen-lockfile` rather than reasoning from published docs,
+which is the rule this project learned the hard way): `better-call`'s router puts `params` on the
+endpoint input → `dispatch.mjs` wraps the handler in `runWithEndpointContext` → `with-hooks.mjs`
+reads it back through `getCurrentAuthContext()` into `hooks.session.create.before`. Confirmed the
+value cannot come from the call site: `link-account.mjs::handleOAuthUserInfo` calls
+`createSession(user.id)` with no provider argument.
+
+**The strongest evidence was not in the brief: Better Auth ships a plugin that already does this.**
+`plugins/last-login-method` resolves `ctx.params?.providerId` from a session `databaseHooks`. So 4B
+rests on a supported pattern, not a private-API bet.
+
+**The two-linked-accounts case — the one that matters — was proved on real PostgreSQL**, not the
+memory adapter: 1 `user` row, 2 `account` rows with different subjects and the same verified email
+(implicitly linked), 2 `session` rows carrying different provider ids. Minting from B's session gives
+`iss = …/idp/contractors` **and** `sub = …bbbb`, both naming B, concurrently with A's session minting
+A's pair. **Both forbidden heuristics would have put A's subject under B's issuer** — which is F24
+reproduced. A single-account fixture passes either way, so this is the assertion that has teeth.
+
+**Four constraints 4B inherits, one of them unanticipated by the decision:**
+
+1. The `session.providerId` column is nullable; pre-4B sessions must **refuse**, never default —
+   asserted by nulling a live row and re-minting.
+2. The refusal must **throw**. `sign.mjs` spells it `await getSubject(...) ?? session.user.id`, so a
+   nullish return silently falls back to the console's own user id — a refusal that returns instead
+   of throwing is not a refusal.
+3. **NEW — the jwt plugin also mints on `/get-session`** (an `after` hook setting `set-auth-jwt`), so
+   a refusal that throws **500s an ordinary session read**. Fix is
+   `jwt: { disableSettingJwtHeader: true }`, demonstrated both ways: one spike part asserts the 500,
+   the next asserts a clean 200 with `/token` still refusing. **This would have shipped as a broken
+   session read discovered in production.**
+4. Read `params`, never `path` — `path` is the route *template*, so `path.split("/").pop()` yields
+   the literal `":providerId"`.
+
+Migration `0003` (`alter table "session" add column "providerId" text;`) was derived from Better
+Auth's own schema compiler rather than hand-written.
+
+**Correction to the decision:** its T0 listed approaches 1–3 as alternatives. **Approaches 1 and 2 are
+not alternatives — 1 supplies the value and 2 is what persists it and reads it back; 4B needs both.**
+Approach 3 (after-callback stamp) is rejected outright: `create.after` is queued through
+`queueAfterTransactionHook`, leaving a window with a NULL provider.
+
+Verification: 10 spike tests green (8 memory, 2 PostgreSQL), `typecheck` and `lint` clean, full
+console suite 561 pass / 1 fail where the single failure is the deliberate `CONSOLE_SKIP_DB_TESTS`
+canary — **also red on the baseline captured first**, which is how it was shown not to be a
+regression. Durable tests used their own `console_auth_t0_spike` database.
+
 ### Reversal conditions
 
-**Primary — blocks 4B only.** If spike T0 shows Better Auth 1.6.25 cannot make the authenticating
+**Primary — blocks 4B only. NOT FIRED; T0 passed (above).** If spike T0 had shown Better Auth 1.6.25
+cannot make the authenticating
 account's `providerId` available to the token minter for the current session, 4B has no honest
 implementation. Ship 4A, keep the console guard, defer multi-provider with that named blocker.
 **Explicitly forbidden as substitutes:** the most-recently-updated-account heuristic (wrong exactly
