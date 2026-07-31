@@ -23,12 +23,16 @@
 //
 // Output is one JSON object on stdout. Diagnostics go to stderr so a parse
 // failure in the parent is a real failure and not a stray log line.
+import { createLocalJWKSet, decodeProtectedHeader, jwtVerify, type JSONWebKeySet } from "jose";
+
 import { createConsoleAuth } from "../../lib/auth";
 import { createConsolePool } from "../../lib/console-db";
 import { InMemoryConsoleSecretStore } from "../../lib/console-secrets";
 import { PostgresConsoleSecretStore } from "../../lib/console-secrets-postgres";
 import { readConsoleEnv } from "../../lib/env";
 import type { ResolvedAuthConfig } from "../../lib/auth-config";
+import { reserveConsolePort, startConsoleServer } from "./console-server";
+import { trustFixtureCa } from "./fixture-tls";
 
 function flag(name: string): string | undefined {
   const index = process.argv.indexOf(`--${name}`);
@@ -52,12 +56,14 @@ function requiredFlag(name: string): string {
  * Auth mints a new pair. That is a real property worth being able to demonstrate,
  * and one of the tests does.
  */
-function probeEnv(databaseUrl: string | undefined) {
+const PROBE_AUDIENCE = "moira-admin-probe";
+
+function probeEnv(databaseUrl: string | undefined, origin = "https://console.invalid") {
   return readConsoleEnv({
     NODE_ENV: "test",
     MOIRA_API_URL: "https://moira.invalid",
-    CONSOLE_PUBLIC_ORIGIN: "https://console.invalid",
-    MOIRA_ADMIN_API_AUDIENCE: "moira-admin-probe",
+    CONSOLE_PUBLIC_ORIGIN: origin,
+    MOIRA_ADMIN_API_AUDIENCE: PROBE_AUDIENCE,
     BETTER_AUTH_SECRET: requiredFlag("auth-secret"),
     CONSOLE_SECRET_ENCRYPTION_KEY: requiredFlag("encryption-key"),
     ...(databaseUrl === undefined ? {} : { CONSOLE_DATABASE_URL: databaseUrl }),
@@ -232,6 +238,120 @@ async function main(): Promise<void> {
         process.stdout.write(JSON.stringify({ ok: true, token, error }) + "\n");
       } finally {
         await close();
+      }
+      return;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* F17 — is the PUBLISHED document one this process can SIGN for?      */
+    /* ------------------------------------------------------------------ */
+    /**
+     * The joint question, asked of the shipped stack over a real socket.
+     *
+     * `jwks` and `sign` above ask the two halves separately, which is what made
+     * F17 visible in the first place. Separate answers cannot express the
+     * property that matters, because the defect IS the disagreement: a JWKS
+     * that 200s and a signer that is dead are each individually unremarkable.
+     *
+     * So this command runs BOTH in one process against one database and reports
+     * whether the console can produce a token that verifies against the very
+     * document it just served. Everything is the shipped path:
+     *
+     *   * `startConsoleServer` builds the instance with `createConsoleAuth` and
+     *     routes through `app/api/auth/[...all]/route.ts` — not `auth.handler`,
+     *     so the route module's own behaviour is included;
+     *   * the JWKS document arrives over a real TLS socket via `fetch`, which is
+     *     Moira's own path (`createRemoteJWKSet` against `jwks_url`), not an
+     *     in-process object;
+     *   * the token is verified with `jose` against THAT document, by `kid`,
+     *     the way Moira verifies it.
+     *
+     * Nothing here re-implements the check the mechanism performs. A guard that
+     * calls the predicate it is guarding proves the predicate compiles.
+     */
+    case "attest": {
+      const dsn = flag("dsn");
+      const port = reserveConsolePort();
+      const origin = `https://localhost:${port}`;
+      const env = probeEnv(dsn, origin);
+      const pool = dsn === undefined ? null : createConsolePool(dsn);
+      trustFixtureCa(origin);
+      const server = startConsoleServer(
+        {
+          env,
+          configs: [probeAuthConfig()],
+          ...(pool === null ? {} : { database: pool }),
+        },
+        port,
+      );
+
+      try {
+        // ---- 1. what the console PUBLISHES, over the wire ----------------
+        let jwksStatus = 0;
+        let jwksBody: unknown = null;
+        let jwksError: string | null = null;
+        try {
+          const response = await fetch(server.jwksUrl);
+          jwksStatus = response.status;
+          jwksBody = (await response.json()) as unknown;
+        } catch (error) {
+          jwksError = (error as Error).message;
+        }
+        const publishedKeys =
+          jwksStatus === 200 && jwksBody !== null && typeof jwksBody === "object"
+            ? ((jwksBody as { keys?: unknown }).keys as Record<string, unknown>[] | undefined) ?? []
+            : [];
+
+        // ---- 2. what the console can SIGN --------------------------------
+        let token: string | null = null;
+        let signError: string | null = null;
+        try {
+          const result = (await server.auth.api.signJWT({
+            body: { payload: { sub: "f17-attestation" } },
+          })) as { token?: string } | string;
+          token = typeof result === "string" ? result : (result.token ?? JSON.stringify(result));
+        } catch (error) {
+          signError = (error as Error).message;
+        }
+
+        // ---- 3. does (2) verify against (1)? -----------------------------
+        //
+        // Moira's verification, reproduced: resolve the signing key by `kid`
+        // out of the fetched document, check the signature, check `iss` and
+        // `aud`. "A token was minted" and "a JWKS was served" are both true in
+        // the broken arrangement; only this step is not.
+        let verifiedKid: string | null = null;
+        let verifyError: string | null = null;
+        if (token !== null && publishedKeys.length > 0) {
+          try {
+            const keySet = createLocalJWKSet({ keys: publishedKeys } as JSONWebKeySet);
+            await jwtVerify(token, keySet, {
+              issuer: env.bffIssuerUrl,
+              audience: PROBE_AUDIENCE,
+            });
+            verifiedKid = decodeProtectedHeader(token).kid ?? null;
+          } catch (error) {
+            verifyError = (error as Error).message;
+          }
+        }
+
+        process.stdout.write(
+          JSON.stringify({
+            ok: true,
+            mode: dsn === undefined ? "memory" : "durable",
+            jwksStatus,
+            jwksBody,
+            jwksError,
+            publishedKids: publishedKeys.map((key) => key["kid"]),
+            token,
+            signError,
+            verifiedKid,
+            verifyError,
+          }) + "\n",
+        );
+      } finally {
+        server.stop();
+        if (pool !== null) await pool.end();
       }
       return;
     }
