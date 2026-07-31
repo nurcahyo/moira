@@ -1311,6 +1311,55 @@ attrition. Diagnose F22 the way the attach race was diagnosed: make it determini
 **Also worth carrying:** docs-only pushes to `main` run the full CI suite, which is what exposed this.
 That is accidental coverage worth keeping rather than optimising away.
 
+## WAVE 4 IS ENGINEERING-COMPLETE — 4A `c98aeb7`, 4B `da384c8`. Only T11 remains, and it is the user's.
+
+**Stage 4B merged** (PR #42, `da384c8`) — per-provider console issuer, N sign-in buttons, a
+GitHub-shaped mock. **Console-only**: `git diff main…HEAD -- . ':!console'` was empty, so no Rust, no
+migration, no OpenAPI change (still 151 operations / 99 paths / 178 schemas). Five CI jobs green with
+steps executed. `ambiguous_enabled_providers` **is still in the tree**, as required.
+
+**The slug decision is better than the one the design specified, and the reason generalises.** The
+design said to add an operator-chosen slug column, warning that deriving issuer strings from the
+provider row UUID would silently revoke a provider's admins on delete-and-recreate — a footgun 4A's
+`trusted_issuer_has_active_grants` guard "does not cover". The implementer instead anchored provider
+identity to the **tail of `trusted_jwt_issuers.issuer`** (`${bffIssuerUrl}/idp/<slug>`): a string
+already operator-chosen, already uniquely indexed, already what Moira pins `Validation::set_issuer`
+to — and **already behind that guard**. Anchoring one level up put provider identity *inside* the
+existing protection instead of beside it, at zero schema cost. *Reversal condition, recorded in the
+code:* a console issuer outside `${bffIssuerUrl}/idp/*` requires a real slug column with a migration,
+uniqueness rule and format CHECK.
+
+**A SECOND toothless guard was caught, in the same design document.** G9's specified assertion list
+had three members; **the minted `sub` has no teeth.** Under the provider-id mutation the flow creates
+a fresh `account` row carrying the same IdP subject, so `sub` stays correct while every pre-existing
+grant is orphaned. Only "`readIdpSubject` still finds the account" and "mints that exact `iss`"
+discriminate. Recorded in the test.
+
+Its G9 mutation was also **under-specified** — "apply the derived scheme to the legacy row" has two
+spellings at two call sites with different blast radii, one a total outage and one silent mass
+revocation. Both were applied.
+
+**The 4A lesson propagated correctly, which is the point of writing it down.** Asked whether
+`ambiguous_enabled_providers`'s condition should change to count per-trusted-issuer, the implementer
+refused and gave the right reason: `0020` makes two enabled rows on one trusted issuer
+**unrepresentable**, so such a guard could never fire — a guard whose premise the schema forbids,
+reading as protection for the multi-provider case it silently permits. **It should be deleted when 4A
+deploys, not rewritten.** That reasoning now sits at `ambiguityGuard`'s doc comment as a removal
+condition plus an explicit "do NOT fix it this way".
+
+**Three more corrections to the design**: `definePayload` performs no account read (what it shares
+with `getSubject` is one *provider resolution* over the same session object — the property holds, the
+named mechanism does not); `ConsoleRuntime`'s cache key had to start hashing the **trusted-issuer**
+rows, or repointing a provider keeps an instance alive minting the previous issuer string, which is
+the wrong grant *namespace* rather than a stale label; and GitHub is not a test-harness-only item —
+shipped code needed a `getUserInfo` override because better-auth defaults `email_verified` to `false`
+without an `id_token`, so a configured GitHub row would otherwise offer a button that can never
+complete.
+
+**GitHub's email handling is deliberately strict:** the address comes only from a `primary && verified`
+entry in `/user/emails`. `GET /user`'s public profile address is attacker-settable, and implicit
+linking would attach it to an existing admin's user row.
+
 ## ⚠️ BLOCKED ON THE USER — T11 needs Stage 4A DEPLOYED, and this loop cannot deploy
 
 **Wave 4 cannot be finished by the loop.** Stage 4A merged (`c98aeb7`), but its last task — **T11,
