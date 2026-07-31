@@ -1018,12 +1018,58 @@ or a `sleep` would hide the race, and both are forbidden here.
 Disk 76 GB free — above the 60 GB threshold, no reclaim needed. `~/.cargo-targets` holds only
 `moira-fsweep` (13 GB).
 
+**Wave 4 re-audited — `85b093d` on `plan/09-wave4-multi-provider`, §0.7, 383 lines. Drift ~70%**
+(31 of 44 falsifiable wave-4 claims wrong or materially incomplete; 12 hold, 2 partly). That lands
+squarely in the 40/45/65/70/85% band every other re-audited plan measured.
+
+**W4-B1 — ESCALATED, and it is the finding that matters.** `governing_policy`
+(`src/infra/repositories/auth_settings.rs`) selects
+`where … (issuer = $1 or trusted_jwt_issuer_id = $2) order by (issuer is not distinct from $1) desc,
+created_at asc, id asc limit 1`. On a console deployment `$1` is the **console's** issuer while each
+provider row's `issuer` column holds the **IdP's** — `src/application/identity.rs` says so in a
+comment — so rows match only through `trusted_jwt_issuer_id`. With several providers registered
+against one console, several rows share that id, they tie on the first sort key, and **the oldest
+enabled row's `allowed_email_domains` governs every claim and redemption regardless of which
+provider actually authenticated the user.** Reachable both ways: a permissive first provider silently
+widens a restrictive second; a restrictive first silently denies a correct second.
+
+This is plan 08's B1 signature again — *the plan states a per-provider allowed-domain policy and no
+named test exercises it.* `ambiguous_enabled_providers` is the only thing holding it back, and wave
+4's stated purpose is to remove that guard. **If wave 4 is descoped, the guard removal is descoped
+with it.**
+
+The audit's stronger structural claim, which decides what wave 4 can honestly promise: **Moira cannot
+see which upstream IdP authenticated a user** — the JWT it receives is the console's. If that holds,
+per-provider domain policy is not merely buggy but unenforceable at Moira's layer, and enforcement
+has to sit in the console.
+
+**Under adversarial verification before any code is written** (run `wf_f1c8b6c2-5b7`): three
+independent lenses on B1 — SQL semantics against a live rolled-back transaction, the shipped console
+data model, and reachability on today's code — plus one each on B2/B3/B4. Recorded here as *claimed*,
+not as established. The method note from cycle 9 applies: an agent correction is not self-proving,
+and one of them was itself half-wrong.
+
+Other blockers claimed: **B2** an unknown provider-kind row makes `auth_method_from_db`'s catch-all
+500 the anonymous login endpoint for *every* provider (migrate-then-roll makes it reachable);
+**B3** changing the console providerId scheme orphans the shipped secret — the AEAD AAD binds it, so
+it cannot decrypt rather than merely miss; **B4** the TS `AuthMethod` union has no drift gate against
+the spec enum. **B5** verified empirically in a rolled-back transaction: the unique index refuses two
+discovery-only OIDC providers.
+
+**Brief corrections from the audit** (this is why every brief ends with the question): next free
+migration is **`0019` on `main` today** — `0020` only after PR #39 merges, since that branch carries
+`0019_single_primary_admin.sql`; `0016` is a permanent gap. Wave 3 never shipped `middleware.ts` —
+the session gate is the `(console)` route-group layout. `PublicSignInMethod` already carries what a
+GitHub button needs; only `provider_id` is missing. F21 is a **wave-2 backend** defect by domain,
+reassigned to wave 4 only because another wave-4 task already opens that file.
+
 **In flight:**
 
 | Agent | Branch | Worktree | Doing |
 |---|---|---|---|
 | A | `fix/findings-sweep` | `…/1b00aa10-…/scratchpad/fsweep` | close the LISTEN/NOTIFY attach race, teeth-check by injection, 5 consecutive suite runs, push → then merge #39 |
-| B | `plan/09-wave4-multi-provider` | `…/3f147114-…/scratchpad/p09w4` | re-audit wave 4 against the tree, write its §0 drift/blockers/decisions. **Audit only — no implementation** |
+| ~~B~~ | `plan/09-wave4-multi-provider` | `…/3f147114-…/scratchpad/p09w4` | **done** — §0.7 committed `85b093d` |
+| verify | read-only | — | `wf_f1c8b6c2-5b7`, six verifiers over W4-B1…B4 |
 
 ### Cycle 10 — 2026-07-29 → 07-31 — plans 10 and 08 MERGED, plan 11 started
 
