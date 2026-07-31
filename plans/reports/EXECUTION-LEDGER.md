@@ -1038,6 +1038,187 @@ The reachable double-count is a **failure** replay — `admin_identity_already_c
 `AppError::Replayed` — which distorts an operator-facing denial rate rather than an invitation count.
 That is the one worth fixing, and it is not the one the sweep brief named.
 
+**CLOSED — already fixed in PR #39, which nobody had noticed.** `redeem_invite`'s `Err` arm carries
+`if !matches!(error, AppError::Replayed(_))`, and
+`an_idempotent_replay_does_not_count_a_second_invitation_or_redemption` asserts the counter reads
+`1.0` after a replayed cacheable 409. **That test works** — it reads `2.0` with the guard removed.
+
+Found by the wave-5 auditor while checking whose wave F21 belonged to. It belongs to **neither**: it
+is a wave-2 defect by domain and was closed by the findings sweep. §0.7's W4-D6 would have
+**double-implemented it**, which is the cost of routing a finding by "which file is already open"
+rather than by checking whether it is still open at all.
+
+## STANDING RISK (2026-07-31) — GitHub stopped firing `pull_request` runs; use `workflow_dispatch`
+
+**`pull_request` events stopped producing workflow runs on this repository** some time after
+08:44 UTC on 2026-07-31, while `push` runs on `main` kept working normally throughout.
+
+PR #39 accumulated **zero check-runs** (`/commits/<sha>/check-runs` → `total_count: 0`) across all
+three of: a `synchronize` from a real push, a close/reopen, and a fresh empty commit. The PR timeline
+records every one of those events, so GitHub received them and produced nothing.
+
+**Everything that could explain it was checked and ruled out:** the workflow is `active`;
+`actions/permissions` is `enabled: true, allowed_actions: all`; `ci.yml` is **byte-identical** on
+`main` and the branch (`git diff` empty), with no `paths` filter and no blocking job-level `if`; no
+commit message carries a skip directive; the repo is public, so Actions minutes are unmetered; and
+`pull_request` runs demonstrably worked on this same workflow as recently as 08:44.
+
+**Resolved honestly, not worked around.** `64d44ec` adds `workflow_dispatch:` to `ci.yml`, so the same
+six jobs can be run against an arbitrary ref: `gh workflow run ci --ref <branch>`. The dispatch uses
+the workflow file **from the target ref**, so the change must exist on the branch too — cherry-picked
+as `3093c3c`.
+
+**The alternative was merging PR #39 on local gates alone, and that was refused.** The old
+infrastructure override is void because CI works; here CI *does* work, just not through the event that
+normally reaches a PR. A dispatched run executes the identical jobs against the identical tree, so it
+is real verification rather than an override. **Never merge this PR on local gates because the event
+did not arrive** — dispatch instead.
+
+## F23 — ESCALATED: `governing_policy` can enforce the WRONG admin-admission policy, and cannot enforce a per-provider one at all
+
+**Raised by the wave-4 re-audit as W4-B1; six adversarial verifiers then corrected its scope, raised
+its severity, and found the audit had it partly wrong in four ways.** Verified empirically against
+the real schema in rolled-back transactions, not argued from reading SQL.
+
+```sql
+select id, allowed_email_domains from auth_provider_settings
+ where deleted_at is null and status = 'active' and enabled
+   and (issuer = $1 or trusted_jwt_issuer_id = $2)
+ order by (issuer is not distinct from $1) desc, created_at asc, id asc
+ limit 1
+```
+
+On a console deployment `$1` is the **console's** issuer while every provider row's `issuer` holds the
+**IdP's**, so rows match only through `$2`, tie on the first sort key, and the oldest row bound to
+that trusted issuer supplies `allowed_email_domains` for **every** claim and redemption — regardless
+of which provider authenticated the user. Three reachable shapes:
+
+- **(a)** ≥2 enabled rows share one `trusted_jwt_issuer_id` and none has `issuer = $1`. They tie;
+  `created_at asc` decides. Reproduced independently by three verifiers; flipping `created_at` flips
+  the governing policy.
+- **(b)** *Not in the audit.* Any enabled row whose own `issuer` equals `$1` outranks the correctly
+  linked row **at any age**, and need not be linked at all — plausible for a `jwks` row registered
+  against the console's own issuer string.
+- **(c)** The intended row is linked to a *different* trusted issuer, never enters the set, and a
+  single wrong row is returned.
+
+**Scope correction — the audit was wrong.** It is **not** "the oldest enabled row in the table". An
+unlinked row carrying the IdP's issuer returns **0 rows** (verified); rows on different trusted
+issuers never compete. It is the oldest enabled row *bound to that one `trusted_jwt_issuer_id`*.
+
+> **RETRACTED — this entry originally accused the audit of misquoting the ORDER BY by omitting
+> `id asc`. That was false, and the error was the coordinator's.** §0.7 quotes all three keys
+> correctly in at least three places (its drift row 7, W4-B1's prose, and §0.1 B5). The truncation
+> was introduced by **the coordinator's own brief to the verifiers**, which quoted the clause as
+> `(issuer is not distinct from $1) desc, created_at asc`. Three verifiers correctly noticed the
+> missing key and reasonably attributed it to the audit; the coordinator then propagated that into
+> this finding. Caught by the wave-5 auditor, which read §0.7's actual text instead of trusting the
+> correction it was sent.
+>
+> `id asc` is real and load-bearing — `created_at` ties exactly for rows inserted in one transaction,
+> and `id asc` is what makes the result deterministic. The audit had it right all along.
+>
+> **The lesson is about verification inputs, not about verification.** A verifier can only falsify
+> what it is shown. Quoting a claim *into* a brief is itself a transcription step, and an error there
+> is laundered into a confident, multiply-confirmed finding — three independent lenses agreed
+> precisely because all three were reading the same corrupted quote. **Point verifiers at the
+> artefact, not at a paraphrase of it.**
+
+**Severity: a defect gated behind a fully supported operator action — reachable TODAY, not
+wave-4-only.** The audit called it gated by the console's `ambiguous_enabled_providers` refusal.
+That is wrong three ways, all confirmed:
+1. `governing_policy`'s only callers are `AdminIdentityService::claim` (system-key auth) and
+   `redeem_invite` (any registered trusted JWT). **Neither reads any console state.**
+2. `consoleRuntime` resolves its snapshot **once per process**; a running console keeps minting
+   tokens after a second row is enabled. The file header's promise of per-request refresh is not
+   implemented.
+3. **Moira has no server-side refusal.** `create`/`set_enabled` do no cross-row check and the only
+   unique index is `(method, coalesce(issuer,''))`. Two enabled rows on one trusted issuer insert
+   cleanly.
+
+**Blast radius.** The deny-by-default gate is enforced from the wrong row in *both* directions,
+silently. The common failure is **availability** — a narrower or empty allow-list 403s every claim
+and redemption, and on a deployment that retired its system key that permanently blocks admin
+onboarding. It is **not** an unauthenticated path to admin: `claim` still needs the bootstrap system
+key and `redeem` still independently enforces the invitation's own email/domain constraint.
+**Medium overall; High on the lockout axis.**
+
+**The structural finding, which is bigger than the query bug: Moira cannot see which upstream IdP
+authenticated a user.** Confirmed on every surface — the console mints `iss: env.bffIssuerUrl`
+unconditionally (one issuer per console, never per provider) and forwards only
+`{iss, sub, email, email_verified}`; `trusted_jwt_issuers` has claim-mapping columns for
+subject/user/tenant/application/roles/scopes but **no slot a provider identifier could map into**;
+`TrustedJwtIdentity` is `{issuer, subject}`; `admin_identities` records no provider column. So
+per-provider `allowed_email_domains` is **unenforceable at Moira's layer by construction**. No
+ordering can select on information the query never receives — which means "fix the ORDER BY" is the
+wrong fix.
+
+**Mitigation wave 4 must ship regardless of which design it picks:** a partial unique index on
+`(trusted_jwt_issuer_id) where enabled and status='active' and deleted_at is null`, plus a coded 409
+in `create`/`set_enabled`. That turns a silent wrong-policy into a refusal at configure time and
+makes the ordering stop being load-bearing. **This is the opposite of plan 09 §0.1 B4's scheduled
+"remove the console's ambiguity guard": the guard may only be removed once Moira itself refuses the
+ambiguous state.**
+
+## F24 — ESCALATED: two IdPs returning the same `sub` collapse into ONE admin grant
+
+Surfaced by the synthesis, not by any single verifier, and it is worse than F23.
+
+`admin_identities`' uniqueness key is `(issuer, subject)` (`migrations/0012`), where `issuer` is the
+**console's** and is therefore identical for every provider. With N providers minting under one
+console issuer, two different IdPs returning the same `sub` string map to the **same admin grant**.
+GitHub subjects are short numeric strings; a generic-OIDC IdP returning a numeric `sub` collides.
+
+**Consequence:** an identity on provider B can land on an admin grant established for a different
+human on provider A. This is a cross-provider identity-confusion hazard, not merely a policy bug.
+
+**Wave 4 must not enable a second provider under one console issuer without resolving this.** It is
+the strongest argument for giving each provider its own console-minted issuer and its own
+`trusted_jwt_issuers` row, which would make `governing_policy`'s `$2` a real discriminator and close
+F23 and F24 together.
+
+## F25 — the console's email-domain enforcement is tested, passing, and DEAD CODE
+
+`checkSession` (`console/lib/moira-session.ts`) is the console's session-boundary gate and the only
+caller of `isEmailDomainAllowed`. **`checkSession` has no shipped caller.** Verified directly: every
+reference outside its own definition is in `console/tests/unit/lib/moira-session.test.ts`,
+`console/tests/integration/oauth-flow.test.ts`, or an i18n catalog *description*.
+
+**Not a hole today** — Moira enforces the same policy server-side in `evaluate_claim_policy`, so the
+deny-by-default admin-claim gate still holds. The failure is that a user passes console sign-in and
+is refused later by Moira.
+
+**Why it is worth a finding.** It is the exact shape §2.3 is about: *a guard nobody has seen fail is
+an assumption*, and here the guard is never even reached, while eleven green unit assertions say it
+works. It is also load-bearing for wave 4: the design option that moves per-provider enforcement into
+the console **must wire this**, not assume it. One verifier asserted the console "already runs the
+same allow-list at the session boundary" — the synthesis caught it, and it was verified again here.
+
+## F22 — a SECOND flake on `main`, distinct from F5, found because docs pushes run CI
+
+Run `30625512140` on `main` at `653461b` — a **docs-only ledger commit** — failed the `rust` job:
+
+```
+every_non_sse_route_group_is_governed_by_the_non_streaming_timeout ... FAILED
+tests/http_middleware_contract.rs:644
+assertion `left == right` failed: the admin route group is not layered with
+RouterPolicy::non_streaming_timeout
+  left: 200, right: 504
+```
+
+**This is not F5.** F5 is the same *file* but a different mechanism — `connections to
+moira_test_template were never released`. Here a request expected to exceed the non-streaming
+timeout returned `200` instead of `504`, i.e. the slow path completed before the deadline.
+
+**Why it matters more than one flaky test:** `main` is not reliably green, so "merge on green CI" has
+a reliability problem in both directions — a red PR run may be a known flake, and a green one proves
+less than it should. Two independent flakes are now known (F5, F22) plus the LISTEN/NOTIFY attach
+race just closed. **Do not paper over this by re-running until green** — that is faking a gate by
+attrition. Diagnose F22 the way the attach race was diagnosed: make it deterministic first.
+
+**Also worth carrying:** docs-only pushes to `main` run the full CI suite, which is what exposed this.
+That is accidental coverage worth keeping rather than optimising away.
+
 ## USER DECISIONS — 2026-07-31, taken interactively
 
 1. **Findings before waves 4–5.** F20, F13, F17 and the Wave 2 leftovers first. F20 is the reason:
@@ -1149,6 +1330,187 @@ above and in plan 09 §0.2 (decision D-F20). Four things worth carrying forward:
    killed, verified by re-applying each mutation by hand and watching the named test fail
    (`scratchpad/verify-mutants.sh`), because re-running the tool costs two hours and answers the
    same question.
+### Cycle 11 (continued) — 2026-07-31 — PR #39 blocked by a pre-existing LISTEN/NOTIFY race; waves 4–5 re-audited
+
+*The section above is the findings-sweep implementation's own record, written on the branch. This one
+is the coordination cycle that carried it to merge. Both were authored as "Cycle 11" concurrently and
+are kept whole rather than reconciled into a single narrative — they describe different work.*
+
+**PR #39 did NOT merge on arrival — its `rust` job ran and failed.** Run `30617393166`: four of five
+jobs green (`supply-chain`, `container-and-helm`, `console`, `console-container-and-helm`); `rust`
+exited 101 on a single test.
+
+```
+test an_auth_settings_write_invalidates_the_cache_via_listen_notify ... FAILED
+tests/auth_provider_settings.rs:914 — ... (CONVENTIONS §7.2): Elapsed(())
+test result: FAILED. 19 passed; 1 failed
+```
+
+**Not PR #39's defect, and not overridden.** `git diff main...origin/fix/findings-sweep` on that file
+is **+144/-0** — the branch only *added* the new F13 test and never touched the failing one, which is
+pre-existing on `main`. The merge is still blocked: a job that ran and failed is real.
+
+**Diagnosed as a listener-attach race in the test, not a product defect.**
+`spawn_runtime_config_listener` (`src/infra/db.rs`) spawns a task that only *then* calls
+`PgListener::connect_with` and `listener.listen("moira_runtime_config")`. The test spawns it and
+proceeds straight to the write. Postgres delivers `NOTIFY` only to sessions **already** listening at
+commit time, so if the listener has not attached when the `UPDATE` commits, that notification is lost
+forever and the 10s poll spins to timeout. The intervening HTTP read normally covers the gap; under
+CI load it did not. In production the listener attaches at boot and lives forever, so the lost-window
+is a startup artefact with no cache populated yet to invalidate.
+
+The fix must **establish the missing precondition, not weaken the assertion** — the test's own comment
+already asks for an acknowledgement gate rather than a fixed sleep (CONVENTIONS §3). A longer timeout
+or a `sleep` would hide the race, and both are forbidden here.
+
+**Worktree hygiene:** six merged worktrees pruned (`f15`, `p08`, `p09a`, `p09b`, `p09c`, `p11`).
+Disk 76 GB free — above the 60 GB threshold, no reclaim needed. `~/.cargo-targets` holds only
+`moira-fsweep` (13 GB).
+
+**The race is CLOSED — `4ea484b` on `fix/findings-sweep`. The diagnosis held, and was made
+deterministic before it was fixed.**
+
+Decisive experiment: move the HTTP read to *before* the spawn, removing its incidental delay and
+changing nothing else. The test then failed **3 of 3** with the byte-identical panic and line from
+CI. That settles the mechanism — `spawn_runtime_config_listener` returns its `JoinHandle` before the
+task has run `PgListener::connect_with` + `listen(…)`, so the racing write's notification is **lost,
+not late**, and no timeout length recovers it. Measured attach latency on a warm, unloaded machine:
+**59 ms** — the size of the window CI lost.
+
+Fixed with `wait_for_listener_attached`, an acknowledgement gate on `pg_stat_activity` polled at
+10 ms inside the existing `WAIT`. **No sleep, no lengthened timeout.** The assertion is byte-for-byte
+unchanged — the cache must still go `Some` → `None` from a raw `update auth_provider_settings` with
+no service involvement — so this establishes a precondition rather than weakening a gate. The
+reordering (populate → spawn → gate → write) is kept permanently, which makes the test *stronger*
+than the original: the gate is now the only thing between spawn and write, so it cannot be masked by
+incidental latency again.
+
+**The agent improved the gate I specified, and the correction is the interesting part.** My predicate
+was `query ilike 'listen%'`. That can match a `LISTEN` still *executing* — uncommitted, and therefore
+not yet able to receive anything. The shipped gate adds `state = 'idle'`, because a backend reports
+idle only after the statement committed, which is the exact point delivery becomes guaranteed; and
+`strpos(query, $1) > 0` bound to the channel name, so it proves the *right* channel is attached
+rather than any `LISTEN`. Both were verified against sqlx's `PgListener::listen` rather than assumed.
+
+**Teeth verified by three injections, all fatal, each reporting accurately:**
+
+| Injection | Result |
+|---|---|
+| dropped the `auth_provider_settings_notify` trigger (`migrations/0013`) | FAILED at the assertion, correct message |
+| removed `targets.auth_settings.invalidate_all()` from `apply_invalidation` | FAILED at the assertion, correct message |
+| listener never spawned | FAILED at the **gate**, naming the channel |
+
+That third row is why the `pg_stat_activity` gate beat the probe-notification fallback I offered: a
+probe gate would consult the same cache the test asserts on, so a broken `apply_invalidation` would
+surface as a *gate timeout with a misleading message* instead of the real assertion failing. The
+catalog observation is orthogonal to the mechanism under test, so each failure mode reports itself
+honestly. Injections were made after the commit; tree verified clean afterwards.
+
+**Gates: all six green, 891 passed.** Five consecutive `auth_provider_settings` runs, 20 passed each,
+**zero skipped DB suites** in every run and in the gates log.
+
+**`auth_provider_settings.rs` was the only ungated listener test.** `tests/runtime_config_invalidation.rs`
+already had `drain_listener`, whose comment states the same property this exercise proved; and
+`tests/coordination_default_path.rs` only asserts `!listener.is_finished()`, so it never needed one.
+No other site to fix.
+
+**§2.2's zsh `noclobber` hazard (form 5) recurred, in a new disguise.** The first attempt at the five
+consecutive runs reported `FAIL` five times with **empty test results** — `> $(mktemp)` on an
+already-existing file was refused and `cargo` never ran. `>|` fixed it. Same root cause as form 5,
+different surface: a redirect to an existing file is a silent way to not run a command at all.
+
+**Wave 4 re-audited — `85b093d` on `plan/09-wave4-multi-provider`, §0.7, 383 lines. Drift ~70%**
+(31 of 44 falsifiable wave-4 claims wrong or materially incomplete; 12 hold, 2 partly). That lands
+squarely in the 40/45/65/70/85% band every other re-audited plan measured.
+
+**W4-B1 — ESCALATED, and it is the finding that matters.** `governing_policy`
+(`src/infra/repositories/auth_settings.rs`) selects
+`where … (issuer = $1 or trusted_jwt_issuer_id = $2) order by (issuer is not distinct from $1) desc,
+created_at asc, id asc limit 1`. On a console deployment `$1` is the **console's** issuer while each
+provider row's `issuer` column holds the **IdP's** — `src/application/identity.rs` says so in a
+comment — so rows match only through `trusted_jwt_issuer_id`. With several providers registered
+against one console, several rows share that id, they tie on the first sort key, and **the oldest
+enabled row's `allowed_email_domains` governs every claim and redemption regardless of which
+provider actually authenticated the user.** Reachable both ways: a permissive first provider silently
+widens a restrictive second; a restrictive first silently denies a correct second.
+
+This is plan 08's B1 signature again — *the plan states a per-provider allowed-domain policy and no
+named test exercises it.* `ambiguous_enabled_providers` is the only thing holding it back, and wave
+4's stated purpose is to remove that guard. **If wave 4 is descoped, the guard removal is descoped
+with it.**
+
+The audit's stronger structural claim, which decides what wave 4 can honestly promise: **Moira cannot
+see which upstream IdP authenticated a user** — the JWT it receives is the console's. If that holds,
+per-provider domain policy is not merely buggy but unenforceable at Moira's layer, and enforcement
+has to sit in the console.
+
+**Under adversarial verification before any code is written** (run `wf_f1c8b6c2-5b7`): three
+independent lenses on B1 — SQL semantics against a live rolled-back transaction, the shipped console
+data model, and reachability on today's code — plus one each on B2/B3/B4. Recorded here as *claimed*,
+not as established. The method note from cycle 9 applies: an agent correction is not self-proving,
+and one of them was itself half-wrong.
+
+Other blockers claimed: **B2** an unknown provider-kind row makes `auth_method_from_db`'s catch-all
+500 the anonymous login endpoint for *every* provider (migrate-then-roll makes it reachable);
+**B3** changing the console providerId scheme orphans the shipped secret — the AEAD AAD binds it, so
+it cannot decrypt rather than merely miss; **B4** the TS `AuthMethod` union has no drift gate against
+the spec enum. **B5** verified empirically in a rolled-back transaction: the unique index refuses two
+discovery-only OIDC providers.
+
+**Brief corrections from the audit** (this is why every brief ends with the question): next free
+migration is **`0019` on `main` today** — `0020` only after PR #39 merges, since that branch carries
+`0019_single_primary_admin.sql`; `0016` is a permanent gap. Wave 3 never shipped `middleware.ts` —
+the session gate is the `(console)` route-group layout. `PublicSignInMethod` already carries what a
+GitHub button needs; only `provider_id` is missing. F21 is a **wave-2 backend** defect by domain,
+reassigned to wave 4 only because another wave-4 task already opens that file.
+
+**Wave 5 re-audited — §0.8 on `plan/09-wave5-invitations-ui`. Drift ~83% (43 of 52)** — the highest
+measured in this project, beating plan 11's 85% only narrowly. 9 hold, 6 partly, 1 unestablished,
+**36 wrong**. Roughly half is "already shipped, differently" (waves 2–3 built more than predicted);
+half is "specified against something that does not exist".
+
+**Wave 5's headline: it is not three UI features.** As written it is two UI features and one
+**backend** feature disguised as a third.
+
+- **Recovery has no backend at all.** Wave 2 took an undocumented decision (D-W2-1) to omit
+  `is_recovery` / `replaces_admin_identity_id`, **recorded only in a migration comment and two
+  catalog comments** — not in this ledger, not in the plan. So `RecoveryPanel`, `recovery.e2e.ts`,
+  `recovery_invite_gets_no_domain_policy_exemption` and `admin_identity_recovered` are all
+  unbuildable. **Cut.** *This is the finding to learn from:* a decision recorded only in code
+  comments silently removed a third of a later wave's scope, and nothing surfaced it until an
+  auditor went looking. The standing authority requires decisions in a plan's §0 **with a reversal
+  condition** precisely so this cannot happen.
+- **`redeem` cannot be registered under any existing `MoiraCredentialRequirement`.** Its spec
+  security is `bearerAuth` alone. `admin` fails the contract test *and* `#buildHeaders`' `admin` arm
+  **prefers the system key**, which would send the bootstrap credential on an invitee's redemption.
+  `none` 401s. Needs a fourth variant (`bearer_only`).
+- **Two DTO fields fail a shipped guard**: `SECRET_DTO_FIELD_PATTERN` matches `token`, so
+  `AdminInvitePreviewRequest.token` / `AdminInviteRedeemRequest.token` red `server-only-guards.test.ts`.
+- **Mounting `OnceOnlySecretModal` reds `secret-leak.e2e.ts` by design** — an armed tripwire that
+  names this wave.
+- **The a11y gate is vacuous for every route inside `(console)`.** There is no authenticated
+  Playwright state, so `page.goto` follows the redirect and audits `/login` instead. Already true of
+  `/` today — so the gate has been passing while auditing the wrong page.
+
+**Session management stays cut.** Durable storage shipped in wave 1, which satisfies half the
+recorded reversal condition — but the other half is what wave 5 builds, and three independent reasons
+stand against it: the plan's session scope silently includes an operator-editable lifetime policy
+**persisted in Moira** (a frozen-contract change); `bun test`/`next dev` default to `memoryAdapter`,
+so unit tests would exercise a store the feature does not use; and its coverage lands behind the same
+a11y silence as every gated route. `DELETE /admin-identities/{id}` already revokes *authorization*,
+which is strictly stronger than revoking a session. The auditor **could not read Better Auth
+1.6.25's `listSessions`/`revokeSession` surface** (`node_modules` absent) and recorded that as
+unverified rather than assuming it — correctly.
+
+**In flight / done this cycle:**
+
+| Agent | Branch | Doing |
+|---|---|---|
+| A | `fix/findings-sweep` | **done** — attach race closed `4ea484b`; CI dispatched as run `30628522675` |
+| B | `plan/09-wave4-multi-provider` | **done** — §0.7 committed `85b093d` |
+| C | `plan/09-wave5-invitations-ui` | **done** — §0.8 committed |
+| verify | read-only | **done** — `wf_f1c8b6c2-5b7`, six verifiers; raised F23/F24/F25 |
+| design | read-only | `wf_05ebcb68-1b2` — three wave-4 designs, three judge lenses, one decision |
 
 ### Cycle 10 — 2026-07-29 → 07-31 — plans 10 and 08 MERGED, plan 11 started
 
