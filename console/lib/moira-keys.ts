@@ -44,9 +44,19 @@ export const MOIRA_SETUP_ERROR_CODES = [
   "auth_provider_url_not_allowed", // 400  NEW
   "duplicate_auth_provider", // 409
   "auth_provider_not_found", // 404
+  // Finding F23, wave 4A. Both are refusals a setup wizard can hit on its own happy path
+  // once a deployment has more than one provider, and both name a remedy the operator can
+  // act on — which is the whole reason they are coded rather than mapped constraint
+  // violations. `duplicate_enabled_provider_for_issuer` also reaches the CLAIM path, where
+  // it means the deployment is already ambiguous.
+  "duplicate_enabled_provider_for_issuer", // 409  NEW
+  "auth_provider_issuer_shadows_trusted_issuer", // 409  NEW
 
   // --- POST /api/v1/admin/jwt-issuers -------------------------------------
   "jwks_url_rejected", // 400
+  // Retiring an issuer that still authorises live admins. Soft delete and disable alike;
+  // the remedy is to revoke the grants first.
+  "trusted_issuer_has_active_grants", // 409  NEW
 
   // --- shared admin-plane codes -------------------------------------------
   "unauthorized", // 401

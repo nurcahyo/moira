@@ -95,20 +95,79 @@ pub trait AuthProviderSettingsRepository: Send + Sync {
     /// The bootstrap read behind `GET /api/v1/admin/setup/auth-methods`.
     async fn list_enabled_public(&self) -> Result<Vec<PublicAuthMethod>, AppError>;
 
-    /// The enabled configuration row governing `issuer`, if any.
+    /// The enabled configuration row whose `allowed_email_domains` admit — or refuse — a
+    /// claim or an invite redemption presented under `issuer`.
     ///
-    /// A direct `issuer` match wins over a match through `trusted_jwt_issuer_id`, so an
-    /// operator who configured the issuer explicitly gets the row they configured. The
-    /// tie-break is written `is not distinct from` rather than `=`: `issuer` is nullable,
-    /// `null = $1` is `NULL`, and `order by … desc` puts nulls **first** in Postgres — so
-    /// the obvious spelling would rank a row with no issuer *above* an exact match.
-    /// `None` means no enabled configuration governs the issuer — which module 10 treats
-    /// as a *stricter* case of "no allowed domains" and denies.
-    async fn governing_policy(
+    /// # Two disjoint stages, and nothing is ordered (finding F23)
+    ///
+    /// This replaces `governing_policy`, which was a single query ending in
+    /// `where … and (issuer = $1 or trusted_jwt_issuer_id = $2)
+    ///  order by (issuer is not distinct from $1) desc, created_at asc, id asc limit 1`.
+    /// Three defects, all reproduced against a live database:
+    ///
+    /// * **(a)** On a console-mediated deployment `$1` is the **console's** issuer while
+    ///   every provider row's `issuer` column holds the **IdP's**, so no legitimately-bound
+    ///   row ever matched the first sort key. Every candidate tied on it and `created_at
+    ///   asc` decided — the *oldest* row bound to that trusted issuer supplied the policy
+    ///   for every claim and every redemption, whichever provider authenticated the human.
+    /// * **(b)** An enabled row whose *own* `issuer` column equals `$1` sorted FIRST at any
+    ///   age and outranked the correctly-bound row — and it need not be bound to any
+    ///   trusted issuer, so no index on `(trusted_jwt_issuer_id)` can reach it. Verified:
+    ///   an unbound `jwks` row with `allowed_email_domains = '{}'` took over the lookup and
+    ///   403'd every claim and redemption for that provider.
+    /// * **(c)** The intended row bound to a *different* trusted issuer never entered the
+    ///   set at all.
+    ///
+    /// The replacement is two disjoint queries with no `ORDER BY` between them:
+    ///
+    /// 1. **Bound**: `trusted_jwt_issuer_id = $2`. At most one row by
+    ///    `auth_provider_settings_one_enabled_per_trusted_issuer` (`migrations/0020`).
+    /// 2. **Only if (1) matched nothing** — `issuer = $1 and trusted_jwt_issuer_id is null`.
+    ///    This is CONVENTIONS §7.3's **mode 3**: bring-your-own-JWKS, where the caller *is*
+    ///    the IdP and the row's `issuer` legitimately equals the token's. Deleting this
+    ///    branch outright would have broken mode 3; restricting it to *unbound* rows is
+    ///    what closes shape (b), because a shadowing row can no longer outrank a bound one.
+    ///
+    /// Stage 2 is unreachable whenever stage 1 matches, so a console-owned issuer string
+    /// colliding with some row's `issuer` column is no longer a policy substitution.
+    ///
+    /// # Why this cannot return "the first of several"
+    ///
+    /// Both stages `fetch_all` and refuse a set larger than one with
+    /// `409 duplicate_enabled_provider_for_issuer`. `fetch_optional` would take an
+    /// arbitrary row from a duplicate set and issue a grant from it — silently, and after
+    /// the index that is supposed to prevent the state has already been bypassed by, say, a
+    /// direct write or a future migration. The index is the invariant; this refusal is the
+    /// query being unable to be wrong even without it.
+    ///
+    /// `None` means no enabled configuration admits the issuer — which the claim policy
+    /// treats as a *stricter* case of "no allowed domains" and denies.
+    async fn admission_policy(
         &self,
         issuer: &str,
         trusted_jwt_issuer_id: Uuid,
     ) -> Result<Option<GoverningAuthPolicy>, AppError>;
+
+    /// Active `trusted_jwt_issuers` rows whose `issuer` string equals `issuer`, excluding
+    /// `exclude_binding` (this provider row's own binding, which is the legitimate case).
+    ///
+    /// Backs the `auth_provider_issuer_shadows_trusted_issuer` guard.
+    async fn trusted_issuer_ids_for_issuer(
+        &self,
+        issuer: &str,
+        exclude_binding: Option<Uuid>,
+    ) -> Result<Vec<Uuid>, AppError>;
+
+    /// Ids of the enabled, active, live rows bound to `trusted_jwt_issuer_id`, excluding
+    /// `exclude_row`.
+    ///
+    /// Backs the pre-envelope `duplicate_enabled_provider_for_issuer` check, so the common
+    /// path returns a coded 409 rather than a mapped constraint violation.
+    async fn enabled_providers_on_trusted_issuer(
+        &self,
+        trusted_jwt_issuer_id: Uuid,
+        exclude_row: Option<Uuid>,
+    ) -> Result<Vec<Uuid>, AppError>;
 
     /// The `scopes_claim` mapping of a trusted JWT issuer, for module 7d's
     /// no-self-asserted-scopes rule.
@@ -194,13 +253,21 @@ impl AuthProviderSettingsRepository for PgAuthProviderSettingsRepository {
     ) -> Result<Vec<AuthProviderSettingsRecord>, AppError> {
         // Descending `(created_at, id)` keyset, strictly less-than, over-fetching by one:
         // the same contract every other admin list follows.
-        let (keyset, limit_param) = match cursor {
-            Some(_) => ("and (created_at, id) < ($1::timestamptz, $2::uuid)", "$3"),
-            None => ("", "$1"),
+        //
+        // `method = any(...)` is the W4-B2 filter — see [`DECODABLE_METHODS`]. It sits
+        // inside the keyset query rather than after it so the over-fetch still answers
+        // "is there another page?" about the rows this binary can actually return.
+        let (keyset, limit_param, methods_param) = match cursor {
+            Some(_) => (
+                "and (created_at, id) < ($1::timestamptz, $2::uuid)",
+                "$4",
+                "$3",
+            ),
+            None => ("", "$2", "$1"),
         };
         let sql = format!(
             "select {RECORD_COLUMNS} from auth_provider_settings \
-             where deleted_at is null {keyset} \
+             where deleted_at is null {keyset} and method = any({methods_param}) \
              order by created_at desc, id desc limit {limit_param}"
         );
         let query = sqlx::query(&sql);
@@ -209,6 +276,7 @@ impl AuthProviderSettingsRepository for PgAuthProviderSettingsRepository {
             None => query,
         };
         let rows = query
+            .bind(decodable_method_strings())
             .bind(limit.saturating_add(1))
             .fetch_all(&self.pool)
             .await?;
@@ -306,7 +374,13 @@ impl AuthProviderSettingsRepository for PgAuthProviderSettingsRepository {
         .bind(enabled)
         .bind(current_version)
         .fetch_optional(&mut *tx)
-        .await?
+        // `0020`'s partial unique index fires on this UPDATE, not only on INSERT: enabling a
+        // second provider on an already-occupied trusted issuer is precisely the transition
+        // it refuses. Without this mapping the request became `500 database_error` — F13's
+        // exact signature, and the reason G4's assertion is on the code string rather than
+        // on the status.
+        .await
+        .map_err(map_constraint_violation)?
         .ok_or_else(version_conflict)?;
         let record = record_from_row(&row)?;
         tx.commit().await?;
@@ -332,6 +406,18 @@ impl AuthProviderSettingsRepository for PgAuthProviderSettingsRepository {
         Ok(())
     }
 
+    /// # W4-B2: one unmappable row must not take the login screen down
+    ///
+    /// This backs the **anonymous** `GET /api/v1/admin/setup/sign-in-methods`, whose
+    /// committed spec declares only `200` and `503` — no `5XX` wildcard. It used to end in
+    /// `collect::<Result<_, _>>`, so a single row carrying a `method` this binary cannot
+    /// decode poisoned the whole list and returned an **undeclared 500 to unauthenticated
+    /// callers, for every provider**, for the length of a rolling deploy.
+    ///
+    /// The undecodable rows are excluded in SQL (see [`DECODABLE_METHODS`]) and logged, so
+    /// the remaining providers still render their buttons. `?` on the `try_get` calls
+    /// stays: a row that *did* decode and then failed to project is a genuine schema
+    /// mismatch, not a version window, and must not be swallowed.
     async fn list_enabled_public(&self) -> Result<Vec<PublicAuthMethod>, AppError> {
         // Projected field by field, never `..record`, so a future column cannot silently
         // widen the bootstrap response.
@@ -340,10 +426,13 @@ impl AuthProviderSettingsRepository for PgAuthProviderSettingsRepository {
                     jwks_url, client_id, requested_scopes, allowed_email_domains \
              from auth_provider_settings \
              where deleted_at is null and status = 'active' and enabled \
+               and method = any($1) \
              order by created_at asc, id asc",
         )
+        .bind(decodable_method_strings())
         .fetch_all(&self.pool)
         .await?;
+        warn_about_undecodable_rows(&self.pool, "list_enabled_public").await;
         rows.iter()
             .map(|row| {
                 Ok(PublicAuthMethod {
@@ -362,29 +451,74 @@ impl AuthProviderSettingsRepository for PgAuthProviderSettingsRepository {
             .collect()
     }
 
-    async fn governing_policy(
+    async fn admission_policy(
         &self,
         issuer: &str,
         trusted_jwt_issuer_id: Uuid,
     ) -> Result<Option<GoverningAuthPolicy>, AppError> {
-        let row = sqlx::query(
+        // Stage 1 — the provider bound to the trusted issuer the token was verified
+        // against. No ORDER BY, no LIMIT: `auth_provider_settings_one_enabled_per_trusted_issuer`
+        // makes this at most one row, and a second one is a refusal rather than a choice.
+        let bound = sqlx::query(
             "select id, allowed_email_domains from auth_provider_settings \
              where deleted_at is null and status = 'active' and enabled \
-               and (issuer = $1 or trusted_jwt_issuer_id = $2) \
-             order by (issuer is not distinct from $1) desc, created_at asc, id asc \
-             limit 1",
+               and trusted_jwt_issuer_id = $1",
+        )
+        .bind(trusted_jwt_issuer_id)
+        .fetch_all(&self.pool)
+        .await?;
+        if let Some(policy) = single_policy(bound, "trusted_jwt_issuer_id")? {
+            return Ok(Some(policy));
+        }
+
+        // Stage 2 — mode 3 (CONVENTIONS §7.3): the caller IS the IdP, so the row's own
+        // `issuer` legitimately equals the token's. Restricted to **unbound** rows, which
+        // is what stops a row carrying a console-owned issuer string from shadowing a bound
+        // provider (F23 shape (b)). Reached only when stage 1 matched nothing.
+        let unbound = sqlx::query(
+            "select id, allowed_email_domains from auth_provider_settings \
+             where deleted_at is null and status = 'active' and enabled \
+               and issuer = $1 and trusted_jwt_issuer_id is null",
         )
         .bind(issuer)
-        .bind(trusted_jwt_issuer_id)
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        row.map(|row| {
-            Ok(GoverningAuthPolicy {
-                id: row.try_get("id")?,
-                allowed_email_domains: row.try_get("allowed_email_domains")?,
-            })
-        })
-        .transpose()
+        single_policy(unbound, "issuer")
+    }
+
+    async fn trusted_issuer_ids_for_issuer(
+        &self,
+        issuer: &str,
+        exclude_binding: Option<Uuid>,
+    ) -> Result<Vec<Uuid>, AppError> {
+        let rows = sqlx::query_scalar::<_, Uuid>(
+            "select id from trusted_jwt_issuers \
+             where issuer = $1 and status = 'active' and deleted_at is null \
+               and ($2::uuid is null or id <> $2)",
+        )
+        .bind(issuer)
+        .bind(exclude_binding)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn enabled_providers_on_trusted_issuer(
+        &self,
+        trusted_jwt_issuer_id: Uuid,
+        exclude_row: Option<Uuid>,
+    ) -> Result<Vec<Uuid>, AppError> {
+        let rows = sqlx::query_scalar::<_, Uuid>(
+            "select id from auth_provider_settings \
+             where deleted_at is null and status = 'active' and enabled \
+               and trusted_jwt_issuer_id = $1 \
+               and ($2::uuid is null or id <> $2)",
+        )
+        .bind(trusted_jwt_issuer_id)
+        .bind(exclude_row)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     async fn trusted_issuer_scopes_claim(&self, id: Uuid) -> Result<Option<String>, AppError> {
@@ -435,6 +569,59 @@ fn version_conflict() -> AppError {
     )
 }
 
+/// The one code for "two enabled providers claim the same issuer identity".
+///
+/// Emitted from three places on purpose, because they are the same fact seen at three
+/// moments: the pre-envelope guard in the service (the common path), the mapped index
+/// violation from `migrations/0020` (a race the guard cannot close), and
+/// [`AuthProviderSettingsRepository::admission_policy`]'s refusal to pick one of a set at
+/// claim time (the invariant already broken by something else). A single code means an
+/// operator reads one remedy — disable the row that should not govern — rather than
+/// three unrelated-looking failures.
+pub(crate) fn duplicate_enabled_provider_for_issuer() -> AppError {
+    AppError::conflict(
+        "duplicate_enabled_provider_for_issuer",
+        "more than one enabled auth provider is bound to this trusted JWT issuer",
+    )
+}
+
+/// Collapse a candidate set to at most one policy, refusing rather than choosing.
+///
+/// Deliberately **not** `rows.into_iter().next()`. Taking the first row of a duplicate set
+/// is how F23 issued grants under the wrong `allowed_email_domains` for a year: it is
+/// indistinguishable from a correct result at every call site, and the caller has no way to
+/// know a choice was made. A 409 says the deployment is ambiguous and names the remedy.
+fn single_policy(
+    rows: Vec<PgRow>,
+    matched_on: &'static str,
+) -> Result<Option<GoverningAuthPolicy>, AppError> {
+    if rows.len() > 1 {
+        let ids: Vec<String> = rows
+            .iter()
+            .filter_map(|row| row.try_get::<Uuid, _>("id").ok())
+            .map(|id| id.to_string())
+            .collect();
+        tracing::error!(
+            target: "moira::auth_settings",
+            matched_on,
+            provider_ids = ?ids,
+            "admission policy lookup matched several enabled providers; refusing rather \
+             than admitting under an arbitrary one. Disable all but the row that should \
+             govern."
+        );
+        return Err(duplicate_enabled_provider_for_issuer());
+    }
+    rows.into_iter()
+        .next()
+        .map(|row| {
+            Ok(GoverningAuthPolicy {
+                id: row.try_get("id")?,
+                allowed_email_domains: row.try_get("allowed_email_domains")?,
+            })
+        })
+        .transpose()
+}
+
 fn auth_provider_not_found(id: Uuid) -> AppError {
     AppError::coded(
         StatusCode::NOT_FOUND,
@@ -443,7 +630,16 @@ fn auth_provider_not_found(id: Uuid) -> AppError {
     )
 }
 
-/// Maps the two constraints `0013` can raise onto their catalogued codes.
+/// Name of the partial unique index added by `migrations/0020`.
+///
+/// Matched by name rather than folded into the generic unique-violation arm: two enabled
+/// providers on one trusted issuer and two rows with the same `(method, issuer)` are
+/// different operator problems with different remedies, and F13 is the finding that says
+/// collapsing a specific conflict onto a generic one costs an operator a page.
+const ONE_ENABLED_PER_TRUSTED_ISSUER_INDEX: &str =
+    "auth_provider_settings_one_enabled_per_trusted_issuer";
+
+/// Maps the constraints `0013` and `0020` can raise onto their catalogued codes.
 ///
 /// The CHECK arm is defence in depth: module 9 validates method shape before the write, so
 /// reaching it means a caller found a shape the service validator missed — which should
@@ -453,6 +649,14 @@ fn map_constraint_violation(error: sqlx::Error) -> AppError {
         return AppError::from(error);
     };
     if database.is_unique_violation() {
+        // `0020`'s index. The service pre-checks this so the common path gets a coded 409
+        // without a round trip through a constraint violation, but two concurrent enables
+        // can still both pass that check and race into the index — and *that* request must
+        // not become a `500 database_error`. Finding F13 is exactly this shape, one table
+        // over.
+        if database.constraint() == Some(ONE_ENABLED_PER_TRUSTED_ISSUER_INDEX) {
+            return duplicate_enabled_provider_for_issuer();
+        }
         return AppError::conflict(
             "duplicate_auth_provider",
             "an auth provider is already configured for this method and issuer",
@@ -500,6 +704,7 @@ fn auth_method_to_db(method: AuthMethod) -> &'static str {
         AuthMethod::GoogleOauth => "google_oauth",
         AuthMethod::GenericOidc => "generic_oidc",
         AuthMethod::Jwks => "jwks",
+        AuthMethod::GithubOauth => "github_oauth",
     }
 }
 
@@ -508,7 +713,84 @@ fn auth_method_from_db(value: String) -> Result<AuthMethod, AppError> {
         "google_oauth" => Ok(AuthMethod::GoogleOauth),
         "generic_oidc" => Ok(AuthMethod::GenericOidc),
         "jwks" => Ok(AuthMethod::Jwks),
+        "github_oauth" => Ok(AuthMethod::GithubOauth),
         _ => Err(AppError::Internal(format!("unknown auth method {value}"))),
+    }
+}
+
+/// Every `method` value this binary can decode into an [`AuthMethod`].
+///
+/// # Why a list exists at all — finding W4-B2
+///
+/// `charts/moira/templates/migration-job.yaml` runs migrations as a Helm pre-upgrade hook,
+/// **before** pods roll, so during any rolling deploy old replicas serve against the new
+/// schema. The moment `0020` lands and someone creates a `github_oauth` row, every replica
+/// still running the previous binary meets a `method` its `auth_method_from_db` rejects.
+///
+/// Before this list, that one row failed the whole projection: `list_enabled_public` used
+/// `collect::<Result<_, _>>`, so a single unmappable row turned the **anonymous**
+/// `GET /api/v1/admin/setup/sign-in-methods` into a 500 — for *every* provider, not just
+/// GitHub — on an endpoint whose committed spec declares only `200` and `503`. The login
+/// screen went down for the whole rolling-deploy window, and the response was undeclared.
+///
+/// Filtering in SQL rather than skipping in Rust is deliberate: [`AuthProviderSettingsRepository::list`]
+/// over-fetches by one to answer "is there another page?", and a row dropped *after* the
+/// fetch shrinks that count, so a full page silently reports itself as the last one. The
+/// predicate keeps the keyset arithmetic exact.
+///
+/// The skipped row is not lost — it is invisible to *this* binary and reappears when the
+/// roll completes. It is logged at `warn!` with its id and raw method so an operator who
+/// is not mid-upgrade can tell the difference between a version window and a corrupt row.
+///
+/// **Maintenance:** one entry per [`AuthMethod`] variant. `auth_method_round_trips_through_the_database_encoding`
+/// enumerates the same set and asserts the count, so a variant added without an entry here
+/// fails that test instead of disappearing from every list.
+const DECODABLE_METHODS: &[AuthMethod] = &[
+    AuthMethod::GoogleOauth,
+    AuthMethod::GenericOidc,
+    AuthMethod::Jwks,
+    AuthMethod::GithubOauth,
+];
+
+fn decodable_method_strings() -> Vec<&'static str> {
+    DECODABLE_METHODS
+        .iter()
+        .copied()
+        .map(auth_method_to_db)
+        .collect()
+}
+
+/// Names the rows this binary is skipping, once per read, at `warn!`.
+///
+/// Never at `error!`: during a rolling deploy this is the *expected* state, and a page for
+/// an expected state trains operators to ignore the signal.
+async fn warn_about_undecodable_rows(pool: &PgPool, context: &'static str) {
+    let rows = sqlx::query(
+        "select id, method from auth_provider_settings \
+         where deleted_at is null and status = 'active' and enabled \
+           and method <> all($1)",
+    )
+    .bind(decodable_method_strings())
+    .fetch_all(pool)
+    .await;
+    let Ok(rows) = rows else { return };
+    if rows.is_empty() {
+        return;
+    }
+    for row in &rows {
+        let id: Result<Uuid, _> = row.try_get("id");
+        let method: Result<String, _> = row.try_get("method");
+        tracing::warn!(
+            target: "moira::auth_settings",
+            row_id = ?id.ok(),
+            method = ?method.ok(),
+            skipped = rows.len(),
+            context,
+            "auth_provider_settings row carries a method this binary cannot decode; it is \
+             skipped rather than failing the whole read. Expected during a rolling deploy \
+             (the migration job runs before pods roll); investigate if no upgrade is in \
+             flight."
+        );
     }
 }
 
@@ -551,19 +833,62 @@ mod tests {
         assert!(AUTH_PROVIDER_VERSION_FOR_UPDATE.ends_with("for update"));
     }
 
+    /// Round-trips every variant, and pins the two literals that matter for W4-B2.
+    ///
+    /// The negative literal used to be `"github"`, which is not the value `0020` writes —
+    /// so the test that was meant to prove "an unknown method is refused" passed while
+    /// saying nothing about `github_oauth`, the one string wave 4 introduces.
+    /// `"github_enterprise"` replaces it: a plausible *next* value, so the assertion is
+    /// about a string the tree does not know rather than a typo of one it does.
     #[test]
     fn auth_method_round_trips_through_the_database_encoding() {
         for method in [
             AuthMethod::GoogleOauth,
             AuthMethod::GenericOidc,
             AuthMethod::Jwks,
+            AuthMethod::GithubOauth,
         ] {
             assert_eq!(
                 auth_method_from_db(auth_method_to_db(method).to_string()).expect("round trip"),
                 method
             );
         }
+        assert_eq!(
+            auth_method_from_db("github_oauth".to_string()).expect("github_oauth decodes"),
+            AuthMethod::GithubOauth,
+            "the value `migrations/0020` admits must decode; `\"github\"` — the string the \
+             previous negative assertion used — is not it"
+        );
+        assert!(auth_method_from_db("github_enterprise".to_string()).is_err());
         assert!(auth_method_from_db("github".to_string()).is_err());
+    }
+
+    /// The W4-B2 filter must name every decodable variant, or a provider vanishes from
+    /// every list without a single test noticing.
+    #[test]
+    fn the_decodable_method_filter_covers_every_variant() {
+        let strings = decodable_method_strings();
+        for method in [
+            AuthMethod::GoogleOauth,
+            AuthMethod::GenericOidc,
+            AuthMethod::Jwks,
+            AuthMethod::GithubOauth,
+        ] {
+            let encoded = auth_method_to_db(method);
+            assert!(
+                strings.contains(&encoded),
+                "{method:?} encodes to {encoded:?}, which DECODABLE_METHODS omits — every \
+                 list would silently drop it"
+            );
+            assert!(
+                auth_method_from_db(encoded.to_string()).is_ok(),
+                "DECODABLE_METHODS must only contain values auth_method_from_db accepts"
+            );
+        }
+        // Bump alongside a new variant. The loop above pins the direction that matters
+        // (every variant is filtered in); this pins the other one (nothing unmappable was
+        // added to the filter by hand).
+        assert_eq!(strings.len(), 4);
     }
 
     #[test]
@@ -589,7 +914,7 @@ mod tests {
             .await
             .expect("bootstrap projection runs");
         assert!(
-            repo.governing_policy("https://issuer.invalid", Uuid::nil())
+            repo.admission_policy("https://issuer.invalid", Uuid::nil())
                 .await
                 .expect("policy lookup runs")
                 .is_none()
@@ -668,18 +993,41 @@ mod tests {
         }
     }
 
-    /// The `order by … desc` tie-break, exercised against a real planner.
+    /// **Guard G2 — a shadowing row cannot govern.** Finding F23 shape (b), against a real
+    /// planner.
     ///
-    /// Written `=` instead of `is not distinct from`, this returns the *issuer-less* row:
-    /// `null = $1` is `NULL`, and a descending sort puts nulls first in Postgres. The bug
-    /// is invisible in a single-row deployment and silently applies the wrong allow-list in
-    /// a multi-provider one, which is exactly the shape of defect a unit test cannot see.
+    /// # What this test used to assert, and why the premise was wrong
     ///
-    /// The `null` issuer is therefore load-bearing and cannot be replaced with a
-    /// `Uuid`-keyed one to sidestep the shared slot; [`IssuerlessSlotLock`] exists to make
-    /// holding that slot safe instead.
+    /// It was `an_exact_issuer_match_outranks_a_match_through_the_trusted_issuer_id`, and it
+    /// asserted the old `governing_policy`'s first sort key: a row whose own `issuer` column
+    /// equals `$1` wins. That ordering was defensible in the abstract — "an operator who
+    /// configured the issuer explicitly gets the row they configured" — and it is exactly
+    /// backwards on a console-mediated deployment, where `$1` is the **console's** issuer
+    /// and every provider row's `issuer` holds the **IdP's**. A row carrying a console-owned
+    /// issuer string is not an operator being explicit; it is a row claiming an identity it
+    /// does not have, and it outranked the correctly-bound provider **at any age** while
+    /// needing no trusted-issuer binding at all — so no index on `(trusted_jwt_issuer_id)`
+    /// could reach it.
+    ///
+    /// Reproduced before the fix: an enabled `jwks` row with
+    /// `allowed_email_domains = '{}'` took over the lookup and 403'd every claim and every
+    /// redemption for the bound provider.
+    ///
+    /// The test is rewritten to the new premise rather than adjusted until it passes: the
+    /// **bound** row governs, and the second stage is reached only when nothing is bound.
+    ///
+    /// # The assertion is on the returned id
+    ///
+    /// Not on "a policy came back", and not on "the claim succeeded". With a permissive
+    /// rogue list the claim succeeds for the wrong reason and every status-level assertion
+    /// stays green — which is how this survived a whole plan. The id names *which row* was
+    /// consulted, and that is the property.
+    ///
+    /// The issuer-less shape is load-bearing (it is what makes the rogue row unreachable by
+    /// the new index), so [`IssuerlessSlotLock`] still guards the shared `('generic_oidc','')`
+    /// slot.
     #[tokio::test]
-    async fn an_exact_issuer_match_outranks_a_match_through_the_trusted_issuer_id() {
+    async fn a_shadowing_unbound_row_cannot_outrank_the_bound_provider() {
         let Ok(database_url) = std::env::var("MOIRA_TEST_DATABASE_URL") else {
             eprintln!("skipping auth provider settings integration: set MOIRA_TEST_DATABASE_URL");
             return;
@@ -690,61 +1038,70 @@ mod tests {
         // back up for grabs while this test is still using it.
         let _slot_lock = IssuerlessSlotLock::acquire(&database_url, &pool).await;
 
-        let issuer = format!("https://governing-{}.invalid", Uuid::now_v7().simple());
+        // The console's issuer — the string `$1` carries on every claim and redemption.
+        let console_issuer = format!("https://console-{}.invalid/idp", Uuid::now_v7().simple());
         let issuer_id = sqlx::query_scalar::<_, Uuid>(
             "insert into trusted_jwt_issuers (issuer, jwks_url) values ($1, $2) returning id",
         )
-        .bind(&issuer)
+        .bind(&console_issuer)
         .bind("https://idp.invalid/.well-known/jwks.json")
         .fetch_one(&pool)
         .await
         .expect("register a trusted JWT issuer");
-        // Inserted first, so `created_at asc` would also prefer it if the tie-break failed.
-        sqlx::query(
+
+        // The correctly-bound provider. Inserted FIRST, so `created_at asc` cannot be what
+        // makes this pass.
+        let bound_id = sqlx::query_scalar::<_, Uuid>(
             "insert into auth_provider_settings \
                  (method, display_name, enabled, client_id, discovery_url, \
                   allowed_email_domains, trusted_jwt_issuer_id) \
-             values ('generic_oidc', 'By issuer id', true, 'cid', $1, array['wrong.example'], $2)",
+             values ('generic_oidc', 'Bound', true, 'cid', $1, array['corp.test'], $2) \
+             returning id",
         )
-        .bind(format!("{issuer}/.well-known/openid-configuration"))
+        .bind(format!("{console_issuer}/.well-known/openid-configuration"))
         .bind(issuer_id)
-        .execute(&pool)
+        .fetch_one(&pool)
         .await
-        .expect("insert the issuer-less row");
-        sqlx::query(
+        .expect("insert the bound provider");
+
+        // The rogue row: enabled, UNBOUND, and carrying the console's own issuer string in
+        // its `issuer` column with an empty allow-list. Under the old query it sorted first
+        // and denied everyone. `0020`'s partial unique index does not touch it — its
+        // `trusted_jwt_issuer_id` is NULL — which is precisely why the two-stage lookup and
+        // not the index is what closes this.
+        let rogue_id = sqlx::query_scalar::<_, Uuid>(
             "insert into auth_provider_settings \
-                 (method, display_name, enabled, issuer, client_id, allowed_email_domains) \
-             values ('google_oauth', 'By issuer', true, $1, 'cid', array['right.example'])",
+                 (method, display_name, enabled, issuer, jwks_url, allowed_email_domains) \
+             values ('jwks', 'Shadow', true, $1, 'https://rogue.invalid/jwks', '{}') \
+             returning id",
         )
-        .bind(&issuer)
-        .execute(&pool)
+        .bind(&console_issuer)
+        .fetch_one(&pool)
         .await
-        .expect("insert the exact-issuer row");
+        .expect("insert the shadowing row");
 
         let policy = PgAuthProviderSettingsRepository::new(pool.clone())
-            .governing_policy(&issuer, issuer_id)
+            .admission_policy(&console_issuer, issuer_id)
             .await
             .expect("policy lookup runs");
 
-        sqlx::query(
-            "delete from auth_provider_settings where issuer = $1 or trusted_jwt_issuer_id = $2",
-        )
-        .bind(&issuer)
-        .bind(issuer_id)
-        .execute(&pool)
-        .await
-        .expect("remove the test rows");
+        sqlx::query("delete from auth_provider_settings where id = any($1)")
+            .bind(vec![bound_id, rogue_id])
+            .execute(&pool)
+            .await
+            .expect("remove the test rows");
         sqlx::query("delete from trusted_jwt_issuers where id = $1")
             .bind(issuer_id)
             .execute(&pool)
             .await
             .expect("remove the test issuer");
 
+        let policy = policy.expect("the bound provider governs");
         assert_eq!(
-            policy
-                .expect("a governing row exists")
-                .allowed_email_domains,
-            vec!["right.example".to_string()]
+            policy.id, bound_id,
+            "the shadowing row governed: {} was consulted instead of the bound provider {}",
+            policy.id, bound_id
         );
+        assert_eq!(policy.allowed_email_domains, vec!["corp.test".to_string()]);
     }
 }

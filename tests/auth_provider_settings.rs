@@ -12,7 +12,7 @@
 
 mod support;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     Router,
@@ -45,6 +45,72 @@ const SECRET_SHAPED: [&str; 8] = [
 ];
 
 const WAIT: Duration = Duration::from_secs(10);
+
+/// The channel `listen_once` subscribes to (`src/infra/db.rs`) and every
+/// `notify_moira_runtime_config_change()` trigger publishes on (`migrations/0002`,
+/// `migrations/0013`). Repeated here rather than imported because it is not exported;
+/// a rename on either side makes [`wait_for_listener_attached`] fail loudly on its
+/// deadline rather than quietly stop gating.
+const RUNTIME_CONFIG_CHANNEL: &str = "moira_runtime_config";
+
+/// Paces [`wait_for_listener_attached`]. The first tick of a `tokio` interval completes
+/// immediately, so an already-attached listener costs nothing and only a genuine failure
+/// pays the deadline.
+const ATTACH_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Blocks until this database holds a session that has *committed*
+/// `LISTEN "moira_runtime_config"`.
+///
+/// # Why a write needs this before it can be observed
+///
+/// `spawn_runtime_config_listener` returns its `JoinHandle` the instant the task is
+/// created; only then does the task acquire a connection and execute its `LISTEN`.
+/// Postgres delivers a notification solely to sessions that were already listening when
+/// the notifying transaction committed, so a write that races the attach is not delivered
+/// late — it is **lost**, permanently, and no amount of polling afterwards recovers it.
+/// Waiting for the attach is therefore a missing precondition, not a tolerance: the
+/// assertion that follows it is unchanged, and a fixed sleep here would only be a guess
+/// at how long the attach takes (CONVENTIONS §3).
+///
+/// # Why this observation is sound
+///
+/// [`LifecycleFixture`] clones a database per test, so `datname = current_database()`
+/// cannot be satisfied by a concurrent suite's listener — this can only ever see the one
+/// this test spawned. `state = 'idle'` is what makes it an acknowledgement rather than a
+/// sighting: a backend reports idle only once the statement it was running has committed,
+/// which is exactly the point from which delivery is guaranteed. And sqlx's `PgListener`
+/// issues `LISTEN "moira_runtime_config"` (`PgListener::listen`, quoting the channel) and
+/// then executes nothing further while it blocks in `recv()`, so that text remains the
+/// session's `query` for as long as the listener lives — verified against
+/// `pg_stat_activity` on a live listener, both before and after a delivered notification.
+async fn wait_for_listener_attached(pool: &sqlx::PgPool) {
+    let mut ticker = tokio::time::interval(ATTACH_POLL_INTERVAL);
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let attached: bool = sqlx::query_scalar(
+            "select exists( \
+                 select 1 from pg_stat_activity \
+                 where datname = current_database() \
+                   and state = 'idle' \
+                   and query ilike 'listen%' \
+                   and strpos(query, $1) > 0 \
+             )",
+        )
+        .bind(RUNTIME_CONFIG_CHANNEL)
+        .fetch_one(pool)
+        .await
+        .expect("read pg_stat_activity");
+        if attached {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the runtime config listener never issued LISTEN \"{RUNTIME_CONFIG_CHANNEL}\" \
+             within {WAIT:?}; without it every NOTIFY this test emits is dropped on the floor"
+        );
+        ticker.tick().await;
+    }
+}
 
 struct HttpResult {
     status: StatusCode,
@@ -857,12 +923,16 @@ async fn an_auth_settings_write_invalidates_the_cache_via_listen_notify() {
     .await;
     assert_eq!(enabled.status, StatusCode::OK, "{:?}", enabled.body);
 
-    let listener = moira::infra::db::spawn_runtime_config_listener(
-        fixture.pool.clone(),
-        moira::infra::db::RuntimeInvalidationTargets::from_state(&fixture.state),
-    );
-
     // Populate the cache through the read path the console uses.
+    //
+    // Done *before* the listener exists, deliberately. The read used to sit between the
+    // spawn and the write, where its latency happened to give the listener time to attach —
+    // an accident, not a guarantee, and one that stopped holding under CI load (run
+    // 30617393166). With it moved here, the only thing standing between the spawn and the
+    // write is `wait_for_listener_attached`, so the gate is load-bearing and a regression in
+    // it cannot be papered over by incidental delay. The create and enable above commit
+    // before the listener attaches too, which means their notifications are lost rather than
+    // arriving later and clearing the cache for a reason this test is not asserting.
     let read = request(
         router,
         "GET",
@@ -882,6 +952,15 @@ async fn an_auth_settings_write_invalidates_the_cache_via_listen_notify() {
             .is_some(),
         "the read path must populate the cache, or this test proves nothing"
     );
+
+    let listener = moira::infra::db::spawn_runtime_config_listener(
+        fixture.pool.clone(),
+        moira::infra::db::RuntimeInvalidationTargets::from_state(&fixture.state),
+    );
+    // The precondition the write below depends on: Postgres routes a notification only to
+    // sessions already listening at commit time, so a write issued before the attach is
+    // silently discarded rather than delayed.
+    wait_for_listener_attached(&fixture.pool).await;
 
     // Write straight to the table rather than through the service, so the *only* thing that
     // can clear the cache is the NOTIFY trigger — the service's own local invalidation is
@@ -1032,6 +1111,150 @@ async fn a_second_provider_for_the_same_method_and_issuer_returns_409() {
 
     assert_eq!(second.status, StatusCode::CONFLICT, "{:?}", second.body);
     assert_eq!(second.code(), "duplicate_auth_provider");
+}
+
+/// **Finding F13.** Every uniqueness conflict in this tree is a `409` — except this one,
+/// which fell through `AppError::Sqlx` to `500 database_error` because
+/// `trusted_jwt_issuers` had no mapping to match `auth_provider_settings`'s
+/// `duplicate_auth_provider` above.
+///
+/// It lives beside that test on purpose: the two are the same condition on two tables, and
+/// the reason the gap survived is that nothing ever compared them. The consequence was
+/// found while building the console — a client recovering from a half-finished registration
+/// cannot adopt the existing issuer by catching a `409` when the `409` never arrives, and a
+/// `500` is indistinguishable from an outage worth paging someone for.
+///
+/// Asserted on the status, the code **and** the `message_key`: the code alone would pass
+/// against an uncatalogued literal, which is exactly the class of defect
+/// `every_coded_error_literal_in_src_has_a_catalog_entry` exists to prevent.
+#[tokio::test]
+async fn a_second_trusted_jwt_issuer_for_the_same_issuer_returns_409_not_500() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let issuer = format!("https://duplicate-issuer-{}.example", Uuid::now_v7());
+    let body = json!({
+        "issuer": issuer,
+        "jwks_url": "https://issuer.example/jwks",
+        "allowed_algorithms": ["RS256"],
+        "subject_claim": "sub"
+    });
+
+    let first = request(
+        router.clone(),
+        "POST",
+        "/api/v1/admin/jwt-issuers",
+        HeaderMap::new(),
+        None,
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::CREATED, "{:?}", first.body);
+
+    let second = request(
+        router.clone(),
+        "POST",
+        "/api/v1/admin/jwt-issuers",
+        HeaderMap::new(),
+        None,
+        Some(body),
+    )
+    .await;
+
+    assert_eq!(
+        second.status,
+        StatusCode::CONFLICT,
+        "a duplicate issuer must be a conflict the caller can act on, not a 500: {:?}",
+        second.body
+    );
+    assert_eq!(second.code(), "duplicate_trusted_jwt_issuer");
+    assert_eq!(
+        second.body["error"]["message_key"],
+        json!("moira.error.duplicate_trusted_jwt_issuer")
+    );
+
+    // The refusal must not have written a second row, and the recovery the `409` enables —
+    // find the existing issuer and adopt it — must actually be available.
+    let rows: i64 =
+        sqlx::query_scalar("select count(*) from trusted_jwt_issuers where issuer = $1")
+            .bind(&issuer)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("count issuers");
+    assert_eq!(rows, 1, "a refused create must leave exactly the first row");
+}
+
+/// **Only a uniqueness conflict is a duplicate.**
+///
+/// Found by `cargo mutants`: replacing the `database.is_unique_violation()` match guard with
+/// `true` survived the suite, because the test above is the only thing that reaches the mapper
+/// and it only ever presents a duplicate. Under that mutation *every* database failure on this
+/// insert — a check violation, a truncation, a constraint the schema grows next year — comes
+/// back as `409 duplicate_trusted_jwt_issuer`, telling a client to go adopt an existing row
+/// that does not exist. `already_claimed_on_unique_violation` has carried the equivalent unit
+/// test since plan 07; this is the one that was missing.
+///
+/// `clock_skew_seconds` is `i32` in the DTO and `check (clock_skew_seconds >= 0)` in the
+/// schema, so a negative value is the reachable non-unique database failure on exactly this
+/// statement.
+///
+/// The assertion is deliberately **negative**. What this deployment currently does with a
+/// negative skew is return `500 database_error` — the value should be refused as a `422` by
+/// the service before it ever reaches SQL, which is a separate gap and not this test's
+/// subject. Pinning the 500 would cement it; pinning "this is not a duplicate" states only the
+/// property the mapper is responsible for.
+#[tokio::test]
+async fn a_non_unique_database_failure_is_not_reported_as_a_duplicate_issuer() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let issuer = format!("https://skew-issuer-{}.example", Uuid::now_v7());
+
+    let refused = request(
+        router.clone(),
+        "POST",
+        "/api/v1/admin/jwt-issuers",
+        HeaderMap::new(),
+        None,
+        Some(json!({
+            "issuer": issuer,
+            "jwks_url": "https://issuer.example/jwks",
+            "allowed_algorithms": ["RS256"],
+            "subject_claim": "sub",
+            "clock_skew_seconds": -1
+        })),
+    )
+    .await;
+
+    assert_ne!(
+        refused.status,
+        StatusCode::CREATED,
+        "the schema's check constraint must refuse a negative clock skew: {:?}",
+        refused.body
+    );
+    assert_ne!(
+        refused.code(),
+        "duplicate_trusted_jwt_issuer",
+        "a check violation is not a uniqueness conflict, and reporting it as one sends the \
+         client to adopt a row that was never created: {:?}",
+        refused.body
+    );
+    assert_ne!(
+        refused.status,
+        StatusCode::CONFLICT,
+        "nor is it any other kind of conflict: {:?}",
+        refused.body
+    );
+
+    let rows: i64 =
+        sqlx::query_scalar("select count(*) from trusted_jwt_issuers where issuer = $1")
+            .bind(&issuer)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("count issuers");
+    assert_eq!(rows, 0, "the premise is that no row was written");
 }
 
 #[tokio::test]
@@ -1398,4 +1621,556 @@ async fn auth_provider_settings_list_pages_without_duplicates_or_gaps() {
             "seeded row {id} was never observed across the full walk"
         );
     }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Plan 09 wave 4A — finding F23's guards                                      */
+/*                                                                             */
+/* Each of these was written against the mutation that must turn it red, and   */
+/* each mutation was applied by hand and observed. A guard nobody has seen     */
+/* fail is an assumption; this project has seven findings whose common shape   */
+/* is an assertion that passed against broken code.                            */
+/* -------------------------------------------------------------------------- */
+
+use moira::infra::repositories::{
+    AuthProviderSettingsRepository, PgAuthProviderSettingsRepository,
+};
+
+/// Register a trusted JWT issuer and return `(id, issuer string)`.
+async fn register_trusted_issuer(pool: &sqlx::PgPool, label: &str) -> (Uuid, String) {
+    let issuer = format!(
+        "https://console.test/idp/{label}-{}",
+        Uuid::now_v7().simple()
+    );
+    let id = sqlx::query_scalar::<_, Uuid>(
+        "insert into trusted_jwt_issuers (issuer, jwks_url) values ($1, $2) returning id",
+    )
+    .bind(&issuer)
+    .bind("https://console.test/.well-known/jwks.json")
+    .fetch_one(pool)
+    .await
+    .expect("register a trusted JWT issuer");
+    (id, issuer)
+}
+
+/// An enabled `generic_oidc` provider bound to `trusted_jwt_issuer_id`.
+///
+/// Its own `issuer` column holds the **IdP's** issuer, which is the arrangement every
+/// console-mediated deployment has and the one F23 turns on: it never equals the `$1` the
+/// claim path passes.
+async fn insert_bound_provider(
+    pool: &sqlx::PgPool,
+    trusted_jwt_issuer_id: Uuid,
+    domains: &[&str],
+) -> Uuid {
+    sqlx::query_scalar::<_, Uuid>(
+        "insert into auth_provider_settings \
+             (method, display_name, enabled, issuer, client_id, allowed_email_domains, \
+              trusted_jwt_issuer_id) \
+         values ('generic_oidc', 'Bound', true, $1, 'cid', $2, $3) returning id",
+    )
+    .bind(format!("https://idp.test/{}", Uuid::now_v7().simple()))
+    .bind(domains.iter().map(|d| d.to_string()).collect::<Vec<_>>())
+    .bind(trusted_jwt_issuer_id)
+    .fetch_one(pool)
+    .await
+    .expect("insert a bound provider")
+}
+
+/// An enabled, UNBOUND row whose own `issuer` column carries `issuer` — F23 shape (b).
+///
+/// By SQL, because `auth_provider_issuer_shadows_trusted_issuer` refuses to create it
+/// through the API. A deployment can hold one only from before `migrations/0020`, which is
+/// precisely the deployment `admission_policy` has to be correct on.
+async fn insert_shadow_row(pool: &sqlx::PgPool, issuer: &str, domains: &[&str]) -> Uuid {
+    sqlx::query_scalar::<_, Uuid>(
+        "insert into auth_provider_settings \
+             (method, display_name, enabled, issuer, jwks_url, allowed_email_domains) \
+         values ('jwks', 'Shadow', true, $1, 'https://rogue.invalid/jwks', $2) returning id",
+    )
+    .bind(issuer)
+    .bind(domains.iter().map(|d| d.to_string()).collect::<Vec<_>>())
+    .fetch_one(pool)
+    .await
+    .expect("insert a shadowing row")
+}
+
+/// **G1 — policy selection does not depend on row order.**
+///
+/// Two enabled providers, each bound to its *own* trusted issuer, with different
+/// `allowed_email_domains`. Each lookup must return **its own row's list contents**; then
+/// the rows' `created_at` values are permuted and the results must be identical.
+///
+/// # The decoys, and why the guard is worthless without them
+///
+/// The wave-4 design document specified G1 as the two bound rows plus the permutation, with
+/// "restore the old `governing_policy`" as the mutation that must turn it red. **Applied,
+/// that mutation left this test green**, and the reason matters: once every provider owns
+/// its own trusted issuer, `trusted_jwt_issuer_id = $2` selects exactly one row, there is
+/// nothing for an `ORDER BY` to arbitrate, and the old query and the new one agree. F23
+/// shape (a) — several enabled rows on one trusted issuer — is unrepresentable after
+/// `migrations/0020`, so a test built only from legal rows cannot reach the defect.
+///
+/// So each lookup is given a **decoy**: an enabled, *unbound* row whose own `issuer` column
+/// carries the console issuer string that lookup passes as `$1`, with a different allow-list.
+/// That is the only shape in which two rows still compete, it is exactly F23 shape (b), and
+/// it is inserted by SQL because `auth_provider_issuer_shadows_trusted_issuer` now refuses
+/// to create it through the API. Under the old query the decoy sorts FIRST — `(issuer is
+/// not distinct from $1) desc` — at any age, and the assertion on the returned **id** fails.
+///
+/// *Mutation, re-verified after the correction:* restore the old `governing_policy` body
+/// behind `admission_policy`. Both lookups then return their decoy.
+///
+/// Deliberately **not** the toothless version: a single enabled row would pass under any
+/// query, and `assert!(policy.is_some())` would pass under the wrong one.
+#[tokio::test]
+async fn the_admission_policy_is_the_bound_rows_own_and_does_not_depend_on_row_order() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let repo = PgAuthProviderSettingsRepository::new(fixture.pool.clone());
+
+    let (google_issuer_id, google_issuer) = register_trusted_issuer(&fixture.pool, "google").await;
+    let (github_issuer_id, github_issuer) = register_trusted_issuer(&fixture.pool, "github").await;
+    let google_row = insert_bound_provider(&fixture.pool, google_issuer_id, &["corp.test"]).await;
+    let github_row =
+        insert_bound_provider(&fixture.pool, github_issuer_id, &["contractor.test"]).await;
+
+    // The premise, asserted rather than assumed: two DISTINCT enabled rows on two DISTINCT
+    // trusted issuers. Without this the test could pass on one row and prove nothing.
+    assert_ne!(google_row, github_row);
+    assert_ne!(google_issuer_id, github_issuer_id);
+
+    // The decoys. Inserted by SQL: the API refuses this shape with
+    // `409 auth_provider_issuer_shadows_trusted_issuer`, which is the point — it is F23
+    // shape (b), and a deployment can only still hold one from before `migrations/0020`.
+    let google_decoy =
+        insert_shadow_row(&fixture.pool, &google_issuer, &["decoy-google.test"]).await;
+    let github_decoy =
+        insert_shadow_row(&fixture.pool, &github_issuer, &["decoy-github.test"]).await;
+
+    // Premise for the decoys too: they are enabled, unbound, and carry the console issuer
+    // string. A decoy that failed to insert would make every assertion below vacuous.
+    let decoy_shape: (bool, Option<Uuid>, Option<String>) = sqlx::query_as(
+        "select enabled, trusted_jwt_issuer_id, issuer from auth_provider_settings where id = $1",
+    )
+    .bind(google_decoy)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read the decoy back");
+    assert_eq!(
+        decoy_shape,
+        (true, None, Some(google_issuer.clone())),
+        "the decoy is not the shape this guard needs"
+    );
+
+    let lookup = async |issuer: &str, issuer_id: Uuid| {
+        repo.admission_policy(issuer, issuer_id)
+            .await
+            .expect("admission policy lookup runs")
+            .expect("a bound provider governs")
+    };
+
+    let google_first = lookup(&google_issuer, google_issuer_id).await;
+    let github_first = lookup(&github_issuer, github_issuer_id).await;
+
+    assert_eq!(google_first.id, google_row);
+    assert_eq!(
+        google_first.allowed_email_domains,
+        vec!["corp.test".to_string()]
+    );
+    assert_eq!(github_first.id, github_row);
+    assert_eq!(
+        github_first.allowed_email_domains,
+        vec!["contractor.test".to_string()],
+        "the GitHub lookup returned the Google row's policy — the ordering is load-bearing"
+    );
+    assert_ne!(google_first.id, google_decoy);
+    assert_ne!(github_first.id, github_decoy);
+
+    // Permute `created_at` so the row the old query would have preferred changes. Under a
+    // correct lookup nothing moves; under an ordered one, everything does.
+    sqlx::query(
+        "update auth_provider_settings set created_at = now() - interval '1 year' where id = $1",
+    )
+    .bind(github_row)
+    .execute(&fixture.pool)
+    .await
+    .expect("age the GitHub row");
+    sqlx::query("update auth_provider_settings set created_at = now() where id = $1")
+        .bind(google_row)
+        .execute(&fixture.pool)
+        .await
+        .expect("freshen the Google row");
+
+    let google_after = lookup(&google_issuer, google_issuer_id).await;
+    let github_after = lookup(&github_issuer, github_issuer_id).await;
+
+    assert_eq!(
+        (google_after.id, google_after.allowed_email_domains.clone()),
+        (google_first.id, google_first.allowed_email_domains.clone()),
+        "permuting created_at changed which policy governs the Google provider"
+    );
+    assert_eq!(
+        (github_after.id, github_after.allowed_email_domains.clone()),
+        (github_first.id, github_first.allowed_email_domains.clone()),
+        "permuting created_at changed which policy governs the GitHub provider"
+    );
+}
+
+/// **G3 — duplicate matches never resolve silently.**
+///
+/// The index from `migrations/0020` is dropped inside this test's own private database, two
+/// enabled rows are forced onto one trusted issuer, and the lookup is called.
+///
+/// *Mutation:* replace `fetch_all` + the `> 1` refusal in `single_policy` with
+/// `fetch_optional`. A grant is then issued from whichever row the planner happened to
+/// return first, instead of a coded refusal.
+///
+/// The index is what normally makes this state unreachable. It is dropped here on purpose:
+/// an invariant enforced in one place only is one a direct write, a restore, or a future
+/// migration can walk around, and the query must not be capable of answering wrongly when
+/// that happens.
+#[tokio::test]
+async fn two_enabled_providers_on_one_trusted_issuer_are_refused_not_arbitrated() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let repo = PgAuthProviderSettingsRepository::new(fixture.pool.clone());
+    let (issuer_id, issuer) = register_trusted_issuer(&fixture.pool, "dup").await;
+
+    // Establish that the invariant holds first, so a test that could never insert the
+    // second row would fail here rather than pass vacuously below.
+    let first = insert_bound_provider(&fixture.pool, issuer_id, &["corp.test"]).await;
+    let refused = insert_bound_provider_result(&fixture.pool, issuer_id, &["other.test"]).await;
+    assert!(
+        refused.is_err(),
+        "auth_provider_settings_one_enabled_per_trusted_issuer did not refuse the second \
+         enabled row — the rest of this test would be testing nothing"
+    );
+
+    sqlx::query("drop index auth_provider_settings_one_enabled_per_trusted_issuer")
+        .execute(&fixture.pool)
+        .await
+        .expect("drop the invariant inside this test's own database");
+    let second = insert_bound_provider(&fixture.pool, issuer_id, &["other.test"]).await;
+    assert_ne!(first, second);
+
+    let error = repo
+        .admission_policy(&issuer, issuer_id)
+        .await
+        .expect_err("an ambiguous deployment must refuse, not choose");
+    assert_eq!(error.status(), StatusCode::CONFLICT);
+    assert!(
+        error
+            .to_string()
+            .starts_with("duplicate_enabled_provider_for_issuer:"),
+        "unexpected error: {error}"
+    );
+}
+
+async fn insert_bound_provider_result(
+    pool: &sqlx::PgPool,
+    trusted_jwt_issuer_id: Uuid,
+    domains: &[&str],
+) -> Result<Uuid, sqlx::Error> {
+    sqlx::query_scalar::<_, Uuid>(
+        "insert into auth_provider_settings \
+             (method, display_name, enabled, issuer, client_id, allowed_email_domains, \
+              trusted_jwt_issuer_id) \
+         values ('generic_oidc', 'Bound', true, $1, 'cid', $2, $3) returning id",
+    )
+    .bind(format!("https://idp.test/{}", Uuid::now_v7().simple()))
+    .bind(domains.iter().map(|d| d.to_string()).collect::<Vec<_>>())
+    .bind(trusted_jwt_issuer_id)
+    .fetch_one(pool)
+    .await
+}
+
+/// **G4 — at most one enabled provider per trusted issuer, refused with a CODE.**
+///
+/// *Mutations:* (a) drop the index and delete the pre-envelope guard — the second enable
+/// succeeds. (b) delete only the `map_constraint_violation` arm — the request still fails,
+/// but as `500 database_error`, and a status-agnostic assertion stays green. That is
+/// finding F13 reproduced exactly, which is why **the assertion is on the code string**.
+#[tokio::test]
+async fn enabling_a_second_provider_on_one_trusted_issuer_is_a_coded_409() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let (issuer_id, _issuer) = register_trusted_issuer(&fixture.pool, "g4").await;
+
+    let first = create_provider(
+        &router,
+        json!({ "trusted_jwt_issuer_id": issuer_id, "enabled": true }),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::CREATED, "{:?}", first.body);
+
+    // Same trusted issuer, different `(method, issuer)` so the OTHER unique index — the
+    // pre-existing `duplicate_auth_provider` one — cannot be what refuses this.
+    let second = create_provider(
+        &router,
+        json!({ "method": "generic_oidc", "trusted_jwt_issuer_id": issuer_id }),
+    )
+    .await;
+    assert_eq!(second.status, StatusCode::CREATED, "{:?}", second.body);
+    let second_id = second.body["id"].as_str().expect("an id").to_string();
+
+    let enabled = request(
+        router.clone(),
+        "POST",
+        &format!("/api/v1/admin/auth/providers/{second_id}/enable"),
+        HeaderMap::new(),
+        Some(second.version()),
+        None,
+    )
+    .await;
+
+    assert_eq!(enabled.status, StatusCode::CONFLICT, "{:?}", enabled.body);
+    assert_eq!(
+        enabled.code(),
+        "duplicate_enabled_provider_for_issuer",
+        "a status-only assertion would pass on `500 database_error` too — that is F13"
+    );
+    assert_ne!(
+        enabled.code(),
+        "duplicate_auth_provider",
+        "this must not be reported as the (method, issuer) collision; the remedy is different"
+    );
+
+    // And creating a second row already enabled is refused the same way, before the
+    // envelope — the create path, not only the enable path.
+    let third = create_provider(
+        &router,
+        json!({ "method": "github_oauth",
+                "issuer": Value::Null,
+                "authorization_url": "https://github.com/login/oauth/authorize",
+                "token_url": "https://github.com/login/oauth/access_token",
+                "trusted_jwt_issuer_id": issuer_id,
+                "enabled": true }),
+    )
+    .await;
+    assert_eq!(third.status, StatusCode::CONFLICT, "{:?}", third.body);
+    assert_eq!(third.code(), "duplicate_enabled_provider_for_issuer");
+}
+
+/// **G5 — GitHub's schema needs BOTH CHECK swaps.**
+///
+/// *Mutation:* relax only `auth_provider_settings_method_check`. The insert must still fail,
+/// on `auth_provider_settings_method_shape`. Applied here by restoring `0013`'s original
+/// shape CHECK inside this test's private database, which is exactly the state a migration
+/// that shipped only half of `0020` would leave behind — a green migration that still
+/// cannot accept a GitHub row.
+#[tokio::test]
+async fn a_github_row_needs_the_method_check_and_the_shape_check_together() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let github = |pool: sqlx::PgPool| async move {
+        sqlx::query(
+            "insert into auth_provider_settings \
+                 (method, display_name, client_id, authorization_url, token_url, \
+                  allowed_email_domains) \
+             values ('github_oauth', 'GitHub', 'cid', \
+                     'https://github.com/login/oauth/authorize', \
+                     'https://github.com/login/oauth/access_token', array['corp.test'])",
+        )
+        .execute(&pool)
+        .await
+    };
+
+    github(fixture.pool.clone())
+        .await
+        .expect("with both constraints from 0020, a GitHub-shaped row inserts");
+
+    sqlx::query("delete from auth_provider_settings where method = 'github_oauth'")
+        .execute(&fixture.pool)
+        .await
+        .expect("clear the row");
+
+    // Roll the shape CHECK back to `0013`'s text, leaving the widened method CHECK in
+    // place. This is the "shipped only (a)" deployment.
+    sqlx::query(
+        "alter table auth_provider_settings drop constraint auth_provider_settings_method_shape",
+    )
+    .execute(&fixture.pool)
+    .await
+    .expect("drop the 0020 shape check");
+    sqlx::query(
+        "alter table auth_provider_settings add constraint auth_provider_settings_method_shape \
+         check ( \
+             (method = 'jwks' and jwks_url is not null and client_id is null) \
+             or (method in ('google_oauth', 'generic_oidc') and client_id is not null \
+                 and (issuer is not null or discovery_url is not null)))",
+    )
+    .execute(&fixture.pool)
+    .await
+    .expect("restore 0013's shape check");
+
+    let error = github(fixture.pool.clone())
+        .await
+        .expect_err("with only the method CHECK widened, a GitHub row must still be refused");
+    let message = error.to_string();
+    assert!(
+        message.contains("auth_provider_settings_method_shape"),
+        "the refusal must name the shape constraint, not the method one: {message}"
+    );
+}
+
+/// **G7 — the anonymous sign-in endpoint survives a row this binary cannot map (W4-B2).**
+///
+/// *Mutation:* restore `collect::<Result<_, _>>` in `list_enabled_public` (equivalently:
+/// drop the `method = any($1)` predicate). The endpoint returns **500** — on a surface whose
+/// committed spec declares only `200` and `503`, to **unauthenticated** callers, for every
+/// provider rather than just the unmappable one.
+///
+/// The unmappable row is created the way a rolling deploy creates it: the schema knows a
+/// method the binary does not. `0020` widened the CHECK, so the value used here is a
+/// plausible *next* one.
+#[tokio::test]
+async fn an_unmappable_method_row_does_not_take_the_anonymous_sign_in_endpoint_down() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+
+    let good = create_provider(&router, json!({ "enabled": true })).await;
+    assert_eq!(good.status, StatusCode::CREATED, "{:?}", good.body);
+    let good_id = good.body["id"].as_str().expect("an id").to_string();
+
+    // The state a newer migration leaves for an older binary.
+    sqlx::query(
+        "alter table auth_provider_settings drop constraint auth_provider_settings_method_check",
+    )
+    .execute(&fixture.pool)
+    .await
+    .expect("widen the method vocabulary the way a future migration would");
+    sqlx::query(
+        "alter table auth_provider_settings drop constraint auth_provider_settings_method_shape",
+    )
+    .execute(&fixture.pool)
+    .await
+    .expect("drop the shape check for the unknown method");
+    sqlx::query(
+        "insert into auth_provider_settings \
+             (method, display_name, enabled, issuer, client_id, allowed_email_domains) \
+         values ('gitlab_oauth', 'GitLab', true, 'https://gitlab.test', 'cid', array['corp.test'])",
+    )
+    .execute(&fixture.pool)
+    .await
+    .expect("insert a row this binary cannot decode");
+
+    // The endpoint that matters: anonymous, and its declared responses are 200 and 503.
+    let anonymous = request(
+        router.clone(),
+        "GET",
+        "/api/v1/admin/setup/sign-in-methods",
+        HeaderMap::new(),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        anonymous.status,
+        StatusCode::OK,
+        "the anonymous login endpoint returned {} — its spec declares only 200 and 503, so \
+         this is an UNDECLARED response to an unauthenticated caller: {:?}",
+        anonymous.status,
+        anonymous.body
+    );
+    let methods = anonymous.body["methods"]
+        .as_array()
+        .expect("a methods array");
+    assert_eq!(
+        methods.len(),
+        1,
+        "the mappable provider must still be offered: {:?}",
+        anonymous.body
+    );
+    assert_eq!(methods[0]["id"], json!(good_id));
+
+    // And the authenticated surface still works with that row present.
+    let listed = request(
+        router.clone(),
+        "GET",
+        "/api/v1/admin/auth/providers",
+        HeaderMap::new(),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(listed.status, StatusCode::OK, "{:?}", listed.body);
+    let ids: Vec<&str> = listed.body["data"]
+        .as_array()
+        .expect("the list payload's `data` array")
+        .iter()
+        .filter_map(|item| item["id"].as_str())
+        .collect();
+    assert!(ids.contains(&good_id.as_str()));
+
+    let fetched = request(
+        router.clone(),
+        "GET",
+        &format!("/api/v1/admin/auth/providers/{good_id}"),
+        HeaderMap::new(),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(fetched.status, StatusCode::OK, "{:?}", fetched.body);
+
+    let patched = request(
+        router,
+        "PATCH",
+        &format!("/api/v1/admin/auth/providers/{good_id}"),
+        HeaderMap::new(),
+        Some(fetched.version()),
+        Some(json!({ "display_name": "Still administrable" })),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK, "{:?}", patched.body);
+}
+
+/// The second F23 configure-time refusal: a provider row may not claim an issuer string
+/// that belongs to a trusted JWT issuer it is not bound to.
+///
+/// This is shape (b) refused at write time. `admission_policy` already makes such a row
+/// unable to outrank a bound provider, but stage 2 is genuinely reachable on a deployment
+/// with nothing bound, and a row whose `issuer` column names the console is confusing to
+/// read even when it is harmless.
+#[tokio::test]
+async fn a_provider_may_not_claim_a_registered_trusted_issuers_string() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let (issuer_id, issuer) = register_trusted_issuer(&fixture.pool, "shadow").await;
+
+    let shadowing = create_provider(&router, json!({ "issuer": issuer.clone() })).await;
+    assert_eq!(
+        shadowing.status,
+        StatusCode::CONFLICT,
+        "{:?}",
+        shadowing.body
+    );
+    assert_eq!(
+        shadowing.code(),
+        "auth_provider_issuer_shadows_trusted_issuer"
+    );
+
+    // The one arrangement in which the two values SHOULD agree: mode 3, where the caller is
+    // the IdP and the row is bound to the very issuer whose string it carries.
+    let mode_three = create_provider(
+        &router,
+        json!({ "issuer": issuer, "trusted_jwt_issuer_id": issuer_id }),
+    )
+    .await;
+    assert_eq!(
+        mode_three.status,
+        StatusCode::CREATED,
+        "binding a row to the issuer it names is CONVENTIONS 7.3 mode 3, not a collision: {:?}",
+        mode_three.body
+    );
 }

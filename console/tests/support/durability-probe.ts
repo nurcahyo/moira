@@ -81,7 +81,9 @@ function probeAuthConfig(): ResolvedAuthConfig {
     scopes: ["openid", "email", "profile"],
     allowedEmailDomains: ["example.com"],
     trustedJwtIssuerId: "00000000-0000-0000-0000-000000000000",
-    cacheKey: "probe",
+    // The probe never mints, so this is only ever the string the plugin would
+    // stamp. It is the console's own issuer, never the IdP's — see `lib/auth.ts`.
+    consoleIssuer: "https://console.invalid",
   };
 }
 
@@ -104,7 +106,7 @@ function buildProbeAuth(dsn: string | undefined): {
   const pool = dsn === undefined ? null : createConsolePool(dsn);
   const auth = createConsoleAuth({
     env,
-    config: probeAuthConfig(),
+    configs: [probeAuthConfig()],
     ...(pool === null ? {} : { database: pool }),
   });
   return { auth, close: async () => void (pool === null ? undefined : await pool.end()) };

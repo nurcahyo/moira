@@ -85,6 +85,47 @@ optional once a second provider or a second replica exists.
 
 **Reversal condition:** none. Without durable storage those features cannot exist.
 
+**D-F20 — ownership is a SINGLE primary, taken at the first grant. Taken by the user, 2026-07-31, in response to finding F20.**
+
+D1 made ownership row state but left nothing that ever *writes* it. `0017`'s backfill is a one-shot
+migration-time `UPDATE`, and on a greenfield deployment it runs against an empty
+`admin_identities`; the only other writer is the transfer endpoint, which requires a primary caller.
+So on **every deployment created after `0017`** no admin was ever primary, `admin_identity_last_primary`
+guarded a permanently empty set, and ownership transfer was reachable only through the system-key
+break-glass path — the credential this plan's invitation flow exists to let an operator retire.
+Wave 5 was to build the ownership UI on top of that.
+
+The decision: **whichever grant arrives first on a deployment with no owner becomes the owner** —
+system-key claim or redeemed invitation alike, because both flip `setup_state.claimed` and `0017`'s
+own backfill named the setup claimant. Transfer **moves** the flag (the incumbent is demoted in the
+same transaction); the last-primary guard prevents clearing it.
+
+Implementation notes that are part of the decision, not of the code:
+
+- The writer is `insert_grant`, which computes "no active primary exists" **in SQL** while holding
+  the existing `moiraown` transaction advisory lock. The lock is the *mechanism*: it is what makes
+  the loser of a race **not primary** rather than **refused**. `0019`'s partial unique index
+  `admin_identities_single_active_primary` is the *invariant* — the backstop that holds if a future
+  path forgets the lock, in exactly the sense `admin_identities_issuer_subject_active_unique` backs
+  the claim. Choosing the index *as* the mechanism would turn a legitimate second grant into a 500.
+- `0019` also repairs already-deployed instances: it collapses any pre-existing set of primaries to
+  one (reachable today, because `PATCH` set the flag without clearing anyone else's) and re-runs
+  `0017`'s two backfill steps, each still guarded by "no active primary exists".
+
+**Two consequences to state rather than discover.** A deployment's *sole* admin can no longer be
+revoked through the API — they are the owner, and revoking the owner clears the flag, which the
+guard refuses. And `create_preview_redeem_grants_admin_and_consumes_the_invite`,
+`clearing_the_only_primary_is_refused_with_the_last_primary_conflict`,
+`a_non_primary_admin_cannot_promote_itself_to_primary` and
+`the_grant_administration_conflicts_are_pinned_to_their_paths` all had premises that this makes
+false; each was rewritten to assert the new premise explicitly rather than adjusted until green.
+
+**Reversal condition:** going to *multiple* primaries is a **schema change, not a config toggle**.
+It means dropping `admin_identities_single_active_primary`, turning the last-primary guard into a
+last-any-primary guard, and changing transfer back from "move the flag" to "set the flag" — one
+deliberate migration with its own tests. Revisit only if a deployment genuinely needs several
+people able to manage admins independently.
+
 ### §0.3 Two designs plan 08 tried and REJECTED — do not re-do them
 
 | Design this plan proposes | Why plan 08 rejected it |
@@ -547,6 +588,283 @@ Recorded because the brief asked, and because two of these would have shaped the
   understated: the shipped decision is a *console-side* refusal standing in front of a *Moira-side*
   defect nobody has recorded. Removing it is not one redesign but two.
 
+### §0.7.7 — Design decision and corrections to §0.1's blockers
+
+**Status: this subsection SUPERSEDES the parts of §0.1 and §0.7.3 it names.** The blocker rows in
+§0.1 and the decisions in §0.7.3 are left exactly as written. They are the record of what was
+believed at the time, and editing them in place would destroy the only evidence of how the belief
+was formed. Where they and this subsection disagree, **§0.7.7 wins**.
+
+Produced by three independently worked designs judged by three lenses, with every load-bearing claim
+verified against the live database in rolled-back transactions rather than argued from reading SQL.
+Written up during implementation, so a few of its own claims are corrected below in §0.7.7.5.
+
+---
+
+#### §0.7.7.1 The decision
+
+**Wave 4 ships Option A′ — Option A's per-provider console issuer, with `governing_policy` replaced
+by a deterministic two-stage lookup (Option B's structural insight, without Option B's second
+column) — staged into 4A and 4B.**
+
+Option C is rejected. Option B is rejected as a whole; one idea is taken from it.
+
+**Stage 4A — ships regardless, and does NOT remove the console's ambiguity guard.** The server-side
+invariant (a partial unique index plus a coded 409), the deterministic policy lookup, the
+`github_oauth` schema and enum, the B2 anonymous-endpoint fix, the trusted-issuer deletion guard, and
+`checkSession` wired at the credential boundary. After 4A, Moira itself refuses the ambiguous state
+and the console guard becomes redundant rather than load-bearing.
+
+**Stage 4B — multi-provider, gated on one spike.** Per-provider minted `iss`, N `genericOAuth`
+entries, N sign-in buttons, and only then the removal of `ambiguous_enabled_providers`.
+
+##### Why A′, settled against the code and the database
+
+- **The mandated invariant and multi-provider are incompatible under one console issuer.** A partial
+  unique index on `(trusted_jwt_issuer_id)` refuses the second enabled provider outright. Per-provider
+  trusted issuers is the only shape in which the invariant wave 4 must ship and the capability wave 4
+  exists to deliver can both hold. That is not a preference; the constraints imply it.
+- **F24 closes with zero `admin_identities` change.** Verified live:
+  `admin_identities_issuer_subject_active_unique` is `(issuer, subject) where deleted_at is null`.
+  Distinct per-provider issuer strings give distinct grants for the same `sub`.
+- **The console mechanism is verified, not assumed.** better-auth 1.6.25, read at
+  `~/.bun/install/cache/better-auth@1.6.25@@@1/`: `dist/plugins/jwt/sign.mjs` is
+  `const iss = payload.iss; … .setIssuer(iss ?? defaultIss)` — `options.jwt.issuer` is the *fallback*,
+  not the value, and `getJwtToken` spreads `definePayload(session)`'s result over it.
+  `dist/plugins/jwt/adapter.mjs::getLatestKey` sorts all `jwks` rows globally with no issuer
+  awareness, so per-issuer key pairs are unimplementable and A′ correctly does not attempt them.
+  `trusted_jwt_issuers` has a unique index on `issuer` alone and none on `jwks_url`, so N issuer rows
+  share one JWKS URL cleanly.
+- **Verification path changes: none.** `authenticate_trusted_jwt_with_issuer` resolves the row from
+  the token's `iss` and pins `Validation::set_issuer` to the registered value.
+- **Option B's real contribution, taken:** stop fencing the `ORDER BY` — delete it. B's *mechanism*
+  (a second `allowed_email_domains` on `trusted_jwt_issuers`) buys a two-column trap, a backfill and
+  a rolling-deploy divergence it could only mitigate with a release note. Under A′ the binding is
+  1:1, so a single-row lookup on `auth_provider_settings.trusted_jwt_issuer_id` is *already*
+  per-provider policy: the same structural win, no new column, no backfill.
+- **Option C is rejected** because it relocates an authorization input into a claim the console
+  derives from its own configuration, inverting a rule the repo already enforces
+  (`reject_self_asserting_console_issuer`), and because its own central guard had no test that could
+  fail against the broken arrangement. Its `nulls not distinct` finding is real and is carried into
+  the standing rule below.
+- **The migration correction reverses B's and C's headline ops argument.** `src/config/settings.rs`
+  makes `database.migrate_on_startup must be false in production` a hard validation violation, and
+  `charts/moira/templates/migration-job.yaml` runs production migrations as a Helm
+  pre-install/pre-upgrade Job. A migration that refuses on ambiguous data therefore aborts the
+  upgrade with the old pods still serving — it is not a CrashLoopBackOff. **No unattended
+  `update … set enabled = false` goes into any migration.** B's and C's auto-disable is struck.
+
+##### The deterministic two-stage lookup (replaces `governing_policy`)
+
+The old query matched provider rows only via `$2`, tied on the first `ORDER BY` key, and handed the
+oldest bound row the policy. It is replaced by two disjoint deterministic queries:
+
+1. `where deleted_at is null and status='active' and enabled and trusted_jwt_issuer_id = $2` — at
+   most one row by the new partial unique index. `fetch_all` with a coded 409 above one row, never
+   `fetch_optional`, which silently takes the first row of a duplicate set.
+2. **Only if (1) returns nothing:** `where … and issuer = $1 and trusted_jwt_issuer_id is null` — the
+   CONVENTIONS §7.3 mode-3 path, where the caller *is* the IdP and the row's `issuer` legitimately
+   equals `$1`. Same refusal above one row.
+
+This kills shape (a) (nothing is ordered), shape (b) (a shadowing row can no longer outrank a bound
+one, because the unbound branch is reached only when nothing is bound) and shape (c) (the binding is
+1:1). Mode 3 keeps working, which a flat removal of the `issuer = $1` branch would have broken.
+
+**Verified in a rolled-back transaction against the live database:** with per-provider issuers the
+Google lookup returned `{corp.test}` and the GitHub lookup `{contractor.test}`; an enabled, *unbound*
+`jwks` row whose own `issuer` equalled `https://console.test/idp/gh` with
+`allowed_email_domains = '{}'` then **took over the GitHub lookup and returned `{}`** — a 403 on
+every claim and redemption for that provider — and the mandated partial unique index created cleanly
+with that rogue row present, because its `trusted_jwt_issuer_id` is NULL. Shape (b) is real, is
+amplified N-fold by per-provider issuers, and the index does not touch it. The two-stage lookup does.
+
+---
+
+#### §0.7.7.2 Reversal conditions
+
+A decision recorded without its reversal condition is not reviewable. All three are part of the
+decision.
+
+**Primary — blocks 4B only.** If the spike shows better-auth 1.6.25 cannot make the authenticating
+account's `providerId` available to the token minter for the current session — neither by stamping it
+on the session at creation nor by reading it in `definePayload`/`getSubject` — then **4B has no
+honest implementation and must not ship**. Ship 4A, keep `ambiguous_enabled_providers`, and defer
+multi-provider with that named blocker. **Do not** substitute the most-recently-updated-account
+heuristic, and **do not** disable implicit account linking to force 1:1 — a second provider then
+returns "account not linked" for exactly the humans multi-provider exists to serve.
+
+Current evidence says the spike will pass, and it is hours not weeks: `dist/db/with-hooks.mjs::createWithHooks`
+calls `hooks[model].create.before(data, context)` with `context = await getCurrentAuthContext()` and
+merges a returned `{data:{…}}`; `dist/api/dispatch.mjs` wraps every handler in
+`runWithEndpointContext`; the generic-OAuth callback is `/oauth2/callback/:providerId`. What is *not*
+established is that `context.params.providerId` is populated at the moment `createSession(user.id)`
+runs inside `dist/oauth2/link-account.mjs`. **That single observation is the gate.**
+
+**Secondary — reverses A′ entirely.** If a requirement appears that two interactive providers must
+share one `trusted_jwt_issuers` row — a downstream consumer keying on a single console issuer string,
+or an operator contract that all admin grants carry one issuer — then the mandated invariant and
+multi-provider cannot both hold under A′, and the decision reverts to a provider-discriminator claim
+(Option C) with its full cost: `provider_claim`/`provider_key` columns, an `admin_identities` key
+rotation that must be spelled `nulls not distinct`, and a self-disarming legacy read-fallback.
+
+**Tertiary — changes 4B's budget, not its shape.** If wave 5's revocation/ownership UI cannot ship
+with per-grant rather than per-human semantics, a `person_key` grouping column on `admin_identities`
+must land in wave 4 and 4B grows by a migration and a uniqueness rule. Verified live:
+`admin_identities_single_active_primary` is UNIQUE on
+`(is_primary) where deleted_at is null and status='active' and is_primary` — exactly one primary
+*globally* — so under 4B a human's second grant is never primary and revoking "the" row leaves a live
+back door.
+
+---
+
+#### §0.7.7.3 C1–C9 — corrections to §0.1's blockers
+
+Each supersedes the named blocker.
+
+**C1 — B5 misstates F23's scope and misreads the `ORDER BY`.** B5 frames the defect as "the redeem
+path never passes `$2`, so every redemption 403s forever". Both callers
+(`AdminIdentityService::claim` and `redeem_invite`) already resolve and pass `$2` via
+`resolve_active_issuer`. The actual defect: because every provider row's `issuer` column holds the
+**IdP's** issuer while `$1` is the **console's**, the first sort key
+`(issuer is not distinct from $1) desc` is FALSE for every legitimately-bound row, so all candidates
+tie on it and `created_at asc` decides — **the oldest row bound to that trusted issuer governs every
+claim and redemption regardless of which provider authenticated the user.** It is a wrong-policy bug,
+not a total-denial bug. B5's quoted SQL text is accurate; its reading of it is not.
+
+**C2 — B5 omits the second vector, which is the more dangerous one.** The `issuer = $1` branch means
+a row whose *own* `issuer` column equals the console's issuer string sorts FIRST at any age and
+outranks the correctly-bound row. **That row need not be bound to any trusted issuer**, so no index
+on `(trusted_jwt_issuer_id)` can reach it. Verified by reproduction (see §0.7.7.1). Recorded as
+**F23 shape (b)**, and closed only by the two-stage lookup *plus* the
+`auth_provider_issuer_shadows_trusted_issuer` guard.
+
+**C3 — B5's closing "mitigating" sentence is wrong and is struck.** B5 says plan 08 shipped a
+read-side guard (`auth-config.ts` → `provider_not_bound_to_trusted_jwt_issuer`) so "the gap is in
+this plan's Moira surface, not in the console". That guard is **console-side and affects only whether
+a sign-in button is offered**. `governing_policy`'s callers read no console state; `consoleRuntime`
+resolves once per process; the ambiguous and shadowing rows are created through **Moira's own admin
+API**; and Moira had no server-side cross-row check at all (the only unique index on the table was
+`(method, coalesce(issuer,''))`). Severity is not gated by anything the console does. The sentence is
+replaced by: *the console guard protects the button, never the claim.*
+
+**C4 — B3's premise is inverted, and one wave-4 fix it invites is dangerous.** B3 states "the console
+is on `memoryAdapter`… there is no `console_auth` database, no `session` table to list or revoke, and
+no `authProviderSecret` table". That shipped in wave 1: `console/db/migrations/0001_better_auth_core.sql`
+(`user`, `session`, `account`, `verification`, `jwks`, `rateLimit`) and `0002_console_provider_secret.sql`.
+The real wave-4 constraint, which B3 does not name: **`session` has no provider column, `account` is
+1:N on `userId`, and `user.email` is unique** — so the console cannot determine from shipped state
+which provider authenticated the current session. That is a prerequisite for multi-provider, not a
+detail. **And the dangerous fix:** minting per-provider console provider ids must **never** be
+implemented by rewriting `console_provider_secret.provider_id`. The AEAD AAD is
+`moira-console/v1/{providerId}/{clientId}` over the **Moira row UUID**; a slug-scheme change is a
+graceful `read() → null` miss, but an `UPDATE` of that column manufactures a decrypt failure
+delivered as an unhandled Next 500. Re-seal via `put()`'s `on conflict do update`. Separately,
+`readIdpSubject` filters `account.providerId === config.providerId`, so any change to the
+console-side id scheme makes every existing admin's lookup miss — safe, but a total sign-in outage.
+
+**C5 — B4's "breaks console sign-in outright" is false, and its ordering is backwards.**
+`resolveAuthConfig` returns a determinate keyed failure `ambiguous_enabled_providers` →
+`CONSOLE_MESSAGE_KEYS.ambiguous_enabled_auth_providers`, with an in-code comment stating the refusal
+is deliberate. The console degrades to "no sign-in offered, with a named remedy"; nothing breaks.
+What B4 omits is the consequential half: **Moira accepted the ambiguous state silently and picked a
+row anyway**, so the guard never protected the claim path. B4's schedule — "this plan owns removing
+`ambiguous_enabled_providers`" — is therefore in the wrong order. **The console guard may be removed
+only after Moira's partial unique index and coded 409 are DEPLOYED**, not merely merged. That is
+task T11 and it belongs to the PR *after* 4A is deployed.
+
+**C6 — B6 reasons about a `provider_id` field that does not exist and must not be created.** B6's
+remedy says "decide explicitly whether GitHub gets a `github_oauth` method value or a `provider_id`
+key". There is no `provider_id` on `auth_provider_settings` and none is to be added; the only
+`provider_id` in the system is `console_provider_secret.provider_id`, which is console-side, holds
+the Moira row UUID, and is AEAD-AAD-bound (see C4) — a different thing at a different layer.
+**Wave 4 takes `method = 'github_oauth'`.** Two further B6 corrections: (a) the constraint is
+`unique (method, coalesce(issuer,'')) where deleted_at is null`, verified live — so "at most one row
+per method can have a null issuer" is right for GitHub (**exactly one GitHub row per deployment, one
+GitHub org per console**) and *also* means two discovery-only OIDC rows with a null `issuer` collide;
+both limits are stated in `migrations/0020`'s header rather than discovered in wave 5. (b) B6 says
+the migration must drop and re-add "two CHECK constraints plus the unique index" — the unique index
+is **not** touched in wave 4; the two CHECK swaps are, and shipping only the first is a green
+migration that still cannot accept a GitHub row.
+
+**This supersedes W4-D2 and W4-D3 in §0.7.3.** W4-D2 adds a `provider_id` slug column to
+`auth_provider_settings`; W4-D3 adds `provider_id` to `PublicSignInMethod`. Neither ships in wave 4A.
+The routing key W4-D2 exists to provide is a **4B** concern (T7), and when it lands it must be an
+operator-chosen stable slug rather than the row UUID — with UUIDs, deleting and recreating a provider
+mints a new issuer and silently revokes its admins, which T4's guard does not cover. W4-D3's field is
+not needed while there is one button, and `PublicSignInMethod` is an anonymous surface that should
+shrink whenever it can.
+
+**C7 — migration numbering.** `0019_single_primary_admin.sql` merged with PR #39. `0016` is a
+permanent gap. **Wave 4 is `0020`.** §0.5's "migrations start at `0017`" is spent.
+
+**C8 — the mandated invariant cannot be created on an already-ambiguous database, and that is the
+correct behaviour.** Index creation fails with
+`could not create unique index … Key (trusted_jwt_issuer_id)=(…) is duplicated`. In production this
+is **not** a CrashLoopBackOff (see §0.7.7.1). The hook fails, the upgrade aborts, the old pods keep
+serving. **No migration in wave 4 may contain an unattended
+`update auth_provider_settings set enabled = false`** — that is a silent change to who can obtain
+admin, executed with no operator present, that a binary rollback cannot undo. The operator remedy
+(find the duplicates, disable the row that should not govern through the audited `/disable`
+endpoint, re-run) is written into the migration comment instead.
+
+**C9 — B9 is stale.** F15 has landed: `PublicSignInMethod` and the anonymous
+`GET /api/v1/admin/setup/sign-in-methods` are in the tree with the admitting rule in the doc comment.
+B9's "F15 is BLOCKING for plan 09" is spent. F15's *rule* remains binding — and is why
+`PublicSignInMethod` gains **no** field in wave 4, GitHub included.
+
+**Also superseded: W4-D4 in §0.7.3.** W4-D4 makes `governing_policy` the *union* of
+`allowed_email_domains` across all enabled rows bound to the caller's trusted issuer, on the ground
+that Moira cannot observe which IdP authenticated a user. The two-stage lookup is chosen instead: a
+union is a deployment-wide widening — a domain allowed for one provider becomes allowed for every
+identity presented under that issuer — and A′ makes it unnecessary, because per-provider trusted
+issuers give the binding real discriminating power. W4-D4's reversal condition (an explicit
+`provider_id` on the two request DTOs) is not needed and is not taken.
+
+---
+
+#### §0.7.7.4 Standing rule, from Option C's one genuinely new finding
+
+**Any future unique index widened over a nullable column must be spelled `nulls not distinct`, with a
+test that inserts two rows with NULL in the new column.** Verified: the naive spelling silently loses
+the pre-existing uniqueness, and every other test in the suite would use non-null values, so the
+regression ships green.
+
+`auth_provider_settings_one_enabled_per_trusted_issuer` is deliberately **not** spelled that way, and
+the migration says why: it is a *new* index whose whole subject is the non-null binding, and unbound
+rows (`jwks`, or a provider configured but not yet bound) are legitimate and may coexist.
+`nulls not distinct` there would refuse the second unbound row and break `jwks` configuration.
+
+---
+
+#### §0.7.7.5 Corrections to the decision document itself, found while implementing
+
+Recorded for the same reason §0.7.6 exists.
+
+* **G1's stated mutation left G1 green.** The design specified G1 as two enabled providers on two
+  trusted issuers plus a `created_at` permutation, with "restore the old `governing_policy`" as the
+  mutation that must turn it red. Applied, it did not: once every provider owns its own trusted
+  issuer, `trusted_jwt_issuer_id = $2` selects exactly one row, an `ORDER BY` has nothing to
+  arbitrate, and the two queries agree. F23 shape (a) is unrepresentable after `0020`, so a guard
+  built only from legal rows cannot reach the defect it is named for. G1 now gives each lookup a
+  **decoy** — an enabled, unbound row carrying that lookup's own console issuer string, inserted by
+  SQL because the API refuses that shape — and is red under the named mutation.
+* **The token endpoint is `GET /api/auth/token`, not `POST`.** `better-auth/plugins/jwt`'s `getToken`
+  is `createAuthEndpoint("/token", { method: "GET", … })`. G12 drives GET; the route guard matches on
+  the path alone so a future verb change cannot slip it.
+* **`auth.api.getSession` MINTS.** The jwt plugin registers an `after` hook whose matcher is
+  `context.path === "/get-session"` and which calls `getJwtToken` to populate a `set-auth-jwt`
+  response header. So `getSubject` — and the admissibility check inside it — runs on a session
+  **read**, and a refusal arrives as a throw rather than as a `null` session. That is the correct
+  failure direction; it is why `consoleSessionCheck` catches and translates rather than reorders.
+* **The `auth_provider_issuer_shadows_trusted_issuer` guard has a blast radius the decision did not
+  name.** A row whose `issuer` column equals a registered trusted issuer's string and which is
+  **unbound** is exactly F23 shape (b), and refusing to create it means `admission_policy`'s stage 2
+  is unreachable through the API on any deployment whose issuer is registered — which is every
+  deployment, because `resolve_active_issuer` requires it. Stage 2 therefore survives as the
+  **legacy/compat path** for rows created before `0020`, and new configuration is steered to binding.
+  Eighteen fixtures in `tests/admin_invite_lifecycle.rs` and fourteen in `tests/identity_claim.rs`
+  used the unbound shape and were rewritten to bind — which is what a real console deployment does
+  and what `auth-config.ts` already requires.
 ---
 
 ## §0.8 — Wave 5 (invitations + ownership UI): drift against the tree (audit 2026-07-31, `main` at `0b7792b`, PR #39 read at `4ea484b`)

@@ -33,12 +33,28 @@ use uuid::Uuid;
 
 use super::admin::ResourceStatus;
 
+/// How a deployment authenticates the humans who may hold Moira admin.
+///
+/// # `github_oauth` is a fourth variant, not a `provider_id`-keyed generic row (plan 09 W4-D1)
+///
+/// `AuthMethod` is already the discriminator in `0013`'s SQL CHECK, in the shape validator,
+/// in the DB encoder and in the committed spec, so adding a variant lights up three
+/// compile-time stops — [`PublicSignInMethod::from_enabled_method`],
+/// `validate_method_shape` and `auth_method_to_db` — each of which forces an explicit
+/// GitHub answer at exactly the right place. A second discriminator alongside `method`
+/// would have left all three matches untouched, which is the same as having no forcing
+/// function at all.
+///
+/// GitHub OAuth is **not** OIDC: no discovery document, no `id_token`, no issuer. Its shape
+/// branch is `client_id` + `authorization_url` + `token_url`, with `issuer` and
+/// `discovery_url` required to be absent.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMethod {
     GoogleOauth,
     GenericOidc,
     Jwks,
+    GithubOauth,
 }
 
 /// One configured auth method, as returned by the `/api/v1/admin/auth/providers` surface.
@@ -241,18 +257,28 @@ impl PublicSignInMethod {
     /// `authorization_url` and no `client_id`, so a console that rendered it as a button would
     /// produce a control that cannot work. Filtering here rather than in the caller keeps the
     /// "is this a sign-in method" judgement in one place.
+    ///
+    /// [`AuthMethod::GithubOauth`] **is** a browser sign-in method and joins the `Some` arm.
+    /// It carries no `issuer` and no `discovery_url` — both are null by
+    /// `auth_provider_settings_method_shape` — and needs neither: everything a GitHub button
+    /// requires is `authorization_url`, `client_id` and `requested_scopes`, all of which this
+    /// projection already carries. **No field is added here for GitHub.** The projection is
+    /// served anonymously, and F15's admitting rule (see [`SetupSignInMethodsResponse`]) is
+    /// what decides what may appear, not what a caller would find convenient.
     pub fn from_enabled_method(method: &PublicAuthMethod) -> Option<Self> {
         match method.method {
-            AuthMethod::GoogleOauth | AuthMethod::GenericOidc => Some(Self {
-                id: method.id,
-                method: method.method,
-                display_name: method.display_name.clone(),
-                issuer: method.issuer.clone(),
-                discovery_url: method.discovery_url.clone(),
-                authorization_url: method.authorization_url.clone(),
-                client_id: method.client_id.clone(),
-                requested_scopes: method.requested_scopes.clone(),
-            }),
+            AuthMethod::GoogleOauth | AuthMethod::GenericOidc | AuthMethod::GithubOauth => {
+                Some(Self {
+                    id: method.id,
+                    method: method.method,
+                    display_name: method.display_name.clone(),
+                    issuer: method.issuer.clone(),
+                    discovery_url: method.discovery_url.clone(),
+                    authorization_url: method.authorization_url.clone(),
+                    client_id: method.client_id.clone(),
+                    requested_scopes: method.requested_scopes.clone(),
+                })
+            }
             AuthMethod::Jwks => None,
         }
     }
@@ -287,6 +313,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&AuthMethod::Jwks).expect("method serializes"),
             "\"jwks\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AuthMethod::GithubOauth).expect("method serializes"),
+            "\"github_oauth\""
         );
     }
 
@@ -454,15 +484,73 @@ mod tests {
     /// A `jwks` row is machine token-verification configuration with no `authorization_url`
     /// and no `client_id`. Rendering it as a button would produce a control that cannot work,
     /// so it is not a sign-in method at all.
+    ///
+    /// Spelled as an exhaustive walk over [`AuthMethod`] rather than as three hand-picked
+    /// cases: a fifth variant added without an answer here fails to compile, which is the
+    /// forcing function W4-D1 chose the enum for. An array literal would have compiled
+    /// happily and left the new variant untested.
     #[test]
     fn the_anonymous_projection_excludes_jwks_rows() {
-        assert!(
-            PublicSignInMethod::from_enabled_method(&enabled_method(AuthMethod::Jwks)).is_none()
+        for method in [
+            AuthMethod::GoogleOauth,
+            AuthMethod::GenericOidc,
+            AuthMethod::Jwks,
+            AuthMethod::GithubOauth,
+        ] {
+            let projected = PublicSignInMethod::from_enabled_method(&enabled_method(method));
+            let expected_interactive = match method {
+                AuthMethod::GoogleOauth | AuthMethod::GenericOidc | AuthMethod::GithubOauth => true,
+                AuthMethod::Jwks => false,
+            };
+            assert_eq!(
+                projected.is_some(),
+                expected_interactive,
+                "{method:?} is on the wrong side of the sign-in filter"
+            );
+        }
+    }
+
+    /// **`PublicSignInMethod` gains no field for GitHub.**
+    ///
+    /// A GitHub row has `issuer: null` and `discovery_url: null` by
+    /// `auth_provider_settings_method_shape`, and everything a button needs is already
+    /// projected. Asserted as an exact key set on a GitHub-shaped row, so a field added
+    /// "for GitHub" fails here before it is published to anonymous callers — the same gate
+    /// [`the_anonymous_projection_drops_the_domain_policy_and_the_jwks_url`] applies to the
+    /// OIDC shape, applied to the one wave 4 adds.
+    #[test]
+    fn the_github_projection_adds_no_field_and_carries_no_issuer() {
+        let mut source = enabled_method(AuthMethod::GithubOauth);
+        source.issuer = None;
+        source.discovery_url = None;
+        source.authorization_url = Some("https://github.com/login/oauth/authorize".to_string());
+
+        let method = PublicSignInMethod::from_enabled_method(&source)
+            .expect("github_oauth is a sign-in method");
+        let json = serde_json::to_value(&method).expect("projection serializes");
+        let object = json.as_object().expect("projection is an object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "authorization_url",
+                "client_id",
+                "discovery_url",
+                "display_name",
+                "id",
+                "issuer",
+                "method",
+                "requested_scopes",
+            ],
+            "the anonymous projection gained a field for GitHub"
         );
-        assert!(
-            PublicSignInMethod::from_enabled_method(&enabled_method(AuthMethod::GenericOidc))
-                .is_some(),
-            "generic_oidc is a browser sign-in method and must survive the filter"
+        assert_eq!(object["issuer"], serde_json::Value::Null);
+        assert_eq!(object["discovery_url"], serde_json::Value::Null);
+        assert_eq!(
+            object["authorization_url"],
+            serde_json::json!("https://github.com/login/oauth/authorize"),
+            "a GitHub button is unrenderable without its authorization URL"
         );
     }
 

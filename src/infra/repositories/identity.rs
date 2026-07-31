@@ -190,6 +190,17 @@ pub trait AdminIdentityRepository: Send + Sync {
     /// `PgAdminCommandTransaction` and exposes its connection. Writing through the pool
     /// here would put the grant outside the savepoint that makes a failed command
     /// leave no trace.
+    ///
+    /// # It also decides ownership (plan 09 finding F20, decision D-F20)
+    ///
+    /// The grant becomes primary **iff the deployment has no active primary**, so the
+    /// first admin a deployment ever gets is its owner and every later one is not. Before
+    /// `0019` nothing outside `0017`'s one-shot migration-time backfill ever wrote
+    /// `is_primary`, and that backfill runs against an empty table on a greenfield
+    /// deployment — so ownership was permanently unreachable there, and with it the whole
+    /// transfer endpoint, unless an operator reached for the break-glass system key.
+    ///
+    /// This is why the method takes the ownership lock; see [`take_ownership_lock`].
     async fn insert_grant(
         &self,
         conn: &mut PgConnection,
@@ -225,6 +236,11 @@ pub trait AdminIdentityRepository: Send + Sync {
     /// Returns `admin_identity_last_primary` rather than succeeding when clearing the
     /// flag would leave zero active primaries — the lockout guard, expressible as a
     /// query only because ownership is row state (decision D1).
+    ///
+    /// **Setting it is a transfer, not an addition** (decision D-F20): the incumbent is
+    /// demoted in the same transaction, so ownership moves rather than accumulating.
+    /// Under `admin_identities_single_active_primary` that is the only behaviour the
+    /// schema admits.
     async fn set_primary(
         &self,
         conn: &mut PgConnection,
@@ -240,6 +256,16 @@ pub trait AdminIdentityRepository: Send + Sync {
     /// Deliberately does **not** touch `setup_state.claimed`: setup-required is a
     /// one-way transition (plan 07), so revoking the last admin leaves system-key
     /// break-glass as the re-entry path rather than reopening the land-grab window.
+    ///
+    /// # Consequence of decision D-F20 worth knowing before you call it
+    ///
+    /// Revoking the **owner** is refused with `admin_identity_last_primary`, because a
+    /// revocation clears `is_primary` and the guard does not care which statement is
+    /// doing the clearing. Since the first grant on a deployment is now its owner, that
+    /// makes a deployment's *sole* admin non-revocable through this path: transfer
+    /// ownership to someone else first, then revoke. That is the lockout guard working as
+    /// specified, not an oversight — an admin plane with no owner is precisely the state
+    /// finding F20 describes.
     async fn revoke_grant(
         &self,
         conn: &mut PgConnection,
@@ -377,12 +403,33 @@ impl AdminIdentityRepository for PgAdminIdentityRepository {
         conn: &mut PgConnection,
         insert: &AdminIdentityGrantInsert,
     ) -> Result<AdminIdentityGrant, AppError> {
+        // This statement *decides ownership*, so it takes the ownership lock like every
+        // other statement that does. Without it the `not exists` below and the insert
+        // that depends on it are one statement in READ COMMITTED but two facts in time:
+        // two claims arriving together would each observe no owner, each decide they are
+        // first, and the second would be refused by
+        // `admin_identities_single_active_primary` — turning a perfectly legitimate
+        // second grant into a `500`. Under the lock the loser simply sees the winner's
+        // committed row and is *not primary*, which is the outcome that belongs to a race
+        // for ownership. The index stays as the backstop, not as the mechanism.
+        take_ownership_lock(conn).await?;
         let row = sqlx::query(&format!(
             r#"
             insert into admin_identities
                 (id, trusted_jwt_issuer_id, issuer, subject, email, email_verified,
-                 granted_scopes, granted_by_actor_type, granted_by_subject)
-            values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 granted_scopes, granted_by_actor_type, granted_by_subject, is_primary)
+            values (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9,
+                -- Decision D-F20. Computed in SQL rather than read into Rust and passed
+                -- back down, so there is no window between asking the question and acting
+                -- on the answer even if a future caller forgets the lock above.
+                not exists (
+                    select 1 from admin_identities existing
+                    where existing.deleted_at is null
+                      and existing.status = 'active'
+                      and existing.is_primary
+                )
+            )
             returning {GRANT_COLUMNS}
             "#
         ))
@@ -463,6 +510,15 @@ impl AdminIdentityRepository for PgAdminIdentityRepository {
         }
         if current.is_primary && !is_primary {
             require_another_active_primary(conn, id).await?;
+        }
+        if is_primary && !current.is_primary {
+            // Decision D-F20: a transfer **moves** the flag. It is not a choice between
+            // two reasonable behaviours any more —
+            // `admin_identities_single_active_primary` refuses a promotion that leaves
+            // the incumbent in place, so "set" would simply be a `500`. Moving it is also
+            // the honest reading of the endpoint's name: an operation that could
+            // accumulate owners is not a transfer.
+            demote_active_primaries_other_than(conn, id).await?;
         }
 
         let row = sqlx::query(&format!(
@@ -709,6 +765,26 @@ async fn lock_grant(conn: &mut PgConnection, id: Uuid) -> Result<AdminIdentityGr
 /// question "who else is primary" answered *"everyone, by implication"*, because
 /// `moira:admin` implies every scope for a trusted-JWT actor — so there was nothing to
 /// count and no guard to write.
+/// Clears ownership from whoever currently holds it, so a promotion can take it.
+///
+/// Runs under [`OWNERSHIP_LOCK_KEY`] and, by `admin_identities_single_active_primary`,
+/// touches at most one row. The version trigger fires on that row, so the demoted grant's
+/// ETag changes — a console still holding the old one gets `resource_version_conflict`
+/// rather than silently acting on a record whose ownership moved underneath it.
+async fn demote_active_primaries_other_than(
+    conn: &mut PgConnection,
+    excluding: Uuid,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "update admin_identities set is_primary = false \
+         where deleted_at is null and status = 'active' and is_primary and id <> $1",
+    )
+    .bind(excluding)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
 async fn require_another_active_primary(
     conn: &mut PgConnection,
     excluding: Uuid,
@@ -826,18 +902,45 @@ fn invite_status_from_db(value: String) -> Result<AdminInviteStatus, AppError> {
     }
 }
 
+/// The one unique index on `admin_identities` whose violation is **not** a claim conflict.
+const SINGLE_ACTIVE_PRIMARY_INDEX: &str = "admin_identities_single_active_primary";
+
 /// The `409` that `admin_identities_issuer_subject_active_unique` produces.
 ///
 /// This is the database-level backstop: it holds even if the command runner's advisory
 /// lock window is somehow raced, which is why the constraint exists rather than a
 /// read-then-write check in the service.
+///
+/// # It matches by constraint name, not by "any unique violation"
+///
+/// `0019` gave this table a second unique index. A violation of
+/// `admin_identities_single_active_primary` means the ownership lock failed to serialise
+/// two grants — an internal invariant break, not "this identity is taken". Reporting it as
+/// `admin_identity_already_claimed` would send an operator to inspect the wrong row and
+/// would hide a real defect inside a routine-looking `409`; letting it fall through to
+/// `AppError::Sqlx` is the honest answer, and deliberately mints no new error code for a
+/// condition no correct code path can reach (a catalogued code with no emitter is what
+/// plan 09 §0.5 rules out).
+///
+/// A violation that reports *no* constraint name still maps to the claim conflict:
+/// `admin_identities_issuer_subject_active_unique` is the only other unique index an
+/// insert here can hit, and preserving the existing `409` matters more than reacting to a
+/// driver that stopped naming constraints.
 fn already_claimed_on_unique_violation(error: sqlx::Error) -> AppError {
-    match &error {
-        sqlx::Error::Database(database) if database.is_unique_violation() => AppError::conflict(
+    let is_claim_conflict = match &error {
+        sqlx::Error::Database(database) => {
+            database.is_unique_violation()
+                && database.constraint() != Some(SINGLE_ACTIVE_PRIMARY_INDEX)
+        }
+        _ => false,
+    };
+    if is_claim_conflict {
+        AppError::conflict(
             "admin_identity_already_claimed",
             "this identity has already been granted admin access",
-        ),
-        _ => AppError::from(error),
+        )
+    } else {
+        AppError::from(error)
     }
 }
 
@@ -1008,6 +1111,52 @@ mod tests {
     fn only_a_unique_violation_becomes_already_claimed() {
         let mapped = already_claimed_on_unique_violation(sqlx::Error::RowNotFound);
         assert!(matches!(mapped, AppError::Sqlx(_)));
+    }
+
+    /// The ownership index is named in exactly one place, and it is the same string the
+    /// migration creates. A rename on either side that forgot the other would restore the
+    /// old behaviour — every unique violation on this table reported as
+    /// `admin_identity_already_claimed` — with no test noticing, because the mapping
+    /// would still *work*, just for the wrong index.
+    #[test]
+    fn the_single_primary_index_name_matches_the_migration_that_creates_it() {
+        let migration = include_str!("../../../migrations/0019_single_primary_admin.sql");
+        assert!(
+            migration.contains(&format!(
+                "create unique index if not exists {SINGLE_ACTIVE_PRIMARY_INDEX}"
+            )),
+            "{SINGLE_ACTIVE_PRIMARY_INDEX} is not the index 0019 creates"
+        );
+        // And the predicate is the one the last-primary guard counts over. A partial index
+        // that forgot `deleted_at is null` or `status = 'active'` would let a revoked grant
+        // keep the ownership slot occupied, which is unreachable through the API and
+        // therefore unrecoverable without SQL.
+        assert!(
+            migration.contains("where deleted_at is null and status = 'active' and is_primary"),
+            "the ownership index must be partial on exactly the set the guard counts"
+        );
+    }
+
+    /// `0019`'s repair steps must survive being run against a database that `0017` already
+    /// backfilled. Migrations are append-only and neither can be edited afterwards, so the
+    /// only thing standing between a re-run and a silent authority change is the
+    /// `not exists` guard on each step.
+    #[test]
+    fn the_ownership_backfill_is_guarded_against_a_deployment_that_already_has_an_owner() {
+        let migration = include_str!("../../../migrations/0019_single_primary_admin.sql");
+        let promotions = migration.matches("set is_primary = true").count();
+        assert_eq!(
+            promotions, 2,
+            "0019 promotes in exactly two steps: the setup claimant, then the sole grant"
+        );
+        assert_eq!(
+            migration
+                .matches("select 1 from admin_identities existing")
+                .count(),
+            promotions,
+            "every promotion must be guarded by 'no active primary exists', or a re-run \
+             would move ownership on a deployment that already has an owner"
+        );
     }
 
     #[tokio::test]

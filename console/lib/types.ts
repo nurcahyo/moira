@@ -66,8 +66,21 @@ export interface SchemaContract {
 export type JsonValue =
   null | boolean | number | string | readonly JsonValue[] | { readonly [key: string]: JsonValue };
 
-/** `#/components/schemas/AuthMethod` */
-export type AuthMethod = "google_oauth" | "generic_oidc" | "jwks";
+/**
+ * `#/components/schemas/AuthMethod`
+ *
+ * `github_oauth` arrived with `migrations/0020` (plan 09 wave 4A) and is listed here because
+ * the union's job is to describe what Moira can put on the wire — a narrower union would be
+ * a type that lies about the response.
+ *
+ * It is deliberately **not** added to `isInteractiveMethod` in this wave. The console mints
+ * one `iss` for every provider, so offering a second sign-in button would mean two providers
+ * sharing one console issuer — which is what finding F24 rules out. Per-provider issuers are
+ * stage 4B; until they ship, a `github_oauth` row is storable in Moira and not offerable
+ * here. W4-B4 (the diagnosis `method_not_interactive` gives is wrong for it) is 4B's, with
+ * the N-button rendering it belongs to.
+ */
+export type AuthMethod = "google_oauth" | "generic_oidc" | "jwks" | "github_oauth";
 
 /** `#/components/schemas/ResourceStatus` */
 export type ResourceStatus = "active" | "disabled" | "deleted";
@@ -342,7 +355,7 @@ assertKeyContract<
  * fails that rule publishes it to the internet.
  *
  * CONSEQUENCE FOR THE CONSOLE: this is enough to RENDER a sign-in button and not
- * enough to RESOLVE the configuration behind one — `resolveAuthConfig` refuses a
+ * enough to RESOLVE the configuration behind one — `resolveAuthConfigs` refuses a
  * row with no `allowed_email_domains` and no `trusted_jwt_issuer_id`, and
  * neither is here.
  */
@@ -566,12 +579,16 @@ export interface AuthProviderSettingsCreateRequest {
   token_url?: string | null;
   /**
    * THE B1 FIELD. Binds this provider row to a registered trusted JWT issuer.
-   * `governing_policy` selects the policy with
-   * `where ... and (issuer = $1 or trusted_jwt_issuer_id = $2)` where `$1` is the
-   * *claim body's* issuer. The console's claim names the *console's* issuer while
-   * this row's `issuer` names the *IdP* — so without this field neither branch
-   * matches, `policy = None`, and every claim is `403
-   * admin_claim_domain_not_allowed`, forever.
+   * `admission_policy` resolves the governing row with
+   * `where ... and trusted_jwt_issuer_id = $2` and only falls back to
+   * `where ... and issuer = $1 and trusted_jwt_issuer_id is null` — the mode-3
+   * bring-your-own-JWKS path. The console's claim names the *console's* issuer
+   * while this row's `issuer` names the *IdP*, so without this field neither
+   * stage matches, `policy = None`, and every claim is
+   * `403 admin_claim_domain_not_allowed`, forever.
+   *
+   * From wave 4B it is also where the console READS this provider's minted
+   * `iss`: the bound row's `issuer` string is what the token carries.
    */
   trusted_jwt_issuer_id?: string | null;
   userinfo_url?: string | null;

@@ -108,7 +108,7 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
     key: K.no_enabled_auth_provider,
     message: "No sign-in provider is enabled yet. Finish setting up this deployment first.",
     description:
-      "`resolveAuthConfig` found no active, enabled `auth_provider_settings` row. This is the " +
+      "`resolveAuthConfigs` found no active, enabled `auth_provider_settings` row. This is the " +
       "normal first-run state, not a failure — it is the setup wizard's whole reason to exist.",
   },
   [K.ambiguous_enabled_auth_providers]: {
@@ -117,9 +117,11 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "More than one sign-in provider is enabled. The console will not guess which one governs — " +
       "disable all but one in Moira.",
     description:
-      "`resolveAuthConfig` found `enabled.length > 1`. Moira permits several enabled rows and " +
-      "picks one by a documented ordering at claim time; the console refuses to, because a " +
-      "sign-in button that silently uses whichever row sorted first is worse than an error.",
+      "`ambiguityGuard` saw more than one enabled row. Wave 4A replaced Moira's row-ordered " +
+      "policy lookup with a deterministic two-stage one plus a partial unique index, which is " +
+      "what makes this refusal redundant — but only on a deployment that has actually RUN that " +
+      "migration, and the console cannot tell. So the guard stays until 4A is deployed rather " +
+      "than merely merged. The resolution underneath it is already N-capable.",
   },
   [K.auth_method_not_interactive]: {
     key: K.auth_method_not_interactive,
@@ -157,6 +159,18 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "The enabled row carries no `trusted_jwt_issuer_id` (the B1 defect). Such a row can be " +
       "signed into and can never produce a successful claim; caught on the read path so the " +
       "failure does not land as a 403 on the very last step of setup.",
+  },
+  [K.trusted_jwt_issuer_not_resolvable]: {
+    key: K.trusted_jwt_issuer_not_resolvable,
+    message:
+      "The trusted JWT issuer this provider is bound to cannot supply an issuer string for this " +
+      "console. Re-bind the provider to an issuer this console registered.",
+    description:
+      "Wave 4B: the console's minted `iss` is the `issuer` of the bound `trusted_jwt_issuers` " +
+      "row. Two shapes reach this key — the id names no active issuer row the console can " +
+      "read, or the row's `issuer` is outside the namespace this console owns so no stable " +
+      "Better Auth `providerId` can be derived from it. Refusing beats inventing an id: " +
+      "`account.providerId` cannot be migrated once a human has signed in.",
   },
 
   /* --- lib/console-secrets.ts / lib/auth-config.ts ------------------------ */
@@ -238,6 +252,17 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
     description:
       "No `account.accountId` was recorded for the session. Minting a token anyway would produce " +
       "one that verifies against the console's JWKS and then matches no admin_identities grant.",
+  },
+  [K.session_provider_unknown]: {
+    key: K.session_provider_unknown,
+    message: "This session predates multi-provider sign-in. Sign out and sign in again.",
+    description:
+      "Wave 4B stamps the authenticating provider onto the session row, and the minted `iss` " +
+      "selects which trusted_jwt_issuers row — and therefore which admin_identities grant " +
+      "namespace — the token is redeemed against. The column is nullable, so every session " +
+      "live at deploy time reaches the minter without one. Those sessions REFUSE rather than " +
+      "default: defaulting would authorise the session against a provider that did not " +
+      "authenticate it.",
   },
 
   /* --- lib/setup-flow.ts -------------------------------------------------- */
@@ -354,11 +379,13 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
     key: K.sign_in_button,
     message: "Continue with {provider}",
     description:
-      "The single sign-in button, when the provider's display name is known. `{provider}` is the " +
-      "`display_name` from the anonymous `GET /api/v1/admin/setup/sign-in-methods` projection. " +
-      "There is AT MOST ONE button by construction: `resolveAuthConfig` returns " +
-      "`ambiguous_enabled_providers` when more than one provider is enabled, so a picker is wrong " +
-      "in this wave rather than merely unbuilt.",
+      "One sign-in button per RESOLVED provider, when that provider's display name is known. " +
+      "`{provider}` is the `display_name` from the anonymous " +
+      "`GET /api/v1/admin/setup/sign-in-methods` projection, or — when several providers are " +
+      "offered and Moira gave no name for one — its Better Auth provider id, because two buttons " +
+      "sharing one accessible name is worse than an ugly one. Wave 4B made the panel N-capable; " +
+      "`ambiguityGuard` still refuses a deployment with more than one enabled row until wave 4A " +
+      "is deployed, so today it renders one.",
   },
   [K.sign_in_button_generic]: {
     key: K.sign_in_button_generic,
@@ -366,7 +393,9 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
     description:
       "The sign-in button when the anonymous sign-in-methods call yielded no display name for the " +
       "resolved provider — Moira unreachable, or the row absent from the projection. The " +
-      "configuration is already resolved at this point, so the button still works.",
+      "configuration is already resolved at this point, so the button still works. Used only when " +
+      "there is exactly ONE provider: with several, an unnamed provider falls back to its id " +
+      "instead, so the buttons stay distinguishable.",
   },
   [K.sign_in_pending]: {
     key: K.sign_in_pending,

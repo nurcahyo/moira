@@ -303,6 +303,15 @@ pub trait AdminRepository {
         id: Uuid,
         expected_version: i64,
     ) -> Result<(), AppError>;
+    /// How many live `admin_identities` grants were made through this trusted JWT issuer.
+    ///
+    /// Backs the `trusted_issuer_has_active_grants` refusal on delete and disable. Both
+    /// paths are **soft** (`status = 'deleted'` / `'disabled'`, `deleted_at` set), so
+    /// `admin_identities`' foreign key never fires — while `load_issuer` filters
+    /// `deleted_at is null`, so every grant made through the issuer stops resolving. One
+    /// button silently revokes every admin who signs in through that issuer, with no
+    /// warning and no error naming the cause.
+    async fn count_active_grants_for_trusted_issuer(&self, id: Uuid) -> Result<i64, AppError>;
 
     async fn insert_audit(&self, insert: AuditLogInsert) -> Result<(), AppError>;
     /// Note the sort key: `audit_logs` orders by `occurred_at`, not `created_at` (it has
@@ -644,7 +653,8 @@ impl PgAdminCommandTransaction {
         .bind(request.clock_skew_seconds)
         .bind(request.allow_delegation)
         .fetch_one(self.connection())
-        .await?;
+        .await
+        .map_err(duplicate_trusted_jwt_issuer_on_unique_violation)?;
         crate::infra::pg_rows::trusted_jwt_issuer_record_from_row(&row)
     }
 
@@ -1895,7 +1905,8 @@ impl AdminRepository for PgAdminRepository {
         .bind(request.clock_skew_seconds)
         .bind(request.allow_delegation)
         .fetch_one(&self.pool)
-        .await?;
+        .await
+        .map_err(duplicate_trusted_jwt_issuer_on_unique_violation)?;
         crate::infra::pg_rows::trusted_jwt_issuer_record_from_row(&row)
     }
 
@@ -2079,6 +2090,19 @@ impl AdminRepository for PgAdminRepository {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn count_active_grants_for_trusted_issuer(&self, id: Uuid) -> Result<i64, AppError> {
+        // The same predicate `authenticate_admin`'s grant lookup uses: a revoked or
+        // soft-deleted grant already authorises nobody, so it is not a reason to refuse.
+        let count = sqlx::query_scalar::<_, i64>(
+            "select count(*) from admin_identities \
+             where trusted_jwt_issuer_id = $1 and deleted_at is null and status = 'active'",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
     }
 
     async fn insert_audit(&self, insert: AuditLogInsert) -> Result<(), AppError> {
@@ -2472,6 +2496,32 @@ fn ensure_affected(rows_affected: u64, resource: String) -> Result<(), AppError>
         Err(AppError::NotFound(resource))
     } else {
         Ok(())
+    }
+}
+
+/// The `409` that `trusted_jwt_issuers_issuer_active_unique` produces (finding F13).
+///
+/// Registering an issuer that already exists used to fall through to `AppError::Sqlx` and
+/// reach the caller as **`500 database_error`** — alone among Moira's uniqueness conflicts;
+/// `auth_provider_settings` has mapped its equivalent to `duplicate_auth_provider` since
+/// `0013`, and `admin_identities` maps its own to `admin_identity_already_claimed`.
+///
+/// The consequence was not cosmetic. A console recovering from a half-finished
+/// registration — the issuer row landed, the step after it did not — cannot adopt the
+/// existing issuer by catching a `409` when the `409` never arrives, so it has to
+/// list-then-adopt instead. And a `500` is indistinguishable from an outage: the operator
+/// is paged for a request that was simply a duplicate.
+///
+/// `issuer` is the only unique index on live `trusted_jwt_issuers` rows
+/// (`0003_security_foundation.sql`), so any unique violation reaching this insert is that
+/// one, and matching on the class rather than on the constraint name is exact here.
+fn duplicate_trusted_jwt_issuer_on_unique_violation(error: sqlx::Error) -> AppError {
+    match &error {
+        sqlx::Error::Database(database) if database.is_unique_violation() => AppError::conflict(
+            "duplicate_trusted_jwt_issuer",
+            "a trusted JWT issuer is already registered for this issuer",
+        ),
+        _ => AppError::from(error),
     }
 }
 

@@ -37,6 +37,7 @@ import { redirect } from "next/navigation";
 import { headers } from "next/headers";
 import type { ReactNode } from "react";
 
+import { consoleSessionCheck } from "@/lib/auth";
 import { consoleRuntime } from "@/lib/auth-runtime";
 import { isMoiraRequestError } from "@/lib/errors";
 
@@ -49,18 +50,38 @@ export const dynamic = "force-dynamic";
 const SIGN_IN_PATH = "/login";
 
 /**
- * Is there a console session right now?
+ * Is there a console session right now, **and may it act**?
  *
  * Never throws for a configuration problem — see the header. A `MoiraRequestError`
  * is caught here rather than at the call site so that `redirect()`'s own control-
  * flow throw is never inside a `catch`.
+ *
+ * ============================================================================
+ * WHY THIS ASKS THE CREDENTIAL BOUNDARY RATHER THAN COUNTING COOKIES (F25)
+ * ============================================================================
+ *
+ * It used to be `session !== null`, which admits anyone the IdP authenticated —
+ * including an address outside `allowed_email_domains`. That human got the whole
+ * console shell and then a bare `403` from Moira on the first data fetch, with
+ * nothing on screen explaining which policy refused them.
+ *
+ * `consoleSessionCheck` runs the *same* `checkSession` that `jwt.getSubject` runs
+ * before minting, from the same resolved config, so the page and the token cannot
+ * disagree. **This gate is not the security control** — `getSubject` and the token
+ * route are, and Moira is the enforcer behind both. Deleting this line loses the
+ * explanation, not the enforcement; deleting `getSubject`'s loses the enforcement.
+ * That asymmetry is why a page-level-only wiring was rejected.
  */
 async function hasConsoleSession(): Promise<boolean> {
   try {
     const runtimeState = await consoleRuntime();
     if (!runtimeState.ok) return false;
-    const session = await runtimeState.auth.api.getSession({ headers: await headers() });
-    return session !== null && session !== undefined;
+    const check = await consoleSessionCheck(
+      runtimeState.auth,
+      runtimeState.configs,
+      await headers(),
+    );
+    return check.ok;
   } catch (error) {
     if (isMoiraRequestError(error)) return false;
     throw error;

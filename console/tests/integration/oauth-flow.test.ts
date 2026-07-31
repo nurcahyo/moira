@@ -36,7 +36,11 @@ import {
   readIdpSubject,
 } from "@/lib/auth";
 import { readConsoleEnv, type ConsoleEnv } from "@/lib/env";
-import { checkSession } from "@/lib/moira-session";
+import {
+  checkSession,
+  mintMoiraToken,
+  SESSION_REJECTION_MESSAGE_KEYS,
+} from "@/lib/moira-session";
 
 import { createBrowserAgent } from "../support/browser-agent";
 import {
@@ -74,9 +78,21 @@ function envFor(consoleOrigin: string): ConsoleEnv {
   });
 }
 
-function configFor(idp: MockIdp, clientSecret: string): ResolvedAuthConfig {
+/**
+ * The INCUMBENT provider, as wave 4B resolves it.
+ *
+ * `consoleIssuer` is `env.bffIssuerUrl` — not a special case in the code, but
+ * the definition: the incumbent is the provider bound to the `bffIssuerUrl`
+ * trusted issuer, so it keeps that string and `moira-console-idp` automatically.
+ * Every assertion below that expects `iss === env.bffIssuerUrl` is asserting
+ * exactly that, and would still pass under a `definePayload` that omitted `iss`
+ * entirely — which is why the multi-provider file (`multi-provider.test.ts`)
+ * owns guard G8 and this one does not claim to.
+ */
+function configFor(idp: MockIdp, clientSecret: string, env: ConsoleEnv): ResolvedAuthConfig {
   return {
     providerId: CONSOLE_OAUTH_PROVIDER_ID,
+    consoleIssuer: env.bffIssuerUrl,
     method: "generic_oidc",
     moiraProviderId: "11111111-1111-4111-8111-111111111111",
     moiraProviderVersion: 3,
@@ -92,7 +108,6 @@ function configFor(idp: MockIdp, clientSecret: string): ResolvedAuthConfig {
     scopes: ["openid", "email", "profile"],
     allowedEmailDomains: ["example.com"],
     trustedJwtIssuerId: "22222222-2222-4222-8222-222222222222",
-    cacheKey: "fixture",
   };
 }
 
@@ -173,7 +188,7 @@ describe("OAuth sign-in against a real mock IdP", () => {
     consoleServer = startConsoleServer(
       {
         env,
-        config: configFor(idp, CLIENT_SECRET),
+        configs: [configFor(idp, CLIENT_SECRET, env)],
         database: memoryAdapter(createConsoleMemoryDatabase()),
       },
       port,
@@ -345,7 +360,7 @@ describe("the console-held client secret is load-bearing", () => {
         // The drift D7 makes possible: Moira's row is right, the console's
         // stored secret is stale. Nothing on the Moira side can detect this,
         // because Moira never held the secret.
-        config: configFor(idp, "the-wrong-secret"),
+        configs: [configFor(idp, "the-wrong-secret", envFor(consoleOrigin))],
         database: memoryAdapter(createConsoleMemoryDatabase()),
       },
       port,
@@ -401,7 +416,7 @@ describe("identity falls back to the userinfo endpoint when the ID token is thin
     consoleServer = startConsoleServer(
       {
         env,
-        config: configFor(idp, CLIENT_SECRET),
+        configs: [configFor(idp, CLIENT_SECRET, env)],
         database: memoryAdapter(createConsoleMemoryDatabase()),
       },
       port,
@@ -464,7 +479,7 @@ describe("a provider that supplies no subject cannot produce a console session",
     consoleServer = startConsoleServer(
       {
         env: envFor(consoleOrigin),
-        config: configFor(idp, CLIENT_SECRET),
+        configs: [configFor(idp, CLIENT_SECRET, envFor(consoleOrigin))],
         database: memoryAdapter(createConsoleMemoryDatabase()),
       },
       port,
@@ -521,5 +536,130 @@ describe("readIdpSubject", () => {
     await expect(
       readIdpSubject(context([]), CONSOLE_OAUTH_PROVIDER_ID, "console-user-1"),
     ).rejects.toBeInstanceOf(MissingIdpSubjectError);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* G12 — the CREDENTIAL gate, not the page gate (finding F25)                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The console's `allowed_email_domains` check had eleven green unit assertions
+ * and no shipped caller. This is the wire-level test that would have failed then
+ * and passes now, and it is deliberately built so that a PAGE-level wiring would
+ * NOT satisfy it.
+ *
+ * The human here completes the whole OAuth flow successfully — the IdP knows
+ * them, the code exchange works, the session cookie is set — and is simply
+ * outside the deployment's allow-list. Under a layout-only gate they would be
+ * redirected in a browser while `GET /api/auth/token` handed the same cookie a
+ * working admin credential. That is the arrangement this asserts against.
+ */
+describe("a session outside the allow-list cannot be exchanged for a Moira credential", () => {
+  let idp: MockIdp;
+  let consoleServer: ConsoleServer;
+
+  beforeAll(async () => {
+    useNativeWhatwgGlobals();
+
+    const port = reserveConsolePort();
+    const consoleOrigin = `https://localhost:${port}`;
+    trustFixtureCa(consoleOrigin);
+
+    idp = await startMockIdp({ clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, user: OPERATOR });
+    trustFixtureCa(idp.origin);
+
+    consoleServer = startConsoleServer(
+      {
+        env: envFor(consoleOrigin),
+        configs: [
+          {
+            ...configFor(idp, CLIENT_SECRET, envFor(consoleOrigin)),
+            // OPERATOR is `operator@example.com`. The deployment admits `corp.test`
+            // and nothing else, so sign-in succeeds and admission does not.
+            allowedEmailDomains: ["corp.test"],
+          },
+        ],
+        database: memoryAdapter(createConsoleMemoryDatabase()),
+      },
+      port,
+    );
+  });
+
+  afterAll(() => {
+    consoleServer?.stop();
+    idp?.stop();
+    untrustFixtureCa();
+    restoreDomWhatwgGlobals();
+  });
+
+  test("the OAuth flow itself still succeeds — the refusal is at the credential, not the door", async () => {
+    const outcome = await signIn(consoleServer.origin);
+    expect(outcome.errorParam).toBeNull();
+    expect(outcome.finalStatus).toBe(200);
+    // The premise, asserted rather than assumed: without a real session cookie
+    // the token request below would be refused for the ordinary reason and the
+    // test would pass while proving nothing.
+    expect(outcome.agent.cookieNames().join(",")).toContain("session_token");
+  });
+
+  test("GET /api/auth/token answers 403 with a keyed body and NO token", async () => {
+    const outcome = await signIn(consoleServer.origin);
+    expect(outcome.agent.cookieNames().join(",")).toContain("session_token");
+
+    const response = await outcome.agent.request(`${consoleServer.origin}/api/auth/token`);
+
+    expect(response.status).toBe(403);
+    const body = (await response.json()) as Record<string, unknown>;
+    // The assertion that matters: no credential came back. A 403 whose body also
+    // carried a usable token would satisfy a status-only test.
+    expect(body["token"]).toBeUndefined();
+    expect(JSON.stringify(body)).not.toContain("eyJ");
+    const error = body["error"] as Record<string, unknown> | undefined;
+    expect(error?.["code"]).toBe("email_domain_not_allowed");
+    expect(error?.["message_key"]).toBe(
+      SESSION_REJECTION_MESSAGE_KEYS.email_domain_not_allowed,
+    );
+  });
+
+  test("mintMoiraToken throws for the same session — the backstop under the route", async () => {
+    const outcome = await signIn(consoleServer.origin);
+    const headers = new Headers({
+      cookie: outcome.agent.cookieHeaderFor(consoleServer.origin),
+    });
+
+    // Straight at `auth.api.getToken`, bypassing the route handler entirely.
+    // This is every server-side minting path — a page, a server action, a future
+    // API route — and none of them passes through `app/api/auth/[...all]`. If
+    // only the route were wired, this call would return a token.
+    await expect(mintMoiraToken(consoleServer.auth, headers)).rejects.toThrow();
+  });
+
+  test("the SAME session is admitted once its domain is allowed", async () => {
+    // The negative control. Without it, a check that refused everybody — or a
+    // token endpoint broken for an unrelated reason — would pass every assertion
+    // above.
+    const port = reserveConsolePort();
+    const origin = `https://localhost:${port}`;
+    trustFixtureCa(origin);
+    const permissive = startConsoleServer(
+      {
+        env: envFor(origin),
+        configs: [
+          { ...configFor(idp, CLIENT_SECRET, envFor(origin)), allowedEmailDomains: ["example.com"] },
+        ],
+        database: memoryAdapter(createConsoleMemoryDatabase()),
+      },
+      port,
+    );
+    try {
+      const outcome = await signIn(permissive.origin);
+      const response = await outcome.agent.request(`${permissive.origin}/api/auth/token`);
+      expect(response.status).toBe(200);
+      const { token } = (await response.json()) as { token?: string };
+      expect(token).toBeString();
+    } finally {
+      permissive.stop();
+    }
   });
 });

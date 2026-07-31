@@ -41,14 +41,22 @@ const copy = (key: string): string => CONSOLE_CATALOG[key as ConsoleMessageKey].
 
 const READY: SignInPanelState = {
   kind: "ready",
-  providerId: "moira-console-idp",
-  displayName: "Example IdP",
+  providers: [{ providerId: "moira-console-idp", displayName: "Example IdP" }],
+};
+
+/** Two resolvable providers, as wave 4B's `consoleRuntime()` would hand them over. */
+const READY_TWO: SignInPanelState = {
+  kind: "ready",
+  providers: [
+    { providerId: "moira-console-idp", displayName: "Corporate IdP" },
+    { providerId: "moira-console-idp-github", displayName: "GitHub" },
+  ],
 };
 
 /**
  * Every refusal the server can resolve to.
  *
- * Six come from `resolveAuthConfig` (`AUTH_CONFIG_PROBLEM_MESSAGE_KEYS`), three
+ * Eight come from `resolveAuthConfigs` (`AUTH_CONFIG_PROBLEM_MESSAGE_KEYS`), three
  * from the D7 drift discriminant, and one from the bootstrap deadlock in
  * `lib/auth-runtime.ts:194-202`. They are read from the shipped tables rather
  * than re-listed, so a key renamed in `lib/` fails here instead of silently
@@ -62,10 +70,10 @@ const REFUSAL_KEYS: readonly string[] = [
 ];
 
 describe("the refusal states are real, distinct, and catalogued", () => {
-  test("the shipped tables still cover the six documented problems", () => {
+  test("the shipped tables still cover every documented problem", () => {
     // A floor. If `AUTH_CONFIG_PROBLEM_MESSAGE_KEYS` shrank, the loop below
     // would quietly test fewer states and still be green.
-    expect(Object.keys(AUTH_CONFIG_PROBLEM_MESSAGE_KEYS)).toHaveLength(7);
+    expect(Object.keys(AUTH_CONFIG_PROBLEM_MESSAGE_KEYS)).toHaveLength(8);
     expect(Object.keys(CONSOLE_SECRET_DRIFT_MESSAGE_KEYS)).toHaveLength(3);
     expect(new Set(REFUSAL_KEYS).size).toBeGreaterThanOrEqual(8);
   });
@@ -146,11 +154,11 @@ describe("the server-supplied message is the fallback, and the catalog wins", ()
   });
 });
 
-describe("the ready state renders exactly one button", () => {
+describe("the ready state renders one button per RESOLVED provider, and no others", () => {
   test("one button, named from the anonymous projection's display_name", () => {
     render(<SignInPanel state={READY} />);
     const buttons = screen.getAllByRole("button");
-    expect(buttons, "at most one button by construction — see the component header").toHaveLength(
+    expect(buttons, "one provider resolved, so one button — see the component header").toHaveLength(
       1,
     );
     expect(buttons[0]).toHaveTextContent(
@@ -159,10 +167,66 @@ describe("the ready state renders exactly one button", () => {
   });
 
   test("a missing display_name falls back to the generic label, still one button", () => {
-    render(<SignInPanel state={{ ...READY, displayName: null }} />);
+    render(
+      <SignInPanel
+        state={{ kind: "ready", providers: [{ providerId: "moira-console-idp", displayName: null }] }}
+      />,
+    );
     const buttons = screen.getAllByRole("button");
     expect(buttons).toHaveLength(1);
     expect(buttons[0]).toHaveTextContent(copy(CONSOLE_MESSAGE_KEYS.sign_in_button_generic));
+  });
+
+  test("WAVE 4B: two resolved providers render two buttons", () => {
+    render(<SignInPanel state={READY_TWO} />);
+    const buttons = screen.getAllByRole("button");
+    expect(buttons).toHaveLength(2);
+    expect(buttons[0]).toHaveTextContent(
+      copy(CONSOLE_MESSAGE_KEYS.sign_in_button).replace("{provider}", "Corporate IdP"),
+    );
+    expect(buttons[1]).toHaveTextContent(
+      copy(CONSOLE_MESSAGE_KEYS.sign_in_button).replace("{provider}", "GitHub"),
+    );
+  });
+
+  test("WITH SEVERAL PROVIDERS, a missing display name must not produce identical buttons", () => {
+    // The generic label is fine for one button and wrong for several: a screen
+    // reader user would be choosing between controls with the same accessible
+    // name. The provider id is ugly and distinct, and the operator can replace
+    // it by setting `display_name` in Moira.
+    render(
+      <SignInPanel
+        state={{
+          kind: "ready",
+          providers: [
+            { providerId: "moira-console-idp", displayName: null },
+            { providerId: "moira-console-idp-github", displayName: null },
+          ],
+        }}
+      />,
+    );
+    const names = screen.getAllByRole("button").map((button) => button.textContent);
+    expect(names).toHaveLength(2);
+    expect(new Set(names).size, "two buttons must not share one accessible name").toBe(2);
+  });
+
+  test("pressing one button posts THAT provider's id, not the first one's", async () => {
+    // The whole point of the picker. A component that always posted
+    // `providers[0]` would render two buttons and sign everyone in through one
+    // provider — and the resulting session would then mint that provider's
+    // `iss`, which is a different admin_identities grant namespace.
+    const bodies: unknown[] = [];
+    const fetchImpl = (async (_url: string, init: RequestInit) => {
+      bodies.push(JSON.parse(String(init.body)));
+      return new Response(JSON.stringify({ url: "https://idp.example/authorize" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+
+    render(<SignInPanel state={READY_TWO} fetchImpl={fetchImpl} navigate={() => {}} />);
+    await userEvent.click(screen.getAllByRole("button")[1]!);
+    expect(bodies).toEqual([{ providerId: "moira-console-idp-github", callbackURL: "/" }]);
   });
 
   test("no password field, ever", () => {

@@ -12,6 +12,7 @@
 //     resolves the signing key by `kid`. Calling the handler in-process and
 //     reading the JSON would test a different thing.
 
+import { handleAuthRequest } from "@/app/api/auth/[...all]/route";
 import { createConsoleAuth, type ConsoleAuthDeps } from "@/lib/auth";
 import { AUTH_BASE_PATH, AUTH_JWKS_PATH } from "@/lib/env";
 
@@ -50,7 +51,24 @@ export function startConsoleServer(deps: ConsoleAuthDeps, port: number): Console
         // builds its reply with the global `Response` and sets cookies through
         // the global `Headers`, and happy-dom's versions of both are wrong for
         // a server. See `native-globals.ts`.
-        return auth.handler(request);
+        //
+        // NOT `auth.handler(request)`. That was the shape until finding F25:
+        // every wire-level test drove Better Auth directly and never touched
+        // `app/api/auth/[...all]/route.ts`, so the handler's own behaviour — the
+        // 503 for an unresolvable configuration, and the keyed 403 the token
+        // endpoint owes a session outside the allow-list — was exercised by
+        // nothing. Only the runtime RESOLUTION is stubbed; every line of policy
+        // in the route module is the shipped one.
+        return handleAuthRequest(request, async () => ({
+          ok: true,
+          auth,
+          configs: deps.configs,
+          // No per-provider problems: the harness is handed already-resolved
+          // configurations, so there is nothing that failed to resolve. A test
+          // that wants to exercise the drifted-row path resolves through
+          // `loadAuthConfigs` instead of through this seam.
+          problems: [],
+        }));
       }
       // The post-sign-in landing page. The flow redirects here, so it has to
       // exist; nothing about it is under test.

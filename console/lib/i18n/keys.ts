@@ -59,6 +59,7 @@ export const CONSOLE_MESSAGE_KEYS = {
   allowed_email_domains_empty: "console.error.allowed_email_domains_empty",
   provider_not_bound_to_trusted_jwt_issuer:
     "console.error.provider_not_bound_to_trusted_jwt_issuer",
+  trusted_jwt_issuer_not_resolvable: "console.error.trusted_jwt_issuer_not_resolvable",
 
   /* --- lib/console-secrets.ts (oauth_client_secret_missing is shared with
          lib/auth-config.ts — one key, two emitters, deliberately) ---------- */
@@ -74,6 +75,7 @@ export const CONSOLE_MESSAGE_KEYS = {
   email_not_verified: "console.error.email_not_verified",
   email_domain_not_allowed: "console.error.email_domain_not_allowed",
   idp_subject_missing: "console.error.idp_subject_missing",
+  session_provider_unknown: "console.error.session_provider_unknown",
 
   /* --- lib/setup-flow.ts -------------------------------------------------- */
   trusted_jwt_issuer_registration_failed: "console.error.trusted_jwt_issuer_registration_failed",

@@ -2,8 +2,8 @@
 //
 // Plan 08's wizard, as originally written, could never produce a successful
 // claim: it wrote the auth-provider row for the IdP, claimed with the console's
-// issuer, and never set `trusted_jwt_issuer_id`, so `governing_policy` matched
-// neither branch and every claim was 403 admin_claim_domain_not_allowed.
+// issuer, and never set `trusted_jwt_issuer_id`, so the admission-policy lookup
+// matched neither stage and every claim was 403 admin_claim_domain_not_allowed.
 //
 // Two things had to change, and BOTH are asserted here, because fixing only the
 // first fixes nothing:
@@ -27,6 +27,7 @@ import {
   buildProviderCreateBody,
   claimAdminIdentity,
   claimIdempotencyKey,
+  consoleIssuerConfigFor,
   isProvisioningComplete,
   provisioningDeficiencies,
   reachableSetupStep,
@@ -653,5 +654,57 @@ describe("buildProviderCreateBody", () => {
     ]);
     // `additionalProperties: false` — an extra field is a hard 400, not a drop.
     for (const key of Object.keys(body)) expect(allowed.has(key)).toBe(true);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Wave 4B — which console issuer a provider is provisioned under             */
+/* -------------------------------------------------------------------------- */
+
+describe("consoleIssuerConfigFor", () => {
+  const env = { bffIssuerUrl: "https://console.example.com", adminApiAudience: "moira-admin-api" };
+  const JWKS = "https://console.example.com/api/auth/.well-known/jwks.json";
+
+  test("the INCUMBENT is provisioned under the deployment's own issuer, unchanged", () => {
+    // `slug === null` is the incumbent. Its issuer string must stay exactly
+    // `env.bffIssuerUrl`, because every `admin_identities` grant made before
+    // wave 4B carries that string and the key is `(issuer, subject)`.
+    const config = consoleIssuerConfigFor(env, JWKS, null);
+    expect(config.issuer).toBe("https://console.example.com");
+    expect(config.audience).toBe("moira-admin-api");
+    expect(config.jwksUrl).toBe(JWKS);
+  });
+
+  test("an ADDITIONAL provider gets its own issuer under the console's namespace", () => {
+    expect(consoleIssuerConfigFor(env, JWKS, "contractors").issuer).toBe(
+      "https://console.example.com/idp/contractors",
+    );
+    // Same JWKS URL, deliberately: `trusted_jwt_issuers` has a unique index on
+    // `issuer` alone and none on `jwks_url`, and better-auth's `getLatestKey`
+    // sorts the `jwks` table globally with no issuer awareness — so per-issuer
+    // key pairs are not implementable and are not attempted.
+    expect(consoleIssuerConfigFor(env, JWKS, "contractors").jwksUrl).toBe(JWKS);
+  });
+
+  test("two providers never share an issuer string", () => {
+    const a = consoleIssuerConfigFor(env, JWKS, null).issuer;
+    const b = consoleIssuerConfigFor(env, JWKS, "github").issuer;
+    const c = consoleIssuerConfigFor(env, JWKS, "contractors").issuer;
+    expect(new Set([a, b, c]).size).toBe(3);
+  });
+
+  test("an unusable slug is refused BEFORE any Moira write", () => {
+    // One-way failure: a trusted issuer registered under a string the console
+    // cannot parse back into a `providerId` cannot be deleted once a grant
+    // exists under it (409 trusted_issuer_has_active_grants), so the provider
+    // would be permanently unofferable and its admins permanently unreachable.
+    for (const bad of ["", "Bad Slug", "a/b", "-lead", "UPPER"]) {
+      expect(() => consoleIssuerConfigFor(env, JWKS, bad)).toThrow();
+    }
+  });
+
+  test("the algorithm list defaults to the pin and is overridable", () => {
+    expect(consoleIssuerConfigFor(env, JWKS, null).allowedAlgorithms).toBeUndefined();
+    expect(consoleIssuerConfigFor(env, JWKS, null, ["ES256"]).allowedAlgorithms).toEqual(["ES256"]);
   });
 });

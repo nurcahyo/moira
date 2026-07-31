@@ -57,6 +57,19 @@ const ADMIN_IDENTITY_REVOKED_NOTICE: &str = "moira.notice.admin_identity_revoked
 /// from an API key in a paste buffer or a log line someone is about to redact.
 const ADMIN_INVITE_NAMESPACE: &str = "moira_inv";
 
+/// Compile-time proof that the invite namespace is one `MIN_API_KEY_PREFIX_LENGTH` was
+/// computed from.
+///
+/// `api_keys`'s source walker can only see namespaces spelled inline at a `generate` call
+/// site, and this one is deliberately a constant — so it is exactly the namespace no
+/// walking gate covers. It is also the shortest, which is what made
+/// `api_keys.prefix_length = 12` leave a `moira_inv_` prefix with two random characters.
+/// A `const` assertion fails the **build**, which is the right severity for "the bound
+/// protecting an anonymous endpoint was computed without this namespace in it".
+const _: () = assert!(crate::security::is_registered_key_namespace(
+    ADMIN_INVITE_NAMESPACE
+));
+
 /// The value `admin_identities.granted_by_actor_type` carries for an invite-created grant.
 ///
 /// A constant rather than an inline literal because the string is a **schema** value:
@@ -171,9 +184,28 @@ impl<'a> AdminIdentityService<'a> {
             .await?;
 
         // Module 10. Runs on every credential path, and can deny a system-key claim.
+        //
+        // Both arguments are load-bearing and they are NOT interchangeable — this is the
+        // `$1`/`$2` asymmetry finding F23 turned on, restated for the two-stage lookup that
+        // replaced `governing_policy`:
+        //
+        //   `$2` (`trusted_jwt_issuer_id`) is the row `resolve_active_issuer` just proved
+        //   registered and active. It selects the **bound** provider, and that stage is
+        //   tried first. On a console-mediated deployment this is the only stage that ever
+        //   matches, because every provider row's `issuer` column holds the *IdP's* issuer
+        //   while `$1` here is the *console's*.
+        //
+        //   `$1` (`issuer`) reaches only the second stage, which is restricted to rows with
+        //   NO trusted-issuer binding — CONVENTIONS §7.3 mode 3, where the caller IS the
+        //   IdP and the row's `issuer` legitimately equals the token's. Passing a nil UUID
+        //   for `$2` would silently fall through to that branch on a deployment where it
+        //   does not apply, and admit or deny under a row nobody bound.
+        //
+        // A duplicate match is a `409 duplicate_enabled_provider_for_issuer`, never a
+        // silent pick. See `AuthProviderSettingsRepository::admission_policy`.
         let policy = self
             .auth_settings
-            .governing_policy(&request.issuer, trusted_jwt_issuer_id)
+            .admission_policy(&request.issuer, trusted_jwt_issuer_id)
             .await?;
         evaluate_claim_policy(&request.email, request.email_verified, policy.as_ref())?;
 
@@ -341,7 +373,14 @@ impl<'a> AdminIdentityService<'a> {
                 })
             })
             .await?;
-        self.state.metrics.record_admin_invite_created();
+        // Counted once per *invitation*, not once per request. A replay returns the first
+        // invite's stored body and mints nothing, so incrementing unconditionally here
+        // made one invitation read as two — and in the direction that overstates activity,
+        // which is the worse direction for a counter an operator watches to answer "how
+        // many people have we invited".
+        if !outcome.replayed {
+            self.state.metrics.record_admin_invite_created();
+        }
         Ok((outcome.response, outcome.replayed))
     }
 
@@ -448,9 +487,18 @@ impl<'a> AdminIdentityService<'a> {
     ///
     /// So the invite lookup, its state checks, the D5 email checks, the invite's own
     /// constraint and plan 07's provider allow-list all run here, outside
-    /// [`AdminCommandRunner::execute`]. A request that fails any of them takes no
-    /// advisory lock, writes no idempotency record, and — crucially — never reaches the
-    /// statement that marks the invite consumed.
+    /// [`AdminCommandRunner::execute`]. A request that fails any of them writes no
+    /// idempotency record and — crucially — never reaches the statement that marks the
+    /// invite consumed.
+    ///
+    /// An earlier revision of this comment also credited the ordering with taking "no
+    /// advisory lock", which named the wrong mechanism. `begin_admin_command` takes no
+    /// lock on any path. The lock a pre-envelope refusal actually skips is the **per-key**
+    /// `pg_try_advisory_xact_lock` inside `PgAdminCommandTransaction::claim_idempotency`,
+    /// and only when the request carries an `Idempotency-Key`; without one the clause was
+    /// vacuous. Getting this right matters for the reason finding F19 records — a guard
+    /// justified by a property it does not have is one refactor away from being deleted as
+    /// redundant, because *for that property it is*.
     ///
     /// **Do not move any of these inside the closure "to make it atomic".** Atomicity is
     /// already provided for the part that needs it: `consume_invite` re-checks state
@@ -505,16 +553,28 @@ impl<'a> AdminIdentityService<'a> {
         // there is deliberately no `invite.is_some()` short-circuit anywhere in this
         // path — `evaluate_claim_policy` cannot branch on a credential it never receives.
         //
-        // The second argument is load-bearing and is the defect plan 09 §0.1 B5 records:
-        // `governing_policy` matches `issuer = $1 or trusted_jwt_issuer_id = $2`, and in
-        // a real deployment `$1` is the *console's* issuer while the provider row's
-        // `issuer` column holds the *IdP's*. The row therefore matches only through
-        // `trusted_jwt_issuer_id`. Passing a nil UUID here — or dropping the argument —
-        // makes every redemption 403 forever on exactly the deployments that are
-        // configured correctly.
+        // The second argument is load-bearing, and the reason is the `$1`/`$2` asymmetry
+        // plan 09 §0.1 B5 half-recorded and finding F23 corrected. `$1` is the *console's*
+        // issuer — the one that signed this redemption's token — while every provider row's
+        // `issuer` column holds the *IdP's*, so the row that governs is reached through
+        // `trusted_jwt_issuer_id` and through nothing else.
+        //
+        // B5 read that as "the redeem path never passes `$2`, so every redemption 403s
+        // forever". It does pass it, and always has (`resolve_active_issuer`, just above).
+        // The real defect was a **wrong-policy** bug, not a total-denial one: under the old
+        // single-query `governing_policy`, every legitimately-bound row tied on the first
+        // sort key and `created_at asc` handed the policy to the oldest row bound to that
+        // trusted issuer — regardless of which provider authenticated the human — and an
+        // enabled row whose *own* `issuer` happened to equal `$1` outranked all of them at
+        // any age, without being bound to anything.
+        //
+        // `admission_policy` resolves the bound row first and reaches the `issuer = $1`
+        // branch only for **unbound** rows (mode 3). Passing a nil UUID here, or dropping
+        // the argument, would skip straight to that branch and evaluate under a row nobody
+        // bound to this issuer.
         let policy = self
             .auth_settings
-            .governing_policy(&identity.issuer, trusted_jwt_issuer_id)
+            .admission_policy(&identity.issuer, trusted_jwt_issuer_id)
             .await?;
         if let Err(error) = evaluate_claim_policy(email, request.email_verified, policy.as_ref()) {
             return Err(self.denied(error));
@@ -528,10 +588,17 @@ impl<'a> AdminIdentityService<'a> {
             subject: identity.subject.clone(),
             email: email.to_string(),
             email_verified: request.email_verified,
-            // An invite grants base admin authority and never ownership: `is_primary`
-            // takes its column default of `false`. A redemption that could mint an owner
-            // would make an invite strictly more powerful than the transfer endpoint it
-            // is supposed to sit beneath.
+            // An invite grants base admin authority; ownership is not its to give and it
+            // has no field here for one. `insert_grant` decides `is_primary`, and under
+            // decision D-F20 it says yes only when the deployment has **no** active
+            // owner — so a redemption on a running deployment produces an ordinary admin,
+            // exactly as before, and an invite is never more powerful than the transfer
+            // endpoint it sits beneath.
+            //
+            // What F20 changed is the bootstrap case. A deployment whose first admin
+            // arrives by invitation now gets an owner from it, instead of having no owner
+            // at all and no route to the transfer endpoint short of the break-glass
+            // system key the invitation flow exists to let an operator retire.
             granted_scopes: vec!["moira:admin".to_string()],
             // The credential that actually produced this grant. `migrations/0018` widened
             // `admin_identities.granted_by_actor_type`'s CHECK to admit it.
@@ -625,13 +692,34 @@ impl<'a> AdminIdentityService<'a> {
 
         match outcome {
             Ok(outcome) => {
-                self.state.metrics.record_admin_invite_redeemed();
+                // One redemption, one increment.
+                //
+                // **This branch cannot currently replay**, and saying so is the point:
+                // `require_redeemable` runs before the envelope, so by the time a retry
+                // arrives the invite is `consumed` and it is refused with
+                // `invite_already_consumed` before `execute` is ever called. The guard is
+                // kept anyway because the property it depends on lives in a *different*
+                // function and is one refactor away from changing — moving validation
+                // inside the envelope, which plan 09 §0 originally proposed, would make
+                // every retried redemption count a grant that does not exist. A boolean is
+                // a cheap price for not having to re-derive that.
+                if !outcome.replayed {
+                    self.state.metrics.record_admin_invite_redeemed();
+                }
                 Ok((outcome.response, outcome.replayed))
             }
             Err(error) => {
-                self.state
-                    .metrics
-                    .record_admin_invite_denied(denial_reason(&error));
+                // A refusal raised *inside* the envelope with a `400`/`404`/`409`/`422`
+                // is cacheable, so a retry under the same key comes back as
+                // `AppError::Replayed` — the only signal available here that this failure
+                // has already been counted. Without the check, one refused redemption is
+                // counted once per client retry, which turns a denial-rate alert into a
+                // measure of the client's retry policy.
+                if !matches!(error, AppError::Replayed(_)) {
+                    self.state
+                        .metrics
+                        .record_admin_invite_denied(denial_reason(&error));
+                }
                 Err(error)
             }
         }
@@ -714,7 +802,19 @@ impl<'a> AdminIdentityService<'a> {
                 })
             })
             .await?;
-        self.state.metrics.record_admin_ownership_transferred();
+        // `ownership_transferred` means the flag **moved onto** someone. It fired on a
+        // clear too, which is a different event, and on a replay, which is not an event at
+        // all.
+        //
+        // There is deliberately no `ownership_cleared` label to pair with this. Under
+        // decision D-F20 clearing the holder is refused by the last-primary guard and
+        // clearing a non-holder is a no-op, so neither produces an event — and a label
+        // value nothing emits is exactly what `ADMIN_INVITE_OUTCOMES`' own comment rules
+        // out, for the reason wave 2 rediscovered: an operator alerting on it watches a
+        // flat line and concludes the condition never occurs.
+        if !outcome.replayed && outcome.response.is_primary {
+            self.state.metrics.record_admin_ownership_transferred();
+        }
         Ok((outcome.response, outcome.replayed))
     }
 
@@ -762,7 +862,11 @@ impl<'a> AdminIdentityService<'a> {
                 })
             })
             .await?;
-        self.state.metrics.record_admin_identity_revoked();
+        // Same rule as every other counter on this path: a replay returns the stored
+        // response of the revocation that already happened, and is not a second one.
+        if !outcome.replayed {
+            self.state.metrics.record_admin_identity_revoked();
+        }
         Ok((outcome.response, outcome.replayed))
     }
 
