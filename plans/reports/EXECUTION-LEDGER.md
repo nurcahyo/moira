@@ -1238,6 +1238,78 @@ attrition. Diagnose F22 the way the attach race was diagnosed: make it determini
 **Also worth carrying:** docs-only pushes to `main` run the full CI suite, which is what exposed this.
 That is accidental coverage worth keeping rather than optimising away.
 
+## D3 — wave 4 implements Option A′, staged 4A / 4B (taken by the loop, 2026-07-31)
+
+Decided by a judged panel: three worked designs, three judge lenses (security closure, migration and
+operational cost, contract and test surface), one synthesis that re-read the code where judges
+disagreed. Claims verified empirically against the live database in rolled-back transactions. Full
+document staged at `scratchpad/wave4-decision.md` and folded into plan 09 §0.7.7.
+
+**Option A′ = per-provider console-minted issuer, plus a deterministic two-stage policy lookup
+replacing `governing_policy`.** Option C (a provider claim) rejected; Option B (console-side
+enforcement) rejected as a whole, one idea taken from it.
+
+**The decisive argument is a constraint, not a preference.** The mandated invariant — a partial unique
+index on `(trusted_jwt_issuer_id) where enabled and status='active' and deleted_at is null` — and
+multi-provider are **incompatible under one console issuer**: the index refuses the second enabled
+provider outright. Per-provider trusted issuers is the only shape in which the invariant wave 4 must
+ship and the capability wave 4 exists to deliver can coexist.
+
+**F24 closes with zero `admin_identities` change** — verified live, since
+`admin_identities_issuer_subject_active_unique` is on `(issuer, subject)`, so distinct per-provider
+issuer strings give distinct grants for the same `sub`.
+
+**F23 shape (b) survives A′ and is AMPLIFIED by it** — an enabled *unbound* row whose own `issuer`
+equals a console issuer string outranks the correctly-bound row at any age, and no index on
+`(trusted_jwt_issuer_id)` can reach it because that column is NULL. Per-provider issuers multiply the
+collidable strings from 1 to N. Reproduced live. Closed only by the two-stage lookup **plus** a new
+`auth_provider_issuer_shadows_trusted_issuer` guard — not by the mandated index, which creates cleanly
+with the rogue row present.
+
+**Staging is load-bearing.** 4A ships the invariant, the deterministic lookup, `github_oauth` schema
+and enum, the B2 fix, a trusted-issuer deletion guard, and wires `checkSession` (F25) — and
+**keeps `ambiguous_enabled_providers`**. The console guard may be removed only after 4A is
+**deployed**, not merely merged, because until Moira itself refuses the ambiguous state the guard is
+the only thing standing in front of it.
+
+### Reversal conditions
+
+**Primary — blocks 4B only.** If spike T0 shows Better Auth 1.6.25 cannot make the authenticating
+account's `providerId` available to the token minter for the current session, 4B has no honest
+implementation. Ship 4A, keep the console guard, defer multi-provider with that named blocker.
+**Explicitly forbidden as substitutes:** the most-recently-updated-account heuristic (wrong exactly
+when two accounts are linked, which is the case it exists to handle), and disabling implicit account
+linking to force 1:1 (a second provider then returns "account not linked" for precisely the humans
+multi-provider serves).
+
+**Secondary — reverses A′ entirely.** If a requirement appears that two interactive providers must
+share one `trusted_jwt_issuers` row, the invariant and multi-provider cannot both hold, and the
+decision reverts to Option C with its full cost: `provider_claim` columns, an `admin_identities` key
+rotation that must be spelled `nulls not distinct`, and a self-disarming legacy read-fallback.
+
+**Tertiary — changes 4B's budget, not its shape.** If wave 5's revocation/ownership UI cannot ship
+with per-grant rather than per-human semantics, a `person_key` grouping column must land in wave 4.
+Verified live: `admin_identities_single_active_primary` is unique on `(is_primary)` **globally**, so
+under 4B a human's second grant is never primary and revoking "the" row leaves a live back door.
+
+### What A′ explicitly does NOT buy — recorded so nobody credits wave 4 with it
+
+- **No cryptographic separation between providers.** One ES256 key pair, one JWKS URL, N issuer
+  strings. A token signed with `iss = <github issuer>` verifies against the GitHub trusted-issuer row
+  whichever IdP actually authenticated the human. **The `iss` selection is a security boundary backed
+  by one line of console code and one test.** F17's blast radius grows from one issuer to N.
+- **No person-level identity.** One human across two providers holds **two** grants with no column
+  linking them; revocation and `is_primary` are per-grant.
+- **Moira still cannot see which upstream IdP authenticated a user.** A′ routes *around* F23's
+  structural finding; it does not close it. Moira receives a console assertion pinned to a registered
+  issuer, not an independent view.
+- **At most one `github_oauth` row per deployment** (one GitHub org per console) and one
+  discovery-only OIDC row with a null issuer — both from the untouched
+  `auth_provider_settings_method_issuer_active_unique`.
+- **No schema/binary version handshake.** B2 is mitigated for one enum only; ~30 `*_from_db` mappers,
+  ~21 fallible per-row `collect()` sites and 48 enum-like CHECKs remain exposed. Rollout ordering
+  (Moira first) is the only mitigation and goes in the release note.
+
 ## USER DECISIONS — 2026-07-31, taken interactively
 
 1. **Findings before waves 4–5.** F20, F13, F17 and the Wave 2 leftovers first. F20 is the reason:
