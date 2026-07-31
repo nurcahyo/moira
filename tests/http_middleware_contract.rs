@@ -663,12 +663,25 @@ async fn every_non_sse_route_group_is_governed_by_the_non_streaming_timeout() {
     // probed handler cannot reach PostgreSQL, so it cannot produce a response head at all
     // until this test drops the guards below — the timeout layer is the only thing that can
     // answer, whatever the ceiling's value happens to be.
+    //
+    // Taking *every* permit is only possible because nothing else holds one for the
+    // fixture's lifetime — `tests/support/mod.rs` records that no fixture spawns
+    // `spawn_runtime_config_listener`, and `PgListener::connect_with` would keep a
+    // `PoolConnection` for as long as it listened. If that ever changes this loop is what
+    // notices, so it says so rather than hanging anonymously for `WAIT`.
     let mut held_connections = Vec::new();
     for slot in 0..fixture.pool.options().get_max_connections() {
         held_connections.push(
             timeout(WAIT, fixture.pool.acquire())
                 .await
-                .unwrap_or_else(|_| panic!("acquiring fixture connection {slot} timed out"))
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "fixture connection {slot} could not be acquired: something else is \
+                         holding a permit on the fixture pool for the fixture's lifetime (a \
+                         PgListener?), so the starvation gate below cannot be closed and the \
+                         probes must not run"
+                    )
+                })
                 .unwrap_or_else(|error| panic!("acquire fixture connection {slot}: {error}")),
         );
     }
