@@ -7,7 +7,7 @@
 //!
 //! # Why the ex-methods are free functions
 //!
-//! `command_hasher`, `reject_denied_jwks_url`, `audit_success`, `audit_denied`,
+//! `command_hasher`, `reject_denied_jwks_url`, `audit_denied`,
 //! `validate_provider_base_url_with_settings`, and `schedule_runtime_cache_invalidation`
 //! were private methods on `AdminService`. Six sub-services now need overlapping subsets of
 //! them. Taking `&AppState` / `&PgAdminRepository` as an argument keeps every sub-service
@@ -15,10 +15,20 @@
 //! `self.repo` expressions untouched, and there is no shared base type or `Deref` to reason
 //! about at the call site.
 //!
-//! Note the near-collision, which predates the split: [`success_audit`] *builds* an
-//! [`AuditLogInsert`] for callers running inside a command transaction, while
-//! [`audit_success`] *writes* one directly through the repository. Both names are kept as
-//! they were so a reviewer diffing against the original file finds the same identifiers.
+//! # There is no longer an `audit_success` here, and that is the point
+//!
+//! This file used to hold two near-identical names: [`success_audit`], which *builds* an
+//! [`AuditLogInsert`], and `audit_success`, which *wrote* one directly through the
+//! repository on a second pooled connection — after the write it described had already
+//! committed on a different one. Thirty-six admin mutations went through that second form
+//! and could therefore lose their audit row while keeping the write.
+//!
+//! `audit_success` is **deleted**. Every write method on `AdminRepository`,
+//! `AuthProviderSettingsRepository` and `RuntimeRepository` now takes an `AuditLogInsert`
+//! and writes it inside its own transaction, so the only way to produce a `Success` audit
+//! row for an admin mutation is to hand it to the write. Re-adding a repository-level
+//! `insert_audit` call on a mutation path re-opens the divergence; `audit_denied` below is
+//! the one deliberate exception, and it records something that did **not** happen.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 
@@ -214,38 +224,6 @@ pub(crate) async fn reject_denied_jwks_url(
         "rejected a trusted JWT issuer registration whose jwks_url is not permitted"
     );
     Err(failure.into_registration_error())
-}
-
-/// Writes a `Success` audit row directly through the repository.
-///
-/// Distinct from [`success_audit`], which only *builds* the row for a caller that is
-/// already inside a command transaction.
-pub(crate) async fn audit_success(
-    repo: &PgAdminRepository,
-    actor: &Actor,
-    ctx: &RequestContext,
-    action: &str,
-    resource_type: &str,
-    resource_id: Option<String>,
-    metadata: Value,
-) -> Result<(), AppError> {
-    repo.insert_audit(AuditLogInsert {
-        request_id: Some(ctx.request_id.clone()),
-        actor_type: Some(format!("{:?}", actor.actor_type).to_ascii_lowercase()),
-        actor_subject: actor.subject.clone(),
-        delegated_subject: actor.delegated_subject.clone(),
-        external_user_id: actor.external_user_id.clone(),
-        external_tenant_id: actor.external_tenant_id.clone(),
-        application_id: actor.internal_application_id,
-        resource_type: resource_type.to_string(),
-        resource_id,
-        action: action.to_string(),
-        result: AuditResult::Success,
-        source_ip: ctx.source_ip,
-        user_agent: ctx.user_agent.clone(),
-        metadata,
-    })
-    .await
 }
 
 /// Records a denial without ever changing the caller-visible outcome.

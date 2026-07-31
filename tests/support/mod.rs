@@ -847,13 +847,7 @@ impl TestDatabase {
             .execute(&mut maintenance)
             .await
             .expect("take a shared lock on the template database");
-        sqlx::raw_sql(&format!(
-            "create database \"{name}\" template \"{}\"",
-            origin.template
-        ))
-        .execute(&mut maintenance)
-        .await
-        .expect("clone the migrated template database");
+        clone_template(&mut maintenance, &maintenance_url, &origin, &name).await;
         let pool = timeout(
             DATABASE_TIMEOUT,
             PgPoolOptions::new()
@@ -1000,6 +994,83 @@ async fn database_origin() -> Option<DatabaseOrigin> {
 /// to the template is the one condition that makes another process's
 /// `CREATE DATABASE … TEMPLATE` fail, and a per-process re-migration created that
 /// window on every single test binary for no benefit.
+/// Clones the template, rebuilding it once if a neighbour dropped it mid-run.
+///
+/// # Why the retry is not paranoia
+///
+/// [`sweep_leaked_databases`] drops **every** `moira_test_template_*` that is not the calling
+/// process's own, and [`template_database`] names the template after a SHA-256 of the migration
+/// set. Two worktrees whose `migrations/` differ by one file therefore have different template
+/// names and each one's [`prepare_template`] destroys the other's.
+///
+/// The shared advisory lock does not close that window. `prepare_template` runs **once** per
+/// process; every fixture afterwards holds the shared lock only for the length of its own
+/// `create database … template …`. Between the prepare and the last fixture there is nothing
+/// keeping the template alive, so a neighbour sweeping in that gap leaves this suite cloning from
+/// a database that no longer exists:
+///
+/// ```text
+/// clone the migrated template database: … code: "3D000",
+/// message: "template database \"moira_test_template_…\" does not exist"
+/// ```
+///
+/// Observed twice on one branch on 2026-08-01, reddening `scripts/gates.sh` with different tests
+/// each time and no code change between the runs — which is the dangerous part, because it is
+/// indistinguishable from a real regression until you read the panic.
+///
+/// Rebuilding and retrying **once** is deliberate: a second `3D000` means the neighbour is
+/// sweeping faster than a template can be built, which is a real environmental problem and should
+/// fail loudly rather than spin. Nothing about the sweep's semantics changes here — stale
+/// templates are still reclaimed — so this cannot mask a genuine schema drift.
+async fn clone_template(
+    maintenance: &mut PgConnection,
+    maintenance_url: &str,
+    origin: &DatabaseOrigin,
+    name: &str,
+) {
+    let sql = format!(
+        "create database \"{name}\" template \"{}\"",
+        origin.template
+    );
+
+    let Err(error) = sqlx::raw_sql(&sql).execute(&mut *maintenance).await else {
+        return;
+    };
+    if !is_undefined_database(&error) {
+        panic!("clone the migrated template database: {error:?}");
+    }
+
+    // Rebuild under the *exclusive* lock, on its own connection: this one still holds the shared
+    // lock, and `build_template` must not run while another process is cloning.
+    let mut rebuild = connect_maintenance(maintenance_url).await;
+    sqlx::query("select pg_advisory_lock($1)")
+        .bind(TEMPLATE_LOCK_KEY)
+        .execute(&mut rebuild)
+        .await
+        .expect("take the exclusive template maintenance lock for a rebuild");
+    build_template(&mut rebuild, origin).await;
+    sqlx::query("select pg_advisory_unlock($1)")
+        .bind(TEMPLATE_LOCK_KEY)
+        .execute(&mut rebuild)
+        .await
+        .expect("release the template maintenance lock after a rebuild");
+    let _ = rebuild.close().await;
+
+    sqlx::raw_sql(&sql)
+        .execute(maintenance)
+        .await
+        .expect("clone the migrated template database after rebuilding it");
+}
+
+/// `3D000` — the object the statement named is not there. Here: the template a neighbouring
+/// worktree swept out from under this clone.
+fn is_undefined_database(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|db| db.code())
+        .is_some_and(|code| code == "3D000")
+}
+
 async fn prepare_template(origin: &DatabaseOrigin) {
     let maintenance_url = origin.url_for(MAINTENANCE_DATABASE);
     let mut maintenance = connect_maintenance(&maintenance_url).await;

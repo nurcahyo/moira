@@ -16,7 +16,7 @@ use crate::{
         AdminCommandMutation, AdminCommandRunner, RequestContext,
         admin::shared::{
             PROVIDER_MODELS_CURSOR, PROVIDERS_CURSOR, PageRequest, admin_command_spec,
-            audit_success, command_hasher, paginate, require_active_row, require_non_empty,
+            command_hasher, paginate, require_active_row, require_non_empty,
             schedule_runtime_cache_invalidation, success_audit, validate_provider_base_url,
             validate_provider_base_url_with_settings,
         },
@@ -140,19 +140,22 @@ impl<'a> ProviderAdminService<'a> {
         };
         let record = self
             .repo
-            .patch_provider(id, expected_version, &request, base_url)
+            .patch_provider(
+                id,
+                expected_version,
+                &request,
+                base_url,
+                success_audit(
+                    actor,
+                    ctx,
+                    "provider.update",
+                    "provider",
+                    Some(id.to_string()),
+                    json!({}),
+                ),
+            )
             .await?;
         self.state.runtime_cache.invalidate_all().await;
-        audit_success(
-            &self.repo,
-            actor,
-            ctx,
-            "provider.update",
-            "provider",
-            Some(id.to_string()),
-            json!({}),
-        )
-        .await?;
         Ok(record)
     }
 
@@ -164,18 +167,22 @@ impl<'a> ProviderAdminService<'a> {
         expected_version: i64,
     ) -> Result<(), AppError> {
         self.state.authz.require(actor, "moira:providers:delete")?;
-        self.repo.soft_delete_provider(id, expected_version).await?;
+        self.repo
+            .soft_delete_provider(
+                id,
+                expected_version,
+                success_audit(
+                    actor,
+                    ctx,
+                    "provider.delete",
+                    "provider",
+                    Some(id.to_string()),
+                    json!({}),
+                ),
+            )
+            .await?;
         self.state.runtime_cache.invalidate_all().await;
-        audit_success(
-            &self.repo,
-            actor,
-            ctx,
-            "provider.delete",
-            "provider",
-            Some(id.to_string()),
-            json!({}),
-        )
-        .await
+        Ok(())
     }
 
     pub(crate) async fn set_provider_enabled(
@@ -193,23 +200,21 @@ impl<'a> ProviderAdminService<'a> {
                 id,
                 expected_version,
                 if enabled { "active" } else { "disabled" },
+                success_audit(
+                    actor,
+                    ctx,
+                    if enabled {
+                        "provider.enable"
+                    } else {
+                        "provider.disable"
+                    },
+                    "provider",
+                    Some(id.to_string()),
+                    json!({}),
+                ),
             )
             .await?;
         self.state.runtime_cache.invalidate_all().await;
-        audit_success(
-            &self.repo,
-            actor,
-            ctx,
-            if enabled {
-                "provider.enable"
-            } else {
-                "provider.disable"
-            },
-            "provider",
-            Some(id.to_string()),
-            json!({}),
-        )
-        .await?;
         Ok(record)
     }
 
@@ -290,19 +295,21 @@ impl<'a> ProviderAdminService<'a> {
         self.state.authz.require(actor, "moira:models:write")?;
         let record = self
             .repo
-            .patch_provider_model(model_id, expected_version, &request)
+            .patch_provider_model(
+                model_id,
+                expected_version,
+                &request,
+                success_audit(
+                    actor,
+                    ctx,
+                    "provider_model.update",
+                    "provider_model",
+                    Some(model_id.to_string()),
+                    json!({}),
+                ),
+            )
             .await?;
         self.state.runtime_cache.invalidate_all().await;
-        audit_success(
-            &self.repo,
-            actor,
-            ctx,
-            "provider_model.update",
-            "provider_model",
-            Some(model_id.to_string()),
-            json!({}),
-        )
-        .await?;
         Ok(record)
     }
 
@@ -324,19 +331,21 @@ impl<'a> ProviderAdminService<'a> {
     ) -> Result<(), AppError> {
         self.state.authz.require(actor, "moira:models:delete")?;
         self.repo
-            .soft_delete_provider_model(model_id, expected_version)
+            .soft_delete_provider_model(
+                model_id,
+                expected_version,
+                success_audit(
+                    actor,
+                    ctx,
+                    "provider_model.delete",
+                    "provider_model",
+                    Some(model_id.to_string()),
+                    json!({}),
+                ),
+            )
             .await?;
         self.state.runtime_cache.invalidate_all().await;
-        audit_success(
-            &self.repo,
-            actor,
-            ctx,
-            "provider_model.delete",
-            "provider_model",
-            Some(model_id.to_string()),
-            json!({}),
-        )
-        .await
+        Ok(())
     }
 
     pub(crate) async fn set_provider_model_enabled(
@@ -354,23 +363,21 @@ impl<'a> ProviderAdminService<'a> {
                 model_id,
                 expected_version,
                 if enabled { "active" } else { "disabled" },
+                success_audit(
+                    actor,
+                    ctx,
+                    if enabled {
+                        "provider_model.enable"
+                    } else {
+                        "provider_model.disable"
+                    },
+                    "provider_model",
+                    Some(model_id.to_string()),
+                    json!({}),
+                ),
             )
             .await?;
         self.state.runtime_cache.invalidate_all().await;
-        audit_success(
-            &self.repo,
-            actor,
-            ctx,
-            if enabled {
-                "provider_model.enable"
-            } else {
-                "provider_model.disable"
-            },
-            "provider_model",
-            Some(model_id.to_string()),
-            json!({}),
-        )
-        .await?;
         Ok(record)
     }
 }

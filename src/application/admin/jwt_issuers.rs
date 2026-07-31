@@ -12,8 +12,8 @@ use crate::{
         AdminCommandMutation, AdminCommandRunner, RequestContext,
         admin::shared::{
             PageRequest, TRUSTED_JWT_ISSUERS_CURSOR, admin_command_spec, audit_denied,
-            audit_success, command_hasher, paginate, reject_denied_jwks_url, require_non_empty,
-            success_audit, validate_jwt_algorithm_list,
+            command_hasher, paginate, reject_denied_jwks_url, require_non_empty, success_audit,
+            validate_jwt_algorithm_list,
         },
     },
     domain::{
@@ -116,18 +116,20 @@ impl<'a> JwtIssuerAdminService<'a> {
         }
         let record = self
             .repo
-            .patch_trusted_jwt_issuer(id, expected_version, &request)
+            .patch_trusted_jwt_issuer(
+                id,
+                expected_version,
+                &request,
+                success_audit(
+                    actor,
+                    ctx,
+                    "jwt_issuer.update",
+                    "trusted_jwt_issuer",
+                    Some(id.to_string()),
+                    json!({}),
+                ),
+            )
             .await?;
-        audit_success(
-            &self.repo,
-            actor,
-            ctx,
-            "jwt_issuer.update",
-            "trusted_jwt_issuer",
-            Some(id.to_string()),
-            json!({}),
-        )
-        .await?;
         Ok(record)
     }
 
@@ -148,22 +150,24 @@ impl<'a> JwtIssuerAdminService<'a> {
         }
         let record = self
             .repo
-            .set_trusted_jwt_issuer_status(id, expected_version, status)
+            .set_trusted_jwt_issuer_status(
+                id,
+                expected_version,
+                status,
+                success_audit(
+                    actor,
+                    ctx,
+                    if enabled {
+                        "jwt_issuer.enable"
+                    } else {
+                        "jwt_issuer.disable"
+                    },
+                    "trusted_jwt_issuer",
+                    Some(id.to_string()),
+                    json!({}),
+                ),
+            )
             .await?;
-        audit_success(
-            &self.repo,
-            actor,
-            ctx,
-            if enabled {
-                "jwt_issuer.enable"
-            } else {
-                "jwt_issuer.disable"
-            },
-            "trusted_jwt_issuer",
-            Some(id.to_string()),
-            json!({}),
-        )
-        .await?;
         Ok(record)
     }
 
@@ -214,17 +218,20 @@ impl<'a> JwtIssuerAdminService<'a> {
             }
         };
 
-        let record = self.repo.touch_trusted_jwt_issuer(id).await?;
-        audit_success(
-            &self.repo,
-            actor,
-            ctx,
-            "jwt_issuer.refresh_jwks",
-            "trusted_jwt_issuer",
-            Some(id.to_string()),
-            json!({ "keys": keys }),
-        )
-        .await?;
+        let record = self
+            .repo
+            .touch_trusted_jwt_issuer(
+                id,
+                success_audit(
+                    actor,
+                    ctx,
+                    "jwt_issuer.refresh_jwks",
+                    "trusted_jwt_issuer",
+                    Some(id.to_string()),
+                    json!({ "keys": keys }),
+                ),
+            )
+            .await?;
         Ok(record)
     }
 
@@ -238,18 +245,20 @@ impl<'a> JwtIssuerAdminService<'a> {
         self.state.authz.require(actor, "moira:jwt-issuers:write")?;
         self.reject_if_issuer_has_active_grants(id).await?;
         self.repo
-            .soft_delete_trusted_jwt_issuer(id, expected_version)
+            .soft_delete_trusted_jwt_issuer(
+                id,
+                expected_version,
+                success_audit(
+                    actor,
+                    ctx,
+                    "jwt_issuer.delete",
+                    "trusted_jwt_issuer",
+                    Some(id.to_string()),
+                    json!({}),
+                ),
+            )
             .await?;
-        audit_success(
-            &self.repo,
-            actor,
-            ctx,
-            "jwt_issuer.delete",
-            "trusted_jwt_issuer",
-            Some(id.to_string()),
-            json!({}),
-        )
-        .await
+        Ok(())
     }
 
     /// Refuse to retire a trusted JWT issuer that still authorises live admins.

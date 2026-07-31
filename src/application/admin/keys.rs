@@ -23,8 +23,8 @@ use crate::{
         AdminCommandMutation, AdminCommandRunner, RequestContext,
         admin::shared::{
             CONSUMER_KEYS_CURSOR, PageRequest, SYSTEM_KEYS_CURSOR, admin_command_spec,
-            audit_success, command_hasher, paginate, require_active_row, sanitized_key_response,
-            success_audit, validate_key_request,
+            command_hasher, paginate, require_active_row, sanitized_key_response, success_audit,
+            validate_key_request,
         },
     },
     domain::{
@@ -342,17 +342,21 @@ impl<'a> ApiKeyAdminService<'a> {
             "moira:consumer-keys:revoke"
         };
         self.state.authz.require(actor, scope)?;
-        let record = self.repo.revoke_key(table, id).await?;
-        audit_success(
-            &self.repo,
-            actor,
-            ctx,
-            "api_key.revoke",
-            table,
-            Some(id.to_string()),
-            json!({}),
-        )
-        .await?;
+        let record = self
+            .repo
+            .revoke_key(
+                table,
+                id,
+                success_audit(
+                    actor,
+                    ctx,
+                    "api_key.revoke",
+                    table,
+                    Some(id.to_string()),
+                    json!({}),
+                ),
+            )
+            .await?;
         Ok(record)
     }
 
@@ -369,16 +373,20 @@ impl<'a> ApiKeyAdminService<'a> {
             "moira:consumer-keys:revoke"
         };
         self.state.authz.require(actor, scope)?;
-        self.repo.soft_delete_key(table, id).await?;
-        audit_success(
-            &self.repo,
-            actor,
-            ctx,
-            "api_key.delete",
-            table,
-            Some(id.to_string()),
-            json!({}),
-        )
-        .await
+        self.repo
+            .soft_delete_key(
+                table,
+                id,
+                success_audit(
+                    actor,
+                    ctx,
+                    "api_key.delete",
+                    table,
+                    Some(id.to_string()),
+                    json!({}),
+                ),
+            )
+            .await?;
+        Ok(())
     }
 }

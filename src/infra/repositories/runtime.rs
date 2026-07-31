@@ -7,18 +7,21 @@ use uuid::Uuid;
 use crate::{
     domain::{
         AgentProfileCreateRequest, AgentProfilePatchRequest, AgentProfileRecord, AttemptStatus,
-        CredentialDecisionSource, CredentialRecord, CredentialType, ExecutionFailureClass,
-        ListCursor, ModelCandidate, ProviderRuntimePolicyPutRequest, ProviderRuntimePolicyRecord,
-        ResolvedProviderConfiguration, RouteDefinitionCreateRequest, RouteDefinitionPatchRequest,
-        RouteDefinitionRecord, RoutingPolicyCreateRequest, RoutingPolicyPatchRequest,
-        RoutingPolicyRecord, UsageSummary,
+        AuditLogInsert, CredentialDecisionSource, CredentialRecord, CredentialType,
+        ExecutionFailureClass, ListCursor, ModelCandidate, ProviderRuntimePolicyPutRequest,
+        ProviderRuntimePolicyRecord, ResolvedProviderConfiguration, RouteDefinitionCreateRequest,
+        RouteDefinitionPatchRequest, RouteDefinitionRecord, RoutingPolicyCreateRequest,
+        RoutingPolicyPatchRequest, RoutingPolicyRecord, UsageSummary,
     },
     error::AppError,
-    infra::pg_rows::{
-        agent_profile_record_from_row, credential_record_from_row, credential_type_to_db,
-        provider_runtime_policy_record_from_row, provider_type_from_db,
-        route_definition_record_from_row, route_selection_strategy_to_db,
-        routing_policy_record_from_row, runtime_policy_status_to_db,
+    infra::{
+        pg_rows::{
+            agent_profile_record_from_row, credential_record_from_row, credential_type_to_db,
+            provider_runtime_policy_record_from_row, provider_type_from_db,
+            route_definition_record_from_row, route_selection_strategy_to_db,
+            routing_policy_record_from_row, runtime_policy_status_to_db,
+        },
+        repositories::admin::commit_with_audit,
     },
     security::EncryptedSecret,
 };
@@ -90,12 +93,34 @@ pub struct UsageRecordInsert {
 /// `resolve_runtime_credential` is the single live credential-precedence implementation in the
 /// process; it returns encrypted material only — decryption stays in `src/security/crypto.rs`, so
 /// an implementation of this trait never sees or produces plaintext secrets.
+///
+/// # Every mutation carries its `audit` row, and the write commits it
+///
+/// A method that changes state takes an [`AuditLogInsert`] and writes it **on the same
+/// connection, inside the same transaction** as the change itself. It is a required
+/// parameter rather than a convention because the alternative had already gone wrong:
+/// thirty-six admin mutations used to write the row afterwards through
+/// `PgAdminRepository::insert_audit`, which acquires a *second* pooled connection. The two
+/// statements then commit separately, and any failure between them — a `22001` from an
+/// over-long `x-request-id`, a pool timeout, a dropped request future, a killed pod —
+/// leaves the administrative change committed with no record of it.
+///
+/// Only that direction was ever reachable, and it is the serious one. The audit row is
+/// written *after* the row lock and version check, so a `409` or `404` still writes
+/// nothing.
+///
+/// Do not add a mutating method here without an `audit` parameter, and do not restore a
+/// caller-side `insert_audit` on a success path. `audit_denied`
+/// (`src/application/admin/shared.rs`) is the one deliberate exception: it records a
+/// refusal, so there is no write for it to be atomic with, and it is swallowed on purpose.
+/// Pinned end to end by `tests/admin_audit_atomicity.rs`.
 #[async_trait]
 pub trait RuntimeRepository: Send + Sync {
     async fn create_route_definition(
         &self,
         id: Uuid,
         request: &RouteDefinitionCreateRequest,
+        audit: AuditLogInsert,
     ) -> Result<RouteDefinitionRecord, AppError>;
 
     /// Lists route definitions newest-first, keyset-paginated on `(created_at, id)`.
@@ -136,6 +161,7 @@ pub trait RuntimeRepository: Send + Sync {
         id: Uuid,
         expected_version: i64,
         request: &RouteDefinitionPatchRequest,
+        audit: AuditLogInsert,
     ) -> Result<RouteDefinitionRecord, AppError>;
 
     async fn set_route_definition_status(
@@ -143,18 +169,21 @@ pub trait RuntimeRepository: Send + Sync {
         id: Uuid,
         expected_version: i64,
         status: &str,
+        audit: AuditLogInsert,
     ) -> Result<RouteDefinitionRecord, AppError>;
 
     async fn soft_delete_route_definition(
         &self,
         id: Uuid,
         expected_version: i64,
+        audit: AuditLogInsert,
     ) -> Result<(), AppError>;
 
     async fn create_routing_policy(
         &self,
         id: Uuid,
         request: &RoutingPolicyCreateRequest,
+        audit: AuditLogInsert,
     ) -> Result<RoutingPolicyRecord, AppError>;
 
     /// See [`Self::list_route_definitions`] for the keyset-pagination contract this shares.
@@ -178,6 +207,7 @@ pub trait RuntimeRepository: Send + Sync {
         id: Uuid,
         expected_version: i64,
         request: &RoutingPolicyPatchRequest,
+        audit: AuditLogInsert,
     ) -> Result<RoutingPolicyRecord, AppError>;
 
     async fn set_routing_policy_status(
@@ -185,18 +215,21 @@ pub trait RuntimeRepository: Send + Sync {
         id: Uuid,
         expected_version: i64,
         status: &str,
+        audit: AuditLogInsert,
     ) -> Result<RoutingPolicyRecord, AppError>;
 
     async fn soft_delete_routing_policy(
         &self,
         id: Uuid,
         expected_version: i64,
+        audit: AuditLogInsert,
     ) -> Result<(), AppError>;
 
     async fn create_agent_profile(
         &self,
         id: Uuid,
         request: &AgentProfileCreateRequest,
+        audit: AuditLogInsert,
     ) -> Result<AgentProfileRecord, AppError>;
 
     /// See [`Self::list_route_definitions`] for the keyset-pagination contract this shares.
@@ -219,6 +252,7 @@ pub trait RuntimeRepository: Send + Sync {
         id: Uuid,
         expected_version: i64,
         request: &AgentProfilePatchRequest,
+        audit: AuditLogInsert,
     ) -> Result<AgentProfileRecord, AppError>;
 
     async fn set_agent_profile_status(
@@ -226,12 +260,14 @@ pub trait RuntimeRepository: Send + Sync {
         id: Uuid,
         expected_version: i64,
         status: &str,
+        audit: AuditLogInsert,
     ) -> Result<AgentProfileRecord, AppError>;
 
     async fn soft_delete_agent_profile(
         &self,
         id: Uuid,
         expected_version: i64,
+        audit: AuditLogInsert,
     ) -> Result<(), AppError>;
 
     async fn get_provider_runtime_policy(
@@ -243,6 +279,7 @@ pub trait RuntimeRepository: Send + Sync {
         &self,
         provider_id: Uuid,
         request: &ProviderRuntimePolicyPutRequest,
+        audit: AuditLogInsert,
     ) -> Result<ProviderRuntimePolicyRecord, AppError>;
 
     async fn ensure_application_active(&self, application_id: Uuid) -> Result<(), AppError>;
@@ -291,7 +328,11 @@ impl RuntimeRepository for PgRuntimeRepository {
         &self,
         id: Uuid,
         request: &RouteDefinitionCreateRequest,
+        audit: AuditLogInsert,
     ) -> Result<RouteDefinitionRecord, AppError> {
+        // A transaction for one `INSERT`, so the audit row shares its fate — see the
+        // trait's `audit` contract.
+        let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             r#"
             insert into route_definitions
@@ -308,9 +349,11 @@ impl RuntimeRepository for PgRuntimeRepository {
         .bind(route_selection_strategy_to_db(&request.selection_strategy))
         .bind(request.agent_profile_id)
         .bind(&request.metadata)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
-        route_definition_record_from_row(&row)
+        let record = route_definition_record_from_row(&row)?;
+        commit_with_audit(tx, audit).await?;
+        Ok(record)
     }
 
     async fn list_route_definitions(
@@ -369,6 +412,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         id: Uuid,
         expected_version: i64,
         request: &RouteDefinitionPatchRequest,
+        audit: AuditLogInsert,
     ) -> Result<RouteDefinitionRecord, AppError> {
         let strategy = request
             .selection_strategy
@@ -408,7 +452,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = route_definition_record_from_row(&row)?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -417,6 +461,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         id: Uuid,
         expected_version: i64,
         status: &str,
+        audit: AuditLogInsert,
     ) -> Result<RouteDefinitionRecord, AppError> {
         let mut tx = self.pool.begin().await?;
         let current_version = lock_and_match_version(
@@ -445,7 +490,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = route_definition_record_from_row(&row)?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -453,6 +498,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         &self,
         id: Uuid,
         expected_version: i64,
+        audit: AuditLogInsert,
     ) -> Result<(), AppError> {
         let mut tx = self.pool.begin().await?;
         let current_version = lock_and_match_version(
@@ -473,7 +519,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         if result.rows_affected() == 0 {
             return Err(version_conflict());
         }
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(())
     }
 
@@ -481,7 +527,10 @@ impl RuntimeRepository for PgRuntimeRepository {
         &self,
         id: Uuid,
         request: &RoutingPolicyCreateRequest,
+        audit: AuditLogInsert,
     ) -> Result<RoutingPolicyRecord, AppError> {
+        // A transaction for one `INSERT`, so the audit row shares its fate.
+        let mut tx = self.pool.begin().await?;
         let row = sqlx::query(routing_policy_insert_sql())
             .bind(id)
             .bind(request.application_id)
@@ -502,9 +551,11 @@ impl RuntimeRepository for PgRuntimeRepository {
             .bind(request.timeout_ms)
             .bind(&request.retry_policy)
             .bind(&request.metadata)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await?;
-        routing_policy_record_from_row(&row)
+        let record = routing_policy_record_from_row(&row)?;
+        commit_with_audit(tx, audit).await?;
+        Ok(record)
     }
 
     async fn list_routing_policies(
@@ -552,6 +603,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         id: Uuid,
         expected_version: i64,
         request: &RoutingPolicyPatchRequest,
+        audit: AuditLogInsert,
     ) -> Result<RoutingPolicyRecord, AppError> {
         let mut tx = self.pool.begin().await?;
         let current_version = lock_and_match_version(
@@ -617,7 +669,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = routing_policy_record_from_row(&row)?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -626,6 +678,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         id: Uuid,
         expected_version: i64,
         status: &str,
+        audit: AuditLogInsert,
     ) -> Result<RoutingPolicyRecord, AppError> {
         let mut tx = self.pool.begin().await?;
         let current_version = lock_and_match_version(
@@ -658,7 +711,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = routing_policy_record_from_row(&row)?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -666,6 +719,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         &self,
         id: Uuid,
         expected_version: i64,
+        audit: AuditLogInsert,
     ) -> Result<(), AppError> {
         let mut tx = self.pool.begin().await?;
         let current_version = lock_and_match_version(
@@ -686,7 +740,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         if result.rows_affected() == 0 {
             return Err(version_conflict());
         }
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(())
     }
 
@@ -694,7 +748,10 @@ impl RuntimeRepository for PgRuntimeRepository {
         &self,
         id: Uuid,
         request: &AgentProfileCreateRequest,
+        audit: AuditLogInsert,
     ) -> Result<AgentProfileRecord, AppError> {
+        // A transaction for one `INSERT`, so the audit row shares its fate.
+        let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             r#"
             insert into agent_profiles
@@ -716,9 +773,11 @@ impl RuntimeRepository for PgRuntimeRepository {
         .bind(&request.context_policy)
         .bind(&request.memory_policy)
         .bind(&request.metadata)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
-        agent_profile_record_from_row(&row)
+        let record = agent_profile_record_from_row(&row)?;
+        commit_with_audit(tx, audit).await?;
+        Ok(record)
     }
 
     async fn list_agent_profiles(
@@ -764,6 +823,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         id: Uuid,
         expected_version: i64,
         request: &AgentProfilePatchRequest,
+        audit: AuditLogInsert,
     ) -> Result<AgentProfileRecord, AppError> {
         let mut tx = self.pool.begin().await?;
         let current_version = lock_and_match_version(
@@ -806,7 +866,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = agent_profile_record_from_row(&row)?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -815,6 +875,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         id: Uuid,
         expected_version: i64,
         status: &str,
+        audit: AuditLogInsert,
     ) -> Result<AgentProfileRecord, AppError> {
         let mut tx = self.pool.begin().await?;
         let current_version = lock_and_match_version(
@@ -844,7 +905,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = agent_profile_record_from_row(&row)?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -852,6 +913,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         &self,
         id: Uuid,
         expected_version: i64,
+        audit: AuditLogInsert,
     ) -> Result<(), AppError> {
         let mut tx = self.pool.begin().await?;
         let current_version = lock_and_match_version(
@@ -872,7 +934,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         if result.rows_affected() == 0 {
             return Err(version_conflict());
         }
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(())
     }
 
@@ -894,8 +956,11 @@ impl RuntimeRepository for PgRuntimeRepository {
         &self,
         provider_id: Uuid,
         request: &ProviderRuntimePolicyPutRequest,
+        audit: AuditLogInsert,
     ) -> Result<ProviderRuntimePolicyRecord, AppError> {
         let status = request.status.as_ref().map(runtime_policy_status_to_db);
+        // A transaction for one upsert, so the audit row shares its fate.
+        let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             r#"
             insert into provider_runtime_policies
@@ -949,9 +1014,11 @@ impl RuntimeRepository for PgRuntimeRepository {
         .bind(request.circuit_failure_threshold)
         .bind(request.circuit_open_duration_ms)
         .bind(status)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
-        provider_runtime_policy_record_from_row(&row)
+        let record = provider_runtime_policy_record_from_row(&row)?;
+        commit_with_audit(tx, audit).await?;
+        Ok(record)
     }
 
     async fn ensure_application_active(&self, application_id: Uuid) -> Result<(), AppError> {
@@ -1969,6 +2036,7 @@ impl RuntimeRepository for InMemoryRuntimeRepository {
         &self,
         _id: Uuid,
         _request: &RouteDefinitionCreateRequest,
+        _audit: AuditLogInsert,
     ) -> Result<RouteDefinitionRecord, AppError> {
         Err(not_stubbed("create_route_definition"))
     }
@@ -1990,6 +2058,7 @@ impl RuntimeRepository for InMemoryRuntimeRepository {
         id: Uuid,
         expected_version: i64,
         _request: &RouteDefinitionPatchRequest,
+        _audit: AuditLogInsert,
     ) -> Result<RouteDefinitionRecord, AppError> {
         Err(match_version(
             self.route_versions(),
@@ -2005,6 +2074,7 @@ impl RuntimeRepository for InMemoryRuntimeRepository {
         id: Uuid,
         expected_version: i64,
         _status: &str,
+        _audit: AuditLogInsert,
     ) -> Result<RouteDefinitionRecord, AppError> {
         Err(match_version(
             self.route_versions(),
@@ -2019,6 +2089,7 @@ impl RuntimeRepository for InMemoryRuntimeRepository {
         &self,
         id: Uuid,
         expected_version: i64,
+        _audit: AuditLogInsert,
     ) -> Result<(), AppError> {
         Err(match_version(
             self.route_versions(),
@@ -2033,6 +2104,7 @@ impl RuntimeRepository for InMemoryRuntimeRepository {
         &self,
         _id: Uuid,
         _request: &RoutingPolicyCreateRequest,
+        _audit: AuditLogInsert,
     ) -> Result<RoutingPolicyRecord, AppError> {
         Err(not_stubbed("create_routing_policy"))
     }
@@ -2062,6 +2134,7 @@ impl RuntimeRepository for InMemoryRuntimeRepository {
         id: Uuid,
         expected_version: i64,
         _request: &RoutingPolicyPatchRequest,
+        _audit: AuditLogInsert,
     ) -> Result<RoutingPolicyRecord, AppError> {
         Err(match_version(
             self.routing_policy_versions(),
@@ -2077,6 +2150,7 @@ impl RuntimeRepository for InMemoryRuntimeRepository {
         id: Uuid,
         expected_version: i64,
         _status: &str,
+        _audit: AuditLogInsert,
     ) -> Result<RoutingPolicyRecord, AppError> {
         Err(match_version(
             self.routing_policy_versions(),
@@ -2091,6 +2165,7 @@ impl RuntimeRepository for InMemoryRuntimeRepository {
         &self,
         id: Uuid,
         expected_version: i64,
+        _audit: AuditLogInsert,
     ) -> Result<(), AppError> {
         Err(match_version(
             self.routing_policy_versions(),
@@ -2105,6 +2180,7 @@ impl RuntimeRepository for InMemoryRuntimeRepository {
         &self,
         _id: Uuid,
         _request: &AgentProfileCreateRequest,
+        _audit: AuditLogInsert,
     ) -> Result<AgentProfileRecord, AppError> {
         Err(not_stubbed("create_agent_profile"))
     }
@@ -2133,6 +2209,7 @@ impl RuntimeRepository for InMemoryRuntimeRepository {
         id: Uuid,
         expected_version: i64,
         _request: &AgentProfilePatchRequest,
+        _audit: AuditLogInsert,
     ) -> Result<AgentProfileRecord, AppError> {
         Err(match_version(
             self.agent_profile_versions(),
@@ -2148,6 +2225,7 @@ impl RuntimeRepository for InMemoryRuntimeRepository {
         id: Uuid,
         expected_version: i64,
         _status: &str,
+        _audit: AuditLogInsert,
     ) -> Result<AgentProfileRecord, AppError> {
         Err(match_version(
             self.agent_profile_versions(),
@@ -2162,6 +2240,7 @@ impl RuntimeRepository for InMemoryRuntimeRepository {
         &self,
         id: Uuid,
         expected_version: i64,
+        _audit: AuditLogInsert,
     ) -> Result<(), AppError> {
         Err(match_version(
             self.agent_profile_versions(),
@@ -2183,6 +2262,7 @@ impl RuntimeRepository for InMemoryRuntimeRepository {
         &self,
         _provider_id: Uuid,
         _request: &ProviderRuntimePolicyPutRequest,
+        _audit: AuditLogInsert,
     ) -> Result<ProviderRuntimePolicyRecord, AppError> {
         Err(not_stubbed("put_provider_runtime_policy"))
     }
@@ -2383,6 +2463,28 @@ mod repository_trait_tests {
         }
     }
 
+    /// The `AuditLogInsert` every write method now demands, for tests that only care about
+    /// the refusal *before* the write. Its content is irrelevant here; what matters is that
+    /// the signature makes an auditless mutation impossible to write down.
+    fn probe_audit() -> AuditLogInsert {
+        AuditLogInsert {
+            request_id: None,
+            actor_type: None,
+            actor_subject: None,
+            delegated_subject: None,
+            external_user_id: None,
+            external_tenant_id: None,
+            application_id: None,
+            resource_type: "test".to_string(),
+            resource_id: None,
+            action: "test".to_string(),
+            result: crate::domain::AuditResult::Success,
+            source_ip: None,
+            user_agent: None,
+            metadata: Value::Null,
+        }
+    }
+
     fn assert_version_conflict(error: &AppError, method: &str) {
         assert_eq!(
             error.status(),
@@ -2419,6 +2521,7 @@ mod repository_trait_tests {
                     route.id,
                     stale(route.version),
                     &RouteDefinitionPatchRequest::default(),
+                    probe_audit(),
                 )
                 .await
                 .expect_err("stale If-Match must not reach the write"),
@@ -2426,14 +2529,19 @@ mod repository_trait_tests {
         );
         assert_version_conflict(
             &repo
-                .set_route_definition_status(route.id, stale(route.version), "disabled")
+                .set_route_definition_status(
+                    route.id,
+                    stale(route.version),
+                    "disabled",
+                    probe_audit(),
+                )
                 .await
                 .expect_err("stale If-Match must not reach the write"),
             "set_route_definition_status",
         );
         assert_version_conflict(
             &repo
-                .soft_delete_route_definition(route.id, stale(route.version))
+                .soft_delete_route_definition(route.id, stale(route.version), probe_audit())
                 .await
                 .expect_err("stale If-Match must not reach the write"),
             "soft_delete_route_definition",
@@ -2445,6 +2553,7 @@ mod repository_trait_tests {
                     policy.id,
                     stale(policy.version),
                     &RoutingPolicyPatchRequest::default(),
+                    probe_audit(),
                 )
                 .await
                 .expect_err("stale If-Match must not reach the write"),
@@ -2452,14 +2561,19 @@ mod repository_trait_tests {
         );
         assert_version_conflict(
             &repo
-                .set_routing_policy_status(policy.id, stale(policy.version), "disabled")
+                .set_routing_policy_status(
+                    policy.id,
+                    stale(policy.version),
+                    "disabled",
+                    probe_audit(),
+                )
                 .await
                 .expect_err("stale If-Match must not reach the write"),
             "set_routing_policy_status",
         );
         assert_version_conflict(
             &repo
-                .soft_delete_routing_policy(policy.id, stale(policy.version))
+                .soft_delete_routing_policy(policy.id, stale(policy.version), probe_audit())
                 .await
                 .expect_err("stale If-Match must not reach the write"),
             "soft_delete_routing_policy",
@@ -2471,6 +2585,7 @@ mod repository_trait_tests {
                     profile.id,
                     stale(profile.version),
                     &AgentProfilePatchRequest::default(),
+                    probe_audit(),
                 )
                 .await
                 .expect_err("stale If-Match must not reach the write"),
@@ -2478,14 +2593,19 @@ mod repository_trait_tests {
         );
         assert_version_conflict(
             &repo
-                .set_agent_profile_status(profile.id, stale(profile.version), "disabled")
+                .set_agent_profile_status(
+                    profile.id,
+                    stale(profile.version),
+                    "disabled",
+                    probe_audit(),
+                )
                 .await
                 .expect_err("stale If-Match must not reach the write"),
             "set_agent_profile_status",
         );
         assert_version_conflict(
             &repo
-                .soft_delete_agent_profile(profile.id, stale(profile.version))
+                .soft_delete_agent_profile(profile.id, stale(profile.version), probe_audit())
                 .await
                 .expect_err("stale If-Match must not reach the write"),
             "soft_delete_agent_profile",
@@ -2503,7 +2623,12 @@ mod repository_trait_tests {
         let absent = Uuid::now_v7();
 
         let error = repo
-            .patch_route_definition(absent, 1, &RouteDefinitionPatchRequest::default())
+            .patch_route_definition(
+                absent,
+                1,
+                &RouteDefinitionPatchRequest::default(),
+                probe_audit(),
+            )
             .await
             .expect_err("an absent route cannot be patched");
         assert_eq!(error.status(), axum::http::StatusCode::NOT_FOUND);
@@ -2516,6 +2641,7 @@ mod repository_trait_tests {
                 route.id,
                 route.version,
                 &RouteDefinitionPatchRequest::default(),
+                probe_audit(),
             )
             .await
             .expect_err("the fake does not perform the write");
@@ -2523,7 +2649,12 @@ mod repository_trait_tests {
 
         // An entity the fake was never seeded for still fails loudly rather than inventing a 404.
         let error = repo
-            .patch_agent_profile(absent, 1, &AgentProfilePatchRequest::default())
+            .patch_agent_profile(
+                absent,
+                1,
+                &AgentProfilePatchRequest::default(),
+                probe_audit(),
+            )
             .await
             .expect_err("agent profiles are not seeded on this fake");
         assert!(error.to_string().contains("not stubbed"));

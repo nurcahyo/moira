@@ -1216,8 +1216,12 @@ its own, and a signing failure is unremarkable on its own. Only together are the
 **The rule: when a test documents current behaviour, say so in its name, and never let a conjunction
 be asserted as two independent facts.**
 
-**Open, and the queue from here:** F14, admin-write/audit non-atomicity, the
-leaked `trusted_jwt_issuers` test rows, and F2 (user-deferred).
+**Open, and the queue from here:** the leaked `trusted_jwt_issuers` test rows and F2 (user-deferred).
+**F6 `f31ff59`, F17 `d8aab3e` and F14 are closed**, and **admin-write/audit non-atomicity is closed as
+F26** — but F26 left a
+successor: `RuntimeAdminService::record_idempotency` is still non-atomic with its own write at 13
+sites, which is a different table and a design change (move `runtime_admin` onto
+`AdminCommandRunner`), not a follow-up commit.
 
 **Needs a human — recorded, not implied:** T11's deploy; the **rig-core issue for F16**, which should
 go under a person's name; and a **Google credential** if the OAuth mock/live seam ever needs closing —
@@ -1313,7 +1317,7 @@ an "active sessions" screen over an in-memory store would be the appearance of a
 | ~~**F13**~~ | ~~Duplicate trusted JWT issuer returns 500, not 409~~ **FIXED** `a6d2984` | `fix/findings-sweep` |
 | **F2** | Pre-auth query-field enumeration | user deferred |
 | ~~**F6**~~ | ~~OTel exports every span; `env_filter` is the sole barrier to Rig prompt spans~~ **CLOSED** `f31ff59` — allow-list of Moira-owned targets on the bridge layer, below the `EnvFilter`. The recorded description understated it: Rig's prompt-bearing span is `INFO`, so a bare `info` was already enough | `fix/f6-otel-span-filter` |
-| — | Admin write + audit row still non-atomic | unscheduled |
+| ~~**F26**~~ | ~~Admin write + audit row still non-atomic~~ **FIXED** `3825fb0` — 36 sites, not all of them; 20 were already atomic inside the command envelope. Reachable from an over-long `x-request-id`, not only from a crash. See the F26 section at the end of this file | `fix/admin-audit-atomicity` |
 | — | ~986 leaked `trusted_jwt_issuers` rows in the shared test DB | hygiene |
 
 **Test baseline:** 779 passing on plan 11's branch (744 on `main` after plan 10).
@@ -2422,3 +2426,268 @@ before the preceding plan merged is wrong about the tree, and budget a cycle to 
   fix is present on `main`.
 - `cargo clean` after merge, per the standing rule: reclaimed 15.9 GiB, 148 Gi free.
 - **Next action:** plan 06 Wave 0 plan rewrite, then the `SecretString` commit, then the exec waves.
+
+## F26 — "Admin write + audit row still non-atomic" was **36 sites, not all of them**, and reachable from a header — **FIXED** `3825fb0`
+
+The one-liner had been carried unowned and unanalysed for many cycles. It was **true**, and in one
+respect **worse** than recorded; in another it was **broader** than the code. Both halves matter,
+because the entry as written invited a sweep of every admin mutation, and 20 of them never had the
+defect.
+
+### What was actually true, per path
+
+| | Sites | Audit row written | Could diverge? |
+|---|---|---|---|
+| Inside `AdminCommandRunner::execute` | **20** | `PgAdminCommandTransaction::insert_audit`, in the command transaction | **No** — already atomic |
+| `PATCH` / `DELETE` / `enable`-`disable`, plus `validate`, `revoke`, `refresh` | **23** | `shared::audit_success` → `PgAdminRepository::insert_audit` → `pool.acquire()` | Yes |
+| Every `RuntimeAdminService` mutation | **13** | `RuntimeAdminService::audit_success` → same second connection | Yes |
+
+**36 divergent sites**, counted three ways that agreed: 36 `audit_success` call sites, 36 write
+methods needing the parameter, and 36 `commit_with_audit` calls after the fix (20 `AdminRepository`
++ 13 `RuntimeRepository` + 3 `AuthProviderSettingsRepository`). Not estimated.
+
+The 20 safe ones are the *creates* and the identity mutations — `claim`, `create_invite`,
+`revoke_invite`, `redeem_invite`, `set_identity_primary`, `revoke_identity`, and every
+`create_*`/`rotate_*`. They write `success_audit(…)` through the command transaction, so a failed
+audit `INSERT` returns `Err`, the runner rolls back, and neither row survives. **A path that cannot
+diverge is not a finding**, and the ledger line did not say which was which.
+
+### The reachable direction, and the failure that reaches it
+
+Only **write commits, audit row does not**. The audit was written strictly after the write's own
+transaction had committed, so the phantom direction (audit without write) was never possible on
+these paths. `audit_denied` writes exactly such a standalone row *by design* — it records a refusal,
+there is no write for it to be atomic with, and its failure is deliberately swallowed so the admin's
+response cannot vary with database state. It is untouched.
+
+**It was not only a crash window.** `RequestContext::from_headers` (`src/application/context.rs:17`)
+takes `x-request-id` from the caller **verbatim and unbounded**; `audit_logs.request_id` is
+`varchar(128)` (`0003:322`). A 129-character request id fails the audit `INSERT` — and nothing else —
+with SQLSTATE `22001`. One ordinary HTTP request, deterministic, no fault injection: the admin change
+committed, the caller got a `500`, and `audit_logs` held nothing. That is the whole finding,
+executable.
+
+### What changed
+
+Every write method on `AdminRepository`, `RuntimeRepository` and `AuthProviderSettingsRepository`
+now takes an `AuditLogInsert` and ends with **`commit_with_audit(tx, audit)`**, which inserts the
+audit row on the transaction's own connection and then commits *that* transaction. Eight writes that
+had no transaction at all (`mark_credential_validated`, `revoke_key`, `soft_delete_key`,
+`touch_trusted_jwt_issuer`, and the four runtime `create`/`put` methods) were given one.
+
+`commit_with_audit` takes the transaction **by value** on purpose. A required `audit` parameter only
+forces the row to be *carried*; it does not stop a later edit from moving the insert below
+`tx.commit()`, which is exactly the pre-fix arrangement. Consuming the transaction removes the
+sequence there is to reorder.
+
+`shared::audit_success` is **deleted**, so a `Success` audit row for an admin mutation can no longer
+be produced outside the write. The version check still runs first, under the row lock, so a `409` or
+`404` writes nothing — unchanged.
+
+Idempotency is untouched: `AdminCommandRunner::execute` still rolls back on any non-cacheable
+failure and `is_cacheable_admin_failure` still excludes `Forbidden` (F19). A `22001` from the audit
+insert is `AppError::Sqlx` → `500` → non-cacheable → full rollback.
+
+### Forced-failure proof — `tests/admin_audit_atomicity.rs`, five tests
+
+Not an argument, and not a happy-path observation. The audit `INSERT` is *made to fail* inside a real
+transaction against a real Postgres, through the installed HTTP stack, and both rows are then
+asserted absent. Each test states its premise (`500`, i.e. the injection fired) before asserting the
+property, because "no audit row" is also satisfied by a `PATCH` that never ran.
+
+**Verified failing under mutation, twice, and reverted.** By *reproducing* the `cdb2f46`
+arrangement, not by checking `cdb2f46` out — at `cdb2f46` these tests do not compile, because the
+write methods took no `audit` argument. That distinction is the honest one and is written into the
+test's own module docs.
+
+* `patch_application`'s `commit_with_audit` replaced by `tx.commit()` + a second `pool.acquire()`:
+
+  ```text
+  the write must be rolled back with its audit row: at cdb2f46 the UPDATE commits and the audit
+  INSERT does not, which is the finding
+    left: "audit-suppressed"
+   right: "Lifecycle 019fb91151147c128c5c8dc0c507cd6e"
+  ```
+
+* the same mutation applied to all 13 `PgRuntimeRepository` sites:
+
+  ```text
+  a runtime-admin write must be rolled back with its audit row
+    left: "route-audit-suppressed"
+   right: "Lifecycle route 019fb913ffe57c228570280070e7dbeb"
+
+  the INSERT and its audit row must be rolled back together
+    left: 1
+   right: 0
+  ```
+
+`the_same_write_without_the_injection_commits_both_rows` is the vacuity guard: the identical `PATCH`
+with a normal request id must return `200` **and** leave exactly one audit row, so the first test
+cannot be green because the endpoint is broken.
+`a_create_inside_the_command_envelope_was_already_atomic` passed before the fix as well — that is its
+job, pinning the 20 sites that were never part of the finding.
+
+### The cheapest edit that breaks the property and leaves the guard green
+
+**Making the same one-line change at any of the 32 sites no test names** — `patch_credential`,
+`soft_delete_provider`, `set_trusted_jwt_issuer_status`, any of them.
+
+Measured, not asserted. `PgAdminRepository::patch_credential` was reverted to `tx.commit()` plus a
+second `pool.acquire()` and `scripts/gates.sh --fast` run against it: **`ok — 906 passed`,
+`ALL GATES PASSED`.** Nothing in the tree notices. Two of the three gate-detectable properties this
+project has been burned on are therefore *not* what defends the other 32 sites.
+
+The guard covers four sites across the two repository traits and both body shapes; it does not, and
+economically cannot, cover 36 endpoints. What covers the rest is structural and should be judged as
+such: the `AuditLogInsert` parameter is required, `audit_success` no longer exists, and
+`commit_with_audit` consumes the transaction — so reintroducing the divergence means hand-writing a
+`commit` **and** a second `pool.acquire()`, which is a visible act rather than a moved line. Anyone
+extending this guard should add sites, not replace the mechanism.
+
+### Reversal condition
+
+Reverse if a repository write must commit while its audit row does *not* — the only sound reason
+being an audit row that has to survive the write's rollback, as `audit_denied`'s does. That is a
+different row (`AuditResult::Denied`) on a different path, so it is not a reason to revert this. If
+it is ever reversed, `tests/admin_audit_atomicity.rs` must be deleted in the same commit with the
+reason written down, not left `#[ignore]`d.
+
+### Three things found alongside it, recorded and NOT fixed
+
+1. **`RuntimeAdminService::record_idempotency` is still non-atomic with its own write**, at all 13
+   sites, on a third connection after the write and audit have committed. A failure between them
+   leaves the mutation done and no ledger row, so a retry carrying the same `Idempotency-Key`
+   executes a second time. The 20 envelope paths do not have this: `finalize_idempotency` runs
+   inside the command transaction. **This is a separate finding about a separate table**, and
+   closing it means moving `runtime_admin` onto `AdminCommandRunner`, which is a design change.
+2. **`x-request-id` is unbounded into a `varchar(128)` column.** After this fix it fails closed —
+   `500`, nothing written — but a client can still turn any audited admin write into a `500` with
+   one header. It arguably belongs in the `400` family. Left alone deliberately: it is the lever
+   `tests/admin_audit_atomicity.rs` injects through, and bounding it silently would turn those
+   tests green-for-the-wrong-reason. **If it is ever bounded, the tests fail rather than pass** (the
+   `500` premise is the first assertion) — replace the lever with a `raise`ing trigger in the
+   fixture's private database, do not delete the tests.
+3. **`audit_logs.actor_type` carries two spellings.** `runtime_admin` writes `format!("{:?}", …)`
+   (`"SystemKey"`); `admin::shared` lowercases it (`"systemkey"`). Deployed rows carry both.
+   Preserved exactly, and now documented at `runtime_audit`: unifying them is a data change, not a
+   refactor, and does not belong in an atomicity fix.
+
+
+## THE SHARED TEST DATABASE CANNOT HOLD TWO MIGRATION SETS AT ONCE — it reds a gate run that has nothing wrong with it — 2026-08-01
+
+`tests/support/mod.rs::sweep_leaked_databases` drops **every** `moira_test_template_*` that is not
+the calling process's own. The template's name is a SHA-256 over the migration set
+(`template_database`, `tests/support/mod.rs:785`), so two worktrees whose migrations differ by a
+single file have different template names — and each one's `prepare_template` destroys the other's.
+
+That is worse than a wasted rebuild. `prepare_template` runs **once** per process, under the
+*exclusive* advisory lock. Every fixture afterwards takes only the **shared** lock, and only for the
+duration of its own `create database … template …`. Nothing holds the template alive *between* the
+prepare and the last fixture, so a neighbouring worktree that sweeps inside that window leaves the
+running suite cloning from a database that no longer exists:
+
+```text
+clone the migrated template database: Database(PgDatabaseError { severity: Error, code: "3D000",
+message: "template database \"moira_test_template_9a2ad893dabfee7b\" does not exist" … })
+```
+
+Observed on `fix/admin-audit-atomicity`, whose `migrations/` is byte-identical to `main`: three
+`tests/secret_leak_snapshots.rs` tests failed this way and `scripts/gates.sh` reported
+`FAILED: test`. The immediate re-run was green, with no code change between them.
+
+**Two things to carry forward.**
+
+1. **A red gate run here is not automatically a code failure.** Read the panic before concluding
+   anything. `3D000` naming a template is a neighbouring worktree, not a regression — and it is
+   otherwise indistinguishable from one, which is precisely the failure mode this ledger keeps
+   warning about.
+2. **The gate's `log holds N of M integration targets` line fires as a *consequence* of any test
+   failure**, because `cargo test` stops scheduling further targets after the first one fails. It is
+   a second symptom of one problem, not a second problem. Do not go looking for a truncated capture.
+
+**Mitigated, not cured, on `fix/admin-audit-atomicity`.** `TestDatabase::create_with_max_connections`
+now goes through `clone_template`, which on `3D000` rebuilds the template under the exclusive lock
+and retries the clone **once**. Retrying once and no more is deliberate: a second `3D000` means a
+neighbour is sweeping faster than a template can be built, which is a real environmental problem and
+should fail loudly rather than spin. The sweep's semantics are untouched, so a genuine schema drift
+still surfaces — the rebuild runs the same `MIGRATOR`.
+
+The cure, when someone takes it, is for the sweep to spare templates other than its own. A template
+with no client backends is exactly what an idle-between-fixtures neighbour looks like, so "no client
+backend" cannot distinguish a leak from a live run; that check needs a different signal (an age, or
+an owning-run marker) before it can safely drop a template it does not recognise. Sweeping
+`moira_test_building_*` and aged fixture clones stays correct as it is.
+
+
+## AN UNMERGED MIGRATION IN ONE WORKTREE BLOCKS EVERY OTHER WORKTREE'S LIB TESTS — including `main`'s — 2026-08-01
+
+Worse than the template sweep above, and a different mechanism. **Integration** suites clone a private
+database from a template built out of the *calling* tree's migrations, so they are isolated. **Lib
+unit tests are not**: `src/**/tests` run `MIGRATOR.run` against `MOIRA_TEST_DATABASE_URL` — the shared
+`moira` database — directly.
+
+`fix/f14-memory-content-hash`, in a sibling worktree, carries
+`migrations/0021_memory_content_hash_is_content_addressed.sql` and its test run applied it. The
+shared database's `_sqlx_migrations` now holds version 21. Every tree that does **not** have that
+file — this branch, and `origin/main` itself, which is still at `0020` — now fails every
+database-backed lib unit test with:
+
+```text
+migrate: Internal("run migrations: migration 21 was previously applied but is missing in the
+resolved migrations")
+```
+
+`cargo test` fails on the lib target and stops, so `scripts/gates.sh` reports both `test` and
+`test:incomplete-log` with **0 of 36** integration targets logged — the whole suite never runs.
+
+**This is not repairable from the affected side.** Deleting the row would break the branch that owns
+it, and the standing instruction on the shared database is not to destroy state other agents depend
+on. It clears when `0021` merges to `main`, or when the shared database is rebuilt by someone who
+owns both.
+
+**The rule that follows: an unmerged migration must not be applied to the shared test database.** A
+branch that adds one needs its own database (`MOIRA_TEST_DATABASE_URL` pointing somewhere private) for
+as long as it is unmerged, because the cost of getting this wrong is not borne by the branch that adds
+the migration — it is borne by every *other* agent, silently, in a failure whose message names a
+migration they have never heard of. The template-clone path already gets this right; the lib unit
+tests are the hole.
+
+**Verified this way on `fix/admin-audit-atomicity`:** the six gates run green end to end against a
+byte-identical database that simply has not had `0021` applied to it, and red against the shared
+`moira` on the same commit, with nothing else changed.
+
+```text
+── fmt
+   ok
+── clippy
+   ok
+── test
+   ok — 906 passed
+── release
+   ok
+── deny
+   ok
+── audit
+   ok
+
+ALL GATES PASSED
+```
+
+`MOIRA_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/moira_atomicity` — created for
+this run, migrated from `0001` by the suite itself, and named outside `moira_test_%` so the leak
+sweep leaves it alone. `scripts/gates.sh`'s own two integrity assertions are what make that summary
+trustworthy: neither the `36 of 36 integration targets` check nor the zero-skip check fired, so no
+suite was silently absent and no DB-backed suite skipped.
+
+**Three further ways a gate run died here, all environmental, none from the code under test** —
+recorded because each was individually indistinguishable from a regression:
+
+| Symptom | Cause |
+|---|---|
+| `3D000 template … does not exist` | neighbouring worktree's leak sweep (see the section above) |
+| `57P01 terminating connection due to administrator command` | same neighbour, different statement |
+| `gates exit=137` | SIGKILL. Two full Rust test suites on one machine; ~56 MB free at the time |
+
+Exit 137 is worth its own line: it is not a test failure at all, and `scripts/gates.sh` cannot
+distinguish it from one. **Two agents must not run `cargo test --workspace` against this machine
+simultaneously** — not for the database's sake, for the RAM's.

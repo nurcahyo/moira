@@ -30,8 +30,8 @@ use crate::{
     application::{
         AdminCommandMutation, AdminCommandRunner, RequestContext,
         admin::shared::{
-            PageRequest, admin_command_spec, audit_success, command_hasher, paginate,
-            require_non_empty, success_audit,
+            PageRequest, admin_command_spec, command_hasher, paginate, require_non_empty,
+            success_audit,
         },
         setup::require_setup_actor,
     },
@@ -233,17 +233,22 @@ impl<'a> AuthProviderSettingsService<'a> {
         // The version check happens inside the repository's transaction, on a row locked by
         // `select … for update` — never against a version read on a separate connection,
         // which is the lost update the `expected_version` parameter exists to close.
-        let record = self.settings.patch(id, expected_version, &request).await?;
-        audit_success(
-            &self.repo,
-            actor,
-            ctx,
-            "auth_provider.update",
-            "auth_provider_settings",
-            Some(id.to_string()),
-            json!({}),
-        )
-        .await?;
+        let record = self
+            .settings
+            .patch(
+                id,
+                expected_version,
+                &request,
+                success_audit(
+                    actor,
+                    ctx,
+                    "auth_provider.update",
+                    "auth_provider_settings",
+                    Some(id.to_string()),
+                    json!({}),
+                ),
+            )
+            .await?;
         self.invalidate_cache().await;
         Ok(record)
     }
@@ -290,22 +295,24 @@ impl<'a> AuthProviderSettingsService<'a> {
         }
         let record = self
             .settings
-            .set_enabled(id, expected_version, enabled)
+            .set_enabled(
+                id,
+                expected_version,
+                enabled,
+                success_audit(
+                    actor,
+                    ctx,
+                    if enabled {
+                        "auth_provider.enable"
+                    } else {
+                        "auth_provider.disable"
+                    },
+                    "auth_provider_settings",
+                    Some(id.to_string()),
+                    json!({}),
+                ),
+            )
             .await?;
-        audit_success(
-            &self.repo,
-            actor,
-            ctx,
-            if enabled {
-                "auth_provider.enable"
-            } else {
-                "auth_provider.disable"
-            },
-            "auth_provider_settings",
-            Some(id.to_string()),
-            json!({}),
-        )
-        .await?;
         self.invalidate_cache().await;
         Ok(record)
     }
@@ -320,17 +327,20 @@ impl<'a> AuthProviderSettingsService<'a> {
         self.state
             .authz
             .require(actor, "moira:auth-settings:delete")?;
-        self.settings.soft_delete(id, expected_version).await?;
-        audit_success(
-            &self.repo,
-            actor,
-            ctx,
-            "auth_provider.delete",
-            "auth_provider_settings",
-            Some(id.to_string()),
-            json!({}),
-        )
-        .await?;
+        self.settings
+            .soft_delete(
+                id,
+                expected_version,
+                success_audit(
+                    actor,
+                    ctx,
+                    "auth_provider.delete",
+                    "auth_provider_settings",
+                    Some(id.to_string()),
+                    json!({}),
+                ),
+            )
+            .await?;
         self.invalidate_cache().await;
         Ok(())
     }

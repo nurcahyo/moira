@@ -11,8 +11,8 @@ use crate::{
     application::{
         AdminCommandMutation, AdminCommandRunner, RequestContext,
         admin::shared::{
-            APPLICATIONS_CURSOR, PageRequest, admin_command_spec, audit_success, command_hasher,
-            paginate, require_non_empty, success_audit, validate_application_identifiers,
+            APPLICATIONS_CURSOR, PageRequest, admin_command_spec, command_hasher, paginate,
+            require_non_empty, success_audit, validate_application_identifiers,
         },
     },
     domain::{
@@ -124,18 +124,20 @@ impl<'a> ApplicationAdminService<'a> {
         }
         let record = self
             .repo
-            .patch_application(id, expected_version, &request)
+            .patch_application(
+                id,
+                expected_version,
+                &request,
+                success_audit(
+                    actor,
+                    ctx,
+                    "application.update",
+                    "application",
+                    Some(id.to_string()),
+                    json!({}),
+                ),
+            )
             .await?;
-        audit_success(
-            &self.repo,
-            actor,
-            ctx,
-            "application.update",
-            "application",
-            Some(id.to_string()),
-            json!({}),
-        )
-        .await?;
         Ok(record)
     }
 
@@ -150,18 +152,20 @@ impl<'a> ApplicationAdminService<'a> {
             .authz
             .require(actor, "moira:applications:delete")?;
         self.repo
-            .soft_delete_application(id, expected_version)
+            .soft_delete_application(
+                id,
+                expected_version,
+                success_audit(
+                    actor,
+                    ctx,
+                    "application.delete",
+                    "application",
+                    Some(id.to_string()),
+                    json!({}),
+                ),
+            )
             .await?;
-        audit_success(
-            &self.repo,
-            actor,
-            ctx,
-            "application.delete",
-            "application",
-            Some(id.to_string()),
-            json!({}),
-        )
-        .await
+        Ok(())
     }
 
     pub(crate) async fn set_application_enabled(
@@ -181,23 +185,21 @@ impl<'a> ApplicationAdminService<'a> {
                 id,
                 expected_version,
                 if enabled { "active" } else { "disabled" },
+                success_audit(
+                    actor,
+                    ctx,
+                    if enabled {
+                        "application.enable"
+                    } else {
+                        "application.disable"
+                    },
+                    "application",
+                    Some(id.to_string()),
+                    json!({}),
+                ),
             )
             .await?;
         self.state.runtime_cache.invalidate_all().await;
-        audit_success(
-            &self.repo,
-            actor,
-            ctx,
-            if enabled {
-                "application.enable"
-            } else {
-                "application.disable"
-            },
-            "application",
-            Some(id.to_string()),
-            json!({}),
-        )
-        .await?;
         Ok(record)
     }
 }
