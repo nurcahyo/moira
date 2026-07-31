@@ -1,0 +1,25 @@
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.heading {
+  margin: 0;
+  font-size: 1.15rem;
+}
+
+.intro,
+.note,
+.activity {
+  margin: 0;
+}
+
+.note {
+  font-size: 0.9rem;
+  opacity: 0.85;
+}
+
+.activity {
+  min-height: 1.25rem;
+}

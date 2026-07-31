@@ -29,9 +29,14 @@
 // them. Rendering the chrome and letting the first data fetch fail would show an
 // operator a working-looking console over a backend that cannot authorise them.
 //
-// The chrome itself is deliberately thin at this wave: navigation, a header and
-// a sign-out control arrive with the surfaces they navigate to. What ships here
-// is the boundary, because the boundary is what the later surfaces depend on.
+// The chrome arrived in plan 09 wave 5, with the first surface worth navigating
+// to. This header used to end "navigation, a header and a sign-out control
+// arrive with the surfaces they navigate to" — `/admins` is that surface, and
+// without `ConsoleHeader` it would be reachable only by typing the URL.
+//
+// The header is a `"use client"` organism because signing out is a POST it makes
+// itself. Everything above it — the gate — stays server-side, so a browser that
+// never runs the header's JavaScript is still gated.
 
 import { redirect } from "next/navigation";
 import { headers } from "next/headers";
@@ -40,6 +45,7 @@ import type { ReactNode } from "react";
 import { consoleSessionCheck } from "@/lib/auth";
 import { consoleRuntime } from "@/lib/auth-runtime";
 import { isMoiraRequestError } from "@/lib/errors";
+import { ConsoleHeader } from "@/modules/chrome/ConsoleHeader";
 
 import styles from "./layout.module.css";
 
@@ -94,5 +100,10 @@ export default async function ConsoleLayout({ children }: { children: ReactNode 
   // a `catch` around it would swallow the redirect and render the chrome.
   if (!signedIn) redirect(SIGN_IN_PATH);
 
-  return <div className={styles.shell}>{children}</div>;
+  return (
+    <div className={styles.shell}>
+      <ConsoleHeader />
+      {children}
+    </div>
+  );
 }

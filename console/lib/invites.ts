@@ -74,57 +74,18 @@ import type {
 } from "./types";
 import type { ConsoleSessionIdentity } from "./moira-session";
 
-/* -------------------------------------------------------------------------- */
-/* The two bounds Moira enforces, mirrored so the form can respect them        */
-/* -------------------------------------------------------------------------- */
-
-/**
- * `MIN_INVITE_EXPIRY_SECONDS` in `src/domain/identity.rs`.
- *
- * Below it, `validated_invite_lifetime` returns `422 invalid_request` — NOT
- * `admin_invite_expiry_too_long`, which is the cap's code. Two bounds, two
- * codes; a form that only knew about the cap would render the floor's refusal as
- * a generic validation failure.
- */
-export const MIN_INVITE_EXPIRY_SECONDS = 60;
-
-/**
- * `MAX_INVITE_EXPIRY_SECONDS` in `src/domain/identity.rs` — 72 hours.
- *
- * A **hard cap, refused rather than clamped**: an operator who believes they
- * issued a 30-day invitation and silently received a 3-day one discovers the
- * difference at the worst possible moment. Mirrored here so `ExpiryPicker` can
- * refuse locally with the same number, and asserted against Moira's own constant
- * in `tests/unit/lib/invites.test.ts`.
- */
-export const MAX_INVITE_EXPIRY_SECONDS = 72 * 60 * 60;
-
-/** The form's default. Well inside both bounds; not a Moira value. */
-export const DEFAULT_INVITE_EXPIRY_SECONDS = 24 * 60 * 60;
-
-/** The public path an invitee lands on. One spelling, used by page and link. */
-export const INVITE_PATH_PREFIX = "/invite";
-
-/** Is this lifetime one Moira will accept? Both bounds, inclusive. */
-export function isAcceptableInviteLifetime(seconds: number): boolean {
-  return (
-    Number.isInteger(seconds) &&
-    seconds >= MIN_INVITE_EXPIRY_SECONDS &&
-    seconds <= MAX_INVITE_EXPIRY_SECONDS
-  );
-}
-
-/**
- * Where invitation links point, e.g. `https://console.example/invite`.
- *
- * `OnceOnlySecretModal` appends the token to this inside its own render, so the
- * console's origin travels to the browser and the token never leaves that one
- * expression. Passing a prebuilt link instead would create a second string
- * holding the token, in a component that is not allow-listed.
- */
-export function inviteBaseUrl(consoleOrigin: string): string {
-  return `${consoleOrigin.replace(/\/+$/, "")}${INVITE_PATH_PREFIX}`;
-}
+// The bounds and the public path live in a CLIENT-SAFE module, because
+// `ExpiryPicker` is a molecule and may not import this one. Re-exported here so
+// server-side callers have a single import, and so the two cannot drift.
+export {
+  DEFAULT_INVITE_EXPIRY_SECONDS,
+  INVITE_PATH_PREFIX,
+  MAX_INVITE_EXPIRY_SECONDS,
+  MIN_INVITE_EXPIRY_SECONDS,
+  inviteBaseUrl,
+  inviteRedeemPath,
+  isAcceptableInviteLifetime,
+} from "./invite-bounds";
 
 /* -------------------------------------------------------------------------- */
 /* Idempotency keys                                                           */

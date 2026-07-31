@@ -1,0 +1,14 @@
+.title {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.body {
+  margin: 0;
+}
+
+.actions {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}

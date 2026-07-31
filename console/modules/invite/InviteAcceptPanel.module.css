@@ -1,0 +1,28 @@
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  align-items: flex-start;
+}
+
+.heading {
+  margin: 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+.expiry,
+.instruction,
+.notice,
+.activity {
+  margin: 0;
+}
+
+.activity {
+  min-height: 1.25rem;
+}
+
+.problem {
+  margin: 0;
+  color: #8a1c1c;
+}

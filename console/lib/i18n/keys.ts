@@ -41,6 +41,10 @@
 //   console.signIn.*  the sign-in surface
 //   console.action.*  a generic control's label, reused across surfaces
 //   console.secret.*  the once-only secret surface
+//   console.chrome.*  the authenticated shell: navigation and sign-out
+//   console.expiry.*  invitation lifetimes (the ExpiryPicker molecule)
+//   console.admins.*  the /admins screen — grants, invitations, ownership
+//   console.invite.*  the public /invite/[token] redemption page
 
 /* -------------------------------------------------------------------------- */
 /* The table                                                                  */
@@ -106,10 +110,101 @@ export const CONSOLE_MESSAGE_KEYS = {
   sign_in_rate_limited: "console.signIn.rate_limited",
   sign_in_no_redirect_url: "console.signIn.no_redirect_url",
 
+  page_admins_title: "console.page.admins_title",
+  page_invite_title: "console.page.invite_title",
+
   /* --- generic actions ---------------------------------------------------- */
   action_copy: "console.action.copy",
   action_copied: "console.action.copied",
   action_copy_failed: "console.action.copy_failed",
+  action_cancel: "console.action.cancel",
+
+  /* --- the authenticated chrome (plan 09 wave 5) -------------------------- */
+  chrome_nav_label: "console.chrome.nav_label",
+  chrome_nav_home: "console.chrome.nav_home",
+  chrome_nav_admins: "console.chrome.nav_admins",
+  chrome_sign_out: "console.chrome.sign_out",
+  chrome_sign_out_pending: "console.chrome.sign_out_pending",
+  chrome_sign_out_failed: "console.chrome.sign_out_failed",
+
+  /* --- invitation lifetimes (the ExpiryPicker molecule) ------------------- */
+  expiry_label: "console.expiry.label",
+  expiry_hint: "console.expiry.hint",
+  expiry_option_one_hour: "console.expiry.option_one_hour",
+  expiry_option_hours: "console.expiry.option_hours",
+
+  /* --- the /admins screen ------------------------------------------------- */
+  admins_heading: "console.admins.heading",
+  admins_intro: "console.admins.intro",
+  admins_per_grant_note: "console.admins.per_grant_note",
+  admins_table_label: "console.admins.table_label",
+  admins_column_email: "console.admins.column_email",
+  admins_column_status: "console.admins.column_status",
+  admins_column_created: "console.admins.column_created",
+  admins_column_actions: "console.admins.column_actions",
+  admins_owner_badge: "console.admins.owner_badge",
+  admins_status_active: "console.admins.status_active",
+  admins_status_revoked: "console.admins.status_revoked",
+  admins_empty: "console.admins.empty",
+  admins_activity_label: "console.admins.activity_label",
+  admins_working: "console.admins.working",
+  admins_request_failed: "console.admins.request_failed",
+  admins_transfer: "console.admins.transfer",
+  admins_transfer_confirm_title: "console.admins.transfer_confirm_title",
+  admins_transfer_confirm_body: "console.admins.transfer_confirm_body",
+  admins_transfer_confirm_action: "console.admins.transfer_confirm_action",
+  admins_revoke: "console.admins.revoke",
+  admins_revoke_confirm_title: "console.admins.revoke_confirm_title",
+  admins_revoke_confirm_body: "console.admins.revoke_confirm_body",
+  admins_revoke_confirm_action: "console.admins.revoke_confirm_action",
+  admins_owner_not_revocable: "console.admins.owner_not_revocable",
+
+  /* --- the invite form ---------------------------------------------------- */
+  admins_invite_heading: "console.admins.invite_heading",
+  admins_invite_constraint_label: "console.admins.invite_constraint_label",
+  admins_invite_constraint_email: "console.admins.invite_constraint_email",
+  admins_invite_constraint_domain: "console.admins.invite_constraint_domain",
+  admins_invite_value_label_email: "console.admins.invite_value_label_email",
+  admins_invite_value_label_domain: "console.admins.invite_value_label_domain",
+  admins_invite_value_hint_email: "console.admins.invite_value_hint_email",
+  admins_invite_value_hint_domain: "console.admins.invite_value_hint_domain",
+  admins_invite_value_required: "console.admins.invite_value_required",
+  admins_invite_submit: "console.admins.invite_submit",
+  admins_invite_pending: "console.admins.invite_pending",
+  admins_invite_domain_not_in_allow_list: "console.admins.invite_domain_not_in_allow_list",
+  admins_invite_no_enabled_provider: "console.admins.invite_no_enabled_provider",
+  admins_invite_multi_provider_warning: "console.admins.invite_multi_provider_warning",
+
+  /* --- the invitation list ------------------------------------------------ */
+  admins_invites_heading: "console.admins.invites_heading",
+  admins_invites_table_label: "console.admins.invites_table_label",
+  admins_invites_empty: "console.admins.invites_empty",
+  admins_invites_privacy_note: "console.admins.invites_privacy_note",
+  admins_invite_column_value: "console.admins.invite_column_value",
+  admins_invite_column_status: "console.admins.invite_column_status",
+  admins_invite_column_expires: "console.admins.invite_column_expires",
+  admins_invite_status_pending: "console.admins.invite_status_pending",
+  admins_invite_status_consumed: "console.admins.invite_status_consumed",
+  admins_invite_status_revoked: "console.admins.invite_status_revoked",
+  admins_invite_status_expired: "console.admins.invite_status_expired",
+  admins_invite_revoke: "console.admins.invite_revoke",
+  admins_invite_revoke_confirm_title: "console.admins.invite_revoke_confirm_title",
+  admins_invite_revoke_confirm_body: "console.admins.invite_revoke_confirm_body",
+  admins_invite_revoke_confirm_action: "console.admins.invite_revoke_confirm_action",
+
+  /* --- the public /invite/[token] page ------------------------------------ */
+  invite_panel_label: "console.invite.panel_label",
+  invite_heading_email: "console.invite.heading_email",
+  invite_heading_domain: "console.invite.heading_domain",
+  invite_expires_at: "console.invite.expires_at",
+  invite_sign_in_first: "console.invite.sign_in_first",
+  invite_accept: "console.invite.accept",
+  invite_accept_pending: "console.invite.accept_pending",
+  invite_accepted: "console.invite.accepted",
+  invite_request_failed: "console.invite.request_failed",
+  invite_unusable_heading: "console.invite.unusable_heading",
+  invite_domain_not_allowed: "console.invite.domain_not_allowed",
+  invite_already_claimed: "console.invite.already_claimed",
 
   /* --- the once-only secret surface --------------------------------------- */
   secret_modal_heading: "console.secret.modal_heading",
