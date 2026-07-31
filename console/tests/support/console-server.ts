@@ -62,7 +62,12 @@ export function startConsoleServer(deps: ConsoleAuthDeps, port: number): Console
         return handleAuthRequest(request, async () => ({
           ok: true,
           auth,
-          config: deps.config,
+          configs: deps.configs,
+          // No per-provider problems: the harness is handed already-resolved
+          // configurations, so there is nothing that failed to resolve. A test
+          // that wants to exercise the drifted-row path resolves through
+          // `loadAuthConfigs` instead of through this seam.
+          problems: [],
         }));
       }
       // The post-sign-in landing page. The flow redirects here, so it has to

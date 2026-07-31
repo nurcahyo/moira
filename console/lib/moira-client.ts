@@ -122,7 +122,7 @@ export const MOIRA_OPERATIONS = {
    *
    * Consequence the console must respect: it is enough to RENDER a sign-in
    * button and NOT enough to RESOLVE the configuration behind one.
-   * `resolveAuthConfig` refuses a row without `allowed_email_domains` or
+   * `resolveAuthConfigs` refuses a row without `allowed_email_domains` or
    * `trusted_jwt_issuer_id`, and neither is in this projection.
    */
   getSetupSignInMethods: op({
@@ -311,9 +311,11 @@ export function assertClaimRequestIsSafe(body: Record<string, unknown>): void {
  *   Moira; "the row is created disabled" is this console's convention, and this
  *   is where the convention is enforced. Only `enableAuthProvider` may enable a row.
  * - `trusted_jwt_issuer_id` must be present and non-empty. Without it,
- *   `governing_policy` matches neither `issuer = $1` (which is the claim body's
- *   issuer — the console's, not the IdP's) nor `trusted_jwt_issuer_id = $2`, so
- *   `policy = None` and every claim is `403 admin_claim_domain_not_allowed`.
+ *   `admission_policy` matches neither its bound stage (`trusted_jwt_issuer_id
+ *   = $2`) nor its unbound one (`issuer = $1`, which is the claim body's issuer —
+ *   the console's, not the IdP's), so `policy = None` and every claim is
+ *   `403 admin_claim_domain_not_allowed`. From wave 4B it is also what the
+ *   console's minted `iss` is read from.
  * - `display_name` is required by the schema; omitting it is a 400.
  */
 export function assertProviderCreateIsSafe(body: Record<string, unknown>): void {

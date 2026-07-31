@@ -11,25 +11,27 @@
 // WHY THE ORDER IS WHAT IT IS. Read before changing anything below.
 // ============================================================================
 //
-// `AuthSettingsService::governing_policy` selects the policy that decides a
-// claim with:
+// `AuthSettingsService::admission_policy` selects the policy that decides a
+// claim in two disjoint stages (wave 4A; it replaced `governing_policy`, which
+// ordered a single `issuer = $1 or trusted_jwt_issuer_id = $2` query and let the
+// oldest bound row govern every claim — finding F23):
 //
-//     select id, allowed_email_domains from auth_provider_settings
-//      where deleted_at is null and status = 'active' and enabled
-//        and (issuer = $1 or trusted_jwt_issuer_id = $2)
+//   1. `where ... and trusted_jwt_issuer_id = $2`   <- at most one row, by the
+//      partial unique index `auth_provider_settings_one_enabled_per_trusted_issuer`
+//   2. only if (1) matched nothing: `where ... and issuer = $1
+//      and trusted_jwt_issuer_id is null`  <- the mode-3 bring-your-own-JWKS path
 //
 // `$1` is the CLAIM BODY's issuer. `$2` is the `trusted_jwt_issuers.id` resolved
-// from that same issuer string. There is no third branch.
+// from that same issuer string.
 //
 // This console claims with the CONSOLE's issuer, while the provider row's
 // `issuer` column holds the IDP's issuer (Google, or the generic-OIDC IdP) —
 // that column is load-bearing for `validate_method_shape` and for composing the
-// OAuth client, and must not be repurposed. So `issuer = $1` can never match.
-// The only branch that can match is `trusted_jwt_issuer_id = $2`, and it matches
-// only if the provider row actually carries the id of the console's registered
-// trusted JWT issuer.
+// OAuth client, and must not be repurposed. So stage 2 can never match a
+// console-provisioned row, and stage 1 matches only if the provider row actually
+// carries the id of the console's registered trusted JWT issuer.
 //
-// Therefore:
+// Therefore, PER PROVIDER:
 //
 //   0. bootstrap the system key            (operator CLI — not automatable here)
 //   1. POST /api/v1/admin/jwt-issuers      <- FIRST Moira write of the wizard
@@ -49,9 +51,33 @@
 //
 // `assertB1Invariant` below is what makes that non-negotiable, and
 // `tests/unit/lib/setup-flow.test.ts` is the regression test.
+//
+// ============================================================================
+// ONE TRUSTED ISSUER PER PROVIDER (wave 4B)
+// ============================================================================
+//
+// `runSetupProvisioning` provisions ONE provider and the ONE trusted JWT issuer
+// it is bound to. That was already true; what changes in 4B is that the issuer
+// string is a per-provider input rather than a deployment constant.
+//
+//   * the FIRST provider takes `env.bffIssuerUrl` — it is the incumbent, so it
+//     keeps that string and Better Auth's `moira-console-idp` automatically,
+//     with no alias table and no "which one is legacy" flag;
+//   * each ADDITIONAL provider takes `consoleIssuerForSlug(bffIssuerUrl, slug)`,
+//     an operator-chosen stable slug under the console's own issuer namespace.
+//
+// Provisioning a second provider is therefore calling `runSetupProvisioning`
+// again with a different `console.issuer` and a different `provider`.
+// `ensureTrustedJwtIssuer` is reuse-first and already generalises: it looks the
+// issuer string up before creating it, so a re-run adopts rather than colliding.
+//
+// The partial unique index means each additional provider MUST get its own
+// trusted-issuer row: two enabled providers bound to one issuer is refused
+// `409 duplicate_enabled_provider_for_issuer` at the enable step.
 
 import "server-only";
 
+import { consoleIssuerForSlug } from "./auth-config";
 import { MoiraClient, ifMatchFor, type MoiraOperationName } from "./moira-client";
 import { isMoiraRequestError, type MoiraError } from "./errors";
 import { CONSOLE_MESSAGE_KEYS } from "./i18n/keys";
@@ -118,7 +144,8 @@ export type ProvisioningDeficiency =
  *
  * The third condition is the one plan 08's body never had: it is not enough for
  * the provider row to exist and be enabled — it must be BOUND to the console's
- * trusted JWT issuer, or `governing_policy` never selects it.
+ * trusted JWT issuer, or `admission_policy` never selects it — and from wave 4B
+ * the binding is also where the console reads this provider's minted `iss`.
  */
 export function provisioningDeficiencies(
   state: SetupProvisioningState,
@@ -266,7 +293,14 @@ export class SetupProvisioningError extends Error {
 /* -------------------------------------------------------------------------- */
 
 export interface ConsoleIssuerConfig {
-  /** `MOIRA_BFF_ISSUER_URL` — what the console's own tokens carry as `iss`. */
+  /**
+   * What THIS provider's console-minted tokens carry as `iss`.
+   *
+   * `env.bffIssuerUrl` for the incumbent, `consoleIssuerForSlug(...)` for every
+   * additional provider. Build it with `consoleIssuerConfigFor` rather than by
+   * hand: the console derives Better Auth's `providerId` back OUT of this string
+   * at sign-in time, and a string it cannot parse gets no sign-in button.
+   */
   readonly issuer: string;
   /** The JWKS URL the console ACTUALLY serves, never a hard-coded guess. */
   readonly jwksUrl: string;
@@ -350,10 +384,60 @@ export function assertB1Invariant(trustedJwtIssuerId: string | null): asserts tr
   if (trustedJwtIssuerId === null || trustedJwtIssuerId === "") {
     throw new SetupOrderingError(
       "the trusted JWT issuer must be registered BEFORE the auth provider is created, and its id " +
-        "must be set as `trusted_jwt_issuer_id` on the create body. Without it `governing_policy` " +
-        "matches neither branch and every claim is 403 admin_claim_domain_not_allowed.",
+        "must be set as `trusted_jwt_issuer_id` on the create body. Without it `admission_policy` " +
+        "matches neither stage and every claim is 403 admin_claim_domain_not_allowed — and from " +
+        "wave 4B the console cannot resolve the provider's minted `iss` either, because that is " +
+        "the bound trusted issuer's own `issuer` string.",
     );
   }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Which console issuer a provider is provisioned under (wave 4B)             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The `ConsoleIssuerConfig` for one provider.
+ *
+ * `slug === null` means the INCUMBENT: the provider bound to the
+ * `env.bffIssuerUrl` trusted issuer, which keeps that string and Better Auth's
+ * `moira-console-idp` id. There is at most one, it is not marked anywhere, and
+ * it does not need to be — "the row bound to the `bffIssuerUrl` issuer" is the
+ * definition, and the partial unique index makes it unique.
+ *
+ * Every other provider gets its own slug, and therefore its own
+ * `trusted_jwt_issuers` row, its own `iss`, and its own `admin_identities` grant
+ * namespace. They SHARE one `jwks_url` and one ES256 key pair: `trusted_jwt_issuers`
+ * has a unique index on `issuer` alone and none on `jwks_url`, and better-auth's
+ * `getLatestKey` sorts the `jwks` table globally with no issuer awareness, so
+ * per-issuer key pairs are not implementable and are not attempted.
+ *
+ * THE FOOTGUN THIS AVOIDS. Deriving the issuer from the `auth_provider_settings`
+ * row UUID instead would mint a NEW issuer string every time an operator deleted
+ * and recreated a provider, silently orphaning every `admin_identities` grant
+ * made through it — and wave 4A's `trusted_issuer_has_active_grants` guard would
+ * not fire, because the trusted-issuer row is not what changed. Anchoring on the
+ * trusted issuer's own `issuer` column puts the identity behind that guard.
+ */
+export function consoleIssuerConfigFor(
+  env: { readonly bffIssuerUrl: string; readonly adminApiAudience: string },
+  jwksUrl: string,
+  slug: string | null,
+  allowedAlgorithms?: readonly string[],
+): ConsoleIssuerConfig {
+  return {
+    // `consoleIssuerForSlug` THROWS on a slug the console could not derive a
+    // `providerId` back out of, and that refusal is deliberately here — before
+    // any Moira write — because the failure it prevents is one-way: a trusted
+    // issuer registered under an unparseable string cannot be deleted once a
+    // grant exists under it (`409 trusted_issuer_has_active_grants`), so the
+    // provider would be permanently unofferable and its admins permanently
+    // unreachable. The validation is NOT restated here: one rule, one spelling.
+    issuer: slug === null ? env.bffIssuerUrl : consoleIssuerForSlug(env.bffIssuerUrl, slug),
+    jwksUrl,
+    audience: env.adminApiAudience,
+    ...(allowedAlgorithms === undefined ? {} : { allowedAlgorithms }),
+  };
 }
 
 /* -------------------------------------------------------------------------- */

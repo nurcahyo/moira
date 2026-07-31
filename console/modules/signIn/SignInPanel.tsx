@@ -15,21 +15,38 @@
 // created.
 //
 // ============================================================================
-// AT MOST ONE BUTTON, BY CONSTRUCTION
+// ONE BUTTON PER RESOLVABLE PROVIDER, AND NEVER MORE (was: AT MOST ONE BUTTON,
+// BY CONSTRUCTION)
 // ============================================================================
 //
-// `lib/auth-config.ts:189-198` returns `fail("ambiguous_enabled_providers")`
-// whenever more than one provider is enabled, and `loadAuthConfig:260` will not
-// even READ a secret in that case. A provider picker is therefore not "not built
-// yet" — it is wrong in this wave, because a console that offers two buttons is
-// a console whose configuration the server has already refused to resolve.
-// Multi-provider is a later wave's decision, not this component's.
+// This header used to say a provider picker was *wrong*, because
+// `resolveAuthConfig` refused any deployment with more than one enabled row and
+// would not even read a secret in that case — so two buttons meant a
+// configuration the server had already refused to resolve. Wave 4B changed the
+// premise underneath it, and the reason it is REWRITTEN rather than deleted is
+// that the invariant it protected is still real; only its arithmetic moved.
+//
+// The invariant, restated for N: **this component renders a button only for a
+// provider the server has fully RESOLVED**, never for one it merely knows about.
+// `SignInPanelState.ready.providers` comes from `consoleRuntime()`'s `configs`,
+// which is the list of providers that have a client secret in the console's own
+// store, a non-empty `allowed_email_domains`, usable endpoints, and a bound
+// trusted JWT issuer whose string this console can derive a `providerId` from.
+// An enabled Moira row missing any of those is reported as a PROBLEM and gets no
+// button — which is exactly what the old "zero buttons in a refusal state" rule
+// said, now applied per provider instead of per deployment.
+//
+// What is NOT switched on yet: `lib/auth-config.ts::ambiguityGuard` still
+// refuses a deployment with more than one enabled row, until wave 4A's
+// server-side invariant is deployed rather than merely merged. So on today's
+// deployments this still renders one button. The component is the part that does
+// not have to change again when that guard goes.
 //
 // ============================================================================
 // WHY THE REFUSAL STATES ARE RESOLVED SERVER-SIDE AND PASSED IN
 // ============================================================================
 //
-// `app/api/auth/[...all]/route.ts:61-66` returns 503 with a `message_key` and NO
+// `app/api/auth/[...all]/route.ts` returns 503 with a `message_key` and NO
 // English on exactly the deployment `sign-in-methods` exists for: system key
 // removed, snapshot cold. A page that renders a button purely from the anonymous
 // endpoint shows a WORKING-LOOKING BUTTON THAT 503s ON CLICK.
@@ -37,10 +54,10 @@
 // The anonymous projection (`PublicSignInMethod`) is enough to RENDER a button
 // and not enough to RESOLVE the configuration behind one: it lacks `enabled`,
 // `status`, `version`, `token_url`, `userinfo_url`, `allowed_email_domains` and
-// `trusted_jwt_issuer_id`, and `resolveAuthConfig` refuses a row without the last
-// two. So `/login` asks `consoleRuntime()` whether a sign-in can actually be
-// resolved, and this component renders a button ONLY in the `ready` state. In
-// every refusal state it renders zero buttons — asserted in
+// `trusted_jwt_issuer_id`, and `resolveAuthConfigs` refuses a row without the
+// last two. So `/login` asks `consoleRuntime()` which sign-ins can actually be
+// resolved, and this component renders buttons ONLY from that list. In every
+// refusal state it renders zero buttons — asserted in
 // `tests/unit/modules/SignInPanel.test.tsx`.
 //
 // ============================================================================
@@ -50,8 +67,8 @@
 // `lib/auth.ts:308-328`: `nextCookies()` is deliberately absent from the plugin
 // list, and with it installed the sign-in reply came back with NO `Set-Cookie`
 // at all and the callback then failed `state_security_mismatch`. There is also
-// no module-scope `auth` object to import — `getConsoleAuth` memoises per
-// `config.cacheKey` and the instance is obtained inside the request handler.
+// no module-scope `auth` object to import — `lib/auth-runtime.ts` memoises per
+// resolution `cacheKey` and the instance is obtained inside the request handler.
 //
 // So this posts to the mounted route handler with `fetch`, exactly the wire
 // format `tests/integration/oauth-flow.test.ts:110-116` drives:
@@ -98,13 +115,23 @@ const CALLBACK_PATH = "/";
  * the catalog, and the catalog is why this state renders English rather than a
  * bare key.
  */
+/** One resolvable provider, as the server offered it. */
+export interface SignInPanelProvider {
+  /** Better Auth's `providerId`. Not the Moira row id. */
+  readonly providerId: string;
+  /** `display_name` from the anonymous projection, or null when unknown. */
+  readonly displayName: string | null;
+}
+
 export type SignInPanelState =
   | {
       readonly kind: "ready";
-      /** Better Auth's `providerId`. Not the Moira row id. */
-      readonly providerId: string;
-      /** `display_name` from the anonymous projection, or null when unknown. */
-      readonly displayName: string | null;
+      /**
+       * Every provider the server RESOLVED. Never empty — a resolution with no
+       * usable provider is an `unavailable` state, not a `ready` one with an
+       * empty list, because an empty list renders a panel with no way out of it.
+       */
+      readonly providers: readonly SignInPanelProvider[];
     }
   | {
       readonly kind: "unavailable";
@@ -123,8 +150,25 @@ export interface SignInPanelProps {
 
 type Phase =
   | { readonly kind: "idle" }
-  | { readonly kind: "pending" }
+  | { readonly kind: "pending"; readonly providerId: string }
   | { readonly kind: "failed"; readonly messageKey: string };
+
+/**
+ * The accessible name for one button.
+ *
+ * With several providers a missing display name cannot fall back to the generic
+ * label: every button would then have the SAME accessible name, and a screen
+ * reader user would be choosing between identical controls. The provider id is
+ * not pretty, but it is distinct, and the operator can set `display_name` in
+ * Moira to replace it.
+ */
+function providerLabel(provider: SignInPanelProvider, total: number): string {
+  if (provider.displayName !== null) {
+    return t(CONSOLE_MESSAGE_KEYS.sign_in_button, { provider: provider.displayName });
+  }
+  if (total === 1) return t(CONSOLE_MESSAGE_KEYS.sign_in_button_generic);
+  return t(CONSOLE_MESSAGE_KEYS.sign_in_button, { provider: provider.providerId });
+}
 
 export function SignInPanel({ state, fetchImpl, navigate }: SignInPanelProps) {
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
@@ -140,13 +184,10 @@ export function SignInPanel({ state, fetchImpl, navigate }: SignInPanelProps) {
     );
   }
 
-  const label =
-    state.displayName === null
-      ? t(CONSOLE_MESSAGE_KEYS.sign_in_button_generic)
-      : t(CONSOLE_MESSAGE_KEYS.sign_in_button, { provider: state.displayName });
+  const providers = state.providers;
 
-  async function start(): Promise<void> {
-    setPhase({ kind: "pending" });
+  async function start(providerId: string): Promise<void> {
+    setPhase({ kind: "pending", providerId });
     const send = fetchImpl ?? globalThis.fetch;
     const go = navigate ?? ((url: string) => globalThis.location.assign(url));
 
@@ -155,10 +196,7 @@ export function SignInPanel({ state, fetchImpl, navigate }: SignInPanelProps) {
       response = await send(SIGN_IN_ENDPOINT, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          providerId: (state as Extract<SignInPanelState, { kind: "ready" }>).providerId,
-          callbackURL: CALLBACK_PATH,
-        }),
+        body: JSON.stringify({ providerId, callbackURL: CALLBACK_PATH }),
       });
     } catch {
       // The thrown cause is deliberately not read: a fetch failure can carry a
@@ -198,16 +236,22 @@ export function SignInPanel({ state, fetchImpl, navigate }: SignInPanelProps) {
 
   return (
     <section className={styles.panel} aria-label={t(CONSOLE_MESSAGE_KEYS.sign_in_heading)}>
-      <Button
-        type="button"
-        variant="primary"
-        loading={phase.kind === "pending"}
-        onClick={() => {
-          void start();
-        }}
-      >
-        {label}
-      </Button>
+      {providers.map((provider) => (
+        <Button
+          key={provider.providerId}
+          type="button"
+          variant="primary"
+          // Only the button that was pressed shows a spinner. `loading` on all
+          // of them would read as "every provider is being contacted".
+          loading={phase.kind === "pending" && phase.providerId === provider.providerId}
+          disabled={phase.kind === "pending"}
+          onClick={() => {
+            void start(provider.providerId);
+          }}
+        >
+          {providerLabel(provider, providers.length)}
+        </Button>
+      ))}
       {phase.kind === "pending" && <Spinner label={t(CONSOLE_MESSAGE_KEYS.sign_in_pending)} />}
       {phase.kind === "failed" && (
         <p className={styles.problem} role="alert">

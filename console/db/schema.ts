@@ -81,6 +81,19 @@ export function consoleAuthSchemaOptions(database: unknown): Parameters<typeof b
     // path would make `account.password` load-bearing rather than vestigial.
     emailAndPassword: { enabled: false },
 
+    // Mirrors `lib/auth.ts`, and it IS the schema: this is the column
+    // `db/migrations/0003_session_provider.sql` adds. `required: false` is what
+    // makes it nullable, and the nullability is load-bearing — every session
+    // live when that migration runs has no value and must REFUSE to mint rather
+    // than default. `input: false` keeps it off every API surface; it does not
+    // affect the DDL, and it is repeated here so the two option sets stay
+    // literally identical rather than merely schema-equivalent.
+    session: {
+      additionalFields: {
+        providerId: { type: "string", required: false, input: false },
+      },
+    },
+
     // Mirrors `lib/auth.ts`, and it DOES change the schema: `getAuthTables`
     // adds a `rateLimit` table only when storage is `"database"`. Omitting it
     // here would leave the migration short of a table the running instance

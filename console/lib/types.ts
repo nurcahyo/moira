@@ -355,7 +355,7 @@ assertKeyContract<
  * fails that rule publishes it to the internet.
  *
  * CONSEQUENCE FOR THE CONSOLE: this is enough to RENDER a sign-in button and not
- * enough to RESOLVE the configuration behind one — `resolveAuthConfig` refuses a
+ * enough to RESOLVE the configuration behind one — `resolveAuthConfigs` refuses a
  * row with no `allowed_email_domains` and no `trusted_jwt_issuer_id`, and
  * neither is here.
  */
@@ -579,12 +579,16 @@ export interface AuthProviderSettingsCreateRequest {
   token_url?: string | null;
   /**
    * THE B1 FIELD. Binds this provider row to a registered trusted JWT issuer.
-   * `governing_policy` selects the policy with
-   * `where ... and (issuer = $1 or trusted_jwt_issuer_id = $2)` where `$1` is the
-   * *claim body's* issuer. The console's claim names the *console's* issuer while
-   * this row's `issuer` names the *IdP* — so without this field neither branch
-   * matches, `policy = None`, and every claim is `403
-   * admin_claim_domain_not_allowed`, forever.
+   * `admission_policy` resolves the governing row with
+   * `where ... and trusted_jwt_issuer_id = $2` and only falls back to
+   * `where ... and issuer = $1 and trusted_jwt_issuer_id is null` — the mode-3
+   * bring-your-own-JWKS path. The console's claim names the *console's* issuer
+   * while this row's `issuer` names the *IdP*, so without this field neither
+   * stage matches, `policy = None`, and every claim is
+   * `403 admin_claim_domain_not_allowed`, forever.
+   *
+   * From wave 4B it is also where the console READS this provider's minted
+   * `iss`: the bound row's `issuer` string is what the token carries.
    */
   trusted_jwt_issuer_id?: string | null;
   userinfo_url?: string | null;

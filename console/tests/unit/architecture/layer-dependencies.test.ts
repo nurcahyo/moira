@@ -53,7 +53,7 @@
 //   * with `import { isSessionExpired } from "@/lib/errors"` added to
 //     SignInPanel.tsx (a legitimate client-safe import):
 //     `bun test tests/unit/architecture` -> 97 pass, 0 fail, exit 0.
-//   * with `import { loadAuthConfig } from "@/lib/auth-config"` instead:
+//   * with `import { loadAuthConfigs } from "@/lib/auth-config"` instead:
 //     -> 95 pass, 2 fail, exit 1. Both failures name the file and the target —
 //     `modules/signIn/SignInPanel.tsx -> lib/auth-config.ts` here, and
 //     `modules/signIn/SignInPanel.tsx` in `server-only-guards.test.ts`.
