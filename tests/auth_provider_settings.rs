@@ -1677,15 +1677,49 @@ async fn insert_bound_provider(
     .expect("insert a bound provider")
 }
 
+/// An enabled, UNBOUND row whose own `issuer` column carries `issuer` — F23 shape (b).
+///
+/// By SQL, because `auth_provider_issuer_shadows_trusted_issuer` refuses to create it
+/// through the API. A deployment can hold one only from before `migrations/0020`, which is
+/// precisely the deployment `admission_policy` has to be correct on.
+async fn insert_shadow_row(pool: &sqlx::PgPool, issuer: &str, domains: &[&str]) -> Uuid {
+    sqlx::query_scalar::<_, Uuid>(
+        "insert into auth_provider_settings \
+             (method, display_name, enabled, issuer, jwks_url, allowed_email_domains) \
+         values ('jwks', 'Shadow', true, $1, 'https://rogue.invalid/jwks', $2) returning id",
+    )
+    .bind(issuer)
+    .bind(domains.iter().map(|d| d.to_string()).collect::<Vec<_>>())
+    .fetch_one(pool)
+    .await
+    .expect("insert a shadowing row")
+}
+
 /// **G1 — policy selection does not depend on row order.**
 ///
 /// Two enabled providers, each bound to its *own* trusted issuer, with different
 /// `allowed_email_domains`. Each lookup must return **its own row's list contents**; then
 /// the rows' `created_at` values are permuted and the results must be identical.
 ///
-/// *Mutation:* restore the old `governing_policy` body behind `admission_policy` — the
-/// single `where … (issuer = $1 or trusted_jwt_issuer_id = $2) order by … created_at asc
-/// limit 1`. The permuted run then disagrees with the first.
+/// # The decoys, and why the guard is worthless without them
+///
+/// The wave-4 design document specified G1 as the two bound rows plus the permutation, with
+/// "restore the old `governing_policy`" as the mutation that must turn it red. **Applied,
+/// that mutation left this test green**, and the reason matters: once every provider owns
+/// its own trusted issuer, `trusted_jwt_issuer_id = $2` selects exactly one row, there is
+/// nothing for an `ORDER BY` to arbitrate, and the old query and the new one agree. F23
+/// shape (a) — several enabled rows on one trusted issuer — is unrepresentable after
+/// `migrations/0020`, so a test built only from legal rows cannot reach the defect.
+///
+/// So each lookup is given a **decoy**: an enabled, *unbound* row whose own `issuer` column
+/// carries the console issuer string that lookup passes as `$1`, with a different allow-list.
+/// That is the only shape in which two rows still compete, it is exactly F23 shape (b), and
+/// it is inserted by SQL because `auth_provider_issuer_shadows_trusted_issuer` now refuses
+/// to create it through the API. Under the old query the decoy sorts FIRST — `(issuer is
+/// not distinct from $1) desc` — at any age, and the assertion on the returned **id** fails.
+///
+/// *Mutation, re-verified after the correction:* restore the old `governing_policy` body
+/// behind `admission_policy`. Both lookups then return their decoy.
 ///
 /// Deliberately **not** the toothless version: a single enabled row would pass under any
 /// query, and `assert!(policy.is_some())` would pass under the wrong one.
@@ -1706,6 +1740,29 @@ async fn the_admission_policy_is_the_bound_rows_own_and_does_not_depend_on_row_o
     // trusted issuers. Without this the test could pass on one row and prove nothing.
     assert_ne!(google_row, github_row);
     assert_ne!(google_issuer_id, github_issuer_id);
+
+    // The decoys. Inserted by SQL: the API refuses this shape with
+    // `409 auth_provider_issuer_shadows_trusted_issuer`, which is the point — it is F23
+    // shape (b), and a deployment can only still hold one from before `migrations/0020`.
+    let google_decoy =
+        insert_shadow_row(&fixture.pool, &google_issuer, &["decoy-google.test"]).await;
+    let github_decoy =
+        insert_shadow_row(&fixture.pool, &github_issuer, &["decoy-github.test"]).await;
+
+    // Premise for the decoys too: they are enabled, unbound, and carry the console issuer
+    // string. A decoy that failed to insert would make every assertion below vacuous.
+    let decoy_shape: (bool, Option<Uuid>, Option<String>) = sqlx::query_as(
+        "select enabled, trusted_jwt_issuer_id, issuer from auth_provider_settings where id = $1",
+    )
+    .bind(google_decoy)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read the decoy back");
+    assert_eq!(
+        decoy_shape,
+        (true, None, Some(google_issuer.clone())),
+        "the decoy is not the shape this guard needs"
+    );
 
     let lookup = async |issuer: &str, issuer_id: Uuid| {
         repo.admission_policy(issuer, issuer_id)
@@ -1728,6 +1785,8 @@ async fn the_admission_policy_is_the_bound_rows_own_and_does_not_depend_on_row_o
         vec!["contractor.test".to_string()],
         "the GitHub lookup returned the Google row's policy — the ordering is load-bearing"
     );
+    assert_ne!(google_first.id, google_decoy);
+    assert_ne!(github_first.id, github_decoy);
 
     // Permute `created_at` so the row the old query would have preferred changes. Under a
     // correct lookup nothing moves; under an ordered one, everything does.
