@@ -180,11 +180,25 @@ Migrations end at **`0020`** (next free `0021`; `0016` is a permanent gap). Open
 |---|---|---|
 | **F16** | `rig-core` logs the whole completion body, now carrying other tenants' retrieved documents. Mitigated below the `EnvFilter` — **and that mitigation's own wiring test was missing until `8bbda15`** | **proper fix is upstream; needs an issue filed by a human** |
 | **F2** | Pre-auth query-field enumeration | user deferred |
-| — | ~986 leaked `trusted_jwt_issuers` rows in the shared test DB | hygiene |
+| — | Leaked `trusted_jwt_issuers` rows in the shared test DB. **The recorded "~986" was stale — measured 160**, all `idp.invalid`, all one day | in flight on `fix/test-row-leak`; the finding is the *leak*, not the rows |
 
-**Closed in the final cycle:** F6, F13, F14, F20, F21, F22, F23, F24, F25, B2. **In flight at handoff:**
-F17 (`fix/f17-jwks-rotation`) and admin-write/audit atomicity (`fix/admin-audit-atomicity`) — check
-whether those branches merged before assuming either is still open.
+**Closed in the final cycle:** F6, F13, F14, F17, F20, F21, F22, F23, F24, F25, **F26**, B2 —
+**nine PRs, #39–#47**, each CI-verified with every job running steps.
+
+Two closures corrected the finding that named them, which is the reason to re-derive rather than
+implement from a one-liner:
+
+- **F14's own suggested fix would have caused a leak.** It proposed moving `content_hash` to an
+  unkeyed digest. `IdempotencyHasher::hash` feeds **four** tables, and
+  `conversation_messages.content_hash` is **served to callers** in two OpenAPI schemas — unkeying it
+  would let anyone holding the hash test candidate plaintexts offline. Applied **per table** instead:
+  memory's becomes a content address, the message hash **stays peppered**, and a test pins that.
+- **F26's one-liner named the wrong scope and understated reach.** Of the sites, **20 were already
+  atomic** inside the command envelope and were never part of it; **36** were genuinely divergent.
+  And it was reachable from a **request header**, not only a crash: `x-request-id` is taken verbatim
+  and unbounded while `audit_logs.request_id` is `varchar(128)`, so a 129-character id fails the
+  audit `INSERT` and nothing else — the change commits, the caller gets a 500, and the audit log is
+  empty.
 
 **Plan 11 Sub-Phases E (summarization) and F (memory extraction) remain deferred**, stated in its PR
 rather than implied. F14 was Sub-Phase F's inherited obligation and is now **closed ahead of it**
