@@ -47,6 +47,26 @@
 -- a miss, never a false match — and the marker is inherent to the encoding rather than a
 -- convention someone has to remember.
 --
+-- # Rollback
+--
+-- **There is no SQL inverse, and unlike `0009` this one is not even approximately reversible.**
+-- The values this statement overwrites were HMACs under a pepper the database has never held, so
+-- nothing in PostgreSQL can reconstruct them. Reverting the code alone is worse than doing
+-- nothing: new rows would be written peppered while every row this touched stays a content
+-- address, which is the two-format split this migration exists to prevent, in the other
+-- direction. A genuine rollback is code revert **plus** an application-level backfill that
+-- re-hashes `content_plain` with `IdempotencyHasher::hash` under the then-active pepper — and
+-- that backfill has to be re-run on every subsequent rotation, which is the cost the F14
+-- decision declined to accept in the first place.
+--
+-- # Locking
+--
+-- sqlx runs each migration in one transaction, so this is a single `UPDATE` holding row locks on
+-- every matching row until it commits. `memory_records` is caller-writable and can be large;
+-- concurrent `create_memory`/`patch_memory` writes to a locked row block for the duration. On a
+-- deployment with a substantial memory corpus, run it in a maintenance window rather than behind
+-- live traffic.
+--
 -- # Reversal condition
 --
 -- If `memory_records.content_hash` ever becomes reachable across a trust boundary — returned on
