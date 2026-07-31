@@ -194,6 +194,11 @@
       "description": "Used when a unique resource already exists."
     },
     {
+      "key": "moira.error.duplicate_trusted_jwt_issuer",
+      "default_message": "A trusted JWT issuer is already registered for this issuer.",
+      "description": "Used when registering a trusted JWT issuer would collide with the unique index over live trusted_jwt_issuers rows on issuer. Finding F13: this condition used to fall through to a 500 database_error - alone among Moira's uniqueness conflicts - so a client recovering from a half-finished registration could not adopt the existing row by catching a 409, and an operator was paged for what was only a duplicate. The remedy is to read the existing issuer rather than to create a second one; issuer is the identity of the row and is deliberately not patchable."
+    },
+    {
       "key": "moira.error.embedding_provider_unsupported",
       "default_message": "The configured embedding provider does not support embeddings.",
       "description": "Used when an application's embedding policy names a provider whose type exposes no embedding model in the configured Rig version. Anthropic and DeepSeek expose none in rig-core 0.40; OpenAI-compatible, Azure OpenAI and Gemini do."

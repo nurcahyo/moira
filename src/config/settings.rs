@@ -522,6 +522,10 @@ impl Settings {
         // immediately. Neither is a tuning choice.
         self.validate_coordination(&mut violations);
 
+        // And again: an API-key prefix shorter than its own namespace plus a usable
+        // random tail is not a tuning choice either.
+        self.validate_api_key_prefix(&mut violations);
+
         // `rag_chunks.chunk_index`, `start_offset` and `end_offset` are all `integer`, and the
         // chunker casts into them. A ceiling at or above `i32::MAX` would make those casts
         // saturate silently, so it is rejected at startup rather than discovered as a chunk
@@ -639,6 +643,37 @@ impl Settings {
         self.workers
             .leader_election_enabled
             .unwrap_or(self.cluster.admission_enabled)
+    }
+
+    /// The API-key prefix must stay long enough to be a lookup key, in every environment.
+    ///
+    /// The prefix is *plaintext* and indexed: `AuthService::verify_api_key` and the
+    /// anonymous invite preview both select a candidate row by it before any Argon2 work
+    /// happens. Two things scale with how much of it is random — the collision rate against
+    /// the unique index over live keys, and the preview endpoint's documented "a caller
+    /// without a valid prefix causes zero Argon2 work" bound.
+    ///
+    /// `ApiKeyHasher::new` used to absorb this with a bare `.max(12)`, which knew nothing
+    /// about the namespace being prefixed: `moira_inv_` is ten characters, so twelve left
+    /// **two** random base64url characters — 4096 distinct prefixes. The shipped default is
+    /// 20, so this was only ever reachable by configuring it, which is exactly why it is
+    /// caught here.
+    ///
+    /// **Refused, not clamped.** A clamp makes the misconfiguration invisible: the operator
+    /// believes they set one value, the process runs another, and nothing says so. The same
+    /// reasoning `validated_invite_lifetime` applies to an invitation's lifetime.
+    fn validate_api_key_prefix(&self, violations: &mut Vec<String>) {
+        use crate::security::{MIN_API_KEY_PREFIX_LENGTH, MIN_RANDOM_PREFIX_CHARS};
+
+        if self.api_keys.prefix_length < MIN_API_KEY_PREFIX_LENGTH {
+            violations.push(format!(
+                "api_keys.prefix_length ({}) must be at least {MIN_API_KEY_PREFIX_LENGTH}, so \
+                 every key namespace keeps {MIN_RANDOM_PREFIX_CHARS} random characters after \
+                 it — a shorter prefix collides on the unique index over live keys and shrinks \
+                 the anonymous invite preview's guessing space to a search",
+                self.api_keys.prefix_length
+            ));
+        }
     }
 
     /// Structural invariants of the admission lease, checked in every environment.
@@ -1372,6 +1407,86 @@ mod tests {
             .to_string();
         assert!(
             error.contains("idempotency.pepper_version must be at most"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The API-key prefix bound, **measured against the hasher** rather than restated.
+    ///
+    /// Restating `MIN_API_KEY_PREFIX_LENGTH`'s own arithmetic here would agree with the
+    /// constant however wrong both were. This generates a real key at the rejected value and
+    /// counts what would actually be left after the namespace — the quantity the unique index
+    /// over live keys and the anonymous invite preview's cost bound both depend on.
+    ///
+    /// It also pins **refusal, not clamping**: the shipped default must pass, and one below
+    /// the floor must produce a startup error, in every environment.
+    #[test]
+    fn the_api_key_prefix_floor_is_the_point_where_a_namespace_stops_leaving_random_material() {
+        use crate::security::{
+            ApiKeyHasher, KEY_NAMESPACES, MIN_API_KEY_PREFIX_LENGTH, MIN_RANDOM_PREFIX_CHARS,
+        };
+
+        let shortest = KEY_NAMESPACES
+            .iter()
+            .min_by_key(|namespace| namespace.len())
+            .expect("at least one key namespace");
+        let longest = KEY_NAMESPACES
+            .iter()
+            .max_by_key(|namespace| namespace.len())
+            .expect("at least one key namespace");
+
+        // At the floor, even the *longest* namespace leaves the required random material.
+        let at_floor = ApiKeyHasher::new(b"pepper".to_vec(), "v1", MIN_API_KEY_PREFIX_LENGTH);
+        let generated = at_floor.generate(longest).expect("generate at the floor");
+        let random = generated
+            .key_prefix
+            .strip_prefix(&format!("{longest}_"))
+            .expect("the prefix still contains the whole namespace");
+        assert_eq!(
+            random.chars().count(),
+            MIN_RANDOM_PREFIX_CHARS,
+            "the floor must be exactly the point where the longest namespace still leaves \
+             {MIN_RANDOM_PREFIX_CHARS} random characters, not a value with slack in it"
+        );
+
+        // One below it, the *shortest* namespace would have been the first to lose material
+        // had the floor not been derived from the longest — which is the drift the derivation
+        // exists to prevent.
+        assert!(
+            MIN_API_KEY_PREFIX_LENGTH - 1 < longest.len() + 1 + MIN_RANDOM_PREFIX_CHARS,
+            "one below the floor must be below the requirement for at least one namespace"
+        );
+        assert!(shortest.len() <= longest.len());
+
+        // Refused, not clamped: the shipped default passes, the value below the floor is a
+        // startup error, and this holds outside production too.
+        let mut settings = Settings::default();
+        assert_eq!(
+            settings.deployment.environment,
+            DeploymentEnvironment::Development,
+            "the check must fire outside production, so this must not be a production default"
+        );
+        settings.validate(ProcessMode::Serve).expect(
+            "the shipped api_keys.prefix_length must satisfy the floor it is validated against",
+        );
+
+        // **Both sides of the boundary, not just the rejected side.** Found by `cargo mutants`:
+        // with only "the default passes" and "one below is refused", turning `<` into `<=`
+        // survived — the default is one *above* the floor, so a comparison that also rejected
+        // the floor itself went unnoticed. The floor has to be an accepted value or it is not
+        // the floor.
+        settings.api_keys.prefix_length = MIN_API_KEY_PREFIX_LENGTH;
+        settings
+            .validate(ProcessMode::Serve)
+            .expect("the floor itself must be an accepted configuration");
+
+        settings.api_keys.prefix_length = MIN_API_KEY_PREFIX_LENGTH - 1;
+        let error = settings
+            .validate(ProcessMode::Serve)
+            .expect_err("a prefix below the floor must be refused at startup")
+            .to_string();
+        assert!(
+            error.contains("api_keys.prefix_length"),
             "unexpected error: {error}"
         );
     }

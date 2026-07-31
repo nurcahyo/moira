@@ -403,7 +403,7 @@ mutation (`admin_identity_already_claimed` where `invite_email_mismatch` was due
 anyway. A guard justified by the wrong property is one refactor away from being removed as
 redundant, because *for that property it is*.
 
-### F20 — on any deployment created after `0017`, no admin is ever primary
+### F20 — on any deployment created after `0017`, no admin is ever primary — **FIXED** `a6d2984`
 
 `claim` never sets `is_primary` — the shared `insert_grant` names no such column — and `0017`'s
 backfill is a one-shot migration-time `UPDATE` that finds an **empty table** on a greenfield deploy.
@@ -411,9 +411,38 @@ So the ownership-transfer endpoint is unreachable by every JWT admin until an op
 the system-key break-glass `PATCH`.
 
 `0017` says "the setup claimant is primary by default", which is true only for deployments that
-already had a claimant when `0017` ran. Not fixed — it is a design decision rather than a typo, and
-`clearing_the_only_primary_is_refused_with_the_last_primary_conflict` now asserts and documents the
-actual behaviour rather than the intended one.
+already had a claimant when `0017` ran.
+
+**Fixed on `fix/findings-sweep` under decision D-F20** (user, 2026-07-31; written into plan 09 §0.2
+with its reversal condition). A single primary, taken at the first grant on a deployment that has
+none — system-key claim or redeemed invitation alike. `insert_grant` computes it in SQL under the
+existing `moiraown` transaction advisory lock; `0019` adds
+`admin_identities_single_active_primary` as the backstop and repairs already-deployed instances;
+`set_primary` now *moves* the flag.
+
+**The load-bearing design choice was which of the two mechanisms decides the race.** A partial
+unique index alone would make the *loser of two concurrent first grants fail with a 500* — the
+index cannot express "you are second, so you are not the owner", only "you are second, so you are
+rejected". The advisory lock is what turns that into a demotion; the index is what keeps the
+invariant true if a future path forgets the lock. Pinned by
+`two_simultaneous_first_grants_produce_exactly_one_owner_and_no_failure`, whose assertion is
+deliberately *both* `201`s **and** one owner — a test that accepted a failing racer would pass
+against the index-only design.
+
+**Consequence worth knowing:** a deployment's sole admin can no longer be revoked through the API.
+They are the owner, revocation clears `is_primary`, and the last-primary guard refuses it. Transfer
+first, then revoke. Documented in `docs/admin-identity-claiming.md`.
+
+**`0019`'s repair path was verified against real PostgreSQL, not reasoned about** — it is the one
+part of the change no test in the suite can reach, because by the time a test runs the migration has
+already applied. Three scenarios on throwaway databases:
+
+| Scenario | Result |
+|---|---|
+| Three active grants, **two** primary, setup claimant = the *younger* of the two | Collapsed to one, and the **claimant** survived, not the oldest. The `coalesce(id = claimant, false) desc` is load-bearing: `desc` puts NULLs *first* in PostgreSQL, so without the `coalesce` a deployment with no recorded claimant would sort an arbitrary row to the top |
+| Zero primaries, a recorded claimant (**the F20 population**) | Claimant promoted, the other grant untouched |
+| Re-running the whole migration | Nothing moved; the index creation is `if not exists` |
+| `update … set is_primary = true` on a second row afterwards | `ERROR: duplicate key value violates unique constraint "admin_identities_single_active_primary"` — which is also what makes `already_claimed_on_unique_violation`'s constraint-name match real rather than assumed |
 
 ### METHOD NOTE — right conclusion, wrong mechanism, and the test that would have proved nothing
 
@@ -612,7 +641,7 @@ and document it, or move `content_hash` to the unkeyed `request_hash` on the sam
 used for `chunk_hash` — peppering exists to protect digests of request bodies that carry provider
 API keys, and memory content is not that.
 
-### F13 — a duplicate trusted JWT issuer returns 500, not 409
+### F13 — a duplicate trusted JWT issuer returns 500, not 409 — **FIXED** `a6d2984`
 
 Every other uniqueness conflict in the tree maps to a 409 — `auth_provider_settings` has an
 `is_unique_violation` → `duplicate_auth_provider` mapping. `trusted_jwt_issuers` has none, so a
@@ -621,7 +650,75 @@ duplicate falls through `AppError::Sqlx` to **500 `database_error`**.
 Consequence, found while building plan 08's console: an orphaned-issuer retry path cannot recover by
 catching a 409, because the 409 never comes. Plan 08 worked around it by listing-then-adopting
 rather than create-then-recover, which is the right client behaviour regardless — but the server
-shape is still wrong. Plan 03 territory; small, clearly correct, not yet scheduled.
+shape is still wrong.
+
+Fixed with `duplicate_trusted_jwt_issuer`: the mapping on **both** `create_trusted_jwt_issuer`
+implementations (the pool one and the command-transaction one — only the second is on the live
+route, but a mapping that exists on one of two identical inserts is a trap for whoever wires the
+other), the catalog entry, the `docs/i18n-response-catalog.json` mirror, the OpenAPI 409, and
+`a_second_trusted_jwt_issuer_for_the_same_issuer_returns_409_not_500` beside the
+`duplicate_auth_provider` test it was missing — the two are the same condition on two tables, and
+the reason the gap survived four plans is that nothing ever put them next to each other.
+
+### F21 — a successful invite redemption cannot be replayed, and the API said it could
+
+Found while writing the `Idempotency-Key` round-trip test the wave-2 sweep asked for.
+
+`POST /api/v1/admin/admin-invites/redeem` documented *"a repeated request with the same key and
+body replays the stored response instead of creating a second grant"*. It does not, and it cannot:
+`redeem_invite` validates **before** the transactional envelope — deliberately, so a policy refusal
+never consumes the invite — and by the time a retry arrives the invite is `consumed`, so
+`require_redeemable` refuses it with `409 invite_already_consumed` and `AdminCommandRunner::execute`
+is never entered. The `Idempotency-Key` is read and can never matter on the success path.
+
+The outcome is safe either way (a single-use invitation cannot produce a second grant), so this is
+a **documentation** defect, not a behavioural one — but it is the kind that gets a client written
+against it. Corrected in the route's parameter description and asserted by
+`an_idempotent_replay_does_not_count_a_second_invitation_or_redemption`.
+
+**It also corrects the wave-2 leftover it was found under.** "`create_invite`/`redeem_invite`
+double-count an idempotent replay" is true of `create_invite` and **unreachable** for
+`redeem_invite`'s success path. The replay that *is* reachable there is a **failure** replay: a
+refusal raised inside the envelope (`admin_identity_already_claimed` from `insert_grant`) is a
+cacheable 409, so the ledger stores it, `consume_invite` never runs, the invite stays pending, and
+the retry gets past the pre-envelope check to the stored response — arriving as
+`AppError::Replayed`. That is where one refused redemption was being counted once per client retry,
+turning a denial-rate alert into a measure of the client's retry policy. Both are fixed; the
+success-path guard is kept and documented as currently-unreachable, because the property it leans
+on lives in a different function and moving validation inside the envelope — which plan 09 §0
+originally proposed — would silently reintroduce it.
+
+### F22 — `api_keys.prefix_length` clamped at 12, which is two random characters for an invite token
+
+`ApiKeyHasher::new` clamped with a bare `.max(12)`, a number that knew nothing about the namespace
+it would be prefixing. `moira_inv_` is ten characters, so a configured `prefix_length` of 12 left
+**two** random base64url characters: 4096 distinct prefixes, colliding on
+`admin_invites_token_prefix_active_unique` (an unmapped unique violation, i.e. a 500) and reducing
+the anonymous preview endpoint's documented *"no Argon2 work without a valid prefix"* bound to a
+4096-guess search.
+
+The shipped default is 20, so this was configuration-only and never live.
+
+**Decision: refuse at startup, do not raise the clamp.** A clamp makes a misconfiguration
+*invisible* — the operator sets one value, the process runs another, and nothing says so. That is
+the same reasoning `validated_invite_lifetime` already applies to an invitation's lifetime
+("refused rather than clamped: an operator who believes they issued a 30-day invite and silently
+received a 3-day one discovers the difference at the worst possible moment"), so this follows an
+established rule rather than inventing one. `Settings::validate` now rejects anything below
+`MIN_API_KEY_PREFIX_LENGTH`, which is **derived** from the longest entry in a new `KEY_NAMESPACES`
+table plus `MIN_RANDOM_PREFIX_CHARS = 8`, never written down. The floor in `ApiKeyHasher::new`
+stays, retargeted, as a backstop configuration can no longer reach.
+
+Two gates keep the derivation honest, because the constant is only as good as the namespace list:
+a source walker over `src/` for inline `generate("…")` call sites, and — for `ADMIN_INVITE_NAMESPACE`,
+which is a `const` and therefore invisible to any walker — a `const` assertion that fails the
+**build**. The invite namespace is both the shortest and the only one no walking gate could see,
+which is exactly why it was the one that broke.
+
+*Reversal condition:* raising `MIN_RANDOM_PREFIX_CHARS` is free. Lowering it, or removing the
+startup check in favour of a clamp, needs an argument about the preview endpoint's cost bound —
+that endpoint is anonymous, and the bound is the only thing standing between it and an Argon2
+CPU-exhaustion oracle.
 
 ### F11 — a retention batch could delete its whole table in one transaction — **FIXED** `9799826`
 
@@ -900,7 +997,7 @@ an "active sessions" screen over an in-memory store would be the appearance of a
 |---|---|---|
 | ~~**F15**~~ | ~~Console cannot render a sign-in button without a credential it can only get by signing in~~ **RESOLVED** — anonymous `GET /api/v1/admin/setup/sign-in-methods`. *Not* by serving `PublicAuthMethod` as recommended: that carries `allowed_email_domains`, the deny-by-default admin-claim policy | `fix/f15-anonymous-auth-methods` |
 | **F14** | Memory dedupe silently stops matching after a pepper rotation | plan 11 Sub-Phase F |
-| **F13** | Duplicate trusted JWT issuer returns 500, not 409 | plan 03 territory |
+| ~~**F13**~~ | ~~Duplicate trusted JWT issuer returns 500, not 409~~ **FIXED** `a6d2984` | `fix/findings-sweep` |
 | **F2** | Pre-auth query-field enumeration | user deferred |
 | **F6** | OTel exports every span; `env_filter` is the sole barrier to Rig prompt spans | unscheduled |
 | — | Admin write + audit row still non-atomic | unscheduled |
@@ -1145,6 +1242,32 @@ That is accidental coverage worth keeping rather than optimising away.
    exist. No citation format would have caught any of those — the ban removes drift *volume*, not
    the danger in it.
 
+## WHAT THE FINDINGS-SWEEP BRIEF GOT WRONG — 2026-07-31
+
+Recorded because the brief was assembled from *these* finding descriptions, so the errors are in
+the ledger's own text and will be inherited by the next brief drawn from it.
+
+1. **"`begin_admin_command` takes no advisory lock on any path, so `redeem_invite`'s doc clause
+   describes something that does not exist."** The clause described the right *behaviour* and named
+   the wrong *function*. `begin_admin_command` indeed takes none — but
+   `PgAdminCommandTransaction::claim_idempotency`, which `AdminCommandRunner::execute` calls
+   immediately after, takes a per-key `pg_try_advisory_xact_lock`. So a pre-envelope refusal really
+   does skip an advisory lock, **whenever the request carries an `Idempotency-Key`**; without one
+   the clause is vacuous rather than false. The comment was rewritten to name the real lock and its
+   condition, not deleted.
+2. **"`create_invite`/`redeem_invite` … an idempotent replay double-counts one invitation."** True
+   for `create_invite`. **Unreachable** for `redeem_invite`'s success path, because the pre-envelope
+   check refuses the consumed invite before the envelope is entered — see F21. The reachable
+   double-count on that path is a *failure* replay, which the brief did not mention and which is the
+   one that distorts an operator-facing denial-rate metric.
+
+Both errors share a shape worth naming: **a conclusion that is right about the system and wrong
+about the mechanism.** That is the same shape as the METHOD NOTE above (plan 09 §0's replayed-403
+argument) and as F15's "a type was named as safe without reading its fields". Three occurrences now.
+The practical rule: when a brief asserts a mechanism, verify the mechanism before writing the test,
+because *the test follows the reason* — and a test written to a wrong reason passes in both the
+fixed and the broken arrangement.
+
 ## COMPACTION DISCIPLINE — added 2026-07-31
 
 This run is unattended and long, so context *will* be summarised. **The rule: this file, the plan
@@ -1166,7 +1289,52 @@ The "State at a glance" block above exists precisely so a compacted context can 
 
 ## Cycle log
 
-### Cycle 11 — 2026-07-31 — PR #39 blocked by a pre-existing LISTEN/NOTIFY race; wave 4 re-audit
+### Cycle 11 — 2026-07-31 — findings sweep (`fix/findings-sweep`, `a6d2984`)
+
+F20, F13 and the wave-2 leftovers, plus `cargo-mutants` adopted. Details in each finding's section
+above and in plan 09 §0.2 (decision D-F20). Four things worth carrying forward:
+
+1. **Fixing F20 falsified four existing tests' premises, and that was the useful signal.**
+   `create_preview_redeem_grants_admin_and_consumes_the_invite`,
+   `clearing_the_only_primary_is_refused_with_the_last_primary_conflict`,
+   `a_non_primary_admin_cannot_promote_itself_to_primary` and
+   `the_grant_administration_conflicts_are_pinned_to_their_paths` each asserted "a redeemed grant is
+   not primary" or built on a deployment with no owner. Every one was rewritten to state the *new*
+   premise explicitly — the non-primary test now creates an owner first, precisely so the 403 it
+   asserts is still due. Adjusting an assertion until it goes green would have left four tests whose
+   stated premise no longer described the system.
+2. **Two of the brief's four premises were wrong in detail** (see the section below). The pattern
+   from cycle 10 held: every wave that was asked to check its brief, found something.
+3. **A gate log named a different worktree's path.** One `scripts/gates.sh` run wrote
+   `Checking moira v0.1.0 (…/scratchpad/f15)` into a log produced from `…/scratchpad/fsweep`, and
+   the same run lost every `^test result` line, which made `gates.sh` exit 1 with no diagnostic at
+   all (`grep` finds nothing → `pipefail` → `set -e`). Re-run under `bash scripts/gates.sh` with
+   `PWD`/`command -v cargo`/`CARGO_TARGET_DIR` echoed into the log, it was correct and green. **Echo
+   provenance into every gate log**: without those three lines the anomaly was indistinguishable
+   from a real failure, and it is a seventh form of the "exit codes lie here" problem.
+4. **`cargo-mutants` is adopted scoped, not tree-wide** — `scripts/mutants.sh` diffs against the
+   merge base and passes `--in-diff`. Deliberately **not** wired as a blocking CI gate; see
+   `docs/mutation-testing.md` for the measured reason and the reversal condition.
+
+   **First run: `63 mutants tested in 2h: 9 missed, 25 caught, 29 unviable`.** All nine survivors
+   were real gaps in code written the same day, in tests written the same day to cover exactly
+   that code. The worst was `set_primary`'s `is_primary && !current.is_primary` → `||`: a
+   `PATCH {"is_primary": false}` on a grant that never owned anything would demote **the actual
+   owner**, through a `200 OK`, around the last-primary guard — which inspects only the row being
+   written. That is the ownerless state F20 describes, re-created by the fix for F20, and nothing
+   in a 887-test suite noticed.
+
+   Every survivor shared one shape: **the test exercised only the side of the boundary the code was
+   written for.** A floor tested at floor−1 and at floor+1 but never at the floor; a membership
+   test with no non-member; an error mapper only ever handed the error it maps. All nine are now
+   killed, verified by re-applying each mutation by hand and watching the named test fail
+   (`scratchpad/verify-mutants.sh`), because re-running the tool costs two hours and answers the
+   same question.
+### Cycle 11 (continued) — 2026-07-31 — PR #39 blocked by a pre-existing LISTEN/NOTIFY race; waves 4–5 re-audited
+
+*The section above is the findings-sweep implementation's own record, written on the branch. This one
+is the coordination cycle that carried it to merge. Both were authored as "Cycle 11" concurrently and
+are kept whole rather than reconciled into a single narrative — they describe different work.*
 
 **PR #39 did NOT merge on arrival — its `rust` job ran and failed.** Run `30617393166`: four of five
 jobs green (`supply-chain`, `container-and-helm`, `console`, `console-container-and-helm`); `rust`
