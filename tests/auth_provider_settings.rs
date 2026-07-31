@@ -12,7 +12,7 @@
 
 mod support;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     Router,
@@ -45,6 +45,72 @@ const SECRET_SHAPED: [&str; 8] = [
 ];
 
 const WAIT: Duration = Duration::from_secs(10);
+
+/// The channel `listen_once` subscribes to (`src/infra/db.rs`) and every
+/// `notify_moira_runtime_config_change()` trigger publishes on (`migrations/0002`,
+/// `migrations/0013`). Repeated here rather than imported because it is not exported;
+/// a rename on either side makes [`wait_for_listener_attached`] fail loudly on its
+/// deadline rather than quietly stop gating.
+const RUNTIME_CONFIG_CHANNEL: &str = "moira_runtime_config";
+
+/// Paces [`wait_for_listener_attached`]. The first tick of a `tokio` interval completes
+/// immediately, so an already-attached listener costs nothing and only a genuine failure
+/// pays the deadline.
+const ATTACH_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Blocks until this database holds a session that has *committed*
+/// `LISTEN "moira_runtime_config"`.
+///
+/// # Why a write needs this before it can be observed
+///
+/// `spawn_runtime_config_listener` returns its `JoinHandle` the instant the task is
+/// created; only then does the task acquire a connection and execute its `LISTEN`.
+/// Postgres delivers a notification solely to sessions that were already listening when
+/// the notifying transaction committed, so a write that races the attach is not delivered
+/// late — it is **lost**, permanently, and no amount of polling afterwards recovers it.
+/// Waiting for the attach is therefore a missing precondition, not a tolerance: the
+/// assertion that follows it is unchanged, and a fixed sleep here would only be a guess
+/// at how long the attach takes (CONVENTIONS §3).
+///
+/// # Why this observation is sound
+///
+/// [`LifecycleFixture`] clones a database per test, so `datname = current_database()`
+/// cannot be satisfied by a concurrent suite's listener — this can only ever see the one
+/// this test spawned. `state = 'idle'` is what makes it an acknowledgement rather than a
+/// sighting: a backend reports idle only once the statement it was running has committed,
+/// which is exactly the point from which delivery is guaranteed. And sqlx's `PgListener`
+/// issues `LISTEN "moira_runtime_config"` (`PgListener::listen`, quoting the channel) and
+/// then executes nothing further while it blocks in `recv()`, so that text remains the
+/// session's `query` for as long as the listener lives — verified against
+/// `pg_stat_activity` on a live listener, both before and after a delivered notification.
+async fn wait_for_listener_attached(pool: &sqlx::PgPool) {
+    let mut ticker = tokio::time::interval(ATTACH_POLL_INTERVAL);
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let attached: bool = sqlx::query_scalar(
+            "select exists( \
+                 select 1 from pg_stat_activity \
+                 where datname = current_database() \
+                   and state = 'idle' \
+                   and query ilike 'listen%' \
+                   and strpos(query, $1) > 0 \
+             )",
+        )
+        .bind(RUNTIME_CONFIG_CHANNEL)
+        .fetch_one(pool)
+        .await
+        .expect("read pg_stat_activity");
+        if attached {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the runtime config listener never issued LISTEN \"{RUNTIME_CONFIG_CHANNEL}\" \
+             within {WAIT:?}; without it every NOTIFY this test emits is dropped on the floor"
+        );
+        ticker.tick().await;
+    }
+}
 
 struct HttpResult {
     status: StatusCode,
@@ -857,12 +923,16 @@ async fn an_auth_settings_write_invalidates_the_cache_via_listen_notify() {
     .await;
     assert_eq!(enabled.status, StatusCode::OK, "{:?}", enabled.body);
 
-    let listener = moira::infra::db::spawn_runtime_config_listener(
-        fixture.pool.clone(),
-        moira::infra::db::RuntimeInvalidationTargets::from_state(&fixture.state),
-    );
-
     // Populate the cache through the read path the console uses.
+    //
+    // Done *before* the listener exists, deliberately. The read used to sit between the
+    // spawn and the write, where its latency happened to give the listener time to attach —
+    // an accident, not a guarantee, and one that stopped holding under CI load (run
+    // 30617393166). With it moved here, the only thing standing between the spawn and the
+    // write is `wait_for_listener_attached`, so the gate is load-bearing and a regression in
+    // it cannot be papered over by incidental delay. The create and enable above commit
+    // before the listener attaches too, which means their notifications are lost rather than
+    // arriving later and clearing the cache for a reason this test is not asserting.
     let read = request(
         router,
         "GET",
@@ -882,6 +952,15 @@ async fn an_auth_settings_write_invalidates_the_cache_via_listen_notify() {
             .is_some(),
         "the read path must populate the cache, or this test proves nothing"
     );
+
+    let listener = moira::infra::db::spawn_runtime_config_listener(
+        fixture.pool.clone(),
+        moira::infra::db::RuntimeInvalidationTargets::from_state(&fixture.state),
+    );
+    // The precondition the write below depends on: Postgres routes a notification only to
+    // sessions already listening at commit time, so a write issued before the attach is
+    // silently discarded rather than delayed.
+    wait_for_listener_attached(&fixture.pool).await;
 
     // Write straight to the table rather than through the service, so the *only* thing that
     // can clear the cache is the NOTIFY trigger — the service's own local invalidation is
