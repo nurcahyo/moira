@@ -78,6 +78,40 @@ export const SENTINEL_ENV: Readonly<Record<string, string>> = {
     "moira-e2e-sentinel-decrypted-credential-1c8f0b6a45d29e7360b4af92d1053e8c",
 };
 
+/**
+ * ============================================================================
+ * SECRETS THE ENVIRONMENT HARVESTER CAN NEVER SEE
+ * ============================================================================
+ *
+ * `forbiddenValues()` below builds its needle set from the console's own
+ * ENVIRONMENT, by name pattern. That covers every credential the console is
+ * CONFIGURED with — and covers nothing that Moira MINTS AT RUNTIME.
+ *
+ * The once-only invitation token is exactly that: `AdminInviteSecretResponse.secret`
+ * exists for one response, is never written to the console's environment, and is
+ * never read from it. So every assertion in `secret-leak.e2e.ts` would stay
+ * green while an invite token leaked through an RSC payload — the failure this
+ * whole suite exists to catch, in the one shape it could not see.
+ *
+ * The repair is a needle this suite OWNS. `ONCE_ONLY_SECRET_FIXTURE` is the
+ * token `tests/unit/modules/OnceOnlySecretModal.test.tsx` renders, imported from
+ * here so the two cannot drift: if that value ever reaches a build output or a
+ * browser-visible response, this gate finds it.
+ *
+ * It satisfies `isUsableNeedle` by construction — 42 characters, no whitespace,
+ * no `/` and no `\` — the same constraints wave 1 solved for the DSN password
+ * at `e2e/support/console-env.ts:44-49`. A value containing `/` would be
+ * discarded as a needle and silently stop being checked.
+ *
+ * WHAT IS NOT YET COVERED, and how you will find out: no route mounts
+ * `OnceOnlySecretModal` in this wave, so the needle is armed but nothing renders
+ * it. `secret-leak.e2e.ts` asserts that fact directly, so the assertion FAILS
+ * the moment a page does mount the modal — at which point the author has to
+ * point the fixture at that page rather than discovering months later that the
+ * gate never watched the render.
+ */
+export const ONCE_ONLY_SECRET_FIXTURE = "moira-invite-token-fixture-8c41ab07f2de9536";
+
 /** A value we must never find in client-visible output, plus a safe label. */
 export interface Needle {
   /** Human-readable origin, safe to print in a failure message. */
@@ -149,6 +183,14 @@ export function forbiddenValues(env: NodeJS.ProcessEnv = process.env): Needle[] 
   for (const [name, value] of Object.entries(SENTINEL_ENV)) {
     needles.set(value, { label: `${name} (seeded sentinel)`, value });
   }
+
+  // Runtime-minted, never in any environment. Added unconditionally rather than
+  // harvested — there is no variable to harvest it from, which is the whole
+  // point. See the block comment above.
+  needles.set(ONCE_ONLY_SECRET_FIXTURE, {
+    label: "once-only invitation token (runtime-minted fixture)",
+    value: ONCE_ONLY_SECRET_FIXTURE,
+  });
 
   for (const [name, value] of Object.entries(env)) {
     if (typeof value !== "string") continue;

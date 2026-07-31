@@ -26,6 +26,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { CONSOLE_CATALOG } from "@/lib/i18n";
 import { CONSOLE_MESSAGE_KEYS, type ConsoleMessageKey } from "@/lib/i18n/keys";
 import type { AdminInviteRecord, ResponseText } from "@/lib/types";
+import { ONCE_ONLY_SECRET_FIXTURE } from "../../../e2e/support/secrets";
 
 /* -------------------------------------------------------------------------- */
 /* The recorder                                                               */
@@ -80,8 +81,16 @@ const { OnceOnlySecretModal } = await import("@/modules/secrets/OnceOnlySecretMo
 /** The catalog's English. Never a literal in this file — see SignInPanel.test. */
 const copy = (key: ConsoleMessageKey): string => CONSOLE_CATALOG[key].message;
 
-/** High-entropy, and unmistakable if it turns up somewhere it should not. */
-const TOKEN = "moira-invite-token-fixture-8c41ab07f2de9536";
+/**
+ * High-entropy, and unmistakable if it turns up somewhere it should not.
+ *
+ * Imported from the e2e needle set rather than declared here, so the two cannot
+ * drift. `e2e/secret-leak.e2e.ts` scans every build output and every
+ * browser-visible response for this exact string — the environment harvester
+ * that finds the console's other credentials can never see a runtime-minted one,
+ * so this is the needle that suite owns. See `e2e/support/secrets.ts`.
+ */
+const TOKEN = ONCE_ONLY_SECRET_FIXTURE;
 
 const RECORD: AdminInviteRecord = {
   id: "11111111-2222-3333-4444-555555555555",
