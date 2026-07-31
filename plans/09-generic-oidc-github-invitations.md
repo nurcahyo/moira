@@ -1462,6 +1462,126 @@ created_at asc, id asc` in full, §0.7.2's W4-B1 prose says "leaving `created_at
 checks out against the tree, including the WHERE-clause scope, the `issuer = $1` outranking vector,
 and the reachability of the state through Moira's admin API without any console involvement.
 
+### §0.8.8 Amendment — what wave 5's implementation found, and what it changed
+
+Written during implementation, for the same reason §0.7.6 and §0.7.7.5 exist. Where this subsection
+and anything above it disagree, **this wins**.
+
+#### §0.8.8.1 Corrections to §0.8 itself
+
+1. **§0.8.4 step 6 is incomplete about `Idempotency-Key`.** It lists the header as declared on
+   "create, revoke, redeem and delete" for the invite/identity family. The committed spec ALSO
+   declares it on `patch_admin_identity`, alongside its required `If-Match`. The registry follows
+   `docs/openapi.json`; `moira-client.test.ts`'s exact-set assertion now names eight operations.
+2. **`revoke_admin_invite` is `POST /admin-invites/{id}/revoke`, not a `DELETE`.** There is no
+   `DELETE /admin-invites/{id}` in the spec at all. §0.8 never says otherwise, but the task list's
+   name (`revokeAdminInvite`) reads as one and a console that guessed would 404 in front of an
+   operator.
+3. **`delete_admin_identity` returns the record, not `204`.** Its 200 body is
+   `AdminIdentityRecord` carrying the `admin_identity_revoked` notice. Typing it `void` compiles and
+   silently drops the one string the operator is meant to see.
+4. **The ownership `PATCH` reuses `moira.notice.admin_identity_claimed`.** There is no
+   `admin_identity_ownership_transferred` notice; `set_primary` returns
+   `record_from_grant_with_notice(grant, claimed_notice())`. §0.8.4 step 9's list of three notices to
+   mirror is right, but the transfer's notice is a fourth key that was already mirrored.
+5. **§0.8.5 item 5b is stale.** It says `checkSession` "and `isEmailDomainAllowed` have no shipped
+   caller". Wave 4A closed F25: `checkSession` is wired at `jwt.getSubject`, at the token route and
+   at the `(console)` layout gate, and `guard-reachability.test.ts` fails if the call sites go. The
+   instruction it carries — *wire it deliberately, with a test that fails when it is unwired* — is
+   what `route-handler-session.test.ts` does for the new handlers.
+
+#### §0.8.8.2 W5-B11 re-read against the post-4A tree
+
+**The blocker holds, and one of its two consequences is now unreachable.**
+
+`governing_policy` is gone. `admission_policy` resolves the row bound to the caller's trusted issuer
+first and reaches the `issuer = $1` branch only when nothing is bound, refusing a duplicate set with
+`409 duplicate_enabled_provider_for_issuer` instead of taking the first of it. So:
+
+* **The under-strict consequence survives unchanged.** Redemption still applies exactly ONE row.
+  `PublicAuthMethod` still carries neither `trusted_jwt_issuer_id` nor `created_at`, so the console
+  still cannot tell which row wins and can still only compute a union. With N enabled providers the
+  union is strictly wider than the governing row.
+* **The over-strict consequence is closed.** §0.8 said "under F23 it can also be narrower in the
+  other direction: a row whose own `issuer` equals the console's outranks the correctly linked row at
+  any age". That shape (F23 shape (b)) is now refused at write time by
+  `auth_provider_issuer_shadows_trusted_issuer`, and shape (a) is unrepresentable after `0020`'s
+  partial unique index. The gate can no longer block an invitation that would in fact have redeemed.
+* **The reversal condition is closer but not met.** It fires when `admission_policy` becomes the
+  union (rejected — §0.7.7 chose the two-stage lookup instead, and W4-D4 is superseded) **or** when
+  Moira refuses more than one enabled row per trusted issuer. 4A refuses more than one per
+  *trusted issuer*, and 4B gives each provider its **own** trusted issuer — so N enabled providers
+  remain legal and the union remains wider than the governing row. **W5-D11 stands as taken.**
+
+Implemented exactly as W5-D11 specifies: block at zero providers, block on an uncovered domain at
+exactly one, warn with the reason above that, and say which of the two it is doing.
+
+#### §0.8.8.3 §0.8.4 step 24 was not implementable as written, and what replaced it
+
+Step 24 says to add the final-URL assertion and *"expect `/` and `/admins` to fail it until an
+authenticated e2e path exists. Record that failure honestly; do not weaken the assertion to make it
+pass."*
+
+A permanently red merge gate is not a gate. It blocks every later change for a reason unrelated to
+that change, and the pressure to weaken it is then constant — which is how the assertion would
+eventually be lost, not kept.
+
+**Taken instead (W5-D7′):** the walker classifies each route as gated or public from its source path,
+asserts a **public** route's final pathname equals the one it asked for before running axe, asserts a
+**gated** route redirects to `/login` and does not audit it, and pins the unaudited set in BOTH
+directions against a declared list. The same information is visible, the same drift fails, and the
+suite can be merged: a gated route added without an edit fails on one side, a stale entry fails on
+the other.
+
+Mutation-verified: injecting a `redirect("/login")` into `/invite/[token]` — a public route — fails
+the URL assertion naming both URLs; removing `/admins` from the declared list fails the set
+assertion. *Reversal condition:* when an authenticated Playwright project exists, delete the entries
+and keep the URL assertion, which is what will prove the authenticated run does anything.
+
+#### §0.8.8.4 The tripwire in §0.8.4 step 23 would have missed its own trigger
+
+`secret-leak.e2e.ts`'s "no shipped route mounts `OnceOnlySecretModal` yet" grepped `app/**` for the
+literal module path. The mount that arrived is `app/(console)/admins/page.tsx` importing
+`modules/admins/InviteAdminForm.tsx`, which imports the modal — the page's own source contains no
+such string. **Verified by mutation: with the modal mounted and the old walk restored, the tripwire
+is green.**
+
+Replaced with a transitive import walk (`e2e/support/module-graph.ts`) and two assertions: the
+mounting set is non-empty and names the page, and every mounting route is gated. The second is what
+W5-B4's render assertion becomes given no authenticated storage state — if anyone mounts the modal on
+a **public** route the render becomes reachable from Playwright and the assertion fails, which is the
+commit on which the fixture-token assertion can finally be written.
+
+#### §0.8.8.5 What wave 5 did NOT land, and why
+
+* **`invite-redeem.e2e.ts`, `invite-domain-policy.e2e.ts`, `ownership-transfer.e2e.ts`,
+  `authorization-denial.e2e.ts`** — all four need a live Moira **and** an authenticated session.
+  `MOIRA_API_URL` is `https://moira.invalid` in the e2e environment and there is no storage state, so
+  each could only be written as a spec that navigates, gets redirected, and asserts nothing about the
+  behaviour it is named for. That is §0.8.5 escalation 1 happening on purpose. The denial case
+  (`admin_identity_not_primary`, a live non-primary grant meeting `require_primary_actor` — W5-B9's
+  correction) is covered at unit level instead.
+* **`invite-negative.e2e.ts` and `i18n-message-key.e2e.ts` DID land**, because the unauthenticated
+  half is genuinely drivable.
+
+#### §0.8.8.6 One design point §0.8 did not anticipate
+
+`SECRET_PROP_PATTERN` matches `token`, so `InviteAcceptPanel` cannot receive the invitation token as
+a prop — and W5-D5's route handlers cannot be reached without knowing it. The resolution is the one
+the repository already chose for the once-only token: **`CopyButton` takes an element id and reads
+the value out of the DOM at click time**. `InviteAcceptPanel` reads the token out of
+`location.pathname` at click time, from the URL the browser already holds, so no prop and no
+serialised payload carries it. A `resolvePathname` seam exists for the unit test, because a test that
+passed the token in would be exercising a different component from the one that ships.
+
+Consequence worth recording: the token IS present in the RSC router state, because it is a dynamic
+route segment. An assertion that `page.content()` omits it was written, run, and **failed on a
+correct page**. The honest property — and what `invite-negative.e2e.ts` asserts — is that it never
+reaches VISIBLE COPY, with the no-foreign-origin assertion in `smoke.e2e.ts` covering the `Referer`
+half.
+
+---
+
 ---
 
 **Objective.** Extend the Moira admin console (shipped in plan 08 as a Better Auth BFF with Google sign-in and a working `genericOAuth` baseline) with **operator-facing provider extensibility** and **multi-admin lifecycle**: hardened generic-OIDC support managed from the console rather than from environment variables, a GitHub sign-in option, an invitation flow so an existing admin can grant a new `(issuer, subject)` admin identity **without touching Moira's bootstrap system key** — the actual gap, since Moira already grants N admins *via that key* (§0.5) — refined session management, and an ownership-transfer / account-recovery story that goes beyond the system-key break-glass that plans 07/08 already provide.

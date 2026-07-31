@@ -1376,6 +1376,58 @@ promises "never a window where both or neither exist" would be the appearance of
 mid-transaction failure-injection test asserting neither half persists without the other. The UI is a
 follow-on to that, never its driver.
 
+## W5-D7′ — the a11y walker DECLARES its blind spot instead of failing forever (taken by the loop, 2026-07-31)
+
+Plan 09 §0.8.4 step 24 asked for the final-URL assertion plus a permanently red suite: *"expect `/`
+and `/admins` to fail it until an authenticated e2e path exists. Record that failure honestly."*
+
+A permanently red merge gate is not a gate. It blocks every later change for a reason unrelated to
+that change, and the pressure to weaken it is then constant — which is how the assertion gets lost
+rather than kept.
+
+**Taken instead:** the walker classifies each route as gated or public from its source path;
+a **public** route's final pathname is asserted to equal the one requested BEFORE axe runs; a
+**gated** route is asserted to redirect to `/login` and is NOT audited; and the unaudited set is
+pinned in **both directions** against a declared list. Same information visible, same drift fails,
+and it merges.
+
+Mutation-verified: a `redirect("/login")` injected into the public `/invite/[token]` fails the URL
+assertion naming both URLs; removing `/admins` from the declared list fails the set assertion.
+
+*Reversal condition:* when an authenticated Playwright project exists — which needs a mock IdP inside
+the e2e environment — delete the declared entries and KEEP the URL assertion. The assertion is what
+will prove the authenticated run is doing anything.
+
+## THE THIRD TOOTHLESS GUARD, CAUGHT BY ITS OWN MUTATION — 2026-07-31 (plan 09 wave 5)
+
+**`route-handler-session.test.ts`'s named mutation left it GREEN.** The guard is "every route handler
+under `app/api/**` re-checks the session itself" — necessary because route groups contribute no
+layout there, so a handler inherits no gate. It scanned each `route.ts` for `withConsoleSession(`.
+
+The mutation was to delete the guard from `DELETE` in `app/api/admins/identities/[id]/route.ts`,
+which exports **both** `PATCH` and `DELETE`. It passed: the file still contained the call, in the
+other handler.
+
+**A file-level scan can express "some handler is guarded", never "every handler is"** — and the
+second exported method in a file is exactly where an unguarded mutation endpoint would go.
+
+Rebuilt per exported method, with the body brace-matched. Two extractor bugs surfaced only by
+re-running the mutation, not by reading the code:
+
+1. the first `{` after `export async function POST` is inside the **second parameter's** type
+   annotation (`{ params: Promise<…> }`), so brace-matching from there ended the "body" before it
+   began, and a correctly guarded handler was reported as unguarded;
+2. `export const GET = handle;` has no body. Skipping it would have made the alias form a hole in the
+   rule, so it is recorded with an empty body — i.e. unguarded — which is the safe direction.
+
+Re-mutated after the fix: both the `DELETE`-only deletion and the alias rewrite fail, naming the
+method.
+
+**Third occurrence of the same shape** (after F19's enumeration oracle and G1's decoy-less fixture).
+The standing question is now: *after any change to what a guard measures, can its fixture still
+represent the defect it is named for?* Here the answer was no for a reason nothing in the code
+looked wrong about.
+
 ## D3 — wave 4 implements Option A′, staged 4A / 4B (taken by the loop, 2026-07-31)
 
 Decided by a judged panel: three worked designs, three judge lenses (security closure, migration and
