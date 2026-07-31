@@ -22,7 +22,9 @@ const KEY = Buffer.alloc(32, 0x11);
 const CLIENT_ID = "console.apps.idp.test";
 const SECRET = "the-client-secret";
 
-function providerRow(overrides: Partial<AuthProviderSettingsRecord> = {}): AuthProviderSettingsRecord {
+function providerRow(
+  overrides: Partial<AuthProviderSettingsRecord> = {},
+): AuthProviderSettingsRecord {
   return {
     id: "11111111-1111-4111-8111-111111111111",
     method: "generic_oidc",
@@ -181,12 +183,7 @@ describe("resolveAuthConfig", () => {
   });
 
   test("`jwks` is not an interactive sign-in method", () => {
-    const result = resolveAuthConfig(
-      [providerRow({ method: "jwks" })],
-      sealedFor(),
-      SECRET,
-      null,
-    );
+    const result = resolveAuthConfig([providerRow({ method: "jwks" })], sealedFor(), SECRET, null);
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.problem).toBe("method_not_interactive");
@@ -359,7 +356,9 @@ describe("isEmailDomainAllowed", () => {
 
 describe("endpoint and method predicates", () => {
   test("a discovery URL alone is enough", () => {
-    expect(hasUsableEndpoints(providerRow({ authorization_url: null, token_url: null }))).toBe(true);
+    expect(hasUsableEndpoints(providerRow({ authorization_url: null, token_url: null }))).toBe(
+      true,
+    );
   });
 
   test("an authorize/token pair alone is enough", () => {

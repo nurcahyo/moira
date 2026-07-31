@@ -162,9 +162,10 @@ describeDatabase("the schema matches what better-auth wants", () => {
       const describe_ = async (options: unknown) => {
         const scratch = new Pool({ connectionString: temporaryDsn, max: 1 });
         try {
-          const m = await getMigrations(
-            { ...(options as Record<string, unknown>), database: scratch } as never,
-          );
+          const m = await getMigrations({
+            ...(options as Record<string, unknown>),
+            database: scratch,
+          } as never);
           return m.toBeCreated
             .map((t) => `${t.table}: ${Object.keys(t.fields).sort().join(",")}`)
             .sort();

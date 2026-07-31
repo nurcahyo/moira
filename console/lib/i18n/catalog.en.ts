@@ -405,6 +405,88 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "`POST /api/auth/sign-in/oauth2` answered 200 with no `url` field. Distinguished from a " +
       "plain failure because it means the configuration resolved but produced no authorization URL.",
   },
+
+  /* --- generic actions ---------------------------------------------------- */
+  //
+  // `console.action.*` rather than `console.secret.*` on purpose: `CopyButton` is
+  // a presentational atom with no idea what it is copying, and a key namespaced
+  // to the secret surface would make it look like one. It is reused by the next
+  // thing that needs a copy control.
+  [K.action_copy]: {
+    key: K.action_copy,
+    message: "Copy",
+    description: "The CopyButton atom's idle label.",
+  },
+  [K.action_copied]: {
+    key: K.action_copied,
+    message: "Copied",
+    description:
+      "The CopyButton atom's label after a successful clipboard write, announced through a polite " +
+      "live region so the change is not silent for a screen-reader user.",
+  },
+  [K.action_copy_failed]: {
+    key: K.action_copy_failed,
+    message: "Could not copy. Select the value and copy it manually.",
+    description:
+      "`navigator.clipboard.writeText` rejected or is unavailable — it requires a secure context " +
+      "and can be blocked by permissions policy. The value is still on screen, so this is a " +
+      "degradation, not a failure.",
+  },
+
+  /* --- the once-only secret surface --------------------------------------- */
+  [K.secret_modal_heading]: {
+    key: K.secret_modal_heading,
+    message: "Invitation created",
+    description: "Accessible name of the OnceOnlySecretModal dialog.",
+  },
+  [K.secret_shown_once]: {
+    key: K.secret_shown_once,
+    message: "This is shown once. Copy it now — the console cannot display it again.",
+    description:
+      "The warning above the value. Moira returns the raw token exactly once, at creation; every " +
+      "later read of the record returns the sanitized shape, which has no token field at all.",
+  },
+  [K.secret_token_label]: {
+    key: K.secret_token_label,
+    message: "Invitation token",
+    description:
+      "Labels the raw value, as distinct from the shareable link built from it. Both are shown " +
+      "because an operator pasting into a chat wants the link and one automating a setup wants " +
+      "the token.",
+  },
+  [K.secret_link_label]: {
+    key: K.secret_link_label,
+    message: "Invitation link",
+    description:
+      "Labels the link. Moira's envelope carries the raw token and never a URL — only the console " +
+      "knows its own public origin — so the link is composed here.",
+  },
+  [K.secret_dismiss]: {
+    key: K.secret_dismiss,
+    message: "I have copied it",
+    description:
+      'The dialog\'s only close control. Worded as a confirmation rather than "Close" because ' +
+      "dismissing it is irreversible.",
+  },
+  [K.secret_already_shown]: {
+    key: K.secret_already_shown,
+    message:
+      "This invitation already exists and its token was shown when it was created. It cannot be " +
+      "shown again — revoke it and create a new one if you no longer have it.",
+    description:
+      "`secret === null` in the envelope. THE NORMAL IDEMPOTENT-REPLAY CASE, not an error: " +
+      "`AdminInviteSecretResponse.secret` is nullable and not required, and the stored replay body " +
+      "is the sanitized record. A UI that treats null as a failure reports a successful, correct " +
+      "operation as broken.",
+  },
+  [K.secret_expires_at]: {
+    key: K.secret_expires_at,
+    message: "Expires {expires_at}.",
+    description:
+      "Rendered under the value. `{expires_at}` is `AdminInviteRecord.expires_at`, an RFC 3339 " +
+      "timestamp. The record's `expired` flag is derived server-side and is not stored — nothing " +
+      "sweeps for expiry, so `status` never reads `expired`.",
+  },
 };
 
 /** Every entry, as a plain array. */

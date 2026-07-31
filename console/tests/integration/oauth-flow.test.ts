@@ -39,7 +39,11 @@ import { readConsoleEnv, type ConsoleEnv } from "@/lib/env";
 import { checkSession } from "@/lib/moira-session";
 
 import { createBrowserAgent } from "../support/browser-agent";
-import { reserveConsolePort, startConsoleServer, type ConsoleServer } from "../support/console-server";
+import {
+  reserveConsolePort,
+  startConsoleServer,
+  type ConsoleServer,
+} from "../support/console-server";
 import { trustFixtureCa, untrustFixtureCa } from "../support/fixture-tls";
 import { restoreDomWhatwgGlobals, useNativeWhatwgGlobals } from "../support/native-globals";
 import { startMockIdp, type MockIdp } from "../support/mock-idp";
@@ -167,7 +171,11 @@ describe("OAuth sign-in against a real mock IdP", () => {
 
     env = envFor(consoleOrigin);
     consoleServer = startConsoleServer(
-      { env, config: configFor(idp, CLIENT_SECRET), database: memoryAdapter(createConsoleMemoryDatabase()) },
+      {
+        env,
+        config: configFor(idp, CLIENT_SECRET),
+        database: memoryAdapter(createConsoleMemoryDatabase()),
+      },
       port,
     );
   });

@@ -39,6 +39,7 @@
 //   console.meta.*    document metadata
 //   console.page.*    page-level copy
 //   console.signIn.*  the sign-in surface
+//   console.action.*  a generic control's label, reused across surfaces
 //   console.secret.*  the once-only secret surface
 
 /* -------------------------------------------------------------------------- */
@@ -102,6 +103,20 @@ export const CONSOLE_MESSAGE_KEYS = {
   sign_in_request_failed: "console.signIn.request_failed",
   sign_in_rate_limited: "console.signIn.rate_limited",
   sign_in_no_redirect_url: "console.signIn.no_redirect_url",
+
+  /* --- generic actions ---------------------------------------------------- */
+  action_copy: "console.action.copy",
+  action_copied: "console.action.copied",
+  action_copy_failed: "console.action.copy_failed",
+
+  /* --- the once-only secret surface --------------------------------------- */
+  secret_modal_heading: "console.secret.modal_heading",
+  secret_shown_once: "console.secret.shown_once",
+  secret_token_label: "console.secret.token_label",
+  secret_link_label: "console.secret.link_label",
+  secret_dismiss: "console.secret.dismiss",
+  secret_already_shown: "console.secret.already_shown",
+  secret_expires_at: "console.secret.expires_at",
 } as const;
 
 /** Every console-originated key, as a union of string literals. */

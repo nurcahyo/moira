@@ -52,11 +52,11 @@ import {
 /**
  * The one file permitted to name a secret in its props.
  *
- * EMPTY until `modules/secrets/OnceOnlySecretModal.tsx` lands. Adding a second
- * entry fails the assertion below; that is deliberate, because "which component
- * may hold the plaintext" is a one-answer question.
+ * Adding a second entry fails the assertion below; that is deliberate, because
+ * "which component may hold the plaintext" is a one-answer question. The entry
+ * is also asserted to be still NEEDED, so it cannot outlive the component.
  */
-const SECRET_PROP_ALLOW_LIST: readonly string[] = [];
+const SECRET_PROP_ALLOW_LIST: readonly string[] = ["modules/secrets/OnceOnlySecretModal.tsx"];
 
 const FIXTURE = "tests/support/secret-props-fixture.tsx";
 
@@ -86,10 +86,9 @@ describe("the scanner is alive", () => {
   });
 
   test("every rendering root contributed at least one file", () => {
-    // `modules/` is empty at this commit, so it is excluded from this assertion
-    // by name rather than silently: the moment the first organism lands, the
-    // exclusion below has to go, and the test says so.
-    for (const root of RENDERING_ROOTS.filter((candidate) => candidate !== "modules")) {
+    // Every root, including `modules/` — it held no sources when this guard
+    // landed and the exclusion that covered that is now gone.
+    for (const root of RENDERING_ROOTS) {
       expect(
         files.some((file) => file.startsWith(`${root}/`)),
         `${root}/ contributed no files — the scan of that layer is vacuous`,
