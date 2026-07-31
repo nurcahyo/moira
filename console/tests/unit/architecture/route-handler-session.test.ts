@@ -28,9 +28,29 @@
 // them can observe whether the function is ever reached.
 //
 // So this asserts REACHABILITY, in the same shape `guard-reachability.test.ts`
-// does: the handler's source must contain a call to `withConsoleSession(`, and
-// the exemption list is checked in both directions so an entry that stops being
+// does: the handler must contain a call to `withConsoleSession(`, and the
+// exemption list is checked in both directions so an entry that stops being
 // justified fails.
+//
+// ============================================================================
+// PER **EXPORTED METHOD**, NOT PER FILE — AND THE MUTATION IS WHY
+// ============================================================================
+//
+// The first version of this file scanned each `route.ts` as a whole: "does this
+// source contain `withConsoleSession(`". It was mutation-tested by deleting the
+// guard from `DELETE` in `app/api/admins/identities/[id]/route.ts` — which
+// exports BOTH `PATCH` and `DELETE` — and it stayed **GREEN**, because the
+// `PATCH` handler still contained the call.
+//
+// That is the defect this project has now hit twice (see the ledger's
+// "THE JUDGED DESIGN PANEL SPECIFIED A TOOTHLESS GUARD" entry): a guard whose
+// granularity cannot represent the state it is named for. A file-level scan
+// cannot express "every handler", only "some handler", and the second exported
+// method in a file is exactly where an unguarded mutation endpoint would go.
+//
+// So the body of each exported HTTP handler is extracted by brace matching and
+// checked on its own. Re-mutated afterwards: deleting the guard from `DELETE`
+// alone now fails, naming the method.
 
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync, statSync } from "node:fs";
@@ -101,8 +121,99 @@ function routeHandlers(): Handler[] {
 
 /** Comments stripped: a mention of the guard in prose is not a call. */
 function callsGuard(source: string): boolean {
-  const code = source.replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "");
+  const code = stripComments(source);
   return new RegExp(`\\b${SESSION_GUARD}\\s*\\(`).test(code);
+}
+
+function stripComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "");
+}
+
+/** The HTTP verbs Next.js routes to an exported function of the same name. */
+const HTTP_EXPORTS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] as const;
+
+export interface ExportedHandler {
+  readonly file: string;
+  readonly method: string;
+  readonly body: string;
+}
+
+/**
+ * Every exported HTTP handler in a route module, with its own body.
+ *
+ * Brace-matched rather than split on the next `export`, so a nested function or
+ * an object literal inside the handler does not truncate it. Both the
+ * `export async function POST(...)` form and
+ * `export const POST = async (...) => {...}` are matched, because Next accepts
+ * either and a guard that only saw one would be silent about the other.
+ */
+/**
+ * Index of the `{` that opens a handler's BODY, skipping its parameter list.
+ *
+ * Returns -1 when the declaration is an alias (`= handle;`) with no body.
+ */
+function openingBraceOfBody(source: string, from: number): number {
+  const paren = source.indexOf("(", from);
+  const semicolon = source.indexOf(";", from);
+  if (paren === -1 || (semicolon !== -1 && semicolon < paren)) return -1;
+  let depth = 0;
+  let index = paren;
+  for (; index < source.length; index += 1) {
+    const character = source[index];
+    if (character === "(") depth += 1;
+    else if (character === ")") {
+      depth -= 1;
+      if (depth === 0) break;
+    }
+  }
+  const brace = source.indexOf("{", index);
+  const end = source.indexOf(";", index);
+  if (brace === -1 || (end !== -1 && end < brace)) return -1;
+  return brace;
+}
+
+export function exportedHandlers(file: string, rawSource: string): ExportedHandler[] {
+  const source = stripComments(rawSource);
+  const found: ExportedHandler[] = [];
+  const declaration = new RegExp(
+    `export\\s+(?:async\\s+)?(?:function\\s+(${HTTP_EXPORTS.join("|")})\\b|const\\s+(${HTTP_EXPORTS.join("|")})\\s*=)`,
+    "g",
+  );
+  for (const match of source.matchAll(declaration)) {
+    const method = match[1] ?? match[2] ?? "";
+    const after = (match.index ?? 0) + match[0].length;
+    // THE PARAMETER LIST HAS TO BE SKIPPED FIRST, and getting this wrong is how
+    // the extractor silently reported a guarded handler as unguarded: Next's own
+    // signature is
+    //   export async function POST(request: Request, context: { params: … })
+    // so the first `{` after the function name is inside the SECOND PARAMETER's
+    // type annotation, and brace-matching from there ends the "body" before the
+    // real one begins. Caught by re-running the mutation, not by reading the
+    // regex.
+    const bodyStart = openingBraceOfBody(source, after);
+    // `export const GET = handle;` — an ALIAS to a function defined elsewhere,
+    // with no body of its own. Recorded with an EMPTY body so it reads as
+    // unguarded, which is the safe direction: a handler whose implementation
+    // this extractor cannot see is one it cannot vouch for. Skipping it instead
+    // would make the alias form a way through the rule.
+    if (bodyStart === -1) {
+      found.push({ file, method, body: "" });
+      continue;
+    }
+    const open = bodyStart;
+    let depth = 0;
+    let index = open;
+    for (; index < source.length; index += 1) {
+      const character = source[index];
+      if (character === "{") depth += 1;
+      else if (character === "}") {
+        depth -= 1;
+        if (depth === 0) break;
+      }
+    }
+    found.push({ file, method, body: source.slice(open, index + 1) });
+  }
+  return found;
 }
 
 const handlers = routeHandlers();
@@ -135,17 +246,68 @@ describe("the scan is alive", () => {
 });
 
 describe("every mutation handler re-checks the session", () => {
-  test("no handler under app/api/** is unguarded and unexplained", () => {
+  test("EVERY exported method is guarded, not merely one per file", () => {
+    // Per method. A file-level scan passed while `DELETE` was unguarded and
+    // `PATCH` beside it was not — see the header.
     const unguarded = handlers
       .filter((handler) => !EXEMPT_PATHS.includes(handler.path))
-      .filter((handler) => !callsGuard(handler.source))
-      .map((handler) => handler.path);
+      .flatMap((handler) => exportedHandlers(handler.path, handler.source))
+      .filter((exported) => !callsGuard(exported.body))
+      .map((exported) => `${exported.method} ${exported.file}`);
     expect(
       unguarded,
-      "these route handlers sit OUTSIDE the (console) session gate — app/api/** is outside " +
-        `every route group — and none of them calls ${SESSION_GUARD}(). Either guard them or ` +
-        "add them to EXEMPT with a reason.",
+      "these exported handlers sit OUTSIDE the (console) session gate — app/api/** is outside " +
+        `every route group — and do not call ${SESSION_GUARD}(). Either guard them or add the ` +
+        "file to EXEMPT with a reason.",
     ).toEqual([]);
+  });
+
+  test("the extractor found every exported method, so the rule above is not scanning air", () => {
+    // The floor for the new granularity. An extractor that stopped matching
+    // would report zero handlers and the rule above would pass on an empty list.
+    const extracted = handlers.flatMap((handler) =>
+      exportedHandlers(handler.path, handler.source).map(
+        (exported) => `${exported.method} ${exported.file}`,
+      ),
+    );
+    // Ten: six of this wave's own handlers plus the four alias exports on the
+    // Better Auth mount (`export const GET = handle;`), which are recorded
+    // rather than skipped — see `exportedHandlers`.
+    expect(extracted.length, `extracted: ${extracted.join(", ")}`).toBeGreaterThanOrEqual(10);
+    // The file that produced the finding: two methods, both must be seen.
+    expect(extracted).toContain("PATCH app/api/admins/identities/[id]/route.ts");
+    expect(extracted).toContain("DELETE app/api/admins/identities/[id]/route.ts");
+  });
+
+  test("POSITIVE CONTROL — an unguarded second method in a guarded file is caught", () => {
+    const fixture = [
+      "export async function PATCH(request: Request) {",
+      "  return withConsoleSession(request, async () => new Response());",
+      "}",
+      "export async function DELETE(request: Request) {",
+      "  return Response.json({ ok: true });",
+      "}",
+    ].join("\n");
+    const unguarded = exportedHandlers("fixture/route.ts", fixture)
+      .filter((exported) => !callsGuard(exported.body))
+      .map((exported) => exported.method);
+    expect(unguarded, "the exact mutation a file-level scan missed").toEqual(["DELETE"]);
+  });
+
+  test("POSITIVE CONTROL — an alias export is recorded as unguarded, not skipped", () => {
+    // `export const DELETE = someHandler;` has no body here. Treating it as
+    // "nothing to check" would make the alias form a hole in the rule.
+    const extracted = exportedHandlers("fixture/route.ts", "export const DELETE = handle;");
+    expect(extracted.map((exported) => exported.method)).toEqual(["DELETE"]);
+    expect(callsGuard(extracted[0]!.body)).toBe(false);
+  });
+
+  test("NEGATIVE CONTROL — the arrow-function export form is matched too", () => {
+    const fixture =
+      "export const POST = async (request: Request) => { return withConsoleSession(request, async () => new Response()); };";
+    const extracted = exportedHandlers("fixture/route.ts", fixture);
+    expect(extracted.map((exported) => exported.method)).toEqual(["POST"]);
+    expect(callsGuard(extracted[0]!.body)).toBe(true);
   });
 
   test("the wave-5 mutation endpoints are all present and all guarded", () => {
@@ -161,7 +323,14 @@ describe("every mutation handler re-checks the session", () => {
     ]) {
       const handler = handlers.find((candidate) => candidate.path === path);
       expect(handler, `${path} is missing from app/api/**`).toBeDefined();
-      expect(callsGuard(handler!.source), `${path} does not call ${SESSION_GUARD}()`).toBe(true);
+      const exported = exportedHandlers(path, handler!.source);
+      expect(exported.length, `${path} exports no HTTP handler`).toBeGreaterThanOrEqual(1);
+      for (const method of exported) {
+        expect(
+          callsGuard(method.body),
+          `${method.method} ${path} does not call ${SESSION_GUARD}()`,
+        ).toBe(true);
+      }
     }
   });
 });
