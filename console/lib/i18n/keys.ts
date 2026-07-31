@@ -91,6 +91,17 @@ export const CONSOLE_MESSAGE_KEYS = {
   /* --- pages -------------------------------------------------------------- */
   page_home_title: "console.page.home_title",
   page_home_body: "console.page.home_body",
+  page_login_title: "console.page.login_title",
+
+  /* --- sign-in ------------------------------------------------------------ */
+  sign_in_heading: "console.signIn.heading",
+  sign_in_button: "console.signIn.button",
+  sign_in_button_generic: "console.signIn.button_generic",
+  sign_in_pending: "console.signIn.pending",
+  sign_in_unavailable_heading: "console.signIn.unavailable_heading",
+  sign_in_request_failed: "console.signIn.request_failed",
+  sign_in_rate_limited: "console.signIn.rate_limited",
+  sign_in_no_redirect_url: "console.signIn.no_redirect_url",
 } as const;
 
 /** Every console-originated key, as a union of string literals. */

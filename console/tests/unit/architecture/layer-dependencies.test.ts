@@ -22,18 +22,44 @@
 // rule would also have had to be repealed on the first component that renders a
 // catalog string, which is this very wave.
 //
+//   4. `modules/**` imports nothing from `app/**`.
+//
 // ============================================================================
-// WHAT THIS FILE DOES *NOT* OWN YET, AND WHY
+// RULE 4 LANDED WITH ITS FIRST ORGANISM, NOT BEFORE IT
 // ============================================================================
 //
-// `modules/** must not import app/**` is NOT here. `console/modules/` holds only
-// `.gitkeep` and `README.md` at this commit, and `listSourceFiles` returns `[]`
-// for a directory with no sources — the rule would assert `[] === []` and pass
-// vacuously. `architecture.test.ts:21-23` says exactly that about itself: "on a
-// clean scaffold this test passes vacuously".
+// Until `modules/signIn/SignInPanel.tsx` existed, `console/modules/` held only
+// `.gitkeep` and `README.md`. `listSourceFiles` returns `[]` for a directory
+// with no sources, so the rule would have asserted `[] === []` and passed
+// vacuously — `architecture.test.ts:21-23` says exactly that about itself ("on a
+// clean scaffold this test passes vacuously"). A rule over an empty directory is
+// worse than no rule, because it reads as coverage.
 //
-// A rule over an empty directory is worse than no rule, because it reads as
-// coverage. It lands in the same commit as the first organism.
+// It is now backed by a scanned-file floor, so emptying `modules/` fails rather
+// than silently returning the rule to vacuity.
+//
+// ============================================================================
+// THE `"use client"` RULE, VERIFIED BY HAND AT THIS COMMIT
+// ============================================================================
+//
+// `server-only-guards.test.ts`'s "no `use client` file imports a
+// credential-carrying module" had NEVER executed against a real client
+// component: before this commit there were zero `"use client"` directives
+// anywhere under `app/ components/ lib/ modules/`, so it filtered an empty set
+// and asserted `[] === []`.
+//
+// `SignInPanel.tsx` is the first. The rule was verified against it directly:
+//
+//   * with `import { isSessionExpired } from "@/lib/errors"` added to
+//     SignInPanel.tsx (a legitimate client-safe import):
+//     `bun test tests/unit/architecture` -> 97 pass, 0 fail, exit 0.
+//   * with `import { loadAuthConfig } from "@/lib/auth-config"` instead:
+//     -> 95 pass, 2 fail, exit 1. Both failures name the file and the target —
+//     `modules/signIn/SignInPanel.tsx -> lib/auth-config.ts` here, and
+//     `modules/signIn/SignInPanel.tsx` in `server-only-guards.test.ts`.
+//
+// Both edits were reverted. The rule fires on a real client component, and the
+// two guard files fire independently of each other.
 //
 // ============================================================================
 // WHY THE DERIVATION IS NOT "the modules that carry the marker"
@@ -103,6 +129,10 @@ describe("the derivation is alive", () => {
     // rule passes while scanning nothing. Floors turn that into a failure.
     expect(byRoot("components/atoms").length, "atoms").toBeGreaterThanOrEqual(5);
     expect(byRoot("components/molecules").length, "molecules").toBeGreaterThanOrEqual(2);
+    // The floor that keeps rule 4 from returning to vacuity. `modules/` held no
+    // sources at all two commits ago; a rule over an empty directory reads as
+    // coverage while asserting nothing.
+    expect(byRoot("modules").length, "modules (organisms)").toBeGreaterThanOrEqual(1);
     expect(byRoot("lib").length, "lib").toBeGreaterThanOrEqual(10);
     expect(byRoot("db").length, "db").toBeGreaterThanOrEqual(3);
   });
@@ -264,6 +294,75 @@ describe("credential modules are marked and contained", () => {
 });
 
 /* -------------------------------------------------------------------------- */
+
+describe("rule 4 — modules/** imports nothing from app/**", () => {
+  const organisms = byRoot("modules");
+
+  test("there is at least one organism to scan", () => {
+    // Without this the rule below asserts `[] === []`. It is the whole reason
+    // this rule waited for `SignInPanel.tsx` instead of landing three commits
+    // earlier alongside the others.
+    expect(organisms.map((file) => file.path)).not.toEqual([]);
+  });
+
+  test("no organism imports a page, a layout, or a route handler", () => {
+    // Direction, not taste: pages compose organisms, so an organism reaching
+    // back into `app/` makes the dependency graph cyclic and makes the organism
+    // unusable from any other page. Nothing scanned `modules/**` at all before
+    // this commit — an organism could import `app/` freely.
+    const offenders = organisms
+      .map((file) => ({
+        file: file.path,
+        reached: directImports(files, file, { includeTypeOnly: true }).filter((target) =>
+          target.startsWith("app/"),
+        ),
+      }))
+      .filter((entry) => entry.reached.length > 0)
+      .map((entry) => `${entry.file} -> ${entry.reached.join(", ")}`);
+    expect(
+      offenders,
+      "one-way rule: pages -> organisms -> molecules -> atoms (CONVENTIONS §6)",
+    ).toEqual([]);
+  });
+
+  test("POSITIVE CONTROL — an organism importing a page is caught", () => {
+    const offender = synthetic(
+      "modules/fixture/Panel.tsx",
+      'import LoginPage from "../../app/login/page";\nexport const p = LoginPage;',
+    );
+    const reached = directImports([...files, offender], offender, { includeTypeOnly: true }).filter(
+      (target) => target.startsWith("app/"),
+    );
+    expect(reached).toEqual(["app/login/page.tsx"]);
+  });
+
+  test("NEGATIVE CONTROL — an organism importing atoms and lib/i18n is permitted", () => {
+    const allowed = synthetic(
+      "modules/fixture/Panel.tsx",
+      'import { Button } from "@/components/atoms/Button";\nimport { t } from "@/lib/i18n";\nexport const x = [Button, t];',
+    );
+    const reached = directImports([...files, allowed], allowed, { includeTypeOnly: true }).filter(
+      (target) => target.startsWith("app/"),
+    );
+    expect(reached).toEqual([]);
+  });
+
+  test('the first `"use client"` file in the repository exists and is an organism', () => {
+    // Recorded because the `"use client"` containment rule had never executed
+    // against a real client component before this commit — see the file header
+    // for the by-hand verification.
+    const clientFiles = files.filter((file) => isClientComponent(file.source)).map((f) => f.path);
+    expect(clientFiles, "no client component exists; the containment rule is vacuous").not.toEqual(
+      [],
+    );
+    for (const path of clientFiles) {
+      expect(
+        path.startsWith("modules/") || path.startsWith("components/"),
+        `${path} is a client component outside the component/organism layers`,
+      ).toBe(true);
+    }
+  });
+});
 
 describe("the two older guard files consume the derivation", () => {
   const guardSources = [

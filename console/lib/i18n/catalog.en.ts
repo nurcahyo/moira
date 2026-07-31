@@ -336,6 +336,75 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "Body copy on the home route. Replaced when the dashboard lands; kept keyed so the " +
       "replacement is a catalog edit rather than a component edit.",
   },
+  [K.page_login_title]: {
+    key: K.page_login_title,
+    message: "Sign in",
+    description:
+      "The `<h1>` of `/login`. Deliberately distinct from `console.signIn.heading`, which names " +
+      "the panel INSIDE the page — the page can host other content around it.",
+  },
+
+  /* --- sign-in ------------------------------------------------------------ */
+  [K.sign_in_heading]: {
+    key: K.sign_in_heading,
+    message: "Sign in to this deployment",
+    description: "Accessible name of the SignInPanel organism's region on /login.",
+  },
+  [K.sign_in_button]: {
+    key: K.sign_in_button,
+    message: "Continue with {provider}",
+    description:
+      "The single sign-in button, when the provider's display name is known. `{provider}` is the " +
+      "`display_name` from the anonymous `GET /api/v1/admin/setup/sign-in-methods` projection. " +
+      "There is AT MOST ONE button by construction: `resolveAuthConfig` returns " +
+      "`ambiguous_enabled_providers` when more than one provider is enabled, so a picker is wrong " +
+      "in this wave rather than merely unbuilt.",
+  },
+  [K.sign_in_button_generic]: {
+    key: K.sign_in_button_generic,
+    message: "Continue with your identity provider",
+    description:
+      "The sign-in button when the anonymous sign-in-methods call yielded no display name for the " +
+      "resolved provider — Moira unreachable, or the row absent from the projection. The " +
+      "configuration is already resolved at this point, so the button still works.",
+  },
+  [K.sign_in_pending]: {
+    key: K.sign_in_pending,
+    message: "Signing in",
+    description:
+      "Accessible name of the Spinner shown while `POST /api/auth/sign-in/oauth2` is in flight and " +
+      "the browser has not yet been redirected to the identity provider.",
+  },
+  [K.sign_in_unavailable_heading]: {
+    key: K.sign_in_unavailable_heading,
+    message: "Sign-in is not available",
+    description:
+      "Heading above any refusal state. Rendered INSTEAD of a button, never alongside one — a " +
+      "button that 503s on click is the failure this surface exists to avoid.",
+  },
+  [K.sign_in_request_failed]: {
+    key: K.sign_in_request_failed,
+    message: "The console could not start the sign-in. Try again in a moment.",
+    description:
+      "`POST /api/auth/sign-in/oauth2` returned a non-2xx other than 429, or the request threw. " +
+      "The response body is deliberately not echoed: it is a Better Auth error object and can " +
+      "name internal configuration.",
+  },
+  [K.sign_in_rate_limited]: {
+    key: K.sign_in_rate_limited,
+    message: "Too many sign-in attempts. Wait a moment, then try again.",
+    description:
+      "HTTP 429 from `POST /api/auth/sign-in/oauth2`. Better Auth's rate limiter is on in " +
+      "production with database storage, so the limit is SHARED ACROSS REPLICAS and a user can " +
+      "hit it without having clicked many times themselves.",
+  },
+  [K.sign_in_no_redirect_url]: {
+    key: K.sign_in_no_redirect_url,
+    message: "The sign-in did not return a destination to continue to.",
+    description:
+      "`POST /api/auth/sign-in/oauth2` answered 200 with no `url` field. Distinguished from a " +
+      "plain failure because it means the configuration resolved but produced no authorization URL.",
+  },
 };
 
 /** Every entry, as a plain array. */
