@@ -72,6 +72,11 @@ const GUARDS: readonly Guard[] = [
     why: "F25: the throwing form checkSession is wired into jwt.getSubject with. It is the single function every minted Moira-bound token passes through.",
   },
   {
+    symbol: "withConsoleSession",
+    definedIn: "lib/console-api.ts",
+    why: "W5-D5/F25: app/api/** sits outside every route group, so a mutation route handler inherits NO session check. This is the wrapper each one performs its own with. Unreached, the console's invitation and ownership endpoints are unauthenticated. `route-handler-session.test.ts` additionally asserts every handler under app/api/** calls it.",
+  },
+  {
     symbol: "consoleSessionCheck",
     definedIn: "lib/auth.ts",
     why: "F25/G12: the request-level form. Its call sites are the token route (which owes the caller a keyed 403 rather than a 500) and the console layout. Both must exist; a layout-only wiring redirects the browser while GET /api/auth/token keeps minting for the same cookie.",

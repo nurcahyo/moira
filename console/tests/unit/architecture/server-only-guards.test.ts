@@ -59,6 +59,12 @@ const CLIENT_SAFE_MODULES = [
   "lib/i18n/keys.ts",
   "lib/i18n/catalog.en.ts",
   "lib/i18n/index.ts",
+  // Plan 09 wave 5. `ExpiryPicker` is a MOLECULE and may not import
+  // `lib/invites.ts`, which is server-only — so the two invitation bounds and
+  // the public invite path live here instead of being re-declared inside the
+  // component, which is how a UI drifts from the rule it claims to respect.
+  // Asserted client-safe rather than believed to be.
+  "lib/invite-bounds.ts",
 ] as const;
 
 /**
