@@ -65,6 +65,8 @@ import type { ResolvedAuthConfig } from "./auth-config";
 import {
   assertAdmissibleSession,
   checkSession,
+  rejectedSession,
+  SessionNotAdmissibleError,
   type ConsoleSessionIdentity,
   type SessionCheck,
 } from "./moira-session";
@@ -395,7 +397,28 @@ export async function consoleSessionCheck(
   config: ResolvedAuthConfig,
   headers: Headers,
 ): Promise<SessionCheck> {
-  const session = await auth.api.getSession({ headers });
+  let session: Awaited<ReturnType<typeof auth.api.getSession>>;
+  try {
+    session = await auth.api.getSession({ headers });
+  } catch (error) {
+    // ----------------------------------------------------------------------
+    // `getSession` MINTS. Verified in better-auth 1.6.25, not assumed.
+    // ----------------------------------------------------------------------
+    //
+    // `dist/plugins/jwt/index.mjs` registers an `after` hook whose matcher is
+    // `context.path === "/get-session"`, and it calls `getJwtToken` to populate a
+    // `set-auth-jwt` response header. So `getSubject` — and therefore the admissibility
+    // check inside it — runs on a session READ, and a refusal arrives here as a throw
+    // rather than as a `null` session.
+    //
+    // That is the correct failure direction and it is why this is a `catch` rather than a
+    // reordering: every path that reads a session for a human who may not act now fails
+    // closed, including ones this file does not know about. What it must not do is reach
+    // the caller as a 500.
+    if (error instanceof SessionNotAdmissibleError) return rejectedSession(error.rejection);
+    if (error instanceof MissingIdpSubjectError) return rejectedSession("idp_subject_missing");
+    throw error;
+  }
   if (session === null || session === undefined) return checkSession(null, config);
 
   const context = await (auth as unknown as { $context: Promise<ConsoleAuthContext> }).$context;

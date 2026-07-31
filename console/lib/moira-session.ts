@@ -73,6 +73,21 @@ function reject(rejection: SessionRejection): SessionCheck {
 }
 
 /**
+ * A refusal as a value, for a caller that learned the verdict by catching it.
+ *
+ * The jwt plugin mints a token on `/get-session` as well as on `/token`
+ * (`better-auth/dist/plugins/jwt/index.mjs`: `matcher: context.path === "/get-session"`,
+ * then `ctx.setHeader("set-auth-jwt", jwt)`), so `jwt.getSubject` runs on a *read* too and
+ * its refusal arrives as a thrown [`SessionNotAdmissibleError`]. That is fail-closed and
+ * correct — but a caller holding the verdict as an exception needs to put it back into the
+ * shape every other caller uses, and must not re-derive it, or two spellings of the same
+ * rule appear.
+ */
+export function rejectedSession(rejection: SessionRejection): SessionCheck {
+  return reject(rejection);
+}
+
+/**
  * Decide whether a session may act against Moira.
  *
  * Runs the SAME allow-list Moira applies at claim time. Duplicating the check is

@@ -69,10 +69,38 @@ function refused(rejection: string, messageKey: string): Response {
   );
 }
 
-async function handle(request: Request): Promise<Response> {
-  let runtimeState: Awaited<ReturnType<typeof consoleRuntime>>;
+/**
+ * How the handler obtains the current configuration.
+ *
+ * Injectable for one reason: `tests/support/console-server.ts` used to bind
+ * `auth.handler` to a socket directly, so every wire-level test in
+ * `tests/integration/oauth-flow.test.ts` bypassed this file entirely — including
+ * the token-endpoint refusal below, which is precisely what those tests exist to
+ * exercise. A harness that reimplements the handler proves the harness works.
+ *
+ * The seam is the runtime resolution and nothing else: the harness supplies an
+ * already-resolved `{ auth, config }`, and every line of policy below is the
+ * shipped one.
+ */
+type ConsoleRuntimeState = Awaited<ReturnType<typeof consoleRuntime>>;
+
+// Declared as a call-signature interface rather than as `type R = () => Promise<S>`.
+// `tests/support/copy-scan.ts` looks for `>text<` and would read the `>` of the fat arrow
+// followed by ` Promise` followed by `<` as a JSX text node — "Promise" is capitalised and
+// long enough to satisfy `looksLikeCopy`, and none of the keywords in `CODE_TOKENS` appears
+// between the brackets. Worked around here rather than by adding `Promise` to that list:
+// widening a copy gate so that new code fits through it is how a gate stops holding.
+export interface ConsoleRuntimeResolver {
+  (): Promise<ConsoleRuntimeState>;
+}
+
+export async function handleAuthRequest(
+  request: Request,
+  resolveRuntime: ConsoleRuntimeResolver = consoleRuntime,
+): Promise<Response> {
+  let runtimeState: ConsoleRuntimeState;
   try {
-    runtimeState = await consoleRuntime();
+    runtimeState = await resolveRuntime();
   } catch (error) {
     // Resolving the configuration means calling Moira, so a Moira outage lands
     // here. Without this catch it escapes as an unhandled rejection and Next
@@ -117,6 +145,8 @@ async function handle(request: Request): Promise<Response> {
 
   return runtimeState.auth.handler(request);
 }
+
+const handle = (request: Request): Promise<Response> => handleAuthRequest(request);
 
 export const GET = handle;
 export const POST = handle;
