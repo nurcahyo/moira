@@ -150,17 +150,18 @@ Migrations end at **`0020`** (next free `0021`; `0016` is a permanent gap). Open
 
 | | What | State |
 |---|---|---|
-| **F14** | Memory dedupe silently stops matching after a pepper rotation | open — plan 11 Sub-Phase F, which is deferred. Needs a **decision**, not a fix: re-hash on rotation, accept and document the duplicate window, or move `content_hash` to the unkeyed `request_hash` |
 | **F16** | `rig-core` logs the whole completion body, now carrying other tenants' retrieved documents. Mitigated below the `EnvFilter` — **and that mitigation's own wiring test was missing until `8bbda15`** | **proper fix is upstream; needs an issue filed by a human** |
 | **F2** | Pre-auth query-field enumeration | user deferred |
 | — | ~986 leaked `trusted_jwt_issuers` rows in the shared test DB | hygiene |
 
-**Closed in the final cycle:** F6, F13, F20, F21, F22, F23, F24, F25, B2. **In flight at handoff:**
+**Closed in the final cycle:** F6, F13, F14, F20, F21, F22, F23, F24, F25, B2. **In flight at handoff:**
 F17 (`fix/f17-jwks-rotation`) and admin-write/audit atomicity (`fix/admin-audit-atomicity`) — check
 whether those branches merged before assuming either is still open.
 
 **Plan 11 Sub-Phases E (summarization) and F (memory extraction) remain deferred**, stated in its PR
-rather than implied. F14 belongs to F.
+rather than implied. F14 was Sub-Phase F's inherited obligation and is now **closed ahead of it**
+(`74262ad`) — `memory_records.content_hash` is a content address, so the dedupe F will write does
+not have to carry a rotation caveat. F's remaining work is unchanged otherwise.
 
 ### 3.3 Three things only the user can do
 

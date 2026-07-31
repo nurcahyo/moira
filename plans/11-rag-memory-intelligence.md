@@ -65,6 +65,17 @@ inherits the rotation fragility above — after a pepper rotation, exact-match m
 stops matching and duplicate memories accumulate. **Sub-Phase F must either accept and document this
 window, or add a separate unkeyed content-address column.** It must not be discovered in production.
 
+> **Discharged ahead of Sub-Phase F — finding F14, commit `74262ad`.** Neither of the two options
+> above was taken; a third was. The reversal condition on `chunk_hash` was applied as an admitting
+> rule **per table**, and `memory_records.content_hash` passed all three clauses (not caller-visible,
+> never a caller-supplied lookup key, never compared across applications), so *that column* moved to
+> `request_hash` rather than gaining a second one. Migration `0021` re-hashes the existing rows.
+> `conversation_messages.content_hash` stays keyed — it fails the first clause, being returned on
+> `ConversationMessageRecord`. **Sub-Phase F can write the exact-match dedupe with no rotation
+> caveat**, provided its lookup keeps the `application_id` predicate; dropping it is one of the
+> three conditions that reverse the decision. See `memory_content_hash` in
+> `src/application/conversation.rs` and `tests/memory_content_hash_rotation.rs`.
+
 ### §0.2 Already shipped — the body assumes these are absent
 
 | Body assumption | Reality |
