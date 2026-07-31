@@ -1238,6 +1238,30 @@ attrition. Diagnose F22 the way the attach race was diagnosed: make it determini
 **Also worth carrying:** docs-only pushes to `main` run the full CI suite, which is what exposed this.
 That is accidental coverage worth keeping rather than optimising away.
 
+## THE JUDGED DESIGN PANEL SPECIFIED A TOOTHLESS GUARD, AND ONLY THE MUTATION CAUGHT IT — 2026-07-31
+
+**G1's named mutation left G1 GREEN.** The guard was "policy selection does not depend on row order",
+and its prescribed mutation was "restore the old `governing_policy`". It passed.
+
+**Why:** with per-provider trusted issuers, `trusted_jwt_issuer_id = $2` selects exactly one row, so
+there is nothing for an `ORDER BY` to arbitrate. **F23 shape (a) is unrepresentable after `0020`** —
+the migration that makes the defect impossible also makes a guard built from *legal* rows unable to
+reach the defect it is named for. Rebuilt with decoy rows inserted by raw SQL, because the API now
+refuses that shape, and re-verified red.
+
+**This is the project's most expensive recurring defect appearing inside the fix for it.** The guard
+was specified by a judged panel of three designs and three judge lenses, written by an implementer
+primed on seven prior laundering findings, and it would have shipped green — a test named for a
+property it could not observe. Nothing but applying the mutation by hand would have found it.
+
+Two general lessons, both worth more than the specific bug:
+
+1. **A fix that makes a defect unrepresentable can silently disarm the test that guards it.** After
+   any constraint that narrows what rows can exist, re-check that the guard's fixture is still
+   *reachable* — a guard whose premise the schema now forbids asserts nothing.
+2. **"Verified by a panel" is not verification.** Three designs, three judges and a synthesis all
+   passed this through. The mutation is the only step that touched reality.
+
 ## D3 — wave 4 implements Option A′, staged 4A / 4B (taken by the loop, 2026-07-31)
 
 Decided by a judged panel: three worked designs, three judge lenses (security closure, migration and
