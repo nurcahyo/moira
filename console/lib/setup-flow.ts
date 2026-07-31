@@ -77,7 +77,7 @@
 
 import "server-only";
 
-import { consoleIssuerForSlug, isProviderSlug } from "./auth-config";
+import { consoleIssuerForSlug } from "./auth-config";
 import { MoiraClient, ifMatchFor, type MoiraOperationName } from "./moira-client";
 import { isMoiraRequestError, type MoiraError } from "./errors";
 import { CONSOLE_MESSAGE_KEYS } from "./i18n/keys";
@@ -144,7 +144,8 @@ export type ProvisioningDeficiency =
  *
  * The third condition is the one plan 08's body never had: it is not enough for
  * the provider row to exist and be enabled — it must be BOUND to the console's
- * trusted JWT issuer, or `governing_policy` never selects it.
+ * trusted JWT issuer, or `admission_policy` never selects it — and from wave 4B
+ * the binding is also where the console reads this provider's minted `iss`.
  */
 export function provisioningDeficiencies(
   state: SetupProvisioningState,
@@ -425,31 +426,18 @@ export function consoleIssuerConfigFor(
   allowedAlgorithms?: readonly string[],
 ): ConsoleIssuerConfig {
   return {
+    // `consoleIssuerForSlug` THROWS on a slug the console could not derive a
+    // `providerId` back out of, and that refusal is deliberately here — before
+    // any Moira write — because the failure it prevents is one-way: a trusted
+    // issuer registered under an unparseable string cannot be deleted once a
+    // grant exists under it (`409 trusted_issuer_has_active_grants`), so the
+    // provider would be permanently unofferable and its admins permanently
+    // unreachable. The validation is NOT restated here: one rule, one spelling.
     issuer: slug === null ? env.bffIssuerUrl : consoleIssuerForSlug(env.bffIssuerUrl, slug),
     jwksUrl,
     audience: env.adminApiAudience,
     ...(allowedAlgorithms === undefined ? {} : { allowedAlgorithms }),
   };
-}
-
-/**
- * Refuse a provider slug the console could not derive a `providerId` from.
- *
- * Raised in-process, before any Moira write, because the failure it prevents is
- * unrecoverable in the direction that matters: a trusted issuer registered under
- * an unparseable string cannot be deleted once a grant exists under it
- * (`409 trusted_issuer_has_active_grants`), so the provider would be permanently
- * unofferable and its admins permanently unreachable.
- */
-export function assertProviderSlug(slug: string): void {
-  if (!isProviderSlug(slug)) {
-    throw new SetupOrderingError(
-      `"${slug}" is not a usable provider slug. It becomes a URL path segment in this ` +
-        "provider's OAuth redirect URI and a value in `account.providerId`, and it is the tail " +
-        "of the trusted JWT issuer string the console derives its minted `iss` from — none of " +
-        "which can be changed after the first sign-in.",
-    );
-  }
 }
 
 /* -------------------------------------------------------------------------- */
