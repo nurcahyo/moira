@@ -356,6 +356,7 @@ and events alike, and it acts before attribute values are copied into a span bui
 | M4 | `target.contains(root)` instead of segment match | `target_ownership_is_decided_by_segment_not_by_substring` |
 | M5 | drop every span (`false`) | `moiras_own_spans_are_still_exported_with_the_guard_on` — M5 is the mutation that passes points 1 and 2 by destroying the observability plan 05 built |
 | M6 | `init()` builds the bridge layer itself, bypassing the seam | `the_otlp_bridge_layer_is_constructed_in_exactly_one_place` |
+| M7 | delete F16's `.with(filter_fn(suppresses_provider_payload_logs))` | *nothing* — 598/598 green. See F16: that gap was found here and closed in `8bbda15` |
 
 The tests also assert their own premise — an unguarded bridge layer, reachable only from
 `#[cfg(test)]`, *does* export `chat`, its preamble, and a Rig event's payload on Moira's own span —
@@ -564,6 +565,21 @@ warnings and errors are never hidden — the dropped events are exactly the ones
 the payload.
 
 Found by a canary test, not by review.
+
+**Its guard was untested where it mattered — the fifth of these, and it was shipped and trusted.**
+Found while closing F6, by injection: deleting `.with(filter_fn(suppresses_provider_payload_logs))`
+from `init` left **all 598 library tests green**. F16's three tests all exercise a `suppresses()`
+helper *re-implemented inside the test module*, because `filter_fn` receives a `Metadata` that
+cannot be constructed outside `tracing`'s macros — so they tested the decision and never the stack
+the decision was supposed to be installed in. The reason no test could reach it was structural:
+`init` installs a global subscriber, which a test process can set once and never undo. Fixed in
+`8bbda15` — stack assembly moved into `build_subscriber`, which `with_default` can install, and
+`the_payload_log_suppression_is_wired_into_the_subscriber_stack` asks the installed subscriber via
+`tracing::enabled!`. Verified failing under the same deletion.
+
+**The transferable rule:** a predicate test and a wiring test are different tests, and "the filter
+function is correct" says nothing about whether anything calls it. Every one of this project's
+laundering findings has had a correct predicate.
 
 **Reversal condition:** remove it the moment `rig-core` gains a way to disable or redact
 request-body logging at the source, which is where it belongs. Residual risk is documented in
