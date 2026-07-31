@@ -75,19 +75,20 @@ export interface ConsoleEnv {
    * encryption is on unless `jwks.disablePrivateKeyEncryption` is set, and this
    * console does not set it).
    *
-   * ROTATING THIS AGAINST A DURABLE DATABASE IS NOT SAFE, and it fails in the
-   * worst available shape. `getJwks` serves the plaintext `publicKey` column,
-   * so the JWKS document is UNCHANGED and Moira's cached copy stays valid;
-   * `signJWT` has to decrypt the private half and raises "Failed to decrypt
-   * private key". It does not regenerate: a key that cannot be decrypted is not
-   * a missing key. The console keeps publishing a JWKS it can no longer sign
-   * for, sign-in still works, and every minted-token call fails with nothing
-   * pointing at the cause.
+   * ROTATING THIS AGAINST A DURABLE DATABASE IS A DELIBERATE OPERATION, not a
+   * config change. It used to be worse than that (finding F17): `getJwks`
+   * served the plaintext `publicKey` column, so the JWKS document was UNCHANGED
+   * and Moira's cached copy stayed valid, while `signJWT` could no longer
+   * decrypt the private half — and better-auth does not regenerate, because a
+   * key that cannot be decrypted is not a missing key. The console kept
+   * publishing a JWKS it could not sign for, silently.
    *
-   * Treat it as durable deployment state. Rotating it deliberately means
-   * deleting the `jwks` rows in the same operation — see
-   * `docs/console-storage.md`. Demonstrated by
-   * `tests/integration/console-jwks-stability.test.ts`.
+   * `lib/jwks-signable.ts` now makes that state a loud `503` instead: the
+   * console refuses to publish a key it cannot sign with. Putting the previous
+   * value back is a COMPLETE recovery (same `kid`, Moira's cache untouched);
+   * rotating on purpose still means deleting the `jwks` rows in the same
+   * operation. Runbook in `docs/console-storage.md`; both paths are exercised
+   * in `tests/integration/console-jwks-stability.test.ts`.
    */
   readonly betterAuthSecret: string;
   /** 32 raw bytes. Seals the console-owned OAuth client secret at rest (D7). */

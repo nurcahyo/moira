@@ -523,7 +523,7 @@ produced a false-confidence test** — the first being F15, where a type was nam
 reading its fields. Both were caught by an agent verifying rather than implementing. The pattern:
 *a conclusion can be right for a reason that is wrong, and the test follows the reason.*
 
-### F17 — rotating `BETTER_AUTH_SECRET` makes the console publish a JWKS it cannot sign for
+### F17 — rotating `BETTER_AUTH_SECRET` makes the console publish a JWKS it cannot sign for — **CLOSED** `fix/f17-jwks-rotation`
 
 **A new hazard created by durable storage; the in-memory path did not have it.**
 
@@ -532,13 +532,95 @@ and Moira's cached copy stays valid. Meanwhile `signJWT` fails with `Failed to d
 — and it does **not** regenerate the pair. The console therefore advertises keys it can no longer
 sign with, and every token it mints is rejected. Silently: the JWKS endpoint looks healthy.
 
-Verified rather than reasoned about, in `console-jwks-stability.test.ts`. Runbook in
-`docs/console-storage.md`.
-
 **Why it is worth its own entry:** with the memory adapter, a rotation regenerated the pair and the
 next process simply published new keys. Making storage durable — which fixes three other problems —
 converts a self-healing restart into a silent, persistent outage. That is the shape of hazard worth
 looking for whenever ephemeral state is made persistent.
+
+**Blast radius, corrected.** The entry above predates wave 4B. There is now one key pair, one `kid`
+and one JWKS URL behind **N** provider issuers, so a single undecryptable row takes every provider's
+admin path down at once — as D3's "what A′ does not buy" already predicted in the abstract.
+
+#### The mechanism — option 1, "fail loudly", implemented as an invariant rather than a check
+
+`console/lib/jwks-signable.ts` installs the jwt plugin's `adapter.getJwks` override.
+`plugins/jwt/adapter.mjs` routes **both** `getAllKeys` (what the JWKS endpoint publishes) and
+`getLatestKey` (what `signJWT` signs with) through that one function, so **published ⊆ signable holds
+by construction** — not by two checks that have to agree. A table with rows and none decryptable is
+refused with a `503 JWKS_KEY_UNSIGNABLE` and one log line carrying the remedy; an empty table is
+still the plugin's ordinary mint-on-first-read.
+
+The predicate is `symmetricDecrypt` against `ctx.context.secretConfig` — literally the two
+operations `sign.mjs` performs before `importJWK`, in the same order. A check that *re-derived* the
+answer could disagree with the signer, and disagreement in the permissive direction is F17 itself.
+
+**Why not the other two.** *Regenerate on decrypt failure* (option 2) restores self-healing and
+preserves the observable property, but it cannot distinguish a deliberate rotation from a **wrong
+secret supplied by mistake**, and in the second case it destroys a fully recoverable state by
+silently minting a new console identity — while the operator, who has just changed a secret and does
+not yet know anything is wrong, is told nothing. Under the refusal, putting the old secret back is a
+*complete* recovery: same `kid`, Moira's cache never invalidated, nothing in flight orphaned.
+*Make rotation supported* (option 3) is real and cheaper than expected — better-auth 1.6.25 already
+ships versioned secrets (`options.secrets` → `SecretConfig`, `$ba$<version>$` envelopes, a
+`legacySecret` fallback), which the console does not use — but it closes rotation, **not the
+finding**: an operator who rotates without declaring the previous secret still gets the silent
+outage. Option 1 is the only one that is unconditional. 1 and 3 compose; 2 is excluded by 1.
+
+**A startup probe was rejected as *the* mechanism** and would only be an addition: it is a
+point-in-time sample (a row can stop being decryptable after boot — a second replica writing under a
+different secret, a restore from an older backup), Next.js has no hook between "pool exists" and
+"first request", and a boot-time database probe turns a transient database blip into a console that
+refuses to start.
+
+#### The guard, and what the mutations showed
+
+`console-jwks-stability.test.ts` **was not a working test for this** — it *pinned the defect*. It
+asserted that the published document was unchanged by the rotation and that signing raised the
+library's decrypt message, which documents F17 and guards nothing: it goes red on the fix, which is
+the opposite of what a guard does. Worse, it asked the two questions **separately**, and F17 is the
+*conjunction* — a 200 JWKS is unremarkable, a signing failure is unremarkable.
+
+It now asserts the joint property over a real socket: the JWKS is fetched over TLS through the
+shipped route handler (`app/api/auth/[...all]/route.ts`, not `auth.handler`) and the minted token is
+verified against **that document** with `jose`, by `kid` — Moira's own verification path.
+
+Five mutations, each applied by hand and observed:
+
+| Mutation | Result |
+|---|---|
+| delete `adapter: signableJwksAdapter(...)` from `lib/auth.ts` | **caught** — "the console PUBLISHED […] and then failed to sign" |
+| `throw` → return the empty set (i.e. become option 2) | **caught** by the separately-labelled *mechanism* assertion, not by the property — option 2 satisfies the property |
+| predicate always `true` | **caught** |
+| `disablePrivateKeyEncryption` flag inverted | **caught** |
+| publish **all** rows whenever one is signable | **caught only after the guard was extended** — see below |
+
+**The fifth one is the finding inside the fix.** Asked for "the cheapest edit that breaks the
+property while leaving the guard green", there *was* one: the first four tests only ever put the
+table in an all-usable or an all-unusable state, against which "publish the usable ones" and "publish
+everything as long as one is usable" are indistinguishable. A mixed table is reachable (a restore, a
+second replica, `rotationInterval` plus a rotation between two mints). The guard now inserts a decoy
+row by **raw SQL** — no API can produce one — stamped newest so `getLatestKey` would reach for it.
+Same technique guard G1 had to be rebuilt with, for the same reason.
+
+**Residual, stated rather than hidden:** the predicate stops at decrypt-and-parse. A row that
+decrypts to a *structurally invalid* JWK would still be published. Nothing in this system writes one
+(better-auth is the only writer), and closing it would mean importing `jose` — a devDependency —
+into shipped console code.
+
+#### Reversal condition
+
+Replace the refusal with re-encryption **the moment there is an operator signal that distinguishes a
+deliberate rotation from a mistake** — that is, when the console adopts better-auth's versioned
+`options.secrets` and an operator can supply the previous secret alongside the new one. At that point
+the deliberate case should re-key the stored row with no new `kid` and no outage, and this refusal
+should survive as the backstop for the *unexplained* case only. Delete it outright only if
+`plugins/jwt/adapter.mjs` stops routing `getLatestKey` through `options.adapter.getJwks`, because the
+invariant is structural in exactly that fact — and if that happens the mechanism must be rebuilt, not
+merely removed.
+
+**What an operator must still do by hand:** exactly one thing — `delete from "jwks";` when the
+rotation was intended. That step is the assertion that a new console signing identity is wanted, and
+it is deliberately not automated.
 
 ### F18 — the sign-in rate limit was multiplying by replica count
 
@@ -1077,7 +1159,17 @@ asking the installed subscriber via `tracing::enabled!`.
 **The transferable rule: a predicate test and a wiring test are different tests — and every one of
 this project's laundering findings has had a correct predicate.**
 
-**Open, and the queue from here:** F17, F14, admin-write/audit non-atomicity, the
+**F17 is CLOSED** (`7640829`) — see its entry. And it exposed a **sixth** bad-guard category, distinct
+from the five above: `console-jwks-stability.test.ts` was not toothless, it **pinned the defect**. It
+asserted the published JWKS was *unchanged* by a rotation and that signing raised the library's
+decrypt string — so it went **red on the fix**, which is the opposite of what a guard does. Worse, it
+asked the two questions **separately**, and F17 is the *conjunction*: a 200 JWKS is unremarkable on
+its own, and a signing failure is unremarkable on its own. Only together are they the outage.
+
+**The rule: when a test documents current behaviour, say so in its name, and never let a conjunction
+be asserted as two independent facts.**
+
+**Open, and the queue from here:** F14, admin-write/audit non-atomicity, the
 leaked `trusted_jwt_issuers` test rows, and F2 (user-deferred).
 
 **Needs a human — recorded, not implied:** T11's deploy; the **rig-core issue for F16**, which should
@@ -1783,7 +1875,9 @@ under 4B a human's second grant is never primary and revoking "the" row leaves a
 - **No cryptographic separation between providers.** One ES256 key pair, one JWKS URL, N issuer
   strings. A token signed with `iss = <github issuer>` verifies against the GitHub trusted-issuer row
   whichever IdP actually authenticated the human. **The `iss` selection is a security boundary backed
-  by one line of console code and one test.** F17's blast radius grows from one issuer to N.
+  by one line of console code and one test.** F17's blast radius grows from one issuer to N. (That
+  consequence is now closed on `fix/f17-jwks-rotation`; the *premise* — one key pair behind N issuers
+  — is unchanged, so any future key-material hazard still lands on every provider at once.)
 - **No person-level identity.** One human across two providers holds **two** grants with no column
   linking them; revocation and `is_primary` are per-grant.
 - **Moira still cannot see which upstream IdP authenticated a user.** A′ routes *around* F23's

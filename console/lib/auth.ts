@@ -97,11 +97,12 @@ import "server-only";
 
 import { betterAuth } from "better-auth";
 import { genericOAuth } from "better-auth/plugins/generic-oauth";
-import { jwt } from "better-auth/plugins/jwt";
+import { jwt, type JwtOptions } from "better-auth/plugins/jwt";
 import { memoryAdapter } from "better-auth/adapters/memory";
 
 import { AUTH_BASE_PATH, AUTH_JWKS_PATH, type ConsoleEnv } from "./env";
 import type { ResolvedAuthConfig } from "./auth-config";
+import { signableJwksAdapter } from "./jwks-signable";
 import {
   assertAdmissibleSession,
   checkSession,
@@ -126,6 +127,29 @@ export const MOIRA_JWT_LIFETIME = "5m";
  * defaults to `["ES256"]` for the same reason.
  */
 export const MOIRA_JWT_ALGORITHM = "ES256" as const;
+
+/**
+ * The jwt plugin's `jwks` options, hoisted to a named constant.
+ *
+ * ============================================================================
+ * WHY THIS IS NOT INLINE (finding F17)
+ * ============================================================================
+ *
+ * `signableJwksAdapter` — the mechanism that stops the console publishing a key
+ * it cannot sign with — has to know whether the private half is encrypted,
+ * because `plugins/jwt/sign.mjs` decides that from
+ * `!options?.jwks?.disablePrivateKeyEncryption` and a check that disagreed with
+ * the signer in the PERMISSIVE direction would be F17 wearing a guard's name.
+ *
+ * So the flag is read from the same object the plugin is configured with,
+ * rather than restated. `disablePrivateKeyEncryption` is deliberately absent
+ * here (encryption ON) and turning it on would flow through to the check on the
+ * same commit.
+ */
+const JWKS_OPTIONS = {
+  keyPairConfig: { alg: MOIRA_JWT_ALGORITHM },
+  jwksPath: AUTH_JWKS_PATH,
+} as const satisfies JwtOptions["jwks"];
 
 /**
  * The session column that records which provider authenticated the session.
@@ -599,10 +623,24 @@ export function createConsoleAuth(deps: ConsoleAuthDeps) {
       }),
 
       jwt({
-        jwks: {
-          keyPairConfig: { alg: MOIRA_JWT_ALGORITHM },
-          jwksPath: AUTH_JWKS_PATH,
-        },
+        jwks: JWKS_OPTIONS,
+
+        // --------------------------------------------------------------------
+        // FINDING F17 — published keys ⊆ signable keys, by construction.
+        // --------------------------------------------------------------------
+        //
+        // `plugins/jwt/adapter.mjs` routes BOTH `getAllKeys` (what the JWKS
+        // endpoint publishes) and `getLatestKey` (what `signJWT` signs with)
+        // through this ONE override. Filtering here is therefore not two checks
+        // that must agree — it is a single read that the document and the
+        // signer share, so "the console advertises a key it cannot sign with"
+        // has no arrangement in which it is true.
+        //
+        // Delete this line and the console goes back to publishing an unchanged,
+        // 200-ing JWKS after a `BETTER_AUTH_SECRET` rotation while every token
+        // it mints is rejected. `tests/integration/console-jwks-stability.test.ts`
+        // is what notices.
+        adapter: signableJwksAdapter(JWKS_OPTIONS),
 
         // --------------------------------------------------------------------
         // WHY THIS FLAG IS SET, AND WHAT BREAKS WITHOUT IT
