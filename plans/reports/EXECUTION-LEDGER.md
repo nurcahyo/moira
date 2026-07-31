@@ -985,6 +985,46 @@ The "State at a glance" block above exists precisely so a compacted context can 
 
 ## Cycle log
 
+### Cycle 11 — 2026-07-31 — PR #39 blocked by a pre-existing LISTEN/NOTIFY race; wave 4 re-audit
+
+**PR #39 did NOT merge on arrival — its `rust` job ran and failed.** Run `30617393166`: four of five
+jobs green (`supply-chain`, `container-and-helm`, `console`, `console-container-and-helm`); `rust`
+exited 101 on a single test.
+
+```
+test an_auth_settings_write_invalidates_the_cache_via_listen_notify ... FAILED
+tests/auth_provider_settings.rs:914 — ... (CONVENTIONS §7.2): Elapsed(())
+test result: FAILED. 19 passed; 1 failed
+```
+
+**Not PR #39's defect, and not overridden.** `git diff main...origin/fix/findings-sweep` on that file
+is **+144/-0** — the branch only *added* the new F13 test and never touched the failing one, which is
+pre-existing on `main`. The merge is still blocked: a job that ran and failed is real.
+
+**Diagnosed as a listener-attach race in the test, not a product defect.**
+`spawn_runtime_config_listener` (`src/infra/db.rs`) spawns a task that only *then* calls
+`PgListener::connect_with` and `listener.listen("moira_runtime_config")`. The test spawns it and
+proceeds straight to the write. Postgres delivers `NOTIFY` only to sessions **already** listening at
+commit time, so if the listener has not attached when the `UPDATE` commits, that notification is lost
+forever and the 10s poll spins to timeout. The intervening HTTP read normally covers the gap; under
+CI load it did not. In production the listener attaches at boot and lives forever, so the lost-window
+is a startup artefact with no cache populated yet to invalidate.
+
+The fix must **establish the missing precondition, not weaken the assertion** — the test's own comment
+already asks for an acknowledgement gate rather than a fixed sleep (CONVENTIONS §3). A longer timeout
+or a `sleep` would hide the race, and both are forbidden here.
+
+**Worktree hygiene:** six merged worktrees pruned (`f15`, `p08`, `p09a`, `p09b`, `p09c`, `p11`).
+Disk 76 GB free — above the 60 GB threshold, no reclaim needed. `~/.cargo-targets` holds only
+`moira-fsweep` (13 GB).
+
+**In flight:**
+
+| Agent | Branch | Worktree | Doing |
+|---|---|---|---|
+| A | `fix/findings-sweep` | `…/1b00aa10-…/scratchpad/fsweep` | close the LISTEN/NOTIFY attach race, teeth-check by injection, 5 consecutive suite runs, push → then merge #39 |
+| B | `plan/09-wave4-multi-provider` | `…/3f147114-…/scratchpad/p09w4` | re-audit wave 4 against the tree, write its §0 drift/blockers/decisions. **Audit only — no implementation** |
+
 ### Cycle 10 — 2026-07-29 → 07-31 — plans 10 and 08 MERGED, plan 11 started
 
 **Plan 10 merged** `671eadf` — cluster admission lease, leader election, durable worker queue,
