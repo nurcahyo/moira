@@ -254,6 +254,12 @@ mod tests {
             "moira.error.auth_provider_method_config_incomplete",
             "moira.error.auth_provider_url_not_allowed",
             "moira.error.console_issuer_must_not_assert_scopes",
+            // Plan 09 wave 4A. Emitters pinned by `tests/auth_provider_settings.rs`
+            // (the two F23 codes) and `tests/identity_claim.rs` (the lifecycle one);
+            // this asserts the catalogued half, exactly as the F13 entry above does.
+            "moira.error.duplicate_enabled_provider_for_issuer",
+            "moira.error.auth_provider_issuer_shadows_trusted_issuer",
+            "moira.error.trusted_issuer_has_active_grants",
         ] {
             let entry = all_entries()
                 .find(|entry| entry.key == key)

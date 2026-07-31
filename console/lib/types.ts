@@ -66,8 +66,21 @@ export interface SchemaContract {
 export type JsonValue =
   null | boolean | number | string | readonly JsonValue[] | { readonly [key: string]: JsonValue };
 
-/** `#/components/schemas/AuthMethod` */
-export type AuthMethod = "google_oauth" | "generic_oidc" | "jwks";
+/**
+ * `#/components/schemas/AuthMethod`
+ *
+ * `github_oauth` arrived with `migrations/0020` (plan 09 wave 4A) and is listed here because
+ * the union's job is to describe what Moira can put on the wire — a narrower union would be
+ * a type that lies about the response.
+ *
+ * It is deliberately **not** added to `isInteractiveMethod` in this wave. The console mints
+ * one `iss` for every provider, so offering a second sign-in button would mean two providers
+ * sharing one console issuer — which is what finding F24 rules out. Per-provider issuers are
+ * stage 4B; until they ship, a `github_oauth` row is storable in Moira and not offerable
+ * here. W4-B4 (the diagnosis `method_not_interactive` gives is wrong for it) is 4B's, with
+ * the N-button rendering it belongs to.
+ */
+export type AuthMethod = "google_oauth" | "generic_oidc" | "jwks" | "github_oauth";
 
 /** `#/components/schemas/ResourceStatus` */
 export type ResourceStatus = "active" | "disabled" | "deleted";

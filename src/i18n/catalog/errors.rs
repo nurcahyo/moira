@@ -613,6 +613,24 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         description: "Used when an auth-provider configuration links a trusted JWT issuer whose scopes_claim is set. Such an issuer's tokens self-assert scopes, which would defeat the admin_identities grant table as the sole source of human authorization (CONVENTIONS 7.5).",
     },
     // ---------------------------------------------------------------------
+    // Plan 09 wave 4A — finding F23 and the trusted-issuer lifecycle.
+    // ---------------------------------------------------------------------
+    I18nEntry {
+        key: "moira.error.duplicate_enabled_provider_for_issuer",
+        default_message: "More than one enabled auth provider is bound to this trusted JWT issuer.",
+        description: "Used when a create, patch or enable would leave two enabled auth_provider_settings rows bound to one trusted_jwt_issuers row, and by the admission-policy lookup when it finds that state already present. Finding F23: with two such rows the old query broke the tie on created_at, so the OLDEST row's allowed_email_domains governed every admin claim and every invite redemption regardless of which provider authenticated the human - silently, and in both directions. The remedy is to disable the row that should not govern; there is deliberately no automatic choice, because which provider governs admission is an operator decision. The same code is emitted at configure time by the service, by the partial unique index auth_provider_settings_one_enabled_per_trusted_issuer when two enables race, and at admission time when the invariant has been bypassed.",
+    },
+    I18nEntry {
+        key: "moira.error.auth_provider_issuer_shadows_trusted_issuer",
+        default_message: "This issuer is already registered as a trusted JWT issuer that the provider is not bound to.",
+        description: "Used when an auth-provider row's own issuer column would equal the issuer string of an active trusted_jwt_issuers row it is not bound to. Finding F23 shape (b): such a row claims an issuer identity it does not have, and before the two-stage admission lookup it outranked the correctly-bound provider at any age while needing no binding at all - so no index on trusted_jwt_issuer_id could reach it. Binding the row to that issuer is permitted and is CONVENTIONS 7.3 mode 3 configured explicitly; leaving it unbound is not.",
+    },
+    I18nEntry {
+        key: "moira.error.trusted_issuer_has_active_grants",
+        default_message: "Active admin identity grants were made through this trusted JWT issuer.",
+        description: "Used when deleting or disabling a trusted JWT issuer that still has active admin_identities rows. Both paths are soft, so admin_identities' foreign key never fires, while load_issuer filters on status = 'active' and deleted_at is null - retiring the issuer therefore stopped every grant made through it from authorising anybody, silently and deployment-wide. Revoke the grants first; the grants are not cascaded here because revocation has its own endpoint, its own audit trail and its own last-primary guard.",
+    },
+    // ---------------------------------------------------------------------
     // Plan 09 wave 2 — admin invitations and grant administration.
     //
     // Every code below has a pinned emitter and a pinned status, asserted by

@@ -83,6 +83,11 @@ impl HttpResult {
 /// tokens minted here therefore carry no scopes at all, and every scope the resulting actor
 /// holds must have come from an `admin_identities` grant.
 struct ConsoleIssuer {
+    /// The `trusted_jwt_issuers.id`. Every provider row this suite configures is BOUND to
+    /// it: since plan 09 wave 4A a row whose own `issuer` column names a registered trusted
+    /// issuer it is not bound to is refused `409 auth_provider_issuer_shadows_trusted_issuer`
+    /// (finding F23 shape (b)), and binding is what a real console deployment does anyway.
+    id: Uuid,
     issuer: String,
     task: JoinHandle<()>,
 }
@@ -113,6 +118,7 @@ impl ConsoleIssuer {
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve test JWKS");
         });
+        let id = Uuid::now_v7();
         let issuer = format!("https://console-idp.test/{}", Uuid::now_v7());
         sqlx::query(
             r#"
@@ -122,13 +128,13 @@ impl ConsoleIssuer {
             values ($1, $2, $3, '{}', array['RS256'], 'sub')
             "#,
         )
-        .bind(Uuid::now_v7())
+        .bind(id)
         .bind(&issuer)
         .bind(format!("http://{address}/jwks"))
         .execute(pool)
         .await
         .expect("register the console trusted JWT issuer");
-        Self { issuer, task }
+        Self { id, issuer, task }
     }
 
     fn token(&self, subject: &str, scopes: &[&str]) -> String {
@@ -289,7 +295,11 @@ async fn mint_system_key(router: &Router, state: &AppState) -> String {
 /// The designed setup order, steps 3 and 4: create an auth-provider configuration carrying
 /// the intended `allowed_email_domains`, then enable it. Until this runs, every claim is
 /// refused — that is the deny-by-default policy, not a defect.
-async fn configure_and_enable_policy(router: &Router, issuer: &str, domains: &[&str]) -> Uuid {
+async fn configure_and_enable_policy(
+    router: &Router,
+    issuer: &ConsoleIssuer,
+    domains: &[&str],
+) -> Uuid {
     let created = post_json(
         router.clone(),
         "/api/v1/admin/auth/providers",
@@ -299,7 +309,13 @@ async fn configure_and_enable_policy(router: &Router, issuer: &str, domains: &[&
         json!({
             "method": "generic_oidc",
             "display_name": "Console",
-            "issuer": issuer,
+            // The IdP's issuer, which is what a real deployment stores in this column,
+            // plus the binding that is what actually resolves the admission policy. Before
+            // wave 4A this row carried the CONSOLE's issuer and no binding; that shape is
+            // now refused at create time (F23 shape (b)) and the binding is what
+            // `admission_policy`'s first stage matches on.
+            "issuer": format!("https://idp.test/{}", Uuid::now_v7().simple()),
+            "trusted_jwt_issuer_id": issuer.id,
             "client_id": "console-client",
             "allowed_email_domains": domains
         }),
@@ -358,7 +374,7 @@ async fn bare_trusted_jwt_cannot_claim_regardless_of_its_scopes() {
     };
     let issuer = ConsoleIssuer::start(&fixture.pool).await;
     let router = moira::build_router(fixture.state.clone()).expect("router");
-    configure_and_enable_policy(&router, &issuer.issuer, &["example.com"]).await;
+    configure_and_enable_policy(&router, &issuer, &["example.com"]).await;
 
     // A JWT that verifies perfectly *and* asserts `moira:admin` — the strongest bearer
     // credential the trust model can produce.
@@ -438,7 +454,7 @@ async fn claim_succeeds_once_the_operator_configures_and_enables_the_allowed_dom
     let issuer = ConsoleIssuer::start(&fixture.pool).await;
     let router = moira::build_router(fixture.state.clone()).expect("router");
     let secret = mint_system_key(&router, &fixture.state).await;
-    configure_and_enable_policy(&router, &issuer.issuer, &["example.com"]).await;
+    configure_and_enable_policy(&router, &issuer, &["example.com"]).await;
 
     let granted = post_json(
         router.clone(),
@@ -487,7 +503,7 @@ async fn a_granted_identity_gains_admin_scope_only_on_the_admin_plane() {
     let issuer = ConsoleIssuer::start(&fixture.pool).await;
     let router = moira::build_router(fixture.state.clone()).expect("router");
     let secret = mint_system_key(&router, &fixture.state).await;
-    configure_and_enable_policy(&router, &issuer.issuer, &["example.com"]).await;
+    configure_and_enable_policy(&router, &issuer, &["example.com"]).await;
 
     let bearer = issuer.bearer("granted-human", &[]);
     let pool = &fixture.pool;
@@ -594,7 +610,7 @@ async fn an_ungranted_subject_on_the_same_issuer_gains_no_scopes() {
     let issuer = ConsoleIssuer::start(&fixture.pool).await;
     let router = moira::build_router(fixture.state.clone()).expect("router");
     let secret = mint_system_key(&router, &fixture.state).await;
-    configure_and_enable_policy(&router, &issuer.issuer, &["example.com"]).await;
+    configure_and_enable_policy(&router, &issuer, &["example.com"]).await;
 
     let claimed = post_json(
         router,
@@ -628,7 +644,7 @@ async fn claim_is_idempotent_under_an_idempotency_key_and_conflicts_without_one(
     let issuer = ConsoleIssuer::start(&fixture.pool).await;
     let router = moira::build_router(fixture.state.clone()).expect("router");
     let secret = mint_system_key(&router, &fixture.state).await;
-    configure_and_enable_policy(&router, &issuer.issuer, &["example.com"]).await;
+    configure_and_enable_policy(&router, &issuer, &["example.com"]).await;
     let key = format!("claim-{}", Uuid::now_v7());
     let body = claim_body(&issuer.issuer, "owner", "owner@example.com");
 
@@ -768,7 +784,7 @@ async fn concurrent_claims_for_the_same_identity_yield_one_201_and_one_409() {
     let issuer = ConsoleIssuer::start(&fixture.pool).await;
     let router = moira::build_router(fixture.state.clone()).expect("router");
     let secret = mint_system_key(&router, &fixture.state).await;
-    configure_and_enable_policy(&router, &issuer.issuer, &["example.com"]).await;
+    configure_and_enable_policy(&router, &issuer, &["example.com"]).await;
     let body = claim_body(&issuer.issuer, "contested", "owner@example.com");
 
     let barrier = std::sync::Arc::new(Barrier::new(3));
@@ -832,7 +848,7 @@ async fn concurrent_claims_for_different_identities_both_succeed() {
     let issuer = ConsoleIssuer::start(&fixture.pool).await;
     let router = moira::build_router(fixture.state.clone()).expect("router");
     let secret = mint_system_key(&router, &fixture.state).await;
-    configure_and_enable_policy(&router, &issuer.issuer, &["example.com"]).await;
+    configure_and_enable_policy(&router, &issuer, &["example.com"]).await;
 
     let barrier = std::sync::Arc::new(Barrier::new(3));
     let first = spawn_claim(
@@ -919,7 +935,7 @@ async fn a_non_unique_database_failure_is_not_reported_as_already_claimed() {
     let issuer = ConsoleIssuer::start(&fixture.pool).await;
     let router = moira::build_router(fixture.state.clone()).expect("router");
     let secret = mint_system_key(&router, &fixture.state).await;
-    configure_and_enable_policy(&router, &issuer.issuer, &["example.com"]).await;
+    configure_and_enable_policy(&router, &issuer, &["example.com"]).await;
 
     // `varchar(320)` in `0012`; the local part alone is longer than the whole column.
     let oversized = format!("{}@example.com", "a".repeat(400));
@@ -1003,7 +1019,7 @@ async fn claim_with_an_unverified_email_returns_403() {
     let issuer = ConsoleIssuer::start(&fixture.pool).await;
     let router = moira::build_router(fixture.state.clone()).expect("router");
     let secret = mint_system_key(&router, &fixture.state).await;
-    configure_and_enable_policy(&router, &issuer.issuer, &["example.com"]).await;
+    configure_and_enable_policy(&router, &issuer, &["example.com"]).await;
 
     let mut body = claim_body(&issuer.issuer, "owner", "owner@example.com");
     body["email_verified"] = json!(false);
@@ -1036,7 +1052,7 @@ async fn claim_with_a_disallowed_domain_returns_403() {
     let issuer = ConsoleIssuer::start(&fixture.pool).await;
     let router = moira::build_router(fixture.state.clone()).expect("router");
     let secret = mint_system_key(&router, &fixture.state).await;
-    configure_and_enable_policy(&router, &issuer.issuer, &["allowed.example"]).await;
+    configure_and_enable_policy(&router, &issuer, &["allowed.example"]).await;
 
     let refused = post_json(
         router,
@@ -1070,7 +1086,7 @@ async fn claim_is_denied_by_default_when_no_domain_allow_list_is_configured() {
     let router = moira::build_router(fixture.state.clone()).expect("router");
     let secret = mint_system_key(&router, &fixture.state).await;
     // Empty allow-list, deliberately: `configure_and_enable_policy` with no domains.
-    configure_and_enable_policy(&router, &issuer.issuer, &[]).await;
+    configure_and_enable_policy(&router, &issuer, &[]).await;
 
     let refused = post_json(
         router,
@@ -1106,7 +1122,7 @@ async fn every_granted_admin_identity_row_carries_a_non_null_email() {
     let mut issuers = Vec::new();
     for index in 0..3 {
         let issuer = ConsoleIssuer::start(&fixture.pool).await;
-        configure_and_enable_policy(&router, &issuer.issuer, &["example.com"]).await;
+        configure_and_enable_policy(&router, &issuer, &["example.com"]).await;
         let granted = post_json(
             router.clone(),
             "/api/v1/admin/setup/claim",
@@ -1159,7 +1175,7 @@ async fn every_claim_error_response_carries_a_nonempty_message_key_and_message()
     let issuer = ConsoleIssuer::start(&fixture.pool).await;
     let router = moira::build_router(fixture.state.clone()).expect("router");
     let secret = mint_system_key(&router, &fixture.state).await;
-    configure_and_enable_policy(&router, &issuer.issuer, &["allowed.example"]).await;
+    configure_and_enable_policy(&router, &issuer, &["allowed.example"]).await;
 
     let mut unverified_body = claim_body(&issuer.issuer, "unverified", "owner@allowed.example");
     unverified_body["email_verified"] = json!(false);
@@ -1253,7 +1269,7 @@ async fn every_claim_attempt_writes_exactly_one_audit_row_with_the_correct_actor
     let issuer = ConsoleIssuer::start(&fixture.pool).await;
     let router = moira::build_router(fixture.state.clone()).expect("router");
     let secret = mint_system_key(&router, &fixture.state).await;
-    configure_and_enable_policy(&router, &issuer.issuer, &["example.com"]).await;
+    configure_and_enable_policy(&router, &issuer, &["example.com"]).await;
 
     let granted = post_json(
         router,
@@ -1330,5 +1346,175 @@ async fn the_existing_structural_setup_status_endpoint_is_unaffected() {
     assert!(
         claim_status.body.get("checks").is_none(),
         "the claim-status endpoint must not grow the structural endpoint's detail"
+    );
+}
+
+/* -------------------------------------------------------------------------- */
+/* Plan 09 wave 4A — G6: retiring a trusted issuer with live grants            */
+/* -------------------------------------------------------------------------- */
+
+/// **G6 — a trusted issuer with live grants cannot be deleted or disabled.**
+///
+/// # The defect
+///
+/// `admin_identities.trusted_jwt_issuer_id` is a real foreign key, so a *hard* delete would
+/// be refused by Postgres. Both retirement paths are **soft** — `soft_delete_trusted_jwt_issuer`
+/// sets `status = 'deleted'` and `deleted_at`, `set_trusted_jwt_issuer_status` sets
+/// `'disabled'` — so the FK never fires. Meanwhile `load_issuer` filters
+/// `status = 'active' and deleted_at is null`. One button therefore stopped every token
+/// minted under that issuer from verifying, and every grant made through it from
+/// authorising anybody: a silent, deployment-wide admin revocation, on a deployment whose
+/// only other way in is the bootstrap system key the invitation flow exists to retire.
+///
+/// # The mutation, and why the assertion goes through `authenticate_admin`
+///
+/// Remove the guard and a repository-level test still passes: the soft delete succeeds
+/// either way, and asserting "the row is gone" is true in both arrangements. What changes
+/// is whether the **grant still authorises**, and only the authentication path can observe
+/// that. So this test deletes, expects a coded 409, and then re-authenticates the *same
+/// bearer* — the assertion that would have gone red before the guard existed, and the one a
+/// row-level assertion cannot make.
+#[tokio::test]
+async fn a_trusted_issuer_with_live_grants_cannot_be_retired() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let issuer = ConsoleIssuer::start(&fixture.pool).await;
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let secret = mint_system_key(&router, &fixture.state).await;
+    configure_and_enable_policy(&router, &issuer, &["example.com"]).await;
+
+    let bearer = issuer.bearer("retire-me", &[]);
+
+    // No grant yet: retiring an issuer nobody depends on stays allowed, so the refusal
+    // below is about the grant and not about the issuer being in use at all.
+    let unused = ConsoleIssuer::start(&fixture.pool).await;
+    let unused_row = get(
+        router.clone(),
+        &format!("/api/v1/admin/jwt-issuers/{}", unused.id),
+    )
+    .await;
+    assert_eq!(unused_row.status, StatusCode::OK, "{:?}", unused_row.body);
+    let removed = send(
+        router.clone(),
+        base(
+            "DELETE",
+            &format!("/api/v1/admin/jwt-issuers/{}", unused.id),
+        )
+        .header("if-match", unused_row.version().to_string())
+        .body(Body::empty())
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        removed.status,
+        StatusCode::NO_CONTENT,
+        "an issuer with no grants must still be removable: {:?}",
+        removed.body
+    );
+
+    // Now make a grant through the issuer under test.
+    let claimed = post_json(
+        router.clone(),
+        "/api/v1/admin/setup/claim",
+        system_key_headers(&secret),
+        None,
+        None,
+        claim_body(&issuer.issuer, "retire-me", "owner@example.com"),
+    )
+    .await;
+    assert_eq!(claimed.status, StatusCode::CREATED, "{:?}", claimed.body);
+
+    // The premise, asserted: the grant authorises on the admin plane right now.
+    let before = fixture
+        .state
+        .auth
+        .authenticate_admin(&fixture.pool, &bearer)
+        .await
+        .expect("the granted identity authenticates before any retirement attempt");
+    assert_eq!(before.scopes, vec!["moira:admin".to_string()]);
+
+    let row = get(
+        router.clone(),
+        &format!("/api/v1/admin/jwt-issuers/{}", issuer.id),
+    )
+    .await;
+    assert_eq!(row.status, StatusCode::OK, "{:?}", row.body);
+    let version = row.version();
+
+    let deleted = send(
+        router.clone(),
+        base(
+            "DELETE",
+            &format!("/api/v1/admin/jwt-issuers/{}", issuer.id),
+        )
+        .header("if-match", version.to_string())
+        .body(Body::empty())
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::CONFLICT, "{:?}", deleted.body);
+    assert_eq!(deleted.code(), "trusted_issuer_has_active_grants");
+
+    // The disable path is the same silent revocation by another name: `load_issuer` filters
+    // on `status = 'active'`, so `'disabled'` is exactly as fatal to a live grant as
+    // `'deleted'`. Guarding only `DELETE` would leave the whole defect one button over.
+    let disabled = post_json(
+        router.clone(),
+        &format!("/api/v1/admin/jwt-issuers/{}/disable", issuer.id),
+        HeaderMap::new(),
+        None,
+        Some(version),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(disabled.status, StatusCode::CONFLICT, "{:?}", disabled.body);
+    assert_eq!(disabled.code(), "trusted_issuer_has_active_grants");
+
+    // ---- the assertion the guard exists for ----------------------------------
+    // Not "the row is still there" — that is true whether or not the guard ran, because
+    // both refusals happen before the write. This re-authenticates the same bearer and
+    // asserts the grant STILL AUTHORISES, which is the property the retirement would have
+    // destroyed.
+    let after = fixture
+        .state
+        .auth
+        .authenticate_admin(&fixture.pool, &bearer)
+        .await
+        .expect("the grant must still authenticate after a refused retirement");
+    assert_eq!(
+        after.scopes,
+        vec!["moira:admin".to_string()],
+        "the trusted issuer was retired anyway and the grant stopped authorising"
+    );
+
+    // And once the grant is gone, retirement is allowed again — so the guard is a
+    // precondition, not a permanent lock on the row.
+    sqlx::query("update admin_identities set status = 'revoked', is_primary = false where trusted_jwt_issuer_id = $1")
+        .bind(issuer.id)
+        .execute(&fixture.pool)
+        .await
+        .expect("revoke the grant");
+    let row = get(
+        router.clone(),
+        &format!("/api/v1/admin/jwt-issuers/{}", issuer.id),
+    )
+    .await;
+    let finally = send(
+        router,
+        base(
+            "DELETE",
+            &format!("/api/v1/admin/jwt-issuers/{}", issuer.id),
+        )
+        .header("if-match", row.version().to_string())
+        .body(Body::empty())
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        finally.status,
+        StatusCode::NO_CONTENT,
+        "a revoked grant must not keep the issuer locked forever: {:?}",
+        finally.body
     );
 }

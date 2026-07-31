@@ -294,9 +294,18 @@ async fn post_json(router: Router, path: &str, headers: HeaderMap, body: Value) 
 /// Named rather than passed as two loose `Option`s because the difference between the two
 /// variants *is* the subject of `redeem_resolves_the_governing_policy_through_the_trusted_jwt_issuer_link`.
 enum PolicyBinding<'a> {
-    /// `auth_provider_settings.issuer` equals the token's issuer. The `governing_policy`
-    /// query matches on `$1` and the `trusted_jwt_issuer_id` argument is never needed.
-    ByIssuerString(&'a str),
+    /// `auth_provider_settings.issuer` equals the token's issuer, **and** the row is bound
+    /// to that same trusted issuer — CONVENTIONS §7.3 mode 3 configured explicitly.
+    ///
+    /// It used to be the unbound shape, on the theory that `governing_policy`'s
+    /// `issuer = $1` branch was the thing under test. Finding F23 corrected that twice
+    /// over: an unbound row carrying the CONSOLE's issuer is shape (b) — it outranked the
+    /// correctly-bound provider at any age and applied its own `allowed_email_domains` —
+    /// and since `migrations/0020` it is refused at create time with
+    /// `409 auth_provider_issuer_shadows_trusted_issuer`. The variant is kept because the
+    /// contrast with the next one is still the point; what it demonstrates is now that the
+    /// `issuer` column's value does not decide anything, in either direction.
+    ByIssuerString { issuer: &'a str, id: Uuid },
     /// `auth_provider_settings.issuer` holds a *different* string — the IdP's own issuer,
     /// which is what a real deployment stores — and the row reaches the console's issuer
     /// only through `trusted_jwt_issuer_id`. This is the arrangement that makes the second
@@ -313,7 +322,7 @@ async fn configure_and_enable_policy(
     domains: &[&str],
 ) -> (Uuid, i64) {
     let (issuer, trusted_jwt_issuer_id) = match binding {
-        PolicyBinding::ByIssuerString(issuer) => (issuer.to_string(), Value::Null),
+        PolicyBinding::ByIssuerString { issuer, id } => (issuer.to_string(), json!(id)),
         PolicyBinding::ByTrustedIssuerLink { other_issuer, id } => {
             (other_issuer.to_string(), json!(id))
         }
@@ -545,11 +554,20 @@ async fn create_preview_redeem_grants_admin_and_consumes_the_invite() {
     let router = moira::build_router(fixture.state.clone()).expect("router");
     let (provider_id, _) = configure_and_enable_policy(
         &router,
-        PolicyBinding::ByIssuerString(&issuer.issuer),
+        PolicyBinding::ByIssuerString {
+            issuer: &issuer.issuer,
+            id: issuer.id,
+        },
         &["example.com"],
     )
     .await;
-    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+    assert_exactly_one_enabled_policy(
+        &fixture.pool,
+        provider_id,
+        Some(&issuer.issuer),
+        Some(issuer.id),
+    )
+    .await;
     assert_eq!(
         grant_count(&fixture.pool).await,
         0,
@@ -667,11 +685,20 @@ async fn a_second_redemption_of_a_consumed_invite_is_refused_and_creates_no_seco
     let router = moira::build_router(fixture.state.clone()).expect("router");
     let (provider_id, _) = configure_and_enable_policy(
         &router,
-        PolicyBinding::ByIssuerString(&issuer.issuer),
+        PolicyBinding::ByIssuerString {
+            issuer: &issuer.issuer,
+            id: issuer.id,
+        },
         &["example.com"],
     )
     .await;
-    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+    assert_exactly_one_enabled_policy(
+        &fixture.pool,
+        provider_id,
+        Some(&issuer.issuer),
+        Some(issuer.id),
+    )
+    .await;
 
     let (invite_id, token) = create_invite(&router, "domain", "example.com").await;
     let first = post_json(
@@ -729,11 +756,20 @@ async fn an_expired_invite_is_refused_by_both_preview_and_redeem() {
     let router = moira::build_router(fixture.state.clone()).expect("router");
     let (provider_id, _) = configure_and_enable_policy(
         &router,
-        PolicyBinding::ByIssuerString(&issuer.issuer),
+        PolicyBinding::ByIssuerString {
+            issuer: &issuer.issuer,
+            id: issuer.id,
+        },
         &["example.com"],
     )
     .await;
-    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+    assert_exactly_one_enabled_policy(
+        &fixture.pool,
+        provider_id,
+        Some(&issuer.issuer),
+        Some(issuer.id),
+    )
+    .await;
 
     let (invite_id, token) = create_invite(&router, "domain", "example.com").await;
     // Backdated rather than slept through: `MIN_INVITE_EXPIRY_SECONDS` is 60, so the API
@@ -797,11 +833,20 @@ async fn a_revoked_invite_is_refused_by_both_preview_and_redeem() {
     let router = moira::build_router(fixture.state.clone()).expect("router");
     let (provider_id, _) = configure_and_enable_policy(
         &router,
-        PolicyBinding::ByIssuerString(&issuer.issuer),
+        PolicyBinding::ByIssuerString {
+            issuer: &issuer.issuer,
+            id: issuer.id,
+        },
         &["example.com"],
     )
     .await;
-    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+    assert_exactly_one_enabled_policy(
+        &fixture.pool,
+        provider_id,
+        Some(&issuer.issuer),
+        Some(issuer.id),
+    )
+    .await;
 
     let (invite_id, token) = create_invite(&router, "domain", "example.com").await;
     let revoked = post_json(
@@ -873,11 +918,20 @@ async fn a_policy_denied_redemption_leaves_the_invite_pending_and_the_same_link_
     // separation the two error codes exist to express.
     let (provider_id, version) = configure_and_enable_policy(
         &router,
-        PolicyBinding::ByIssuerString(&issuer.issuer),
+        PolicyBinding::ByIssuerString {
+            issuer: &issuer.issuer,
+            id: issuer.id,
+        },
         &["already-onboarded.test"],
     )
     .await;
-    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+    assert_exactly_one_enabled_policy(
+        &fixture.pool,
+        provider_id,
+        Some(&issuer.issuer),
+        Some(issuer.id),
+    )
+    .await;
 
     let (invite_id, token) = create_invite(&router, "domain", "example.com").await;
     let denied = post_json(
@@ -962,11 +1016,20 @@ async fn a_refusal_that_belongs_to_the_invite_is_not_pre_empted_by_the_grant_tab
     let router = moira::build_router(fixture.state.clone()).expect("router");
     let (provider_id, version) = configure_and_enable_policy(
         &router,
-        PolicyBinding::ByIssuerString(&issuer.issuer),
+        PolicyBinding::ByIssuerString {
+            issuer: &issuer.issuer,
+            id: issuer.id,
+        },
         &["example.com"],
     )
     .await;
-    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+    assert_exactly_one_enabled_policy(
+        &fixture.pool,
+        provider_id,
+        Some(&issuer.issuer),
+        Some(issuer.id),
+    )
+    .await;
 
     // Premise — this identity already holds a grant, which is what makes `insert_grant`
     // fail if it is ever reached. Without it both probes below would pass against the
@@ -1123,11 +1186,20 @@ async fn a_non_primary_admin_cannot_promote_itself_to_primary() {
     let router = moira::build_router(fixture.state.clone()).expect("router");
     let (provider_id, _) = configure_and_enable_policy(
         &router,
-        PolicyBinding::ByIssuerString(&issuer.issuer),
+        PolicyBinding::ByIssuerString {
+            issuer: &issuer.issuer,
+            id: issuer.id,
+        },
         &["example.com"],
     )
     .await;
-    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+    assert_exactly_one_enabled_policy(
+        &fixture.pool,
+        provider_id,
+        Some(&issuer.issuer),
+        Some(issuer.id),
+    )
+    .await;
 
     // The deployment needs an owner *other than* the caller under test: since finding F20
     // the first grant takes ownership, so without this the "non-primary admin" would be the
@@ -1220,13 +1292,22 @@ async fn an_invite_bound_to_another_address_is_refused_with_its_own_code_and_sta
     let router = moira::build_router(fixture.state.clone()).expect("router");
     let (provider_id, _) = configure_and_enable_policy(
         &router,
-        PolicyBinding::ByIssuerString(&issuer.issuer),
+        PolicyBinding::ByIssuerString {
+            issuer: &issuer.issuer,
+            id: issuer.id,
+        },
         &["example.com"],
     )
     .await;
     // Premise: the provider allow-list *does* admit the presented domain, so a refusal here
     // can only come from the invite's own constraint.
-    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+    assert_exactly_one_enabled_policy(
+        &fixture.pool,
+        provider_id,
+        Some(&issuer.issuer),
+        Some(issuer.id),
+    )
+    .await;
 
     let (invite_id, token) = create_invite(&router, "email", "intended@example.com").await;
     let refused = post_json(
@@ -1277,11 +1358,20 @@ async fn every_refused_redemption_increments_a_bounded_counter_and_no_preview_do
     let router = moira::build_router(observable_state(&fixture.pool)).expect("router");
     let (provider_id, _) = configure_and_enable_policy(
         &router,
-        PolicyBinding::ByIssuerString(&issuer.issuer),
+        PolicyBinding::ByIssuerString {
+            issuer: &issuer.issuer,
+            id: issuer.id,
+        },
         &["example.com"],
     )
     .await;
-    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+    assert_exactly_one_enabled_policy(
+        &fixture.pool,
+        provider_id,
+        Some(&issuer.issuer),
+        Some(issuer.id),
+    )
+    .await;
 
     const REASONS: &[&str] = &[
         "not_found",
@@ -1490,11 +1580,20 @@ async fn the_grant_administration_conflicts_are_pinned_to_their_paths() {
     let router = moira::build_router(fixture.state.clone()).expect("router");
     let (provider_id, _) = configure_and_enable_policy(
         &router,
-        PolicyBinding::ByIssuerString(&issuer.issuer),
+        PolicyBinding::ByIssuerString {
+            issuer: &issuer.issuer,
+            id: issuer.id,
+        },
         &["example.com"],
     )
     .await;
-    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+    assert_exactly_one_enabled_policy(
+        &fixture.pool,
+        provider_id,
+        Some(&issuer.issuer),
+        Some(issuer.id),
+    )
+    .await;
 
     // admin_identity_not_found — premise: this id really is absent.
     let absent = Uuid::now_v7();
@@ -1595,11 +1694,20 @@ async fn clearing_the_only_primary_is_refused_with_the_last_primary_conflict() {
     let router = moira::build_router(fixture.state.clone()).expect("router");
     let (provider_id, _) = configure_and_enable_policy(
         &router,
-        PolicyBinding::ByIssuerString(&issuer.issuer),
+        PolicyBinding::ByIssuerString {
+            issuer: &issuer.issuer,
+            id: issuer.id,
+        },
         &["example.com"],
     )
     .await;
-    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+    assert_exactly_one_enabled_policy(
+        &fixture.pool,
+        provider_id,
+        Some(&issuer.issuer),
+        Some(issuer.id),
+    )
+    .await;
 
     let (_, token) = create_invite(&router, "domain", "example.com").await;
     let redeemed = redeem(&router, &issuer, "owner-to-be", &token).await;
@@ -1676,11 +1784,20 @@ async fn two_simultaneous_redemptions_of_one_token_produce_exactly_one_grant() {
     let router = moira::build_router(fixture.state.clone()).expect("router");
     let (provider_id, _) = configure_and_enable_policy(
         &router,
-        PolicyBinding::ByIssuerString(&issuer.issuer),
+        PolicyBinding::ByIssuerString {
+            issuer: &issuer.issuer,
+            id: issuer.id,
+        },
         &["example.com"],
     )
     .await;
-    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+    assert_exactly_one_enabled_policy(
+        &fixture.pool,
+        provider_id,
+        Some(&issuer.issuer),
+        Some(issuer.id),
+    )
+    .await;
 
     let (invite_id, token) = create_invite(&router, "domain", "example.com").await;
     assert_eq!(invite_status(&fixture.pool, invite_id).await, "pending");
@@ -1760,11 +1877,20 @@ async fn the_first_grant_on_a_deployment_owns_it_and_the_second_does_not() {
     let router = moira::build_router(fixture.state.clone()).expect("router");
     let (provider_id, _) = configure_and_enable_policy(
         &router,
-        PolicyBinding::ByIssuerString(&issuer.issuer),
+        PolicyBinding::ByIssuerString {
+            issuer: &issuer.issuer,
+            id: issuer.id,
+        },
         &["example.com"],
     )
     .await;
-    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+    assert_exactly_one_enabled_policy(
+        &fixture.pool,
+        provider_id,
+        Some(&issuer.issuer),
+        Some(issuer.id),
+    )
+    .await;
 
     // Premise: a deployment with no grant and therefore no owner. This is the state F20
     // says every post-`0017` deployment was permanently stuck in.
@@ -1821,11 +1947,20 @@ async fn two_simultaneous_first_grants_produce_exactly_one_owner_and_no_failure(
     let router = moira::build_router(fixture.state.clone()).expect("router");
     let (provider_id, _) = configure_and_enable_policy(
         &router,
-        PolicyBinding::ByIssuerString(&issuer.issuer),
+        PolicyBinding::ByIssuerString {
+            issuer: &issuer.issuer,
+            id: issuer.id,
+        },
         &["example.com"],
     )
     .await;
-    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+    assert_exactly_one_enabled_policy(
+        &fixture.pool,
+        provider_id,
+        Some(&issuer.issuer),
+        Some(issuer.id),
+    )
+    .await;
     assert_eq!(
         active_primary_count(&fixture.pool).await,
         0,
@@ -1909,11 +2044,20 @@ async fn transferring_ownership_moves_the_flag_rather_than_adding_a_second_owner
     let router = moira::build_router(observable_state(&fixture.pool)).expect("router");
     let (provider_id, _) = configure_and_enable_policy(
         &router,
-        PolicyBinding::ByIssuerString(&issuer.issuer),
+        PolicyBinding::ByIssuerString {
+            issuer: &issuer.issuer,
+            id: issuer.id,
+        },
         &["example.com"],
     )
     .await;
-    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+    assert_exactly_one_enabled_policy(
+        &fixture.pool,
+        provider_id,
+        Some(&issuer.issuer),
+        Some(issuer.id),
+    )
+    .await;
 
     let (_, outgoing_token) = create_invite(&router, "domain", "example.com").await;
     let outgoing = redeem(&router, &issuer, "outgoing", &outgoing_token).await;
@@ -2025,11 +2169,20 @@ async fn a_replayed_revocation_does_not_count_a_second_one() {
     let router = moira::build_router(observable_state(&fixture.pool)).expect("router");
     let (provider_id, _) = configure_and_enable_policy(
         &router,
-        PolicyBinding::ByIssuerString(&issuer.issuer),
+        PolicyBinding::ByIssuerString {
+            issuer: &issuer.issuer,
+            id: issuer.id,
+        },
         &["example.com"],
     )
     .await;
-    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+    assert_exactly_one_enabled_policy(
+        &fixture.pool,
+        provider_id,
+        Some(&issuer.issuer),
+        Some(issuer.id),
+    )
+    .await;
 
     // The owner exists only so the target is revocable: revoking the owner is refused by the
     // last-primary guard, which would make this test assert a conflict instead of a replay.
@@ -2109,11 +2262,20 @@ async fn revoking_the_owner_is_refused_by_the_last_primary_guard() {
     let router = moira::build_router(fixture.state.clone()).expect("router");
     let (provider_id, _) = configure_and_enable_policy(
         &router,
-        PolicyBinding::ByIssuerString(&issuer.issuer),
+        PolicyBinding::ByIssuerString {
+            issuer: &issuer.issuer,
+            id: issuer.id,
+        },
         &["example.com"],
     )
     .await;
-    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+    assert_exactly_one_enabled_policy(
+        &fixture.pool,
+        provider_id,
+        Some(&issuer.issuer),
+        Some(issuer.id),
+    )
+    .await;
 
     let (_, token) = create_invite(&router, "domain", "example.com").await;
     let owner = redeem(&router, &issuer, "sole-admin", &token).await;
@@ -2166,11 +2328,20 @@ async fn an_idempotent_replay_does_not_count_a_second_invitation_or_redemption()
     let router = moira::build_router(observable_state(&fixture.pool)).expect("router");
     let (provider_id, _) = configure_and_enable_policy(
         &router,
-        PolicyBinding::ByIssuerString(&issuer.issuer),
+        PolicyBinding::ByIssuerString {
+            issuer: &issuer.issuer,
+            id: issuer.id,
+        },
         &["example.com"],
     )
     .await;
-    assert_exactly_one_enabled_policy(&fixture.pool, provider_id, Some(&issuer.issuer), None).await;
+    assert_exactly_one_enabled_policy(
+        &fixture.pool,
+        provider_id,
+        Some(&issuer.issuer),
+        Some(issuer.id),
+    )
+    .await;
 
     let before = scrape_metrics(router.clone()).await;
     assert!(
