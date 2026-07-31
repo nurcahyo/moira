@@ -186,7 +186,13 @@ Migrations end at **`0020`** (next free `0021`; `0016` is a permanent gap). Open
 |---|---|---|
 | **F16** | `rig-core` logs the whole completion body, now carrying other tenants' retrieved documents. Mitigated below the `EnvFilter` — **and that mitigation's own wiring test was missing until `8bbda15`** | **proper fix is upstream; needs an issue filed by a human** |
 | **F2** | Pre-auth query-field enumeration | user deferred |
+| **F10 item 1** | `tests/retention_worker.rs` asserts an **exact** delete count against a cluster-wide sweep, and seeds century-backdated rows with no cleanup path, so a failure leaks rows that sort ahead of the next run's — self-poisoning | open. **It is now the LAST suite on the shared database**, so it is also the only remaining source of cross-run coupling |
 | ~~**F27**~~ | ~~Leaked `trusted_jwt_issuers` rows in the shared test DB~~ **CLOSED** `fix/test-row-leak`. **The recorded count was wrong**: it said ~986; the measurement was **160** — exactly ten rows (the ten `register_issuer` call sites in `tests/jwks_hardening.rs`) × sixteen runs, and it leaked them on the **happy** path, not only on a panic. `tests/http_middleware_contract.rs` was the same shape (F10 item 2) with **42** *active* `moira:admin` API keys. Both now use `support::TestDatabase`, whose `Drop` discards the whole database including while unwinding. Residue deleted by predicate; `audit_logs` residue (180 rows) left in place deliberately | hygiene |
+
+**A concurrent branch `fix/test-row-leak-2` exists on origin** — a *reclaim* approach to the same
+finding (delete the rows), superseded by `cac20ff` because reclaiming leaves the suite writing to the
+shared database, so the next run leaks again. It was **left in place rather than deleted**: it is
+another writer's work, and this loop does not destroy branches it did not create.
 
 *Reversal condition for F27:* it reopens if any test source outside `SHARED_DATABASE_ALLOWLIST` in
 `tests/test_database_isolation.rs` resolves `MOIRA_TEST_DATABASE_URL` itself, or if either suite's
