@@ -46,6 +46,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 const INVITE_OUTCOMES: &str = "moira_admin_invite_outcomes_total";
+const GRANT_EVENTS: &str = "moira_admin_identity_grant_events_total";
 
 /// The same key material `tests/identity_claim.rs` uses.
 ///
@@ -525,6 +526,10 @@ async fn scrape_metrics(router: Router) -> String {
 
 fn invite_outcome(exposition: &str, label: &str) -> f64 {
     counter_value(exposition, INVITE_OUTCOMES, "outcome", label)
+}
+
+fn ownership_transfers(exposition: &str) -> f64 {
+    counter_value(exposition, GRANT_EVENTS, "event", "ownership_transferred")
 }
 
 // ===========================================================================================
@@ -1881,20 +1886,27 @@ async fn two_simultaneous_first_grants_produce_exactly_one_owner_and_no_failure(
     );
 }
 
-/// Transfer **moves** the flag; it does not add a second holder.
+/// Transfer **moves** the flag; it does not add a second holder — and it is the *only* thing
+/// `moira_admin_identity_grant_events_total{event="ownership_transferred"}` counts.
 ///
 /// Asserted on the incumbent as well as on the target, because "the target is now primary" is
 /// true of both designs and only the incumbent's demotion distinguishes them. The incumbent's
 /// `version` is checked too: a demotion that did not bump it would leave a console holding a
 /// stale `ETag` that still validates, and the next `If-Match` write would act on a record
 /// whose ownership had moved underneath it.
+///
+/// The counter half is a wave-2 leftover: `record_admin_ownership_transferred` fired after
+/// **every** successful `PATCH`, including one that *cleared* the flag — a different event —
+/// so a `{"is_primary": false}` on a grant that was never the owner, which changes nothing at
+/// all, still reported an ownership transfer. Both directions are exercised here, because
+/// asserting only the increment would pass against the version that counts everything.
 #[tokio::test]
 async fn transferring_ownership_moves_the_flag_rather_than_adding_a_second_owner() {
     let Some(fixture) = LifecycleFixture::new().await else {
         return;
     };
     let issuer = ConsoleIssuer::start(&fixture.pool).await;
-    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let router = moira::build_router(observable_state(&fixture.pool)).expect("router");
     let (provider_id, _) = configure_and_enable_policy(
         &router,
         PolicyBinding::ByIssuerString(&issuer.issuer),
@@ -1910,22 +1922,55 @@ async fn transferring_ownership_moves_the_flag_rather_than_adding_a_second_owner
     let incoming = redeem(&router, &issuer, "incoming", &incoming_token).await;
     assert_eq!(incoming.status, StatusCode::CREATED, "{:?}", incoming.body);
 
-    // Premise: `outgoing` owns it, `incoming` does not.
+    // Premise: `outgoing` owns it, `incoming` does not, and nothing has been transferred yet.
     assert!(is_primary(&fixture.pool, grant_id(&outgoing)).await);
     assert!(!is_primary(&fixture.pool, grant_id(&incoming)).await);
     let outgoing_version_before = outgoing.body["version"].as_i64().expect("a version");
+    let before = scrape_metrics(router.clone()).await;
+    assert!(
+        before.contains(GRANT_EVENTS),
+        "the family must be registered before a zero reading means anything"
+    );
+    assert_eq!(ownership_transfers(&before), 0.0);
 
-    let transferred = send_json(
+    // A `PATCH` that clears the flag on a grant which never held it: a successful 200 that
+    // changes nothing. It is the case that used to be counted as an ownership transfer.
+    let noop = send_json(
         router.clone(),
         "PATCH",
         &format!("/api/v1/admin/admin-identities/{}", grant_id(&incoming)),
         HeaderMap::new(),
         incoming.body["version"].as_i64(),
+        json!({ "is_primary": false }),
+    )
+    .await;
+    assert_eq!(noop.status, StatusCode::OK, "{:?}", noop.body);
+    assert_eq!(noop.body["is_primary"], json!(false));
+    assert_eq!(
+        ownership_transfers(&scrape_metrics(router.clone()).await),
+        0.0,
+        "clearing a flag nobody held is not an ownership transfer"
+    );
+
+    // `If-Match` carries the version the no-op left behind: the bump trigger fires on any
+    // UPDATE, so reusing the pre-no-op version would fail with `resource_version_conflict`
+    // and this test would be asserting the wrong refusal.
+    let transferred = send_json(
+        router.clone(),
+        "PATCH",
+        &format!("/api/v1/admin/admin-identities/{}", grant_id(&incoming)),
+        HeaderMap::new(),
+        Some(noop.version()),
         json!({ "is_primary": true }),
     )
     .await;
     assert_eq!(transferred.status, StatusCode::OK, "{:?}", transferred.body);
     assert_eq!(transferred.body["is_primary"], json!(true));
+    assert_eq!(
+        ownership_transfers(&scrape_metrics(router.clone()).await),
+        1.0,
+        "the flag moved onto someone, which is the one thing this counter means"
+    );
 
     assert!(
         !is_primary(&fixture.pool, grant_id(&outgoing)).await,
@@ -2100,12 +2145,7 @@ async fn an_idempotent_replay_does_not_count_a_second_invitation_or_redemption()
     let after_success = scrape_metrics(router.clone()).await;
     assert_eq!(invite_outcome(&after_success, "redeemed"), 1.0);
     assert_eq!(
-        counter_value(
-            &after_success,
-            "moira_admin_identity_grant_events_total",
-            "event",
-            "granted"
-        ),
+        counter_value(&after_success, GRANT_EVENTS, "event", "granted"),
         1.0,
         "`redeemed` also drives the grant ledger"
     );
