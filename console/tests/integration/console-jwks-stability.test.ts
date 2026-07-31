@@ -42,6 +42,7 @@
 // those tests for why a joint assertion is the only kind that can see F17.
 import { afterAll, beforeAll, expect, test } from "bun:test";
 
+import { exportJWK, generateKeyPair } from "jose";
 import type { Pool } from "pg";
 
 import {
@@ -324,6 +325,62 @@ describeDatabase("the JWKS key pair", () => {
       "the recovery produced the SAME key id, which is impossible unless the probe is reporting " +
         "something other than what the console served",
     ).not.toEqual(before.publishedKids);
+  }, 180_000);
+
+  test("F17 — a MIXED table publishes only the row it can sign with", async () => {
+    // ========================================================================
+    // FOUND BY ASKING FOR THE CHEAPEST EDIT THAT BREAKS THE PROPERTY WITH THE
+    // GUARD STILL GREEN. There was one, and this is it.
+    // ========================================================================
+    //
+    // The two tests above only ever put the table in an all-usable or an
+    // all-unusable state. Against those, `return usable` and
+    // `return usable.length > 0 ? allRows : usable` are indistinguishable —
+    // and the second one republishes a dead key the moment ONE live key exists.
+    //
+    // That state is reachable: a restore that brings back a row sealed under an
+    // older secret, a second replica that wrote under a different one, or
+    // `jwks.rotationInterval` being switched on and the secret rotated between
+    // two mints. Better Auth's own `getLatestKey` sorts by `createdAt`
+    // descending, so the decoy is stamped NEWEST — unfiltered, it is the row
+    // `signJWT` would reach for, which makes the unmitigated behaviour a
+    // signing failure AND a poisoned document rather than only the latter.
+    //
+    // The decoy is inserted with raw SQL because no API can produce it. That is
+    // the same technique guard G1 had to be rebuilt with, for the same reason:
+    // a guard whose premise the shipped code cannot construct asserts nothing.
+    const dsn = testDatabaseUrl();
+    await resetConsoleTestDatabase(pool);
+
+    const healthy = await attestConsole(AUTH_SECRET, dsn);
+    expect(healthy.jwksStatus, "premise: one real, signable key pair exists").toBe(200);
+    expect(healthy.publishedKids).toHaveLength(1);
+    const realKid = healthy.publishedKids[0] ?? "";
+    expect(realKid).not.toBe("");
+
+    // A REAL P-256 public half — so the document stays well formed and the only
+    // thing wrong with this key is that nothing can sign with it — paired with a
+    // private half that is not decipherable under any secret.
+    const { publicKey } = await generateKeyPair("ES256", { extractable: true });
+    const decoyKid = "f17-decoy-key-newest-by-createdAt";
+    await pool.query(
+      'insert into "jwks" ("id", "publicKey", "privateKey", "createdAt") ' +
+        "values ($1, $2, $3, now() + interval '1 minute')",
+      [decoyKid, JSON.stringify(await exportJWK(publicKey)), JSON.stringify("not-a-ciphertext")],
+    );
+
+    const mixed = await attestConsole(AUTH_SECRET, dsn);
+    expectNeverAdvertisesWhatItCannotSign(mixed, "with one signable and one unsignable row");
+    expect(
+      mixed.jwksStatus,
+      "one bad row must not take the whole document down — the console can still sign",
+    ).toBe(200);
+    expect(
+      mixed.publishedKids,
+      "the console published the undecryptable decoy. Moira caches this document and resolves " +
+        "the signing key by `kid`, so a dead key in it is a key some future token can name and " +
+        "no verification can ever satisfy.",
+    ).toEqual([realKid]);
   }, 180_000);
 
   test("CONTROL: the attestation is not a constant — the memory adapter attests healthy too", async () => {
