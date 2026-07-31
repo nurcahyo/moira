@@ -81,6 +81,7 @@ import { consoleDatabase, hasConsoleDatabase } from "./console-db";
 import { InMemoryConsoleSecretStore, type ConsoleSecretStore } from "./console-secrets";
 import { PostgresConsoleSecretStore } from "./console-secrets-postgres";
 import { consoleEnv, type ConsoleEnv } from "./env";
+import { CONSOLE_MESSAGE_KEYS } from "./i18n/keys";
 import { MoiraClient } from "./moira-client";
 import { moiraClientForSetup } from "./moira-session";
 
@@ -197,7 +198,7 @@ export async function consoleRuntime(env: ConsoleEnv = consoleEnv()): Promise<Co
         resolution: {
           ok: false,
           problem: "no_enabled_provider",
-          messageKey: "console.error.auth_config_unavailable",
+          messageKey: CONSOLE_MESSAGE_KEYS.auth_config_unavailable,
         },
       };
     }

@@ -37,6 +37,7 @@ import { createHash } from "node:crypto";
 
 import type { ConsoleSecretStore, ConsoleSecretDrift, SealedClientSecret } from "./console-secrets";
 import { classifySecretDrift } from "./console-secrets";
+import { CONSOLE_MESSAGE_KEYS } from "./i18n/keys";
 import type { MoiraClient } from "./moira-client";
 import type { AuthMethod, AuthProviderSettingsRecord } from "./types";
 
@@ -85,13 +86,14 @@ export type AuthConfigProblem =
   | "console_secret_unavailable";
 
 export const AUTH_CONFIG_PROBLEM_MESSAGE_KEYS: Readonly<Record<AuthConfigProblem, string>> = {
-  no_enabled_provider: "console.error.no_enabled_auth_provider",
-  ambiguous_enabled_providers: "console.error.ambiguous_enabled_auth_providers",
-  method_not_interactive: "console.error.auth_method_not_interactive",
-  provider_endpoints_incomplete: "console.error.auth_provider_endpoints_incomplete",
-  allowed_email_domains_empty: "console.error.allowed_email_domains_empty",
-  provider_not_bound_to_trusted_jwt_issuer: "console.error.provider_not_bound_to_trusted_jwt_issuer",
-  console_secret_unavailable: "console.error.oauth_client_secret_missing",
+  no_enabled_provider: CONSOLE_MESSAGE_KEYS.no_enabled_auth_provider,
+  ambiguous_enabled_providers: CONSOLE_MESSAGE_KEYS.ambiguous_enabled_auth_providers,
+  method_not_interactive: CONSOLE_MESSAGE_KEYS.auth_method_not_interactive,
+  provider_endpoints_incomplete: CONSOLE_MESSAGE_KEYS.auth_provider_endpoints_incomplete,
+  allowed_email_domains_empty: CONSOLE_MESSAGE_KEYS.allowed_email_domains_empty,
+  provider_not_bound_to_trusted_jwt_issuer:
+    CONSOLE_MESSAGE_KEYS.provider_not_bound_to_trusted_jwt_issuer,
+  console_secret_unavailable: CONSOLE_MESSAGE_KEYS.oauth_client_secret_missing,
 };
 
 /** The provider id Better Auth routes on. One console, one interactive provider. */

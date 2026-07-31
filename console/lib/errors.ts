@@ -15,6 +15,7 @@
 // they are legitimately signed in to, mid-setup, and hide the actual cause. It
 // is mapped to its own remedy and `isSessionExpired()` returns false for it.
 
+import { CONSOLE_MESSAGE_KEYS } from "./i18n/keys";
 import type { JsonValue, MoiraErrorResponse } from "./types";
 
 /* -------------------------------------------------------------------------- */
@@ -98,8 +99,11 @@ export type MoiraError = MoiraApiError | MoiraTransportError | MoiraMalformedErr
 /* Console-originated keys used when the server gave us nothing usable        */
 /* -------------------------------------------------------------------------- */
 
-export const CONSOLE_TRANSPORT_ERROR_KEY = "console.error.moira_unreachable";
-export const CONSOLE_MALFORMED_ERROR_KEY = "console.error.moira_response_unreadable";
+// Re-exported, not redefined: `tests/unit/lib/errors.test.ts:184,197` imports
+// these two names from THIS module, and `lib/i18n/keys.ts` is the single place a
+// `console.*` key is spelled. Both halves matter — see the header of that file.
+export const CONSOLE_TRANSPORT_ERROR_KEY = CONSOLE_MESSAGE_KEYS.moira_unreachable;
+export const CONSOLE_MALFORMED_ERROR_KEY = CONSOLE_MESSAGE_KEYS.moira_response_unreadable;
 
 /* -------------------------------------------------------------------------- */
 /* The (code -> remedy) table                                                 */

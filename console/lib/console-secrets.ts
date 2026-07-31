@@ -29,6 +29,7 @@
 import "server-only";
 
 import { createCipheriv, createDecipheriv, randomBytes, timingSafeEqual } from "node:crypto";
+import { CONSOLE_MESSAGE_KEYS } from "./i18n/keys";
 
 /* -------------------------------------------------------------------------- */
 /* Errors                                                                     */
@@ -298,7 +299,7 @@ export function classifySecretDrift(
 export const CONSOLE_SECRET_DRIFT_MESSAGE_KEYS: Readonly<
   Record<Exclude<ConsoleSecretDrift, "in_sync">, string>
 > = {
-  console_secret_missing: "console.error.oauth_client_secret_missing",
-  client_id_mismatch: "console.error.oauth_client_id_drifted",
-  moira_client_id_missing: "console.error.moira_provider_client_id_missing",
+  console_secret_missing: CONSOLE_MESSAGE_KEYS.oauth_client_secret_missing,
+  client_id_mismatch: CONSOLE_MESSAGE_KEYS.oauth_client_id_drifted,
+  moira_client_id_missing: CONSOLE_MESSAGE_KEYS.moira_provider_client_id_missing,
 };

@@ -1,4 +1,5 @@
 import type { LabelHTMLAttributes, ReactNode } from "react";
+import { CONSOLE_MESSAGE_KEYS, t } from "@/lib/i18n";
 import styles from "./Label.module.css";
 
 export interface LabelProps extends LabelHTMLAttributes<HTMLLabelElement> {
@@ -29,7 +30,12 @@ export function Label({ htmlFor, required = false, className, children, ...rest 
           *
         </span>
       )}
-      {required && <span className={styles.visuallyHidden}> (required)</span>}
+      {/* The catalog English carries a LEADING SPACE — it is what separates the
+          suffix from the label text in the computed accessible name
+          ("Email * (required)"), which FormField.test.tsx pins. */}
+      {required && (
+        <span className={styles.visuallyHidden}>{t(CONSOLE_MESSAGE_KEYS.a11y_required)}</span>
+      )}
     </label>
   );
 }

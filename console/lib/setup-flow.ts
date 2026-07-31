@@ -54,6 +54,7 @@ import "server-only";
 
 import { MoiraClient, ifMatchFor, type MoiraOperationName } from "./moira-client";
 import { isMoiraRequestError, type MoiraError } from "./errors";
+import { CONSOLE_MESSAGE_KEYS } from "./i18n/keys";
 import type { AuthMethod, AuthProviderSettingsRecord, TrustedJwtIssuerRecord } from "./types";
 
 /* -------------------------------------------------------------------------- */
@@ -217,10 +218,10 @@ export type SetupPartialStateRemedy =
   | "retry_enable_no_secret_re_entry";
 
 export const SETUP_PARTIAL_STATE_MESSAGE_KEYS: Readonly<Record<SetupProvisioningStepId, string>> = {
-  ensure_trusted_jwt_issuer: "console.error.trusted_jwt_issuer_registration_failed",
-  create_auth_provider: "console.error.auth_provider_create_failed",
-  store_console_secret: "console.error.auth_provider_secret_write_failed",
-  enable_auth_provider: "console.error.auth_provider_enable_failed",
+  ensure_trusted_jwt_issuer: CONSOLE_MESSAGE_KEYS.trusted_jwt_issuer_registration_failed,
+  create_auth_provider: CONSOLE_MESSAGE_KEYS.auth_provider_create_failed,
+  store_console_secret: CONSOLE_MESSAGE_KEYS.auth_provider_secret_write_failed,
+  enable_auth_provider: CONSOLE_MESSAGE_KEYS.auth_provider_enable_failed,
 };
 
 const SETUP_PARTIAL_STATE_REMEDIES: Readonly<
