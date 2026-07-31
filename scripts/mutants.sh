@@ -44,6 +44,13 @@ if ! psql "$MOIRA_TEST_DATABASE_URL" -c 'select 1' >/dev/null 2>&1; then
     exit 1
 fi
 
+# **`CARGO_TARGET_DIR` must not survive into the run.** cargo-mutants builds each mutant in
+# its own scratch copy of the tree; an absolute `CARGO_TARGET_DIR` overrides that and points
+# every job at one shared build directory, where they serialise on cargo's exclusive lock and
+# — worse — a mutant can be tested against another mutant's artifacts. Agents in this repo run
+# with a private target dir exported, so unsetting it here is not hypothetical hygiene.
+unset CARGO_TARGET_DIR
+
 if ! command -v cargo-mutants >/dev/null 2>&1; then
     printf 'cargo-mutants is not installed. Install it with:\n\n    cargo install cargo-mutants --locked\n' >&2
     exit 1

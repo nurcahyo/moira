@@ -433,6 +433,17 @@ against the index-only design.
 They are the owner, revocation clears `is_primary`, and the last-primary guard refuses it. Transfer
 first, then revoke. Documented in `docs/admin-identity-claiming.md`.
 
+**`0019`'s repair path was verified against real PostgreSQL, not reasoned about** — it is the one
+part of the change no test in the suite can reach, because by the time a test runs the migration has
+already applied. Three scenarios on throwaway databases:
+
+| Scenario | Result |
+|---|---|
+| Three active grants, **two** primary, setup claimant = the *younger* of the two | Collapsed to one, and the **claimant** survived, not the oldest. The `coalesce(id = claimant, false) desc` is load-bearing: `desc` puts NULLs *first* in PostgreSQL, so without the `coalesce` a deployment with no recorded claimant would sort an arbitrary row to the top |
+| Zero primaries, a recorded claimant (**the F20 population**) | Claimant promoted, the other grant untouched |
+| Re-running the whole migration | Nothing moved; the index creation is `if not exists` |
+| `update … set is_primary = true` on a second row afterwards | `ERROR: duplicate key value violates unique constraint "admin_identities_single_active_primary"` — which is also what makes `already_claimed_on_unique_violation`'s constraint-name match real rather than assumed |
+
 ### METHOD NOTE — right conclusion, wrong mechanism, and the test that would have proved nothing
 
 Plan 09 §0 argued the redeem validation must sit **outside** the transactional envelope because,
