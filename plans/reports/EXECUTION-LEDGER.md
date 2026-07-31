@@ -2429,3 +2429,39 @@ tests are the hole.
 **Verified this way on `fix/admin-audit-atomicity`:** the six gates run green end to end against a
 byte-identical database that simply has not had `0021` applied to it, and red against the shared
 `moira` on the same commit, with nothing else changed.
+
+```text
+── fmt
+   ok
+── clippy
+   ok
+── test
+   ok — 906 passed
+── release
+   ok
+── deny
+   ok
+── audit
+   ok
+
+ALL GATES PASSED
+```
+
+`MOIRA_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/moira_atomicity` — created for
+this run, migrated from `0001` by the suite itself, and named outside `moira_test_%` so the leak
+sweep leaves it alone. `scripts/gates.sh`'s own two integrity assertions are what make that summary
+trustworthy: neither the `36 of 36 integration targets` check nor the zero-skip check fired, so no
+suite was silently absent and no DB-backed suite skipped.
+
+**Three further ways a gate run died here, all environmental, none from the code under test** —
+recorded because each was individually indistinguishable from a regression:
+
+| Symptom | Cause |
+|---|---|
+| `3D000 template … does not exist` | neighbouring worktree's leak sweep (see the section above) |
+| `57P01 terminating connection due to administrator command` | same neighbour, different statement |
+| `gates exit=137` | SIGKILL. Two full Rust test suites on one machine; ~56 MB free at the time |
+
+Exit 137 is worth its own line: it is not a test failure at all, and `scripts/gates.sh` cannot
+distinguish it from one. **Two agents must not run `cargo test --workspace` against this machine
+simultaneously** — not for the database's sake, for the RAM's.
