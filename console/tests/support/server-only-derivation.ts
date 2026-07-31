@@ -278,6 +278,38 @@ export function deriveCredentialModulePaths(
   return deriveCredentialModules(files).map((entry) => entry.path);
 }
 
+/**
+ * Modules that CARRY the marker, whatever the shape derivation says.
+ *
+ * The union of this and `deriveCredentialModulePaths()` is what the containment
+ * rules use. The two sets answer different questions and both are needed:
+ *
+ *   derived  "which modules MUST carry the marker" — the assertion. Derived from
+ *            credential shape, never from the marker, so deleting the marker
+ *            cannot remove a module from it.
+ *   marked   "which modules have declared themselves server-only" — a module may
+ *            be server-only for a reason the shape scan cannot see.
+ *            `lib/errors-server.ts` is exactly that: it holds no credential, it
+ *            returns Moira's unfiltered `details`.
+ *
+ * Using `marked` for the ASSERTION would be circular; using it for CONTAINMENT
+ * is not — a module that says it is server-only is taken at its word about where
+ * it may not be imported from.
+ */
+export function markedServerOnlyModules(files: readonly SourceFile[]): string[] {
+  return files
+    .filter((file) => hasServerOnlyImport(file.source))
+    .map((file) => file.path)
+    .sort();
+}
+
+/** Everything that must stay off the client: derived shape UNION declared marker. */
+export function containedModulePaths(files: readonly SourceFile[] = allSourceFiles()): string[] {
+  return [
+    ...new Set([...deriveCredentialModulePaths(files), ...markedServerOnlyModules(files)]),
+  ].sort();
+}
+
 /** A real side-effect import, not a mention in a comment. */
 export function hasServerOnlyImport(source: string): boolean {
   return /^\s*import\s+["']server-only["']\s*;?\s*$/m.test(stripComments(source));

@@ -286,30 +286,22 @@ function transportReason(cause: unknown): string {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Server-side-only diagnostics                                               */
+/* Server-side-only diagnostics — MOVED OUT OF THIS MODULE                    */
 /* -------------------------------------------------------------------------- */
-
-/** `request_id` and `details`. Log these; never return them to a caller. */
-export interface MoiraServerDiagnostics {
-  readonly requestId: string | null;
-  readonly details: JsonValue | null;
-}
-
-/**
- * Extract the fields that must stay on the server.
- *
- * Kept in this module, next to the mapper, so the two are read together: the
- * reason `toMoiraError` drops these is that this function exists to consume
- * them.
- */
-export function serverDiagnostics(body: unknown): MoiraServerDiagnostics {
-  if (!isMoiraErrorResponse(body)) return { requestId: null, details: null };
-  const error = body.error as MoiraErrorResponse["error"] & { details?: JsonValue };
-  return {
-    requestId: typeof error.request_id === "string" ? error.request_id : null,
-    details: error.details ?? null,
-  };
-}
+//
+// `MoiraServerDiagnostics` and `serverDiagnostics()` now live in
+// `lib/errors-server.ts`, which carries `import "server-only"`.
+//
+// They were here, and that was a hole with only a doc comment holding it shut.
+// This module deliberately carries NO `import "server-only"` — `MoiraError` has
+// to cross to the browser — so a client component could import
+// `serverDiagnostics` from here and Next would compile it happily. And that
+// function is the one thing in this file that returns UNFILTERED pass-through
+// data: `details: error.details ?? null`, typed `JsonValue`, with no allow-list.
+//
+// It was dead code in application paths (its only callers were two lines of
+// `errors.test.ts`), so nothing noticed. Wave 3 adds the first real caller, and
+// a one-line import edit turned the doc comment into a build failure.
 
 /* -------------------------------------------------------------------------- */
 /* Predicates the UI uses                                                     */

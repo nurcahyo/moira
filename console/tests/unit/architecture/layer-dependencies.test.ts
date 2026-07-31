@@ -50,6 +50,7 @@ import { join } from "node:path";
 
 import {
   allSourceFiles,
+  containedModulePaths,
   CONSOLE_ROOT,
   CREDENTIAL_SEEDS,
   deriveCredentialModulePaths,
@@ -67,6 +68,16 @@ import {
 const files = allSourceFiles();
 const credentialModules = deriveCredentialModules(files);
 const credentialPaths = deriveCredentialModulePaths(files);
+
+/**
+ * What may not be reachable from the client: derived shape UNION declared marker.
+ *
+ * `lib/errors-server.ts` is why the union exists. It holds no credential, so the
+ * shape derivation does not name it — but it returns Moira's `details` verbatim
+ * with no allow-list, which is why it declared itself server-only. Containment
+ * takes that declaration at its word.
+ */
+const containedPaths = containedModulePaths(files);
 
 const byRoot = (root: string) => files.filter((file) => file.path.startsWith(`${root}/`));
 
@@ -184,7 +195,7 @@ describe("credential modules are marked and contained", () => {
 
   test("nothing under components/** imports a credential-carrying module", () => {
     const offenders = byRoot("components")
-      .map((file) => ({ file: file.path, reached: importsAnyOf(files, file, credentialPaths) }))
+      .map((file) => ({ file: file.path, reached: importsAnyOf(files, file, containedPaths) }))
       .filter((entry) => entry.reached.length > 0)
       .map((entry) => `${entry.file} -> ${entry.reached.join(", ")}`);
     expect(
@@ -197,10 +208,38 @@ describe("credential modules are marked and contained", () => {
   test('no "use client" module imports a credential-carrying module', () => {
     const offenders = files
       .filter((file) => isClientComponent(file.source))
-      .map((file) => ({ file: file.path, reached: importsAnyOf(files, file, credentialPaths) }))
+      .map((file) => ({ file: file.path, reached: importsAnyOf(files, file, containedPaths) }))
       .filter((entry) => entry.reached.length > 0)
       .map((entry) => `${entry.file} -> ${entry.reached.join(", ")}`);
     expect(offenders).toEqual([]);
+  });
+
+  test("the contained set is a superset of the derived set, and names errors-server", () => {
+    for (const path of credentialPaths) expect(containedPaths).toContain(path);
+    expect(
+      containedPaths,
+      "lib/errors-server.ts declares itself server-only and must be contained even though it " +
+        "holds no credential — it returns Moira's `details` unfiltered",
+    ).toContain("lib/errors-server.ts");
+    expect(credentialPaths).not.toContain("lib/errors-server.ts");
+  });
+
+  test("POSITIVE CONTROL — a client component importing lib/errors-server is caught", () => {
+    const offender = synthetic(
+      "modules/fixture/Panel.tsx",
+      '"use client";\nimport { serverDiagnostics } from "@/lib/errors-server";\nexport const d = serverDiagnostics;',
+    );
+    expect(importsAnyOf([...files, offender], offender, containedPaths)).toEqual([
+      "lib/errors-server.ts",
+    ]);
+  });
+
+  test("NEGATIVE CONTROL — importing lib/errors itself stays permitted", () => {
+    const allowed = synthetic(
+      "modules/fixture/Panel.tsx",
+      '"use client";\nimport { isSessionExpired } from "@/lib/errors";\nexport const e = isSessionExpired;',
+    );
+    expect(importsAnyOf([...files, allowed], allowed, containedPaths)).toEqual([]);
   });
 
   test("POSITIVE CONTROL — the containment rule fires on a synthetic offender", () => {

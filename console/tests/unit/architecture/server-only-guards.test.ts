@@ -34,6 +34,7 @@ import { join, resolve } from "node:path";
 import { extractInterfaces } from "../../support/secret-props-scan";
 import {
   allSourceFiles,
+  containedModulePaths,
   deriveCredentialModulePaths,
   importsAnyOf,
   isClientComponent,
@@ -41,8 +42,11 @@ import {
 
 const CONSOLE_ROOT = resolve(import.meta.dir, "../../..");
 
-/** Derived, never listed. */
+/** Derived, never listed. What MUST carry the marker. */
 const SERVER_ONLY_MODULE_PATHS = deriveCredentialModulePaths();
+
+/** What must not be reachable from the client: derived UNION declared marker. */
+const CONTAINED_MODULE_PATHS = containedModulePaths();
 
 /** Modules that must stay importable from a client component. */
 const CLIENT_SAFE_MODULES = [
@@ -104,7 +108,7 @@ describe("credential-carrying modules are marked and contained", () => {
   test('no "use client" file imports a credential-carrying module', () => {
     const violations = sourceFiles
       .filter((file) => isClientComponent(file.source))
-      .filter((file) => importsAnyOf(sourceFiles, file, SERVER_ONLY_MODULE_PATHS).length > 0)
+      .filter((file) => importsAnyOf(sourceFiles, file, CONTAINED_MODULE_PATHS).length > 0)
       .map((file) => file.path);
     expect(violations).toEqual([]);
   });
@@ -112,7 +116,7 @@ describe("credential-carrying modules are marked and contained", () => {
   test("nothing under components/** imports a credential-carrying module", () => {
     const violations = sourceFiles
       .filter((file) => file.path.startsWith("components/"))
-      .filter((file) => importsAnyOf(sourceFiles, file, SERVER_ONLY_MODULE_PATHS).length > 0)
+      .filter((file) => importsAnyOf(sourceFiles, file, CONTAINED_MODULE_PATHS).length > 0)
       .map((file) => file.path);
     expect(violations).toEqual([]);
   });
@@ -134,14 +138,28 @@ describe("the client-safe modules really are client-safe", () => {
 });
 
 describe("the error boundary is enforced in one place", () => {
-  test("request_id and details are read only inside lib/errors.ts", () => {
+  test("request_id and details are read only inside lib/errors-server.ts", () => {
+    // ONE module, and it is the SERVER-ONLY one (plan 09 wave 3). `lib/errors.ts`
+    // used to be exempt too, because `serverDiagnostics()` lived there — and that
+    // exemption was what let the unfiltered `details` pass-through sit in a
+    // module a client component may import. It is gone, and its absence is now
+    // load-bearing: moving that function back into the client-safe module fails
+    // this test.
     const offenders = sourceFiles
-      .filter((file) => file.path !== "lib/errors.ts" && file.path !== "lib/errors-server.ts")
+      .filter((file) => file.path !== "lib/errors-server.ts")
       .filter((file) => /\.request_id\b/.test(file.code) || /\.details\b/.test(file.code))
       .map((file) => file.path);
-    // Every consumer goes through `toMoiraError` / `serverDiagnostics`. A second
-    // reader is a second place the boundary can be broken.
     expect(offenders).toEqual([]);
+  });
+
+  test("lib/errors.ts genuinely no longer reads either field", () => {
+    // Asserted directly as well as by exclusion above: the rule reads better as
+    // "one module may see these", and this is the half that says WHICH module
+    // stopped being able to.
+    const clientSafe = sourceFiles.find((file) => file.path === "lib/errors.ts");
+    expect(clientSafe).toBeDefined();
+    expect(/\.request_id\b/.test(clientSafe!.code)).toBe(false);
+    expect(/\.details\b/.test(clientSafe!.code)).toBe(false);
   });
 
   test("nothing outside lib/errors.ts constructs a client-facing error by spreading the envelope", () => {

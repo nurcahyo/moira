@@ -7,11 +7,15 @@ import {
   isActionableSetupCondition,
   isSessionExpired,
   remedyForStatus,
-  serverDiagnostics,
   toMoiraError,
   toTransportError,
   type MoiraError,
 } from "@/lib/errors";
+// Moved behind `import "server-only"` in plan 09 wave 3: it is the only function in
+// the error surface that returns unfiltered `details`, and `lib/errors.ts` is
+// deliberately client-safe. `bunfig.toml` preloads the shim that makes the marker
+// package importable under `bun test`.
+import { serverDiagnostics } from "@/lib/errors-server";
 import { MOIRA_SETUP_ERROR_CODES } from "@/lib/moira-keys";
 import { errorEnvelope } from "../../support/moira-stub";
 
