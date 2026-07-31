@@ -568,7 +568,9 @@ console-unit and e2e tests; and the wave-5 Definition-of-Done and product-decisi
 checking each against the working tree, the committed `docs/openapi.json`, a shipped test, or PR #39's
 diff. Roughly half the drift is *"already shipped, in a different shape"* (waves 2 and 3 built more
 than this plan predicted, and named it differently); the other half is *"specified against something
-that does not exist"*.
+that does not exist"*. **The figure is unchanged by §0.8.7's amendment:** the adversarial
+verification of §0.7 added two blockers (**W5-B11**, **W5-B12**) and moved one claim from *holds* to
+*holds in part*, which leaves wrong-or-materially-incomplete at 43 of 52.
 
 **The one-paragraph version.** Wave 5 as written is three features. One of them —
 **invitations** — is genuinely a UI wave over a backend that is complete, better than specified, and
@@ -659,9 +661,13 @@ Grouped by area. "Body" means the wave-5 prose in this file unless another secti
 | 51 | D3 — an invite is never an exemption from `allowed_email_domains`, identically for routine and recovery invites | **Holds** for routine invites, shipped and tested. The recovery half is vacuous (#8) |
 | 52 | **F21** is plan 09's to fix — and §0.7's **W4-D6** reassigns it to wave 4 on cost grounds | **Both are wrong. F21 is already fixed, in PR #39, with a test.** `redeem_invite`'s `Err` arm on `fix/findings-sweep` reads `if !matches!(error, AppError::Replayed(_)) { … record_admin_invite_denied(…) }`, and `an_idempotent_replay_does_not_count_a_second_invitation_or_redemption` drives a cacheable 409 (`admin_identity_already_claimed`) twice under one `Idempotency-Key` and asserts `invite_outcome(…, "other") == 1.0` after the replay. That assertion would read `2.0` with the guard removed, so it is a test that works. **Neither wave 4 nor wave 5 may implement it** |
 
-**Holds as written (do not re-litigate):** the invite/ownership data-flow *shape* (create → share out of band → preview → sign in → redeem); D3 and D5 inheritance with no invitation carve-out; the token in request bodies only, never a query string; once-only display; the separation of `invite_*_mismatch` from `admin_claim_domain_not_allowed` on remedy grounds; `InviteAdminForm`'s pre-submit allow-list gate as the correct fix for the stranding case (never a policy carve-out); `*.e2e.ts` under `console/e2e/`; Atomic-Design placement with organisms in `modules/`; no console-sent invite emails; and "the console's client-side capability check is UI gating only — Moira is the authority".
+**Holds as written (do not re-litigate):** the invite/ownership data-flow *shape* (create → share out of band → preview → sign in → redeem); D3 and D5 inheritance with no invitation carve-out; the token in request bodies only, never a query string; once-only display; the separation of `invite_*_mismatch` from `admin_claim_domain_not_allowed` on remedy grounds; `InviteAdminForm`'s pre-submit allow-list gate as the right *direction* for the stranding case (never a policy carve-out — but see **W5-B11**, which shows it cannot be the *guarantee* the body claims); `*.e2e.ts` under `console/e2e/`; Atomic-Design placement with organisms in `modules/`; no console-sent invite emails; and "the console's client-side capability check is UI gating only — Moira is the authority".
 
 ### §0.8.2 Blockers, ranked
+
+Ranked by the stated severity on each heading, not by position: **W5-B11** and **W5-B12** were
+appended by §0.8.7's amendment and sit textually between W5-B7 and W5-B8, but W5-B11 is **high** and
+belongs to be read with W5-B2–W5-B4.
 
 **W5-B1 — the recovery UI is specified over a backend that does not exist, and building it is a Moira wave, not a UI wave. (Severity: highest — it is a third of the stated scope, and every artefact named for it is unbuildable.)**
 
@@ -704,6 +710,25 @@ Every screen this wave adds under `(console)` inherits that silence, and so woul
 `layer-dependencies.test.ts` rule 5 forbids any `"use client"` module from importing a credential-carrying module, where that set is **derived** (reads `process.env`, imports `pg`, sends `X-Moira-System-Key` or `Authorization`, constructs an AEAD, handles a `clientSecret`, calls `betterAuth(`) and closed transitively over value imports. `lib/moira-client.ts` is in it by name. A client organism may import only `lib/errors.ts`, `lib/types.ts`, `lib/moira-keys.ts` and `lib/i18n/**`.
 
 So every mutation — create invite, revoke invite, transfer, revoke grant, redeem — needs a server-side transport. The plan says `actions.ts`; **there is no `actions.ts` in the repository**, `nextCookies()` is deliberately excluded from the Better Auth plugin list, and the one shipped interactive organism posts to a route handler instead. Choosing server actions means adopting `nextCookies()` — a change to the auth instance, in a wave that should not be touching it. See **W5-D5**.
+
+**W5-B11 — `InviteAdminForm`'s pre-submit gate cannot be as strong as the plan promises, and the projection it reads cannot be made to reproduce what redemption actually applies. (Severity: high — added by the §0.7 verification, see §0.8.7; it turns a stated guarantee into a best-effort hint.)**
+
+The body's rule is unambiguous: the gate blocks any invite that "would be refused at redemption", and "the client-side check is never more permissive than" Moira's. Redemption applies **exactly one** row. `redeem_invite` calls `governing_policy(&identity.issuer, trusted_jwt_issuer_id)`, whose `limit 1` selects the first enabled, active, non-deleted row matching `issuer = $1 or trusted_jwt_issuer_id = $2`, ordered `(issuer is not distinct from $1) desc, created_at asc, id asc`.
+
+The gate can only compute a **union** over `getSetupAuthMethods()`, and it cannot do better even in principle: `PublicAuthMethod` carries `id, method, display_name, issuer, discovery_url, authorization_url, client_id, jwks_url, requested_scopes, allowed_email_domains` — and **no `trusted_jwt_issuer_id`, no `created_at`, no enabled/ordering data**. So the console cannot tell which rows are in `governing_policy`'s candidate set, nor which of them wins.
+
+Consequences, both reachable:
+
+* With **one** enabled row the union equals the governing row and the gate is exactly right. That is today's state, and it is the strongest argument for shipping wave 5 before wave 4 (**W5-D10**).
+* With **two or more** enabled rows bound to the console's trusted issuer, the union is strictly wider than the governing row, so the gate passes invites that redemption refuses — the exact stranding it exists to prevent. Under **F23** it can also be narrower in the other direction: a row whose own `issuer` equals the console's outranks the correctly linked row at any age, so the gate may block an invite that would in fact have redeemed.
+
+Closing it properly is not wave-5 work. Either Moira's rule becomes the union (§0.7 **W4-D4**), or Moira refuses the ambiguous multi-row state outright (F23's mitigation), or `PublicAuthMethod` grows the resolution inputs — a frozen-contract change on a credentialed projection. See **W5-D11**.
+
+**W5-B12 — the admin list has no human-distinguishable identity column, and under F24 two people can be one row. (Severity: medium — a correct-looking screen that misattributes authority.)**
+
+`admin_identities` is keyed on `(issuer, subject)` where `issuer` is the **console's** and therefore identical on every row, for every provider. So `AdminTable` rendering an "issuer" column shows one constant value and disambiguates nothing; `subject` is an opaque IdP string; **`email` is the only human-identifiable attribute on the record**, which is exactly why D5 makes it required and non-nullable.
+
+**F24** makes that worse rather than merely inelegant: with two providers minting under one console issuer, two IdPs returning the same `sub` collapse onto **one grant**. The wave-5 surfaces that must answer for it: `AdminTable` must lead with `email`, not `issuer`; and `InviteAcceptPanel` must not word `admin_identity_already_claimed` as "you already have admin", because under F24 the holder may be someone else entirely. Note also that this is the one refusal raised **inside** the transactional envelope, which is why it is the cacheable 409 that F19's ordering keeps from pre-empting the invite's own constraint and that F21's guard stops double-counting — the same code, on three findings.
 
 **W5-B8 — transfer is one call after #39 and two before it, and the sole-admin row can no longer be revoked. (Severity: medium — ships a wrong action or a bare 409.)**
 
@@ -840,7 +865,28 @@ one is ever added it is `0020` after #39 and `0021` if wave 4 has also landed �
 `git ls-files migrations/` at branch time; two migrations with one number is a hard failure.**
 *Reversal condition:* if #39 is abandoned rather than merged, F20 reopens, F21 reopens with it, and
 wave 5's ownership half must be re-planned from the top — it would be building a transfer UI for a
-flag nothing sets.
+flag nothing sets. **Amended by §0.8.7:** wave 5 should also land **before** wave 4, not merely after
+#39 — F23 shows the multi-provider state is what breaks the invite gate (**W5-B11**) and the admin
+list (**W5-B12**), so every wave-5 screen is at its most correct while exactly one provider is
+enabled.
+
+**W5-D11 — `InviteAdminForm` WARNS rather than blocks whenever more than one provider is enabled, and says which it is doing. Do not claim a guarantee the projection cannot support.**
+Per **W5-B11** the console cannot reproduce `governing_policy`'s single-row resolution from
+`PublicAuthMethod`. Three ways to respond, and only one is honest. Blocking on the union is
+*under*-strict (it passes invites redemption refuses) and, under F23, also *over*-strict. Silently
+best-effort is the plan-08 B1 signature — a stated invariant nothing exercises. So: **block** when
+zero providers are enabled (unambiguous, and already the plan's rule); **block** when exactly one is
+enabled and the domain is uncovered (the union is provably the governing row, so the gate is exact);
+and **warn, with the reason, and allow submission** when two or more are enabled. The real safety net
+is shipped and stronger than the gate anyway: a policy-denied redemption does **not** consume the
+invite, so the same link works once the allow-list widens
+(`a_policy_denied_redemption_leaves_the_invite_pending_and_the_same_link_still_works`). Say that in
+the warning copy.
+*Reversal condition:* restore the hard block for N providers when **either** `governing_policy`
+becomes the union (§0.7 **W4-D4**) — at which point the console's union is exactly Moira's rule —
+**or** Moira refuses more than one enabled row per trusted issuer (F23's mitigation), which makes N
+unreachable. Do **not** close it by adding resolution inputs to `PublicAuthMethod` without arguing
+F15's admitting rule for a credentialed projection first.
 
 ### §0.8.4 Ordered task list for the wave-5 implementation
 
@@ -930,9 +976,11 @@ and finding that out after the screens are written is the expensive order.
     token in the **body**, then `getSetupSignInMethods()` (anonymous — #29) to render `SignInPanel`.
     An invalid or expired token must render an accessible error **page**, not a 404 (**W5-B5**).
 21. `InviteAdminForm`'s pre-submit gate reads the enabled providers' `allowed_email_domains` through
-    `getSetupAuthMethods()` (credential `admin` — the inviting admin's bearer token). Blocks
-    submission for an uncovered domain and disables entirely when no provider is enabled. UI gating
-    only: Moira's redeem-time check remains the authority and the console is never more permissive.
+    `getSetupAuthMethods()` (credential `admin` — the inviting admin's bearer token). Disables
+    entirely when no provider is enabled. Per **W5-B11** and **W5-D11** it **warns** rather than
+    blocks when more than one provider is enabled, because the projection it reads cannot reproduce
+    what `governing_policy` resolves — and it must say which of the two it is doing. UI gating only:
+    Moira's redeem-time check remains the authority.
 
 **Phase 5 — the four gates that go red, closed deliberately**
 
@@ -989,6 +1037,17 @@ and finding that out after the screens are written is the expensive order.
    wave's §0, not only where it was taken.
 5. **F21 is fixed in PR #39** and **§0.7's W4-D6 is wrong** (#52). If wave 4 has already started, tell
    it to skip that task. If #39 is abandoned, F21 reopens together with F20 and F13.
+5a. **SECURITY — F23 and F24 both land on the redeem path, which is wave 5's UI.** `redeem_invite` is
+   one of only two callers of `governing_policy`, so F23's wrong-policy resolution is enforced on
+   every redemption; and F24's `(issuer, subject)` collapse is what turns a second person's
+   redemption into `admin_identity_already_claimed`. Neither is wave 5's to fix — both are Moira-side
+   and both are prerequisites for *wave 4*, not wave 5 — but wave 5 is where an operator will meet
+   them, so **W5-B11** and **W5-B12** exist to make the UI honest about both rather than to repair
+   them. Full entries in the ledger.
+5b. **F25 — do not credit `checkSession` with anything.** It and `isEmailDomainAllowed` have no
+   shipped caller; the console's session-boundary domain gate is dead code with eleven green
+   assertions over it. Bears directly on **W5-D5**'s "each route handler re-checks the session
+   itself", which is where a wave-5 author would most plausibly assume it was already wired.
 6. **NO LIVE CREDENTIAL IS REQUESTED OR NEEDED.** Wave 5 touches no OAuth provider configuration; the
    invitee signs in through whatever wave 3 and wave 4 already resolve, against the TLS mock IdP.
    Nothing in this wave is deferred for want of a credential.
@@ -1031,6 +1090,59 @@ and finding that out after the screens are written is the expensive order.
 §0.8 appends after §0.7.6, so the two changes do not overlap and should merge without conflict — but
 verify rather than assume, and if a conflict appears, **keep both**: D-F20 is the decision and §0.8 is
 the audit that depends on it.
+
+### §0.8.7 Amendment — what changed when §0.7 was adversarially verified (F23, F24, F25)
+
+§0.8 was written against §0.7. Six independent verifiers then corrected §0.7 and raised **F23**,
+**F24** and **F25**, all now in `plans/reports/EXECUTION-LEDGER.md`. This subsection records exactly
+what that bought, so the value of the verification is visible rather than absorbed silently.
+
+**First, what did NOT change.** §0.8 rests on **no** corrected §0.7 claim. It never cites W4-B1,
+W4-B3, W4-B4, `PublicSignInMethod.provider_id`, or `governing_policy`'s scope. Its only reference to
+§0.7's conclusions is **W4-D6**, which it already overturns (#52). Checked mechanically, not by
+memory: the strings `W4-B1`, `W4-B3`, `W4-B4`, `provider_id` and `governing_policy` appeared nowhere
+in §0.8 before this amendment.
+
+**What changed — three additions, all in the direction of less confidence:**
+
+1. **W5-B11 is new**, at **Severity: high** — read it directly after W5-B4. The verification's finding that
+   `governing_policy` resolves one row *bound to one `trusted_jwt_issuer_id`*, and that this is
+   reachable today through Moira's admin API rather than gated by any console refusal, is what forced
+   the question "can the console's pre-submit gate reproduce that?". It cannot: `PublicAuthMethod`
+   carries neither `trusted_jwt_issuer_id` nor `created_at`, verified against the committed spec. The
+   plan's promise that the console "is never more permissive" than Moira is therefore unsatisfiable
+   for N > 1 providers. **W5-D11** takes the decision; the "Holds as written" list was amended, and
+   Phase 4 step 21 was rewritten from *block* to *block-or-warn, and say which*.
+2. **W5-B12 is new**, from **F24**. The wave-5 admin list is precisely the screen that has to answer
+   "which human is this row?", and the answer is `email` alone — `issuer` is the console's on every
+   row, and two IdPs returning one `sub` collapse onto a single grant. It also changed the required
+   copy for `admin_identity_already_claimed` on the invite path: it must not tell the reader they
+   already have admin, because they may not.
+3. **W5-D10 was amended** to prefer wave 5 **before** wave 4, not merely after #39. Every wave-5
+   screen is at its most correct while exactly one provider is enabled, which is the state F23 says
+   must be preserved until Moira itself refuses the ambiguous one.
+
+**F25 changes an instruction rather than a finding.** `checkSession` and `isEmailDomainAllowed` in
+`lib/moira-session.ts` have no shipped caller — confirmed here independently: every reference outside
+their definitions is a test or an i18n *description*. This matters for **W5-D5**, which puts each
+mutation behind a route handler under `app/api/**` that must re-check the session itself: a wave-5
+author will find `checkSession` sitting there under eleven green assertions and reasonably assume it
+is the shipped, wired guard. It is not. Wire it deliberately, with a test that fails when it is
+unwired, or leave it — but do not credit the console with enforcing anything at its session boundary.
+
+**F21's placement, restated with the verification's framing.** The verification agrees F21 is a
+**wave-2 backend defect by domain** — it lives in `redeem_invite`, which wave 2 wrote. §0.7's
+reassignment to wave 4 was on cost grounds only, and the reasoning is moot regardless: it is
+**already fixed in PR #39, with a test that would fail if the guard were removed** (#52). So the
+answer is neither "wave 4" nor "wave 5" — it is "wave 2's defect, already closed in #39". Neither
+wave implements it; both must be told so.
+
+**One correction back.** The claim that §0.7 "misquotes the ORDER BY, omitting `id asc`" is **wrong**,
+and F23's ledger entry repeats it. §0.7's drift row #7 quotes `(issuer is not distinct from $1) desc,
+created_at asc, id asc` in full, §0.7.2's W4-B1 prose says "leaving `created_at asc, id asc`", and
+§0.1 **B5** quotes the entire clause including `id asc`. Every other correction in the verification
+checks out against the tree, including the WHERE-clause scope, the `issuer = $1` outranking vector,
+and the reachability of the state through Moira's admin API without any console involvement.
 
 ---
 
