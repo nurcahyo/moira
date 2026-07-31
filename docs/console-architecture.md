@@ -130,11 +130,17 @@ whole tree for that endpoint's name as a bare literal, comments included.
 ## Routes, layouts, and where the auth boundary sits
 
 ```
-app/layout.tsx              root layout, <html lang="en">, generateMetadata()
-├── app/(console)/          the AUTHENTICATED group — session gate in its layout
-│   └── page.tsx            `/`
-├── app/login/page.tsx      `/login` — deliberately OUTSIDE the group
-└── app/api/**              route handlers — outside every group by construction
+app/layout.tsx                    root layout, <html lang="en">, generateMetadata()
+├── app/(console)/                the AUTHENTICATED group — session gate in its layout
+│   ├── layout.tsx                the gate, plus the chrome (nav + sign-out)
+│   ├── page.tsx                  `/`
+│   └── admins/page.tsx           `/admins` — grants, invitations, ownership
+├── app/login/page.tsx            `/login` — deliberately OUTSIDE the group
+├── app/invite/[token]/page.tsx   PUBLIC redemption page — also outside the group
+└── app/api/**                    route handlers — outside every group by construction
+    ├── admins/invites/…          create / withdraw an invitation
+    ├── admins/identities/[id]    transfer ownership (PATCH) / revoke a grant (DELETE)
+    └── invite/[token]/redeem     the invitee's own redemption
 ```
 
 Three properties, each of which breaks something if changed:
@@ -282,11 +288,126 @@ Three things are worth knowing before touching this surface:
 - Better Auth's rate limiter uses `storage: "database"`, so the limit is shared
   across replicas rather than multiplying by the pod count.
 
+## Invitations and ownership
+
+The operator-facing runbook is [docs/admin-invitations.md](admin-invitations.md); this section is
+the console's side of it.
+
+### The flow, end to end
+
+1. An admin opens `/admins` and creates an invitation, bound to **one email
+   address** or to **one email domain**, with a lifetime between 60 seconds and
+   72 hours. There is no "anyone with the link" invitation: an unbound one would
+   make a leaked URL equivalent to handing out admin.
+2. Moira returns the raw token **exactly once**. `OnceOnlySecretModal` shows it
+   and the link built from it; every later read of the record returns a shape
+   with no token field at all. On an idempotent replay the token is `null` and
+   the modal says so — that is the normal retry outcome, not a failure.
+3. The admin shares the link **out of band**. The console sends no email.
+4. The invitee opens `/invite/<token>`. The page exchanges the token
+   **server-side** through the anonymous preview endpoint and renders what Moira
+   is willing to tell an unauthenticated holder: the constraint, its value, and
+   the expiry. Nothing about the inviter, the deployment, or the policy.
+5. They sign in with whatever provider this deployment has configured, then
+   accept. The console POSTs to its own route handler, which redeems with the
+   **invitee's own** bearer token.
+
+### Two consequences of single-primary ownership an operator will meet
+
+Ownership is `admin_identities.is_primary` — **row state, not a scope**. A
+`moira:admins:manage` scope was specified and is unimplementable: every admin
+identity is granted `moira:admin`, and a `moira:admin`-holding trusted-JWT actor
+is granted every scope by implication with no per-scope opt-out, so such a scope
+would have been satisfied by everyone.
+
+- **Transfer is one request, and it moves the flag.** `PATCH
+  /admin-identities/{id}` with `{ "is_primary": true }` demotes every other
+  active primary in the same transaction. There is no second call to make, and
+  after it the operator who performed the transfer is no longer the owner.
+- **A deployment's sole admin cannot be revoked through the API at all.**
+  Revoking a grant clears `is_primary`, and the last-primary guard refuses that.
+  The console renders this as a stated rule beside a disabled control with its
+  remedy — *transfer ownership first* — rather than as a failed request.
+
+### What is per-grant, and why the screen says so
+
+`admin_identities` is keyed on `(issuer, subject)` where `issuer` is the
+**console's**, so from the multi-provider wave one human signing in through two
+providers holds **two grants with no column linking them**. Revocation is
+per-grant, and `is_primary` is globally unique, so that human is the owner
+through at most one of them.
+
+`/admins` states this rather than inventing a grouping: a table that merged the
+two rows would be claiming a person-level identity the data model does not have,
+and an operator acting on it would revoke "the" row and leave the other live.
+
+### The invitation form's pre-submit check is a HINT above one provider
+
+It reads the enabled providers' `allowed_email_domains` and:
+
+- **blocks** when no provider is enabled — nobody could sign in at all;
+- **blocks** an uncovered domain when exactly one provider is enabled, where the
+  union it computes provably equals the row Moira will resolve;
+- **warns, and says so, above one provider**, because redemption applies exactly
+  one provider row and the projection the console can read carries neither the
+  trusted-issuer binding nor the ordering inputs that decide which. A block there
+  would refuse invitations that would in fact redeem.
+
+Either way it is UI gating only. Moira's redeem-time check is the authority, and
+a policy-denied redemption does **not** consume the invitation — so the same link
+works once the allow-list widens.
+
+### Domain policy is never waived for an invitation
+
+Plan 07 decision D3 applies unchanged: an invitation is a **scoping token, never
+a policy exemption**. An invitee at a domain outside `allowed_email_domains` is
+refused even holding a valid link, on both the console's session boundary and
+Moira's. The invitation page renders that as an actionable instruction — add the
+domain, then use this link again — and never conflates it with
+`invite_email_mismatch` / `invite_domain_mismatch`, whose remedy is a new
+invitation instead.
+
+### The token in the URL
+
+`/invite/[token]` carries a secret in a URL path. That is deliberate — it is the
+only shape a shareable link can take — and it is bounded on both sides:
+
+- Moira does a prefix lookup before any Argon2 work, so the endpoint is not a
+  CPU-exhaustion oracle, and returns an identical `invite_not_found` for a wrong
+  prefix and a wrong hash, so it is not a guessing oracle;
+- the console exchanges the token server-side on first load, never renders it
+  into visible copy, and contacts no third-party origin from that page — a single
+  external request would put the full URL into a `Referer` header.
+
+An unusable invitation renders as a **page** with a keyed explanation, not a 404:
+it is a condition the holder needs explained, and the a11y walker requires every
+discovered route to answer below 400.
+
+### `/admins` renders personal data
+
+The invitation list is a directory of who was invited, and it is returned to any
+holder of `moira:admins:read`. That is the right audience; the screen says so in
+its own copy so that future exports and retention are thought about that way.
+
 ## What is not built yet
 
-The setup wizard's UI, the admin-management surfaces, and the public
-`/invite/[token]` page. `lib/setup-flow.ts` implements the provisioning sequence
-those surfaces will drive, and `modules/secrets/OnceOnlySecretModal.tsx` is the
-component the invite-creation surface will mount — no route mounts it today, and
-`console/e2e/secret-leak.e2e.ts` asserts that, so the assertion fails the moment
-one does.
+**Account recovery.** There is no `is_recovery` column, no
+`replaces_admin_identity_id`, no atomic revoke-and-grant swap and no
+`admin_identity_recovered` event — omitted deliberately (decision D-W2-1: *"a
+column no code writes is the schema equivalent of a catalog entry with no
+emitter"*). Half of what it promises is already achievable as two ordinary
+operations, revoke then invite; what is missing is the *atomicity* of the swap,
+and atomicity is a backend property.
+
+**Session management.** No active-sessions screen. `DELETE /admin-identities/{id}`
+already revokes *authorization*, which is strictly stronger than ending an
+*authentication*.
+
+**An authenticated end-to-end path.** There is no authenticated Playwright
+storage state, so no e2e in this repository can drive a signed-in screen. The
+a11y gate asserts that gated routes redirect to `/login` and does **not** audit
+them, with the unaudited set pinned in both directions — see
+`console/e2e/a11y.e2e.ts`. Building the authenticated project needs a mock IdP
+inside the Playwright environment; until then `/admins` is covered by unit tests
+and by Moira's own integration suite, and that limit is written down rather than
+papered over.

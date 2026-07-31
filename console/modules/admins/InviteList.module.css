@@ -1,0 +1,43 @@
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.heading {
+  margin: 0;
+  font-size: 1.15rem;
+}
+
+.note,
+.empty,
+.activity {
+  margin: 0;
+}
+
+.note {
+  font-size: 0.9rem;
+  opacity: 0.85;
+}
+
+.activity {
+  min-height: 1.25rem;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.caption {
+  text-align: left;
+  padding-bottom: 0.5rem;
+  font-weight: 600;
+}
+
+.table th,
+.table td {
+  text-align: left;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.1);
+}

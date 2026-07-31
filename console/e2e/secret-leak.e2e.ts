@@ -1,10 +1,8 @@
 import { expect, test } from "@playwright/test";
 
-import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-
 import { attachLeakTap, scanBuildOutput } from "./support/leak-tap";
 import { CONSOLE_E2E_ENV } from "./support/console-env";
+import { routesMountingTheModal } from "./support/module-graph";
 import { NEXT_BUILD_DIR, APP_DIR } from "./support/paths";
 import { discoverPageRoutes, visitableRoutes } from "./support/routes";
 import {
@@ -188,36 +186,82 @@ test.describe("secret leak", () => {
     expect(ONCE_ONLY_SECRET_FIXTURE.includes("\\")).toBe(false);
   });
 
-  test("no shipped route mounts OnceOnlySecretModal yet — and this fails when one does", () => {
-    // THE NEEDLE IS ARMED BUT NOT YET EXERCISED, and that is stated as an
-    // assertion rather than left as an omission.
+  test("the modal IS mounted by a route now, and the walk can see through an organism", () => {
+    // ========================================================================
+    // THE TRIPWIRE, FIRED AND REPLACED — plan 09 wave 5 (blocker W5-B4)
+    // ========================================================================
     //
-    // No page renders the modal in this wave, so no route scan below can
-    // possibly observe the token. The moment a page does mount it — plan 09's
-    // `/invite/[token]`, or an admin surface that creates one — this assertion
-    // FAILS, and whoever wrote that page has to arrange for the fixture token to
-    // flow through it. Without this, that author would inherit a gate that reads
-    // as covering the render and does not.
-    const reachable: string[] = [];
-    const walk = (dir: string): void => {
-      for (const entry of readdirSync(dir, { withFileTypes: true })) {
-        const full = join(dir, entry.name);
-        if (entry.isDirectory()) {
-          if (entry.name === "node_modules" || entry.name === ".next") continue;
-          walk(full);
-          continue;
-        }
-        if (!/\.(ts|tsx)$/.test(entry.name)) continue;
-        const source = readFileSync(full, "utf8");
-        if (source.includes("modules/secrets/OnceOnlySecretModal")) reachable.push(full);
-      }
-    };
-    walk(APP_DIR);
+    // This used to assert `reachable === []`, with a comment naming this wave:
+    // *"The moment a page does mount it — plan 09's `/invite/[token]`, or an
+    // admin surface that creates one — this assertion FAILS, and whoever wrote
+    // that page has to arrange for the fixture token to flow through it."*
+    //
+    // `/admins` now mounts it, through `modules/admins/InviteAdminForm.tsx`.
+    //
+    // FIRST, THE WALK HAD TO BE FIXED, and this is the part that matters more
+    // than the assertion. The old walk grepped `app/**` for the literal string
+    // `modules/secrets/OnceOnlySecretModal`. A page that imports an ORGANISM
+    // which imports the modal contains no such string, so the tripwire would
+    // have stayed GREEN through exactly the change it was armed for — an
+    // accidental evasion nobody would have noticed, in a guard whose whole
+    // purpose is to notice. The walk is now transitive over the import graph.
+    const mounting = routesMountingTheModal();
 
     expect(
-      reachable,
-      "a route now mounts OnceOnlySecretModal. Point an e2e fixture at that route so the " +
-        "once-only needle is actually scanned on a rendered page, then update this assertion.",
+      mounting,
+      "no route reaches OnceOnlySecretModal any more. If the invitation UI was removed, remove " +
+        "this assertion deliberately; if the import path changed, the walk below stopped " +
+        "resolving and every rule in this block is now vacuous.",
+    ).not.toEqual([]);
+    expect(mounting).toContain("app/(console)/admins/page.tsx");
+  });
+
+  test("every route that mounts the modal is gated, so the render is provably unreachable here", () => {
+    // ========================================================================
+    // THE HONEST HALF, AND IT IS NOT THE COMFORTABLE ONE
+    // ========================================================================
+    //
+    // W5-B4 asks for "a positive assertion that renders the modal with
+    // `ONCE_ONLY_SECRET_FIXTURE` on a real route". That cannot be done in this
+    // suite, for the same reason `a11y.e2e.ts` cannot audit `/admins`: the modal
+    // is reachable only after creating an invitation as a signed-in admin, and
+    // there is no authenticated Playwright storage state — building one needs a
+    // mock IdP inside the e2e environment, which decision W5-D7 declined to
+    // fake.
+    //
+    // So instead of a render assertion that would silently exercise nothing,
+    // this asserts the PRECONDITION of the gap: every mounting route is inside
+    // `(console)`. Two consequences, both wanted:
+    //
+    //   * if anyone mounts the modal on a PUBLIC route, this fails — and at that
+    //     point the render IS reachable from Playwright, so the author must wire
+    //     the fixture token through it, which is what W5-B4 wanted;
+    //   * the per-route scan below still runs over every mounting route and
+    //     still asserts the needle is absent. On a gated route that is a weak
+    //     statement, and saying so here is the difference between a documented
+    //     limit and a gate that reads as covering the render.
+    //
+    // The render itself is covered at unit level meanwhile:
+    // `tests/unit/modules/OnceOnlySecretModal.test.tsx` records every props
+    // object handed to an imported component and asserts the token reaches none
+    // of them, and `tests/unit/architecture/no-secret-props.test.ts` rule (c)
+    // asserts exactly one module mounts it and that module holds no standalone
+    // `secret` binding.
+    const gatedSources = new Set(
+      discoverPageRoutes(APP_DIR)
+        .filter((route) => route.gated)
+        // `source` is absolute; the graph walk is console-root-relative.
+        .map((route) => route.source.replaceAll("\\", "/"))
+        .map((source) => source.slice(source.indexOf("/app/") + 1)),
+    );
+    const publicMounts = routesMountingTheModal().filter((page) => !gatedSources.has(page));
+
+    expect(
+      publicMounts,
+      "a route outside (console) now mounts OnceOnlySecretModal, so Playwright CAN reach the " +
+        "render. Point a fixture at that route, seed ONCE_ONLY_SECRET_FIXTURE through it, and " +
+        "assert the token appears in zero captured bodies — that is the assertion W5-B4 asked " +
+        "for and this is the commit that can finally write it.",
     ).toEqual([]);
   });
 

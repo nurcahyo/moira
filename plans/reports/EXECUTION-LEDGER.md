@@ -1472,6 +1472,99 @@ Two general lessons, both worth more than the specific bug:
 2. **"Verified by a panel" is not verification.** Three designs, three judges and a synthesis all
    passed this through. The mutation is the only step that touched reality.
 
+## D-W2-1 — recovery invites were deliberately NOT built in wave 2 (recorded 2026-07-31, retroactively)
+
+**This decision was taken in plan 09 wave 2 and recorded nowhere a planner would find it.** Its only
+written trace was a comment in `migrations/0017_admin_invites.sql` and two comments in the i18n
+catalogues:
+
+> *"a column no code writes is the schema equivalent of a catalog entry with no emitter."*
+
+Wave 2 shipped the invitation backend without `is_recovery` and without
+`replaces_admin_identity_id`. There is no column, no DTO field, no route, no service method, no error
+code, no notice (`src/i18n/catalog/notices.rs` says "deliberately no `admin_identity_recovered`
+notice"), no audit event (`ADMIN_IDENTITY_GRANT_EVENTS` is exactly
+`["granted","revoked","ownership_transferred"]`) and no test.
+
+**Why it belongs here rather than only in a migration comment.** It removes a *third of wave 5's
+stated scope*. `RecoveryPanel`, `recovery.e2e.ts`, `recovery_invite_gets_no_domain_policy_exemption`
+and the `admin_identity_recovered` event are all unbuildable, and a wave-5 implementer reading the
+plan body would have discovered that only by trying. The general rule this produces: **a decision
+that changes a later wave's scope must land in that wave's §0 and in this ledger, not only where it
+was taken.**
+
+## W5-D1 — recovery is CUT from plan 09 wave 5 (taken by the loop, 2026-07-31)
+
+Wave 5 ships **invitations and ownership only**. Per D-W2-1 above, recovery is a Moira backend slice
+— one migration (two columns plus a CHECK that `replaces_admin_identity_id` is set iff
+`is_recovery`), two DTO changes, an atomic revoke-and-grant swap inside the existing transactional
+envelope, a new error code and notice with pinned emitters, an OpenAPI regeneration, and a
+mid-transaction failure-injection test — with a thin UI on top. That is the size of wave 2's own
+grant-administration slice, and it is not UI work.
+
+Half of what recovery promises is **already achievable with what exists**: "revoke a locked-out
+admin's grant, then invite their replacement" is two ordinary operations, and `AdminTable` plus
+`InviteAdminForm` expose both. What is genuinely missing is the *atomicity* of the swap, and
+atomicity is a backend property. A `RecoveryPanel` performing two independent calls while the plan
+promises "never a window where both or neither exist" would be the appearance of a feature.
+
+*Reversal condition:* when a wave takes the Moira change end to end — `is_recovery`,
+`replaces_admin_identity_id`, the in-envelope swap, `admin_identity_recovered`, and the
+mid-transaction failure-injection test asserting neither half persists without the other. The UI is a
+follow-on to that, never its driver.
+
+## W5-D7′ — the a11y walker DECLARES its blind spot instead of failing forever (taken by the loop, 2026-07-31)
+
+Plan 09 §0.8.4 step 24 asked for the final-URL assertion plus a permanently red suite: *"expect `/`
+and `/admins` to fail it until an authenticated e2e path exists. Record that failure honestly."*
+
+A permanently red merge gate is not a gate. It blocks every later change for a reason unrelated to
+that change, and the pressure to weaken it is then constant — which is how the assertion gets lost
+rather than kept.
+
+**Taken instead:** the walker classifies each route as gated or public from its source path;
+a **public** route's final pathname is asserted to equal the one requested BEFORE axe runs; a
+**gated** route is asserted to redirect to `/login` and is NOT audited; and the unaudited set is
+pinned in **both directions** against a declared list. Same information visible, same drift fails,
+and it merges.
+
+Mutation-verified: a `redirect("/login")` injected into the public `/invite/[token]` fails the URL
+assertion naming both URLs; removing `/admins` from the declared list fails the set assertion.
+
+*Reversal condition:* when an authenticated Playwright project exists — which needs a mock IdP inside
+the e2e environment — delete the declared entries and KEEP the URL assertion. The assertion is what
+will prove the authenticated run is doing anything.
+
+## THE THIRD TOOTHLESS GUARD, CAUGHT BY ITS OWN MUTATION — 2026-07-31 (plan 09 wave 5)
+
+**`route-handler-session.test.ts`'s named mutation left it GREEN.** The guard is "every route handler
+under `app/api/**` re-checks the session itself" — necessary because route groups contribute no
+layout there, so a handler inherits no gate. It scanned each `route.ts` for `withConsoleSession(`.
+
+The mutation was to delete the guard from `DELETE` in `app/api/admins/identities/[id]/route.ts`,
+which exports **both** `PATCH` and `DELETE`. It passed: the file still contained the call, in the
+other handler.
+
+**A file-level scan can express "some handler is guarded", never "every handler is"** — and the
+second exported method in a file is exactly where an unguarded mutation endpoint would go.
+
+Rebuilt per exported method, with the body brace-matched. Two extractor bugs surfaced only by
+re-running the mutation, not by reading the code:
+
+1. the first `{` after `export async function POST` is inside the **second parameter's** type
+   annotation (`{ params: Promise<…> }`), so brace-matching from there ended the "body" before it
+   began, and a correctly guarded handler was reported as unguarded;
+2. `export const GET = handle;` has no body. Skipping it would have made the alias form a hole in the
+   rule, so it is recorded with an empty body — i.e. unguarded — which is the safe direction.
+
+Re-mutated after the fix: both the `DELETE`-only deletion and the alias rewrite fail, naming the
+method.
+
+**Third occurrence of the same shape** (after F19's enumeration oracle and G1's decoy-less fixture).
+The standing question is now: *after any change to what a guard measures, can its fixture still
+represent the defect it is named for?* Here the answer was no for a reason nothing in the code
+looked wrong about.
+
 ## D3 — wave 4 implements Option A′, staged 4A / 4B (taken by the loop, 2026-07-31)
 
 Decided by a judged panel: three worked designs, three judge lenses (security closure, migration and

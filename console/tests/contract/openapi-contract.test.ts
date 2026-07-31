@@ -234,6 +234,15 @@ describe("operation registry matches docs/openapi.json", () => {
         // The load-bearing distinction: a bearer JWT is refused here even if it
         // verifies. Anything else in this list would be a contract change.
         expect(schemes).toEqual(["systemKeyAuth"]);
+      } else if (operation.credential === "bearer_only") {
+        // The mirror image, and the reason the variant exists (plan 09 W5-D3).
+        // `redeem_admin_invite` declares `bearerAuth` and nothing else so that
+        // no token-asserted scope and no bootstrap credential can reach a path
+        // that mints an `admin_identities` grant. If `systemKeyAuth` ever
+        // appears here, this fails — and that spec change is itself a decision
+        // needing its own argument about why the console should be able to
+        // self-grant.
+        expect(schemes).toEqual(["bearerAuth"]);
       } else {
         expect(schemes).not.toBeNull();
         expect(schemes).toContain("systemKeyAuth");

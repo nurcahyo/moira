@@ -59,6 +59,12 @@ const CLIENT_SAFE_MODULES = [
   "lib/i18n/keys.ts",
   "lib/i18n/catalog.en.ts",
   "lib/i18n/index.ts",
+  // Plan 09 wave 5. `ExpiryPicker` is a MOLECULE and may not import
+  // `lib/invites.ts`, which is server-only — so the two invitation bounds and
+  // the public invite path live here instead of being re-declared inside the
+  // component, which is how a UI drifts from the rule it claims to respect.
+  // Asserted client-safe rather than believed to be.
+  "lib/invite-bounds.ts",
 ] as const;
 
 /**
@@ -85,8 +91,49 @@ const CONNECTION_STRING_READERS = ["db/dsn.ts", "lib/console-db.ts", "lib/env.ts
 const SECRET_DTO_FIELD_PATTERN =
   /(secret|masked|fingerprint|token|password|api_?key|private_?key|credential)/i;
 
-/** The one interface permitted to model a raw secret. */
-const EXEMPT_DTO_INTERFACES = ["AdminInviteSecretResponse"] as const;
+/**
+ * The interfaces permitted to model a raw secret, each with its member set PINNED.
+ *
+ * ============================================================================
+ * WHY THE PINNING IS THE WHOLE MECHANISM (plan 09 wave 5, decision W5-D4)
+ * ============================================================================
+ *
+ * `SECRET_DTO_FIELD_PATTERN` matches `token`, and the redemption path needs two
+ * DTOs whose only field of interest IS a token: `AdminInvitePreviewRequest` and
+ * `AdminInviteRedeemRequest`. There were two ways to land them and only one is
+ * honest.
+ *
+ *   REJECTED — drop `token` from the pattern. That un-guards `token_prefix`,
+ *   `refresh_token`, `access_token` and every future DTO field with `token` in
+ *   its name, across the whole file, forever, in exchange for two interfaces.
+ *
+ *   TAKEN — exempt the two interfaces BY NAME with their member sets pinned
+ *   exactly, so a later field cannot ride in on the exemption. Adding
+ *   `client_secret` to `AdminInviteRedeemRequest` fails the pin even though the
+ *   interface is exempt.
+ *
+ * Every exemption is checked in REVERSE as well ("still NEEDED"), so an
+ * exemption that carves out nothing is itself a failure.
+ *
+ * AT THREE ENTRIES, STOP. The reversal condition recorded with W5-D4: if a third
+ * DTO needs a `token` field, introduce a typed `InviteToken` newtype whose name
+ * does not match the pattern instead — at three exemptions the list has become
+ * the thing it was guarding against.
+ */
+const EXEMPT_DTO_INTERFACES: ReadonlyArray<{
+  readonly name: string;
+  /** Sorted member set. A new field on an exempt interface fails here. */
+  readonly members: readonly string[];
+}> = [
+  {
+    name: "AdminInviteSecretResponse",
+    members: ["notice", "resource", "secret", "secret_retrievable"],
+  },
+  { name: "AdminInvitePreviewRequest", members: ["token"] },
+  { name: "AdminInviteRedeemRequest", members: ["email", "email_verified", "token"] },
+];
+
+const EXEMPT_DTO_INTERFACE_NAMES = EXEMPT_DTO_INTERFACES.map((entry) => entry.name);
 
 /** Field names that match the pattern but are not credentials. Asserted live. */
 const EXEMPT_DTO_FIELDS = ["token_url", "setup_token"] as const;
@@ -255,11 +302,14 @@ describe("no rotate-secret anywhere", () => {
     // `token_url` is an OAuth endpoint, not a token. `setup_token` is the
     // reserved-and-rejected field modelled solely so the shape matches the
     // committed schema; `assertClaimRequestIsSafe` refuses to send it.
+    //
+    // TWO MORE INTERFACES ARE EXEMPT from plan 09 wave 5 — the redeem/preview
+    // request bodies, whose member sets are pinned. See EXEMPT_DTO_INTERFACES.
     const source = readFileSync(join(CONSOLE_ROOT, "lib/types.ts"), "utf8");
     const interfaces = extractInterfaces("lib/types.ts", source, "[A-Za-z0-9_]+");
 
     const offenders = interfaces
-      .filter((declared) => !(EXEMPT_DTO_INTERFACES as readonly string[]).includes(declared.name))
+      .filter((declared) => !EXEMPT_DTO_INTERFACE_NAMES.includes(declared.name))
       .flatMap((declared) =>
         declared.members
           .filter((member) => SECRET_DTO_FIELD_PATTERN.test(member))
@@ -303,20 +353,39 @@ describe("no rotate-secret anywhere", () => {
     expect(withMembers.length).toBeGreaterThanOrEqual(15);
   });
 
-  test("the exemption is still NEEDED", () => {
-    // Reverse direction: an exemption whose interface no longer declares a
-    // secret-shaped field is a stale carve-out that will silently cover the next
-    // interface to take that name.
-    const source = readFileSync(join(CONSOLE_ROOT, "lib/types.ts"), "utf8");
-    const envelope = extractInterfaces("lib/types.ts", source, "[A-Za-z0-9_]+").find(
-      (declared) => declared.name === "AdminInviteSecretResponse",
-    );
-    expect(envelope, "AdminInviteSecretResponse is exempt but was not found").toBeDefined();
-    expect([...envelope!.members].sort()).toEqual([
-      "notice",
-      "resource",
-      "secret",
-      "secret_retrievable",
-    ]);
+  for (const exemption of EXEMPT_DTO_INTERFACES) {
+    test(`the ${exemption.name} exemption is still NEEDED, and its members are pinned`, () => {
+      // Two directions in one test, because they fail for different reasons and
+      // both messages matter.
+      //
+      //   NEEDED   an exemption whose interface no longer declares a
+      //            secret-shaped field is a stale carve-out that will silently
+      //            cover the next interface to take that name.
+      //   PINNED   an exemption is per-INTERFACE, so without the pin a later
+      //            field on an exempt interface inherits the carve-out. This is
+      //            what stops `AdminInviteRedeemRequest` growing a
+      //            `client_secret` under cover of its `token`.
+      const source = readFileSync(join(CONSOLE_ROOT, "lib/types.ts"), "utf8");
+      const declared = extractInterfaces("lib/types.ts", source, "[A-Za-z0-9_]+").find(
+        (candidate) => candidate.name === exemption.name,
+      );
+      expect(declared, `${exemption.name} is exempt but was not found`).toBeDefined();
+      expect([...declared!.members].sort()).toEqual([...exemption.members].sort());
+      expect(
+        declared!.members.some((member) => SECRET_DTO_FIELD_PATTERN.test(member)),
+        `${exemption.name} declares no secret-shaped field — the exemption carves out nothing`,
+      ).toBe(true);
+    });
+  }
+
+  test("the exemption list has not grown past the point where it IS the hazard", () => {
+    // W5-D4's reversal condition, asserted rather than left in prose. Three is
+    // the recorded ceiling: at four, the fix is a typed `InviteToken` newtype
+    // whose name does not match the pattern, not a fourth carve-out.
+    expect(
+      EXEMPT_DTO_INTERFACES.length,
+      "a fourth exempt interface means the allow-list has become the thing it was guarding " +
+        "against — introduce a newtype instead (plan 09 §0.8.3 W5-D4)",
+    ).toBeLessThanOrEqual(3);
   });
 });

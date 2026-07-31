@@ -27,17 +27,48 @@ export interface DiscoveredRoute {
   /** Repo-relative source file that defines the route. */
   readonly source: string;
   readonly dynamic: boolean;
+  /**
+   * Does this route sit inside the authenticated `(console)` route group?
+   *
+   * Derived from the SOURCE PATH, not from a list — the group directory is what
+   * makes a route gated, so a route added inside it is classified correctly with
+   * no edit here. This is what lets `a11y.e2e.ts` tell "I audited the page I
+   * asked for" apart from "I followed a redirect to /login and audited that".
+   */
+  readonly gated: boolean;
 }
+
+/**
+ * The token used for the `/invite/[token]` fixture URL.
+ *
+ * ============================================================================
+ * DELIBERATELY **NOT** `ONCE_ONLY_SECRET_FIXTURE`
+ * ============================================================================
+ *
+ * The invitation token travels in the URL PATH of that route, so a fixture URL
+ * built from the once-only needle would put that needle in every response body,
+ * every RSC payload and the browser's own address bar for that page — and
+ * `secret-leak.e2e.ts` would fail on the fixture rather than on a leak. Worse,
+ * the obvious "fix" would be to drop the needle, which is how the gate loses the
+ * one value it owns.
+ *
+ * Two values, two jobs: this one exercises the route, `ONCE_ONLY_SECRET_FIXTURE`
+ * stays the needle nothing may echo.
+ *
+ * It matches no live invitation, which is the point: `/invite/[token]` must
+ * render its unusable state as a PAGE (200 with a keyed explanation), because
+ * the a11y walker asserts every discovered route answers below 400.
+ */
+export const INVITE_ROUTE_FIXTURE_TOKEN = "invite-e2e-fixture-token-0f3c2a91";
 
 /**
  * Concrete URLs to substitute for dynamic route patterns.
  *
- * Plan 08 owns the real entries (e.g. `"/providers/[id]": "/providers/e2e-fixture"`).
  * Leaving a dynamic route out of this map is a *failing* condition, not an
  * implicit skip — see `test('every page-level route is covered', ...)`.
  */
 export const DYNAMIC_ROUTE_FIXTURES: Readonly<Record<string, string>> = {
-  // "/providers/[id]": "/providers/e2e-fixture-provider",
+  "/invite/[token]": `/invite/${INVITE_ROUTE_FIXTURE_TOKEN}`,
 };
 
 const PAGE_FILES = new Set(["page.tsx", "page.ts", "page.jsx", "page.js", "page.mjs"]);
@@ -80,11 +111,15 @@ function walk(dir: string, segments: string[], out: DiscoveredRoute[]): void {
       const normalized = pattern === "/" ? "/" : pattern.replace(/\/+$/, "");
       const dynamic = segments.some(isDynamicSegment);
       const fixture = DYNAMIC_ROUTE_FIXTURES[normalized];
+      const source = path.join(dir, entry.name);
       out.push({
         pattern: normalized,
         url: dynamic ? (fixture ?? null) : normalized,
-        source: path.join(dir, entry.name),
+        source,
         dynamic,
+        // The group directory is the gate. `app/(console)/admins/page.tsx` is
+        // gated; `app/login/page.tsx` and `app/invite/[token]/page.tsx` are not.
+        gated: source.split(path.sep).includes("(console)"),
       });
       continue;
     }

@@ -35,11 +35,28 @@
 //       into the Moira stub's once-only response and added to
 //       `forbiddenValues()`, which fails if the value reaches the browser by any
 //       route at all. This file is the fast, local, always-on half.
+//
+//   (c) a MOUNT rule, added in plan 09 wave 5. Rules (a) and (b) between them
+//       say "one component may hold the plaintext, and it may not forward it".
+//       Neither says anything about the component that RENDERS that one — and
+//       the obvious way to write the invitation form is
+//       `const [secret, setSecret] = useState<string | null>(null)`, which
+//       creates a second standalone binding of the token in a file rule (b) does
+//       not scan, because rule (b) runs only over the allow-list.
+//
+//       So: exactly one module may mount `OnceOnlySecretModal`, it is named, and
+//       it must hold the whole `AdminInviteSecretResponse` envelope rather than
+//       binding the token to an identifier of its own. The token is then read as
+//       a property at the JSX site, which keeps the count of bindings at one —
+//       the property that modal's own header claims.
 
 import { describe, expect, test } from "bun:test";
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import { extname, join, relative } from "node:path";
 
 import {
   consoleFileExists,
+  CONSOLE_ROOT,
   extractPropsInterfaces,
   readConsoleFile,
   renderingSourceFiles,
@@ -207,5 +224,132 @@ describe("rule (b) — an allowed file may hold the secret but never forward it"
   test("NEGATIVE CONTROL — rendering the secret as text is permitted", () => {
     expect(secretFlowViolations("<code>{secret}</code>")).toEqual([]);
     expect(secretFlowViolations("<Child>{null}</Child>\nconst x = secret;")).toEqual([]);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Rule (c) — who may MOUNT the one component that holds the plaintext        */
+/* -------------------------------------------------------------------------- */
+
+/** The module every once-only render must go through. */
+const MODAL_MODULE = "modules/secrets/OnceOnlySecretModal";
+
+/**
+ * The single module permitted to render it.
+ *
+ * One answer, like the allow-list above, and for the same reason: "which
+ * component may put the plaintext on screen" and "which component may hand it
+ * there" are both one-answer questions, and the second one had no guard at all
+ * until this wave.
+ */
+const MODAL_MOUNT_ALLOW_LIST: readonly string[] = ["modules/admins/InviteAdminForm.tsx"];
+
+/**
+ * A standalone binding of the token.
+ *
+ * `const secret = …`, `let secret`, and the `useState` destructuring that reads
+ * `const [secret, setSecret] = …`. A PROPERTY READ (`envelope.secret`) is
+ * deliberately not matched: that is the shape this rule exists to steer towards,
+ * because it keeps the token in the expression that renders it.
+ */
+const STANDALONE_SECRET_BINDING = /\b(?:const|let|var)\s+(?:secret\b|\[\s*secret\b)/;
+
+function everySourceFile(): string[] {
+  const found: string[] = [];
+  const walk = (absolute: string): void => {
+    let entries: string[];
+    try {
+      entries = readdirSync(absolute);
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry === "node_modules" || entry === ".next") continue;
+      const full = join(absolute, entry);
+      if (statSync(full).isDirectory()) {
+        walk(full);
+        continue;
+      }
+      const ext = extname(entry);
+      if (ext !== ".ts" && ext !== ".tsx") continue;
+      if (/\.(test|spec|stories)\.[tj]sx?$/.test(entry)) continue;
+      found.push(relative(CONSOLE_ROOT, full).replace(/\\/g, "/"));
+    }
+  };
+  for (const root of ["app", "components", "lib", "modules"]) walk(join(CONSOLE_ROOT, root));
+  return found.sort();
+}
+
+/** Files that IMPORT the modal, excluding the modal itself. */
+function modalImporters(): string[] {
+  return everySourceFile()
+    .filter((file) => !file.startsWith(MODAL_MODULE))
+    .filter((file) => {
+      const code = readFileSync(join(CONSOLE_ROOT, file), "utf8").replace(
+        /\/\*[\s\S]*?\*\/|\/\/.*$/gm,
+        "",
+      );
+      return code.includes(MODAL_MODULE) || /from\s+["']\.\/OnceOnlySecretModal["']/.test(code);
+    });
+}
+
+describe("rule (c) — exactly one module mounts the once-only modal", () => {
+  test("the file walk found the tree at all", () => {
+    const files = everySourceFile();
+    expect(files.length, `walked ${files.length} files`).toBeGreaterThanOrEqual(25);
+    expect(files, "the allow-listed mount is not in the scan set").toContain(
+      MODAL_MOUNT_ALLOW_LIST[0]!,
+    );
+  });
+
+  test("the mounting set is exactly the allow-list", () => {
+    // Both directions. A second mount point means a second place the plaintext
+    // is handled and a second render to reason about; a mounting set that has
+    // become empty means the invitation UI was removed and this rule, plus the
+    // e2e needle it backs, are now asserting nothing.
+    expect(
+      modalImporters().sort(),
+      "who renders the once-only token is a one-answer question. A new entry needs the same " +
+        "argument the first one made, and an empty set means the needle in " +
+        "e2e/secret-leak.e2e.ts is guarding a component nothing uses.",
+    ).toEqual([...MODAL_MOUNT_ALLOW_LIST].sort());
+  });
+
+  for (const file of MODAL_MOUNT_ALLOW_LIST) {
+    test(`${file} holds the ENVELOPE, never a standalone secret binding`, () => {
+      // The failure this prevents is the obvious way to write the component:
+      //
+      //   const [secret, setSecret] = useState<string | null>(null);
+      //
+      // which puts the plaintext into a named binding inside a file that is NOT
+      // on the rule-(b) allow-list, so nothing would scan how it flows from
+      // there. Holding `AdminInviteSecretResponse` and reading `.secret` at the
+      // JSX site keeps the count of bindings at one — in the modal.
+      const code = readConsoleFile(file).replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "");
+      expect(
+        STANDALONE_SECRET_BINDING.test(code),
+        `${file} binds the invitation token to a standalone identifier. Hold the whole ` +
+          "AdminInviteSecretResponse and read `.secret` where the modal is rendered.",
+      ).toBe(false);
+      // And it really does mount the modal, so the rule above is not passing on
+      // a file that stopped being relevant.
+      expect(code).toContain(MODAL_MODULE);
+    });
+  }
+
+  test("POSITIVE CONTROL — every binding spelling is detected", () => {
+    expect(STANDALONE_SECRET_BINDING.test("const secret = envelope.secret;")).toBe(true);
+    expect(STANDALONE_SECRET_BINDING.test("let secret: string | null = null;")).toBe(true);
+    expect(
+      STANDALONE_SECRET_BINDING.test("const [secret, setSecret] = useState<string | null>(null);"),
+    ).toBe(true);
+  });
+
+  test("NEGATIVE CONTROL — a property read and a neighbouring name are not", () => {
+    expect(STANDALONE_SECRET_BINDING.test("secret={created.secret ?? null}")).toBe(false);
+    expect(STANDALONE_SECRET_BINDING.test("const secretStore = consoleSecretStore(env);")).toBe(
+      false,
+    );
+    expect(STANDALONE_SECRET_BINDING.test("const created = await response.json();")).toBe(false);
   });
 });

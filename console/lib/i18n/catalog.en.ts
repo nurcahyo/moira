@@ -368,6 +368,20 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "The `<h1>` of `/login`. Deliberately distinct from `console.signIn.heading`, which names " +
       "the panel INSIDE the page — the page can host other content around it.",
   },
+  [K.page_admins_title]: {
+    key: K.page_admins_title,
+    message: "Admin access",
+    description:
+      "The `<h1>` of `/admins`. Distinct from `console.admins.heading`, which names the grants " +
+      "region inside the page; the page also hosts the invitation form and the invitation list.",
+  },
+  [K.page_invite_title]: {
+    key: K.page_invite_title,
+    message: "Admin invitation",
+    description:
+      "The `<h1>` of the public `/invite/[token]` page. Deliberately says nothing about who sent " +
+      "it or which deployment it is for — the page is reachable by anyone holding the link.",
+  },
 
   /* --- sign-in ------------------------------------------------------------ */
   [K.sign_in_heading]: {
@@ -516,6 +530,514 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "timestamp. The record's `expired` flag is derived server-side and is not stored — nothing " +
       "sweeps for expiry, so `status` never reads `expired`.",
   },
+  [K.action_cancel]: {
+    key: K.action_cancel,
+    message: "Cancel",
+    description:
+      "The dismissing control on every DangerConfirmDialog. `console.action.*` rather than a " +
+      "per-screen key because the dialog is a molecule with no idea what it is confirming.",
+  },
+
+  /* --- the authenticated chrome (plan 09 wave 5) -------------------------- */
+  [K.chrome_nav_label]: {
+    key: K.chrome_nav_label,
+    message: "Console sections",
+    description:
+      "Accessible name of the `<nav>` in the (console) layout. `no-hardcoded-copy.test.tsx` " +
+      "forbids a literal `aria-label`, so every landmark name is a catalog key.",
+  },
+  [K.chrome_nav_home]: {
+    key: K.chrome_nav_home,
+    message: "Home",
+    description:
+      "Navigation link to `/`, the authenticated home route. Deliberately not the same English " +
+      "as `console.page.home_title` — two keys sharing one message fail the catalog gate, and a " +
+      "nav item and a page heading are edited by different people for different reasons.",
+  },
+  [K.chrome_nav_admins]: {
+    key: K.chrome_nav_admins,
+    message: "Admins",
+    description:
+      "Navigation link to `/admins`. Without it that route is reachable only by typing the URL, " +
+      "which is why the (console) layout's own header scheduled the chrome for this wave.",
+  },
+  [K.chrome_sign_out]: {
+    key: K.chrome_sign_out,
+    message: "Sign out",
+    description: "The sign-out control in the console header.",
+  },
+  [K.chrome_sign_out_pending]: {
+    key: K.chrome_sign_out_pending,
+    message: "Signing out",
+    description:
+      "Announced while the sign-out request is in flight. The control is `aria-busy` for the " +
+      "same interval.",
+  },
+  [K.chrome_sign_out_failed]: {
+    key: K.chrome_sign_out_failed,
+    message: "Could not sign out. Close this browser or clear its cookies.",
+    description:
+      "Better Auth's sign-out endpoint refused or was unreachable. The remedy is deliberately " +
+      "client-side: the session cookie is the only thing that needs to stop existing, and the " +
+      "console cannot promise a server round trip it just failed to make.",
+  },
+
+  /* --- invitation lifetimes ----------------------------------------------- */
+  [K.expiry_label]: {
+    key: K.expiry_label,
+    message: "Valid for",
+    description: "Label of the ExpiryPicker select in the invitation form.",
+  },
+  [K.expiry_hint]: {
+    key: K.expiry_hint,
+    message: "Moira refuses anything longer than 72 hours rather than shortening it silently.",
+    description:
+      "Hint under the ExpiryPicker. States the cap as a REFUSAL because that is what " +
+      "`validated_invite_lifetime` does — an operator who believed they issued a 30-day " +
+      "invitation and silently received a 3-day one would find out at the worst moment.",
+  },
+  [K.expiry_option_one_hour]: {
+    key: K.expiry_option_one_hour,
+    message: "1 hour",
+    description:
+      "The shortest offered lifetime. Separate from the plural key because English has no " +
+      "plural-rule machinery in this catalog and `1 hours` reads as a bug.",
+  },
+  [K.expiry_option_hours]: {
+    key: K.expiry_option_hours,
+    message: "{hours} hours",
+    description:
+      "Every offered lifetime above one hour. `{hours}` is an integer supplied by ExpiryPicker.",
+  },
+
+  /* --- the /admins screen -------------------------------------------------- */
+  [K.admins_heading]: {
+    key: K.admins_heading,
+    message: "Admin grants",
+    description: "Heading and accessible name of the grants region on /admins.",
+  },
+  [K.admins_intro]: {
+    key: K.admins_intro,
+    message:
+      "Everyone listed here can use this console. Only the owner can transfer ownership or " +
+      "revoke another admin.",
+    description:
+      "Intro copy on /admins. States the ownership rule in the terms Moira enforces it in — " +
+      "`require_primary_actor` reads the caller's own row, so this is row state, not a scope.",
+  },
+  [K.admins_per_grant_note]: {
+    key: K.admins_per_grant_note,
+    message:
+      "Each row is one sign-in identity. Somebody who signs in through two different providers " +
+      "appears twice, and revoking one row leaves the other active.",
+    description:
+      "Finding F24, stated to the operator instead of papered over. `admin_identities` is keyed " +
+      "on (issuer, subject) and there is no column linking two grants to one human, so the " +
+      "screen must not imply person-level identity it does not have.",
+  },
+  [K.admins_table_label]: {
+    key: K.admins_table_label,
+    message: "Admin sign-in identities",
+    description: "Accessible name of the grants table.",
+  },
+  [K.admins_column_email]: {
+    key: K.admins_column_email,
+    message: "Email",
+    description:
+      "First column, deliberately. `issuer` is this console's own string on every row and " +
+      "disambiguates nothing; `subject` is an opaque IdP identifier. Email is the only " +
+      "human-identifiable attribute on the record, which is why decision D5 makes it required.",
+  },
+  [K.admins_column_status]: {
+    key: K.admins_column_status,
+    message: "Status",
+    description: "Grant status column header.",
+  },
+  [K.admins_column_created]: {
+    key: K.admins_column_created,
+    message: "Granted",
+    description: "Column header for `created_at` on a grant.",
+  },
+  [K.admins_column_actions]: {
+    key: K.admins_column_actions,
+    message: "Actions",
+    description: "Column header for the per-row controls.",
+  },
+  [K.admins_owner_badge]: {
+    key: K.admins_owner_badge,
+    message: "Owner",
+    description:
+      "Rendered for `is_primary`. A property of the ROW, never of the signed-in reader — " +
+      "`lib/types.ts` carries the same warning, because a console that treated it as a " +
+      "permission would disagree with Moira the moment a non-primary admin opened the page.",
+  },
+  [K.admins_status_active]: {
+    key: K.admins_status_active,
+    message: "Active",
+    description: "`AdminIdentityStatus.active`.",
+  },
+  [K.admins_status_revoked]: {
+    key: K.admins_status_revoked,
+    message: "Revoked",
+    description: "`AdminIdentityStatus.revoked` — a soft revoke; the row is retained.",
+  },
+  [K.admins_empty]: {
+    key: K.admins_empty,
+    message: "No admin sign-in identities have been granted yet.",
+    description:
+      "Empty state for the grants table. Reachable on a deployment whose only admin was created " +
+      "through the bootstrap system key and then revoked.",
+  },
+  [K.admins_activity_label]: {
+    key: K.admins_activity_label,
+    message: "Admin management activity",
+    description:
+      "Accessible name of the polite live region that reports the outcome of a transfer or a " +
+      "revocation. Present before it is populated, because a live region created and filled in " +
+      "the same tick is frequently missed.",
+  },
+  [K.admins_working]: {
+    key: K.admins_working,
+    message: "Applying the change",
+    description: "Announced while a transfer or revocation is in flight.",
+  },
+  [K.admins_request_failed]: {
+    key: K.admins_request_failed,
+    message: "The request did not reach this deployment. Check your connection and try again.",
+    description:
+      "The browser could not complete the call to the console's own route handler. Distinct " +
+      "from a refusal by Moira, which arrives with its own key and is rendered through `t()`.",
+  },
+  [K.admins_transfer]: {
+    key: K.admins_transfer,
+    message: "Make owner",
+    description:
+      "Per-row transfer control. ONE request: `set_primary` demotes every other active primary " +
+      "in the same transaction, so there is no second demote-the-actor call to make.",
+  },
+  [K.admins_transfer_confirm_title]: {
+    key: K.admins_transfer_confirm_title,
+    message: "Transfer ownership?",
+    description: "Accessible name and heading of the transfer confirmation dialog.",
+  },
+  [K.admins_transfer_confirm_body]: {
+    key: K.admins_transfer_confirm_body,
+    message:
+      "{email} becomes the owner and you stop being it. Only they will be able to transfer it " +
+      "back.",
+    description:
+      "Transfer confirmation body. Says the actor loses ownership, because they do: exactly one " +
+      "grant can be primary at a time, enforced by a unique index.",
+  },
+  [K.admins_transfer_confirm_action]: {
+    key: K.admins_transfer_confirm_action,
+    message: "Transfer ownership",
+    description: "The confirming control in the transfer dialog.",
+  },
+  [K.admins_revoke]: {
+    key: K.admins_revoke,
+    message: "Revoke",
+    description: "Per-row control that soft-revokes a grant.",
+  },
+  [K.admins_revoke_confirm_title]: {
+    key: K.admins_revoke_confirm_title,
+    message: "Revoke admin access?",
+    description: "Accessible name and heading of the grant revocation dialog.",
+  },
+  [K.admins_revoke_confirm_body]: {
+    key: K.admins_revoke_confirm_body,
+    message: "{email} loses access to this console immediately. An invitation can restore it.",
+    description:
+      "Revocation confirmation body. Names the remedy, because revocation and re-invitation are " +
+      "the two ordinary operations that together do what a recovery flow would.",
+  },
+  [K.admins_revoke_confirm_action]: {
+    key: K.admins_revoke_confirm_action,
+    message: "Revoke access",
+    description: "The confirming control in the revocation dialog.",
+  },
+  [K.admins_owner_not_revocable]: {
+    key: K.admins_owner_not_revocable,
+    message: "The owner cannot be revoked. Transfer ownership to somebody else first.",
+    description:
+      "Decision D-F20's operator-visible consequence, stated as a RULE rather than surfaced as a " +
+      "failed request: `revoke_grant` clears `is_primary` and the last-primary guard refuses " +
+      "that, so on a deployment with one admin the operation is permanently unavailable for " +
+      "that row. Rendered beside the disabled control, never as an error banner.",
+  },
+
+  /* --- the invitation form ------------------------------------------------- */
+  [K.admins_invite_heading]: {
+    key: K.admins_invite_heading,
+    message: "Invite an admin",
+    description: "Heading and accessible name of the invitation form region.",
+  },
+  [K.admins_invite_constraint_label]: {
+    key: K.admins_invite_constraint_label,
+    message: "Bind this invitation to",
+    description:
+      "Label of the constraint selector. `constraint` is required and there is no " +
+      "anyone-with-the-link option, because an unbound invitation would make a leaked URL " +
+      "equivalent to handing out admin.",
+  },
+  [K.admins_invite_constraint_email]: {
+    key: K.admins_invite_constraint_email,
+    message: "One email address",
+    description: "`AdminInviteConstraint.email`.",
+  },
+  [K.admins_invite_constraint_domain]: {
+    key: K.admins_invite_constraint_domain,
+    message: "Any address at one domain",
+    description:
+      "`AdminInviteConstraint.domain`. Exact match on the domain — `sub.example.com` is not " +
+      "admitted by `example.com`, mirroring `evaluate_claim_policy`.",
+  },
+  [K.admins_invite_value_label_email]: {
+    key: K.admins_invite_value_label_email,
+    message: "Email address",
+    description: "Field label when the constraint is a single address.",
+  },
+  [K.admins_invite_value_label_domain]: {
+    key: K.admins_invite_value_label_domain,
+    message: "Email domain",
+    description: "Field label when the constraint is a domain.",
+  },
+  [K.admins_invite_value_hint_email]: {
+    key: K.admins_invite_value_hint_email,
+    message: "Only this address can redeem the invitation.",
+    description: "Hint under the value field in email mode.",
+  },
+  [K.admins_invite_value_hint_domain]: {
+    key: K.admins_invite_value_hint_domain,
+    message: "Any address at exactly this domain can redeem the invitation, once.",
+    description:
+      "Hint under the value field in domain mode. Says `once`: the invitation is single-use " +
+      "whichever constraint it carries.",
+  },
+  [K.admins_invite_value_required]: {
+    key: K.admins_invite_value_required,
+    message: "Enter the address or domain to invite.",
+    description: "Client-side required-field refusal on the invitation form.",
+  },
+  [K.admins_invite_submit]: {
+    key: K.admins_invite_submit,
+    message: "Create invitation",
+    description: "Submit control of the invitation form.",
+  },
+  [K.admins_invite_pending]: {
+    key: K.admins_invite_pending,
+    message: "Creating the invitation",
+    description: "Announced while the create request is in flight.",
+  },
+  [K.admins_invite_domain_not_in_allow_list]: {
+    key: K.admins_invite_domain_not_in_allow_list,
+    message:
+      "No enabled sign-in provider admits this domain, so the invitation could not be redeemed. " +
+      "Add the domain to that provider's allowed email domains first.",
+    description:
+      "The pre-submit gate's HARD refusal, used only when exactly one provider is enabled — the " +
+      "one case in which the console's union provably equals the row Moira will resolve. UI " +
+      "gating only; Moira's redeem-time check remains the authority.",
+  },
+  [K.admins_invite_no_enabled_provider]: {
+    key: K.admins_invite_no_enabled_provider,
+    message: "No sign-in provider is enabled, so nobody could redeem an invitation yet.",
+    description:
+      "The unambiguous refusal: with zero enabled providers there is no way to sign in at all, " +
+      "so an invitation would strand its holder however it was written.",
+  },
+  [K.admins_invite_multi_provider_warning]: {
+    key: K.admins_invite_multi_provider_warning,
+    message:
+      "Several sign-in providers are enabled and this console cannot tell which one will govern " +
+      "the redemption, so this check is a hint rather than a guarantee. If it is refused, the " +
+      "invitation stays usable and the same link works once the domain is allowed.",
+    description:
+      "Blocker W5-B11, decision W5-D11. Redemption applies exactly ONE provider row; the " +
+      "anonymous projection carries neither `trusted_jwt_issuer_id` nor `created_at`, so the " +
+      "console can only compute a union and cannot tell which row wins. Warning rather than " +
+      "block, and it says which of the two it is doing. The real safety net is that a " +
+      "policy-denied redemption does not consume the invitation.",
+  },
+
+  /* --- the invitation list ------------------------------------------------- */
+  [K.admins_invites_heading]: {
+    key: K.admins_invites_heading,
+    message: "Invitations",
+    description: "Heading and accessible name of the invitation list region.",
+  },
+  [K.admins_invites_table_label]: {
+    key: K.admins_invites_table_label,
+    message: "Issued invitations",
+    description: "Accessible name of the invitation table.",
+  },
+  [K.admins_invites_empty]: {
+    key: K.admins_invites_empty,
+    message: "No invitations have been issued.",
+    description: "Empty state for the invitation list.",
+  },
+  [K.admins_invites_privacy_note]: {
+    key: K.admins_invites_privacy_note,
+    message: "This list names the people who were invited. Treat it as personal data.",
+    description:
+      "`AdminInviteRecord.value` is the invited address or domain and `consumed_subject` is the " +
+      "redeemer's IdP subject; both are returned to any holder of `moira:admins:read`. That is " +
+      "the right audience, and worth stating rather than discovering.",
+  },
+  [K.admins_invite_column_value]: {
+    key: K.admins_invite_column_value,
+    message: "Invited",
+    description: "Column header for `AdminInviteRecord.value`.",
+  },
+  [K.admins_invite_column_status]: {
+    key: K.admins_invite_column_status,
+    message: "State",
+    description:
+      "Column header for the invitation's state. Deliberately not the same English as the grant " +
+      "table's Status column — two keys with identical copy fail the catalog gate, and these " +
+      "genuinely name different vocabularies.",
+  },
+  [K.admins_invite_column_expires]: {
+    key: K.admins_invite_column_expires,
+    message: "Expires",
+    description: "Column header for `AdminInviteRecord.expires_at`.",
+  },
+  [K.admins_invite_status_pending]: {
+    key: K.admins_invite_status_pending,
+    message: "Waiting to be redeemed",
+    description: "`AdminInviteStatus.pending` and not past `expires_at`.",
+  },
+  [K.admins_invite_status_consumed]: {
+    key: K.admins_invite_status_consumed,
+    message: "Redeemed",
+    description: "`AdminInviteStatus.consumed`. Single-use, so this is terminal.",
+  },
+  [K.admins_invite_status_revoked]: {
+    key: K.admins_invite_status_revoked,
+    message: "Withdrawn",
+    description: "`AdminInviteStatus.revoked`.",
+  },
+  [K.admins_invite_status_expired]: {
+    key: K.admins_invite_status_expired,
+    message: "Expired",
+    description:
+      "DERIVED from `AdminInviteRecord.expired`, not a `status` value: nothing sweeps for " +
+      "expiry, so `status` never reads `expired` and a UI keying off `status` alone would show " +
+      "a dead invitation as pending.",
+  },
+  [K.admins_invite_revoke]: {
+    key: K.admins_invite_revoke,
+    message: "Withdraw",
+    description: "Per-row control that revokes an invitation.",
+  },
+  [K.admins_invite_revoke_confirm_title]: {
+    key: K.admins_invite_revoke_confirm_title,
+    message: "Withdraw this invitation?",
+    description: "Accessible name and heading of the invitation revocation dialog.",
+  },
+  [K.admins_invite_revoke_confirm_body]: {
+    key: K.admins_invite_revoke_confirm_body,
+    message: "The link sent to {value} stops working. Issue a new invitation to replace it.",
+    description:
+      "Invitation revocation body. Names the remedy, and names the invitee so the operator can " +
+      "see which link they are about to break.",
+  },
+  [K.admins_invite_revoke_confirm_action]: {
+    key: K.admins_invite_revoke_confirm_action,
+    message: "Withdraw invitation",
+    description: "The confirming control in the invitation revocation dialog.",
+  },
+
+  /* --- the public /invite/[token] page ------------------------------------- */
+  [K.invite_panel_label]: {
+    key: K.invite_panel_label,
+    message: "Invitation",
+    description: "Accessible name of the InviteAcceptPanel region.",
+  },
+  [K.invite_heading_email]: {
+    key: K.invite_heading_email,
+    message: "This invitation is for {value}.",
+    description:
+      "Rendered for `AdminInviteConstraint.email`. `{value}` comes from the anonymous preview, " +
+      "which carries the constraint, the value and the expiry and nothing else — no inviter, no " +
+      "deployment detail, no policy.",
+  },
+  [K.invite_heading_domain]: {
+    key: K.invite_heading_domain,
+    message: "This invitation is for anyone with a {value} address.",
+    description: "Rendered for `AdminInviteConstraint.domain`.",
+  },
+  [K.invite_expires_at]: {
+    key: K.invite_expires_at,
+    message: "It stops working after {expires_at}.",
+    description:
+      "`{expires_at}` is the preview's RFC 3339 timestamp. Separate from " +
+      "`console.secret.expires_at`, which the inviter sees: two audiences, two sentences.",
+  },
+  [K.invite_sign_in_first]: {
+    key: K.invite_sign_in_first,
+    message: "Sign in to accept it.",
+    description:
+      "Shown above the sign-in panel when the visitor has no session. Redemption needs a " +
+      "verified identity — the token proves the invitation, never the person.",
+  },
+  [K.invite_accept]: {
+    key: K.invite_accept,
+    message: "Accept invitation",
+    description: "The control that redeems the invitation for the signed-in visitor.",
+  },
+  [K.invite_accept_pending]: {
+    key: K.invite_accept_pending,
+    message: "Accepting the invitation",
+    description: "Announced while the redemption request is in flight.",
+  },
+  [K.invite_accepted]: {
+    key: K.invite_accepted,
+    message: "Done. You can open the console now.",
+    description:
+      "Redemption succeeded. Moira's own `admin_invite_redeemed` notice is rendered beside this " +
+      "through `t()`; this key is the console's own next-step instruction.",
+  },
+  [K.invite_request_failed]: {
+    key: K.invite_request_failed,
+    message: "The request did not reach this deployment. Try the link again.",
+    description:
+      "The browser could not complete the call to the console's redemption route handler. " +
+      "Deliberately distinct copy from `console.admins.request_failed`: identical English on two " +
+      "keys fails the catalog gate, and these are read by different people.",
+  },
+  [K.invite_unusable_heading]: {
+    key: K.invite_unusable_heading,
+    message: "This invitation cannot be used",
+    description:
+      "Heading of the error STATE, which is rendered as a page with a 200 status rather than as " +
+      "a 404: the a11y walker asserts every discovered route answers below 400, and an " +
+      "unreadable invitation is a condition the holder needs explained, not a missing document.",
+  },
+  [K.invite_domain_not_allowed]: {
+    key: K.invite_domain_not_allowed,
+    message:
+      "This deployment does not accept admins at your email domain. Ask whoever invited you to " +
+      "add it to the sign-in provider's allowed domains, then use this link again.",
+    description:
+      "`moira.error.admin_claim_domain_not_allowed` on the redemption path, rendered as an " +
+      "actionable instruction and never as a generic error banner. It is NOT the same condition " +
+      "as `invite_email_mismatch`/`invite_domain_mismatch`, whose remedy is a new invitation. " +
+      "Decision D3: an invitation is a scoping token, never a policy exemption — and a " +
+      "policy-denied redemption does not consume it, so the same link works afterwards.",
+  },
+  [K.invite_already_claimed]: {
+    key: K.invite_already_claimed,
+    message:
+      "An admin identity already exists for this sign-in. Ask an existing admin to check the " +
+      "admin list.",
+    description:
+      "`moira.error.admin_identity_already_claimed`, worded for finding F24. It must NOT say " +
+      '"you already have admin": `admin_identities` is keyed on (issuer, subject) with the ' +
+      "console's own issuer on every row, so under two providers minting one issuer the holder " +
+      "of that grant may be somebody else entirely.",
+  },
+
 };
 
 /** Every entry, as a plain array. */

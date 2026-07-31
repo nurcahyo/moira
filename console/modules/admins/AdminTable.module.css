@@ -1,0 +1,41 @@
+.table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.caption {
+  text-align: left;
+  padding-bottom: 0.5rem;
+  font-weight: 600;
+}
+
+.table th,
+.table td {
+  text-align: left;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.1);
+  vertical-align: top;
+}
+
+.email {
+  font-weight: 600;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.rule {
+  margin: 0;
+  font-size: 0.85rem;
+  opacity: 0.8;
+  max-width: 22rem;
+}
+
+.empty {
+  margin: 0;
+  opacity: 0.8;
+}
