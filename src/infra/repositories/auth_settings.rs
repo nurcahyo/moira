@@ -34,11 +34,11 @@ use uuid::Uuid;
 
 use crate::{
     domain::{
-        AuthMethod, AuthProviderSettingsCreateRequest, AuthProviderSettingsPatchRequest,
-        AuthProviderSettingsRecord, ListCursor, PublicAuthMethod,
+        AuditLogInsert, AuthMethod, AuthProviderSettingsCreateRequest,
+        AuthProviderSettingsPatchRequest, AuthProviderSettingsRecord, ListCursor, PublicAuthMethod,
     },
     error::AppError,
-    infra::pg_rows::resource_status_from_db,
+    infra::{pg_rows::resource_status_from_db, repositories::admin::insert_audit_with_connection},
 };
 
 /// The subset of an `auth_provider_settings` row that the admin-identity claim policy
@@ -55,6 +55,9 @@ pub struct GoverningAuthPolicy {
     pub allowed_email_domains: Vec<String>,
 }
 
+/// Every mutation below takes an [`AuditLogInsert`] and writes it inside the write's own
+/// transaction — see [`AdminRepository`](super::AdminRepository) for why that is a
+/// parameter and not a convention.
 #[async_trait]
 pub trait AuthProviderSettingsRepository: Send + Sync {
     /// Inserts a configuration row **inside the caller's transaction**, so the write sits
@@ -81,6 +84,7 @@ pub trait AuthProviderSettingsRepository: Send + Sync {
         id: Uuid,
         expected_version: i64,
         request: &AuthProviderSettingsPatchRequest,
+        audit: AuditLogInsert,
     ) -> Result<AuthProviderSettingsRecord, AppError>;
 
     async fn set_enabled(
@@ -88,9 +92,15 @@ pub trait AuthProviderSettingsRepository: Send + Sync {
         id: Uuid,
         expected_version: i64,
         enabled: bool,
+        audit: AuditLogInsert,
     ) -> Result<AuthProviderSettingsRecord, AppError>;
 
-    async fn soft_delete(&self, id: Uuid, expected_version: i64) -> Result<(), AppError>;
+    async fn soft_delete(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+        audit: AuditLogInsert,
+    ) -> Result<(), AppError>;
 
     /// The bootstrap read behind `GET /api/v1/admin/setup/auth-methods`.
     async fn list_enabled_public(&self) -> Result<Vec<PublicAuthMethod>, AppError>;
@@ -300,6 +310,7 @@ impl AuthProviderSettingsRepository for PgAuthProviderSettingsRepository {
         id: Uuid,
         expected_version: i64,
         request: &AuthProviderSettingsPatchRequest,
+        audit: AuditLogInsert,
     ) -> Result<AuthProviderSettingsRecord, AppError> {
         let mut tx = self.pool.begin().await?;
         let current_version = lock_auth_provider_version(&mut tx, id, expected_version).await?;
@@ -350,6 +361,7 @@ impl AuthProviderSettingsRepository for PgAuthProviderSettingsRepository {
         .map_err(map_constraint_violation)?
         .ok_or_else(version_conflict)?;
         let record = record_from_row(&row)?;
+        insert_audit_with_connection(&mut tx, audit).await?;
         tx.commit().await?;
         Ok(record)
     }
@@ -359,6 +371,7 @@ impl AuthProviderSettingsRepository for PgAuthProviderSettingsRepository {
         id: Uuid,
         expected_version: i64,
         enabled: bool,
+        audit: AuditLogInsert,
     ) -> Result<AuthProviderSettingsRecord, AppError> {
         let mut tx = self.pool.begin().await?;
         let current_version = lock_auth_provider_version(&mut tx, id, expected_version).await?;
@@ -383,11 +396,17 @@ impl AuthProviderSettingsRepository for PgAuthProviderSettingsRepository {
         .map_err(map_constraint_violation)?
         .ok_or_else(version_conflict)?;
         let record = record_from_row(&row)?;
+        insert_audit_with_connection(&mut tx, audit).await?;
         tx.commit().await?;
         Ok(record)
     }
 
-    async fn soft_delete(&self, id: Uuid, expected_version: i64) -> Result<(), AppError> {
+    async fn soft_delete(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+        audit: AuditLogInsert,
+    ) -> Result<(), AppError> {
         let mut tx = self.pool.begin().await?;
         let current_version = lock_auth_provider_version(&mut tx, id, expected_version).await?;
         let result = sqlx::query(
@@ -402,6 +421,7 @@ impl AuthProviderSettingsRepository for PgAuthProviderSettingsRepository {
         if result.rows_affected() == 0 {
             return Err(version_conflict());
         }
+        insert_audit_with_connection(&mut tx, audit).await?;
         tx.commit().await?;
         Ok(())
     }

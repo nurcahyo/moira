@@ -46,7 +46,7 @@ pub struct RuntimeAdminService<'a> {
     /// `PgRuntimeRepository`, so the runtime read/write surface can be swapped for a fake.
     ///
     /// Note for whoever writes the first Postgres-free `RuntimeAdminService` unit test: this
-    /// field alone is not enough. `audit_success` and `idempotency_replay` go through
+    /// field alone is not enough. `idempotency_replay` goes through
     /// `admin_repo`, whose only implementation is `PgAdminRepository` — and *that* requires a
     /// live `PgPool` at construction. Making this service fully Postgres-free therefore also
     /// needs an `AdminRepository` fake (60+ methods), which is outside Module 8's four-trait
@@ -81,24 +81,29 @@ impl<'a> RuntimeAdminService<'a> {
         validate_key("route_key", &request.route_key)?;
         validate_display_name(&request.display_name)?;
         validate_metadata(&request.metadata)?;
+        // Hoisted so the audit row can name the id before the row exists: the audit is
+        // now written inside the INSERT's own transaction, not after it.
+        let id = Uuid::now_v7();
         let record = self
             .runtime_repo
-            .create_route_definition(Uuid::now_v7(), &request)
+            .create_route_definition(
+                id,
+                &request,
+                self.runtime_audit(
+                    actor,
+                    ctx,
+                    "route.create",
+                    "route",
+                    Some(id.to_string()),
+                    json!({ "route_key": &request.route_key }),
+                ),
+            )
             .await?;
         self.invalidate_runtime(
             RuntimeConfigInvalidation::new(db::RESOURCE_TYPE_ROUTE_DEFINITIONS, record.id),
             CircuitResetScope::Unaffected,
         )
         .await;
-        self.audit_success(
-            actor,
-            ctx,
-            "route.create",
-            "route",
-            Some(record.id.to_string()),
-            json!({ "route_key": record.route_key }),
-        )
-        .await?;
         self.record_idempotency(ctx, actor, "route.create", &request, &record)
             .await?;
         Ok(record)
@@ -156,22 +161,25 @@ impl<'a> RuntimeAdminService<'a> {
         }
         let record = self
             .runtime_repo
-            .patch_route_definition(id, expected_version, &request)
+            .patch_route_definition(
+                id,
+                expected_version,
+                &request,
+                self.runtime_audit(
+                    actor,
+                    ctx,
+                    "route.update",
+                    "route",
+                    Some(id.to_string()),
+                    json!({}),
+                ),
+            )
             .await?;
         self.invalidate_runtime(
             RuntimeConfigInvalidation::new(db::RESOURCE_TYPE_ROUTE_DEFINITIONS, id),
             CircuitResetScope::Unaffected,
         )
         .await;
-        self.audit_success(
-            actor,
-            ctx,
-            "route.update",
-            "route",
-            Some(id.to_string()),
-            json!({}),
-        )
-        .await?;
         Ok(record)
     }
 
@@ -184,22 +192,25 @@ impl<'a> RuntimeAdminService<'a> {
     ) -> Result<(), AppError> {
         self.state.authz.require(actor, "moira:routes:delete")?;
         self.runtime_repo
-            .soft_delete_route_definition(id, expected_version)
+            .soft_delete_route_definition(
+                id,
+                expected_version,
+                self.runtime_audit(
+                    actor,
+                    ctx,
+                    "route.delete",
+                    "route",
+                    Some(id.to_string()),
+                    json!({}),
+                ),
+            )
             .await?;
         self.invalidate_runtime(
             RuntimeConfigInvalidation::new(db::RESOURCE_TYPE_ROUTE_DEFINITIONS, id),
             CircuitResetScope::Unaffected,
         )
         .await;
-        self.audit_success(
-            actor,
-            ctx,
-            "route.delete",
-            "route",
-            Some(id.to_string()),
-            json!({}),
-        )
-        .await
+        Ok(())
     }
 
     pub async fn set_route_definition_enabled(
@@ -217,6 +228,18 @@ impl<'a> RuntimeAdminService<'a> {
                 id,
                 expected_version,
                 if enabled { "active" } else { "disabled" },
+                self.runtime_audit(
+                    actor,
+                    ctx,
+                    if enabled {
+                        "route.enable"
+                    } else {
+                        "route.disable"
+                    },
+                    "route",
+                    Some(id.to_string()),
+                    json!({}),
+                ),
             )
             .await?;
         self.invalidate_runtime(
@@ -224,19 +247,6 @@ impl<'a> RuntimeAdminService<'a> {
             CircuitResetScope::Unaffected,
         )
         .await;
-        self.audit_success(
-            actor,
-            ctx,
-            if enabled {
-                "route.enable"
-            } else {
-                "route.disable"
-            },
-            "route",
-            Some(id.to_string()),
-            json!({}),
-        )
-        .await?;
         Ok(record)
     }
 
@@ -261,24 +271,29 @@ impl<'a> RuntimeAdminService<'a> {
             request.provider_model_id,
         )
         .await?;
+        // Hoisted so the audit row can name the id before the row exists: the audit is
+        // now written inside the INSERT's own transaction, not after it.
+        let id = Uuid::now_v7();
         let record = self
             .runtime_repo
-            .create_routing_policy(Uuid::now_v7(), &request)
+            .create_routing_policy(
+                id,
+                &request,
+                self.runtime_audit(
+                    actor,
+                    ctx,
+                    "routing_policy.create",
+                    "routing_policy",
+                    Some(id.to_string()),
+                    json!({ "route_id": request.route_id }),
+                ),
+            )
             .await?;
         self.invalidate_runtime(
             RuntimeConfigInvalidation::new(db::RESOURCE_TYPE_ROUTING_POLICIES, record.id),
             CircuitResetScope::Unaffected,
         )
         .await;
-        self.audit_success(
-            actor,
-            ctx,
-            "routing_policy.create",
-            "routing_policy",
-            Some(record.id.to_string()),
-            json!({ "route_id": record.route_id }),
-        )
-        .await?;
         self.record_idempotency(ctx, actor, "routing_policy.create", &request, &record)
             .await?;
         Ok(record)
@@ -339,22 +354,25 @@ impl<'a> RuntimeAdminService<'a> {
             .await?;
         let record = self
             .runtime_repo
-            .patch_routing_policy(id, expected_version, &request)
+            .patch_routing_policy(
+                id,
+                expected_version,
+                &request,
+                self.runtime_audit(
+                    actor,
+                    ctx,
+                    "routing_policy.update",
+                    "routing_policy",
+                    Some(id.to_string()),
+                    json!({}),
+                ),
+            )
             .await?;
         self.invalidate_runtime(
             RuntimeConfigInvalidation::new(db::RESOURCE_TYPE_ROUTING_POLICIES, id),
             CircuitResetScope::Unaffected,
         )
         .await;
-        self.audit_success(
-            actor,
-            ctx,
-            "routing_policy.update",
-            "routing_policy",
-            Some(id.to_string()),
-            json!({}),
-        )
-        .await?;
         Ok(record)
     }
 
@@ -387,22 +405,25 @@ impl<'a> RuntimeAdminService<'a> {
             .authz
             .require(actor, "moira:routing-policies:delete")?;
         self.runtime_repo
-            .soft_delete_routing_policy(id, expected_version)
+            .soft_delete_routing_policy(
+                id,
+                expected_version,
+                self.runtime_audit(
+                    actor,
+                    ctx,
+                    "routing_policy.delete",
+                    "routing_policy",
+                    Some(id.to_string()),
+                    json!({}),
+                ),
+            )
             .await?;
         self.invalidate_runtime(
             RuntimeConfigInvalidation::new(db::RESOURCE_TYPE_ROUTING_POLICIES, id),
             CircuitResetScope::Unaffected,
         )
         .await;
-        self.audit_success(
-            actor,
-            ctx,
-            "routing_policy.delete",
-            "routing_policy",
-            Some(id.to_string()),
-            json!({}),
-        )
-        .await
+        Ok(())
     }
 
     pub async fn set_routing_policy_enabled(
@@ -422,6 +443,18 @@ impl<'a> RuntimeAdminService<'a> {
                 id,
                 expected_version,
                 if enabled { "active" } else { "disabled" },
+                self.runtime_audit(
+                    actor,
+                    ctx,
+                    if enabled {
+                        "routing_policy.enable"
+                    } else {
+                        "routing_policy.disable"
+                    },
+                    "routing_policy",
+                    Some(id.to_string()),
+                    json!({}),
+                ),
             )
             .await?;
         self.invalidate_runtime(
@@ -429,19 +462,6 @@ impl<'a> RuntimeAdminService<'a> {
             CircuitResetScope::Unaffected,
         )
         .await;
-        self.audit_success(
-            actor,
-            ctx,
-            if enabled {
-                "routing_policy.enable"
-            } else {
-                "routing_policy.disable"
-            },
-            "routing_policy",
-            Some(id.to_string()),
-            json!({}),
-        )
-        .await?;
         Ok(record)
     }
 
@@ -470,24 +490,29 @@ impl<'a> RuntimeAdminService<'a> {
             &request.memory_policy,
             &request.metadata,
         )?;
+        // Hoisted so the audit row can name the id before the row exists: the audit is
+        // now written inside the INSERT's own transaction, not after it.
+        let id = Uuid::now_v7();
         let record = self
             .runtime_repo
-            .create_agent_profile(Uuid::now_v7(), &request)
+            .create_agent_profile(
+                id,
+                &request,
+                self.runtime_audit(
+                    actor,
+                    ctx,
+                    "agent_profile.create",
+                    "agent_profile",
+                    Some(id.to_string()),
+                    json!({ "profile_key": &request.profile_key }),
+                ),
+            )
             .await?;
         self.invalidate_runtime(
             RuntimeConfigInvalidation::new(db::RESOURCE_TYPE_AGENT_PROFILES, record.id),
             CircuitResetScope::Unaffected,
         )
         .await;
-        self.audit_success(
-            actor,
-            ctx,
-            "agent_profile.create",
-            "agent_profile",
-            Some(record.id.to_string()),
-            json!({ "profile_key": record.profile_key }),
-        )
-        .await?;
         self.record_idempotency(ctx, actor, "agent_profile.create", &request, &record)
             .await?;
         Ok(record)
@@ -547,22 +572,25 @@ impl<'a> RuntimeAdminService<'a> {
         )?;
         let record = self
             .runtime_repo
-            .patch_agent_profile(id, expected_version, &request)
+            .patch_agent_profile(
+                id,
+                expected_version,
+                &request,
+                self.runtime_audit(
+                    actor,
+                    ctx,
+                    "agent_profile.update",
+                    "agent_profile",
+                    Some(id.to_string()),
+                    json!({}),
+                ),
+            )
             .await?;
         self.invalidate_runtime(
             RuntimeConfigInvalidation::new(db::RESOURCE_TYPE_AGENT_PROFILES, id),
             CircuitResetScope::Unaffected,
         )
         .await;
-        self.audit_success(
-            actor,
-            ctx,
-            "agent_profile.update",
-            "agent_profile",
-            Some(id.to_string()),
-            json!({}),
-        )
-        .await?;
         Ok(record)
     }
 
@@ -577,22 +605,25 @@ impl<'a> RuntimeAdminService<'a> {
             .authz
             .require(actor, "moira:agent-profiles:delete")?;
         self.runtime_repo
-            .soft_delete_agent_profile(id, expected_version)
+            .soft_delete_agent_profile(
+                id,
+                expected_version,
+                self.runtime_audit(
+                    actor,
+                    ctx,
+                    "agent_profile.delete",
+                    "agent_profile",
+                    Some(id.to_string()),
+                    json!({}),
+                ),
+            )
             .await?;
         self.invalidate_runtime(
             RuntimeConfigInvalidation::new(db::RESOURCE_TYPE_AGENT_PROFILES, id),
             CircuitResetScope::Unaffected,
         )
         .await;
-        self.audit_success(
-            actor,
-            ctx,
-            "agent_profile.delete",
-            "agent_profile",
-            Some(id.to_string()),
-            json!({}),
-        )
-        .await
+        Ok(())
     }
 
     pub async fn set_agent_profile_enabled(
@@ -612,6 +643,18 @@ impl<'a> RuntimeAdminService<'a> {
                 id,
                 expected_version,
                 if enabled { "active" } else { "disabled" },
+                self.runtime_audit(
+                    actor,
+                    ctx,
+                    if enabled {
+                        "agent_profile.enable"
+                    } else {
+                        "agent_profile.disable"
+                    },
+                    "agent_profile",
+                    Some(id.to_string()),
+                    json!({}),
+                ),
             )
             .await?;
         self.invalidate_runtime(
@@ -619,19 +662,6 @@ impl<'a> RuntimeAdminService<'a> {
             CircuitResetScope::Unaffected,
         )
         .await;
-        self.audit_success(
-            actor,
-            ctx,
-            if enabled {
-                "agent_profile.enable"
-            } else {
-                "agent_profile.disable"
-            },
-            "agent_profile",
-            Some(id.to_string()),
-            json!({}),
-        )
-        .await?;
         Ok(record)
     }
 
@@ -699,7 +729,18 @@ impl<'a> RuntimeAdminService<'a> {
         }
         let record = self
             .runtime_repo
-            .put_provider_runtime_policy(provider_id, &request)
+            .put_provider_runtime_policy(
+                provider_id,
+                &request,
+                self.runtime_audit(
+                    actor,
+                    ctx,
+                    "provider_runtime_policy.upsert",
+                    "provider_runtime_policy",
+                    Some(provider_id.to_string()),
+                    json!({ "provider_id": provider_id }),
+                ),
+            )
             .await?;
         self.invalidate_runtime(
             RuntimeConfigInvalidation::new(
@@ -709,15 +750,6 @@ impl<'a> RuntimeAdminService<'a> {
             CircuitResetScope::Unaffected,
         )
         .await;
-        self.audit_success(
-            actor,
-            ctx,
-            "provider_runtime_policy.upsert",
-            "provider_runtime_policy",
-            Some(provider_id.to_string()),
-            json!({ "provider_id": provider_id }),
-        )
-        .await?;
         self.record_idempotency(
             ctx,
             actor,
@@ -828,7 +860,19 @@ impl<'a> RuntimeAdminService<'a> {
         }
     }
 
-    async fn audit_success(
+    /// Builds this module's audit row; the **repository** writes it, inside the write's own
+    /// transaction.
+    ///
+    /// It used to write the row itself, through `admin_repo.insert_audit` on a second pooled
+    /// connection, after the write had already committed. All thirteen mutations here were
+    /// non-atomic that way: a failed audit `INSERT` left an administrative change with no
+    /// record of it. Every `RuntimeRepository` write now takes its `AuditLogInsert`.
+    ///
+    /// `format!("{:?}", actor.actor_type)` is **deliberately not** lowercased, unlike
+    /// `admin::shared::success_audit`. The two have disagreed since this module was written
+    /// and deployed rows carry both spellings; unifying them is a data change, not a
+    /// refactor, and does not belong in an atomicity fix.
+    fn runtime_audit(
         &self,
         actor: &Actor,
         ctx: &RequestContext,
@@ -836,25 +880,23 @@ impl<'a> RuntimeAdminService<'a> {
         resource_type: &str,
         resource_id: Option<String>,
         metadata: Value,
-    ) -> Result<(), AppError> {
-        self.admin_repo
-            .insert_audit(AuditLogInsert {
-                request_id: Some(ctx.request_id.clone()),
-                actor_type: Some(format!("{:?}", actor.actor_type)),
-                actor_subject: actor.subject.clone(),
-                delegated_subject: actor.delegated_subject.clone(),
-                external_user_id: actor.external_user_id.clone(),
-                external_tenant_id: actor.external_tenant_id.clone(),
-                application_id: actor.internal_application_id,
-                resource_type: resource_type.to_string(),
-                resource_id,
-                action: action.to_string(),
-                result: AuditResult::Success,
-                source_ip: ctx.source_ip,
-                user_agent: ctx.user_agent.clone(),
-                metadata,
-            })
-            .await
+    ) -> AuditLogInsert {
+        AuditLogInsert {
+            request_id: Some(ctx.request_id.clone()),
+            actor_type: Some(format!("{:?}", actor.actor_type)),
+            actor_subject: actor.subject.clone(),
+            delegated_subject: actor.delegated_subject.clone(),
+            external_user_id: actor.external_user_id.clone(),
+            external_tenant_id: actor.external_tenant_id.clone(),
+            application_id: actor.internal_application_id,
+            resource_type: resource_type.to_string(),
+            resource_id,
+            action: action.to_string(),
+            result: AuditResult::Success,
+            source_ip: ctx.source_ip,
+            user_agent: ctx.user_agent.clone(),
+            metadata,
+        }
     }
 
     async fn idempotency_replay<Req, Resp>(

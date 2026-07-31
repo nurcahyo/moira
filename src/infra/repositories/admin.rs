@@ -89,6 +89,27 @@ pub struct StoredCredentialSecret {
 ///
 /// A repository method therefore never returns `has_more` and never encodes a cursor; it
 /// only knows how to seek and how to over-fetch by one.
+///
+/// # Every mutation carries its `audit` row, and the write commits it
+///
+/// A method that changes state takes an [`AuditLogInsert`] and writes it **on the same
+/// connection, inside the same transaction** as the change itself. It is a required
+/// parameter rather than a convention because the alternative had already gone wrong:
+/// thirty-six admin mutations used to write the row afterwards through
+/// `PgAdminRepository::insert_audit`, which acquires a *second* pooled connection. The two
+/// statements then commit separately, and any failure between them — a `22001` from an
+/// over-long `x-request-id`, a pool timeout, a dropped request future, a killed pod —
+/// leaves the administrative change committed with no record of it.
+///
+/// Only that direction was ever reachable, and it is the serious one. The audit row is
+/// written *after* the row lock and version check, so a `409` or `404` still writes
+/// nothing.
+///
+/// Do not add a mutating method here without an `audit` parameter, and do not restore a
+/// caller-side `insert_audit` on a success path. `audit_denied`
+/// (`src/application/admin/shared.rs`) is the one deliberate exception: it records a
+/// refusal, so there is no write for it to be atomic with, and it is swallowed on purpose.
+/// Pinned end to end by `tests/admin_audit_atomicity.rs`.
 #[async_trait]
 pub trait AdminRepository {
     async fn create_application(
@@ -111,17 +132,20 @@ pub trait AdminRepository {
         id: Uuid,
         expected_version: i64,
         request: &ApplicationPatchRequest,
+        audit: AuditLogInsert,
     ) -> Result<ApplicationRecord, AppError>;
     async fn set_application_status(
         &self,
         id: Uuid,
         expected_version: i64,
         status: &str,
+        audit: AuditLogInsert,
     ) -> Result<ApplicationRecord, AppError>;
     async fn soft_delete_application(
         &self,
         id: Uuid,
         expected_version: i64,
+        audit: AuditLogInsert,
     ) -> Result<(), AppError>;
 
     async fn create_provider(
@@ -142,14 +166,21 @@ pub trait AdminRepository {
         expected_version: i64,
         request: &ProviderPatchRequest,
         normalized_base_url: Option<Option<String>>,
+        audit: AuditLogInsert,
     ) -> Result<ProviderRecord, AppError>;
     async fn set_provider_status(
         &self,
         id: Uuid,
         expected_version: i64,
         status: &str,
+        audit: AuditLogInsert,
     ) -> Result<ProviderRecord, AppError>;
-    async fn soft_delete_provider(&self, id: Uuid, expected_version: i64) -> Result<(), AppError>;
+    async fn soft_delete_provider(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+        audit: AuditLogInsert,
+    ) -> Result<(), AppError>;
 
     async fn create_provider_model(
         &self,
@@ -168,6 +199,7 @@ pub trait AdminRepository {
         id: Uuid,
         expected_version: i64,
         request: &ProviderModelPatchRequest,
+        audit: AuditLogInsert,
     ) -> Result<ProviderModelRecord, AppError>;
     async fn get_provider_model(&self, id: Uuid) -> Result<ProviderModelRecord, AppError>;
     async fn set_provider_model_status(
@@ -175,11 +207,13 @@ pub trait AdminRepository {
         id: Uuid,
         expected_version: i64,
         status: &str,
+        audit: AuditLogInsert,
     ) -> Result<ProviderModelRecord, AppError>;
     async fn soft_delete_provider_model(
         &self,
         id: Uuid,
         expected_version: i64,
+        audit: AuditLogInsert,
     ) -> Result<(), AppError>;
 
     async fn create_credential(
@@ -208,6 +242,7 @@ pub trait AdminRepository {
         id: Uuid,
         expected_version: i64,
         request: &CredentialPatchRequest,
+        audit: AuditLogInsert,
     ) -> Result<CredentialRecord, AppError>;
     async fn rotate_credential(
         &self,
@@ -221,15 +256,25 @@ pub trait AdminRepository {
         id: Uuid,
         expected_version: i64,
         status: &str,
+        audit: AuditLogInsert,
     ) -> Result<CredentialRecord, AppError>;
-    async fn mark_credential_validated(&self, id: Uuid) -> Result<CredentialRecord, AppError>;
-    async fn soft_delete_credential(&self, id: Uuid, expected_version: i64)
-    -> Result<(), AppError>;
+    async fn mark_credential_validated(
+        &self,
+        id: Uuid,
+        audit: AuditLogInsert,
+    ) -> Result<CredentialRecord, AppError>;
+    async fn soft_delete_credential(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+        audit: AuditLogInsert,
+    ) -> Result<(), AppError>;
     async fn soft_delete_user_credential(
         &self,
         external_user_id: &str,
         id: Uuid,
         expected_version: i64,
+        audit: AuditLogInsert,
     ) -> Result<(), AppError>;
 
     async fn create_system_key(
@@ -271,8 +316,18 @@ pub trait AdminRepository {
         fingerprint: &str,
         pepper_version: &str,
     ) -> Result<ApiKeyRecord, AppError>;
-    async fn revoke_key(&self, table: &str, id: Uuid) -> Result<ApiKeyRecord, AppError>;
-    async fn soft_delete_key(&self, table: &str, id: Uuid) -> Result<(), AppError>;
+    async fn revoke_key(
+        &self,
+        table: &str,
+        id: Uuid,
+        audit: AuditLogInsert,
+    ) -> Result<ApiKeyRecord, AppError>;
+    async fn soft_delete_key(
+        &self,
+        table: &str,
+        id: Uuid,
+        audit: AuditLogInsert,
+    ) -> Result<(), AppError>;
 
     async fn create_trusted_jwt_issuer(
         &self,
@@ -290,18 +345,25 @@ pub trait AdminRepository {
         id: Uuid,
         expected_version: i64,
         request: &TrustedJwtIssuerPatchRequest,
+        audit: AuditLogInsert,
     ) -> Result<TrustedJwtIssuerRecord, AppError>;
     async fn set_trusted_jwt_issuer_status(
         &self,
         id: Uuid,
         expected_version: i64,
         status: &str,
+        audit: AuditLogInsert,
     ) -> Result<TrustedJwtIssuerRecord, AppError>;
-    async fn touch_trusted_jwt_issuer(&self, id: Uuid) -> Result<TrustedJwtIssuerRecord, AppError>;
+    async fn touch_trusted_jwt_issuer(
+        &self,
+        id: Uuid,
+        audit: AuditLogInsert,
+    ) -> Result<TrustedJwtIssuerRecord, AppError>;
     async fn soft_delete_trusted_jwt_issuer(
         &self,
         id: Uuid,
         expected_version: i64,
+        audit: AuditLogInsert,
     ) -> Result<(), AppError>;
     /// How many live `admin_identities` grants were made through this trusted JWT issuer.
     ///
@@ -909,6 +971,7 @@ impl AdminRepository for PgAdminRepository {
         id: Uuid,
         expected_version: i64,
         request: &ApplicationPatchRequest,
+        audit: AuditLogInsert,
     ) -> Result<ApplicationRecord, AppError> {
         let mut tx = self.pool.begin().await?;
         let current_version = lock_and_match_version(
@@ -942,6 +1005,7 @@ impl AdminRepository for PgAdminRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = application_record_from_row(&row)?;
+        insert_audit_with_connection(&mut tx, audit).await?;
         tx.commit().await?;
         Ok(record)
     }
@@ -951,6 +1015,7 @@ impl AdminRepository for PgAdminRepository {
         id: Uuid,
         expected_version: i64,
         status: &str,
+        audit: AuditLogInsert,
     ) -> Result<ApplicationRecord, AppError> {
         let mut tx = self.pool.begin().await?;
         let current_version = lock_and_match_version(
@@ -979,6 +1044,7 @@ impl AdminRepository for PgAdminRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = application_record_from_row(&row)?;
+        insert_audit_with_connection(&mut tx, audit).await?;
         tx.commit().await?;
         Ok(record)
     }
@@ -987,6 +1053,7 @@ impl AdminRepository for PgAdminRepository {
         &self,
         id: Uuid,
         expected_version: i64,
+        audit: AuditLogInsert,
     ) -> Result<(), AppError> {
         let mut tx = self.pool.begin().await?;
         let current_version = lock_and_match_version(
@@ -1007,6 +1074,7 @@ impl AdminRepository for PgAdminRepository {
         if result.rows_affected() == 0 {
             return Err(version_conflict());
         }
+        insert_audit_with_connection(&mut tx, audit).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1083,6 +1151,7 @@ impl AdminRepository for PgAdminRepository {
         expected_version: i64,
         request: &ProviderPatchRequest,
         normalized_base_url: Option<Option<String>>,
+        audit: AuditLogInsert,
     ) -> Result<ProviderRecord, AppError> {
         let update_base_url = normalized_base_url.is_some();
         let base_url = normalized_base_url.flatten();
@@ -1117,6 +1186,7 @@ impl AdminRepository for PgAdminRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = provider_record_from_row(&row)?;
+        insert_audit_with_connection(&mut tx, audit).await?;
         tx.commit().await?;
         Ok(record)
     }
@@ -1126,6 +1196,7 @@ impl AdminRepository for PgAdminRepository {
         id: Uuid,
         expected_version: i64,
         status: &str,
+        audit: AuditLogInsert,
     ) -> Result<ProviderRecord, AppError> {
         let mut tx = self.pool.begin().await?;
         let current_version = lock_and_match_version(
@@ -1154,11 +1225,17 @@ impl AdminRepository for PgAdminRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = provider_record_from_row(&row)?;
+        insert_audit_with_connection(&mut tx, audit).await?;
         tx.commit().await?;
         Ok(record)
     }
 
-    async fn soft_delete_provider(&self, id: Uuid, expected_version: i64) -> Result<(), AppError> {
+    async fn soft_delete_provider(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+        audit: AuditLogInsert,
+    ) -> Result<(), AppError> {
         let mut tx = self.pool.begin().await?;
         let current_version = lock_and_match_version(
             &mut tx,
@@ -1178,6 +1255,7 @@ impl AdminRepository for PgAdminRepository {
         if result.rows_affected() == 0 {
             return Err(version_conflict());
         }
+        insert_audit_with_connection(&mut tx, audit).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1239,6 +1317,7 @@ impl AdminRepository for PgAdminRepository {
         id: Uuid,
         expected_version: i64,
         request: &ProviderModelPatchRequest,
+        audit: AuditLogInsert,
     ) -> Result<ProviderModelRecord, AppError> {
         let mut tx = self.pool.begin().await?;
         let current_version = lock_and_match_version(
@@ -1268,6 +1347,7 @@ impl AdminRepository for PgAdminRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = provider_model_record_from_row(&row)?;
+        insert_audit_with_connection(&mut tx, audit).await?;
         tx.commit().await?;
         Ok(record)
     }
@@ -1293,6 +1373,7 @@ impl AdminRepository for PgAdminRepository {
         id: Uuid,
         expected_version: i64,
         status: &str,
+        audit: AuditLogInsert,
     ) -> Result<ProviderModelRecord, AppError> {
         let mut tx = self.pool.begin().await?;
         let current_version = lock_and_match_version(
@@ -1321,6 +1402,7 @@ impl AdminRepository for PgAdminRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = provider_model_record_from_row(&row)?;
+        insert_audit_with_connection(&mut tx, audit).await?;
         tx.commit().await?;
         Ok(record)
     }
@@ -1329,6 +1411,7 @@ impl AdminRepository for PgAdminRepository {
         &self,
         id: Uuid,
         expected_version: i64,
+        audit: AuditLogInsert,
     ) -> Result<(), AppError> {
         let mut tx = self.pool.begin().await?;
         let current_version = lock_and_match_version(
@@ -1349,6 +1432,7 @@ impl AdminRepository for PgAdminRepository {
         if result.rows_affected() == 0 {
             return Err(version_conflict());
         }
+        insert_audit_with_connection(&mut tx, audit).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1480,6 +1564,7 @@ impl AdminRepository for PgAdminRepository {
         id: Uuid,
         expected_version: i64,
         request: &CredentialPatchRequest,
+        audit: AuditLogInsert,
     ) -> Result<CredentialRecord, AppError> {
         let mut tx = self.pool.begin().await?;
         let current_version = lock_and_match_version(
@@ -1516,6 +1601,7 @@ impl AdminRepository for PgAdminRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = credential_record_from_row(&row)?;
+        insert_audit_with_connection(&mut tx, audit).await?;
         tx.commit().await?;
         Ok(record)
     }
@@ -1566,6 +1652,7 @@ impl AdminRepository for PgAdminRepository {
         id: Uuid,
         expected_version: i64,
         status: &str,
+        audit: AuditLogInsert,
     ) -> Result<CredentialRecord, AppError> {
         let mut tx = self.pool.begin().await?;
         let current_version = lock_and_match_version(
@@ -1597,11 +1684,19 @@ impl AdminRepository for PgAdminRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = credential_record_from_row(&row)?;
+        insert_audit_with_connection(&mut tx, audit).await?;
         tx.commit().await?;
         Ok(record)
     }
 
-    async fn mark_credential_validated(&self, id: Uuid) -> Result<CredentialRecord, AppError> {
+    async fn mark_credential_validated(
+        &self,
+        id: Uuid,
+        audit: AuditLogInsert,
+    ) -> Result<CredentialRecord, AppError> {
+        // A transaction for one `UPDATE`, so the audit row shares its fate. Every write on
+        // this trait carries its own audit row for exactly this reason; see the trait docs.
+        let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             r#"
             update provider_credentials
@@ -1615,16 +1710,20 @@ impl AdminRepository for PgAdminRepository {
             "#,
         )
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("provider credential {id}")))?;
-        credential_record_from_row(&row)
+        let record = credential_record_from_row(&row)?;
+        insert_audit_with_connection(&mut tx, audit).await?;
+        tx.commit().await?;
+        Ok(record)
     }
 
     async fn soft_delete_credential(
         &self,
         id: Uuid,
         expected_version: i64,
+        audit: AuditLogInsert,
     ) -> Result<(), AppError> {
         let mut tx = self.pool.begin().await?;
         let current_version = lock_and_match_version(
@@ -1645,6 +1744,7 @@ impl AdminRepository for PgAdminRepository {
         if result.rows_affected() == 0 {
             return Err(version_conflict());
         }
+        insert_audit_with_connection(&mut tx, audit).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1654,6 +1754,7 @@ impl AdminRepository for PgAdminRepository {
         external_user_id: &str,
         id: Uuid,
         expected_version: i64,
+        audit: AuditLogInsert,
     ) -> Result<(), AppError> {
         let mut tx = self.pool.begin().await?;
         // Scoped by `external_user_id` as well as `id`: a credential owned by a different user
@@ -1681,6 +1782,7 @@ impl AdminRepository for PgAdminRepository {
         if result.rows_affected() == 0 {
             return Err(version_conflict());
         }
+        insert_audit_with_connection(&mut tx, audit).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1823,7 +1925,12 @@ impl AdminRepository for PgAdminRepository {
         api_key_record_from_row(&row)
     }
 
-    async fn revoke_key(&self, table: &str, id: Uuid) -> Result<ApiKeyRecord, AppError> {
+    async fn revoke_key(
+        &self,
+        table: &str,
+        id: Uuid,
+        audit: AuditLogInsert,
+    ) -> Result<ApiKeyRecord, AppError> {
         let sql = match table {
             "system_api_keys" => {
                 r#"
@@ -1847,15 +1954,24 @@ impl AdminRepository for PgAdminRepository {
             }
             _ => return Err(AppError::Internal("unsupported api key table".to_string())),
         };
+        let mut tx = self.pool.begin().await?;
         let row = sqlx::query(sql)
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("api key {id}")))?;
-        api_key_record_from_row(&row)
+        let record = api_key_record_from_row(&row)?;
+        insert_audit_with_connection(&mut tx, audit).await?;
+        tx.commit().await?;
+        Ok(record)
     }
 
-    async fn soft_delete_key(&self, table: &str, id: Uuid) -> Result<(), AppError> {
+    async fn soft_delete_key(
+        &self,
+        table: &str,
+        id: Uuid,
+        audit: AuditLogInsert,
+    ) -> Result<(), AppError> {
         let sql = match table {
             "system_api_keys" => {
                 "update system_api_keys set status = 'deleted', deleted_at = now(), updated_at = now() where id = $1 and deleted_at is null"
@@ -1865,8 +1981,12 @@ impl AdminRepository for PgAdminRepository {
             }
             _ => return Err(AppError::Internal("unsupported api key table".to_string())),
         };
-        let result = sqlx::query(sql).bind(id).execute(&self.pool).await?;
-        ensure_affected(result.rows_affected(), format!("api key {id}"))
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(sql).bind(id).execute(&mut *tx).await?;
+        ensure_affected(result.rows_affected(), format!("api key {id}"))?;
+        insert_audit_with_connection(&mut tx, audit).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn create_trusted_jwt_issuer(
@@ -1946,6 +2066,7 @@ impl AdminRepository for PgAdminRepository {
         id: Uuid,
         expected_version: i64,
         request: &TrustedJwtIssuerPatchRequest,
+        audit: AuditLogInsert,
     ) -> Result<TrustedJwtIssuerRecord, AppError> {
         let mut tx = self.pool.begin().await?;
         let current_version = lock_and_match_version(
@@ -2000,6 +2121,7 @@ impl AdminRepository for PgAdminRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = crate::infra::pg_rows::trusted_jwt_issuer_record_from_row(&row)?;
+        insert_audit_with_connection(&mut tx, audit).await?;
         tx.commit().await?;
         Ok(record)
     }
@@ -2009,6 +2131,7 @@ impl AdminRepository for PgAdminRepository {
         id: Uuid,
         expected_version: i64,
         status: &str,
+        audit: AuditLogInsert,
     ) -> Result<TrustedJwtIssuerRecord, AppError> {
         let mut tx = self.pool.begin().await?;
         let current_version = lock_and_match_version(
@@ -2040,11 +2163,17 @@ impl AdminRepository for PgAdminRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = crate::infra::pg_rows::trusted_jwt_issuer_record_from_row(&row)?;
+        insert_audit_with_connection(&mut tx, audit).await?;
         tx.commit().await?;
         Ok(record)
     }
 
-    async fn touch_trusted_jwt_issuer(&self, id: Uuid) -> Result<TrustedJwtIssuerRecord, AppError> {
+    async fn touch_trusted_jwt_issuer(
+        &self,
+        id: Uuid,
+        audit: AuditLogInsert,
+    ) -> Result<TrustedJwtIssuerRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             r#"
             update trusted_jwt_issuers
@@ -2058,16 +2187,20 @@ impl AdminRepository for PgAdminRepository {
             "#,
         )
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("trusted JWT issuer {id}")))?;
-        crate::infra::pg_rows::trusted_jwt_issuer_record_from_row(&row)
+        let record = crate::infra::pg_rows::trusted_jwt_issuer_record_from_row(&row)?;
+        insert_audit_with_connection(&mut tx, audit).await?;
+        tx.commit().await?;
+        Ok(record)
     }
 
     async fn soft_delete_trusted_jwt_issuer(
         &self,
         id: Uuid,
         expected_version: i64,
+        audit: AuditLogInsert,
     ) -> Result<(), AppError> {
         let mut tx = self.pool.begin().await?;
         let current_version = lock_and_match_version(
@@ -2088,6 +2221,7 @@ impl AdminRepository for PgAdminRepository {
         if result.rows_affected() == 0 {
             return Err(version_conflict());
         }
+        insert_audit_with_connection(&mut tx, audit).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -2272,7 +2406,14 @@ fn idempotency_record_from_row(row: &sqlx::postgres::PgRow) -> Result<Idempotenc
     })
 }
 
-async fn insert_audit_with_connection(
+/// The one `insert into audit_logs` in the crate that a repository write can reach.
+///
+/// `pub(crate)` because [`super::runtime`] and [`super::auth_settings`] write their audit
+/// rows through it as well, on the connection their own write is using. That shared
+/// connection is the whole point: an audit row written on a *second* connection commits
+/// separately from the write it describes, which is the divergence the `audit` parameter
+/// on every write method exists to make impossible.
+pub(crate) async fn insert_audit_with_connection(
     connection: &mut PgConnection,
     insert: AuditLogInsert,
 ) -> Result<(), AppError> {

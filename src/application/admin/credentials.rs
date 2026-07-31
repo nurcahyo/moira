@@ -16,7 +16,7 @@ use crate::{
         AdminCommandMutation, AdminCommandRunner, RequestContext,
         admin::shared::{
             CREDENTIALS_CURSOR, PageRequest, USER_CREDENTIALS_CURSOR, admin_command_spec,
-            audit_success, authorize_credential_record, authorize_credential_scope, command_hasher,
+            authorize_credential_record, authorize_credential_scope, command_hasher,
             load_credential_record, mask_credential_secret, paginate, require_active_row,
             schedule_runtime_cache_invalidation, success_audit, validate_credential_scope,
             validate_credential_secret,
@@ -179,19 +179,21 @@ impl<'a> CredentialAdminService<'a> {
         }
         let record = self
             .repo
-            .patch_credential(id, expected_version, &request)
+            .patch_credential(
+                id,
+                expected_version,
+                &request,
+                success_audit(
+                    actor,
+                    ctx,
+                    "credential.update",
+                    "provider_credential",
+                    Some(id.to_string()),
+                    json!({}),
+                ),
+            )
             .await?;
         self.state.runtime_cache.invalidate_all().await;
-        audit_success(
-            &self.repo,
-            actor,
-            ctx,
-            "credential.update",
-            "provider_credential",
-            Some(id.to_string()),
-            json!({}),
-        )
-        .await?;
         Ok(record)
     }
 
@@ -290,17 +292,20 @@ impl<'a> CredentialAdminService<'a> {
             .state
             .cipher
             .decrypt(&stored.encrypted, aad.as_bytes())?;
-        let record = self.repo.mark_credential_validated(id).await?;
-        audit_success(
-            &self.repo,
-            actor,
-            ctx,
-            "credential.validate",
-            "provider_credential",
-            Some(id.to_string()),
-            json!({ "provider_id": record.provider_id }),
-        )
-        .await?;
+        let record = self
+            .repo
+            .mark_credential_validated(
+                id,
+                success_audit(
+                    actor,
+                    ctx,
+                    "credential.validate",
+                    "provider_credential",
+                    Some(id.to_string()),
+                    json!({ "provider_id": stored.record.provider_id }),
+                ),
+            )
+            .await?;
         Ok(record)
     }
 
@@ -320,23 +325,25 @@ impl<'a> CredentialAdminService<'a> {
         let status = if enabled { "active" } else { "disabled" };
         let record = self
             .repo
-            .set_credential_status(id, expected_version, status)
+            .set_credential_status(
+                id,
+                expected_version,
+                status,
+                success_audit(
+                    actor,
+                    ctx,
+                    if enabled {
+                        "credential.enable"
+                    } else {
+                        "credential.disable"
+                    },
+                    "provider_credential",
+                    Some(id.to_string()),
+                    json!({}),
+                ),
+            )
             .await?;
         self.state.runtime_cache.invalidate_all().await;
-        audit_success(
-            &self.repo,
-            actor,
-            ctx,
-            if enabled {
-                "credential.enable"
-            } else {
-                "credential.disable"
-            },
-            "provider_credential",
-            Some(id.to_string()),
-            json!({}),
-        )
-        .await?;
         Ok(record)
     }
 
@@ -353,19 +360,21 @@ impl<'a> CredentialAdminService<'a> {
         let existing = self.repo.get_credential(id).await?;
         authorize_credential_record(actor, &existing)?;
         self.repo
-            .soft_delete_credential(id, expected_version)
+            .soft_delete_credential(
+                id,
+                expected_version,
+                success_audit(
+                    actor,
+                    ctx,
+                    "credential.delete",
+                    "provider_credential",
+                    Some(id.to_string()),
+                    json!({}),
+                ),
+            )
             .await?;
         self.state.runtime_cache.invalidate_all().await;
-        audit_success(
-            &self.repo,
-            actor,
-            ctx,
-            "credential.delete",
-            "provider_credential",
-            Some(id.to_string()),
-            json!({}),
-        )
-        .await
+        Ok(())
     }
 
     pub(crate) async fn delete_user_credential(
@@ -381,18 +390,21 @@ impl<'a> CredentialAdminService<'a> {
             .require(actor, "moira:credentials:delete")?;
         ExternalUserId::parse(external_user_id.to_string())?;
         self.repo
-            .soft_delete_user_credential(external_user_id, id, expected_version)
+            .soft_delete_user_credential(
+                external_user_id,
+                id,
+                expected_version,
+                success_audit(
+                    actor,
+                    ctx,
+                    "credential.delete",
+                    "provider_credential",
+                    Some(id.to_string()),
+                    json!({ "external_user_id": external_user_id }),
+                ),
+            )
             .await?;
         self.state.runtime_cache.invalidate_all().await;
-        audit_success(
-            &self.repo,
-            actor,
-            ctx,
-            "credential.delete",
-            "provider_credential",
-            Some(id.to_string()),
-            json!({ "external_user_id": external_user_id }),
-        )
-        .await
+        Ok(())
     }
 }
