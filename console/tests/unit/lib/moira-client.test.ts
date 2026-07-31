@@ -38,11 +38,12 @@ const ok = (body: unknown) => () => ({ status: 200, body });
 /* -------------------------------------------------------------------------- */
 
 describe("credential selection is driven by the operation registry", () => {
-  test("the anonymous operations are exactly the two the console binds to", () => {
-    // WAS `claim_status_is_the_only_anonymous_call`. That stopped being true:
-    // finding F15's fix added `GET /api/v1/admin/setup/sign-in-methods` with no
-    // `security` block, and wave 2 added `POST /api/v1/admin/admin-invites/preview`
-    // as a third anonymous Moira operation (which this console does not bind to).
+  test("the anonymous operations are exactly the three the console binds to", () => {
+    // WAS `claim_status_is_the_only_anonymous_call`, then a two-entry set.
+    // Finding F15's fix added `GET /api/v1/admin/setup/sign-in-methods` with no
+    // `security` block; plan 09 wave 5 binds the third,
+    // `POST /api/v1/admin/admin-invites/preview`, which wave 2 shipped
+    // credential-free and nothing in the console previously called.
     //
     // The assertion is still an exact set rather than a count: "how many are
     // anonymous" is not the interesting question, "which ones" is. A new entry
@@ -50,7 +51,22 @@ describe("credential selection is driven by the operation registry", () => {
     const anonymous = (Object.keys(MOIRA_OPERATIONS) as MoiraOperationName[])
       .filter((name) => MOIRA_OPERATIONS[name].credential === "none")
       .sort();
-    expect(anonymous).toEqual(["getSetupClaimStatus", "getSetupSignInMethods"]);
+    expect(anonymous).toEqual([
+      "getSetupClaimStatus",
+      "getSetupSignInMethods",
+      "previewAdminInvite",
+    ]);
+  });
+
+  test("redeem is the ONLY bearer_only operation", () => {
+    const bearerOnly = (Object.keys(MOIRA_OPERATIONS) as MoiraOperationName[])
+      .filter((name) => MOIRA_OPERATIONS[name].credential === "bearer_only")
+      .sort();
+    expect(
+      bearerOnly,
+      "a second bearer_only operation means a second path on which the console must not be " +
+        "able to present its own bootstrap credential — argue it before adding it",
+    ).toEqual(["redeemAdminInvite"]);
   });
 
   test("every anonymous operation really sends no credential", async () => {
@@ -143,12 +159,16 @@ describe("Idempotency-Key is sent only where the spec declares it", () => {
     expect(stub.requests[0]?.headers["Idempotency-Key"]).toBe("idem-1");
   });
 
-  test("exactly four of the registry's operations declare a key", () => {
-    // `createAdminInvite` is the fourth (plan 09 wave 3). Read off the spec, not
-    // assumed: `POST /api/v1/admin/admin-invites` declares an optional
-    // `Idempotency-Key` header parameter and no `If-Match`.
-    // `tests/contract/openapi-contract.test.ts` re-derives both from
+  test("exactly eight of the registry's operations declare a key", () => {
+    // Every entry is read off the spec, not assumed;
+    // `tests/contract/openapi-contract.test.ts` re-derives each flag from
     // `docs/openapi.json` on every run.
+    //
+    // FOUR ARE NEW IN WAVE 5, and one of them is a correction to plan 09 §0.8.4
+    // step 6, which lists "create, revoke, redeem and delete" for this family.
+    // `patch_admin_identity` declares an optional `Idempotency-Key` **as well as**
+    // its required `If-Match`, so the audit's list was incomplete. The registry
+    // follows the committed spec, not the audit.
     const withKey = (Object.keys(MOIRA_OPERATIONS) as MoiraOperationName[])
       .filter((name) => MOIRA_OPERATIONS[name].declaresIdempotencyKey)
       .sort();
@@ -157,6 +177,10 @@ describe("Idempotency-Key is sent only where the spec declares it", () => {
       "createAdminInvite",
       "createAuthProvider",
       "createTrustedJwtIssuer",
+      "deleteAdminIdentity",
+      "patchAdminIdentity",
+      "redeemAdminInvite",
+      "revokeAdminInvite",
     ]);
   });
 });
@@ -402,5 +426,182 @@ describe("findTrustedJwtIssuerByIssuer", () => {
     expect(found?.issuer).toBe("https://console.example.com");
     expect(stub.requests).toHaveLength(2);
     expect(stub.requests[1]?.url).toContain("cursor=c2");
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The invitation and ownership surface (plan 09 wave 5)                      */
+/* -------------------------------------------------------------------------- */
+
+const inviteRecord = {
+  id: "invite-1",
+  constraint: "email",
+  value: "colleague@corp.test",
+  status: "pending",
+  expired: false,
+  expires_at: "2026-08-01T00:00:00Z",
+  created_at: "2026-07-31T00:00:00Z",
+  version: 1,
+};
+
+const identityRecord = {
+  id: "grant-1",
+  issuer: "https://console.test/idp/google",
+  subject: "sub-1",
+  email: "colleague@corp.test",
+  email_verified: true,
+  granted_scopes: ["moira:admin"],
+  status: "active",
+  created_at: "2026-07-31T00:00:00Z",
+  version: 3,
+  notice: { message_key: "moira.notice.admin_identity_claimed", message: "Granted." },
+  is_primary: false,
+};
+
+describe("redeem carries the invitee's bearer token and NEVER the system key", () => {
+  test("a client holding a system key REFUSES to redeem", async () => {
+    // ========================================================================
+    // THE ASSERTION THIS WHOLE VARIANT EXISTS FOR (plan 09 W5-D3 / W5-B2)
+    // ========================================================================
+    //
+    // `#buildHeaders`' `admin` arm prefers the system key whenever one is
+    // present. Had redeem been registered as `admin`, a console holding the
+    // bootstrap credential — which `moiraClientForSetup` does — would have sent
+    // `X-Moira-System-Key` on a request that mints an `admin_identities` grant.
+    // Moira cannot tell that apart from a legitimate operator action.
+    //
+    // Written as a REFUSAL rather than as "the header is absent" on purpose: an
+    // absence assertion passes when the request is never built at all, and it
+    // would also pass if a future edit silently dropped the credential and
+    // produced a 401 instead.
+    const { stub, client } = clientWith(
+      { "POST /api/v1/admin/admin-invites/redeem": ok(identityRecord) },
+      { systemKey: SYSTEM_KEY, bearerToken: () => "jwt-from-the-invitee-session" },
+    );
+
+    await expect(
+      client.redeemAdminInvite({ token: "t", email: "a@b.test", email_verified: true }),
+    ).rejects.toThrow(MoiraClientContractError);
+
+    // And nothing went on the wire: the refusal is before the fetch, so a
+    // misconfigured client cannot leak the key to a server that logs headers.
+    expect(stub.requests, "the refusal must happen before the request is sent").toEqual([]);
+  });
+
+  test("a session client sends Authorization and no system key", async () => {
+    const { stub, client } = clientWith(
+      { "POST /api/v1/admin/admin-invites/redeem": ok(identityRecord) },
+      { systemKey: undefined, bearerToken: () => "jwt-from-the-invitee-session" },
+    );
+
+    await client.redeemAdminInvite(
+      { token: "raw-token", email: "colleague@corp.test", email_verified: true },
+      { idempotencyKey: "redeem-1" },
+    );
+
+    const headers = stub.requests[0]?.headers ?? {};
+    expect(headers["Authorization"]).toBe("Bearer jwt-from-the-invitee-session");
+    expect(Object.keys(headers)).not.toContain("X-Moira-System-Key");
+    expect(headers["Idempotency-Key"]).toBe("redeem-1");
+    expect(stub.bodyOf("POST /api/v1/admin/admin-invites/redeem")).toEqual({
+      token: "raw-token",
+      email: "colleague@corp.test",
+      email_verified: true,
+    });
+  });
+
+  test("with neither credential it refuses rather than sending an anonymous request", async () => {
+    const { client } = clientWith(
+      { "POST /api/v1/admin/admin-invites/redeem": ok(identityRecord) },
+      { systemKey: undefined, bearerToken: undefined },
+    );
+    await expect(
+      client.redeemAdminInvite({ token: "t", email: "a@b.test", email_verified: true }),
+    ).rejects.toThrow(MoiraClientContractError);
+  });
+});
+
+describe("preview is anonymous and puts the token in the BODY", () => {
+  test("no credential header, and the token is never in the URL", async () => {
+    const { stub, client } = clientWith({
+      "POST /api/v1/admin/admin-invites/preview": ok({
+        constraint: "email",
+        value: "colleague@corp.test",
+        expires_at: "2026-08-01T00:00:00Z",
+      }),
+    });
+
+    await client.previewAdminInvite("raw-token-value");
+
+    const request = stub.requests[0]!;
+    expect(Object.keys(request.headers)).not.toContain("Authorization");
+    expect(Object.keys(request.headers)).not.toContain("X-Moira-System-Key");
+    // The URL reaches access logs, proxy logs and `Referer` chains. The body
+    // does not.
+    expect(request.url).not.toContain("raw-token-value");
+    expect(request.body).toEqual({ token: "raw-token-value" });
+  });
+});
+
+describe("the ownership surface", () => {
+  test("patch requires If-Match and sends exactly one field", async () => {
+    const { stub, client } = clientWith({
+      "PATCH /api/v1/admin/admin-identities/grant-1": ok({ ...identityRecord, is_primary: true }),
+    });
+
+    await client.patchAdminIdentity("grant-1", { is_primary: true }, ifMatchFor(identityRecord));
+
+    expect(stub.requests[0]?.headers["If-Match"]).toBe("3");
+    expect(stub.bodyOf("PATCH /api/v1/admin/admin-identities/grant-1")).toEqual({
+      is_primary: true,
+    });
+  });
+
+  test("patch without If-Match is a contract error, not a request", async () => {
+    const { stub, client } = clientWith({
+      "PATCH /api/v1/admin/admin-identities/grant-1": ok(identityRecord),
+    });
+    await expect(
+      client.patchAdminIdentity("grant-1", { is_primary: true }, ""),
+    ).rejects.toThrow(MoiraClientContractError);
+    expect(stub.requests).toEqual([]);
+  });
+
+  test("delete declares NO If-Match, so supplying one is refused", async () => {
+    // The neighbouring PATCH requires one, which is exactly why this is asserted
+    // rather than assumed: a caller copying the transfer call would otherwise
+    // send a header the operation does not declare.
+    const { client } = clientWith({
+      "DELETE /api/v1/admin/admin-identities/grant-1": ok(identityRecord),
+    });
+    expect(MOIRA_OPERATIONS.deleteAdminIdentity.requiresIfMatch).toBe(false);
+    await expect(client.deleteAdminIdentity("grant-1")).resolves.toMatchObject({ id: "grant-1" });
+  });
+
+  test("revoke is a POST to a sub-resource, not a DELETE", async () => {
+    const { stub, client } = clientWith({
+      "POST /api/v1/admin/admin-invites/invite-1/revoke": ok({
+        ...inviteRecord,
+        status: "revoked",
+      }),
+    });
+    await client.revokeAdminInvite("invite-1", { idempotencyKey: "revoke-1" });
+    expect(stub.routes()).toEqual(["POST /api/v1/admin/admin-invites/invite-1/revoke"]);
+    expect(stub.requests[0]?.headers["Idempotency-Key"]).toBe("revoke-1");
+  });
+
+  test("the reads carry no Idempotency-Key and no If-Match", async () => {
+    const empty = { data: [], pagination: { has_more: false, next_cursor: null } };
+    const { stub, client } = clientWith({
+      "GET /api/v1/admin/admin-invites": ok(empty),
+      "GET /api/v1/admin/admin-identities": ok(empty),
+    });
+    await client.listAdminInvites({ limit: 50 });
+    await client.listAdminIdentities({ limit: 50, status: "active" });
+    for (const request of stub.requests) {
+      expect(Object.keys(request.headers)).not.toContain("Idempotency-Key");
+      expect(Object.keys(request.headers)).not.toContain("If-Match");
+    }
+    expect(stub.requests[1]?.url).toContain("status=active");
   });
 });

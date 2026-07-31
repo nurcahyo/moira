@@ -157,6 +157,46 @@ export const MOIRA_CODE_REMEDIES: Readonly<Record<string, MoiraRemedy>> = {
   // the issuer or by binding the row — so it is form input rather than configuration.
   auth_provider_issuer_shadows_trusted_issuer: "fix_form_input",
 
+  // --- invitation redemption (plan 09 wave 5) ------------------------------
+  // 404. The token names no live invite. `missing_resource`, NOT `retry`: the
+  // same code is returned for a wrong prefix and for a wrong hash, deliberately,
+  // so that retrying is never how you learn anything.
+  invite_not_found: "missing_resource",
+  // 403. Nothing the holder can do with THIS link; a new invitation is the only
+  // route forward, and that is somebody else's action.
+  invite_expired: "denied",
+  // 409. Someone already redeemed it — possibly this same person on another
+  // device. `resolve_conflict` sends the reader to re-read state rather than to
+  // retry a request that will keep failing.
+  invite_already_consumed: "resolve_conflict",
+  invite_revoked: "denied", // 403
+  // 403 both. `choose_different_identity`, and NOT `fix_setup_configuration`:
+  // the deployment is fine, the invitation was issued for a different address or
+  // domain than the one that just signed in. Merging these into
+  // `admin_claim_domain_not_allowed`'s remedy would send an invitee to an
+  // auth-settings screen they cannot reach and must not change.
+  invite_email_mismatch: "choose_different_identity",
+  invite_domain_mismatch: "choose_different_identity",
+
+  // --- invitation creation --------------------------------------------------
+  // 422, a HARD CAP refused rather than clamped. The field is in the form the
+  // operator just submitted, so it is form input.
+  admin_invite_expiry_too_long: "fix_form_input",
+
+  // --- grant administration -------------------------------------------------
+  admin_identity_not_found: "missing_resource", // 404
+  admin_identity_already_revoked: "resolve_conflict", // 409
+  // 409, decision D-F20. NOT `resolve_conflict`: re-reading and retrying will
+  // fail identically forever, because the row IS the last primary. The remedy is
+  // "transfer ownership first", which is a different operation — `denied` is the
+  // honest classification, and the ownership screen states the rule in its own
+  // copy rather than surfacing this as a failed request.
+  admin_identity_last_primary: "denied",
+  // 403. The caller's own grant is not primary. THE constructible
+  // authorization-denial case — `moira:admins:manage` does not exist and could
+  // not be withheld if it did.
+  admin_identity_not_primary: "denied",
+
   // --- jwt-issuer path ----------------------------------------------------
   jwks_url_rejected: "fix_form_input",
   // 409. Live admin grants were made through this issuer; retiring it would revoke every

@@ -76,11 +76,97 @@ export const MOIRA_SETUP_ERROR_CODES = [
 
 export type MoiraSetupErrorCode = (typeof MOIRA_SETUP_ERROR_CODES)[number];
 
-/** Moira notices the console renders through `t()`. */
-export const MOIRA_NOTICE_NAMES = ["admin_identity_claimed"] as const;
+/**
+ * Error codes on the invitation and ownership paths (plan 09 wave 5).
+ *
+ * **All eleven shipped in wave 2 and #39. Wave 5 adds none** — plan 09's body
+ * lists ten of them as wave-5 deliverables, and every one already has a pinned
+ * emitter and a pinned status in Moira. The eleventh, `admin_identity_not_primary`,
+ * the plan never names at all, and it is the one the ownership UI must actually
+ * render: it is what a non-primary admin gets from `require_primary_actor`, and
+ * it is the constructible authorization-denial case (`moira:admins:manage` is not
+ * a scope and never was).
+ *
+ * The status beside each code is Moira's, read from the constructor, not guessed —
+ * they decide which remedy applies, and three of them are 403s that a status-only
+ * mapping would render as a bare "denied".
+ */
+export const MOIRA_ADMIN_LIFECYCLE_ERROR_CODES = [
+  // --- redeeming an invitation --------------------------------------------
+  // 404. The same code for a wrong prefix and a wrong hash — deliberately, so
+  // the endpoint is not a guessing oracle.
+  "invite_not_found",
+  "invite_expired", // 403
+  "invite_already_consumed", // 409
+  "invite_revoked", // 403
+  // 403, and NEVER collapsed into `admin_claim_domain_not_allowed`: the invite's
+  // own constraint failed, and the remedy is a new invitation rather than a
+  // change to the deployment's allow-list.
+  "invite_email_mismatch",
+  "invite_domain_mismatch", // 403
+
+  // --- creating an invitation ---------------------------------------------
+  // 422. A HARD CAP, refused rather than clamped. The floor
+  // (`MIN_INVITE_EXPIRY_SECONDS = 60`) is a plain `invalid_request`, also 422,
+  // and is already mirrored above.
+  "admin_invite_expiry_too_long",
+
+  // --- managing grants -----------------------------------------------------
+  "admin_identity_not_found", // 404
+  "admin_identity_already_revoked", // 409
+  // 409, decision D-F20. On a deployment with ONE admin this makes
+  // `DELETE /admin-identities/{id}` permanently unavailable for that row:
+  // `revoke_grant` clears `is_primary` and the last-primary guard refuses that.
+  // The UI states it as a rule with a remedy ("transfer ownership first"), never
+  // as a failed request.
+  "admin_identity_last_primary",
+  // 403. THE OWNERSHIP GATE, and it is row state rather than a scope —
+  // `is_known_scope("moira:admins:manage")` is asserted FALSE in Moira. The
+  // catalogue entry gives the reason in one sentence: "a scope could not express
+  // 'not every admin'".
+  "admin_identity_not_primary",
+] as const;
+
+export type MoiraAdminLifecycleErrorCode = (typeof MOIRA_ADMIN_LIFECYCLE_ERROR_CODES)[number];
+
+/**
+ * Every Moira error code this console mirrors.
+ *
+ * One list, so `tests/unit/lib/errors.test.ts`'s "every mirrored error code has
+ * an explicit remedy" covers the invitation family too. Splitting the arrays and
+ * leaving that test on the setup half would have been the shape this project
+ * keeps rediscovering: a coverage assertion that stops covering the new thing.
+ */
+export const MOIRA_MIRRORED_ERROR_CODES = [
+  ...MOIRA_SETUP_ERROR_CODES,
+  ...MOIRA_ADMIN_LIFECYCLE_ERROR_CODES,
+] as const;
+
+export type MoiraMirroredErrorCode = (typeof MOIRA_MIRRORED_ERROR_CODES)[number];
+
+/**
+ * Moira notices the console renders through `t()`.
+ *
+ * `admin_identity_claimed` covers the ownership PATCH as well as the claim —
+ * `set_primary` returns `record_from_grant_with_notice(grant, claimed_notice())`,
+ * verified against the service rather than assumed from the operation's name.
+ * There is deliberately **no** `admin_identity_ownership_transferred` notice; the
+ * transfer is observable as a metric label, not as a catalogue entry.
+ *
+ * There is also deliberately no `admin_identity_recovered`: recovery has no
+ * backend at all (decision D-W2-1), and `src/i18n/catalog/notices.rs` says so in
+ * as many words. Adding the key here would fail `moira-keys.test.ts`, which is
+ * the correct outcome.
+ */
+export const MOIRA_NOTICE_NAMES = [
+  "admin_identity_claimed",
+  "admin_invite_created",
+  "admin_invite_redeemed",
+  "admin_identity_revoked",
+] as const;
 
 /** Every Moira key the console mirrors, fully qualified. */
 export const MIRRORED_MOIRA_KEYS: readonly string[] = [
-  ...MOIRA_SETUP_ERROR_CODES.map(moiraErrorKey),
+  ...MOIRA_MIRRORED_ERROR_CODES.map(moiraErrorKey),
   ...MOIRA_NOTICE_NAMES.map(moiraNoticeKey),
 ];

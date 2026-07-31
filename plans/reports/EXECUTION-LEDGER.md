@@ -1335,6 +1335,47 @@ Two general lessons, both worth more than the specific bug:
 2. **"Verified by a panel" is not verification.** Three designs, three judges and a synthesis all
    passed this through. The mutation is the only step that touched reality.
 
+## D-W2-1 — recovery invites were deliberately NOT built in wave 2 (recorded 2026-07-31, retroactively)
+
+**This decision was taken in plan 09 wave 2 and recorded nowhere a planner would find it.** Its only
+written trace was a comment in `migrations/0017_admin_invites.sql` and two comments in the i18n
+catalogues:
+
+> *"a column no code writes is the schema equivalent of a catalog entry with no emitter."*
+
+Wave 2 shipped the invitation backend without `is_recovery` and without
+`replaces_admin_identity_id`. There is no column, no DTO field, no route, no service method, no error
+code, no notice (`src/i18n/catalog/notices.rs` says "deliberately no `admin_identity_recovered`
+notice"), no audit event (`ADMIN_IDENTITY_GRANT_EVENTS` is exactly
+`["granted","revoked","ownership_transferred"]`) and no test.
+
+**Why it belongs here rather than only in a migration comment.** It removes a *third of wave 5's
+stated scope*. `RecoveryPanel`, `recovery.e2e.ts`, `recovery_invite_gets_no_domain_policy_exemption`
+and the `admin_identity_recovered` event are all unbuildable, and a wave-5 implementer reading the
+plan body would have discovered that only by trying. The general rule this produces: **a decision
+that changes a later wave's scope must land in that wave's §0 and in this ledger, not only where it
+was taken.**
+
+## W5-D1 — recovery is CUT from plan 09 wave 5 (taken by the loop, 2026-07-31)
+
+Wave 5 ships **invitations and ownership only**. Per D-W2-1 above, recovery is a Moira backend slice
+— one migration (two columns plus a CHECK that `replaces_admin_identity_id` is set iff
+`is_recovery`), two DTO changes, an atomic revoke-and-grant swap inside the existing transactional
+envelope, a new error code and notice with pinned emitters, an OpenAPI regeneration, and a
+mid-transaction failure-injection test — with a thin UI on top. That is the size of wave 2's own
+grant-administration slice, and it is not UI work.
+
+Half of what recovery promises is **already achievable with what exists**: "revoke a locked-out
+admin's grant, then invite their replacement" is two ordinary operations, and `AdminTable` plus
+`InviteAdminForm` expose both. What is genuinely missing is the *atomicity* of the swap, and
+atomicity is a backend property. A `RecoveryPanel` performing two independent calls while the plan
+promises "never a window where both or neither exist" would be the appearance of a feature.
+
+*Reversal condition:* when a wave takes the Moira change end to end — `is_recovery`,
+`replaces_admin_identity_id`, the in-envelope swap, `admin_identity_recovered`, and the
+mid-transaction failure-injection test asserting neither half persists without the other. The UI is a
+follow-on to that, never its driver.
+
 ## D3 — wave 4 implements Option A′, staged 4A / 4B (taken by the loop, 2026-07-31)
 
 Decided by a judged panel: three worked designs, three judge lenses (security closure, migration and
