@@ -27,31 +27,57 @@
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# ONE REPLICA. This is a correctness constraint, not a capacity choice.
+# STILL ONE REPLICA — and read the whole note, because three of the four
+# original reasons are now gone.
 # ---------------------------------------------------------------------------
-# The design intends replicas to share no in-process authority: sessions, rate
-# limits and the Better Auth JWKS all belong in the console's own PostgreSQL
-# database, at which point `replicaCount > 1` is safe with no affinity
-# requirement, and that is the deliberate difference from `charts/moira` (which
-# pins 1 because its concurrency and rate limits are process-local).
+# Plan 09 Wave 1 gave the console a durable PostgreSQL database
+# (CONSOLE_DATABASE_URL, `console/db/migrations`). What used to be per-pod
+# memory is now shared, and each half has a test that demonstrates it across
+# genuinely separate processes — which is the same thing as across pods:
 #
-# That is NOT what ships today. Per plans/08 §0.6.4, this wave has no database
-# available to it, so two things are in process memory:
+#   * the OAuth client secret — `console_provider_secret`, sealed AES-256-GCM.
+#     `tests/integration/console-secret-store-postgres.test.ts` writes it in one
+#     process and reveals it in another, with an in-memory control that fails
+#     the same way to prove the test is not tautological.
+#   * the Better Auth ES256 key pair — the `jwks` table.
+#     `tests/integration/console-jwks-stability.test.ts` compares the full
+#     published public key across two processes, with the same control.
+#   * sessions — the `session` table, so a session started on one pod is valid
+#     on another.
+#   * rate limits — `rateLimit.storage: "database"` in `console/lib/auth.ts`.
+#     Better Auth's default is per-process memory with `enabled: isProduction`,
+#     which would have multiplied the sign-in limit by the replica count.
 #
-#   * the OAuth client secret (`InMemoryConsoleSecretStore`), and
-#   * the Better Auth jwt plugin's ES256 signing key pair (`memoryAdapter`).
+# WHAT IS STILL NOT SHARED, and why this stays at 1:
 #
-# With two replicas the operator completes setup against one pod and then gets
-# routed to the other, which holds no client secret and cannot start a code
-# exchange; and each pod publishes a DIFFERENT JWKS, so Moira's cached copy
-# verifies tokens from one pod and rejects the other's. Both failures are
-# intermittent and load-balancer-dependent, which is the worst way to find them.
+#   The auth-config SNAPSHOT in `console/lib/auth-runtime.ts` is per process. It
+#   exists because the console's FULL configuration read needs a credential, so
+#   each pod caches what it last managed to read and refreshes only on a request
+#   that carries one. Two pods can therefore hold DIFFERENT provider
+#   configurations — including different OAuth client secrets after a rotation —
+#   for an unbounded time. The symptom is an `invalid_client` from the IdP on
+#   some sign-ins and not others, depending on which pod the load balancer
+#   picked: intermittent and load-balancer-dependent, which is the worst way to
+#   find anything.
 #
-# REVERSE THIS (to 2, and enable autoscaling below) in the same commit that
-# supplies a Kysely dialect over the `console_auth` database to
-# `ConsoleAuthDeps.database` and implements `ConsoleSecretStore` over it. No
-# other code changes are needed — see the reversal note in
-# `console/lib/console-secrets.ts`.
+#   Finding F15 is FIXED (commit f0d8de7) and does not resolve this. That fix
+#   added an anonymous `GET /api/v1/admin/setup/sign-in-methods` serving
+#   `PublicSignInMethod` — deliberately `PublicAuthMethod` MINUS
+#   `allowed_email_domains` (which is plan 07 decision D3, the admin-claim
+#   policy, not configuration) and minus `jwks_url`. `resolveAuthConfig` needs
+#   both `allowed_email_domains` and `trusted_jwt_issuer_id`, and refuses a row
+#   carrying neither. So the anonymous projection is enough to RENDER a sign-in
+#   button and not enough to RESOLVE the configuration behind it, which is what
+#   the snapshot holds.
+#
+#   Lifting the replica count today would trade three demonstrated fixes for one
+#   undemonstrated failure mode, on a console that has no operator-facing screen
+#   yet (`console/modules/` is still empty), so it would buy no availability
+#   either.
+#
+# REVERSE THIS (to 2, and enable autoscaling and the PDB below) when the
+# snapshot in `auth-runtime.ts` is gone or is backed by shared storage. The
+# database half of the work is done and needs nothing further.
 replicaCount: 1
 
 image:
@@ -262,20 +288,37 @@ secret:
   name: moira-console-secrets
   data: {}
 
-# Better Auth schema migration, as a pre-install/pre-upgrade hook.
+# Console schema migration, as a pre-install/pre-upgrade hook.
 #
-# DISABLED BY DEFAULT, and that is not an oversight. The migration is run by
-# `@better-auth/cli migrate`, which is a devDependency: it is not in
-# `.next/standalone`, and the runtime image is distroless — no shell, no package
-# manager, no `bunx`. So there is no command the *runtime* image can run to
-# perform this migration, and a job that defaults to the runtime image would
-# fail at deploy time, which is exactly the class of bug this chart is trying
-# not to ship.
+# WHAT RUNS IT — corrected by plan 09 Wave 1. This chart used to say
+# `@better-auth/cli migrate`. That CLI cannot be used: npm's newest
+# `@better-auth/cli` is 1.4.21 while `console/package.json` pins
+# `better-auth: 1.6.25`, and the CLI carries its own `better-auth: 1.4.21`
+# dependency — so it would migrate to the schema of a library two minor versions
+# behind the one the console runs. `console/db/migrate.ts` replaces it: it
+# applies the reviewed SQL in `console/db/migrations/` against a checksummed
+# ledger (`console_auth_migrations`) under a `pg_advisory_lock`, so two pods'
+# hooks cannot both run it.
 #
-# To enable, supply an image that contains the CLI and its dependencies (a build
-# stage of `console/Dockerfile` published under its own tag is the usual answer)
-# and an explicit command. The render FAILS rather than guessing if you enable
-# this without a command.
+# STILL DISABLED BY DEFAULT, and that is still not an oversight. The runtime
+# image is distroless: no shell, no package manager, no `bun`. So there remains
+# no command the RUNTIME image can run, and a job defaulting to it would fail at
+# deploy time — the class of bug this chart is trying not to ship.
+#
+# To enable, publish the `build` stage of `console/Dockerfile` under its own tag
+# (it is a `bun` image and already contains `node_modules`, `db/migrations/` and
+# `db/migrate.ts`) and set:
+#
+#   migrationJob:
+#     enabled: true
+#     image: { repository: ghcr.io/example/moira-console-migrate, tag: <same-as-app> }
+#     command: ["bun", "run", "db/migrate.ts"]
+#
+# Tag it with the SAME version as the app image. A migration job running a
+# different build than the Deployment is how a fleet ends up half-migrated.
+#
+# The render FAILS rather than guessing if you enable this without a command.
+# `db/migrate.ts --check` is the read-only form, for a CI or readiness gate.
 migrationJob:
   enabled: false
   image:

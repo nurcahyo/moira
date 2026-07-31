@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 
 import { attachLeakTap, scanBuildOutput } from "./support/leak-tap";
+import { CONSOLE_E2E_ENV } from "./support/console-env";
 import { NEXT_BUILD_DIR, APP_DIR } from "./support/paths";
 import { discoverPageRoutes, visitableRoutes } from "./support/routes";
 import {
@@ -59,6 +60,46 @@ import {
  * `process.env.MOIRA_E2E_SENTINEL_SYSTEM_KEY` from a page, which produced
  * failures in both the browser-surface scan and the build-output scan; the leak
  * was then reverted. Re-run that experiment before trusting any change here.
+ *
+ * ============================================================================
+ * WHAT PLAN 09 WAVE 1 ADDED, AND WHAT IT DELIBERATELY DID NOT
+ * ============================================================================
+ *
+ * Durable storage is a new place a secret can leak, in two distinct shapes.
+ *
+ *   1. THE CONNECTION STRING. `CONSOLE_DATABASE_URL` carries the database
+ *      password inline, and its name matches none of the SECRET/KEY/TOKEN
+ *      patterns the ambient harvester keys on — so it would have been the one
+ *      console credential this gate never looked for. `secrets.ts` now extracts
+ *      the password half as a needle, and adds a value-independent pattern for
+ *      any `postgres://user:pass@` string, which fires even on a DSN this run
+ *      never knew (a driver error message, a stack trace, a config dump).
+ *      Covered here, on every route and over the build output.
+ *
+ *   2. THE CIPHERTEXT AT REST. Not covered here, on purpose. This suite scans
+ *      what the BROWSER sees, and `console_provider_secret` has no browser
+ *      surface at all in this wave — no route reads it. Asserting over a table
+ *      from Playwright would also mean importing `lib/console-secrets-postgres.ts`,
+ *      whose `import "server-only"` throws outside a Next.js server build.
+ *      That coverage lives in `tests/integration/console-secret-store-postgres.test.ts`
+ *      ("nothing readable is written to the database"), which has a real
+ *      PostgreSQL and reads back every column of every row.
+ *
+ * REVERSE THAT SPLIT the moment a route renders anything derived from the
+ * secret store — a drift banner, a masked fingerprint, a "configured" badge.
+ * At that point the value is on a page and belongs in the loop below.
+ *
+ * PROVEN TO FAIL (plan 09 Wave 1): `<p>{process.env.CONSOLE_DATABASE_URL}</p>`
+ * was temporarily rendered from `app/page.tsx`; both the browser-surface scan
+ * and the build-output scan failed, reporting "secret value from
+ * CONSOLE_DATABASE_URL password (ambient server env)". The leak was reverted.
+ *
+ * ONE HARNESS PROPERTY THAT EXPERIMENT EXPOSED — worth knowing before trusting
+ * a green run: with `E2E_SKIP_BUILD=1` the SAME injected leak passed. `/` is
+ * statically prerendered, so a server-side `process.env` read is resolved at
+ * BUILD time; reusing a `.next` produced without the e2e environment means the
+ * value was never in the output to find. `E2E_SKIP_BUILD=1` is a local
+ * iteration shortcut and must not be used for a gating run.
  */
 
 const needles = forbiddenValues();
@@ -91,6 +132,21 @@ test.describe("secret leak", () => {
       result.leaks,
       `secret material found in the build output:\n${describeLeaks(result.leaks)}`,
     ).toEqual([]);
+  });
+
+  test("the database password is one of the needles", () => {
+    // The DSN's name matches none of the SECRET/KEY/TOKEN patterns, and the DSN
+    // itself contains `/` so it can never be a needle on its own. If the
+    // password extraction in `secrets.ts` regresses, every other assertion in
+    // this file still passes while the console's newest credential goes
+    // unchecked — so it is asserted directly.
+    const password = new URL(CONSOLE_E2E_ENV["CONSOLE_DATABASE_URL"]!).password;
+    expect(password.length, "the e2e DSN has no password to check for").toBeGreaterThan(12);
+    expect(
+      needles.map((needle) => needle.value),
+      "the database password was not extracted from CONSOLE_DATABASE_URL, so no scan in " +
+        "this file is looking for it",
+    ).toContain(password);
   });
 
   test("no NEXT_PUBLIC_* variable is named like a secret", () => {

@@ -32,6 +32,21 @@ export const CONSOLE_E2E_ENV: Readonly<Record<string, string>> = {
   // 32 bytes, base64, and deliberately free of `+` and `/`.
   CONSOLE_SECRET_ENCRYPTION_KEY: "1wEFCqo384H0xewVWQUmKeDYFHvzNZnaokjN4v2M1GQ=",
   BETTER_AUTH_SECRET: "moira-console-e2e-better-auth-secret-2f7a41c9e6",
+  // Required because the e2e server runs with NODE_ENV=production, where
+  // `lib/env.ts` refuses to boot without it — the console must not reach the
+  // ephemeral storage path by omission in anything production-shaped.
+  //
+  // Port 1 and the `.invalid` TLD make it unreachable BY CONSTRUCTION: env
+  // validation is shape-only and `pg` connects lazily, so nothing in this suite
+  // touches a database, and a regression that started opening one at boot fails
+  // loudly instead of quietly talking to a developer's local PostgreSQL.
+  //
+  // The password is the point. It is high-entropy and `/`-free so that
+  // `forbiddenValues()` picks it out of the DSN and every route scan, plus the
+  // build-output scan, checks for it. Without a DSN here, the console's newest
+  // credential would be the one value the leak gate never looked for.
+  CONSOLE_DATABASE_URL:
+    "postgres://moira-console-e2e:e2e-db-password-8d41cb07f2ae9536@db.invalid:1/console_auth_e2e",
 };
 
 /**
