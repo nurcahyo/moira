@@ -21,7 +21,7 @@ use crate::{
             route_definition_record_from_row, route_selection_strategy_to_db,
             routing_policy_record_from_row, runtime_policy_status_to_db,
         },
-        repositories::admin::insert_audit_with_connection,
+        repositories::admin::commit_with_audit,
     },
     security::EncryptedSecret,
 };
@@ -352,8 +352,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         .fetch_one(&mut *tx)
         .await?;
         let record = route_definition_record_from_row(&row)?;
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -453,8 +452,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = route_definition_record_from_row(&row)?;
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -492,8 +490,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = route_definition_record_from_row(&row)?;
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -522,8 +519,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         if result.rows_affected() == 0 {
             return Err(version_conflict());
         }
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(())
     }
 
@@ -558,8 +554,7 @@ impl RuntimeRepository for PgRuntimeRepository {
             .fetch_one(&mut *tx)
             .await?;
         let record = routing_policy_record_from_row(&row)?;
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -674,8 +669,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = routing_policy_record_from_row(&row)?;
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -717,8 +711,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = routing_policy_record_from_row(&row)?;
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -747,8 +740,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         if result.rows_affected() == 0 {
             return Err(version_conflict());
         }
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(())
     }
 
@@ -784,8 +776,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         .fetch_one(&mut *tx)
         .await?;
         let record = agent_profile_record_from_row(&row)?;
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -875,8 +866,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = agent_profile_record_from_row(&row)?;
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -915,8 +905,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = agent_profile_record_from_row(&row)?;
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -945,8 +934,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         if result.rows_affected() == 0 {
             return Err(version_conflict());
         }
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(())
     }
 
@@ -1029,8 +1017,7 @@ impl RuntimeRepository for PgRuntimeRepository {
         .fetch_one(&mut *tx)
         .await?;
         let record = provider_runtime_policy_record_from_row(&row)?;
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 

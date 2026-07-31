@@ -38,7 +38,7 @@ use crate::{
         AuthProviderSettingsPatchRequest, AuthProviderSettingsRecord, ListCursor, PublicAuthMethod,
     },
     error::AppError,
-    infra::{pg_rows::resource_status_from_db, repositories::admin::insert_audit_with_connection},
+    infra::{pg_rows::resource_status_from_db, repositories::admin::commit_with_audit},
 };
 
 /// The subset of an `auth_provider_settings` row that the admin-identity claim policy
@@ -361,8 +361,7 @@ impl AuthProviderSettingsRepository for PgAuthProviderSettingsRepository {
         .map_err(map_constraint_violation)?
         .ok_or_else(version_conflict)?;
         let record = record_from_row(&row)?;
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -396,8 +395,7 @@ impl AuthProviderSettingsRepository for PgAuthProviderSettingsRepository {
         .map_err(map_constraint_violation)?
         .ok_or_else(version_conflict)?;
         let record = record_from_row(&row)?;
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -421,8 +419,7 @@ impl AuthProviderSettingsRepository for PgAuthProviderSettingsRepository {
         if result.rows_affected() == 0 {
             return Err(version_conflict());
         }
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(())
     }
 

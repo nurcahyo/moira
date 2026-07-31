@@ -142,11 +142,41 @@ impl Fixture {
     }
 
     async fn applications_named(&self, slug: &str) -> i64 {
-        sqlx::query_scalar::<_, i64>("select count(*) from applications where application_slug = $1")
-            .bind(slug)
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from applications where application_slug = $1",
+        )
+        .bind(slug)
+        .fetch_one(&self.inner.pool)
+        .await
+        .expect("count applications")
+    }
+
+    fn route_path(&self) -> String {
+        format!("/api/v1/admin/routes/{}", self.inner.route_id)
+    }
+
+    async fn stored_route_display_name(&self) -> String {
+        sqlx::query_scalar::<_, String>("select display_name from route_definitions where id = $1")
+            .bind(self.inner.route_id)
             .fetch_one(&self.inner.pool)
             .await
-            .expect("count applications")
+            .expect("read the route row")
+    }
+
+    async fn stored_route_version(&self) -> i64 {
+        sqlx::query_scalar::<_, i64>("select version from route_definitions where id = $1")
+            .bind(self.inner.route_id)
+            .fetch_one(&self.inner.pool)
+            .await
+            .expect("read the route version")
+    }
+
+    async fn routes_keyed(&self, route_key: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>("select count(*) from route_definitions where route_key = $1")
+            .bind(route_key)
+            .fetch_one(&self.inner.pool)
+            .await
+            .expect("count routes")
     }
 }
 
@@ -297,5 +327,90 @@ async fn a_create_inside_the_command_envelope_was_already_atomic() {
         fixture.applications_named(&slug).await,
         0,
         "the command envelope rolls the create back with its audit row"
+    );
+}
+
+/// The same property on the **other** repository trait, and on the other write shape.
+///
+/// `RuntimeAdminService` reaches its tables through `Arc<dyn RuntimeRepository>`, not through
+/// `PgAdminRepository`, and it never enters the command envelope at all — it hand-rolls
+/// replay and ledger writes around the mutation. All thirteen of its mutations audited on a
+/// second connection. `patch_route_definition` stands for the twelve that already had a
+/// transaction; [`a_runtime_create_leaves_no_row_when_its_audit_fails`] stands for the four
+/// single-statement writes that had to be given one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_runtime_patch_is_rolled_back_with_its_audit_row() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+
+    let before_name = fixture.stored_route_display_name().await;
+    let before_version = fixture.stored_route_version().await;
+
+    let (status, body) = fixture
+        .send(patch_request(
+            &fixture.route_path(),
+            before_version,
+            "route-audit-suppressed",
+            &oversized_request_id(),
+        ))
+        .await;
+
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the oversized x-request-id must make the audit INSERT fail; body: {body}"
+    );
+    assert_eq!(
+        fixture.stored_route_display_name().await,
+        before_name,
+        "a runtime-admin write must be rolled back with its audit row"
+    );
+    assert_eq!(
+        fixture.stored_route_version().await,
+        before_version,
+        "a rolled-back runtime write must not advance the row's version"
+    );
+}
+
+/// The write shape that had **no transaction at all** before this fix.
+///
+/// `create_route_definition` was a single `INSERT` on the pool followed by an audit row on
+/// another connection. It now opens a transaction for the pair, so a failed audit takes the
+/// route with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_runtime_create_leaves_no_row_when_its_audit_fails() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+
+    let route_key = format!("atomicity_{}", Uuid::now_v7().simple());
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/admin/routes")
+        .header("x-request-id", oversized_request_id())
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "route_key": route_key,
+                "display_name": "Atomicity control",
+                "selection_strategy": "default",
+                "metadata": {},
+            })
+            .to_string(),
+        ))
+        .expect("HTTP request");
+
+    let (status, body) = fixture.send(request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the oversized x-request-id must make the audit INSERT fail; body: {body}"
+    );
+    assert_eq!(
+        fixture.routes_keyed(&route_key).await,
+        0,
+        "the INSERT and its audit row must be rolled back together"
     );
 }

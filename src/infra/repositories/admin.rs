@@ -1005,8 +1005,7 @@ impl AdminRepository for PgAdminRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = application_record_from_row(&row)?;
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -1044,8 +1043,7 @@ impl AdminRepository for PgAdminRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = application_record_from_row(&row)?;
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -1074,8 +1072,7 @@ impl AdminRepository for PgAdminRepository {
         if result.rows_affected() == 0 {
             return Err(version_conflict());
         }
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(())
     }
 
@@ -1186,8 +1183,7 @@ impl AdminRepository for PgAdminRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = provider_record_from_row(&row)?;
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -1225,8 +1221,7 @@ impl AdminRepository for PgAdminRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = provider_record_from_row(&row)?;
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -1255,8 +1250,7 @@ impl AdminRepository for PgAdminRepository {
         if result.rows_affected() == 0 {
             return Err(version_conflict());
         }
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(())
     }
 
@@ -1347,8 +1341,7 @@ impl AdminRepository for PgAdminRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = provider_model_record_from_row(&row)?;
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -1402,8 +1395,7 @@ impl AdminRepository for PgAdminRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = provider_model_record_from_row(&row)?;
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -1432,8 +1424,7 @@ impl AdminRepository for PgAdminRepository {
         if result.rows_affected() == 0 {
             return Err(version_conflict());
         }
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(())
     }
 
@@ -1601,8 +1592,7 @@ impl AdminRepository for PgAdminRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = credential_record_from_row(&row)?;
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -1684,8 +1674,7 @@ impl AdminRepository for PgAdminRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = credential_record_from_row(&row)?;
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -1714,8 +1703,7 @@ impl AdminRepository for PgAdminRepository {
         .await?
         .ok_or_else(|| AppError::NotFound(format!("provider credential {id}")))?;
         let record = credential_record_from_row(&row)?;
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -1744,8 +1732,7 @@ impl AdminRepository for PgAdminRepository {
         if result.rows_affected() == 0 {
             return Err(version_conflict());
         }
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(())
     }
 
@@ -1782,8 +1769,7 @@ impl AdminRepository for PgAdminRepository {
         if result.rows_affected() == 0 {
             return Err(version_conflict());
         }
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(())
     }
 
@@ -1961,8 +1947,7 @@ impl AdminRepository for PgAdminRepository {
             .await?
             .ok_or_else(|| AppError::NotFound(format!("api key {id}")))?;
         let record = api_key_record_from_row(&row)?;
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -1984,8 +1969,7 @@ impl AdminRepository for PgAdminRepository {
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(sql).bind(id).execute(&mut *tx).await?;
         ensure_affected(result.rows_affected(), format!("api key {id}"))?;
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(())
     }
 
@@ -2121,8 +2105,7 @@ impl AdminRepository for PgAdminRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = crate::infra::pg_rows::trusted_jwt_issuer_record_from_row(&row)?;
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -2163,8 +2146,7 @@ impl AdminRepository for PgAdminRepository {
         .await?
         .ok_or_else(version_conflict)?;
         let record = crate::infra::pg_rows::trusted_jwt_issuer_record_from_row(&row)?;
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -2191,8 +2173,7 @@ impl AdminRepository for PgAdminRepository {
         .await?
         .ok_or_else(|| AppError::NotFound(format!("trusted JWT issuer {id}")))?;
         let record = crate::infra::pg_rows::trusted_jwt_issuer_record_from_row(&row)?;
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(record)
     }
 
@@ -2221,8 +2202,7 @@ impl AdminRepository for PgAdminRepository {
         if result.rows_affected() == 0 {
             return Err(version_conflict());
         }
-        insert_audit_with_connection(&mut tx, audit).await?;
-        tx.commit().await?;
+        commit_with_audit(tx, audit).await?;
         Ok(())
     }
 
@@ -2406,14 +2386,32 @@ fn idempotency_record_from_row(row: &sqlx::postgres::PgRow) -> Result<Idempotenc
     })
 }
 
-/// The one `insert into audit_logs` in the crate that a repository write can reach.
+/// Writes `audit` on `tx`'s own connection and then commits **that same transaction**.
 ///
-/// `pub(crate)` because [`super::runtime`] and [`super::auth_settings`] write their audit
-/// rows through it as well, on the connection their own write is using. That shared
-/// connection is the whole point: an audit row written on a *second* connection commits
-/// separately from the write it describes, which is the divergence the `audit` parameter
-/// on every write method exists to make impossible.
-pub(crate) async fn insert_audit_with_connection(
+/// # Why this consumes the transaction
+///
+/// The bug this closes was not a missing audit row; it was an audit row written *after* the
+/// write had already committed, on a second pooled connection. Two statements, two commits,
+/// and any failure between them leaves an administrative change with no record of it.
+///
+/// Taking `tx` **by value** is what makes that arrangement hard to write down again. There
+/// is no `insert_audit; … ; commit` sequence a later edit can quietly reorder: the insert and
+/// the commit are one operation, and once it returns the transaction is gone. Reintroducing
+/// the divergence now requires committing by hand *and* acquiring a second connection —
+/// visible, deliberate lines, not a moved one.
+///
+/// `pub(crate)` because [`super::runtime`] and [`super::auth_settings`] end their writes
+/// with it too.
+pub(crate) async fn commit_with_audit(
+    mut transaction: sqlx::Transaction<'static, sqlx::Postgres>,
+    audit: AuditLogInsert,
+) -> Result<(), AppError> {
+    insert_audit_with_connection(&mut transaction, audit).await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+async fn insert_audit_with_connection(
     connection: &mut PgConnection,
     insert: AuditLogInsert,
 ) -> Result<(), AppError> {
