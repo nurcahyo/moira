@@ -688,9 +688,19 @@ async fn every_non_sse_route_group_is_governed_by_the_non_streaming_timeout() {
         if needs_key {
             builder = builder.header("x-consumer-key", &consumer_key);
         }
+        // This, not the `assert_eq!` below, is what a deleted `.layer(timeout)` looks like
+        // now: with the pool starved the handler cannot answer at all, so an unlayered
+        // group produces no response rather than a fast one. Verified by injection on the
+        // admin and operational groups.
         let response = timeout(WAIT, builder.send())
             .await
-            .unwrap_or_else(|_| panic!("{group} probe timed out at the test level"))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the {group} probe never returned. With the fixture pool starved the \
+                     only response this route can produce is the timeout layer's, so this \
+                     is a {group} route group missing RouterPolicy::non_streaming_timeout"
+                )
+            })
             .unwrap_or_else(|_| panic!("{group} probe response"));
         assert_eq!(
             response.status(),
