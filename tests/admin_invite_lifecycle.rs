@@ -1951,6 +1951,21 @@ async fn transferring_ownership_moves_the_flag_rather_than_adding_a_second_owner
         0.0,
         "clearing a flag nobody held is not an ownership transfer"
     );
+    // **And it must not have touched the real owner.** Found by `cargo mutants`: turning
+    // `set_primary`'s `is_primary && !current.is_primary` into `||` makes the demotion run on
+    // a *clear* as well, so this request — which changes nothing on its own target — would
+    // strip ownership from `outgoing` and leave the deployment with none. That is precisely
+    // the ownerless state finding F20 describes, reached through a `200 OK` and around the
+    // last-primary guard, which only ever looks at the row being written.
+    assert!(
+        is_primary(&fixture.pool, grant_id(&outgoing)).await,
+        "a no-op clear on one grant must not demote a different grant"
+    );
+    assert_eq!(
+        active_primary_count(&fixture.pool).await,
+        1,
+        "the deployment must still have exactly one owner"
+    );
 
     // `If-Match` carries the version the no-op left behind: the bump trigger fires on any
     // UPDATE, so reusing the pre-no-op version would fail with `resource_version_conflict`
