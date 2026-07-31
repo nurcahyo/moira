@@ -1018,6 +1018,58 @@ or a `sleep` would hide the race, and both are forbidden here.
 Disk 76 GB free — above the 60 GB threshold, no reclaim needed. `~/.cargo-targets` holds only
 `moira-fsweep` (13 GB).
 
+**The race is CLOSED — `4ea484b` on `fix/findings-sweep`. The diagnosis held, and was made
+deterministic before it was fixed.**
+
+Decisive experiment: move the HTTP read to *before* the spawn, removing its incidental delay and
+changing nothing else. The test then failed **3 of 3** with the byte-identical panic and line from
+CI. That settles the mechanism — `spawn_runtime_config_listener` returns its `JoinHandle` before the
+task has run `PgListener::connect_with` + `listen(…)`, so the racing write's notification is **lost,
+not late**, and no timeout length recovers it. Measured attach latency on a warm, unloaded machine:
+**59 ms** — the size of the window CI lost.
+
+Fixed with `wait_for_listener_attached`, an acknowledgement gate on `pg_stat_activity` polled at
+10 ms inside the existing `WAIT`. **No sleep, no lengthened timeout.** The assertion is byte-for-byte
+unchanged — the cache must still go `Some` → `None` from a raw `update auth_provider_settings` with
+no service involvement — so this establishes a precondition rather than weakening a gate. The
+reordering (populate → spawn → gate → write) is kept permanently, which makes the test *stronger*
+than the original: the gate is now the only thing between spawn and write, so it cannot be masked by
+incidental latency again.
+
+**The agent improved the gate I specified, and the correction is the interesting part.** My predicate
+was `query ilike 'listen%'`. That can match a `LISTEN` still *executing* — uncommitted, and therefore
+not yet able to receive anything. The shipped gate adds `state = 'idle'`, because a backend reports
+idle only after the statement committed, which is the exact point delivery becomes guaranteed; and
+`strpos(query, $1) > 0` bound to the channel name, so it proves the *right* channel is attached
+rather than any `LISTEN`. Both were verified against sqlx's `PgListener::listen` rather than assumed.
+
+**Teeth verified by three injections, all fatal, each reporting accurately:**
+
+| Injection | Result |
+|---|---|
+| dropped the `auth_provider_settings_notify` trigger (`migrations/0013`) | FAILED at the assertion, correct message |
+| removed `targets.auth_settings.invalidate_all()` from `apply_invalidation` | FAILED at the assertion, correct message |
+| listener never spawned | FAILED at the **gate**, naming the channel |
+
+That third row is why the `pg_stat_activity` gate beat the probe-notification fallback I offered: a
+probe gate would consult the same cache the test asserts on, so a broken `apply_invalidation` would
+surface as a *gate timeout with a misleading message* instead of the real assertion failing. The
+catalog observation is orthogonal to the mechanism under test, so each failure mode reports itself
+honestly. Injections were made after the commit; tree verified clean afterwards.
+
+**Gates: all six green, 891 passed.** Five consecutive `auth_provider_settings` runs, 20 passed each,
+**zero skipped DB suites** in every run and in the gates log.
+
+**`auth_provider_settings.rs` was the only ungated listener test.** `tests/runtime_config_invalidation.rs`
+already had `drain_listener`, whose comment states the same property this exercise proved; and
+`tests/coordination_default_path.rs` only asserts `!listener.is_finished()`, so it never needed one.
+No other site to fix.
+
+**§2.2's zsh `noclobber` hazard (form 5) recurred, in a new disguise.** The first attempt at the five
+consecutive runs reported `FAIL` five times with **empty test results** — `> $(mktemp)` on an
+already-existing file was refused and `cargo` never ran. `>|` fixed it. Same root cause as form 5,
+different surface: a redirect to an existing file is a silent way to not run a command at all.
+
 **Wave 4 re-audited — `85b093d` on `plan/09-wave4-multi-provider`, §0.7, 383 lines. Drift ~70%**
 (31 of 44 falsifiable wave-4 claims wrong or materially incomplete; 12 hold, 2 partly). That lands
 squarely in the 40/45/65/70/85% band every other re-audited plan measured.
