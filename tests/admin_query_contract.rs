@@ -30,17 +30,18 @@
 //! `200`-returning ignore test needs Postgres, and it uses the shared
 //! `tests/support` fixture with that suite's usual skip behaviour.
 //!
-//! # A gap this file records rather than papers over
+//! # The gap this file used to record, now closed (F2)
 //!
-//! `plans/06-architecture-test-hygiene.md` module 11 asks for the rejection to carry a
-//! non-empty `message_key` **and** `message` (CONVENTIONS §4.5). It does not. axum's
-//! `QueryRejection` is a bare `text/plain` `400` that never passes through `AppError`,
-//! and `normalize_infrastructure_error` (`src/lib.rs`) only rewrites `413` and `504`.
-//! Converting it would be an observable change to the wire contract, which plan 06's
-//! premise explicitly excludes — so
-//! `unknown_query_field_rejection_is_plain_text_and_precedes_authentication` records
-//! the shape that actually ships, including the two things about it that are worth a
-//! decision: no envelope, and no authentication.
+//! `plans/06-architecture-test-hygiene.md` module 11 asked for the rejection to carry a
+//! non-empty `message_key` **and** `message` (CONVENTIONS §4.5). Until F2 it did not:
+//! axum's `QueryRejection` was a bare `text/plain` `400` that never passed through
+//! `AppError`, and `normalize_infrastructure_error` (`src/lib.rs`) rewrote only `413`
+//! and `504`. It now rewrites every non-JSON client- and server-error response, so the
+//! rejection carries the standard envelope and says nothing about the query surface.
+//!
+//! `unknown_query_field_rejection_carries_the_error_envelope_and_enumerates_nothing`
+//! (formerly `unknown_query_field_rejection_is_plain_text_and_precedes_authentication`,
+//! which pinned the shipped defect) is the guard for both halves.
 
 mod support;
 
@@ -126,12 +127,18 @@ impl HttpResult {
 }
 
 async fn get(router: &Router, path: &str) -> HttpResult {
-    let request = Request::builder()
+    get_with_headers(router, path, &[]).await
+}
+
+async fn get_with_headers(router: &Router, path: &str, headers: &[(&str, &str)]) -> HttpResult {
+    let mut builder = Request::builder()
         .method("GET")
         .uri(path)
-        .header("x-request-id", format!("query-contract-{}", Uuid::now_v7()))
-        .body(Body::empty())
-        .expect("GET request");
+        .header("x-request-id", format!("query-contract-{}", Uuid::now_v7()));
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let request = builder.body(Body::empty()).expect("GET request");
     let response = router
         .clone()
         .oneshot(request)
@@ -160,6 +167,14 @@ fn poolless_router() -> Router {
 }
 
 /// The finding itself, asserted on every list route rather than a representative one.
+///
+/// The envelope assertions were added when F2 closed. `plans/06-architecture-test-hygiene.md`
+/// module 11 asked for "`400` plus a well-formed error envelope carrying a non-empty
+/// `message_key` **and** `message`" here; until the rejection went through `AppError` only
+/// the status could be checked, and the Definition-of-Done box could not honestly be ticked.
+/// They live on *this* test, across all twelve routes, rather than only on the single-route
+/// F2 guard below — the mapper is global, but the twelve routes are what a per-endpoint
+/// query type would move off it one at a time.
 #[tokio::test]
 async fn each_admin_list_endpoint_rejects_an_unknown_query_field() {
     let router = poolless_router();
@@ -178,6 +193,38 @@ async fn each_admin_list_endpoint_rejects_an_unknown_query_field() {
             StatusCode::BAD_REQUEST,
             "{handler} ({path}) accepted a query parameter that is not on PageQuery; \
              body was {:?}",
+            result.text()
+        );
+        let body = result.json();
+        let error = &body["error"];
+        assert_eq!(
+            error["code"], "invalid_request",
+            "{handler} ({path}) must reject with the standard envelope: {body}"
+        );
+        let message_key = error["message_key"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{handler} ({path}) has no message_key: {body}"));
+        assert!(
+            !message_key.is_empty() && moira::i18n::is_known_key(message_key),
+            "{handler} ({path}): {message_key:?} is empty or not in the i18n catalog"
+        );
+        assert!(
+            !error["message"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{handler} ({path}) has no message: {body}"))
+                .is_empty(),
+            "{handler} ({path}) must carry a non-empty message"
+        );
+        assert!(
+            !error["request_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{handler} ({path}) has no request_id: {body}"))
+                .is_empty(),
+            "{handler} ({path}) must carry a request_id"
+        );
+        assert!(
+            !result.text().contains("not_a_real_field"),
+            "{handler} ({path}) echoes the caller's field name back: {}",
             result.text()
         );
     }
@@ -215,51 +262,214 @@ async fn each_admin_list_endpoint_accepts_the_same_request_without_the_unknown_f
     }
 }
 
-/// **Recorded gap, not an endorsement.**
+/// Every `in: query` parameter name the committed OpenAPI document publishes for
+/// `GET /api/v1/admin/applications` — i.e. `PageQuery`'s field names, read from the
+/// artifact rather than retyped.
 ///
-/// `plans/06-architecture-test-hygiene.md` module 11 and its Definition of Done ask
-/// for the unknown-query-field rejection to carry a non-empty `message_key` and
-/// `message`. It does not, and this test pins exactly why so the claim is not lost:
+/// Deriving the list this way is the point: a hand-written list of 26 strings would
+/// stop covering field 27 the moment somebody added one, and nothing would say so.
+/// `docs/openapi.json` is generated from `PageQuery` itself and is gated against
+/// drift by `committed_openapi_matches_the_generated_document`, so it cannot fall
+/// behind the struct.
+fn documented_query_parameter_names() -> Vec<String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/openapi.json");
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    let document: Value = serde_json::from_str(&raw).expect("docs/openapi.json is JSON");
+    let names: Vec<String> = document["paths"]["/api/v1/admin/applications"]["get"]["parameters"]
+        .as_array()
+        .expect("the applications list operation documents its parameters")
+        .iter()
+        .filter(|parameter| parameter["in"] == "query")
+        .map(|parameter| {
+            parameter["name"]
+                .as_str()
+                .expect("every parameter has a name")
+                .to_string()
+        })
+        .collect();
+
+    // Vacuity guard. A selector that matched nothing would make the enumeration
+    // assertion below pass against a response that leaked every field name.
+    assert!(
+        names.len() >= 26,
+        "expected at least PageQuery's 26 query parameters in docs/openapi.json, found \
+         {}: {names:?} — the selector has drifted and the enumeration oracle below is \
+         asserting nothing",
+        names.len()
+    );
+    for expected in ["limit", "cursor", "credential_type", "occurred_after"] {
+        assert!(
+            names.iter().any(|name| name == expected),
+            "{expected:?} is a PageQuery field but is missing from the derived list: {names:?}"
+        );
+    }
+    names
+}
+
+/// Collects every string *value* in a JSON document, at any depth, ignoring object
+/// keys.
 ///
-/// * The body is `text/plain`, produced by axum's `QueryRejection`. It never passes
-///   through `AppError`, so it has no `code`, no `message_key`, no `request_id`.
-///   `normalize_infrastructure_error` (`src/lib.rs`) rewrites only `413` and `504`.
-/// * The rejection happens in the extractor, i.e. **before** `admin_actor`. An
-///   unauthenticated caller therefore receives the rejection — and axum's message
-///   enumerates all 26 `PageQuery` field names, which is a (minor) disclosure of the
-///   admin filter surface to an anonymous caller.
+/// Keys are excluded on purpose. `request_id` is both an envelope field name and a
+/// `PageQuery` field name, so a substring check over the raw body would report a leak
+/// for the envelope's own structural key on every single response. Values are where a
+/// leak would actually land, and collecting them recursively keeps the oracle correct
+/// if `ErrorDetail` ever grows a field.
+fn json_string_values(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(text) => out.push(text.clone()),
+        Value::Array(items) => items.iter().for_each(|item| json_string_values(item, out)),
+        Value::Object(fields) => fields
+            .values()
+            .for_each(|field| json_string_values(field, out)),
+        _ => {}
+    }
+}
+
+/// **F2, closed.** The guard that replaces
+/// `unknown_query_field_rejection_is_plain_text_and_precedes_authentication`, which
+/// pinned the shipped defect: a `400 text/plain` with no `code`, no `message_key` and
+/// no `request_id`, whose body enumerated all 26 `PageQuery` field names to a caller
+/// that had presented no credential.
 ///
-/// Fixing either would change the wire contract, which plan 06 excludes by premise.
-/// This test is the tripwire: it goes red the day someone does fix it, which is when
-/// the module 11 Definition-of-Done box can honestly be ticked.
+/// Three properties, and the third is the one that matters:
+///
+/// 1. **The envelope.** The rejection now goes through `AppError`, so it carries the
+///    same `code` / `message_key` / `message` / `request_id` as every other error —
+///    which is what `docs/openapi.json` already claimed for `4XX` on this operation
+///    the whole time it was untrue.
+/// 2. **It is still pre-authentication, deliberately.** No credential is sent here and
+///    the answer is `400`, not `401`: `Query` is the last extractor and `admin_actor`
+///    runs inside the handler, so the rejection precedes authentication. That is
+///    recorded rather than fixed — see the decision note in `plans/reports/`. It is
+///    acceptable *because of* property 3: the response is now identical for every
+///    caller and every malformed query, so reaching it early reveals nothing that
+///    `docs/openapi.json` does not already publish.
+/// 3. **It enumerates nothing.** Asserted two ways, because a fix that closed only the
+///    half its author imagined would pass either one alone: no documented query
+///    parameter name appears in any value of the response, *and* the response does not
+///    vary with the caller's input.
 #[tokio::test]
-async fn unknown_query_field_rejection_is_plain_text_and_precedes_authentication() {
+async fn unknown_query_field_rejection_carries_the_error_envelope_and_enumerates_nothing() {
     let router = poolless_router();
-    let result = get(&router, "/api/v1/admin/applications?not_a_real_field=1").await;
+    let documented = documented_query_parameter_names();
 
-    assert_eq!(result.status, StatusCode::BAD_REQUEST);
+    // Random, so it cannot collide with a real field name and cannot be matched by a
+    // hard-coded carve-out in the implementation.
+    let probe = format!("zzzprobe{}", Uuid::now_v7().simple());
+    assert!(
+        !documented.iter().any(|name| name == &probe),
+        "the probe field must not be a real PageQuery field, or the request would be \
+         accepted and this test would assert nothing"
+    );
+
+    let result = get(&router, &format!("/api/v1/admin/applications?{probe}=1")).await;
+
+    // 1 — the envelope.
     assert_eq!(
-        result.content_type.as_deref(),
-        Some("text/plain; charset=utf-8"),
-        "if this is now JSON the envelope gap has been closed — replace this test with \
-         the message_key/message assertions plan 06 module 11 asked for"
+        result.status,
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        result.text()
+    );
+    assert!(
+        result
+            .content_type
+            .as_deref()
+            .is_some_and(|value| value.trim_start().starts_with("application/json")),
+        "the rejection must carry the JSON error envelope, got content-type {:?} and body \
+         {:?}",
+        result.content_type,
+        result.text()
+    );
+    let body = result.json();
+    let error = &body["error"];
+    assert_eq!(
+        error["code"], "invalid_request",
+        "the rejection must carry a generic, catalogued code: {body}"
+    );
+    let message_key = error["message_key"]
+        .as_str()
+        .expect("message_key is a string");
+    assert_eq!(message_key, "moira.error.invalid_request");
+    // Checked against the catalog, not only against the literal above: a key that is
+    // spelled consistently but absent from the catalog renders as nothing in a console.
+    assert!(
+        moira::i18n::is_known_key(message_key),
+        "{message_key} is not in the i18n catalog"
+    );
+    assert!(
+        !error["message"].as_str().expect("message").is_empty(),
+        "message must carry the catalogued English default: {body}"
+    );
+    assert!(
+        !error["request_id"].as_str().expect("request_id").is_empty(),
+        "request_id must be populated: {body}"
     );
 
-    let body = result.text();
+    // 2 — still pre-authentication, and recorded as such. Asserted as *credential
+    // independence* rather than as "not a 401": the 400 above already implies the latter,
+    // so restating it would prove nothing. Sending a syntactically valid but wholly bogus
+    // bearer token and getting byte-identical output (bar the request id) is what actually
+    // shows the extractor decides before `admin_actor` ever looks at the header.
+    let with_credential = get_with_headers(
+        &router,
+        &format!("/api/v1/admin/applications?{probe}=1"),
+        &[("authorization", "Bearer not-a-real-token")],
+    )
+    .await;
+    assert_eq!(
+        with_credential.status,
+        StatusCode::BAD_REQUEST,
+        "a bogus credential changed the outcome, so the rejection is no longer decided \
+         ahead of authentication. That is a deliberate design decision (recorded in \
+         plans/reports/EXECUTION-LEDGER.md under F2) and must be re-recorded, not drifted \
+         into: body {}",
+        with_credential.text()
+    );
+
+    // 3a — no documented query parameter name survives into any value of the response.
+    let mut values = Vec::new();
+    json_string_values(&body, &mut values);
     assert!(
-        body.contains("not_a_real_field"),
-        "the rejection should name the offending field, got: {body}"
+        !values.is_empty(),
+        "no string values were collected from the envelope, so the check below is vacuous"
+    );
+    let haystack = values.join("\u{1f}");
+    let leaked: Vec<&String> = documented
+        .iter()
+        .filter(|name| haystack.contains(name.as_str()))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "the rejection enumerates {leaked:?} to an unauthenticated caller — F2 has \
+         reopened. Response values: {values:?}"
     );
     assert!(
-        serde_json::from_str::<Value>(&body).is_err(),
-        "the rejection body is not an error envelope; got parseable JSON: {body}"
+        !haystack.contains(&probe),
+        "the rejection echoes the caller's own field name {probe:?} back: {values:?}"
     );
-    // No credential of any kind was sent, and the answer is still 400 rather than 401:
-    // the extractor runs ahead of `admin_actor`.
-    assert!(
-        body.contains("credential_type") && body.contains("occurred_after"),
-        "recorded disclosure: the rejection enumerates PageQuery's field names to an \
-         unauthenticated caller. Got: {body}"
+
+    // 3b — and the response does not vary with the caller's input at all. This catches
+    // the partial fix that keeps the envelope but interpolates the rejection text into
+    // `message`, which 3a would only catch for the *expected-fields* half of axum's
+    // sentence.
+    let other_probe = format!("zzzprobe{}", Uuid::now_v7().simple());
+    let second = get(
+        &router,
+        &format!("/api/v1/admin/applications?{other_probe}=1"),
+    )
+    .await;
+    let mut second_body = second.json();
+    let mut first_body = body.clone();
+    // `request_id` is the one field that legitimately differs per response.
+    for document in [&mut first_body, &mut second_body] {
+        document["error"]["request_id"] = Value::Null;
+    }
+    assert_eq!(
+        first_body, second_body,
+        "the rejection body varies with the caller's query string, so something from the \
+         rejection is being echoed"
     );
 }
 

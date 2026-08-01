@@ -296,22 +296,95 @@ the gap — so the number cannot grow silently.
 product-copy decision, not a refactor, and inventing them unreviewed would be worse than the gap.
 **Decide:** write them in plan 06, or schedule a dedicated i18n pass.
 
-### F2 — unknown query fields are rejected before authentication, and the 400 enumerates field names
+### ~~F2 — unknown query fields are rejected before authentication, and the 400 enumerates field names~~ — **CLOSED** `fix/f2-query-rejection-envelope` (2026-08-01)
 
-Rejection of an unknown query parameter is axum's `QueryRejection`: `400 text/plain`, with no `code`,
-no `message_key`, and no `request_id` — `normalize_infrastructure_error` (`src/lib.rs:165`) only
-rewrites 413 and 504. Because `Query` is the last extractor and `admin_actor` runs *inside* the
-handler, **the rejection precedes authentication**, and axum's message enumerates all 26 `PageQuery`
-field names to an anonymous caller.
+**The finding as recorded.** Rejection of an unknown query parameter was axum's `QueryRejection`:
+`400 text/plain`, with no `code`, no `message_key`, and no `request_id` —
+`normalize_infrastructure_error` (`src/lib.rs`) only rewrote 413 and 504. Because `Query` is the last
+extractor and `admin_actor` runs *inside* the handler, **the rejection precedes authentication**, and
+axum's message enumerated all 26 `PageQuery` field names to an anonymous caller. Low severity — field
+*names*, no data, no credentials, and the endpoints are already known from the public OpenAPI
+document — but an unauthenticated response shape that bypassed the error envelope, and it meant
+**Module 11's DoD item could not honestly be ticked**.
 
-Low severity — field *names*, no data, no credentials, and the endpoints are already known from the
-public OpenAPI document. But it is an unauthenticated response shape that bypasses the error
-envelope, and it means **Module 11's DoD item cannot honestly be ticked**.
+**Two things the finding got wrong, both in the direction of understating it.**
 
-Not fixed here because the fix lives in `src/lib.rs` and changes an observable wire response, which
-plan 06 excludes by premise. `unknown_query_field_rejection_is_plain_text_and_precedes_authentication`
-pins the shipped shape and goes red the day someone fixes it.
-**Decide:** fold the envelope fix into plan 06b (which already carries wire changes), or accept it.
+1. **It was never a `Query`-only defect, and the "observable wire change" framing was backwards.**
+   Every axum *extractor* rejection had the same shape and none was covered: `Json`'s 400/415/422,
+   `Path`'s 400, `Extension`'s 500 (which names the missing Rust type). More to the point, every one
+   of them **already contradicted the published contract**: `docs/openapi.json` documents `4XX` and
+   `5XX` on these operations as `application/json` → `ErrorResponse`. The fix does not change the
+   documented wire contract; it makes the implementation obey the one that was already committed.
+   That is why the OpenAPI snapshot is byte-identical after the fix.
+2. **The scope was fixed by inverting the rule, not by extending the list.** A status allow-list has
+   to grow every time an extractor is added and nothing fails when it does not.
+   `normalize_infrastructure_error` now rewrites **any** client- or server-error response that is not
+   already `application/json` — `AppError` is the only thing in Moira that produces an error body, so
+   a non-JSON error body is by construction one that bypassed the envelope. 4xx → `invalid_request`,
+   5xx → `internal_error`, with 413/504 keeping their existing specific codes.
+
+**DECISION — the rejection stays pre-authentication.** Moving it behind `admin_actor` would mean
+either an authentication middleware layer (Moira deliberately authenticates *inside* handlers) or a
+custom extractor threaded through all 25 `Query<…>` call sites so the handler can `?` it after
+authenticating. Both are large, and neither buys anything now: the response no longer varies with the
+caller, the credential, or the query string, so reaching it early reveals nothing that
+`docs/openapi.json` does not already publish to anonymous readers. *Reversal condition:* if a
+rejection ever becomes able to carry request-specific detail again — a per-endpoint query type with
+its own message, a `details` payload, anything that makes the response a function of the input — the
+early-exit becomes a disclosure again and it must move behind authentication.
+
+**DECISION — no diagnostic detail, and none logged either.** The rejection text is discarded, not
+downgraded to a log line. `redacted_request_span` deliberately drops the query string from the span,
+and a rejection body echoes caller-supplied query keys and — for an unknown enum variant —
+caller-supplied *values*; writing it to `tracing` would reintroduce exactly the request content that
+decision removed. The cost is real: a developer who mistypes a filter now gets "The request is
+invalid." and must consult the OpenAPI document. *Reversal condition:* revisit if the rejection ever
+moves behind authentication, where a detailed message would go only to an authenticated caller.
+
+**DECISION — 404 and 405 are carved out** (`ROUTER_STATUSES_LEFT_UNWRAPPED`). Both are produced by
+the router rather than by a rejection, both carry an empty body, and 405 carries an `Allow` header a
+synthesised envelope would drop. *Reversal condition:* stated on the constant, and
+`router_produced_404_and_405_keep_their_bodyless_shape` asserts the premise (empty body, `Allow`
+present) rather than assuming it — so the carve-out cannot outlive its own justification.
+
+**Guards.** `unknown_query_field_rejection_is_plain_text_and_precedes_authentication` pinned the
+defect and was rewritten, not deleted, into
+`unknown_query_field_rejection_carries_the_error_envelope_and_enumerates_nothing` — renamed because a
+test asserting JSON under a name that says `is_plain_text` is the §3.4 failure mode. Its enumeration
+oracle **reads the 26 parameter names out of `docs/openapi.json`** instead of hard-coding them, so
+field 27 is covered the day it is added, and it has a vacuity guard on the selector. The
+"enumerates nothing" property is asserted twice — no documented parameter name in any *value* of the
+envelope, **and** the response does not vary between two different unknown field names — because a
+partial fix that echoed only one half of axum's sentence would pass either check alone. Plan 06
+module 11's DoD assertions (non-empty `message_key` **and** `message`) were also added to
+`each_admin_list_endpoint_rejects_an_unknown_query_field`, across all twelve routes.
+
+**Mutation evidence.** Reverting `normalize_infrastructure_error` to its two-status form and re-running
+the suite is recorded below under "F2 mutation".
+
+### F28 — `metrics_endpoint_exposes_db_pool_gauges_reflecting_the_live_pool` races the sqlx pool under load
+
+Found 2026-08-01 during F2's gate run, on a machine that also had another agent's `cargo clippy`
+running. The suite failed with `left: 1.0, right: 0.0` at the second `assert_eq!` in
+`tests/metrics_endpoint.rs`: after `fixture.pool.acquire()` holds one connection, the test requires
+`idle == baseline_idle - 1`, and the scrape still reported `idle == 1` while `total` was unchanged at
+`1` — i.e. a held connection and a full idle count in the *same* scrape. **The identical target
+passed 9/9 on an immediate re-run with nothing changed.**
+
+The mechanism is that `sqlx::Pool::num_idle()` is documented as *approximate* — it reads the idle
+queue's length, and the pool's own maintenance can transiently disagree with `size()`. The test
+treats two approximate gauges as exact and as mutually consistent within one scrape, which is a
+stronger premise than sqlx offers, and the gap widens under CPU contention.
+
+**Not caused by F2's change**, and that is checkable rather than asserted: `/metrics` answers `200`,
+and `normalize_infrastructure_error` returns the response untouched for any status that is not a
+client or server error, so no code path F2 touched can execute on this request.
+
+**The fix is not "add a sleep".** Either bound the assertion (`idle <= baseline_idle - 1`, which is
+what the property actually is — a held connection cannot be idle), or poll the scrape inside a
+`timeout(…)` the way the rest of the suite polls for eventual state. Recorded rather than fixed here
+because it is a different file from F2's change and gate runs are serialised; fixing it inside F2's
+branch would have cost another full gate cycle to prove.
 
 ### F3 — the skill files still describe deleted code, and agents are briefed from them
 
@@ -1315,7 +1388,7 @@ its own, and a signing failure is unremarkable on its own. Only together are the
 be asserted as two independent facts.**
 
 **Open, and the queue from here:** ~~the leaked `trusted_jwt_issuers` test rows~~ (**closed as F27**)
-and F2 (user-deferred).
+and ~~F2 (user-deferred)~~ (**closed** `fix/f2-query-rejection-envelope`, 2026-08-01).
 **F6 `f31ff59`, F17 `d8aab3e` and F14 are closed**, and **admin-write/audit non-atomicity is closed as
 F26** — but F26 left a
 successor: `RuntimeAdminService::record_idempotency` is still non-atomic with its own write at 13
@@ -1414,7 +1487,7 @@ an "active sessions" screen over an in-memory store would be the appearance of a
 | ~~**F15**~~ | ~~Console cannot render a sign-in button without a credential it can only get by signing in~~ **RESOLVED** — anonymous `GET /api/v1/admin/setup/sign-in-methods`. *Not* by serving `PublicAuthMethod` as recommended: that carries `allowed_email_domains`, the deny-by-default admin-claim policy | `fix/f15-anonymous-auth-methods` |
 | **F14** | Memory dedupe silently stops matching after a pepper rotation | plan 11 Sub-Phase F |
 | ~~**F13**~~ | ~~Duplicate trusted JWT issuer returns 500, not 409~~ **FIXED** `a6d2984` | `fix/findings-sweep` |
-| **F2** | Pre-auth query-field enumeration | user deferred |
+| ~~**F2**~~ | ~~Pre-auth query-field enumeration~~ **CLOSED** — `normalize_infrastructure_error` now envelopes **every** non-JSON 4xx/5xx, not a list of statuses, and discards the rejection text. It was never `Query`-only, and it was violating `docs/openapi.json`'s own `4XX → ErrorResponse` claim, so the snapshot is unchanged. See the F2 section above | `fix/f2-query-rejection-envelope` |
 | ~~**F6**~~ | ~~OTel exports every span; `env_filter` is the sole barrier to Rig prompt spans~~ **CLOSED** `f31ff59` — allow-list of Moira-owned targets on the bridge layer, below the `EnvFilter`. The recorded description understated it: Rig's prompt-bearing span is `INFO`, so a bare `info` was already enough | `fix/f6-otel-span-filter` |
 | ~~**F26**~~ | ~~Admin write + audit row still non-atomic~~ **FIXED** `3825fb0` — 36 sites, not all of them; 20 were already atomic inside the command envelope. Reachable from an over-long `x-request-id`, not only from a crash. See the F26 section at the end of this file | `fix/admin-audit-atomicity` |
 | ~~**F27**~~ | ~~~986 leaked `trusted_jwt_issuers` rows in the shared test DB~~ **CLOSED** `fix/test-row-leak` — the count was **160**, not 986; see F27 below | hygiene |
@@ -2102,6 +2175,42 @@ under 4B a human's second grant is never primary and revoking "the" row leaves a
 - **No schema/binary version handshake.** B2 is mitigated for one enum only; ~30 `*_from_db` mappers,
   ~21 fallible per-row `collect()` sites and 48 enum-like CHECKs remain exposed. Rollout ordering
   (Moira first) is the only mitigation and goes in the release note.
+
+### F29 — `ExecutionOutcome.structured_output` is always `None`, for every caller
+
+The **request** side of structured output works: `output_schema` is honoured and
+`structured_output_invalid`/`_unsupported` are catalogued. The **response** side does not.
+`ExecutionRunOutput.structured_output` is hardcoded `None` at three sites in
+`src/application/execution.rs` — on the streaming **and** non-streaming paths — so no caller in the
+tree has ever received a parsed structured output.
+
+**No test pins the gap**, which is why it survived. Found while building plan 11 Sub-Phase F, whose
+extractor parses `output_text` and prefers `structured_output` when present — so it works today only
+because the preference never fires.
+
+Not Sub-Phase F's to close, and recorded rather than fixed in passing: it changes what every caller
+of the execution API receives, which deserves its own change and its own tests.
+
+### F30 — there are TWO memory-consent columns, and nothing makes them agree
+
+`application_memory_policies.consent_mode` and
+`application_conversation_policies.memory_consent_mode` are **independent**, both default
+`'explicit_only'`, and no constraint or code path reconciles them. Plan 11's body — and the brief
+derived from it — name only one.
+
+**Reading either alone is a defect in both directions**: honour only the memory policy and a
+conversation-level `explicit_only` is ignored; honour only the conversation policy and the reverse.
+Sub-Phase F takes the **stricter of the two** (decision D4).
+
+Worth stating because it is the shape that hides: two columns that agree in every default
+deployment, and disagree exactly when an operator has deliberately tightened one of them.
+
+### A defect the plan's own wording would have shipped, and it looks correct
+
+Plan 11 says to dedupe against existing **active** memories. Retrieval is `active`-only, so scoping
+dedupe the same way reads as consistent — and makes an `explicit_only` application accumulate **one
+unconfirmed duplicate per turn**, because unconfirmed candidates are never `active` and therefore
+never match. Caught by implementing it, not by reading it.
 
 ## USER DECISIONS — 2026-07-31, taken interactively
 

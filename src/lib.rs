@@ -44,6 +44,13 @@ const PAYLOAD_TOO_LARGE_KEY: &str = "moira.error.payload_too_large";
 const PAYLOAD_TOO_LARGE_FALLBACK: &str = "The request body exceeds the maximum allowed size.";
 const REQUEST_TIMEOUT_KEY: &str = "moira.error.request_timeout";
 const REQUEST_TIMEOUT_FALLBACK: &str = "The request timed out before it could be completed.";
+/// i18n key for every *other* client-error status an infrastructure layer can produce.
+///
+/// Deliberately one generic key rather than a per-status vocabulary: the responses this
+/// covers are produced **before** any handler runs, therefore before authentication, so
+/// whatever they say is said to an anonymous caller. See [`normalize_infrastructure_error`].
+const INVALID_REQUEST_KEY: &str = "moira.error.invalid_request";
+const INVALID_REQUEST_FALLBACK: &str = "The request is invalid.";
 
 /// Assembles Moira's HTTP stack.
 ///
@@ -146,24 +153,79 @@ fn panic_payload_description(payload: &(dyn Any + Send + 'static)) -> String {
     }
 }
 
-/// Rewrites the bodyless/plain-text responses produced by infrastructure layers into
+/// Statuses this mapper deliberately leaves alone.
+///
+/// Both are produced by the **router**, not by a rejection: `404` is axum's fallback for a
+/// path that matches nothing and `405` its answer for a path that matches with the wrong
+/// method. Neither carries a body, so neither can disclose anything, and `405` carries an
+/// `Allow` header that a synthesised envelope would drop. Rewriting them would change the
+/// answer to every unmatched request in the service for no security or contract benefit.
+///
+/// *Reversal condition:* if any layer ever produces a `404` or `405` with a **non-empty**
+/// body, or if the public contract grows a requirement that unmatched paths answer with the
+/// envelope, delete this carve-out and preserve `Allow` explicitly instead.
+const ROUTER_STATUSES_LEFT_UNWRAPPED: &[StatusCode] =
+    &[StatusCode::NOT_FOUND, StatusCode::METHOD_NOT_ALLOWED];
+
+/// Rewrites the bodyless/plain-text error responses produced by infrastructure layers into
 /// Moira's standard `ErrorResponse` envelope.
 ///
-/// Two producers exist today and neither goes through `AppError`:
-/// * Axum's `DefaultBodyLimit` rejects an oversized body with a bare `text/plain` 413
-///   carrying no `code`, no `message_key` and no `request_id`.
-/// * `tower_http`'s `TimeoutLayer` returns a completely empty 504.
+/// # Why every status, and not a list of the ones observed so far
 ///
-/// Responses that already carry `application/json` are left untouched — that is what
-/// keeps a genuine application-level 504 (`ExecutionFailureClass::ProviderTimeout` /
+/// This started as two special cases — `DefaultBodyLimit`'s bare `text/plain` 413 and
+/// `tower_http::TimeoutLayer`'s empty 504 — and that shape was the finding (F2). Every axum
+/// **extractor** rejection has the same defect and none of them were covered:
+/// `Query`'s `400`, `Json`'s `400`/`415`/`422`, `Path`'s `400`, `Extension`'s `500`. They
+/// carry no `code`, no `message_key` and no `request_id`, so they contradict the
+/// `4XX`/`5XX` → `ErrorResponse` contract every operation publishes in `docs/openapi.json`.
+///
+/// A status allow-list would have to grow every time an extractor is added, and nothing
+/// would fail when it did not. The rule is inverted instead: **any** client- or server-error
+/// response that is not already `application/json` did not come from [`AppError`] — that is
+/// the only thing in Moira that produces an error body — and is therefore rewritten. The
+/// exceptions are named in [`ROUTER_STATUSES_LEFT_UNWRAPPED`].
+///
+/// # Why the rewritten message says nothing specific
+///
+/// Extractors run **before** the handler body, and Moira authenticates *inside* the handler
+/// (`admin_actor` / `public_actor`). Every response this mapper produces is therefore
+/// addressed to a caller who has presented no credential. axum's own messages are written
+/// for a trusted developer audience and enumerate internals to that anonymous caller —
+/// `Query<PageQuery>` answers `?nope=1` with all 26 field names of the admin filter surface,
+/// and `Json<T>` names the missing field of the target type. So the mapper keeps the status
+/// (which says *what class* of thing was wrong) and discards the text.
+///
+/// The rejection detail is **not** logged either. `redacted_request_span` deliberately drops
+/// the query string from the span, and a rejection body echoes caller-supplied query keys
+/// and — for an unknown enum variant — caller-supplied *values*; writing it to `tracing`
+/// would reintroduce exactly the request content that decision removed.
+///
+/// # Why `application/json` is the discriminator
+///
+/// Responses that already carry `application/json` are left untouched. That is what keeps a
+/// genuine application-level 504 (`ExecutionFailureClass::ProviderTimeout` /
 /// `DeadlineExceeded`, `src/application/public.rs`) from being clobbered with the
-/// transport-level `request_timeout` code.
+/// transport-level `request_timeout` code, and it is what stops every coded `AppError` in
+/// the service from collapsing into `invalid_request`.
 async fn infrastructure_error_envelope(req: Request<Body>, next: Next) -> Response {
     normalize_infrastructure_error(next.run(req).await)
 }
 
 fn normalize_infrastructure_error(response: Response) -> Response {
-    let error = match response.status() {
+    let status = response.status();
+    if !(status.is_client_error() || status.is_server_error()) {
+        return response;
+    }
+    if ROUTER_STATUSES_LEFT_UNWRAPPED.contains(&status) {
+        return response;
+    }
+    // The only producer of a JSON error body in Moira is `AppError`, so a JSON body here is
+    // already an envelope and must survive verbatim.
+    if is_json_response(&response) {
+        return response;
+    }
+
+    let error = match status {
         StatusCode::PAYLOAD_TOO_LARGE => AppError::coded(
             StatusCode::PAYLOAD_TOO_LARGE,
             "payload_too_large",
@@ -174,12 +236,22 @@ fn normalize_infrastructure_error(response: Response) -> Response {
             "request_timeout",
             catalog_message(REQUEST_TIMEOUT_KEY, REQUEST_TIMEOUT_FALLBACK),
         ),
-        _ => return response,
+        // An infrastructure 5xx is by definition not something the caller can act on, and
+        // its text is the likeliest to carry internal detail (`Extension`'s rejection names
+        // the missing Rust type). It reuses the panic path's code for the same reason that
+        // one does: telling a caller *which* internal mechanism failed has no client benefit.
+        other if other.is_server_error() => AppError::coded(
+            other,
+            "internal_error",
+            catalog_message(INTERNAL_ERROR_KEY, INTERNAL_ERROR_FALLBACK),
+        ),
+        other => AppError::coded(
+            other,
+            "invalid_request",
+            catalog_message(INVALID_REQUEST_KEY, INVALID_REQUEST_FALLBACK),
+        ),
     };
 
-    if is_json_response(&response) {
-        return response;
-    }
     error.into_response()
 }
 
@@ -308,7 +380,11 @@ async fn secure_response_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{app::AppState, config::Settings, error::ErrorResponse};
+    use crate::{
+        app::AppState,
+        config::Settings,
+        error::{ErrorDetail, ErrorResponse},
+    };
     use axum::{
         body::to_bytes,
         http::{Method, Request},
@@ -963,6 +1039,169 @@ mod tests {
         assert_eq!(body.error.code, "upstream_timeout");
     }
 
+    /// Builds the shape every axum extractor rejection has: a status, `text/plain`, and a
+    /// developer-facing message. `IntoResponse for (StatusCode, &str)` is exactly what
+    /// `QueryRejection`, `JsonRejection` and friends use internally, so this is not a
+    /// hand-rolled approximation of the input — it is the input.
+    fn plain_text_rejection(status: StatusCode, message: &'static str) -> Response {
+        (status, message).into_response()
+    }
+
+    /// **F2.** Before this, only `413` and `504` were mapped, so every extractor rejection
+    /// reached the caller as bare `text/plain` with no `code`, no `message_key` and no
+    /// `request_id` — contradicting the `4XX`/`5XX` → `ErrorResponse` contract that every
+    /// operation publishes in `docs/openapi.json`.
+    ///
+    /// The statuses below are the ones axum's own extractors emit
+    /// (`Query`/`Path`/`Json`/`Extension`), plus the two that were already handled, so this
+    /// is a *closure* check rather than a sample: a status that reaches a caller without an
+    /// envelope is the defect, whichever layer produced it.
+    #[tokio::test]
+    async fn every_non_json_error_status_is_rewritten_into_the_envelope() {
+        for (status, expected_code) in [
+            (StatusCode::BAD_REQUEST, "invalid_request"),
+            (StatusCode::UNSUPPORTED_MEDIA_TYPE, "invalid_request"),
+            (StatusCode::UNPROCESSABLE_ENTITY, "invalid_request"),
+            (StatusCode::LENGTH_REQUIRED, "invalid_request"),
+            (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
+            (StatusCode::GATEWAY_TIMEOUT, "request_timeout"),
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
+            (StatusCode::NOT_IMPLEMENTED, "internal_error"),
+        ] {
+            let response = normalize_infrastructure_error(plain_text_rejection(
+                status,
+                "Failed to deserialize query string: unknown field `nope`, expected one of \
+                 `limit`, `cursor`, `occurred_after`",
+            ));
+
+            assert_eq!(response.status(), status, "{status} lost its status");
+            assert!(
+                is_json_response(&response),
+                "{status} is still not application/json"
+            );
+            let body = error_body(response).await;
+            assert_eq!(body.error.code, expected_code, "{status}");
+            assert_eq!(
+                body.error.message_key,
+                format!("moira.error.{expected_code}"),
+                "{status}"
+            );
+            assert!(
+                i18n::is_known_key(&body.error.message_key),
+                "{status}: {} is not in the i18n catalog",
+                body.error.message_key
+            );
+            assert!(!body.error.message.is_empty(), "{status}");
+            assert!(!body.error.request_id.is_empty(), "{status}");
+        }
+    }
+
+    /// The half of F2 that is the actual disclosure, asserted separately from the envelope
+    /// half: an extractor rejection is produced *before* the handler runs and therefore
+    /// before `admin_actor`, so its text is addressed to an anonymous caller. Nothing from
+    /// the rejection may survive into the response.
+    ///
+    /// Asserted as "the response does not vary with the rejection text" rather than as a
+    /// list of forbidden substrings: a partial fix that echoed only the offending field
+    /// name, or only the expected-field list, would pass a substring check written against
+    /// whichever half its author imagined.
+    #[tokio::test]
+    async fn the_rewritten_body_carries_nothing_from_the_rejection_text() {
+        async fn rewritten(message: &'static str) -> ErrorResponse {
+            let response = normalize_infrastructure_error(plain_text_rejection(
+                StatusCode::BAD_REQUEST,
+                message,
+            ));
+            error_body(response).await
+        }
+
+        let first = rewritten(
+            "Failed to deserialize query string: unknown field `zzz_probe_alpha`, expected \
+             one of `limit`, `cursor`, `credential_type`, `occurred_after`",
+        )
+        .await;
+        let second = rewritten(
+            "Failed to deserialize the JSON body into the target type: missing field \
+             `zzz_probe_beta` at line 1 column 2",
+        )
+        .await;
+
+        // `request_id` is generated per response and is the one field that legitimately
+        // differs, so it is compared out rather than ignored wholesale.
+        assert_ne!(first.error.request_id, second.error.request_id);
+        assert_eq!(
+            ErrorResponse {
+                error: ErrorDetail {
+                    request_id: String::new(),
+                    ..first.error.clone()
+                },
+            },
+            ErrorResponse {
+                error: ErrorDetail {
+                    request_id: String::new(),
+                    ..second.error.clone()
+                },
+            },
+            "the envelope varies with the rejection text, so something from it is being \
+             echoed to an unauthenticated caller"
+        );
+        let rendered =
+            serde_json::to_string(&first).unwrap() + &serde_json::to_string(&second).unwrap();
+        for probe in ["zzz_probe_alpha", "zzz_probe_beta", "credential_type"] {
+            assert!(
+                !rendered.contains(probe),
+                "{probe:?} from the rejection text reached the response body: {rendered}"
+            );
+        }
+    }
+
+    /// The carve-out in [`ROUTER_STATUSES_LEFT_UNWRAPPED`], with the premise it rests on
+    /// asserted rather than assumed: it is only safe to leave `404`/`405` alone while they
+    /// carry no body. A layer that starts answering either with text would be disclosing it
+    /// through the one hole this mapper leaves.
+    #[tokio::test]
+    async fn router_produced_404_and_405_keep_their_bodyless_shape() {
+        let router = router_for(Settings::default());
+
+        let unmatched = send(
+            router.clone(),
+            Request::builder()
+                .uri("/definitely/not/a/route")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(unmatched.status(), StatusCode::NOT_FOUND);
+
+        // `/health/live` exists as a GET, so a DELETE to it is the router's 405.
+        let wrong_method = send(
+            router,
+            Request::builder()
+                .method(Method::DELETE)
+                .uri("/health/live")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(wrong_method.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert!(
+            wrong_method.headers().contains_key(header::ALLOW),
+            "the 405 carve-out exists partly to preserve `Allow`; if the header is gone the \
+             carve-out has lost half its reason to exist"
+        );
+
+        for (label, response) in [("404", unmatched), ("405", wrong_method)] {
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert!(
+                bytes.is_empty(),
+                "the {label} carve-out assumes an empty body; this one carries {:?}. Either \
+                 the producer changed or the carve-out must go — see \
+                 ROUTER_STATUSES_LEFT_UNWRAPPED",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+    }
+
     #[tokio::test]
     async fn once_only_secret_routes_carry_no_content_encoding() {
         // Regression guard for the compression rule documented on `build_router`: today
@@ -994,6 +1233,7 @@ mod tests {
             (INTERNAL_ERROR_KEY, INTERNAL_ERROR_FALLBACK),
             (PAYLOAD_TOO_LARGE_KEY, PAYLOAD_TOO_LARGE_FALLBACK),
             (REQUEST_TIMEOUT_KEY, REQUEST_TIMEOUT_FALLBACK),
+            (INVALID_REQUEST_KEY, INVALID_REQUEST_FALLBACK),
         ] {
             assert!(i18n::is_known_key(key), "{key} is missing from the catalog");
             let message = catalog_message(key, fallback);
