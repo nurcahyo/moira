@@ -383,19 +383,29 @@ fn normalise_memory_key(key: Option<&str>) -> Option<String> {
     (!truncated.is_empty()).then_some(truncated)
 }
 
-/// The same needle list `crate::application::conversation::validate_content` applies to
-/// caller-supplied memories.
+/// Whether `content` looks like credential material.
 ///
-/// Duplicated deliberately rather than imported: that function returns an `AppError` for a
-/// caller-facing 422, and this one returns a rejection reason for a row nobody sees. Sharing
-/// the needles by making one call the other would mean an extraction rejection could surface as
-/// a caller-visible error code, which is the exact coupling this wave must not create. The two
-/// lists are pinned equal by `extraction_and_manual_memory_share_one_secret_needle_list`.
+/// The *functions* are deliberately separate from
+/// `crate::application::conversation::validate_content`: that one returns an `AppError` for a
+/// caller-facing 422, this one returns a rejection reason for a row nobody sees, and making
+/// either call the other would let an extraction rejection surface as a caller-visible error
+/// code — the exact coupling this wave must not create.
+///
+/// The **data** is shared, because keeping two copies of the list is how the caller-supplied
+/// path and the model-supplied path drift apart, and the model-supplied path is the laxer one to
+/// be wrong about. An earlier draft had two copies and a test that walked only this one, which
+/// would have stayed green while the other grew a needle this path did not have.
 fn contains_secret_like_text(content: &str) -> bool {
     let lower = content.to_ascii_lowercase();
     SECRET_NEEDLES.iter().any(|needle| lower.contains(needle))
 }
 
+/// The one list both memory paths screen against.
+///
+/// Not a security boundary on its own — it is a coarse, case-insensitive substring screen, and
+/// nothing here claims it recognises every credential shape. It exists so the obvious
+/// accidents (a pasted `sk-…`, a copied `Authorization:` header) do not become durable stored
+/// memories.
 pub(crate) const SECRET_NEEDLES: [&str; 5] = [
     "api_key=",
     "authorization:",
@@ -786,10 +796,12 @@ mod tests {
     }
 
     #[test]
-    fn extraction_and_manual_memory_share_one_secret_needle_list() {
-        // The two lists are separate functions on purpose (see `contains_secret_like_text`),
-        // which makes them able to drift. This is the pin. If the manual list gains a needle,
-        // extraction must gain it too, or model-proposed content becomes the laxer path.
+    fn extraction_refuses_every_needle_the_manual_path_screens_for() {
+        // `conversation::validate_content` screens against this same constant, so drift between
+        // the two paths is impossible by construction rather than by this test. What this adds
+        // is that a needle added to the shared list actually reaches *extraction's* refusal —
+        // a screen the manual path applies and extraction skips would make model-proposed
+        // content, which nobody reviewed, the laxer of the two.
         for needle in SECRET_NEEDLES {
             let probe = format!("some prose {needle} more prose");
             assert_eq!(

@@ -8,9 +8,10 @@ use crate::{
         AdminCommandIdempotency, AdminCommandMutation, AdminCommandRunner, AdminCommandSpec,
         ContextSections, EXTRACTION_TRANSCRIPT_MESSAGES, ExecutionService, ExtractionPolicy,
         FAILURE_EXTRACTION_CALL_FAILED, MAXIMUM_CANDIDATES_PER_RUN, MoiraExecutionService,
-        NEAR_DUPLICATE_MAX_DISTANCE, RejectionReason, RequestContext, assemble_context,
-        budget_tokens, classify_candidate, effective_extraction_status, extraction_messages,
-        extraction_output_schema, is_near_duplicate, parse_candidates, render_transcript,
+        NEAR_DUPLICATE_MAX_DISTANCE, RejectionReason, RequestContext, SECRET_NEEDLES,
+        assemble_context, budget_tokens, classify_candidate, effective_extraction_status,
+        extraction_messages, extraction_output_schema, is_near_duplicate, parse_candidates,
+        render_transcript,
     },
     domain::{
         AuditLogInsert, AuditResult, CallerRuntimeIdentity, ConversationCreateRequest,
@@ -2730,17 +2731,16 @@ fn estimate_tokens(content: &str) -> i64 {
     content.split_whitespace().count().max(1) as i64
 }
 
+/// Whether caller-supplied memory content looks like credential material.
+///
+/// Shares [`SECRET_NEEDLES`] with the extraction path rather than keeping its own copy. The two
+/// *functions* stay separate — this one raises a caller-facing 422, the other records a
+/// rejection reason on a run row nobody sees — but a second copy of the list is how the
+/// caller-supplied and model-supplied paths drift apart, and the model-supplied one is the
+/// worse of the two to be lax about.
 fn contains_secret_like_text(content: &str) -> bool {
     let lower = content.to_ascii_lowercase();
-    [
-        "api_key=",
-        "authorization:",
-        "bearer ",
-        "sk-",
-        "private key",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
+    SECRET_NEEDLES.iter().any(|needle| lower.contains(needle))
 }
 
 #[cfg(test)]

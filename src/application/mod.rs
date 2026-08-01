@@ -35,6 +35,10 @@ pub use memory_extraction::{
     effective_extraction_status, extraction_messages, extraction_output_schema, is_near_duplicate,
     parse_candidates, render_transcript, status_for_consent_mode,
 };
+// `pub(crate)`, unlike the block above: the needle list is shared with
+// `conversation::validate_content` so the caller-supplied and model-supplied memory paths screen
+// against one list rather than two copies that can drift. It is not part of any public surface.
+pub(crate) use memory_extraction::SECRET_NEEDLES;
 pub use public::{ExecutionPipeline, PublicExecutionService};
 pub use runtime_admin::RuntimeAdminService;
 pub use setup::SetupService;

@@ -240,6 +240,45 @@ Full findings in `HANDOFF-PROMPT.md` §5.1. Headlines:
 
 ## OPEN FINDINGS — need a decision, not a mechanical fix
 
+### F28 — inline memory extraction delays the terminal SSE event and consumes a caller concurrency permit
+
+Found while building plan 11 Sub-Phase F (`feat/plan-11-subphase-f`). **Both halves only bite an
+application that has turned `automatic_extraction_enabled` on, which defaults to `false`** — so
+nothing in the shipped default is affected. Neither is a correctness bug; both are costs that must
+not be discovered in production.
+
+**(a) The streaming terminal event is delayed by a full extraction round-trip.**
+`record_conversation_assistant` — and therefore `extract_memories` — runs at
+`src/application/public.rs`'s streaming arm **before** the `response.completed` SSE event is pushed.
+The tokens themselves are unaffected: `EventCollector::streaming` forwards each chunk live during
+execution, so the caller already has the whole text. What is delayed is the terminal event and the
+stream close. A client that waits for `response.completed` therefore sees the last token, then a
+multi-second stall, then completion.
+
+*Why it was not fixed in this wave:* the fix is to emit the terminal event before extracting, and
+that arm is the streaming terminal-state machine — the same code that owns the committed-output
+override and the cancellation path, and whose branch on `conversation_result` decides which SSE is
+emitted. Reordering it hastily at the end of a wave is how HANDOFF §3.4's six toothless guards got
+written. **No test pins the current ordering**, deliberately: a test asserting today's order would
+go red on the fix, which is the "test pinned the defect" antipattern from §3.4.
+
+**Decide:** either move extraction after the terminal SSE push (its own change, with a test that the
+terminal event precedes the second provider call), or move it to the queue once a real
+`JobDispatcher` exists — decision D3's reversal condition, which fixes this as a side effect.
+
+**(b) Extraction takes a concurrency permit from the caller's own pool.**
+`execute_inner` acquires `state.concurrency.acquire_scoped(provider, …, application_id,
+external_user_id)` per attempt, and extraction goes through the same `MoiraExecutionService::execute`
+path. So an extraction-enabled application's effective per-provider, per-application and per-user
+headroom is **halved** — two permits per caller turn instead of one.
+
+There is **no deadlock**: the caller's own permit is released when `execute_inner` returns, which is
+before `record_conversation_assistant` is called. Under saturation the extraction call is simply
+refused by `acquire_scoped`, which surfaces as `memory_extraction_runs.failure_class =
+'extraction_call_failed'` and does not touch the caller's response — the fail-open policy working as
+designed. It is a capacity-planning fact, now documented in `docs/memory-extraction.md`, not a
+defect.
+
 ### F1 — 23 uncatalogued error codes reach the wire (pre-existing, NOT fixed)
 
 `failure_code()` (`src/application/public.rs:2009`) returns 28 codes that flow into

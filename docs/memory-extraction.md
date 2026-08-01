@@ -56,6 +56,17 @@ enables extraction should expect roughly double the per-turn model cost and late
 separate extraction route today; see the reversal condition on
 `ConversationExecutionLink::route_hint`.
 
+Two consequences worth planning for (finding F28):
+
+- **Concurrency headroom halves.** The extraction call takes a permit from the same
+  per-provider / per-application / per-user pool the caller's own request used — two permits per
+  turn instead of one. There is no deadlock, because the caller's permit is released before
+  extraction starts; under saturation the extraction call is simply refused and recorded as
+  `extraction_call_failed`, leaving the response untouched.
+- **On the streaming path, the terminal event is delayed.** Tokens stream live and are unaffected,
+  but `response.completed` is emitted *after* extraction finishes, so a client that waits for it
+  sees the last token, then a pause of roughly one extraction round-trip, then completion.
+
 ## What it will not write
 
 Each candidate is validated independently, and a refusal costs one `rejected_count`, never the
