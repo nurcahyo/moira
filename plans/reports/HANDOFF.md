@@ -326,7 +326,7 @@ Three corollaries earned the hard way:
 - **Gates:** `scripts/gates.sh` (six gates; asserts zero skipped DB suites and log completeness).
   Console: `bun install --frozen-lockfile && bun run typecheck && bun run lint && bun test && bun run build && bun run e2e`.
 - **Disk — check every cycle.** `df -g .` **and** `du -sh ~/.cargo-targets/*`; usage is
-  `main + N × ~2 GB` and grows with every agent. Below 60 GB free run `scratchpad/reclaim.sh`; below
+  `main + N × ~2 GB` and grows with every agent. Below 60 GB free run `scripts/reclaim.sh`; below
   30 GB also delete finished agents' target dirs. **Delete them routinely, not only under pressure.**
   `debug = 1` took a full build from 20 GB to 2 GB and a cold rebuild to 2m21s.
 - **Migrations** are append-only; next free number is **`0020`**.

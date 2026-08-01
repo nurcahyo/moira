@@ -55,7 +55,7 @@ merge, self-paced cadence. Security findings escalate to the user immediately.
    Check `df -g .` **and** `du -sh ~/.cargo-targets/*` at the top of each cycle, not just the main
    `target/`. Agents now hold *private* target dirs, so total usage is `main + N × ~2 GB` and grows
    with every agent spawned — the number that mattered historically was never one directory.
-   - **Below 60 GB free:** run `scratchpad/reclaim.sh`, which escalates from the free-to-delete
+   - **Below 60 GB free:** run `scripts/reclaim.sh`, which escalates from the free-to-delete
      `debug/incremental` cache upward and refuses to run while a build is live.
    - **Below 30 GB free:** also delete `~/.cargo-targets/*` for agents that have finished. They
      rebuild in ~2m21s; a stalled overnight run costs far more.
@@ -1312,7 +1312,7 @@ rules were workarounds for artifact bloat that no longer exists:
   build) is ~40 minutes per wave re-proving a tree nobody changed. Agents run `cargo check` plus
   their own tests; the coordinator runs all six gates once before the PR. Exceptions: broad `src/`
   changes, and proving a race — where repeated full runs *are* the evidence.
-- Prefer `scratchpad/reclaim.sh` over `cargo clean`: `debug/incremental` is ~45% of the tree and
+- Prefer `scripts/reclaim.sh` over `cargo clean`: `debug/incremental` is ~45% of the tree and
   free to delete, while `deps` is the expensive half. But at 2m21s to recover, cleaning is now an
   annoyance rather than a lost afternoon.
 
