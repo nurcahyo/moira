@@ -13,20 +13,34 @@ Admin APIs:
 
 OpenAPI includes schemas for these resources and omits embeddings, extraction prompts, protected instructions, and parser internals.
 
-## MVP boundary
+## What these routes feed
 
-These are persistence and configuration primitives only. See
-[`docs/public-api.md`](./public-api.md#mvp-boundary-conversations-memory-and-rag) for
-the full statement of what does not run yet (retrieval, chunking, embeddings, context
-injection, and summarization).
+Plan 11 wired the pipeline these routes configure. Stored content now reaches the model:
+`POST /api/v1/responses` plans context for the attached conversation, retrieves memories and
+RAG chunks, injects them into the prompt, and returns the provenance in `citations`. See
+[`docs/retrieval-citations.md`](./retrieval-citations.md) and
+[`docs/context-planning.md`](./context-planning.md).
+
+**Retrieval is off until an operator turns it on.**
+`application_retrieval_policies.enabled`, `.memory_retrieval_enabled` and
+`.rag_retrieval_enabled` all default to `false`, and an application with no embedding model
+configured cannot retrieve at all. An application that has changed none of these behaves
+exactly as it did before plan 11.
 
 | Route group | Does today | Does not do today |
 | --- | --- | --- |
-| `/api/v1/conversations`, `/api/v1/conversations/{id}/messages` | Store conversation and message rows; attach a conversation to a response | Load history into the prompt sent to a provider |
-| `/api/v1/memories` | Store explicit memory records | Extract memories automatically; embed or retrieve memories; inject memories into a prompt |
-| Conversation and memory policy endpoints | Store policy configuration, and genuinely gate the conversation and memory routes with it | Enforce summarization or extraction behavior that does not exist yet |
-| Retrieval and embedding policy endpoints | Store and return policy configuration | Affect any behavior at all — nothing reads these policies yet, because the retrieval and embedding pipelines they configure do not exist |
-| `/api/v1/admin/rag-collections`, `/api/v1/admin/rag-documents` (create/ingest/reindex) | Store and version document content; set `ingestion_status`; replay `Idempotency-Key` | Chunk, embed, or index content for retrieval |
+| `/api/v1/conversations`, `/api/v1/conversations/{id}/messages` | Store conversation and message rows; attach a conversation to a response; replay bounded history into the prompt | Summarize a conversation past its budget |
+| `/api/v1/memories` | Store explicit memory records; embed them; retrieve and inject them under policy; cite them | — |
+| Conversation and memory policy endpoints | Store policy configuration and gate history replay, memory retrieval, and automatic memory extraction with it | Enforce summarization, which does not exist yet |
+| Retrieval and embedding policy endpoints | Store policy configuration **and gate live behavior**: `enabled` switches retrieval on for the application, and the embedding policy selects the model that embeds both the corpus and the query | — |
+| `/api/v1/admin/rag-collections`, `/api/v1/admin/rag-documents` (create/ingest/reindex) | Store and version document content; chunk, embed, and index it; report real progress in `ingestion_status`; replay `Idempotency-Key` | — |
+
+## The one thing that still does not run
+
+Conversation summarization (plan 11 Sub-Phase E). `conversation_summaries` has no writer,
+so a conversation past its configured budget is truncated rather than summarized. The
+context planner already reads a summary when one exists, so this is a missing producer, not
+a missing consumer.
 
 Idempotency behavior for these routes is documented in
 [`docs/idempotency.md`](./idempotency.md).
