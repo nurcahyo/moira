@@ -797,6 +797,110 @@ async fn a_near_duplicate_is_recognised_by_embedding_distance() {
     case.shutdown().await;
 }
 
+/// The exact content-address dedupe, with the embedding path taken away.
+///
+/// # Why this case exists
+///
+/// It was added because a mutation survived. Breaking the exact-hash lookup so it never matches
+/// left every other case in this file green: the same content embeds to the same vector, so the
+/// *near-duplicate* check caught the duplicate instead and the outcome was byte-identical. The
+/// exact path is the one that works when an application has `memory_embeddings_enabled` off —
+/// which is the documented reason it runs first — and nothing was testing it.
+///
+/// Turning embeddings off is what makes the exact path the only path that can possibly fire.
+#[tokio::test]
+async fn an_exact_repeat_is_deduped_with_no_embedding_to_fall_back_on() {
+    let Some(case) = Case::consenting(vec![
+        ProviderScript::Completion {
+            text: ASSISTANT_REPLY.to_string(),
+        },
+        extraction_reply(json!([memory("preference", MEMORY_BODY, 0.95, "normal")])),
+        ProviderScript::Completion {
+            text: "Still understood.".to_string(),
+        },
+        extraction_reply(json!([memory("preference", MEMORY_BODY, 0.95, "normal")])),
+    ])
+    .await
+    else {
+        return;
+    };
+    case.fixture
+        .patch_embedding_policy(moira::domain::EmbeddingPolicyPutRequest {
+            memory_embeddings_enabled: Some(false),
+            ..moira::domain::EmbeddingPolicyPutRequest::default()
+        })
+        .await;
+
+    let (status, first) = case.respond(USER_TURN).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let conversation_id = first["conversation"]["id"]
+        .as_str()
+        .expect("conversation id")
+        .to_string();
+    let (status, second) = case.respond_in(USER_TURN, Some(&conversation_id)).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+
+    // Premise: the near-duplicate path really is unavailable, so a pass here is attributable to
+    // the exact check and to nothing else.
+    assert_eq!(
+        case.memory_embedding_count().await,
+        0,
+        "embeddings must be off for this case to isolate the exact-hash path"
+    );
+    let memories = case.memories().await;
+    assert_eq!(
+        memories.len(),
+        1,
+        "the exact content address must suppress the duplicate on its own: {memories:?}"
+    );
+    assert_eq!(memories[0].use_count, 1);
+    assert_eq!(case.runs().await[1].metadata["duplicates"], json!(1));
+    case.shutdown().await;
+}
+
+/// More candidates than the run cap: the excess is rejected and counted, never written.
+///
+/// Also added after a mutation survived. `MAXIMUM_CANDIDATES_PER_RUN` was asserted only against
+/// itself — the schema test compares the schema's `maxItems` to the same constant — so raising
+/// the constant moved both sides and proved nothing. The cap is enforced in the per-candidate
+/// loop, which needs a database, so this is the only layer that can see it.
+#[tokio::test]
+async fn candidates_beyond_the_run_cap_are_rejected_and_counted() {
+    const CAP: usize = 16;
+    let proposed: Vec<Value> = (0..CAP + 3)
+        .map(|index| memory("fact", &format!("uses tool number {index}"), 0.95, "normal"))
+        .collect();
+    let Some(case) = Case::consenting(vec![
+        ProviderScript::Completion {
+            text: ASSISTANT_REPLY.to_string(),
+        },
+        extraction_reply(Value::Array(proposed)),
+    ])
+    .await
+    else {
+        return;
+    };
+    let (status, body) = case.respond(USER_TURN).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let memories = case.memories().await;
+    assert_eq!(
+        memories.len(),
+        CAP,
+        "the cap must bound what is written, not merely what is proposed: {}",
+        memories.len()
+    );
+    let runs = case.runs().await;
+    assert_eq!(runs[0].candidate_count, (CAP + 3) as i32);
+    assert_eq!(runs[0].accepted_count, CAP as i32);
+    assert_eq!(runs[0].rejected_count, 3);
+    assert_eq!(
+        runs[0].metadata["rejections"]["run_candidate_limit"],
+        json!(3)
+    );
+    case.shutdown().await;
+}
+
 /// The dedupe must not be a blanket suppressor: an unrelated memory still gets written.
 ///
 /// The premise assertion for the two cases above. Without it, an implementation that discards
