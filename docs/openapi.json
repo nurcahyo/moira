@@ -6426,7 +6426,7 @@
       "PublicResponse": {
         "properties": {
           "citations": {
-            "description": "Always an empty array: RAG retrieval is not wired into response generation in\nthis release, so no citation is ever produced. See\nplans/11-rag-memory-intelligence.md for the tracked follow-up.",
+            "description": "Provenance for the retrieved context that reached the model on this request: one\nentry per memory or RAG chunk that was actually included in the assembled prompt,\nnever per candidate the token budget dropped.\n\nPopulated on `POST /api/v1/responses` and the OpenAI-compatible `POST /v1/responses`\nwhen the request carries a `conversation`, the caller's application has retrieval\nenabled with an embedding model configured, and at least one memory or chunk scores\nabove the configured threshold. An empty array is the normal result whenever any of\nthose does not hold: no conversation on the request, retrieval disabled for the\napplication, nothing matched, or a retrieval failure absorbed by the default\n`continue_without_semantic_retrieval` policy.\n\nOnly retrieved memories and RAG chunks are cited. Replayed conversation history and\nthe conversation summary are injected into the prompt without citations, so an empty\narray does not mean the model saw no conversation context.\n\n`GET /api/v1/responses/{response_id}` returns an empty array for every response:\ncitations come from the context plan computed during the originating request and are\ndeliberately not re-resolved afterwards. Serialises as `[]`, never `null`. See\ndocs/retrieval-citations.md.",
             "items": {
               "$ref": "#/components/schemas/PublicCitation"
             },

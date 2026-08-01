@@ -1676,8 +1676,70 @@ mod tests {
         );
     }
 
+    /// Ways of restating the falsehood this test was inverted to catch.
+    ///
+    /// Matched against a lowercased, whitespace-collapsed description, because the
+    /// generated document hard-wraps the doc comment and a claim split across two lines
+    /// is the same claim.
+    const CITATIONS_UNWIRED_CLAIMS: [&str; 7] = [
+        "always an empty array",
+        "always empty",
+        "not wired",
+        "no citation is ever produced",
+        "never produced",
+        "never populated",
+        "retrieval is not implemented",
+    ];
+
+    /// Facts the description must carry for a caller to parse the field correctly.
+    ///
+    /// Each is a substring of the shipped description plus the reason it is load-bearing,
+    /// so a failure says what is missing rather than only that something is.
+    const CITATIONS_REQUIRED_FACTS: [(&str, &str); 3] = [
+        (
+            "provenance",
+            "the field must be described as provenance, not as a placeholder",
+        ),
+        (
+            "memory",
+            "memories are one of the two citable kinds and callers must expect them",
+        ),
+        (
+            "rag chunk",
+            "RAG chunks are the other citable kind and callers must expect them",
+        ),
+    ];
+
+    /// Ways of saying that an empty array is a normal outcome. Any one suffices.
+    ///
+    /// Guards the *opposite* absolute: a description that swings from "always empty" to
+    /// implying a citation is always present is a new lie, not a fix.
+    const CITATIONS_EMPTY_IS_NORMAL: [&str; 3] = [
+        "an empty array is the normal result",
+        "nothing matched",
+        "returns an empty array for every response",
+    ];
+
+    /// `PublicResponse.citations` carries real retrieval provenance, and the schema must
+    /// say so.
+    ///
+    /// **This test was inverted.** It shipped as
+    /// `public_response_schema_documents_always_empty_citations`, asserting the description
+    /// *contained* "empty" and "not wired" — true when plan 02a wrote it, false from the
+    /// moment plan 11 Sub-Phase G wired retrieval into response generation. For that window
+    /// a committed test was enforcing a contract that lied to every caller, and the honest
+    /// fix had to turn CI red before it could turn it green. That is the second test in this
+    /// repository found pinning a defect rather than guarding against one (see
+    /// `plans/reports/HANDOFF.md` §3.4 on `console-jwks-stability.test.ts`), so it is named
+    /// here to make the pattern visible: **a test that asserts a limitation must be revisited
+    /// by whatever removes the limitation**, and nothing but review enforces that.
+    ///
+    /// Division of labour with its siblings: `committed_openapi_matches_the_generated_document`
+    /// already pins this description *verbatim* through the snapshot, so any prose edit is
+    /// already a deliberate act. This test asks the question the snapshot cannot — whether
+    /// the prose, whatever it now says, is still **true**.
     #[test]
-    fn public_response_schema_documents_always_empty_citations() {
+    fn public_response_schema_documents_citations_as_real_provenance() {
         let value = serde_json::to_value(documented_router(RouterPolicy::default()).into_openapi())
             .unwrap();
         let description = value["components"]["schemas"]["PublicResponse"]["properties"]
@@ -1685,13 +1747,39 @@ mod tests {
             .as_str()
             .expect("PublicResponse.citations must carry a description");
         assert!(!description.is_empty());
+
+        let normalized = description
+            .to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        for claim in CITATIONS_UNWIRED_CLAIMS {
+            assert!(
+                !normalized.contains(claim),
+                "citations description claims retrieval is unwired ({claim:?}), but plan 11 \
+                 Sub-Phase G wired it: citations are populated from the context plan written \
+                 during the request, and tests/rag_retrieval_end_to_end.rs proves a citation \
+                 names a chunk that was actually retrieved. Describe the real conditions \
+                 instead: {description}"
+            );
+        }
+
+        for (fact, why) in CITATIONS_REQUIRED_FACTS {
+            assert!(
+                normalized.contains(fact),
+                "citations description is missing {fact:?} — {why}: {description}"
+            );
+        }
+
         assert!(
-            description.to_lowercase().contains("empty"),
-            "citations description must state that the array is always empty: {description}"
-        );
-        assert!(
-            description.to_lowercase().contains("not wired"),
-            "citations description must state that retrieval is not wired: {description}"
+            CITATIONS_EMPTY_IS_NORMAL
+                .iter()
+                .any(|marker| normalized.contains(marker)),
+            "citations description must say that an empty array is a normal outcome. \
+             Retrieval is off by default (application_retrieval_policies.enabled defaults to \
+             false) and a request without a conversation never plans context, so implying a \
+             citation is always present replaces one false absolute with another: {description}"
         );
     }
 
