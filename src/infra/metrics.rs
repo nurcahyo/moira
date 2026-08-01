@@ -116,6 +116,22 @@ const EMBEDDING_BATCH_LATENCY_SECONDS: &str = "moira_embedding_batch_latency_sec
 const RETRIEVAL_RUNS_TOTAL: &str = "moira_retrieval_runs_total";
 const RETRIEVAL_LATENCY_SECONDS: &str = "moira_retrieval_latency_seconds";
 
+// Plan 11 Sub-Phase F — automatic memory extraction.
+//
+// Three families, and the split is deliberate. `..._runs_total` reuses the shared
+// `succeeded`/`failed` `outcome` domain and adds no new label *value*, exactly as
+// `RAG_INGESTION_RUNS_TOTAL` does. The other two are **label-free**: the interesting breakdown
+// is *why* a candidate was refused, and that is per-application, per-policy detail which
+// `ALLOWED_LABEL_KEYS` admits no dimension for. It goes on `memory_extraction_runs.metadata`,
+// which is the row this counter is the aggregate of.
+//
+// Written at all because extraction is invisible by construction: it never surfaces an error to
+// the caller, so without these families "extraction silently stopped writing memories" and
+// "nobody has enabled extraction" look identical on a dashboard.
+const MEMORY_EXTRACTION_RUNS_TOTAL: &str = "moira_memory_extraction_runs_total";
+const MEMORY_EXTRACTION_WRITTEN_TOTAL: &str = "moira_memory_extraction_written_total";
+const MEMORY_EXTRACTION_REJECTED_TOTAL: &str = "moira_memory_extraction_rejected_total";
+
 // Plan 09 wave 2 — the admin-invitation surface, which grants full `moira:admin` on
 // redemption and had no operational signal at all before this.
 //
@@ -391,6 +407,25 @@ impl MetricsRegistry {
                  queries plus ranking — in seconds. Recorded on failure as well as success."
             );
             describe_counter!(
+                MEMORY_EXTRACTION_RUNS_TOTAL,
+                "Automatic memory-extraction runs, by outcome. A run is counted once per \
+                 assistant turn that actually called the extractor; a turn on an application \
+                 with automatic_extraction_enabled off — the default — counts nothing."
+            );
+            describe_counter!(
+                MEMORY_EXTRACTION_WRITTEN_TOTAL,
+                "Memory records written by automatic extraction. Counts inserts only: a \
+                 candidate recognised as a duplicate of an existing memory confirms that row \
+                 and is not counted here."
+            );
+            describe_counter!(
+                MEMORY_EXTRACTION_REJECTED_TOTAL,
+                "Extraction candidates refused by the application's memory policy — \
+                 disallowed type or sensitivity, confidence below the minimum, or content that \
+                 failed validation. Per-reason detail is on memory_extraction_runs.metadata; a \
+                 reason label would be unbounded per application."
+            );
+            describe_counter!(
                 ADMIN_INVITE_OUTCOMES_TOTAL,
                 "Admin-invitation outcomes, by a bounded outcome/denial-reason label. Carries \
                  no invitee email, domain, invite id or issuer: those are unbounded \
@@ -425,9 +460,12 @@ impl MetricsRegistry {
             }
             counter!(RAG_CHUNKS_WRITTEN_TOTAL).increment(0);
             counter!(RAG_EMBEDDINGS_WRITTEN_TOTAL).increment(0);
+            counter!(MEMORY_EXTRACTION_WRITTEN_TOTAL).increment(0);
+            counter!(MEMORY_EXTRACTION_REJECTED_TOTAL).increment(0);
             for outcome in RAG_INGESTION_OUTCOMES {
                 counter!(RAG_INGESTION_RUNS_TOTAL, "outcome" => *outcome).increment(0);
                 counter!(RETRIEVAL_RUNS_TOTAL, "outcome" => *outcome).increment(0);
+                counter!(MEMORY_EXTRACTION_RUNS_TOTAL, "outcome" => *outcome).increment(0);
             }
             for outcome in ADMIN_INVITE_OUTCOMES {
                 counter!(ADMIN_INVITE_OUTCOMES_TOTAL, "outcome" => *outcome).increment(0);
@@ -572,6 +610,29 @@ impl MetricsRegistry {
         with_local_recorder(&self.inner.recorder, || {
             counter!(RETRIEVAL_RUNS_TOTAL, "outcome" => outcome).increment(1);
             histogram!(RETRIEVAL_LATENCY_SECONDS).record(seconds);
+        });
+    }
+
+    /// Records one automatic memory-extraction run — plan 11 Sub-Phase F.
+    ///
+    /// `written` counts inserts, not accepted candidates: a candidate that turned out to
+    /// duplicate an existing memory confirms that row instead, and counting it here would make
+    /// "extraction is producing memories" true on an application that has produced exactly one
+    /// and re-observed it a thousand times.
+    ///
+    /// Counted on failure as well as success, and always counted when the extractor was
+    /// actually called. Extraction never surfaces an error to the caller, so this counter and
+    /// the `memory_extraction_runs` row are the only places a failing extractor shows up.
+    pub fn record_memory_extraction_run(&self, written: u64, rejected: u64, succeeded: bool) {
+        let outcome = if succeeded { "succeeded" } else { "failed" };
+        with_local_recorder(&self.inner.recorder, || {
+            counter!(MEMORY_EXTRACTION_RUNS_TOTAL, "outcome" => outcome).increment(1);
+            if written > 0 {
+                counter!(MEMORY_EXTRACTION_WRITTEN_TOTAL).increment(written);
+            }
+            if rejected > 0 {
+                counter!(MEMORY_EXTRACTION_REJECTED_TOTAL).increment(rejected);
+            }
         });
     }
 
@@ -1504,10 +1565,33 @@ mod tests {
             RAG_EMBEDDINGS_WRITTEN_TOTAL,
             RAG_INGESTION_RUNS_TOTAL,
             RETRIEVAL_RUNS_TOTAL,
+            MEMORY_EXTRACTION_RUNS_TOTAL,
+            MEMORY_EXTRACTION_WRITTEN_TOTAL,
+            MEMORY_EXTRACTION_REJECTED_TOTAL,
         ] {
             assert!(
                 rendered.contains(family),
                 "{family} is absent from a fresh scrape body:\n{rendered}"
+            );
+        }
+        // The two label-free extraction families must be seeded at literal zero, not merely
+        // present: an alert on "extraction stopped writing memories" has to have a series to
+        // evaluate on a process where extraction has never run.
+        for family in [
+            MEMORY_EXTRACTION_WRITTEN_TOTAL,
+            MEMORY_EXTRACTION_REJECTED_TOTAL,
+        ] {
+            assert!(
+                rendered.contains(&format!("{family}{{service=\"moira-test\"}} 0")),
+                "{family} is not zero-seeded:\n{rendered}"
+            );
+        }
+        for outcome in RAG_INGESTION_OUTCOMES {
+            assert!(
+                rendered.contains(&format!(
+                    "{MEMORY_EXTRACTION_RUNS_TOTAL}{{service=\"moira-test\",outcome=\"{outcome}\"}}"
+                )),
+                "{MEMORY_EXTRACTION_RUNS_TOTAL} is missing its {outcome} series:\n{rendered}"
             );
         }
         // Both outcome series, not just the one a happy path would produce: an alert on

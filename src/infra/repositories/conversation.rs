@@ -75,10 +75,11 @@ use crate::{
         ConversationPolicyPutRequest, ConversationPolicyRecord, ConversationQuery,
         ConversationRecord, ConversationStatus, EmbeddingPolicyPutRequest, EmbeddingPolicyRecord,
         ListCursor, MemoryCreateRequest, MemoryPatchRequest, MemoryPolicyPutRequest,
-        MemoryPolicyRecord, MemoryQuery, MemoryRecord, MemoryScope, RagCollectionCreateRequest,
-        RagCollectionPatchRequest, RagCollectionQuery, RagCollectionRecord, RagCollectionStatus,
-        RagDocumentCreateRequest, RagDocumentIngestRequest, RagDocumentRecord,
-        RetrievalPolicyPutRequest, RetrievalPolicyRecord, SeqCursor,
+        MemoryPolicyRecord, MemoryQuery, MemoryRecord, MemoryScope, MemorySensitivity,
+        MemoryStatus, MemoryType, RagCollectionCreateRequest, RagCollectionPatchRequest,
+        RagCollectionQuery, RagCollectionRecord, RagCollectionStatus, RagDocumentCreateRequest,
+        RagDocumentIngestRequest, RagDocumentRecord, RetrievalPolicyPutRequest,
+        RetrievalPolicyRecord, SeqCursor,
     },
     error::AppError,
     infra::pg_rows::{
@@ -1975,6 +1976,68 @@ pub struct RetrievalScope {
     pub external_user_id: Option<String>,
 }
 
+/// **The isolation predicate every `memory_records` read shares.** `$2` application id, `$3`
+/// external tenant id, `$4` external user id.
+///
+/// A constant interpolated into each query rather than a literal repeated in each, so
+/// "extraction's dedupe is scoped exactly like retrieval" is a fact about one string instead of
+/// a claim about several that a later edit can quietly falsify. `every_memory_read_shares_the_isolation_predicate`
+/// asserts every builder below embeds it.
+///
+/// It also carries F14's third clause. `memory_records.content_hash` is an **unkeyed content
+/// address** (`memory_content_hash`, `src/application/conversation.rs`), and that decision holds
+/// only while the hash is never compared across applications. The `m.application_id = $2` line
+/// here is what makes that true for the extraction dedupe. A query that stops using this
+/// constant, or an edit that removes that line from it, is exactly the condition that reverses
+/// F14 and puts the peppered hasher back.
+const MEMORY_SCOPE_PREDICATE: &str = r#"
+              m.application_id = $2
+              and (
+                    m.memory_scope = 'application'
+                 or (m.memory_scope = 'tenant_application'
+                     and coalesce(m.external_tenant_id, '') = coalesce($3, ''))
+                 or (m.memory_scope in ('user_application', 'conversation')
+                     and coalesce(m.external_tenant_id, '') = coalesce($3, '')
+                     and coalesce(m.external_user_id, '') = coalesce($4, ''))
+              )
+"#;
+
+/// Statuses a memory may hold and still suppress a duplicate extraction.
+///
+/// `'candidate'` is included and that is load-bearing. Retrieval only ever sees `'active'`, so
+/// scoping the dedupe to `'active'` would look correct and would make `explicit_only`
+/// applications accumulate one unconfirmed duplicate **per turn** — the memory exists, nothing
+/// can retrieve it, and nothing recognises it. Pinned by
+/// `extraction_dedupes_against_unconfirmed_candidate_rows`.
+const DEDUPE_STATUSES: &str = "('active', 'candidate')";
+
+fn memory_candidates_sql() -> String {
+    format!(
+        r#"
+            select m.id as memory_uuid,
+                   m.public_id,
+                   m.memory_type,
+                   m.memory_key,
+                   m.content_plain,
+                   m.importance,
+                   (e.embedding <=> $1::vector) as distance,
+                   -- `extract` returns `numeric` on PostgreSQL 14+, which sqlx will not decode as
+                   -- `f64`. The cast is not cosmetic: without it every candidate query fails at
+                   -- decode time and retrieval degrades to "backend failed" on every request.
+                   extract(epoch from (now() - m.updated_at))::float8 as age_seconds
+            from memory_embeddings e
+            join memory_records m on m.id = e.memory_id
+            where e.superseded_at is null
+              and e.embedding is not null
+              and m.deleted_at is null
+              and m.status = 'active'
+              and {MEMORY_SCOPE_PREDICATE}
+            order by e.embedding <=> $1::vector
+            limit $5
+            "#
+    )
+}
+
 /// Semantically-ranked `memory_records` candidates for one caller scope.
 ///
 /// # The scope predicate, and why it is not the flat one
@@ -2008,45 +2071,14 @@ pub(crate) async fn find_memory_candidates(
     query_vector: &str,
     limit: i64,
 ) -> Result<Vec<MemoryCandidate>, AppError> {
-    let rows = sqlx::query(
-        r#"
-            select m.id as memory_uuid,
-                   m.public_id,
-                   m.memory_type,
-                   m.memory_key,
-                   m.content_plain,
-                   m.importance,
-                   (e.embedding <=> $1::vector) as distance,
-                   -- `extract` returns `numeric` on PostgreSQL 14+, which sqlx will not decode as
-                   -- `f64`. The cast is not cosmetic: without it every candidate query fails at
-                   -- decode time and retrieval degrades to "backend failed" on every request.
-                   extract(epoch from (now() - m.updated_at))::float8 as age_seconds
-            from memory_embeddings e
-            join memory_records m on m.id = e.memory_id
-            where e.superseded_at is null
-              and e.embedding is not null
-              and m.deleted_at is null
-              and m.status = 'active'
-              and m.application_id = $2
-              and (
-                    m.memory_scope = 'application'
-                 or (m.memory_scope = 'tenant_application'
-                     and coalesce(m.external_tenant_id, '') = coalesce($3, ''))
-                 or (m.memory_scope in ('user_application', 'conversation')
-                     and coalesce(m.external_tenant_id, '') = coalesce($3, '')
-                     and coalesce(m.external_user_id, '') = coalesce($4, ''))
-              )
-            order by e.embedding <=> $1::vector
-            limit $5
-            "#,
-    )
-    .bind(query_vector)
-    .bind(scope.application_id)
-    .bind(&scope.external_tenant_id)
-    .bind(&scope.external_user_id)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
+    let rows = sqlx::query(&memory_candidates_sql())
+        .bind(query_vector)
+        .bind(scope.application_id)
+        .bind(&scope.external_tenant_id)
+        .bind(&scope.external_user_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
     rows.iter().map(memory_candidate_from_row).collect()
 }
 
@@ -2230,6 +2262,324 @@ pub(crate) async fn insert_memory_embedding(
     .bind(embedding_model_id)
     .bind(SUPPORTED_EMBEDDING_DIMENSION as i32)
     .bind(encoded_vector)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Automatic memory extraction — plan 11 Sub-Phase F.
+//
+// INVARIANT — every read here goes through `MEMORY_SCOPE_PREDICATE`, which binds
+// `application_id`. Extraction compares content hashes and embedding distances against stored
+// memories, and both comparisons are existence oracles if they can reach another application's
+// rows. See the constant's own doc for why this is F14's reversal condition.
+// ---------------------------------------------------------------------------
+
+/// The row opened at the start of an extraction run.
+#[derive(Debug, Clone)]
+pub struct MemoryExtractionRunInsert {
+    pub conversation_uuid: Option<Uuid>,
+    pub response_id: Option<Uuid>,
+    pub input_message_ids: Vec<Uuid>,
+    pub provider_model_id: Option<Uuid>,
+}
+
+/// Opens a `memory_extraction_runs` row in `'running'`.
+///
+/// Written **before** the completion call, not after it. A run that dies mid-call — a panic, a
+/// process restart, a deadline — then leaves a `'running'` row rather than no row at all, which
+/// is the difference between "extraction was attempted and we do not know the outcome" and
+/// "extraction never happened". Recording only completed runs is the same dishonesty as P0-1's
+/// hardcoded `'indexed'`, in the other direction.
+pub(crate) async fn insert_memory_extraction_run(
+    pool: &PgPool,
+    insert: &MemoryExtractionRunInsert,
+) -> Result<Uuid, AppError> {
+    let id = Uuid::now_v7();
+    sqlx::query(
+        r#"
+            insert into memory_extraction_runs (
+                id, conversation_id, response_id, status, input_message_ids, provider_model_id
+            )
+            values ($1, $2, $3, 'running', $4, $5)
+            "#,
+    )
+    .bind(id)
+    .bind(insert.conversation_uuid)
+    .bind(insert.response_id)
+    .bind(&insert.input_message_ids)
+    .bind(insert.provider_model_id)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+/// How an extraction run ended.
+#[derive(Debug, Clone)]
+pub struct MemoryExtractionRunOutcome {
+    pub candidate_count: i32,
+    pub accepted_count: i32,
+    pub rejected_count: i32,
+    /// `'completed'` or `'failed'`, per the check constraint.
+    pub status: &'static str,
+    pub failure_class: Option<&'static str>,
+    /// Per-reason rejection counts and dedupe/contradiction tallies.
+    ///
+    /// On the row, never on a metric label: `ALLOWED_LABEL_KEYS` admits no per-application
+    /// dimension, and a rejection-reason label would be one more series per application per
+    /// reason on a scrape path.
+    pub metadata: Value,
+}
+
+pub(crate) async fn complete_memory_extraction_run(
+    pool: &PgPool,
+    run_id: Uuid,
+    outcome: &MemoryExtractionRunOutcome,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+            update memory_extraction_runs
+            set status = $2,
+                candidate_count = $3,
+                accepted_count = $4,
+                rejected_count = $5,
+                failure_class = $6,
+                metadata = $7,
+                completed_at = now()
+            where id = $1
+            "#,
+    )
+    .bind(run_id)
+    .bind(outcome.status)
+    .bind(outcome.candidate_count)
+    .bind(outcome.accepted_count)
+    .bind(outcome.rejected_count)
+    .bind(outcome.failure_class)
+    .bind(&outcome.metadata)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+fn memory_by_content_hash_sql() -> String {
+    format!(
+        r#"
+            select m.id as memory_uuid
+            from memory_records m
+            where m.deleted_at is null
+              and m.status in {DEDUPE_STATUSES}
+              and m.content_hash = $1
+              and {MEMORY_SCOPE_PREDICATE}
+            order by m.created_at asc
+            limit 1
+            "#
+    )
+}
+
+/// The oldest in-scope memory whose content address equals `content_hash`.
+///
+/// Exact dedupe. `content_hash` here is the **unkeyed** content address F14 established, so
+/// identical text produces an identical value indefinitely and this lookup keeps working across
+/// a pepper rotation. The `application_id` binding is what keeps that safe — see
+/// [`MEMORY_SCOPE_PREDICATE`].
+pub(crate) async fn find_memory_by_content_hash(
+    pool: &PgPool,
+    scope: &RetrievalScope,
+    content_hash: &str,
+) -> Result<Option<Uuid>, AppError> {
+    let row = sqlx::query(&memory_by_content_hash_sql())
+        .bind(content_hash)
+        .bind(scope.application_id)
+        .bind(&scope.external_tenant_id)
+        .bind(&scope.external_user_id)
+        .fetch_optional(pool)
+        .await?;
+    match row {
+        Some(row) => Ok(Some(row.try_get("memory_uuid")?)),
+        None => Ok(None),
+    }
+}
+
+fn nearest_memory_sql() -> String {
+    format!(
+        r#"
+            select m.id as memory_uuid,
+                   (e.embedding <=> $1::vector) as distance
+            from memory_embeddings e
+            join memory_records m on m.id = e.memory_id
+            where e.superseded_at is null
+              and e.embedding is not null
+              and m.deleted_at is null
+              and m.status in {DEDUPE_STATUSES}
+              and {MEMORY_SCOPE_PREDICATE}
+            order by e.embedding <=> $1::vector
+            limit 1
+            "#
+    )
+}
+
+/// The single closest in-scope memory to `query_vector`, with its cosine distance.
+///
+/// The distance comparison stays in the caller ([`crate::application::memory_extraction::is_near_duplicate`])
+/// rather than becoming a `having` clause here, so the threshold and its boundary are testable
+/// without a database. What must **not** move is the scope predicate: an unscoped nearest
+/// neighbour would tell an attacker who can drive extraction whether another application holds
+/// a semantically similar memory, purely from whether their own memory got written.
+pub(crate) async fn find_nearest_memory(
+    pool: &PgPool,
+    scope: &RetrievalScope,
+    query_vector: &str,
+) -> Result<Option<(Uuid, f64)>, AppError> {
+    let row = sqlx::query(&nearest_memory_sql())
+        .bind(query_vector)
+        .bind(scope.application_id)
+        .bind(&scope.external_tenant_id)
+        .bind(&scope.external_user_id)
+        .fetch_optional(pool)
+        .await?;
+    match row {
+        Some(row) => Ok(Some((
+            row.try_get("memory_uuid")?,
+            row.try_get("distance")?,
+        ))),
+        None => Ok(None),
+    }
+}
+
+fn memory_by_key_sql() -> String {
+    format!(
+        r#"
+            select m.id as memory_uuid, m.content_hash
+            from memory_records m
+            where m.deleted_at is null
+              and m.status in {DEDUPE_STATUSES}
+              and m.memory_key = $1
+              and {MEMORY_SCOPE_PREDICATE}
+            order by m.created_at desc
+            limit 1
+            "#
+    )
+}
+
+/// The most recent in-scope memory carrying `memory_key`, with its content address.
+///
+/// The contradiction heuristic the plan specifies: same key, different content address means
+/// the caller has told us two different things about the same subject. The comparison of the
+/// two hashes is left to the caller so the "different content" half is a pure decision.
+pub(crate) async fn find_memory_by_key(
+    pool: &PgPool,
+    scope: &RetrievalScope,
+    memory_key: &str,
+) -> Result<Option<(Uuid, String)>, AppError> {
+    let row = sqlx::query(&memory_by_key_sql())
+        .bind(memory_key)
+        .bind(scope.application_id)
+        .bind(&scope.external_tenant_id)
+        .bind(&scope.external_user_id)
+        .fetch_optional(pool)
+        .await?;
+    match row {
+        Some(row) => Ok(Some((
+            row.try_get("memory_uuid")?,
+            row.try_get("content_hash")?,
+        ))),
+        None => Ok(None),
+    }
+}
+
+/// Records that an existing memory was re-observed, instead of inserting a duplicate.
+///
+/// `use_count` is incremented and `last_confirmed_at` set — the plan's "skip or update"
+/// alternative, taking the update branch so a repeatedly-confirmed memory is distinguishable
+/// from one that was mentioned once. Deliberately does **not** touch `content_plain`: a
+/// near-duplicate is not necessarily a better phrasing, and overwriting on similarity would let
+/// a later turn silently rewrite an earlier memory's meaning.
+pub(crate) async fn confirm_memory(pool: &PgPool, memory_uuid: Uuid) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+            update memory_records
+            set use_count = use_count + 1,
+                last_confirmed_at = now()
+            where id = $1 and deleted_at is null
+            "#,
+    )
+    .bind(memory_uuid)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// One extracted memory, ready to insert.
+#[derive(Debug, Clone)]
+pub struct ExtractedMemoryInsert<'a> {
+    pub id: Uuid,
+    pub public_id: &'a str,
+    pub application_id: Uuid,
+    pub external_tenant_id: Option<&'a str>,
+    pub external_user_id: Option<&'a str>,
+    pub conversation_uuid: Option<Uuid>,
+    pub scope: MemoryScope,
+    pub memory_type: MemoryType,
+    pub memory_key: Option<&'a str>,
+    pub content: &'a str,
+    pub content_hash: &'a str,
+    pub confidence: f64,
+    pub sensitivity: MemorySensitivity,
+    pub status: MemoryStatus,
+    pub source_message_ids: Vec<Uuid>,
+    pub source_response_id: Option<Uuid>,
+    pub source_extraction_run_id: Uuid,
+    pub contradicts_memory_id: Option<Uuid>,
+    pub resolution_status: Option<&'a str>,
+}
+
+/// Writes one extracted memory.
+///
+/// Separate from [`ConversationRepository::create_memory`] rather than a widening of it, because
+/// that method hardcodes `'normal'`/`'active'` for the manual path and every column this one
+/// needs — status, sensitivity, key, provenance, contradiction — is a column extraction is the
+/// only writer of. Widening the shared method would put four `coalesce`s and a nullable status
+/// on the caller-facing path to serve a use case it does not have.
+pub(crate) async fn insert_extracted_memory(
+    pool: &PgPool,
+    insert: &ExtractedMemoryInsert<'_>,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+            insert into memory_records (
+                id, public_id, application_id, external_tenant_id, external_user_id,
+                conversation_id, memory_scope, memory_type, memory_key, content_plain,
+                content_hash, confidence, sensitivity, status, source_message_ids,
+                source_response_id, source_extraction_run_id, contradicts_memory_id,
+                resolution_status, metadata
+            )
+            values (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                $11, $12, $13, $14, $15, $16, $17, $18, $19,
+                jsonb_build_object('source', 'automatic_extraction')
+            )
+            "#,
+    )
+    .bind(insert.id)
+    .bind(insert.public_id)
+    .bind(insert.application_id)
+    .bind(insert.external_tenant_id)
+    .bind(insert.external_user_id)
+    .bind(insert.conversation_uuid)
+    .bind(memory_scope_to_db(insert.scope))
+    .bind(memory_type_to_db(insert.memory_type))
+    .bind(insert.memory_key)
+    .bind(insert.content)
+    .bind(insert.content_hash)
+    .bind(insert.confidence)
+    .bind(memory_sensitivity_to_db(insert.sensitivity))
+    .bind(memory_status_to_db(insert.status))
+    .bind(&insert.source_message_ids)
+    .bind(insert.source_response_id)
+    .bind(insert.source_extraction_run_id)
+    .bind(insert.contradicts_memory_id)
+    .bind(insert.resolution_status)
     .execute(pool)
     .await?;
     Ok(())
@@ -2497,10 +2847,76 @@ fn message_sequence(value: Option<&str>) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        LIST_CONVERSATIONS_SQL, LIST_MEMORIES_SQL, LIST_MESSAGES_SQL, LIST_RAG_COLLECTIONS_SQL,
-        LIST_RAG_DOCUMENTS_SQL, conversation_message_select, conversation_select, memory_select,
+        DEDUPE_STATUSES, LIST_CONVERSATIONS_SQL, LIST_MEMORIES_SQL, LIST_MESSAGES_SQL,
+        LIST_RAG_COLLECTIONS_SQL, LIST_RAG_DOCUMENTS_SQL, MEMORY_SCOPE_PREDICATE,
+        conversation_message_select, conversation_select, memory_by_content_hash_sql,
+        memory_by_key_sql, memory_candidates_sql, memory_select, nearest_memory_sql,
         rag_document_select,
     };
+
+    /// **F14's third clause, as a test.** Every `memory_records` read that compares content
+    /// across rows must bind `application_id` in the same query.
+    ///
+    /// `memory_records.content_hash` is an unkeyed content address. That is only safe while the
+    /// hash is never compared across applications, so the extraction dedupe — which is exactly a
+    /// content-hash comparison and a nearest-neighbour comparison — is where that decision can
+    /// be silently reversed. Asserting the emitted SQL rather than the behaviour is deliberate:
+    /// a behavioural test needs two applications whose contents actually collide, and one
+    /// written without that collision passes against a query with no scope at all.
+    #[test]
+    fn every_memory_read_shares_the_isolation_predicate() {
+        for (name, sql) in [
+            ("retrieval candidates", memory_candidates_sql()),
+            ("exact-hash dedupe", memory_by_content_hash_sql()),
+            ("near-duplicate dedupe", nearest_memory_sql()),
+            ("contradiction lookup", memory_by_key_sql()),
+        ] {
+            assert!(
+                sql.contains(MEMORY_SCOPE_PREDICATE),
+                "{name} does not use the shared isolation predicate:\n{sql}"
+            );
+            assert!(
+                sql.contains("m.application_id = $2"),
+                "{name} does not bind an application id:\n{sql}"
+            );
+        }
+        // And the predicate itself still carries the application binding — a mutation that
+        // empties it would leave every assertion above trivially true.
+        assert!(MEMORY_SCOPE_PREDICATE.contains("m.application_id = $2"));
+        assert!(MEMORY_SCOPE_PREDICATE.contains("m.memory_scope = 'tenant_application'"));
+        assert!(MEMORY_SCOPE_PREDICATE.contains("coalesce(m.external_user_id, '')"));
+    }
+
+    /// Retrieval sees only `'active'`; dedupe must also see `'candidate'`.
+    ///
+    /// The asymmetry is the point, so it is asserted in both directions: a dedupe query scoped
+    /// like retrieval would make `explicit_only` applications accumulate one unconfirmed
+    /// duplicate per turn, and a retrieval query widened like dedupe would serve unconfirmed
+    /// memories as if consent had been given.
+    #[test]
+    fn dedupe_sees_unconfirmed_candidates_and_retrieval_does_not() {
+        assert!(DEDUPE_STATUSES.contains("'candidate'"));
+        assert!(DEDUPE_STATUSES.contains("'active'"));
+        for sql in [
+            memory_by_content_hash_sql(),
+            nearest_memory_sql(),
+            memory_by_key_sql(),
+        ] {
+            assert!(
+                sql.contains(&format!("m.status in {DEDUPE_STATUSES}")),
+                "a dedupe query must consider unconfirmed candidates:\n{sql}"
+            );
+        }
+        let retrieval = memory_candidates_sql();
+        assert!(
+            retrieval.contains("m.status = 'active'"),
+            "retrieval must stay active-only:\n{retrieval}"
+        );
+        assert!(
+            !retrieval.contains("'candidate'"),
+            "retrieval must never serve an unconfirmed memory:\n{retrieval}"
+        );
+    }
 
     /// The list endpoint's ordering is a property of the OUTER select, and is asserted here at the
     /// SQL level rather than through a query.

@@ -6,14 +6,19 @@ use crate::{
     app::AppState,
     application::{
         AdminCommandIdempotency, AdminCommandMutation, AdminCommandRunner, AdminCommandSpec,
-        ContextSections, RequestContext, assemble_context, budget_tokens,
+        ContextSections, EXTRACTION_TRANSCRIPT_MESSAGES, ExecutionService, ExtractionPolicy,
+        FAILURE_EXTRACTION_CALL_FAILED, MAXIMUM_CANDIDATES_PER_RUN, MoiraExecutionService,
+        NEAR_DUPLICATE_MAX_DISTANCE, RejectionReason, RequestContext, assemble_context,
+        budget_tokens, classify_candidate, effective_extraction_status, extraction_messages,
+        extraction_output_schema, is_near_duplicate, parse_candidates, render_transcript,
     },
     domain::{
-        AuditLogInsert, AuditResult, ConversationCreateRequest, ConversationMessageCreateRequest,
-        ConversationMessageQuery, ConversationMessageRecord, ConversationMessageRole,
-        ConversationMessageType, ConversationPatchRequest, ConversationPolicyPutRequest,
-        ConversationPolicyRecord, ConversationQuery, ConversationRecord, ConversationStatus,
-        CursorScope, DomainMessage, EmbeddingPolicyPutRequest, EmbeddingPolicyRecord,
+        AuditLogInsert, AuditResult, CallerRuntimeIdentity, ConversationCreateRequest,
+        ConversationMessageCreateRequest, ConversationMessageQuery, ConversationMessageRecord,
+        ConversationMessageRole, ConversationMessageType, ConversationPatchRequest,
+        ConversationPolicyPutRequest, ConversationPolicyRecord, ConversationQuery,
+        ConversationRecord, ConversationStatus, CursorScope, DomainMessage,
+        EmbeddingPolicyPutRequest, EmbeddingPolicyRecord, ExecutionCommand, ExecutionOptions,
         HistoryStrategy, ListCursor, ListResponse, MemoryConsentMode, MemoryCreateRequest,
         MemoryPatchRequest, MemoryPolicyPutRequest, MemoryPolicyRecord, MemoryQuery, MemoryRecord,
         MemoryScope, MemoryStatus, Pagination, PublicCitation, PublicContentPart,
@@ -25,14 +30,17 @@ use crate::{
     error::AppError,
     infra::repositories::{
         AdminRepository, ContextPlanInsert, ConversationAccess, ConversationInsert,
-        ConversationMessageInsert, ConversationRepository, MemoryInsert, PgAdminRepository,
+        ConversationMessageInsert, ConversationRepository, ExtractedMemoryInsert,
+        MemoryExtractionRunInsert, MemoryExtractionRunOutcome, MemoryInsert, PgAdminRepository,
         PgConversationRepository, RagIngestionContext, RetrievalRunInsert, RetrievalScope,
-        create_rag_collection_with_connection, create_rag_document_with_connection,
-        find_application_embedding_target, find_collection_ingestion_context,
-        find_conversation_context_anchor, find_document_ingestion_context,
-        find_embedding_model_target, find_memory_candidates, find_rag_chunk_candidates,
+        complete_memory_extraction_run, confirm_memory, create_rag_collection_with_connection,
+        create_rag_document_with_connection, find_application_embedding_target,
+        find_collection_ingestion_context, find_conversation_context_anchor,
+        find_document_ingestion_context, find_embedding_model_target, find_memory_by_content_hash,
+        find_memory_by_key, find_memory_candidates, find_nearest_memory, find_rag_chunk_candidates,
         find_recent_messages, ingest_rag_document_with_connection, insert_context_plan,
-        insert_memory_embedding, insert_retrieval_run, resolve_embedding_credential,
+        insert_extracted_memory, insert_memory_embedding, insert_memory_extraction_run,
+        insert_retrieval_run, resolve_embedding_credential,
     },
     orchestration::{
         CANDIDATE_OVERFETCH, ChunkStrategy, ChunkingLimits, EmbeddingBatchPlan, EmbeddingFactory,
@@ -149,6 +157,30 @@ fn paginate<T, K: PageKey>(
 
 /// The database or connection pool refused the candidate query.
 const FAILURE_RETRIEVAL_BACKEND: &str = "retrieval_backend_failed";
+
+/// `memory_records.resolution_status` for a contradiction nobody has adjudicated.
+///
+/// The column has no check constraint (`migrations/0007…:255`), so this is a constant rather
+/// than a literal at the write site: two spellings would make "how many contradictions are
+/// outstanding" unanswerable by query.
+const CONTRADICTION_UNRESOLVED: &str = "unresolved";
+
+/// A run that produced nothing, with the reason on the row.
+///
+/// `candidate_count` is zero rather than "however many we had parsed": a failure before the
+/// parse means no candidate was ever proposed, and a failure at the parse means none was
+/// proposed *usably*. Reporting a non-zero candidate count with zero accepted and zero rejected
+/// would not add up.
+fn failed_extraction(failure_class: &'static str) -> MemoryExtractionRunOutcome {
+    MemoryExtractionRunOutcome {
+        candidate_count: 0,
+        accepted_count: 0,
+        rejected_count: 0,
+        status: "failed",
+        failure_class: Some(failure_class),
+        metadata: json!({}),
+    }
+}
 
 /// The only `application_embedding_policies.failure_behavior` value that makes retrieval a hard
 /// requirement.
@@ -995,7 +1027,414 @@ impl ConversationService {
             json!({ "conversation_id": link.conversation_id, "source": "response_completion" }),
         )
         .await?;
+        // Automatic memory extraction (plan 11 Sub-Phase F). Deliberately after the assistant
+        // message is persisted and audited, and deliberately infallible: the caller's response
+        // has already been produced, and an extraction problem must not turn a successful
+        // response into an error. Every failure is recorded on `memory_extraction_runs`.
+        self.extract_memories(actor, ctx, link, response_id).await;
         Ok(Some(message))
+    }
+
+    /// Extracts durable memories from the turn that just completed — plan 11 Sub-Phase F.
+    ///
+    /// # Why this is inline rather than enqueued
+    ///
+    /// Sub-Phase E's summarization is specified as *enqueued*, and the same reasoning would
+    /// apply here — extraction is a second completion call, so it roughly doubles the latency
+    /// of a turn on an application that enables it. It is nevertheless synchronous, because the
+    /// alternatives available in this tree are worse:
+    ///
+    /// * **The queue does not execute job bodies yet.** `run_supervisor` wires
+    ///   `queue::StubJobDispatcher` (`src/infra/workers.rs`), so an enqueued extraction would
+    ///   be claimed and dropped. Shipping a feature whose work never runs, behind a flag that
+    ///   says it does, is exactly the P0-1 shape this plan exists to remove.
+    /// * **A detached `tokio::spawn` would outlive the request** and its pool guarantees, and
+    ///   could not be asserted on deterministically without a `sleep` — which
+    ///   `CONVENTIONS.md` §3 forbids and finding P2-12 is about.
+    ///
+    /// The cost is bounded by the flag: `automatic_extraction_enabled` defaults to `false`, so
+    /// no existing application pays anything, and an operator who turns it on is opting into a
+    /// second model call per turn — which is documented in `docs/memory-extraction.md`.
+    ///
+    /// **Reversal condition:** move the body behind `memory-extraction-retry` the moment a real
+    /// `JobDispatcher` replaces the stub. This function is already shaped for it — it takes
+    /// only ids and reads everything else from the database.
+    ///
+    /// # Failure policy
+    ///
+    /// Returns `()`. Every early return is a *decision*, not an error, and every genuine
+    /// failure is written to `memory_extraction_runs.failure_class`. Nothing here can produce
+    /// an `AppError`, so there is no path by which extraction changes the caller's status code.
+    async fn extract_memories(
+        &self,
+        actor: &Actor,
+        ctx: &RequestContext,
+        link: &ConversationExecutionLink,
+        response_id: Uuid,
+    ) {
+        let Some(application_id) = actor.internal_application_id else {
+            return;
+        };
+        let Ok(pool) = self.state.pool() else {
+            return;
+        };
+        let (Ok(memory_policy), Ok(conversation_policy)) = (
+            self.repo.get_or_create_memory_policy(application_id).await,
+            self.repo
+                .get_or_create_conversation_policy(application_id)
+                .await,
+        ) else {
+            return;
+        };
+        // Three independent switches, all of which must be on. `enabled` gates the memory
+        // subsystem, `automatic_extraction_enabled` gates this feature, and the conversation
+        // policy's own `memory_extraction_enabled` gates it again per the belt-and-braces rule
+        // `plan_context` already applies to retrieval.
+        if !memory_policy.enabled
+            || !memory_policy.automatic_extraction_enabled
+            || !conversation_policy.memory_enabled
+            || !conversation_policy.memory_extraction_enabled
+        {
+            return;
+        }
+        // **The consent branch.** `None` means consent was withheld by at least one of the two
+        // consent columns, and nothing at all is written — not a memory, not a run row. A run
+        // row would itself be a record that Moira read the conversation for extraction
+        // purposes, which is the thing consent was withheld for.
+        let Some(status) = effective_extraction_status(
+            conversation_policy.memory_consent_mode,
+            memory_policy.consent_mode,
+        ) else {
+            return;
+        };
+
+        let Ok(Some((conversation_uuid, _, _, _))) =
+            find_conversation_context_anchor(pool, &link.conversation_id).await
+        else {
+            return;
+        };
+        let Ok(history) = find_recent_messages(
+            pool,
+            &link.conversation_id,
+            i64::MAX,
+            EXTRACTION_TRANSCRIPT_MESSAGES,
+        )
+        .await
+        else {
+            return;
+        };
+        let turns: Vec<(String, String)> = history
+            .iter()
+            .filter_map(|message| {
+                message
+                    .content
+                    .clone()
+                    .map(|content| (message.role.clone(), content))
+            })
+            .collect();
+        if turns.is_empty() {
+            // A conversation persisting no plaintext (`conversation_content_persistence` of
+            // `'none'`/`'metadata_only'`/`'encrypted_content'`) has nothing to extract from.
+            // Returning here rather than calling a model with an empty transcript is both the
+            // cheaper and the more honest answer.
+            return;
+        }
+        let input_message_ids: Vec<Uuid> =
+            history.iter().map(|message| message.message_uuid).collect();
+
+        let run_id = match insert_memory_extraction_run(
+            pool,
+            &MemoryExtractionRunInsert {
+                conversation_uuid: Some(conversation_uuid),
+                response_id: Some(response_id),
+                input_message_ids,
+                provider_model_id: None,
+            },
+        )
+        .await
+        {
+            Ok(id) => id,
+            Err(_) => return,
+        };
+
+        let outcome = self
+            .run_extraction(
+                actor,
+                application_id,
+                conversation_uuid,
+                response_id,
+                run_id,
+                status,
+                &memory_policy,
+                &turns,
+            )
+            .await;
+
+        self.state.metrics.record_memory_extraction_run(
+            outcome.accepted_count.max(0) as u64,
+            outcome.rejected_count.max(0) as u64,
+            outcome.status == "completed",
+        );
+        let _ = complete_memory_extraction_run(pool, run_id, &outcome).await;
+        // Audited by count, never by content. `memory_extraction_runs` carries the same counts
+        // and `audit_logs` is the operator-facing record that extraction ran at all — neither
+        // holds a byte of the transcript or of the extracted memories.
+        let _ = self
+            .audit(
+                actor,
+                ctx,
+                "memory.extraction.completed",
+                "memory_extraction_run",
+                Some(run_id.to_string()),
+                json!({
+                    "status": outcome.status,
+                    "candidate_count": outcome.candidate_count,
+                    "accepted_count": outcome.accepted_count,
+                    "rejected_count": outcome.rejected_count,
+                    "failure_class": outcome.failure_class,
+                }),
+            )
+            .await;
+    }
+
+    /// The extraction call and the per-candidate loop.
+    ///
+    /// Split out so [`Self::extract_memories`] is the policy/consent gate and this is the work:
+    /// every path here returns a [`MemoryExtractionRunOutcome`], so there is no way to leave
+    /// the run row in `'running'` except by the process dying, which is the one case the row is
+    /// there to make visible.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_extraction(
+        &self,
+        actor: &Actor,
+        application_id: Uuid,
+        conversation_uuid: Uuid,
+        response_id: Uuid,
+        run_id: Uuid,
+        status: MemoryStatus,
+        policy: &MemoryPolicyRecord,
+        turns: &[(String, String)],
+    ) -> MemoryExtractionRunOutcome {
+        let Ok(pool) = self.state.pool() else {
+            return failed_extraction(FAILURE_EXTRACTION_CALL_FAILED);
+        };
+        let command = ExecutionCommand {
+            request_id: format!("memory-extraction-{run_id}"),
+            execution_id: Uuid::now_v7(),
+            identity: CallerRuntimeIdentity {
+                actor_type: format!("{:?}", actor.actor_type),
+                subject: actor.subject.clone(),
+                external_user_id: actor.external_user_id.clone(),
+                external_tenant_id: actor.external_tenant_id.clone(),
+                application_id: Some(application_id),
+                scopes: actor.scopes.clone(),
+            },
+            application_id: Some(application_id),
+            external_tenant_id: effective_tenant(actor),
+            external_user_id: effective_user(actor),
+            messages: extraction_messages(&render_transcript(turns)),
+            route_hint: None,
+            provider_hint: None,
+            model_hint: None,
+            credential_hint: None,
+            options: ExecutionOptions {
+                // Zero temperature: the same transcript must produce the same candidates, or
+                // the dedupe below is testing a moving target.
+                temperature: Some(0.0),
+                output_schema: Some(extraction_output_schema()),
+                stream: false,
+                ..ExecutionOptions::default()
+            },
+            metadata: json!({ "moira": { "purpose": "memory_extraction" } }),
+        };
+
+        let Ok(service) = MoiraExecutionService::new(self.state.clone()) else {
+            return failed_extraction(FAILURE_EXTRACTION_CALL_FAILED);
+        };
+        let Ok(execution) = service.execute(command).await else {
+            return failed_extraction(FAILURE_EXTRACTION_CALL_FAILED);
+        };
+        // `structured_output` is not populated by the execution kernel today — it is `None` on
+        // both the streaming and non-streaming paths — so the schema-constrained reply arrives
+        // as `output_text` and is parsed here. Preferring `structured_output` when it is
+        // present means this call site needs no edit the day the kernel starts filling it.
+        let raw = match execution
+            .structured_output
+            .as_ref()
+            .map(|value| value.to_string())
+            .or(execution.output_text)
+        {
+            Some(raw) => raw,
+            None => return failed_extraction(FAILURE_EXTRACTION_CALL_FAILED),
+        };
+        let candidates = match parse_candidates(&raw) {
+            Ok(candidates) => candidates,
+            Err(class) => return failed_extraction(class),
+        };
+
+        let scope = RetrievalScope {
+            application_id,
+            external_tenant_id: effective_tenant(actor),
+            external_user_id: effective_user(actor),
+        };
+        let extraction_policy = ExtractionPolicy {
+            allowed_memory_types: policy.allowed_memory_types.clone(),
+            allowed_sensitivity_levels: policy.allowed_sensitivity_levels.clone(),
+            minimum_extraction_confidence: policy.minimum_extraction_confidence,
+        };
+        // The scope a new memory is written at: the narrowest one the actor can represent.
+        // `user_application` needs an external user id and `conversation` needs a conversation
+        // id, per `memory_records_scope_valid` — so an actor with no user id gets a
+        // conversation-scoped memory rather than a broader tenant- or application-scoped one.
+        // Widening on missing identity is how a memory ends up readable by callers who never
+        // said it.
+        let memory_scope = if effective_user(actor).is_some() {
+            MemoryScope::UserApplication
+        } else {
+            MemoryScope::Conversation
+        };
+
+        let mut rejections: std::collections::BTreeMap<&'static str, i64> = Default::default();
+        let mut accepted = 0i32;
+        let mut rejected = 0i32;
+        let mut duplicates = 0i64;
+        let mut contradictions = 0i64;
+        let candidate_count = candidates.len() as i32;
+
+        for (index, proposed) in candidates.iter().enumerate() {
+            if index >= MAXIMUM_CANDIDATES_PER_RUN {
+                rejected += 1;
+                *rejections
+                    .entry(RejectionReason::RunCandidateLimit.label())
+                    .or_default() += 1;
+                continue;
+            }
+            let candidate = match classify_candidate(proposed, &extraction_policy) {
+                Ok(candidate) => candidate,
+                Err(reason) => {
+                    rejected += 1;
+                    *rejections.entry(reason.label()).or_default() += 1;
+                    continue;
+                }
+            };
+            let content_hash = memory_content_hash(&candidate.content);
+
+            // Exact dedupe first: it needs no embedding, so an application with embeddings off
+            // still gets duplicate suppression.
+            match find_memory_by_content_hash(pool, &scope, &content_hash).await {
+                Ok(Some(existing)) => {
+                    let _ = confirm_memory(pool, existing).await;
+                    duplicates += 1;
+                    continue;
+                }
+                Ok(None) => {}
+                // A failed lookup must not become a silent insert: an unavailable dedupe is a
+                // reason to skip the candidate, not to write a row the check would have refused.
+                Err(_) => {
+                    rejected += 1;
+                    *rejections.entry("dedupe_unavailable").or_default() += 1;
+                    continue;
+                }
+            }
+
+            let embedding = self
+                .embed_memory_content(application_id, &candidate.content)
+                .await;
+            if let Some((encoded, _)) = embedding.as_ref()
+                && let Ok(Some((existing, distance))) =
+                    find_nearest_memory(pool, &scope, encoded).await
+                && is_near_duplicate(distance, NEAR_DUPLICATE_MAX_DISTANCE)
+            {
+                let _ = confirm_memory(pool, existing).await;
+                duplicates += 1;
+                continue;
+            }
+
+            // Contradiction: the same subject, a different thing said about it. Recorded on the
+            // new row rather than resolved — overwriting the old memory would destroy the
+            // evidence that the caller changed their mind, which is the only thing that makes
+            // the conflict reviewable.
+            let mut contradicts = None;
+            if let Some(key) = candidate.memory_key.as_deref()
+                && let Ok(Some((existing, existing_hash))) =
+                    find_memory_by_key(pool, &scope, key).await
+                && existing_hash != content_hash
+            {
+                contradicts = Some(existing);
+                contradictions += 1;
+            }
+
+            let id = Uuid::now_v7();
+            let public_id = format!("mem_{id}");
+            let tenant = effective_tenant(actor);
+            let user = effective_user(actor);
+            let insert = ExtractedMemoryInsert {
+                id,
+                public_id: &public_id,
+                application_id,
+                external_tenant_id: tenant.as_deref(),
+                external_user_id: user.as_deref(),
+                conversation_uuid: Some(conversation_uuid),
+                scope: memory_scope,
+                memory_type: candidate.memory_type,
+                memory_key: candidate.memory_key.as_deref(),
+                content: &candidate.content,
+                content_hash: &content_hash,
+                confidence: candidate.confidence,
+                sensitivity: candidate.sensitivity,
+                status,
+                source_message_ids: Vec::new(),
+                source_response_id: Some(response_id),
+                source_extraction_run_id: run_id,
+                contradicts_memory_id: contradicts,
+                resolution_status: contradicts.map(|_| CONTRADICTION_UNRESOLVED),
+            };
+            if insert_extracted_memory(pool, &insert).await.is_err() {
+                rejected += 1;
+                *rejections.entry("insert_failed").or_default() += 1;
+                continue;
+            }
+            accepted += 1;
+            if let Some((encoded, model_id)) = embedding {
+                let _ = insert_memory_embedding(pool, id, model_id, &encoded).await;
+            }
+        }
+
+        MemoryExtractionRunOutcome {
+            candidate_count,
+            accepted_count: accepted,
+            rejected_count: rejected,
+            status: "completed",
+            failure_class: None,
+            metadata: json!({
+                "rejections": rejections,
+                "duplicates": duplicates,
+                "contradictions": contradictions,
+            }),
+        }
+    }
+
+    /// Embeds one memory body, returning the pgvector literal and the model that produced it.
+    ///
+    /// `None` when the application has memory embeddings off or the embedding call failed. The
+    /// caller degrades to exact-hash dedupe only — a missing embedding must not become a
+    /// missing memory, and it must not become a *duplicate* memory either, which is why the
+    /// exact check runs first and unconditionally.
+    async fn embed_memory_content(
+        &self,
+        application_id: Uuid,
+        content: &str,
+    ) -> Option<(String, Option<Uuid>)> {
+        let policy = self
+            .repo
+            .get_or_create_embedding_policy(application_id)
+            .await
+            .ok()?;
+        if !policy.memory_embeddings_enabled {
+            return None;
+        }
+        let embedding = self.embed_query(application_id, content).await.ok()?;
+        Some((encode_vector_literal(&embedding.vector), embedding.model_id))
     }
 
     pub async fn create_memory(
@@ -1076,27 +1515,11 @@ impl ConversationService {
         let Ok(pool) = self.state.pool() else {
             return;
         };
-        let Ok(Some(policy)) = self
-            .repo
-            .get_or_create_embedding_policy(application_id)
-            .await
-            .map(Some)
+        let Some((encoded, model_id)) = self.embed_memory_content(application_id, content).await
         else {
             return;
         };
-        if !policy.memory_embeddings_enabled {
-            return;
-        }
-        let Ok(embedding) = self.embed_query(application_id, content).await else {
-            return;
-        };
-        let _ = insert_memory_embedding(
-            pool,
-            memory_id,
-            embedding.model_id,
-            &encode_vector_literal(&embedding.vector),
-        )
-        .await;
+        let _ = insert_memory_embedding(pool, memory_id, model_id, &encoded).await;
     }
 
     /// Lists memories, paging by `(updated_at, id)`.

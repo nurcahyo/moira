@@ -58,6 +58,17 @@ pub(crate) use conversation::{
     find_rag_chunk_candidates, find_recent_messages, insert_context_plan, insert_memory_embedding,
     insert_retrieval_run,
 };
+// Plan 11 Sub-Phase F. `pub(crate)` for the same reason as the block above and one more: the
+// three lookups are content-hash and nearest-neighbour comparisons over `memory_records`, which
+// are existence oracles the moment they run under a scope the caller chose rather than one
+// derived from the acting `Actor`. `insert_extracted_memory` writes a row with no authorization
+// check of its own — `ConversationService::extract_memories` is the only legitimate caller and
+// supplies all of it.
+pub(crate) use conversation::{
+    ExtractedMemoryInsert, MemoryExtractionRunInsert, MemoryExtractionRunOutcome,
+    complete_memory_extraction_run, confirm_memory, find_memory_by_content_hash,
+    find_memory_by_key, find_nearest_memory, insert_extracted_memory, insert_memory_extraction_run,
+};
 pub use public::{
     IdempotencyClaim, PgPublicRepository, PublicAccess, PublicRepository, ResponseStartedInsert,
     ResponseTerminalUpdate, default_application_execution_policy, idempotency_record,
