@@ -2308,9 +2308,13 @@ under a deployment-held pepper, which F14's own analysis is the argument for.
 and **fails closed** for rows that already hold it. Accepting a value named for encryption while
 storing plaintext was F32's sharpest edge: the API itself was doing the misleading.
 
-**Six hand-written mutations, all caught** (`scratchpad/f32-mutate.sh`): plaintext stored anyway;
-`none` collapsing into `metadata_only`; `encrypted_content` failing open; the refusal removed; the
-missing-row default flipped; the summary write ignoring the policy.
+**Six hand-written mutations, all caught** — committed as `scripts/f32-mutate.sh` so the claim is
+re-derivable rather than a paragraph asserting a guard works, which is the artefact that failed six
+times in §3.4. Plaintext stored anyway (M1, literally the pre-fix line — four cases red); `none`
+collapsing into `metadata_only`; `encrypted_content` failing open; the refusal removed; the
+missing-row default flipped; the summary write ignoring the policy. Each mutation asserts its own
+anchor text is present first, so the script fails loudly if the code moves instead of silently
+mutating nothing and reporting all-caught.
 
 **OpenAPI is one added `description`** on `ConversationContentPersistence` — 152 operations / 100
 paths / 181 schemas, unchanged. (The handoff's "151 / 99 / 178" is stale as of `dac7468`.)
