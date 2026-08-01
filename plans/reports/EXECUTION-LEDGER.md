@@ -2263,6 +2263,86 @@ plaintext has nothing to extract from, a state no configuration can currently pr
 `encrypted_content` actually means (there is no cipher wired to those columns), and only then
 extend it to summaries and extraction transcripts.
 
+#### F32 — CLOSED, `fix/f32-content-persistence`. Wired, not removed
+
+**The decision was wire rather than remove**, and the reasoning is worth keeping because the
+alternative was defensible. Removing the column is a migration plus an OpenAPI change plus a drift
+regeneration, and it is *destructive to any deployment that has already set it* — including exactly
+the deployments the column exists for. Wiring it is additive, and the four values name a real
+requirement (a data-residency or PII obligation) that Moira has no other way to express.
+*Reversal condition:* remove it if a deployment ever needs conversation content withheld at a
+granularity this column cannot express — per conversation, per tenant, or per message role —
+because at that point the application-wide enum is the wrong shape and keeping it would be a second
+policy that disagrees with the first.
+
+**Two corrections to the finding as written above**, both of which the brief drawn from it
+inherited:
+
+1. **"a state no configuration can currently produce" was right; the gloss that grew around it was
+   not.** The finding was later restated as the policy having an *emergent* effect — an operator
+   setting `'none'` getting no extraction because there was no plaintext to extract. That is
+   backwards. `content_plain` was bound unconditionally, so `'none'` stored **full plaintext**,
+   `turns` was never empty for a policy reason, and extraction ran on a `'none'` application exactly
+   as on a `'plain_content'` one. There was no emergent protection to preserve. Verified by
+   mutation M1 below, which is literally the pre-fix line and turns four cases red.
+2. **Four sites named the policy, not two.** Beyond the extraction `turns.is_empty()` branch and
+   `summarization.rs`'s doc comment, `build_summarization_plan` had the *same* false claim in its
+   own `turns.is_empty()` branch, and `ConversationSummaryInsert::summary_text` was documented as
+   "`None` when the application's persistence policy excludes plaintext" — a prepared seam whose
+   only caller always passed `Some`. `run_summarization` even took `policy` and discarded it with
+   `let _ = policy;`.
+
+**What was built.** Enforcement at `add_message`, in the existing `for update` lock query via a
+`left join` + `coalesce`, so it costs no extra round trip and cannot observe a policy from a
+different instant than the row it governs. Chosen over the three application-layer call sites
+deliberately: `add_message` is the only path into `conversation_messages`, so a fourth writer
+inherits the policy instead of having to remember it — and "having to remember it" is what F32
+*was*. Second enforcement point at the summary write, reachable only via a mid-conversation policy
+tightening (under a steady `none` the plan refuses first, so a guard there would have been
+unreachable — HANDOFF §3.4 corollary 1). `none` vs `metadata_only` differ in the length-revealing
+metadata (`content_size_bytes`, `token_count`); two enum values with identical behaviour would have
+been the same defect in miniature. `content_hash` is retained under every value — it is an HMAC
+under a deployment-held pepper, which F14's own analysis is the argument for.
+
+**`encrypted_content` is refused on write** (`conversation_content_persistence_unsupported`, 422)
+and **fails closed** for rows that already hold it. Accepting a value named for encryption while
+storing plaintext was F32's sharpest edge: the API itself was doing the misleading.
+
+**Six hand-written mutations, all caught** (`scratchpad/f32-mutate.sh`): plaintext stored anyway;
+`none` collapsing into `metadata_only`; `encrypted_content` failing open; the refusal removed; the
+missing-row default flipped; the summary write ignoring the policy.
+
+**OpenAPI is one added `description`** on `ConversationContentPersistence` — 152 operations / 100
+paths / 181 schemas, unchanged. (The handoff's "151 / 99 / 178" is stale as of `dac7468`.)
+
+### F33 — five `*_encrypted` columns, no cipher, no writer, no reader
+
+Split out of F32 on closure, 2026-08-02, because it outlives it and is the larger half.
+
+`migrations/0007` creates **five** encryption-at-rest columns —
+`conversation_messages.content_encrypted`, `conversation_summaries.summary_text_encrypted`,
+`memory_records.content_encrypted`, `rag_document_versions.content_encrypted`,
+`rag_chunks.chunk_text_encrypted`. **Nothing in `src/` writes or reads any of them**, and no cipher,
+key store, or key-rotation path exists anywhere in the tree. The schema advertises a capability the
+binary does not have.
+
+F32's fix removes the *acute* harm — no caller can now select `encrypted_content` and be told their
+content is encrypted while it is stored in the clear — but the columns remain, and the next reader
+of `0007` will reasonably infer that encryption at rest is implemented. Two prior findings in this
+project had exactly this shape (a schema or a comment asserting a property no code delivered), so
+the inference is not hypothetical.
+
+**This is a scoping question for a human, not an autonomous change.** Envelope encryption touches
+key custody, rotation, backup/restore, and — per plan 11's still-open Decision 3 — what keyword
+retrieval is even allowed to do over encrypted rows. Doing it badly is worse than not doing it.
+
+The honest interim options are (a) implement envelope encryption and make `encrypted_content`
+selectable again, or (b) drop the five columns in a migration and state plainly that Moira relies on
+storage-layer encryption (disk/volume) rather than application-layer. **Neither should be picked
+without the operator requirement that motivates it.** Until then the state is documented rather than
+implied: the enum's OpenAPI description and `docs/conversation-summarization.md` both say the value
+does not encrypt.
+
 Plan 11 says to dedupe against existing **active** memories. Retrieval is `active`-only, so scoping
 dedupe the same way reads as consistent — and makes an `explicit_only` application accumulate **one
 unconfirmed duplicate per turn**, because unconfirmed candidates are never `active` and therefore

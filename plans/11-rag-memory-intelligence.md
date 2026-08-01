@@ -213,10 +213,17 @@ waves 1–3 and Sub-Phase F. **Where this subsection disagrees with the body, th
   outcome, already carried by the metric and the audit row. Adding a table would be a migration for
   one boolean. This is what D-E6's reversal condition is waiting on, so it is a known trade, not an
   oversight.
-- **`conversation_content_persistence` is still honoured by nothing.** Summarization writes
-  `summary_text_plain` unconditionally, exactly as `conversation_messages.content_plain` already
-  does. That column is read nowhere in `src/`. Making summaries the *first* consumer of a policy
-  the message path ignores would create an inconsistency rather than remove one — see finding F31.
+- ~~**`conversation_content_persistence` is still honoured by nothing.**~~ **Superseded** by
+  `fix/f32-content-persistence`. The message path enforces it in `add_message` — the choke point,
+  chosen so a fourth writer inherits the policy rather than having to remember it — and the summary
+  write enforces it too, so the inconsistency this note was avoiding no longer exists. `'none'` and
+  `'metadata_only'` additionally differ in whether length-revealing metadata is kept.
+  `'encrypted_content'` is **refused** on write (422, coded) because no cipher is wired to the
+  `*_encrypted` columns; rows that already hold it fail closed. See finding F32 (closed) and F33
+  (the five unwritten encryption columns, open, and a scoping question for a human).
+  *Reversal condition:* if Decision 3 below is ever answered by transiently decrypting for keyword
+  search, the enforcement points must be re-read — that decision would give `'encrypted_content'`
+  a real implementation and the refusal is then the only thing that has to be deleted.
 
 ### §0.2 Already shipped — the body assumes these are absent
 
