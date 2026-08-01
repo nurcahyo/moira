@@ -67,13 +67,17 @@ PROBES = {
         "    if candidate.confidence < policy.minimum_extraction_confidence {",
         "    if false {",
     ),
-    # The transcript moves into Moira's own instruction slot. Written with an explicit
-    # backslash-n so no quoting layer can mangle it — the escaping is exactly what broke the
-    # first harness.
+    # The transcript moves into Moira's own instruction slot.
+    #
+    # The anchor is deliberately just the constructor call and not the whole `format!`: the
+    # first version of this probe anchored on the one-line form, `cargo fmt` had since split
+    # the call across four lines, the anchor missed, and the probe reported a false SURVIVED.
+    # `main` refuses an anchor that matches more than once, which is what makes a short anchor
+    # safe here.
     "M8": (
         EXTR,
-        'DomainMessage::user(format!("{EXTRACTION_SOURCE_LABEL}\\n{}", transcript.trim_end()))',
-        'DomainMessage::system(format!("{EXTRACTION_SOURCE_LABEL}\\n{}", transcript.trim_end()))',
+        "        DomainMessage::user(format!(",
+        "        DomainMessage::system(format!(",
     ),
     "M9": (
         CONV,

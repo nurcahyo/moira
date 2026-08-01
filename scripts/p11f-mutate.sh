@@ -81,7 +81,9 @@ probe M8  "the transcript becomes a System message — e2e"                  mem
 probe M9  "contradictions are never recorded"                              memory_extraction
 probe M10 "exact content-address dedupe never matches"                     memory_extraction
 probe M11 "secret-shaped extracted content is not refused"                 lib  memory_extraction
-probe M12 "the per-run candidate cap is effectively removed"               lib  memory_extraction
+# Deliberately NOT the lib target. The cap is enforced in the per-candidate loop, which needs a
+# database — pointing this probe at the unit layer is how it was first reported as a survivor.
+probe M12 "the per-run candidate cap is effectively removed"               memory_extraction
 
 printf '\n%s survivor(s).\n' "$survivors"
 [ "$survivors" -eq 0 ]
