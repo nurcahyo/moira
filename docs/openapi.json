@@ -11910,7 +11910,7 @@
         ]
       },
       "put": {
-        "description": "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.",
+        "description": "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.",
         "operationId": "put_conversation_policy",
         "parameters": [
           {
@@ -12123,7 +12123,7 @@
         ]
       },
       "put": {
-        "description": "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.",
+        "description": "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.",
         "operationId": "put_embedding_policy",
         "parameters": [
           {
@@ -12336,7 +12336,7 @@
         ]
       },
       "put": {
-        "description": "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.",
+        "description": "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.",
         "operationId": "put_memory_policy",
         "parameters": [
           {
@@ -12549,7 +12549,7 @@
         ]
       },
       "put": {
-        "description": "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.",
+        "description": "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.",
         "operationId": "put_retrieval_policy",
         "parameters": [
           {
@@ -20187,7 +20187,7 @@
         ]
       },
       "post": {
-        "description": "Persistence primitive: no retrieval, chunking, or embedding pipeline runs, and stored content is not used to influence model responses. See docs/conversation-memory-rag-api.md.",
+        "description": "Ingested content is chunked, embedded, and indexed for retrieval; ingestion_status reports that pipeline's real progress rather than storage. Indexed chunks reach the prompt on POST /api/v1/responses for applications whose retrieval policy enables RAG, and appear in that response's citations. See docs/conversation-memory-rag-api.md.",
         "operationId": "create_rag_collection",
         "parameters": [
           {
@@ -20452,7 +20452,7 @@
         ]
       },
       "post": {
-        "description": "Persistence primitive: no retrieval, chunking, or embedding pipeline runs, and stored content is not used to influence model responses. See docs/conversation-memory-rag-api.md.",
+        "description": "Ingested content is chunked, embedded, and indexed for retrieval; ingestion_status reports that pipeline's real progress rather than storage. Indexed chunks reach the prompt on POST /api/v1/responses for applications whose retrieval policy enables RAG, and appear in that response's citations. See docs/conversation-memory-rag-api.md.",
         "operationId": "create_rag_document",
         "parameters": [
           {
@@ -21279,7 +21279,7 @@
     },
     "/api/v1/admin/rag-documents/{id}/ingest": {
       "post": {
-        "description": "Persistence primitive: no retrieval, chunking, or embedding pipeline runs, and stored content is not used to influence model responses. See docs/conversation-memory-rag-api.md.",
+        "description": "Ingested content is chunked, embedded, and indexed for retrieval; ingestion_status reports that pipeline's real progress rather than storage. Indexed chunks reach the prompt on POST /api/v1/responses for applications whose retrieval policy enables RAG, and appear in that response's citations. See docs/conversation-memory-rag-api.md.",
         "operationId": "ingest_rag_document",
         "parameters": [
           {
@@ -21421,7 +21421,7 @@
     },
     "/api/v1/admin/rag-documents/{id}/reindex": {
       "post": {
-        "description": "Persistence primitive: no retrieval, chunking, or embedding pipeline runs, and stored content is not used to influence model responses. See docs/conversation-memory-rag-api.md.",
+        "description": "Ingested content is chunked, embedded, and indexed for retrieval; ingestion_status reports that pipeline's real progress rather than storage. Indexed chunks reach the prompt on POST /api/v1/responses for applications whose retrieval policy enables RAG, and appear in that response's citations. See docs/conversation-memory-rag-api.md.",
         "operationId": "reindex_rag_document",
         "parameters": [
           {
@@ -25743,7 +25743,7 @@
         ]
       },
       "post": {
-        "description": "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.",
+        "description": "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.",
         "operationId": "create_conversation",
         "parameters": [
           {
@@ -26357,7 +26357,7 @@
         ]
       },
       "post": {
-        "description": "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.",
+        "description": "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.",
         "operationId": "create_message",
         "parameters": [
           {
@@ -26963,7 +26963,7 @@
         ]
       },
       "post": {
-        "description": "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.",
+        "description": "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.",
         "operationId": "create_memory",
         "parameters": [
           {

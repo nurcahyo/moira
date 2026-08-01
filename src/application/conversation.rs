@@ -570,7 +570,13 @@ impl ConversationService {
         Ok(record)
     }
 
-    // Persists the user's message for later retrieval by GET endpoints; does not load history, summaries, memories, or RAG content into the prompt sent to the provider. See docs/conversation-memory-rag-api.md for the MVP boundary.
+    /// Persists the user's turn, then plans the context that turn executes against.
+    ///
+    /// The comment this replaced said the opposite — "does not load history, summaries,
+    /// memories, or RAG content into the prompt sent to the provider" — which stopped being
+    /// true when plan 11 added the [`Self::plan_context`] call below, on the same function.
+    /// The returned [`ConversationExecutionLink`] carries both the assembled messages and
+    /// the citations for them.
     pub async fn prepare_response_conversation(
         &self,
         actor: &Actor,

@@ -1479,8 +1479,24 @@ mod tests {
         ),
     ];
 
-    const SENTENCE_A_RAG_WRITE: &str = "Persistence primitive: no retrieval, chunking, or embedding pipeline runs, and stored content is not used to influence model responses. See docs/conversation-memory-rag-api.md.";
-    const SENTENCE_A_SHORT: &str = "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.";
+    const SENTENCE_A_RAG_WRITE: &str = "Ingested content is chunked, embedded, and indexed for retrieval; ingestion_status reports that pipeline's real progress rather than storage. Indexed chunks reach the prompt on POST /api/v1/responses for applications whose retrieval policy enables RAG, and appear in that response's citations. See docs/conversation-memory-rag-api.md.";
+    const SENTENCE_A_SHORT: &str = "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.";
+
+    /// Restatements of the pre-plan-11 "these routes store but do nothing" claim.
+    ///
+    /// The eleven operations below shipped that claim until plan 11 wired chunking
+    /// (Sub-Phase A/B), retrieval (D), context injection (C), memory extraction (F) and
+    /// citations (G). Four of them are the *policy* routes that switch retrieval on, so the
+    /// spec was telling operators that the setting they were writing "does not affect any
+    /// behavior at all".
+    const INERT_PRIMITIVE_CLAIMS: [&str; 6] = [
+        "not yet used to influence model responses",
+        "is not used to influence model responses",
+        "no retrieval, chunking, or embedding pipeline runs",
+        "persistence primitive",
+        "persistence/configuration primitive",
+        "does not affect any behavior",
+    ];
     const SENTENCE_B_INTERIM_IDEMPOTENCY: &str = "Idempotency-Key is accepted but replay is not implemented yet; retrying can duplicate side effects.";
     /// The truthful `Idempotency-Key` parameter description 02b installs on all four
     /// RAG write operations, replacing 02a's "not implemented yet" text
@@ -1584,48 +1600,76 @@ mod tests {
         assert_eq!(parameter["description"], "RAG collection identifier");
     }
 
+    /// The eleven conversation/memory/RAG operations must say where stored content is used.
+    ///
+    /// **This test was inverted, for the same reason as
+    /// `public_response_schema_documents_citations_as_real_provenance`.** It shipped as
+    /// `conversation_memory_rag_operations_document_the_mvp_preview_boundary`, pinning
+    /// plan 02a's honest-at-the-time claim that these routes were inert. Plan 11 made the
+    /// claim false on eleven shipped operations at once — including the four policy PUTs
+    /// that *switch retrieval on* — and the test held the falsehood in place.
+    ///
+    /// The property is no longer "these routes disclaim behaviour" but "these routes name
+    /// the behaviour they feed", so the invariant phrase moved from
+    /// `"used to influence model responses"` (which read naturally inside a negation) to a
+    /// forbidden family plus a positive requirement that each description names
+    /// `POST /api/v1/responses` and the doc that states the remaining gap.
     #[test]
-    fn conversation_memory_rag_operations_document_the_mvp_preview_boundary() {
-        // Assert Sentence A only (the permanent boundary text). Sentence B is
-        // deliberately checked by a separate test that plan 02b deletes.
+    fn conversation_memory_rag_operations_document_where_stored_content_is_used() {
         let value = serde_json::to_value(documented_router(RouterPolicy::default()).into_openapi())
             .unwrap();
-        for (path, method) in RAG_WRITE_OPERATIONS {
-            let operation = &value["paths"][path][method];
-            let description = operation["description"]
-                .as_str()
-                .unwrap_or_else(|| panic!("{method} {path} is missing an operation description"));
-            assert!(
-                !description.is_empty(),
-                "{method} {path} description must not be empty"
-            );
-            assert!(
-                description.contains("used to influence model responses"),
-                "{method} {path} description is missing the invariant phrase"
-            );
-            assert!(
-                description.contains(SENTENCE_A_RAG_WRITE),
-                "{method} {path} description is missing Sentence A verbatim"
-            );
-        }
-        for (path, method) in OTHER_PREVIEW_OPERATIONS {
-            let operation = &value["paths"][path][method];
-            let description = operation["description"]
-                .as_str()
-                .unwrap_or_else(|| panic!("{method} {path} is missing an operation description"));
-            assert!(
-                !description.is_empty(),
-                "{method} {path} description must not be empty"
-            );
-            assert!(
-                description.contains("used to influence model responses"),
-                "{method} {path} description is missing the invariant phrase"
-            );
-            assert!(
-                description.contains(SENTENCE_A_SHORT),
-                "{method} {path} description is missing the short Sentence A verbatim"
-            );
-        }
+        let mut checked = 0usize;
+        let mut check = |operations: &[(&str, &str)], sentence: &str, label: &str| {
+            for (path, method) in operations {
+                let operation = &value["paths"][path][method];
+                let description = operation["description"].as_str().unwrap_or_else(|| {
+                    panic!("{method} {path} is missing an operation description")
+                });
+                assert!(
+                    !description.is_empty(),
+                    "{method} {path} description must not be empty"
+                );
+                let normalized = description.to_lowercase();
+                for claim in INERT_PRIMITIVE_CLAIMS {
+                    assert!(
+                        !normalized.contains(claim),
+                        "{method} {path} still describes itself as an inert primitive \
+                         ({claim:?}), but plan 11 wired chunking, embedding, retrieval, \
+                         context injection and citations. Say what the route now feeds: \
+                         {description}"
+                    );
+                }
+                assert!(
+                    description.contains("POST /api/v1/responses"),
+                    "{method} {path} description must name the operation its stored content \
+                     reaches, so a caller can tell what enabling it does: {description}"
+                );
+                assert!(
+                    description.contains("docs/conversation-memory-rag-api.md"),
+                    "{method} {path} description must point at the doc that states the \
+                     remaining gap: {description}"
+                );
+                assert!(
+                    description.contains(sentence),
+                    "{method} {path} description is missing {label} verbatim"
+                );
+                checked += 1;
+            }
+        };
+        check(&RAG_WRITE_OPERATIONS, SENTENCE_A_RAG_WRITE, "Sentence A");
+        check(
+            &OTHER_PREVIEW_OPERATIONS,
+            SENTENCE_A_SHORT,
+            "the short Sentence A",
+        );
+        // Vacuity guard: a walker that iterates an emptied constant asserts nothing and
+        // passes. HANDOFF §2.3.
+        assert_eq!(
+            checked,
+            RAG_WRITE_OPERATIONS.len() + OTHER_PREVIEW_OPERATIONS.len(),
+            "the operation lists must not shrink silently"
+        );
+        assert_eq!(checked, 11, "eleven operations carry this contract");
     }
 
     #[test]

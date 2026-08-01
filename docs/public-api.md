@@ -18,18 +18,30 @@ The only optional compatibility route is `POST /v1/responses`, gated by `public_
 
 All JSON responses include `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and propagated `X-Request-Id`.
 
-## MVP boundary: conversations, memory, and RAG
+## Conversations, memory, and RAG: what runs
 
 `/api/v1/conversations`, `/api/v1/memories`, and the admin RAG endpoints under
-`/api/v1/admin/rag-collections` and `/api/v1/admin/rag-documents` are **persistence
-and configuration primitives only** in this release. They store and version content
-durably and enforce policy, but:
+`/api/v1/admin/rag-collections` and `/api/v1/admin/rag-documents` store and version
+content, enforce policy, **and feed the model**:
 
-- No retrieval, chunking, or embedding pipeline runs. `ingestion_status` on a RAG
-  document reflects storage, not indexing for retrieval.
-- Conversation history, explicit memories, and RAG documents are not loaded into the
-  prompt sent to a provider. `POST /v1/responses` always returns `citations: []`.
-- No summarization runs; `conversation_summaries` is never populated.
+- Ingested RAG documents are chunked, embedded, and indexed. `ingestion_status` reports
+  that pipeline's real progress; a version that produced no chunks does not reach
+  `indexed`.
+- Conversation history, explicit memories, and retrieved RAG chunks are injected into the
+  prompt on `POST /api/v1/responses` (and the compatibility route `POST /v1/responses`)
+  when the request attaches a conversation. Memories and chunks that reach the prompt come
+  back in `citations`; replayed history and the summary do not.
+- Memories are extracted automatically from completed turns under the application's
+  consent and extraction policy.
+
+**Retrieval is opt-in.** `application_retrieval_policies.enabled`,
+`.memory_retrieval_enabled` and `.rag_retrieval_enabled` default to `false`, and retrieval
+also needs an embedding model configured for the application. Until an operator enables
+them, `citations` is `[]` and no retrieval runs — which is why an empty array must be read
+as "nothing was retrieved" rather than as a contract guarantee.
+
+Still absent: summarization. `conversation_summaries` has no writer, so a conversation past
+its configured budget is truncated rather than summarized.
 
 The RAG create/ingest/reindex routes under `/api/v1/admin/rag-collections` and
 `/api/v1/admin/rag-documents` now replay under `Idempotency-Key`, on the same
@@ -42,7 +54,10 @@ actor-fingerprint formula, with no advisory lock and a different in-progress err
 for the distinction. Conversation and memory create routes do not declare
 `Idempotency-Key` and do not replay.
 
-Full retrieval/memory intelligence is tracked separately and is not part of this MVP.
+Retrieval and memory intelligence landed in plan 11; see
+[`docs/conversation-memory-rag-api.md`](./conversation-memory-rag-api.md) for the per-route
+breakdown and [`docs/retrieval-citations.md`](./retrieval-citations.md) for what a citation
+means.
 
 Do not send real provider secrets, API keys, authorization headers, JWTs, or private documents in prompts while developing locally. Moira does not return provider credentials or raw key material from these routes.
 
