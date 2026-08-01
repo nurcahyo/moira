@@ -76,6 +76,68 @@ window, or add a separate unkeyed content-address column.** It must not be disco
 > three conditions that reverse the decision. See `memory_content_hash` in
 > `src/application/conversation.rs` and `tests/memory_content_hash_rotation.rs`.
 
+### §0.1b Sub-Phase F, as built — five decisions and four corrections to this plan
+
+Written 2026-08-01 on `feat/plan-11-subphase-f`, after re-auditing Sub-Phase F's section
+against waves 1–2. **The body's Sub-Phase F text predates those waves and is wrong in four
+places**; where it disagrees with this subsection, this subsection wins.
+
+#### Corrections to the body
+
+| # | Body says | Reality |
+|---|---|---|
+| **F-C1** | *"Consent enforcement: `consent_mode = 'explicit_only'` …"* (`:386`), naming **one** consent column. | **There are two.** `application_memory_policies.consent_mode` (`migrations/0007…:40-41`) and `application_conversation_policies.memory_consent_mode` (`:20-21`) are independent columns over the same four values, both defaulting to `'explicit_only'`, and nothing makes them agree. Reading either alone is a real defect in both directions. **Built:** `effective_extraction_status` takes the more restrictive of the two, mirroring the belt-and-braces rule `plan_context` already applies to `memory_retrieval_enabled`. |
+| **F-C2** | *"if none exists yet, this sub-phase must add minimal structured-output support"* — corrected in §0.2 to *"structured output already exists; Sub-Phase F **wires** it."* | **Half right.** The *request* side exists: `build_completion_request` turns `ExecutionOptions::output_schema` into a `rig_core::schemars::Schema` and the OpenAI-compatible wire request really does carry `response_format.json_schema` (verified against the mock's received body). The *response* side does **not**: `ExecutionRunOutput.structured_output` is hardcoded `None` on **both** the non-streaming (`execute_rig_completion`) and streaming paths, so `ExecutionOutcome.structured_output` is always `None` for every caller in the tree. Extraction therefore parses `output_text`, preferring `structured_output` when present so the call site needs no edit the day the kernel starts filling it. **This is a live gap in the execution kernel that no test pins**, and it is not Sub-Phase F's to close. |
+| **F-C3** | *"deduplicates against existing active memories"* (`:262`), and *"Dedupe: exact match via `content_hash`"* (`:384`). | **`'active'` alone is wrong** and would have shipped a defect that looks correct. Retrieval is `status = 'active'`; scoping dedupe the same way makes an `explicit_only` application accumulate **one unconfirmed duplicate per turn** — the memory exists, retrieval cannot see it, and nothing recognises it. Dedupe runs over `('active', 'candidate')`. |
+| **F-C4** | Sub-Phase F is listed as touching only `src/application/conversation.rs` (Wave 5, `:453`). | Waves 1–3 established that everything below the service layer is a **free function taking `&PgPool`**, not a trait method — `find_memory_candidates`, `insert_retrieval_run`, `insert_context_plan` and six others are all outside `ConversationRepository`. Sub-Phase F followed that precedent, so **`InMemoryConversationRepository` was not touched at all** and the brief's "every trait method lands in both impls" did not apply. |
+
+#### Decisions, each with the condition that reverses it
+
+- **D-F1 — the near-duplicate threshold is a code constant, not a policy column.** The body asks
+  for "a configurable threshold". `application_memory_policies` has no column for one, and
+  `MemoryPolicyRecord`/`MemoryPolicyPutRequest` are both `ToSchema`, so adding one is a migration
+  **plus** an OpenAPI surface change **plus** a drift-gate regeneration, in a wave whose subject is
+  extraction. `NEAR_DUPLICATE_MAX_DISTANCE = 0.05` (cosine similarity 0.95), inclusive at the
+  boundary. *Reverses* the first time an operator needs a different value.
+- **D-F2 — extraction runs inline on the response path, not on the queue.** Sub-Phase E's
+  summarization is specified as enqueued and the same latency argument applies here, but
+  `run_supervisor` wires `queue::StubJobDispatcher`, so an enqueued extraction would be claimed and
+  dropped — a feature whose work never runs behind a flag that says it does, which is P0-1's exact
+  shape. A detached `tokio::spawn` would outlive the request and could not be asserted on without a
+  `sleep`. Cost is bounded by `automatic_extraction_enabled` defaulting to `false`. *Reverses* the
+  moment a real `JobDispatcher` replaces the stub; `extract_memories` already takes only ids.
+- **D-F3 — extraction reuses the caller's route.** `route_hint: None` lands on
+  `get_default_route()`, which is not necessarily the route the caller's turn used; that produced
+  `NoEligibleModel` on every run until the e2e suite caught it. `ConversationExecutionLink` now
+  carries the caller's route verbatim, so extraction cannot be routed anywhere the caller's own turn
+  would not have gone. *Reverses* when extraction needs a cheaper model than the response path — a
+  policy column, a DTO field, an OpenAPI regeneration, and a test that the two routes differ.
+- **D-F4 — no new error code, and no i18n key.** The body's i18n table assigns
+  `memory_consent_required`, `memory_sensitivity_forbidden`, `memory_disabled` and
+  `structured_output_invalid`/`_unsupported` to Sub-Phase F. Those keys exist and are already used
+  by the **manual** memory path; extraction reuses none of them because **extraction never produces
+  a caller-visible response**. A failure is recorded on `memory_extraction_runs.failure_class` and
+  is invisible to the caller by design. Minting a key for a message nobody receives would be an
+  unreachable error code, which Open Decision 8 already forbids elsewhere in this plan. *Reverses*
+  if an admin diagnostic endpoint over extraction runs is ever added.
+- **D-F5 — extracted memories take the narrowest representable scope.** `user_application` when
+  the actor carries an `effective_user` (which for a consumer key falls back to `actor.subject`,
+  so this is the normal case), otherwise `conversation` with the conversation id set. Never
+  `application` or `tenant_application`: widening on missing identity is how a memory ends up
+  readable by callers who never said it, and `memory_records_scope_valid` makes the narrow arms
+  representable in every case.
+
+#### What Sub-Phase F did **not** build, and why
+
+- **The `memory-extraction-retry` worker body.** Blocked on D-F2's stub dispatcher. The name stays
+  registered and metric-seeded; a failed run is recorded and not retried.
+- **Semantic contradiction detection** beyond `memory_key` equality with a differing content
+  address — which is exactly what the body specifies for the initial implementation (`:385`) and
+  Open Decision 4 leaves as a product call.
+- **An admin diagnostic endpoint over `memory_extraction_runs`.** Not in Sub-Phase F's scope, and
+  keeping it out is what leaves this wave with **no OpenAPI change, no migration and no new
+  scope** — the whole surface is behind flags that already exist.
+
 ### §0.2 Already shipped — the body assumes these are absent
 
 | Body assumption | Reality |

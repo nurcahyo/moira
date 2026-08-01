@@ -139,6 +139,7 @@ impl PublicExecutionService {
                 actor,
                 ctx,
                 prepared.command.execution_id,
+                prepared.command.route_hint.clone(),
                 idempotency_request.conversation.as_ref(),
                 &idempotency_request.input,
             )
@@ -310,6 +311,7 @@ impl PublicExecutionService {
                 &actor,
                 &ctx,
                 prepared.command.execution_id,
+                prepared.command.route_hint.clone(),
                 conversation_request.conversation.as_ref(),
                 &conversation_request.input,
             )

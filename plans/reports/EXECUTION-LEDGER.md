@@ -240,6 +240,45 @@ Full findings in `HANDOFF-PROMPT.md` §5.1. Headlines:
 
 ## OPEN FINDINGS — need a decision, not a mechanical fix
 
+### F28 — inline memory extraction delays the terminal SSE event and consumes a caller concurrency permit
+
+Found while building plan 11 Sub-Phase F (`feat/plan-11-subphase-f`). **Both halves only bite an
+application that has turned `automatic_extraction_enabled` on, which defaults to `false`** — so
+nothing in the shipped default is affected. Neither is a correctness bug; both are costs that must
+not be discovered in production.
+
+**(a) The streaming terminal event is delayed by a full extraction round-trip.**
+`record_conversation_assistant` — and therefore `extract_memories` — runs at
+`src/application/public.rs`'s streaming arm **before** the `response.completed` SSE event is pushed.
+The tokens themselves are unaffected: `EventCollector::streaming` forwards each chunk live during
+execution, so the caller already has the whole text. What is delayed is the terminal event and the
+stream close. A client that waits for `response.completed` therefore sees the last token, then a
+multi-second stall, then completion.
+
+*Why it was not fixed in this wave:* the fix is to emit the terminal event before extracting, and
+that arm is the streaming terminal-state machine — the same code that owns the committed-output
+override and the cancellation path, and whose branch on `conversation_result` decides which SSE is
+emitted. Reordering it hastily at the end of a wave is how HANDOFF §3.4's six toothless guards got
+written. **No test pins the current ordering**, deliberately: a test asserting today's order would
+go red on the fix, which is the "test pinned the defect" antipattern from §3.4.
+
+**Decide:** either move extraction after the terminal SSE push (its own change, with a test that the
+terminal event precedes the second provider call), or move it to the queue once a real
+`JobDispatcher` exists — decision D3's reversal condition, which fixes this as a side effect.
+
+**(b) Extraction takes a concurrency permit from the caller's own pool.**
+`execute_inner` acquires `state.concurrency.acquire_scoped(provider, …, application_id,
+external_user_id)` per attempt, and extraction goes through the same `MoiraExecutionService::execute`
+path. So an extraction-enabled application's effective per-provider, per-application and per-user
+headroom is **halved** — two permits per caller turn instead of one.
+
+There is **no deadlock**: the caller's own permit is released when `execute_inner` returns, which is
+before `record_conversation_assistant` is called. Under saturation the extraction call is simply
+refused by `acquire_scoped`, which surfaces as `memory_extraction_runs.failure_class =
+'extraction_call_failed'` and does not touch the caller's response — the fail-open policy working as
+designed. It is a capacity-planning fact, now documented in `docs/memory-extraction.md`, not a
+defect.
+
 ### F1 — 23 uncatalogued error codes reach the wire (pre-existing, NOT fixed)
 
 `failure_code()` (`src/application/public.rs:2009`) returns 28 codes that flow into
@@ -916,6 +955,21 @@ suitability is now asserted (`23f8687`).
 `create_memory` *and* `patch_memory` — and reverting only the second is the cheapest way back to
 F14. Both are covered.
 
+**The dedupe reader this closure was made for now exists** (plan 11 Sub-Phase F,
+`feat/plan-11-subphase-f`), so clause (c) has three new call sites and F14's reversal condition has
+a new way to be tripped. `find_memory_by_content_hash` compares this exact value across rows;
+`find_nearest_memory` and `find_memory_by_key` compare content by other means. All three, plus
+`find_memory_candidates`, are now built from **one** `MEMORY_SCOPE_PREDICATE` constant rather than
+four copies of the predicate, and `every_memory_read_shares_the_isolation_predicate` asserts on the
+**emitted SQL** that each embeds it and binds `m.application_id = $2`. Asserting the SQL rather than
+the behaviour is deliberate: a behavioural cross-application test needs two applications whose
+contents actually collide, and one written without that collision passes against a query with no
+scope at all. Mutation-verified — emptying the application binding in the shared constant turns the
+guard red (probe M6, `scripts/p11f-mutate.sh`).
+
+The closure's claim that the reset "would be nearly free today, so it is the wrong choice" is now
+settled the right way round: the reader shipped *after* `0021`, so it compares one format only.
+
 ### F13 — a duplicate trusted JWT issuer returns 500, not 409 — **FIXED** `a6d2984`
 
 Every other uniqueness conflict in the tree maps to a 409 — `auth_provider_settings` has an
@@ -1182,6 +1236,42 @@ Removing them early means a client retrying an idempotent request across the dep
 its ledger row and **executes twice**. The fallbacks cost one extra index probe on a miss. They stay;
 the markers are retargeted off plan 07 so 07 is not credited with work it must not do.
 **Reverse by:** confirming the deploy date, then deleting the fallbacks 24h after it.
+
+### D3 — plan 11 Sub-Phase F runs extraction inline, not on the worker queue
+
+Sub-Phase E's summarization is specified as *enqueued* to keep it off the response path, and the same
+latency argument applies to extraction — it is a second completion call per assistant turn, so an
+application that enables it pays roughly double per turn.
+
+It is nevertheless **synchronous**, because both alternatives available in this tree are worse.
+`WorkerRegistry::run_supervisor` wires `queue::StubJobDispatcher`, so an enqueued extraction would be
+claimed and dropped: a feature whose work never runs, behind a flag that says it does, which is
+P0-1's exact shape and the thing plan 11 exists to remove. A detached `tokio::spawn` would outlive
+the request and its pool guarantees and could not be asserted on without a `sleep`, which
+CONVENTIONS §3 forbids and finding P2-12 is about.
+
+The cost is bounded by the flag: `automatic_extraction_enabled` defaults to `false`, so no existing
+application pays anything, and the doubling is documented in `docs/memory-extraction.md`.
+
+**Reverse by:** moving the body behind `memory-extraction-retry` the moment a real `JobDispatcher`
+replaces the stub. `extract_memories` already takes only ids and reads everything else from the
+database, so the move is a call-site change rather than a rewrite.
+
+### D4 — Sub-Phase F reads BOTH consent columns and takes the more restrictive
+
+`application_memory_policies.consent_mode` and
+`application_conversation_policies.memory_consent_mode` are independent columns over the same four
+values, both defaulting to `'explicit_only'`. Nothing in the schema or the code makes them agree, and
+plan 11's Sub-Phase F text names only the first.
+
+Reading either alone is a real defect in **both** directions: read only the memory policy and an
+operator who set the conversation policy to `'disabled'` still gets memories extracted; read only the
+conversation policy and the reverse. `effective_extraction_status` returns the minimum over the
+lattice `refuse < candidate < active`. Mutation-verified in both directions (probes M1 and M2), at
+the unit *and* e2e layers — a unit test alone would not have shown the branch was wired.
+
+**Reverse by:** a product decision that one column is authoritative — at which point the other should
+be **removed**, not left meaning nothing.
 
 ---
 

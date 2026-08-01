@@ -117,6 +117,9 @@ impl Case {
                 actor,
                 &request_context(),
                 execution_id,
+                // No route hint: this suite drives the planner directly and never reaches the
+                // extraction path, which is the only consumer of it.
+                None,
                 Some(&ResponseConversationInput {
                     create: true,
                     id: None,
