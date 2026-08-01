@@ -516,6 +516,55 @@ impl LifecycleFixture {
             .expect("enable manual memory policy");
     }
 
+    /// Turns automatic memory extraction on — plan 11 Sub-Phase F.
+    ///
+    /// **Both consent columns are set explicitly**, and that is the whole point of the
+    /// signature. `application_memory_policies.consent_mode` and
+    /// `application_conversation_policies.memory_consent_mode` are independent columns that both
+    /// default to `'explicit_only'`, and extraction takes the more restrictive of the two. A
+    /// fixture that set only one would leave the other at its default and every "this mode
+    /// produces active memories" case would fail for a reason unrelated to what it asserts —
+    /// or, worse, a fixture that set only the memory policy would make a test for the
+    /// conversation policy's branch pass without exercising it.
+    pub async fn enable_memory_extraction(
+        &self,
+        conversation_mode: MemoryConsentMode,
+        memory_mode: MemoryConsentMode,
+        overrides: MemoryPolicyPutRequest,
+    ) {
+        let conversations = ConversationService::new(&self.state).expect("conversation service");
+        conversations
+            .put_memory_policy(
+                &self.actor,
+                &request_context(),
+                self.application_id,
+                MemoryPolicyPutRequest {
+                    enabled: Some(true),
+                    automatic_extraction_enabled: Some(true),
+                    consent_mode: Some(memory_mode),
+                    ..overrides
+                },
+            )
+            .await
+            .expect("enable memory extraction policy");
+        conversations
+            .put_conversation_policy(
+                &self.actor,
+                &request_context(),
+                self.application_id,
+                ConversationPolicyPutRequest {
+                    conversations_enabled: Some(true),
+                    caller_can_create_conversations: Some(true),
+                    memory_enabled: Some(true),
+                    memory_extraction_enabled: Some(true),
+                    memory_consent_mode: Some(conversation_mode),
+                    ..ConversationPolicyPutRequest::default()
+                },
+            )
+            .await
+            .expect("enable conversation extraction policy");
+    }
+
     /// A caller-plane actor bound to this fixture's application, with an explicit scope.
     ///
     /// Built directly rather than issued as a consumer key because a consumer-key actor carries

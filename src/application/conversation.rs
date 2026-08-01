@@ -57,6 +57,22 @@ use crate::{
 pub struct ConversationExecutionLink {
     pub conversation_id: String,
     pub user_message_id: String,
+    /// The route the caller's own turn was issued against, verbatim.
+    ///
+    /// Carried so memory extraction (Sub-Phase F) can issue its second completion through the
+    /// **same** route. Extraction has no configuration surface of its own — there is no
+    /// `extraction_route_key` policy column — and reusing the caller's route is the only choice
+    /// that cannot fail on an application where responses themselves work: same provider, same
+    /// credential, same model policy, already proven reachable one call ago.
+    ///
+    /// `None` reproduces the caller's own "no hint" case and lands on the default route, which
+    /// is what the caller got too. Extraction is therefore never routed somewhere the caller's
+    /// own turn would not have gone.
+    ///
+    /// **Reversal condition:** give extraction its own route the moment an operator needs it on
+    /// a cheaper model than the response path — a policy column, a DTO field, an OpenAPI
+    /// regeneration, and a test that the two routes really differ.
+    pub route_hint: Option<String>,
     /// What the planner assembled for this turn (plan 11 Sub-Phases D and G).
     ///
     /// Empty when the application has retrieval disabled, which is the default — the field is
@@ -559,6 +575,7 @@ impl ConversationService {
         actor: &Actor,
         ctx: &RequestContext,
         execution_id: Uuid,
+        route_hint: Option<String>,
         input: Option<&ResponseConversationInput>,
         messages: &[PublicInputMessage],
     ) -> Result<Option<ConversationExecutionLink>, AppError> {
@@ -634,6 +651,7 @@ impl ConversationService {
         Ok(Some(ConversationExecutionLink {
             conversation_id: conversation.id,
             user_message_id: message.id,
+            route_hint,
             context,
         }))
     }
@@ -1113,6 +1131,8 @@ impl ConversationService {
         else {
             return;
         };
+        // `i64::MAX` rather than the current sequence: unlike the planner, extraction *wants*
+        // the turn that just happened — it is the whole subject of the run.
         let Ok(history) = find_recent_messages(
             pool,
             &link.conversation_id,
@@ -1167,6 +1187,7 @@ impl ConversationService {
                 status,
                 &memory_policy,
                 &turns,
+                link.route_hint.clone(),
             )
             .await;
 
@@ -1214,6 +1235,7 @@ impl ConversationService {
         status: MemoryStatus,
         policy: &MemoryPolicyRecord,
         turns: &[(String, String)],
+        route_hint: Option<String>,
     ) -> MemoryExtractionRunOutcome {
         let Ok(pool) = self.state.pool() else {
             return failed_extraction(FAILURE_EXTRACTION_CALL_FAILED);
@@ -1233,7 +1255,7 @@ impl ConversationService {
             external_tenant_id: effective_tenant(actor),
             external_user_id: effective_user(actor),
             messages: extraction_messages(&render_transcript(turns)),
-            route_hint: None,
+            route_hint,
             provider_hint: None,
             model_hint: None,
             credential_hint: None,
@@ -2519,6 +2541,13 @@ pub(crate) fn conversation_audit(
 ///   `application_id` — `find_memory_authorized`, `list_memories_authorized` and
 ///   `find_memory_candidates` all require it in every arm — so a dedupe built on this value
 ///   cannot become an existence oracle over another application's memories.
+///
+///   **Plan 11 Sub-Phase F built that dedupe, so clause (c) now has a second set of call
+///   sites.** `find_memory_by_content_hash` compares this exact value across rows, and
+///   `find_nearest_memory`/`find_memory_by_key` compare content by other means; all three go
+///   through `MEMORY_SCOPE_PREDICATE` in `src/infra/repositories/conversation.rs`, which binds
+///   `application_id` in every arm, and `every_memory_read_shares_the_isolation_predicate`
+///   asserts it against the emitted SQL rather than against behaviour.
 ///
 /// # Reversal condition
 ///
