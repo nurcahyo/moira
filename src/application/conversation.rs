@@ -1180,6 +1180,14 @@ impl ConversationService {
             // `'none'`/`'metadata_only'`/`'encrypted_content'`) has nothing to extract from.
             // Returning here rather than calling a model with an empty transcript is both the
             // cheaper and the more honest answer.
+            //
+            // **This is a consequence, not the guard.** The policy is enforced in `add_message`
+            // — that is what makes `content_plain` null and this branch reachable. Until F32 was
+            // fixed the comment above described a state no configuration could produce: every
+            // message was stored in plaintext whatever the policy said, so extraction ran on a
+            // `none` application exactly as it did on a `plain_content` one. Do not let this
+            // branch stand in for the check again; if extraction must be gated on the policy
+            // *directly*, read the policy here and say so.
             return;
         }
         let input_message_ids: Vec<Uuid> =
@@ -1701,6 +1709,12 @@ impl ConversationService {
             // `none`/`metadata_only`/`encrypted_content`. Refused rather than sent to a model
             // with an empty transcript, which would bill for a summary of nothing and then
             // advance the coverage boundary over messages that were never summarised.
+            //
+            // Reachable only because `add_message` enforces the policy (finding F32); before
+            // that fix `content_plain` was written unconditionally and this branch could not
+            // fire for a policy reason. The policy's own guard for the *summary body* is at the
+            // write in `run_summarization`, which covers the case this one cannot: a
+            // conversation that accumulated plaintext before the policy was tightened.
             return Err(AppError::coded_with_details(
                 axum::http::StatusCode::CONFLICT,
                 "summarization_not_needed",
@@ -1735,7 +1749,6 @@ impl ConversationService {
         policy: &ConversationPolicyRecord,
         plan: &SummarizationPlan,
     ) -> Result<ConversationSummaryRow, AppError> {
-        let _ = policy;
         // The route the conversation's own turns went to. `route_hint: None` would land on
         // `get_default_route()`, which is decision D-F3's exact trap — a route the caller never
         // used, and `NoEligibleModel` on a deployment with no active default.
@@ -1795,12 +1808,32 @@ impl ConversationService {
 
         let summary_hash = request_hash(summary.text.as_bytes());
         let token_count = budget_tokens(&summary.text);
+        // The second enforcement point for `conversation_content_persistence`. A summary is
+        // conversation content — derived, but a body of caller text all the same — so writing
+        // it in plaintext under a policy that excludes plaintext would reopen the hole
+        // `add_message` just closed, one table over.
+        //
+        // **This is reachable, and the path is a policy change mid-conversation.** Under a
+        // steady `none`/`metadata_only`, messages carry no plaintext, `build_summarization_plan`
+        // finds no turns and refuses before any model call — so this branch would be dead. It is
+        // reached when a conversation accumulated plaintext under `plain_content` and the
+        // operator then tightened the policy: the backlog is still readable, a run still fires,
+        // and without this the derived copy would be written in the clear under the new setting.
+        //
+        // `covers_through_sequence` still advances and `summary_hash` is still written. The run
+        // genuinely happened and genuinely covers that backlog; recording the boundary without
+        // the body is the honest outcome, and is exactly the shape `ConversationSummaryRow`
+        // already documents for a null `summary_text`.
+        let summary_text = policy
+            .conversation_content_persistence
+            .persists_plaintext()
+            .then_some(summary.text.as_str());
         insert_conversation_summary(
             pool,
             &ConversationSummaryInsert {
                 conversation_uuid,
                 covers_through_sequence: plan.covers_through_sequence,
-                summary_text: Some(summary.text.as_str()),
+                summary_text,
                 summary_hash: &summary_hash,
                 token_count: Some(token_count),
                 provider_model_id: None,
@@ -2074,6 +2107,32 @@ impl ConversationService {
             .authz
             .require(actor, "moira:conversation-policies:write")?;
         validate_metadata_option(&request.metadata)?;
+        // Refuse a value Moira cannot honour rather than storing it and behaving as something
+        // else. `encrypted_content` is the only one: the `content_encrypted` columns exist on
+        // three tables and have no writer anywhere in `src/`, so accepting it would tell an
+        // operator with a PII or data-residency obligation that their content is encrypted at
+        // rest when it is not. That was finding F32's sharpest edge — the API was the thing
+        // doing the misleading.
+        //
+        // Fail-closed on both sides: a row that already holds `encrypted_content` keeps
+        // parsing and stores no plaintext (`persists_plaintext` is false for it), so an
+        // existing deployment is made safer rather than broken, while no new deployment can
+        // select it.
+        //
+        // **Reversal condition:** delete this check the moment a cipher is wired to the
+        // `content_encrypted` columns. It is deliberately the only thing that has to change.
+        if let Some(persistence) = request.conversation_content_persistence
+            && !persistence.is_enforceable()
+        {
+            return Err(AppError::coded_with_details(
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "conversation_content_persistence_unsupported",
+                "encrypted_content is not implemented: no cipher is wired to the content \
+                 columns, so Moira cannot encrypt conversation content at rest. Use \
+                 metadata_only or none to withhold plaintext.",
+                json!({ "conversation_content_persistence": "encrypted_content" }),
+            ));
+        }
         let record = self
             .repo
             .put_conversation_policy(application_id, &request)
