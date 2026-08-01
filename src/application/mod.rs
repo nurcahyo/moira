@@ -23,7 +23,9 @@ pub use context_planner::{
     AssembledContext, CONTEXT_LENGTH_EXCEEDED, ContextPlanner, ContextSections,
     RETRIEVED_CONTEXT_LABEL, SUMMARY_CONTEXT_LABEL, assemble_context, budget_tokens,
 };
-pub use conversation::{ConversationExecutionLink, ConversationService, PlannedContext};
+pub use conversation::{
+    ConversationExecutionLink, ConversationService, PlannedContext, SummarizationOutcome,
+};
 pub use execution::{ExecutionService, MoiraExecutionService, execute_diagnostic};
 pub use identity::{AdminIdentityService, ClaimCredential};
 // Plan 11 Sub-Phase F. Everything here is pure decision-making — the consent branch, the policy

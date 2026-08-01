@@ -75,9 +75,9 @@ pub(crate) use conversation::{
 // would let external code read any conversation's history without the `ConversationAccess`
 // predicate that `ConversationService::summarize_conversation` resolves first.
 pub(crate) use conversation::{
-    ConversationSummaryInsert, ConversationSummaryRow, count_messages_after_sequence,
-    find_active_conversation_summary, find_messages_after_sequence, insert_conversation_summary,
-    try_lock_conversation_summarization, unlock_conversation_summarization,
+    ConversationSummaryInsert, ConversationSummaryRow, SummarizationLock,
+    count_messages_after_sequence, find_active_conversation_summary,
+    find_conversation_route_hint, find_messages_after_sequence, insert_conversation_summary,
 };
 pub use public::{
     IdempotencyClaim, PgPublicRepository, PublicAccess, PublicRepository, ResponseStartedInsert,

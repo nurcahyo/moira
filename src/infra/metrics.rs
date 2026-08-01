@@ -132,6 +132,23 @@ const MEMORY_EXTRACTION_RUNS_TOTAL: &str = "moira_memory_extraction_runs_total";
 const MEMORY_EXTRACTION_WRITTEN_TOTAL: &str = "moira_memory_extraction_written_total";
 const MEMORY_EXTRACTION_REJECTED_TOTAL: &str = "moira_memory_extraction_rejected_total";
 
+// Plan 11 Sub-Phase E — conversation summarization.
+//
+// One family, reusing the shared `succeeded`/`failed` `outcome` domain and adding no new label
+// value. There is deliberately **no `conversation_id` label and no per-skip-reason label**: the
+// first is unbounded by construction and the second is unbounded per application, which is the
+// rule `ALLOWED_LABEL_KEYS` enforces and this module's header explains.
+//
+// A run is counted only when the summarizer was actually invoked — a turn on an application with
+// `summarization_enabled` off, or one whose backlog is below the thresholds, counts nothing.
+// Without that, the family would measure how many conversations exist rather than how
+// summarization is behaving.
+//
+// Unlike extraction, summarization is *partly* visible: the manual endpoint returns its failure.
+// The automatic path does not, so a summarizer that started failing on every turn would
+// otherwise be invisible until a conversation's context quietly stopped carrying a summary.
+const SUMMARIZATION_RUNS_TOTAL: &str = "moira_summarization_runs_total";
+
 // Plan 09 wave 2 — the admin-invitation surface, which grants full `moira:admin` on
 // redemption and had no operational signal at all before this.
 //
@@ -426,6 +443,14 @@ impl MetricsRegistry {
                  reason label would be unbounded per application."
             );
             describe_counter!(
+                SUMMARIZATION_RUNS_TOTAL,
+                "Conversation-summarization runs, by outcome. A run is counted once per \
+                 invocation that reached the model — a turn below the trigger thresholds, or on \
+                 an application with summarization_enabled off (the default), counts nothing. \
+                 Carries no conversation id: per-conversation detail is the \
+                 conversation_summaries row itself."
+            );
+            describe_counter!(
                 ADMIN_INVITE_OUTCOMES_TOTAL,
                 "Admin-invitation outcomes, by a bounded outcome/denial-reason label. Carries \
                  no invitee email, domain, invite id or issuer: those are unbounded \
@@ -466,6 +491,7 @@ impl MetricsRegistry {
                 counter!(RAG_INGESTION_RUNS_TOTAL, "outcome" => *outcome).increment(0);
                 counter!(RETRIEVAL_RUNS_TOTAL, "outcome" => *outcome).increment(0);
                 counter!(MEMORY_EXTRACTION_RUNS_TOTAL, "outcome" => *outcome).increment(0);
+                counter!(SUMMARIZATION_RUNS_TOTAL, "outcome" => *outcome).increment(0);
             }
             for outcome in ADMIN_INVITE_OUTCOMES {
                 counter!(ADMIN_INVITE_OUTCOMES_TOTAL, "outcome" => *outcome).increment(0);
@@ -633,6 +659,18 @@ impl MetricsRegistry {
             if rejected > 0 {
                 counter!(MEMORY_EXTRACTION_REJECTED_TOTAL).increment(rejected);
             }
+        });
+    }
+
+    /// Records one conversation-summarization run — plan 11 Sub-Phase E.
+    ///
+    /// Called only when the summarizer reached the model. A run refused by the trigger decision
+    /// is not a run: counting it would make the family measure conversation traffic instead of
+    /// summarizer behaviour, and would hide a genuine failure rate behind a large denominator.
+    pub fn record_summarization_run(&self, succeeded: bool) {
+        let outcome = if succeeded { "succeeded" } else { "failed" };
+        with_local_recorder(&self.inner.recorder, || {
+            counter!(SUMMARIZATION_RUNS_TOTAL, "outcome" => outcome).increment(1);
         });
     }
 
@@ -1568,10 +1606,22 @@ mod tests {
             MEMORY_EXTRACTION_RUNS_TOTAL,
             MEMORY_EXTRACTION_WRITTEN_TOTAL,
             MEMORY_EXTRACTION_REJECTED_TOTAL,
+            SUMMARIZATION_RUNS_TOTAL,
         ] {
             assert!(
                 rendered.contains(family),
                 "{family} is absent from a fresh scrape body:\n{rendered}"
+            );
+        }
+        // Both outcome series for summarization, for the same reason as retrieval below: the
+        // alert an operator writes is on the *failure* rate, and a family with only a
+        // `succeeded` series evaluates to "no data" on a process that has never failed one.
+        for outcome in RAG_INGESTION_OUTCOMES {
+            assert!(
+                rendered.contains(&format!(
+                    "{SUMMARIZATION_RUNS_TOTAL}{{service=\"moira-test\",outcome=\"{outcome}\"}} 0"
+                )),
+                "{SUMMARIZATION_RUNS_TOTAL} is missing its zero-seeded {outcome} series:\n{rendered}"
             );
         }
         // The two label-free extraction families must be seeded at literal zero, not merely

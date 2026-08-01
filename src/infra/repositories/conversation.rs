@@ -2749,7 +2749,6 @@ pub(crate) async fn find_conversation_context_anchor(
 #[derive(Debug, Clone)]
 pub struct ConversationSummaryRow {
     pub id: Uuid,
-    pub conversation_uuid: Uuid,
     pub summary_version: i64,
     pub covers_through_sequence: i64,
     pub summary_text: Option<String>,
@@ -2761,7 +2760,6 @@ pub struct ConversationSummaryRow {
 fn conversation_summary_row_from(row: &sqlx::postgres::PgRow) -> Result<ConversationSummaryRow, AppError> {
     Ok(ConversationSummaryRow {
         id: row.try_get("id")?,
-        conversation_uuid: row.try_get("conversation_id")?,
         summary_version: row.try_get("summary_version")?,
         covers_through_sequence: row.try_get("covers_through_sequence")?,
         summary_text: row.try_get("summary_text_plain")?,
@@ -2784,7 +2782,7 @@ pub(crate) async fn find_active_conversation_summary(
 ) -> Result<Option<ConversationSummaryRow>, AppError> {
     let row = sqlx::query(
         r#"
-            select id, conversation_id, summary_version, covers_through_sequence,
+            select id, summary_version, covers_through_sequence,
                    summary_text_plain, token_count, created_at, superseded_at
             from conversation_summaries
             where conversation_id = $1 and superseded_at is null
@@ -2932,7 +2930,7 @@ pub(crate) async fn insert_conversation_summary(
                 summary_text_plain, summary_hash, token_count, provider_model_id
             )
             values ($1, $2, $3, $4, $5, $6, $7, $8)
-            returning id, conversation_id, summary_version, covers_through_sequence,
+            returning id, summary_version, covers_through_sequence,
                       summary_text_plain, token_count, created_at, superseded_at
             "#,
     )
@@ -2948,6 +2946,47 @@ pub(crate) async fn insert_conversation_summary(
     .await?;
     tx.commit().await?;
     conversation_summary_row_from(&row)
+}
+
+/// The route key the conversation's most recent completed turn was issued against.
+///
+/// # Why summarization does not simply pass `route_hint: None`
+///
+/// Sub-Phase F learned this the expensive way (decision D-F3): `route_hint: None` does **not**
+/// mean "the route the caller used". `DefaultTaskRouter::select_route` falls through to
+/// `get_default_route()`, which is a *different* route on any deployment that has more than one —
+/// and on one that has no active default it is `NoEligibleModel` on every run. Extraction failed
+/// on every run until an e2e test caught it.
+///
+/// Extraction had a caller to copy from: it runs on the response path and
+/// `ConversationExecutionLink` carries that turn's hint verbatim. The **manual** summarize
+/// endpoint has no such caller — it is not a completion request — so the equivalent guarantee has
+/// to be reconstructed from the conversation itself. This is that reconstruction: the route of
+/// the conversation's most recent response. Summarization therefore cannot be routed anywhere
+/// that conversation's own turns have not already gone.
+///
+/// `None` — a conversation whose messages were all written through the conversations API and
+/// which has never produced a response — genuinely has no route to copy, and the caller falls
+/// back to the default route. That is the one case where the D-F3 hazard is unavoidable, and it
+/// surfaces as a recorded `summarization_failed`, never a 500.
+pub(crate) async fn find_conversation_route_hint(
+    pool: &PgPool,
+    conversation_uuid: Uuid,
+) -> Result<Option<String>, AppError> {
+    let route_key: Option<String> = sqlx::query_scalar(
+        r#"
+            select rd.route_key
+            from responses r
+            join route_definitions rd on rd.id = r.route_id
+            where r.conversation_id = $1
+            order by r.created_at desc
+            limit 1
+            "#,
+    )
+    .bind(conversation_uuid)
+    .fetch_optional(pool)
+    .await?;
+    Ok(route_key)
 }
 
 /// The advisory-lock namespace summarization takes its per-conversation locks in.
@@ -2982,38 +3021,79 @@ pub(crate) fn summarization_lock_object(conversation_uuid: Uuid) -> i32 {
     i32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]])
 }
 
-/// Takes the per-conversation summarization lock on `connection`, or reports it already held.
+/// A held per-conversation summarization lock.
 ///
-/// **Session-scoped, not transaction-scoped.** A summarization run spans a provider call, and a
-/// transaction-scoped lock would mean holding an open transaction across a network round trip.
-/// Session scope means the caller must own the connection for the run and release explicitly —
-/// [`unlock_conversation_summarization`] — which is why the caller takes a dedicated
-/// `PoolConnection` rather than using the pool. A connection returned to the pool still holding
-/// an advisory lock would be inherited by an unrelated checkout, the hazard
-/// `auth_settings.rs`'s `IssuerlessSlotLock` documents.
-pub(crate) async fn try_lock_conversation_summarization(
-    connection: &mut PgConnection,
+/// # Why session-scoped, and why on a detached connection
+///
+/// A summarization run spans a provider call, so a **transaction**-scoped lock would mean holding
+/// an open transaction across a network round trip. Session scope avoids that, and brings the
+/// hazard [`crate::infra::workers::leader::LeaderLock`] documents in full: a *pooled* connection
+/// goes back to the pool still holding the lock, and the next checkout inherits it — and because
+/// `pg_try_advisory_lock` is re-entrant within a session, that checkout would then believe it had
+/// acquired a lock somebody else holds.
+///
+/// [`sqlx::pool::PoolConnection::detach`] is the established answer in this tree: the connection
+/// leaves the pool permanently (the pool opens a replacement), so the lock's lifetime is a socket.
+/// Dropping the guard closes the socket, PostgreSQL reaps the backend and the lock is released —
+/// **including while unwinding from a panic**, which is the case no explicit release can cover.
+///
+/// The cost is one connection open per summarization run. That is acceptable because the run is
+/// already gated by `summarization_enabled` (default `false`) plus two thresholds, so the rate is
+/// orders of magnitude below the request rate. *Reversal condition:* if summarization ever runs
+/// per-turn on a hot path, replace this with a lock table row and a bounded lease, rather than
+/// making the lock pooled — a pooled session lock is not a cheaper version of this, it is a wrong
+/// one.
+pub(crate) struct SummarizationLock {
+    session: sqlx::PgConnection,
     conversation_uuid: Uuid,
-) -> Result<bool, AppError> {
-    let acquired: bool = sqlx::query_scalar("select pg_try_advisory_lock($1, $2)")
-        .bind(SUMMARIZATION_LOCK_CLASS)
-        .bind(summarization_lock_object(conversation_uuid))
-        .fetch_one(connection)
-        .await?;
-    Ok(acquired)
 }
 
-/// Releases a lock taken by [`try_lock_conversation_summarization`] on the same connection.
-pub(crate) async fn unlock_conversation_summarization(
-    connection: &mut PgConnection,
-    conversation_uuid: Uuid,
-) -> Result<(), AppError> {
-    sqlx::query("select pg_advisory_unlock($1, $2)")
-        .bind(SUMMARIZATION_LOCK_CLASS)
-        .bind(summarization_lock_object(conversation_uuid))
-        .execute(connection)
-        .await?;
-    Ok(())
+/// Hand-written so the guard is printable without printing a connection, which carries the
+/// database URL — the same reason `LeaderLock` writes its own.
+impl std::fmt::Debug for SummarizationLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SummarizationLock")
+            .field("conversation_uuid", &self.conversation_uuid)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SummarizationLock {
+    /// Takes the lock if it is free. `Ok(None)` means a run is already in flight for this
+    /// conversation, which is a normal outcome — the endpoint's `202` — and not an error.
+    pub(crate) async fn try_acquire(
+        pool: &PgPool,
+        conversation_uuid: Uuid,
+    ) -> Result<Option<Self>, AppError> {
+        let mut session = pool.acquire().await?.detach();
+        let acquired: bool = sqlx::query_scalar("select pg_try_advisory_lock($1, $2)")
+            .bind(SUMMARIZATION_LOCK_CLASS)
+            .bind(summarization_lock_object(conversation_uuid))
+            .fetch_one(&mut session)
+            .await?;
+        if !acquired {
+            // Closed rather than dropped so the backend goes away now, not at the next GC.
+            let _ = sqlx::Connection::close(session).await;
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            session,
+            conversation_uuid,
+        }))
+    }
+
+    /// Releases the lock and closes the session.
+    ///
+    /// Dropping would release it too, when the server notices the closed socket. Unlocking
+    /// explicitly makes the next caller's `202` window milliseconds rather than seconds.
+    pub(crate) async fn release(mut self) {
+        let _ = sqlx::query("select pg_advisory_unlock($1, $2)")
+            .bind(SUMMARIZATION_LOCK_CLASS)
+            .bind(summarization_lock_object(self.conversation_uuid))
+            .execute(&mut self.session)
+            .await;
+        let _ = sqlx::Connection::close(self.session).await;
+    }
 }
 
 /// The embedding provider/model/limits for an application, independent of any document.
