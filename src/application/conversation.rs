@@ -1546,9 +1546,15 @@ impl ConversationService {
     ///   That list predates this wave; it is what a response-plane key looks like, not a fixture
     ///   tuned to make this argument.
     /// * Move the `require` call into this function and
-    ///   `a_summary_written_on_one_turn_is_injected_into_the_next`
-    ///   (`tests/conversation_summarization.rs`) fails: no summary is ever written, so the next
-    ///   turn's `context_plans.included_summary_id` is `None`.
+    ///   `automatic_summarization_runs_for_a_key_that_cannot_call_the_endpoint`
+    ///   (`tests/conversation_summarization.rs`) fails: no summary is written at all.
+    ///
+    ///   **That test exists because this claim was false when it was first written here.** The
+    ///   comment originally named a different test, and running the mutation showed the whole
+    ///   suite stayed green — every case drove its turns with a key that happened to hold
+    ///   `moira:conversations:write`, so nothing exercised the split. An earlier *fixture* fix
+    ///   had removed the only scope-less turn. A claim in a comment is not a guard; this one is
+    ///   now backed by a test that has been seen to fail.
     /// * The endpoint still enforces the scope, and
     ///   `the_summarize_endpoint_refuses_a_key_without_the_write_scope` is what proves it — so
     ///   the split widens nothing. Deleting *that* test is the other way to break this safely

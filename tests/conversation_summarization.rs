@@ -403,6 +403,66 @@ async fn a_summary_written_on_one_turn_is_injected_into_the_next() {
 // The prompt-injection boundary.
 // ---------------------------------------------------------------------------
 
+/// Automatic summarization runs for a key that **cannot** call the summarize endpoint.
+///
+/// # This is the guard the scope split exists for, and it was missing until a mutation found it
+///
+/// `summarize_conversation` requires `moira:conversations:write`;
+/// `summarize_conversation_unscoped` does not, and the automatic path calls the latter. That
+/// split is the whole reason automatic summarization works at all for an ordinary caller — and
+/// for a while **nothing here tested it**, because every other case in this file drives its turns
+/// with `summarize_key`, which holds the write scope.
+///
+/// The gap was invisible to review and was found by running the mutation: adding the `require`
+/// call back into `summarize_conversation_unscoped` left the entire suite green. That is
+/// HANDOFF §3.4's shape — a guard whose fixture cannot reach the state it guards — and it was
+/// introduced by an earlier *fixture* fix, not by the code under test: routing all turns through
+/// one key to solve a cross-key `conversation_not_found` failure also removed the only case that
+/// used a scope-less key.
+///
+/// So this case drives the turn with `response_key` — the key `enable_public_streaming` mints,
+/// which deliberately lacks `moira:conversations:write` — and asserts a summary is written
+/// anyway. Re-adding the scope check to the shared body makes exactly this test fail.
+#[tokio::test]
+async fn automatic_summarization_runs_for_a_key_that_cannot_call_the_endpoint() {
+    let Some(case) =
+        Case::enabled(vec![completion(ASSISTANT_REPLY), completion(SUMMARY_BODY)]).await
+    else {
+        return;
+    };
+
+    // Premise assertion: this key must genuinely lack the scope, or the case is vacuous.
+    let (status, _, body) = case
+        .summarize(&case.response_key, "conv_does_not_matter", true)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "response_key must lack moira:conversations:write, or this case proves nothing: {body}"
+    );
+
+    let (status, body) = case.respond_as(&case.response_key, USER_TURN, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let summaries = case.summaries().await;
+    assert_eq!(
+        summaries.len(),
+        1,
+        "automatic summarization must not require the endpoint's scope: {summaries:?}"
+    );
+    assert_eq!(
+        summaries[0].summary_text_plain.as_deref(),
+        Some(SUMMARY_BODY)
+    );
+    assert_eq!(
+        case.completion.call_count().await,
+        2,
+        "the summarizer must have actually run"
+    );
+
+    case.shutdown().await;
+}
+
 /// The transcript is data on the wire, not an instruction.
 ///
 /// Asserted against the body the mock **received**, not against the pure builder — the pure test
