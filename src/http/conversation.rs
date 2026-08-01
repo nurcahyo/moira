@@ -2,21 +2,23 @@ use axum::{
     Json,
     extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::{IntoResponse, Response},
 };
 use uuid::Uuid;
 
 use crate::{
     app::AppState,
-    application::{ConversationService, RequestContext},
+    application::{ConversationService, RequestContext, SummarizationOutcome},
     domain::{
         ConversationCreateRequest, ConversationMessageCreateRequest, ConversationMessageQuery,
         ConversationMessageRecord, ConversationPatchRequest, ConversationPolicyPutRequest,
         ConversationPolicyRecord, ConversationQuery, ConversationRecord, ConversationStatus,
+        ConversationSummarizeAccepted, ConversationSummarizeRequest, ConversationSummaryRecord,
         EmbeddingPolicyPutRequest, EmbeddingPolicyRecord, ListResponse, MemoryCreateRequest,
         MemoryPatchRequest, MemoryPolicyPutRequest, MemoryPolicyRecord, MemoryQuery, MemoryRecord,
         PageQuery, RagCollectionCreateRequest, RagCollectionPatchRequest, RagCollectionQuery,
         RagCollectionRecord, RagCollectionStatus, RagDocumentCreateRequest,
-        RagDocumentIngestRequest, RagDocumentRecord, RetrievalPolicyPutRequest,
+        RagDocumentIngestRequest, RagDocumentRecord, ResponseText, RetrievalPolicyPutRequest,
         RetrievalPolicyRecord,
     },
     error::{AppError, ErrorResponse},
@@ -248,6 +250,78 @@ pub async fn restore_conversation(
         .await?;
     Ok((json_headers(&ctx.request_id), Json(record)))
 }
+
+/// `POST /api/v1/conversations/{id}/summarize` — plan 11 Sub-Phase E.
+///
+/// Registered in `conversation_routes()`, not `admin_conversation_routes()`. That is a decision,
+/// not an accident: the group carries the body limit, and `src/http/mod.rs` records the bug where
+/// admin RAG paths silently inherited the 1 MiB caller cap purely because of which Rust module
+/// their handlers lived in. This is a caller-plane action on the caller's own conversation, gated
+/// on `moira:conversations:write`, with a request body of one boolean — 1 MiB is the right cap
+/// and `conversation_routes()` is the right group.
+#[utoipa::path(
+    post,
+    path = "/api/v1/conversations/{id}/summarize",
+    tag = "conversations",
+    description = "Produces a new immutable conversation summary version. `force` bypasses the configured trigger thresholds; it does not bypass `summarization_enabled`, and it cannot produce a summary when nothing has been said since the last one.",
+    request_body = ConversationSummarizeRequest,
+    params(("id" = String, Path, description = "Conversation identifier")),
+    responses(
+        (status = 200, description = "A new summary version was produced", body = ConversationSummaryRecord),
+        (status = 202, description = "A summarization is already in flight for this conversation; nothing was started", body = ConversationSummarizeAccepted, headers(("retry-after" = String, description = "Seconds to wait before retrying"))),
+        (status = "4XX", description = "Request, authentication, authorization, policy, conflict, or not-found error", body = ErrorResponse),
+        (status = "5XX", description = "Infrastructure, upstream, or internal error", body = ErrorResponse)
+    ),
+    security(("bearerAuth" = []), ("systemKeyAuth" = []), ("consumerKeyAuth" = []))
+)]
+pub async fn summarize_conversation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<ConversationSummarizeRequest>,
+) -> Result<Response, AppError> {
+    let actor = public_actor(&state, &headers).await?;
+    let ctx = RequestContext::from_headers(&headers);
+    let outcome = ConversationService::new(&state)?
+        .summarize_conversation(&actor, &ctx, &id, request.force)
+        .await?;
+    let mut response_headers = json_headers(&ctx.request_id);
+    Ok(match outcome {
+        SummarizationOutcome::Summarized(record) => {
+            (StatusCode::OK, response_headers, Json(record)).into_response()
+        }
+        SummarizationOutcome::AlreadyRunning => {
+            response_headers.insert(
+                header::RETRY_AFTER,
+                HeaderValue::from_static(SUMMARIZATION_RETRY_AFTER_SECONDS),
+            );
+            // The notice's default message comes from the catalog rather than being written
+            // here, so the English a caller sees and the English a translator works from cannot
+            // drift — CONVENTIONS.md §4.2.
+            let notice = ResponseText::new(
+                SUMMARIZATION_IN_PROGRESS_KEY,
+                crate::i18n::default_message_for_key(SUMMARIZATION_IN_PROGRESS_KEY)
+                    .unwrap_or_default(),
+            );
+            (
+                StatusCode::ACCEPTED,
+                response_headers,
+                Json(ConversationSummarizeAccepted { notice }),
+            )
+                .into_response()
+        }
+    })
+}
+
+/// The catalog key the `202` carries. A constant so the handler and its test name one string.
+const SUMMARIZATION_IN_PROGRESS_KEY: &str = "moira.notice.summarization_in_progress";
+
+/// `Retry-After` for the `202`.
+///
+/// A summarization run is one completion call, so a couple of seconds is the honest order of
+/// magnitude — long enough that a retry is unlikely to hit the same lock, short enough that a
+/// caller polling for a summary is not told to wait a minute for a two-second job.
+const SUMMARIZATION_RETRY_AFTER_SECONDS: &str = "2";
 
 #[utoipa::path(
     get,

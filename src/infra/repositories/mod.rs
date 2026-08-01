@@ -76,8 +76,8 @@ pub(crate) use conversation::{
 // predicate that `ConversationService::summarize_conversation` resolves first.
 pub(crate) use conversation::{
     ConversationSummaryInsert, ConversationSummaryRow, SummarizationLock,
-    count_messages_after_sequence, find_active_conversation_summary,
-    find_conversation_route_hint, find_messages_after_sequence, insert_conversation_summary,
+    count_messages_after_sequence, find_active_conversation_summary, find_conversation_route_hint,
+    find_messages_after_sequence, insert_conversation_summary,
 };
 pub use public::{
     IdempotencyClaim, PgPublicRepository, PublicAccess, PublicRepository, ResponseStartedInsert,

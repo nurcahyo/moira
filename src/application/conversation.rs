@@ -21,15 +21,14 @@ use crate::{
         ConversationMessageRole, ConversationMessageType, ConversationPatchRequest,
         ConversationPolicyPutRequest, ConversationPolicyRecord, ConversationQuery,
         ConversationRecord, ConversationStatus, ConversationSummaryRecord, CursorScope,
-        DomainMessage,
-        EmbeddingPolicyPutRequest, EmbeddingPolicyRecord, ExecutionCommand, ExecutionOptions,
-        HistoryStrategy, ListCursor, ListResponse, MemoryConsentMode, MemoryCreateRequest,
-        MemoryPatchRequest, MemoryPolicyPutRequest, MemoryPolicyRecord, MemoryQuery, MemoryRecord,
-        MemoryScope, MemoryStatus, Pagination, PublicCitation, PublicContentPart,
-        PublicInputMessage, RagCollectionCreateRequest, RagCollectionPatchRequest,
-        RagCollectionQuery, RagCollectionRecord, RagCollectionStatus, RagDocumentCreateRequest,
-        RagDocumentIngestRequest, RagDocumentRecord, ResponseConversationInput,
-        RetrievalPolicyPutRequest, RetrievalPolicyRecord, SeqCursor,
+        DomainMessage, EmbeddingPolicyPutRequest, EmbeddingPolicyRecord, ExecutionCommand,
+        ExecutionOptions, HistoryStrategy, ListCursor, ListResponse, MemoryConsentMode,
+        MemoryCreateRequest, MemoryPatchRequest, MemoryPolicyPutRequest, MemoryPolicyRecord,
+        MemoryQuery, MemoryRecord, MemoryScope, MemoryStatus, Pagination, PublicCitation,
+        PublicContentPart, PublicInputMessage, RagCollectionCreateRequest,
+        RagCollectionPatchRequest, RagCollectionQuery, RagCollectionRecord, RagCollectionStatus,
+        RagDocumentCreateRequest, RagDocumentIngestRequest, RagDocumentRecord,
+        ResponseConversationInput, RetrievalPolicyPutRequest, RetrievalPolicyRecord, SeqCursor,
     },
     error::AppError,
     infra::repositories::{
@@ -1589,9 +1588,7 @@ impl ConversationService {
             .await;
         lock.release().await;
 
-        self.state
-            .metrics
-            .record_summarization_run(outcome.is_ok());
+        self.state.metrics.record_summarization_run(outcome.is_ok());
         let row = outcome?;
         // Audited by shape, never by content: the version, the coverage boundary and the token
         // count. `audit_logs` records that a summary was produced and how far it reaches; the
@@ -1612,9 +1609,10 @@ impl ConversationService {
             }),
         )
         .await?;
-        Ok(SummarizationOutcome::Summarized(
-            summary_record_from_row(&conversation.id, &row),
-        ))
+        Ok(SummarizationOutcome::Summarized(summary_record_from_row(
+            &conversation.id,
+            &row,
+        )))
     }
 
     /// Reads the backlog and applies the trigger decision.
@@ -1638,10 +1636,15 @@ impl ConversationService {
         // estimate below is over the *capped* fetch instead, which is conservative in the safe
         // direction — it can only under-report the backlog, and under-reporting delays a
         // summarization rather than triggering one over content the run would not have read.
-        let messages_since_summary = count_messages_after_sequence(pool, conversation_uuid, boundary).await?;
-        let messages =
-            find_messages_after_sequence(pool, conversation_uuid, boundary, SUMMARY_TRANSCRIPT_MESSAGES)
-                .await?;
+        let messages_since_summary =
+            count_messages_after_sequence(pool, conversation_uuid, boundary).await?;
+        let messages = find_messages_after_sequence(
+            pool,
+            conversation_uuid,
+            boundary,
+            SUMMARY_TRANSCRIPT_MESSAGES,
+        )
+        .await?;
         let tokens_since_summary = messages
             .iter()
             .filter_map(|message| message.content.as_deref())
@@ -1658,7 +1661,8 @@ impl ConversationService {
             messages_since_summary,
             tokens_since_summary,
         };
-        decide_summarization(&summarization_policy, backlog, force).map_err(summarization_skip_error)?;
+        decide_summarization(&summarization_policy, backlog, force)
+            .map_err(summarization_skip_error)?;
 
         let turns: Vec<(String, String)> = messages
             .iter()

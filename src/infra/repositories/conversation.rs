@@ -2757,7 +2757,9 @@ pub struct ConversationSummaryRow {
     pub superseded_at: Option<chrono::DateTime<Utc>>,
 }
 
-fn conversation_summary_row_from(row: &sqlx::postgres::PgRow) -> Result<ConversationSummaryRow, AppError> {
+fn conversation_summary_row_from(
+    row: &sqlx::postgres::PgRow,
+) -> Result<ConversationSummaryRow, AppError> {
     Ok(ConversationSummaryRow {
         id: row.try_get("id")?,
         summary_version: row.try_get("summary_version")?,
