@@ -2227,6 +2227,13 @@ mod tests {
     /// rejected anything, so removing it would have been silent. This goes
     /// through the real `Query` extractor rather than `serde_urlencoded`
     /// directly, because the extractor is what the routes use.
+    ///
+    /// **The rejection's `Display` is not the wire response.** It names the
+    /// offending field, and that is asserted below only to prove the extractor
+    /// really rejected *this* field rather than failing for some other reason.
+    /// `normalize_infrastructure_error` (`src/lib.rs`) discards the text before
+    /// it leaves the process — see F2 and
+    /// `tests/admin_query_contract.rs::unknown_query_field_rejection_carries_the_error_envelope_and_enumerates_nothing`.
     #[test]
     fn page_query_rejects_a_field_absent_from_the_struct() {
         let uri: Uri = "/api/v1/admin/applications?not_a_real_field=1"

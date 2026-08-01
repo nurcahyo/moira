@@ -50,8 +50,11 @@ impl<T> ListResponse<T> {
 /// belongs to whichever plan is willing to regenerate the spec.
 ///
 /// One further consequence of rejecting at the extractor: the `Query` rejection is produced
-/// by axum *before* the handler runs, so it precedes `admin_actor` authentication and does
-/// not pass through `AppError`. See `tests/admin_query_contract.rs` for the recorded shape.
+/// by axum *before* the handler runs, so it precedes `admin_actor` authentication. It is
+/// nevertheless served in the standard error envelope — `normalize_infrastructure_error`
+/// (`src/lib.rs`) rewrites it, and deliberately discards axum's message, which used to
+/// enumerate all 26 field names below to a caller that had presented no credential (F2).
+/// See `tests/admin_query_contract.rs` for the guard.
 #[derive(Debug, Clone, Deserialize, Default, IntoParams)]
 #[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
