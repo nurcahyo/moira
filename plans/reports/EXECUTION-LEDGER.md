@@ -2086,6 +2086,42 @@ under 4B a human's second grant is never primary and revoking "the" row leaves a
   ~21 fallible per-row `collect()` sites and 48 enum-like CHECKs remain exposed. Rollout ordering
   (Moira first) is the only mitigation and goes in the release note.
 
+### F29 — `ExecutionOutcome.structured_output` is always `None`, for every caller
+
+The **request** side of structured output works: `output_schema` is honoured and
+`structured_output_invalid`/`_unsupported` are catalogued. The **response** side does not.
+`ExecutionRunOutput.structured_output` is hardcoded `None` at three sites in
+`src/application/execution.rs` — on the streaming **and** non-streaming paths — so no caller in the
+tree has ever received a parsed structured output.
+
+**No test pins the gap**, which is why it survived. Found while building plan 11 Sub-Phase F, whose
+extractor parses `output_text` and prefers `structured_output` when present — so it works today only
+because the preference never fires.
+
+Not Sub-Phase F's to close, and recorded rather than fixed in passing: it changes what every caller
+of the execution API receives, which deserves its own change and its own tests.
+
+### F30 — there are TWO memory-consent columns, and nothing makes them agree
+
+`application_memory_policies.consent_mode` and
+`application_conversation_policies.memory_consent_mode` are **independent**, both default
+`'explicit_only'`, and no constraint or code path reconciles them. Plan 11's body — and the brief
+derived from it — name only one.
+
+**Reading either alone is a defect in both directions**: honour only the memory policy and a
+conversation-level `explicit_only` is ignored; honour only the conversation policy and the reverse.
+Sub-Phase F takes the **stricter of the two** (decision D4).
+
+Worth stating because it is the shape that hides: two columns that agree in every default
+deployment, and disagree exactly when an operator has deliberately tightened one of them.
+
+### A defect the plan's own wording would have shipped, and it looks correct
+
+Plan 11 says to dedupe against existing **active** memories. Retrieval is `active`-only, so scoping
+dedupe the same way reads as consistent — and makes an `explicit_only` application accumulate **one
+unconfirmed duplicate per turn**, because unconfirmed candidates are never `active` and therefore
+never match. Caught by implementing it, not by reading it.
+
 ## USER DECISIONS — 2026-07-31, taken interactively
 
 1. **Findings before waves 4–5.** F20, F13, F17 and the Wave 2 leftovers first. F20 is the reason:
