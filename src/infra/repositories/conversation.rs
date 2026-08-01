@@ -2732,6 +2732,290 @@ pub(crate) async fn find_conversation_context_anchor(
     .transpose()
 }
 
+// ---------------------------------------------------------------------------
+// Plan 11 Sub-Phase E — conversation summarization.
+//
+// `conversation_summaries` had two readers and no writer until this block: the planner's
+// `find_conversation_context_anchor` above, and the `summary_available` existence check in
+// `conversation_select`. Both keep working unchanged and simply start returning something.
+// ---------------------------------------------------------------------------
+
+/// One `conversation_summaries` row, as the summarizer and the API need it.
+///
+/// `summary_text` is `Option` because `summary_text_plain` is nullable: an application whose
+/// `conversation_content_persistence` excludes plaintext gets a row that records *that* a summary
+/// exists and what it covers, with no body. That is the same honesty `conversation_messages`
+/// already applies, and it is why the API DTO's text field is optional too.
+#[derive(Debug, Clone)]
+pub struct ConversationSummaryRow {
+    pub id: Uuid,
+    pub conversation_uuid: Uuid,
+    pub summary_version: i64,
+    pub covers_through_sequence: i64,
+    pub summary_text: Option<String>,
+    pub token_count: Option<i64>,
+    pub created_at: chrono::DateTime<Utc>,
+    pub superseded_at: Option<chrono::DateTime<Utc>>,
+}
+
+fn conversation_summary_row_from(row: &sqlx::postgres::PgRow) -> Result<ConversationSummaryRow, AppError> {
+    Ok(ConversationSummaryRow {
+        id: row.try_get("id")?,
+        conversation_uuid: row.try_get("conversation_id")?,
+        summary_version: row.try_get("summary_version")?,
+        covers_through_sequence: row.try_get("covers_through_sequence")?,
+        summary_text: row.try_get("summary_text_plain")?,
+        token_count: row.try_get("token_count")?,
+        created_at: row.try_get("created_at")?,
+        superseded_at: row.try_get("superseded_at")?,
+    })
+}
+
+/// The conversation's active (non-superseded) summary, if it has one.
+///
+/// Ordered by `summary_version desc` rather than `created_at`, matching
+/// `find_conversation_context_anchor`, so the planner and the summarizer can never disagree about
+/// which row is current. `limit 1` is defensive: the supersession write in
+/// [`insert_conversation_summary`] runs in one transaction and leaves exactly one active row, but
+/// a historical row predating that write should not make this ambiguous.
+pub(crate) async fn find_active_conversation_summary(
+    pool: &PgPool,
+    conversation_uuid: Uuid,
+) -> Result<Option<ConversationSummaryRow>, AppError> {
+    let row = sqlx::query(
+        r#"
+            select id, conversation_id, summary_version, covers_through_sequence,
+                   summary_text_plain, token_count, created_at, superseded_at
+            from conversation_summaries
+            where conversation_id = $1 and superseded_at is null
+            order by summary_version desc
+            limit 1
+            "#,
+    )
+    .bind(conversation_uuid)
+    .fetch_optional(pool)
+    .await?;
+    row.as_ref().map(conversation_summary_row_from).transpose()
+}
+
+/// How many live messages sit after a coverage boundary.
+///
+/// Separate from [`find_messages_after_sequence`] on purpose. That one is capped at
+/// `SUMMARY_TRANSCRIPT_MESSAGES`, so deriving the backlog from its length would silently clamp
+/// the number the trigger decision reads — a 5 000-message backlog would report 200, which is
+/// still over every threshold today but would quietly become wrong the moment a threshold moved
+/// above the cap. The count is the honest input; the fetch is the bounded one.
+pub(crate) async fn count_messages_after_sequence(
+    pool: &PgPool,
+    conversation_uuid: Uuid,
+    after_sequence: i64,
+) -> Result<i64, AppError> {
+    let count: i64 = sqlx::query_scalar(
+        r#"
+            select count(*)
+            from conversation_messages
+            where conversation_id = $1
+              and deleted_at is null
+              and sequence_number > $2
+            "#,
+    )
+    .bind(conversation_uuid)
+    .bind(after_sequence)
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
+}
+
+/// The first `limit` live messages after a coverage boundary, oldest first.
+///
+/// Oldest-first and forward-bounded, unlike `find_recent_messages`, which reads the *tail*. The
+/// difference is load-bearing: a summary must extend its predecessor's coverage contiguously, so
+/// when the backlog exceeds the cap the run summarises the **oldest** un-covered messages and
+/// sets `covers_through_sequence` from what it actually read. Reading the tail instead would
+/// advance the boundary over messages no summary ever saw — a silent hole in coverage that
+/// nothing downstream could detect.
+pub(crate) async fn find_messages_after_sequence(
+    pool: &PgPool,
+    conversation_uuid: Uuid,
+    after_sequence: i64,
+    limit: i64,
+) -> Result<Vec<HistoryMessage>, AppError> {
+    let rows = sqlx::query(
+        r#"
+            select id as message_uuid, role, content_plain, sequence_number
+            from conversation_messages
+            where conversation_id = $1
+              and deleted_at is null
+              and sequence_number > $2
+            order by sequence_number asc
+            limit $3
+            "#,
+    )
+    .bind(conversation_uuid)
+    .bind(after_sequence)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|row| {
+            Ok(HistoryMessage {
+                message_uuid: row.try_get("message_uuid")?,
+                role: row.try_get("role")?,
+                content: row.try_get("content_plain")?,
+                sequence_number: row.try_get("sequence_number")?,
+            })
+        })
+        .collect()
+}
+
+/// Everything one new `conversation_summaries` row needs.
+#[derive(Debug, Clone)]
+pub struct ConversationSummaryInsert<'a> {
+    pub conversation_uuid: Uuid,
+    pub covers_through_sequence: i64,
+    /// `None` when the application's persistence policy excludes plaintext.
+    pub summary_text: Option<&'a str>,
+    /// `request_hash` over the summary bytes — a content address, written even when the text is
+    /// not, so two runs producing the same summary are recognisable without the body.
+    pub summary_hash: &'a str,
+    pub token_count: Option<i64>,
+    pub provider_model_id: Option<Uuid>,
+}
+
+/// Supersedes the active summary and inserts the new one, in one transaction.
+///
+/// Three properties, all of which need the single transaction:
+///
+/// 1. **`summary_version` is `max + 1` read under the same transaction as the insert.** Two
+///    concurrent runs cannot mint the same version, because the second blocks on the first's
+///    row lock and then reads the version it wrote.
+/// 2. **There is never more than one active row.** The `update … set superseded_at = now()` and
+///    the insert commit together, so no reader can observe two active summaries or zero.
+/// 3. **A failed insert leaves the previous summary active.** Superseding first and inserting
+///    second in two statements outside a transaction would, on a constraint violation, leave the
+///    conversation with *no* active summary — silently discarding coverage that was already
+///    earned.
+///
+/// `conversation_summary_boundary_unique (conversation_id, covers_through_sequence)` is what
+/// makes a duplicate run at the same boundary a refusal rather than a second row.
+/// `decide_summarization` refuses an empty backlog before any model call so this constraint is
+/// reached only by a genuine race, which is exactly what it is for.
+pub(crate) async fn insert_conversation_summary(
+    pool: &PgPool,
+    insert: &ConversationSummaryInsert<'_>,
+) -> Result<ConversationSummaryRow, AppError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        r#"
+            update conversation_summaries
+            set superseded_at = now()
+            where conversation_id = $1 and superseded_at is null
+            "#,
+    )
+    .bind(insert.conversation_uuid)
+    .execute(&mut *tx)
+    .await?;
+    let next_version: i64 = sqlx::query_scalar(
+        r#"
+            select coalesce(max(summary_version), 0) + 1
+            from conversation_summaries
+            where conversation_id = $1
+            "#,
+    )
+    .bind(insert.conversation_uuid)
+    .fetch_one(&mut *tx)
+    .await?;
+    let row = sqlx::query(
+        r#"
+            insert into conversation_summaries (
+                id, conversation_id, summary_version, covers_through_sequence,
+                summary_text_plain, summary_hash, token_count, provider_model_id
+            )
+            values ($1, $2, $3, $4, $5, $6, $7, $8)
+            returning id, conversation_id, summary_version, covers_through_sequence,
+                      summary_text_plain, token_count, created_at, superseded_at
+            "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(insert.conversation_uuid)
+    .bind(next_version)
+    .bind(insert.covers_through_sequence)
+    .bind(insert.summary_text)
+    .bind(insert.summary_hash)
+    .bind(insert.token_count)
+    .bind(insert.provider_model_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    conversation_summary_row_from(&row)
+}
+
+/// The advisory-lock namespace summarization takes its per-conversation locks in.
+///
+/// # Why the two-argument lock form, and why this cannot collide (A7)
+///
+/// Sub-Phase E needs a lock keyed on a *conversation*, so its key is derived rather than
+/// declared. Every other advisory lock in this tree — `moiralrt`, `moirastp`, `moiraoid`,
+/// `moiratdb` and the test-only `MOIRARET` — is a `bigint` key built from eight ASCII bytes, and
+/// a derived 64-bit key could in principle land on one of them.
+///
+/// PostgreSQL removes the question rather than leaving it to an assertion list: the
+/// single-argument `pg_*_advisory_*(bigint)` family and the two-argument
+/// `pg_*_advisory_*(int, int)` family occupy **separate lock spaces that never overlap** — the
+/// two-argument form sets the tag's `field4` to `1` and the one-argument form to `2`. So a
+/// two-argument lock cannot collide with any `bigint` key no matter what integers it derives,
+/// and the `objid` half is free to be a hash of the conversation id.
+///
+/// `classid` is this constant, which distinguishes summarization from any future two-argument
+/// user of the same mechanism. `declared_two_argument_advisory_namespaces_are_unique` pins it.
+pub(crate) const SUMMARIZATION_LOCK_CLASS: i32 = i32::from_be_bytes(*b"mSUM");
+
+/// The `objid` half of a conversation's summarization lock.
+///
+/// A truncation of the conversation uuid, not a hash: the uuid is already uniformly distributed
+/// (`uuid_generate` / `now_v7` both randomise the low bits), and a collision costs at worst one
+/// unnecessary `202` on an unrelated conversation — it can never produce a wrong summary, because
+/// the lock is an optimisation and `conversation_summary_boundary_unique` is the correctness
+/// boundary.
+pub(crate) fn summarization_lock_object(conversation_uuid: Uuid) -> i32 {
+    let bytes = conversation_uuid.as_bytes();
+    i32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]])
+}
+
+/// Takes the per-conversation summarization lock on `connection`, or reports it already held.
+///
+/// **Session-scoped, not transaction-scoped.** A summarization run spans a provider call, and a
+/// transaction-scoped lock would mean holding an open transaction across a network round trip.
+/// Session scope means the caller must own the connection for the run and release explicitly —
+/// [`unlock_conversation_summarization`] — which is why the caller takes a dedicated
+/// `PoolConnection` rather than using the pool. A connection returned to the pool still holding
+/// an advisory lock would be inherited by an unrelated checkout, the hazard
+/// `auth_settings.rs`'s `IssuerlessSlotLock` documents.
+pub(crate) async fn try_lock_conversation_summarization(
+    connection: &mut PgConnection,
+    conversation_uuid: Uuid,
+) -> Result<bool, AppError> {
+    let acquired: bool = sqlx::query_scalar("select pg_try_advisory_lock($1, $2)")
+        .bind(SUMMARIZATION_LOCK_CLASS)
+        .bind(summarization_lock_object(conversation_uuid))
+        .fetch_one(connection)
+        .await?;
+    Ok(acquired)
+}
+
+/// Releases a lock taken by [`try_lock_conversation_summarization`] on the same connection.
+pub(crate) async fn unlock_conversation_summarization(
+    connection: &mut PgConnection,
+    conversation_uuid: Uuid,
+) -> Result<(), AppError> {
+    sqlx::query("select pg_advisory_unlock($1, $2)")
+        .bind(SUMMARIZATION_LOCK_CLASS)
+        .bind(summarization_lock_object(conversation_uuid))
+        .execute(connection)
+        .await?;
+    Ok(())
+}
+
 /// The embedding provider/model/limits for an application, independent of any document.
 ///
 /// Retrieval needs the same embedding model ingestion used, but reaches it from the acting

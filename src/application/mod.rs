@@ -10,6 +10,7 @@ mod memory_extraction;
 mod public;
 mod runtime_admin;
 mod setup;
+mod summarization;
 
 pub use admin::AdminService;
 pub use admin_command::{
@@ -42,3 +43,13 @@ pub(crate) use memory_extraction::SECRET_NEEDLES;
 pub use public::{ExecutionPipeline, PublicExecutionService};
 pub use runtime_admin::RuntimeAdminService;
 pub use setup::SetupService;
+// Plan 11 Sub-Phase E. Same split as `context_planner` and `memory_extraction`: the trigger
+// decision, the prompt boundary and the reply contract are pure, so they are tested with no
+// database and no provider.
+pub use summarization::{
+    FAILURE_SUMMARIZATION_CALL_FAILED, FAILURE_SUMMARY_EMPTY, FAILURE_SUMMARY_TOO_LARGE,
+    MAXIMUM_SUMMARY_BYTES, PRIOR_SUMMARY_LABEL, SUMMARIZATION_INSTRUCTION,
+    SUMMARY_TRANSCRIPT_LABEL, SUMMARY_TRANSCRIPT_MESSAGES, SummarizationBacklog,
+    SummarizationPolicy, SummarizationSkip, ValidatedSummary, decide_summarization, parse_summary,
+    summarization_messages,
+};

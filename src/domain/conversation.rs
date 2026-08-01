@@ -4,6 +4,8 @@ use serde_json::Value;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
+use super::i18n::ResponseText;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ConversationStatus {
@@ -244,6 +246,58 @@ pub struct ConversationMessageCreateRequest {
     pub content: String,
     #[serde(default = "empty_object")]
     pub metadata: Value,
+}
+
+/// One immutable conversation summary version — plan 11 Sub-Phase E.
+///
+/// `summary_text` is optional and carries the body only when the application's
+/// `conversation_content_persistence` admits plaintext. A row with `summary_text: null` is not an
+/// error: it records that a summary exists, which version it is and how far it covers, without a
+/// body Moira was not permitted to store. Callers must treat "a summary exists" and "the summary
+/// text is available" as two separate facts, exactly as `ConversationMessageRecord.content`
+/// already requires.
+///
+/// There is deliberately **no `summary_hash` field**. The hash is a content address over the
+/// summary bytes, and publishing it on a caller-visible response would make it an offline oracle
+/// over candidate summary plaintexts — the first clause of finding F14's admitting rule, which is
+/// exactly why `conversation_messages.content_hash` stayed peppered while
+/// `memory_records.content_hash` did not.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ConversationSummaryRecord {
+    pub id: String,
+    pub object: String,
+    pub conversation_id: String,
+    pub summary_version: i64,
+    /// The `sequence_number` of the last message this summary covers.
+    pub covers_through_sequence: i64,
+    pub summary_text: Option<String>,
+    pub token_count: Option<i64>,
+    pub created_at: DateTime<Utc>,
+    /// Always `null` on a freshly created summary; present on a version a later run replaced.
+    pub superseded_at: Option<DateTime<Utc>>,
+}
+
+/// Body of `POST /api/v1/conversations/{id}/summarize`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ConversationSummarizeRequest {
+    /// Bypass `summary_trigger_tokens` and `minimum_messages_since_summary`.
+    ///
+    /// Does **not** bypass `summarization_enabled`, and does not make a summary possible when
+    /// nothing has been said since the last one — see `decide_summarization` for why each of
+    /// those two is not a threshold.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// Body of the `202` from `POST /api/v1/conversations/{id}/summarize`.
+///
+/// A summarization for this conversation is already running, so this request did not start a
+/// second one. The notice carries the catalog key rather than an English literal, per
+/// CONVENTIONS.md §4.2.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ConversationSummarizeAccepted {
+    pub notice: ResponseText,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

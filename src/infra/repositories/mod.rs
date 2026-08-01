@@ -69,6 +69,16 @@ pub(crate) use conversation::{
     complete_memory_extraction_run, confirm_memory, find_memory_by_content_hash,
     find_memory_by_key, find_nearest_memory, insert_extracted_memory, insert_memory_extraction_run,
 };
+// Plan 11 Sub-Phase E. `pub(crate)` for the same reason as the two blocks above: none of these
+// applies an authorization check of its own. `find_active_conversation_summary` and
+// `find_messages_after_sequence` read conversation content by internal uuid — a `pub` export
+// would let external code read any conversation's history without the `ConversationAccess`
+// predicate that `ConversationService::summarize_conversation` resolves first.
+pub(crate) use conversation::{
+    ConversationSummaryInsert, ConversationSummaryRow, count_messages_after_sequence,
+    find_active_conversation_summary, find_messages_after_sequence, insert_conversation_summary,
+    try_lock_conversation_summarization, unlock_conversation_summarization,
+};
 pub use public::{
     IdempotencyClaim, PgPublicRepository, PublicAccess, PublicRepository, ResponseStartedInsert,
     ResponseTerminalUpdate, default_application_execution_policy, idempotency_record,
