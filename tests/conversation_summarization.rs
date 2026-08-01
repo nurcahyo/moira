@@ -32,7 +32,7 @@
 
 mod support;
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use axum::http::StatusCode;
 use moira::domain::ConversationPolicyPutRequest;
@@ -100,7 +100,15 @@ impl Case {
         // After `enable_public_streaming`, which writes its own conversation policy.
         fixture.enable_summarization(policy).await;
         let summarize_key = fixture.consumer_key_with_scopes(SUMMARIZE_SCOPES).await;
-        let moira = MoiraHttpServer::start(fixture.state.clone()).await;
+        // `/metrics` is off by default (`config/default.toml` sets
+        // `telemetry.prometheus_enabled = false`), so a scrape would 404 without this. Same
+        // clone-and-override `tests/metrics_endpoint.rs::start_server` performs; the registry's
+        // own `service` label is fixed at `AppState::new` and is not affected.
+        let mut state = fixture.state.clone();
+        let mut settings = (*fixture.state.settings).clone();
+        settings.telemetry.prometheus_enabled = true;
+        state.settings = Arc::new(settings);
+        let moira = MoiraHttpServer::start(state).await;
         Some(Self {
             fixture,
             completion,
@@ -244,6 +252,36 @@ impl Case {
         .fetch_all(&self.fixture.pool)
         .await
         .expect("read audit_logs")
+    }
+
+    /// The value of one `moira_summarization_runs_total` outcome series, scraped over HTTP.
+    ///
+    /// Returns `0.0` when the series is absent, which is indistinguishable from a genuine zero
+    /// **and that is correct here**: the family is zero-seeded for both outcomes at registry
+    /// construction, so an absent series would itself be a seeding regression that
+    /// `the_new_families_are_seeded_at_zero_before_any_observation` already owns.
+    ///
+    /// No synchronisation is needed between driving traffic and scraping: the summarization
+    /// recorder runs inside the request that triggered it, so a completed HTTP response implies
+    /// a completed recording (CONVENTIONS.md §3 — no `sleep()`).
+    async fn summarization_runs(&self, outcome: &str) -> f64 {
+        let body = self
+            .client
+            .get(format!("{}/metrics", self.moira.base_url))
+            .send()
+            .await
+            .expect("scrape /metrics")
+            .text()
+            .await
+            .expect("read /metrics body");
+        let needle = format!("outcome=\"{outcome}\"");
+        body.lines()
+            .filter(|line| line.starts_with("moira_summarization_runs_total{"))
+            .filter(|line| line.contains(&needle))
+            .filter_map(|line| line.rsplit(' ').next())
+            .filter_map(|value| value.parse::<f64>().ok())
+            .next()
+            .unwrap_or(0.0)
     }
 
     async fn shutdown(self) {
@@ -925,6 +963,63 @@ async fn an_automatic_summarization_failure_leaves_the_caller_s_response_untouch
         "the caller's own output must be intact: {body}"
     );
     assert!(case.summaries().await.is_empty());
+
+    // The failure counter is the ONLY signal an automatic summarization failed: the caller sees
+    // a normal 200, no row is written, and there is no `conversation_summarization_runs` table.
+    // `docs/conversation-summarization.md`, the metric's own description and plan 11 §0.1c's
+    // D-E6 all assert this in prose; until this scrape, nothing asserted it in code.
+    //
+    // **Both series, not just the failing one.** `record_summarization_run(outcome.is_ok())`
+    // mutated to a constant `true` moves the count to the *wrong* series while still
+    // incrementing something — `failed >= 1` alone stays green against that, and against a
+    // recorder that counts every run twice. Pinning `failed == 1` and `succeeded == 0` together
+    // is what makes the assertion able to fail. This pairing is the assertion, not decoration
+    // around it; deleting either half as redundant restores the hole.
+    assert_eq!(
+        case.summarization_runs("failed").await,
+        1.0,
+        "a failed automatic summarization must be counted as failed"
+    );
+    assert_eq!(
+        case.summarization_runs("succeeded").await,
+        0.0,
+        "nothing succeeded, so the succeeded series must still read zero"
+    );
+
+    case.shutdown().await;
+}
+
+/// A successful automatic summarization counts as succeeded, and nothing counts as failed.
+///
+/// The mirror of the case above, and it exists for the same reason that one asserts both series:
+/// a recorder wired to a constant — in either direction — satisfies exactly one of these two
+/// tests. Together they pin that the argument reaching the counter is the run's real outcome.
+#[tokio::test]
+async fn a_successful_automatic_summarization_counts_as_succeeded() {
+    let Some(case) =
+        Case::enabled(vec![completion(ASSISTANT_REPLY), completion(SUMMARY_BODY)]).await
+    else {
+        return;
+    };
+
+    let (status, body) = case.respond(USER_TURN).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        case.summaries().await.len(),
+        1,
+        "the fixture must summarise"
+    );
+
+    assert_eq!(
+        case.summarization_runs("succeeded").await,
+        1.0,
+        "a successful run must be counted as succeeded"
+    );
+    assert_eq!(
+        case.summarization_runs("failed").await,
+        0.0,
+        "nothing failed, so the failed series must still read zero"
+    );
 
     case.shutdown().await;
 }

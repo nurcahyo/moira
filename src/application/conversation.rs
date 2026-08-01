@@ -1531,11 +1531,28 @@ impl ConversationService {
     ///
     /// `moira:conversations:write` is the **endpoint's** requirement, not the operation's. The
     /// automatic path runs on the response path, where the acting key is whatever issued
-    /// `POST /api/v1/responses` — typically a consumer key holding `moira:responses:write` and
-    /// nothing else. Leaving the scope check in the shared body would make automatic
+    /// `POST /api/v1/responses`. Leaving the scope check in the shared body would make automatic
     /// summarization silently never run for the ordinary caller while every flag said it was on:
-    /// a feature that is enabled, configured, metric-seeded and dead. That is P0-1's shape, and
-    /// it is the exact failure this split exists to prevent.
+    /// a feature that is enabled, configured, metric-seeded and dead. That is P0-1's shape — the
+    /// finding this whole plan exists to remove — and it is the exact failure this split prevents.
+    ///
+    /// **Do not merge these two functions.** That instruction is worth nothing on its own, so
+    /// here is the evidence, checkable in ten seconds:
+    ///
+    /// * `LifecycleFixture::enable_public_streaming` (`tests/support/mod.rs`) mints the consumer
+    ///   key a caller actually uses: `moira:responses:create`, `moira:responses:stream`,
+    ///   `moira:responses:read`, `moira:execution:override-route`, `moira:conversations:create`
+    ///   and `moira:conversations:read` — and deliberately **not** `moira:conversations:write`.
+    ///   That list predates this wave; it is what a response-plane key looks like, not a fixture
+    ///   tuned to make this argument.
+    /// * Move the `require` call into this function and
+    ///   `a_summary_written_on_one_turn_is_injected_into_the_next`
+    ///   (`tests/conversation_summarization.rs`) fails: no summary is ever written, so the next
+    ///   turn's `context_plans.included_summary_id` is `None`.
+    /// * The endpoint still enforces the scope, and
+    ///   `the_summarize_endpoint_refuses_a_key_without_the_write_scope` is what proves it — so
+    ///   the split widens nothing. Deleting *that* test is the other way to break this safely
+    ///   looking change.
     ///
     /// Everything that is a *property of the data* stays here — the access predicate, the
     /// archived check, the policy, the trigger. Only the caller-plane scope moves out.
