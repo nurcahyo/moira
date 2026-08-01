@@ -202,7 +202,7 @@ impl Case {
 
     async fn runs(&self) -> Vec<RunRow> {
         sqlx::query_as::<_, RunRow>(
-            "select status, candidate_count, accepted_count, rejected_count, failure_class, \
+            "select id, status, candidate_count, accepted_count, rejected_count, failure_class, \
                     metadata, (completed_at is not null) as completed \
              from memory_extraction_runs order by started_at asc",
         )
@@ -246,6 +246,7 @@ struct MemoryRow {
 
 #[derive(Debug, sqlx::FromRow)]
 struct RunRow {
+    id: Uuid,
     status: String,
     candidate_count: i32,
     accepted_count: i32,
@@ -324,8 +325,8 @@ async fn a_consenting_application_writes_an_active_memory_and_records_the_run() 
     assert_eq!(runs[0].failure_class, None);
     assert!(runs[0].completed, "a finished run must have completed_at");
     assert_eq!(
-        written.source_extraction_run_id.is_some(),
-        true,
+        written.source_extraction_run_id,
+        Some(runs[0].id),
         "the memory must name the run that produced it"
     );
 
