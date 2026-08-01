@@ -1952,6 +1952,86 @@
         ],
         "type": "string"
       },
+      "ConversationSummarizeAccepted": {
+        "description": "Body of the `202` from `POST /api/v1/conversations/{id}/summarize`.\n\nA summarization for this conversation is already running, so this request did not start a\nsecond one. The notice carries the catalog key rather than an English literal, per\nCONVENTIONS.md §4.2.",
+        "properties": {
+          "notice": {
+            "$ref": "#/components/schemas/ResponseText"
+          }
+        },
+        "required": [
+          "notice"
+        ],
+        "type": "object"
+      },
+      "ConversationSummarizeRequest": {
+        "additionalProperties": false,
+        "description": "Body of `POST /api/v1/conversations/{id}/summarize`.",
+        "properties": {
+          "force": {
+            "description": "Bypass `summary_trigger_tokens` and `minimum_messages_since_summary`.\n\nDoes **not** bypass `summarization_enabled`, and does not make a summary possible when\nnothing has been said since the last one — see `decide_summarization` for why each of\nthose two is not a threshold.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "ConversationSummaryRecord": {
+        "description": "One immutable conversation summary version — plan 11 Sub-Phase E.\n\n`summary_text` is optional and carries the body only when the application's\n`conversation_content_persistence` admits plaintext. A row with `summary_text: null` is not an\nerror: it records that a summary exists, which version it is and how far it covers, without a\nbody Moira was not permitted to store. Callers must treat \"a summary exists\" and \"the summary\ntext is available\" as two separate facts, exactly as `ConversationMessageRecord.content`\nalready requires.\n\nThere is deliberately **no `summary_hash` field**. The hash is a content address over the\nsummary bytes, and publishing it on a caller-visible response would make it an offline oracle\nover candidate summary plaintexts — the first clause of finding F14's admitting rule, which is\nexactly why `conversation_messages.content_hash` stayed peppered while\n`memory_records.content_hash` did not.",
+        "properties": {
+          "conversation_id": {
+            "type": "string"
+          },
+          "covers_through_sequence": {
+            "description": "The `sequence_number` of the last message this summary covers.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "object": {
+            "type": "string"
+          },
+          "summary_text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "summary_version": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "superseded_at": {
+            "description": "Always `null` on a freshly created summary; present on a version a later run replaced.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "token_count": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "object",
+          "conversation_id",
+          "summary_version",
+          "covers_through_sequence",
+          "created_at"
+        ],
+        "type": "object"
+      },
       "CredentialCreateRequest": {
         "additionalProperties": false,
         "properties": {
@@ -26551,6 +26631,137 @@
             "consumerKeyAuth": []
           }
         ],
+        "tags": [
+          "conversations"
+        ]
+      }
+    },
+    "/api/v1/conversations/{id}/summarize": {
+      "post": {
+        "description": "Produces a new immutable conversation summary version. `force` bypasses the configured trigger thresholds; it does not bypass `summarization_enabled`, and it cannot produce a summary when nothing has been said since the last one.",
+        "operationId": "summarize_conversation",
+        "parameters": [
+          {
+            "description": "Conversation identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConversationSummarizeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationSummaryRecord"
+                }
+              }
+            },
+            "description": "A new summary version was produced",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationSummarizeAccepted"
+                }
+              }
+            },
+            "description": "A summarization is already in flight for this conversation; nothing was started",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "retry-after": {
+                "description": "Seconds to wait before retrying",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request, authentication, authorization, policy, conflict, or not-found error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure, upstream, or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "summary": "`POST /api/v1/conversations/{id}/summarize` — plan 11 Sub-Phase E.",
         "tags": [
           "conversations"
         ]

@@ -54,4 +54,13 @@ pub const RESPONSE_NOTICE_CATALOG: &[I18nEntry] = &[
         default_message: "Admin access has been revoked for this identity.",
         description: "Used on the 200 of DELETE /api/v1/admin/admin-identities/{id}. The revocation is a soft one - status becomes 'revoked' and the row stays - so the response carries the updated record rather than an empty 204, and this notice is what makes that record readable to a human.",
     },
+    // Plan 11 Sub-Phase E. Exactly one notice, on exactly one branch. The 200 of
+    // the same endpoint returns a ConversationSummaryRecord, which carries no
+    // human-readable prose field, so it gets none - the same rule that gave the
+    // auth-method and claim-status responses none above.
+    I18nEntry {
+        key: "moira.notice.summarization_in_progress",
+        default_message: "A summarization is already in progress for this conversation.",
+        description: "Used on the 202 of POST /api/v1/conversations/{id}/summarize, when the per-conversation singleflight advisory lock is already held by another run. The response carries a Retry-After header; nothing was started by this request. This is not an error - the caller's intent (a summary exists soon) is being satisfied by the run already underway.",
+    },
 ];

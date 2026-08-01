@@ -33,6 +33,7 @@ pub use conversation::{
     ConversationMessageQuery, ConversationMessageRecord, ConversationMessageRole,
     ConversationMessageType, ConversationPatchRequest, ConversationPolicyPutRequest,
     ConversationPolicyRecord, ConversationQuery, ConversationRecord, ConversationStatus,
+    ConversationSummarizeAccepted, ConversationSummarizeRequest, ConversationSummaryRecord,
     EmbeddingPolicyPutRequest, EmbeddingPolicyRecord, HistoryStrategy, MemoryConsentMode,
     MemoryCreateRequest, MemoryPatchRequest, MemoryPolicyPutRequest, MemoryPolicyRecord,
     MemoryQuery, MemoryRecord, MemoryScope, MemorySensitivity, MemoryStatus, MemoryType,

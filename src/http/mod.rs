@@ -382,6 +382,9 @@ fn conversation_routes() -> OpenApiRouter<AppState> {
         ))
         .routes(routes!(conversation::archive_conversation))
         .routes(routes!(conversation::restore_conversation))
+        // Plan 11 Sub-Phase E. Caller-plane, so it belongs here and inherits
+        // `CONVERSATION_BODY_LIMIT_BYTES` — see the handler's own note.
+        .routes(routes!(conversation::summarize_conversation))
         .routes(routes!(
             conversation::list_messages,
             conversation::create_message
@@ -665,6 +668,7 @@ mod tests {
             "/api/v1/conversations/{id}",
             "/api/v1/conversations/{id}/archive",
             "/api/v1/conversations/{id}/restore",
+            "/api/v1/conversations/{id}/summarize",
             "/api/v1/conversations/{id}/messages",
             "/api/v1/memories",
             "/api/v1/memories/{id}",
@@ -769,7 +773,8 @@ mod tests {
         }
         // 142 + plan 09 wave 2's nine: create/list/get/revoke an admin invitation,
         // preview and redeem one, and list/patch/delete an admin identity grant.
-        assert_eq!(operation_count, 151);
+        // + plan 11 Sub-Phase E's one: POST /api/v1/conversations/{id}/summarize.
+        assert_eq!(operation_count, 152);
     }
 
     #[test]

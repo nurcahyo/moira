@@ -33,15 +33,23 @@ content, enforce policy, **and feed the model**:
   back in `citations`; replayed history and the summary do not.
 - Memories are extracted automatically from completed turns under the application's
   consent and extraction policy.
+- Conversation summarization runs as of plan 11 Sub-Phase E, behind
+  `application_conversation_policies.summarization_enabled`, which defaults to `false`.
+  `POST /api/v1/conversations/{id}/summarize` produces a version on demand, and an
+  application with the flag on summarizes automatically once a conversation's backlog
+  crosses both `summary_trigger_tokens` and `minimum_messages_since_summary`. See
+  `docs/conversation-summarization.md`.
 
-**Retrieval is opt-in.** `application_retrieval_policies.enabled`,
-`.memory_retrieval_enabled` and `.rag_retrieval_enabled` default to `false`, and retrieval
-also needs an embedding model configured for the application. Until an operator enables
-them, `citations` is `[]` and no retrieval runs — which is why an empty array must be read
-as "nothing was retrieved" rather than as a contract guarantee.
+**Everything above is opt-in, and that is the point of this section.**
+`application_retrieval_policies.enabled`, `.memory_retrieval_enabled` and
+`.rag_retrieval_enabled` default to `false`, retrieval also needs an embedding model
+configured for the application, and summarization has its own default-`false` flag. Until
+an operator turns them on, `citations` is `[]` and no retrieval runs — which is why an
+empty array must be read as "nothing was retrieved" rather than as a contract guarantee.
 
-Still absent: summarization. `conversation_summaries` has no writer, so a conversation past
-its configured budget is truncated rather than summarized.
+Two capabilities are genuinely still absent: no OAuth/OIDC *client* runs inside Moira, and
+the durable worker queue claims summarization and extraction jobs through a stub
+dispatcher, so both run inline rather than being retried out of band.
 
 The RAG create/ingest/reindex routes under `/api/v1/admin/rag-collections` and
 `/api/v1/admin/rag-documents` now replay under `Idempotency-Key`, on the same
