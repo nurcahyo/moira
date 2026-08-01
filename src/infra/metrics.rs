@@ -1672,6 +1672,35 @@ mod tests {
         }
     }
 
+    /// Both summarization outcomes reach their own series — plan 11 Sub-Phase E.
+    ///
+    /// The seeding test above proves the series *exist*; this one proves the recorder actually
+    /// emits to them. Those are different facts, and this repository has already shipped five
+    /// metric labels that were seeded and never emitted (`HANDOFF.md` §2.3). The cheapest edit
+    /// that breaks the property while leaving the seeding test green is a `record_*` that never
+    /// runs, or one that maps both outcomes onto the same label — this catches both, because it
+    /// asserts the two series carry *different* counts.
+    #[test]
+    fn summarization_runs_are_counted_against_the_outcome_that_happened() {
+        let metrics = registry();
+        metrics.record_summarization_run(true);
+        metrics.record_summarization_run(true);
+        metrics.record_summarization_run(false);
+        let rendered = metrics.render_prometheus("moira-test", false, false);
+
+        let series = |outcome: &str| {
+            format!("{SUMMARIZATION_RUNS_TOTAL}{{service=\"moira-test\",outcome=\"{outcome}\"}}")
+        };
+        assert!(
+            rendered.contains(&format!("{} 2", series("succeeded"))),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("{} 1", series("failed"))),
+            "{rendered}"
+        );
+    }
+
     /// `job_name` is a metric label, so it must come from the closed set. An
     /// unrecognised name is dropped rather than folded into another job's total,
     /// for the same reason an unrecognised retention table is.

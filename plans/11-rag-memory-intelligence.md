@@ -138,6 +138,86 @@ places**; where it disagrees with this subsection, this subsection wins.
   keeping it out is what leaves this wave with **no OpenAPI change, no migration and no new
   scope** — the whole surface is behind flags that already exist.
 
+### §0.1c Sub-Phase E, as built — six decisions and four corrections to this plan
+
+Written 2026-08-02 on `feat/plan-11-subphase-e`, after re-auditing Sub-Phase E's section against
+waves 1–3 and Sub-Phase F. **Where this subsection disagrees with the body, this subsection wins.**
+
+#### Corrections to the body and to the briefing
+
+| # | Claim | Reality |
+|---|---|---|
+| **E-C1** | `conversation_summaries` "is referenced exactly once — a read-only `exists(...)` computing `summary_available`." | **Twice.** `conversation_select`'s `summary_available` *and* `find_conversation_context_anchor`, which is the planner's own summary read (Sub-Phase D wired it deliberately so the drop-order would not ship untested). Both are in `src/infra/repositories/conversation.rs`. Neither changed; both simply start returning something. |
+| **E-C2** | Body: *"enqueue (not synchronously run, to avoid adding summarization latency to the response path) a summarization job"* (`:440`). | **Not possible in this tree.** `run_supervisor` wires `queue::StubJobDispatcher`, so an enqueued summarization is claimed and dropped — a feature whose work never runs behind a flag that says it does, which is P0-1's exact shape. Same reasoning, same outcome as D-F2. See **D-E2**. |
+| **E-C3** | Body: *"`202 Accepted` with `Retry-After` … `422 context_length_exceeded` if even the minimal summarization input can't be assembled"* (`:533`). | `context_length_exceeded` is **not reachable** from summarization. It is `assemble_context`'s error, raised when the *caller's own turn* exceeds the history budget; summarization does not call `assemble_context` and has no caller turn. The genuinely-needed codes are the three in **D-E5**, none of which the body names. |
+| **E-C4** | Body treats the summarization prompt as carrying only a transcript (`:438`). | It also carries **the previous summary**, which is Moira's own prior model output derived from untrusted content. Folding it into the instruction slot — the obvious reading of "Moira generated it, so it is trusted" — is the only way an injection could *escalate* across summarization generations rather than dying with the turn that carried it. It is labelled and placed in a `User` message like the transcript. |
+
+#### Decisions, each with the condition that reverses it
+
+- **D-E1 — the scope check is on the endpoint, not on the operation.**
+  `summarize_conversation` requires `moira:conversations:write` and delegates to
+  `summarize_conversation_unscoped`, which the automatic path calls directly. The automatic path
+  runs with whatever key issued `POST /api/v1/responses` — `enable_public_streaming`'s fixture key
+  holds `moira:responses:create` and **not** `moira:conversations:write`, which is what a real
+  caller-plane key looks like. A shared body with the scope check in it would have made automatic
+  summarization dead for every ordinary caller while every flag said it was on. *Reverses* if
+  summarization ever becomes a thing a caller must be separately entitled to have happen at all,
+  as opposed to a thing they may separately *request*.
+- **D-E2 — summarization runs inline, not on the queue.** Per E-C2. Cost is bounded twice:
+  `summarization_enabled` defaults to `false`, and a run happens once per `summary_trigger_tokens`
+  of conversation rather than once per turn. *Reverses* the moment a real `JobDispatcher` replaces
+  the stub; `summarize_conversation_unscoped` already takes only ids.
+- **D-E3 — `force` bypasses the two thresholds and nothing else.** Not `summarization_enabled` (an
+  operator's switch is not a threshold, and the endpoint is caller-plane), and not the empty-backlog
+  check (`conversation_summary_boundary_unique` makes a second summary at the same boundary
+  unrepresentable, so forcing one is a unique violation arriving as a 500). *Reverses* for the
+  `enabled` clause only if an **admin-plane** summarize endpoint is added — an operator overriding
+  their own switch is a different actor from a caller overriding it.
+- **D-E4 — the summarization route is the conversation's own most recent response route.** D-F3's
+  trap applies here and extraction's fix does not transfer: the manual endpoint is not a completion
+  request, so there is no `ConversationExecutionLink` to copy a hint from.
+  `find_conversation_route_hint` reconstructs it from `responses.route_id`. A conversation that has
+  never produced a response falls back to `get_default_route()`, which is the one place the hazard
+  is unavoidable — and it surfaces as a recorded `summarization_failed`, never a 500. *Reverses*
+  when summarization needs a cheaper model than the response path: a policy column, a DTO field, an
+  OpenAPI regeneration, and a test that the two routes differ.
+- **D-E5 — three error codes and one notice, not seven.** `summarization_disabled` (403, a policy
+  condition an operator can change), `summarization_not_needed` (409, with the specific skip reason
+  in `details.reason` — four reasons, one code, because a caller acts on all four identically), and
+  `summarization_failed` (502, with the failure class in `details.reason`).
+  `moira.notice.summarization_in_progress` for the 202, which the body already required. The 200
+  returns a `ConversationSummaryRecord` with no prose field, so it gets no notice. *Reverses* per
+  code if a caller is ever shown to branch on one of the four skip reasons.
+- **D-E6 — the summary body is not screened for credential-like text, though extracted memories
+  are.** The symmetric move looks right and is wrong: a rejected summary writes no row, so
+  `covers_through_sequence` does not advance, so a conversation in which somebody pasted the word
+  `bearer ` would re-trigger a model call **every turn, forever**, with the bill as the only
+  symptom. Extraction has no such loop. And the content is not new — a summary condenses
+  `content_plain` rows the application already chose to persist. Instead:
+  `SUMMARIZATION_INSTRUCTION` asks the model not to include secret material, and the leak
+  assertions pin that summary text reaches neither `audit_logs` nor a metric label. *Reverses* the
+  moment a `conversation_summarization_runs` table (or any per-conversation failure marker) exists
+  to bound the retry.
+
+#### What Sub-Phase E did **not** build, and why
+
+- **No migration.** `conversation_summaries` already carries every column this needs, so the
+  append-only window is untouched and the shared test database needs nothing applied to it — which
+  the ledger's own "an unmerged migration must not be applied to the shared test database" rule
+  makes a real benefit, not just an absence.
+- **No `notify_moira_runtime_config_change()` trigger**, so §0.3 A5 is discharged by *not*
+  attaching one: `conversation_summaries` stays unclassified in `CIRCUIT_UNAFFECTED_RESOURCE_TYPES`
+  because nothing NOTIFYs on it. Stated explicitly, as A5 requires.
+- **No `conversation_summarization_runs` table.** `memory_extraction_runs` exists because
+  extraction has per-candidate outcomes worth aggregating; a summarization run has exactly one
+  outcome, already carried by the metric and the audit row. Adding a table would be a migration for
+  one boolean. This is what D-E6's reversal condition is waiting on, so it is a known trade, not an
+  oversight.
+- **`conversation_content_persistence` is still honoured by nothing.** Summarization writes
+  `summary_text_plain` unconditionally, exactly as `conversation_messages.content_plain` already
+  does. That column is read nowhere in `src/`. Making summaries the *first* consumer of a policy
+  the message path ignores would create an inconsistency rather than remove one — see finding F31.
+
 ### §0.2 Already shipped — the body assumes these are absent
 
 | Body assumption | Reality |

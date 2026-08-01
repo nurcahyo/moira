@@ -39,10 +39,11 @@ flowchart TD
 
 1. Reads the conversation policy and the retrieval policy.
 2. Loads bounded recent history, excluding the turn this request just wrote.
-3. Loads the latest non-superseded `conversation_summaries` row. **Nothing writes that table
-   yet** — summarization is Sub-Phase E and is not implemented. The read is wired anyway because
-   the summary's position in the drop order is meaningless untested, and adding it later would
-   change the drop order silently.
+3. Loads the latest non-superseded `conversation_summaries` row. Sub-Phase E writes that table
+   now — see `docs/conversation-summarization.md`. The read was wired one wave ahead of the
+   writer, deliberately, because the summary's position in the drop order is meaningless
+   untested and adding it later would have changed the drop order silently. Nothing in this
+   step changed when the writer landed, which is what that ordering bought.
 4. Embeds the current turn and runs both retrieval arms, when enabled.
 5. Budgets, dropping optional sections in the documented order.
 6. Writes one `context_plans` row and one `retrieval_runs` row.

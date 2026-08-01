@@ -2205,7 +2205,63 @@ Sub-Phase F takes the **stricter of the two** (decision D4).
 Worth stating because it is the shape that hides: two columns that agree in every default
 deployment, and disagree exactly when an operator has deliberately tightened one of them.
 
-### A defect the plan's own wording would have shipped, and it looks correct
+### F31 — the public OpenAPI contract still says citations are always empty, and a test **enforces** that
+
+Found by Sub-Phase E, 2026-08-02. Not Sub-Phase E's to fix, and deliberately left alone.
+
+`docs/openapi.json` documents `PublicResponse.citations` as:
+
+> *"Always an empty array: RAG retrieval is not wired into response generation in this release, so
+> no citation is ever produced."*
+
+That has been false since Sub-Phase G. `citations_from_link` (`src/application/public.rs`) returns
+`link.context.citations`, which the planner populates from real retrieval provenance, and
+`tests/rag_retrieval_end_to_end.rs` asserts it.
+
+**The part that makes this an entry rather than a typo:**
+`public_response_schema_documents_always_empty_citations` (`src/http/mod.rs`) asserts the
+description **contains** the words `"empty"` and `"not wired"`. It is green today, and it goes red
+on the fix. That is HANDOFF §3.4's sixth shape — *a test that pins the defect* — and it is the
+second instance of it in this repository.
+
+The reach is a public contract, not an internal comment: every consumer generating a client from
+`docs/openapi.json` is told a field it now receives data in is permanently empty.
+
+**Why Sub-Phase E did not fix it.** The correct replacement text is a statement about *when*
+citations are populated, which is Sub-Phase G's semantics rather than E's, and getting it wrong
+would put a second false statement on the public contract. Fixing it also regenerates
+`docs/openapi.json`, which would entangle an unrelated contract change with E's reviewable diff.
+
+**Remedy, in one change:** rewrite the description to state the real condition, rename the test to
+say what it now guards, and regenerate the snapshot. Verify the new test fails against the *old*
+description — a guard on a description string is exactly the kind that passes by accident.
+
+### F32 — `conversation_content_persistence` is enforced by nothing
+
+Found by Sub-Phase E, 2026-08-02, while deciding whether a summary body may be persisted in
+plaintext.
+
+`application_conversation_policies.conversation_content_persistence` is a four-value column
+(`none`, `metadata_only`, `plain_content`, `encrypted_content`) with a check constraint and a
+default. **No code in `src/` reads it.** `conversation_messages.content_plain` is written
+unconditionally by `add_message`, and `*_encrypted` columns exist on three tables with no writer at
+all.
+
+So an operator who selects `metadata_only` or `encrypted_content` — which is what a deployment with
+a data-residency or PII obligation would select — gets `plain_content` behaviour, silently, with no
+error and no signal. The policy reads as enforced because it is validated, versioned, exposed on
+`ConversationPolicyRecord`, and settable through the admin API.
+
+Sub-Phase E **deliberately did not become the first consumer** (decision D-E6's neighbour, recorded
+in plan 11 §0.1c): honouring it for summaries while the message path ignores it would mean a
+conversation stores every turn in plaintext and withholds only the summary derived from them —
+an inconsistency dressed as a fix. Sub-Phase F reached the same column from the other side and
+guessed the same way: its `turns.is_empty()` branch comments that a conversation persisting no
+plaintext has nothing to extract from, a state no configuration can currently produce.
+
+**Remedy is a change of its own:** make `add_message` the enforcement point, decide what
+`encrypted_content` actually means (there is no cipher wired to those columns), and only then
+extend it to summaries and extraction transcripts.
 
 Plan 11 says to dedupe against existing **active** memories. Retrieval is `active`-only, so scoping
 dedupe the same way reads as consistent — and makes an `explicit_only` application accumulate **one
