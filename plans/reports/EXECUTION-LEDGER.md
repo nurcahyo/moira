@@ -2268,6 +2268,47 @@ dedupe the same way reads as consistent — and makes an `explicit_only` applica
 unconfirmed duplicate per turn**, because unconfirmed candidates are never `active` and therefore
 never match. Caught by implementing it, not by reading it.
 
+### F33 — ESCALATED: five encryption-at-rest columns exist and nothing writes or reads any of them
+
+`migrations/0007` creates `conversation_messages.content_encrypted`,
+`conversation_summaries.summary_text_encrypted`, `memory_records.content_encrypted`,
+`rag_document_versions.content_encrypted` and `rag_chunks.chunk_text_encrypted`.
+
+**Nothing in `src/` touches any of them.** The schema says content can be encrypted at rest; no
+cipher exists anywhere in the tree.
+
+**Needs a human, not an autonomous change.** Envelope encryption is key custody, key rotation, and
+plan 11's still-open Decision 3 — a scoping question, not an implementation gap. Recorded here so
+the columns are not mistaken for a partially-built feature by whoever finds them next.
+
+### F32 — a data-protection policy that protected nothing — **CORRECTED, then fixed**
+
+**My own framing of this finding was wrong in the direction that mattered, and the correction is the
+finding.** I briefed it as an *unused column* whose effect was "emergent": setting `'none'` yielded
+no extraction because there was no plaintext to extract.
+
+**There was no plaintext protection at all.** `add_message` binds `content_plain` unconditionally —
+verified on `main`, the write path never mentions the policy. So a deployment setting
+`conversation_content_persistence = 'none'` stored **full message plaintext**, and extraction ran
+exactly as under `'plain_content'`. An operator configuring PII or data-residency controls received
+none, with the API reporting success. Proven by mutation M1, which reintroduces the pre-fix line.
+
+The ledger's *original* F32 wording was right — "a state no configuration can currently produce."
+The gloss I added on top of it was not. **A finding's later summary can be worse than its first
+draft**, and mine was.
+
+**`encrypted_content` was accepted while nothing encrypts** (see F33). Storing plaintext under a
+value literally named for encryption meant the *API itself* was doing the misleading, not merely
+failing to act. It is now refused on write (`conversation_content_persistence_unsupported`, 422) and
+**fails closed** for rows that already hold it.
+
+**Enforcement sits at `add_message`**, in the existing `for update` lock query — the only path into
+`conversation_messages`, so a fourth writer *inherits* the policy rather than having to remember it.
+Having to remember it is what F32 was.
+
+**Not auto-merged.** A 422 on a previously-accepted value will break any deployment setting
+`encrypted_content` in IaC — loudly, which is the point, but that deserves human sight.
+
 ## USER DECISIONS — 2026-07-31, taken interactively
 
 1. **Findings before waves 4–5.** F20, F13, F17 and the Wave 2 leftovers first. F20 is the reason:
