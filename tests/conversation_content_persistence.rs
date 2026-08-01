@@ -34,8 +34,8 @@ use axum::http::StatusCode;
 use moira::{
     application::ConversationService,
     domain::{
-        ConversationContentPersistence, ConversationCreateRequest, ConversationMessageCreateRequest,
-        ConversationMessageRole, ConversationPolicyPutRequest,
+        ConversationContentPersistence, ConversationCreateRequest,
+        ConversationMessageCreateRequest, ConversationMessageRole, ConversationPolicyPutRequest,
     },
     security::Actor,
 };
@@ -383,12 +383,13 @@ async fn an_application_with_no_policy_row_stores_plaintext() {
     let Some(case) = Case::new().await else {
         return;
     };
-    let deleted = sqlx::query("delete from application_conversation_policies where application_id = $1")
-        .bind(case.fixture.application_id)
-        .execute(&case.fixture.pool)
-        .await
-        .expect("delete the policy row")
-        .rows_affected();
+    let deleted =
+        sqlx::query("delete from application_conversation_policies where application_id = $1")
+            .bind(case.fixture.application_id)
+            .execute(&case.fixture.pool)
+            .await
+            .expect("delete the policy row")
+            .rows_affected();
     assert_eq!(
         deleted, 1,
         "no policy row existed to delete, so this case never exercised the missing-row path"
@@ -425,13 +426,12 @@ async fn a_tightened_policy_does_not_rewrite_history() {
     let after = case.write_and_read(BODY).await;
     assert_eq!(after.content_plain, None, "the new write must be withheld");
 
-    let still_there: i64 = sqlx::query_scalar(
-        "select count(*) from conversation_messages where content_plain = $1",
-    )
-    .bind(BODY)
-    .fetch_one(&case.fixture.pool)
-    .await
-    .expect("count surviving plaintext");
+    let still_there: i64 =
+        sqlx::query_scalar("select count(*) from conversation_messages where content_plain = $1")
+            .bind(BODY)
+            .fetch_one(&case.fixture.pool)
+            .await
+            .expect("count surviving plaintext");
     assert_eq!(
         still_there, 1,
         "the policy governs writes, not history: content stored under plain_content stays \
