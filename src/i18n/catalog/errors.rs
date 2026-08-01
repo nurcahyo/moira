@@ -337,6 +337,21 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         description: "Used when the context planner's retrieval or embedding backend cannot serve a query AND the application's application_embedding_policies.failure_behavior is 'fail_request'. It must never fire under the default 'continue_without_semantic_retrieval', where a retrieval failure degrades silently to a 200 with empty citations — a broken vector index must not take down the execution path. Both branches are pinned by named tests.",
     },
     I18nEntry {
+        key: "moira.error.summarization_disabled",
+        default_message: "Conversation summarization is disabled for this application.",
+        description: "Used when POST /api/v1/conversations/{id}/summarize is called on an application whose application_conversation_policies.summarization_enabled is false. Deliberately NOT bypassable by the request's force flag: force overrides the two trigger thresholds, not the operator's switch, because the endpoint is caller-plane and the caller is not the operator.",
+    },
+    I18nEntry {
+        key: "moira.error.summarization_not_needed",
+        default_message: "There is nothing new to summarize in this conversation.",
+        description: "Used when a summarize request is refused because the conversation's backlog does not warrant a new summary version. details.reason distinguishes the cases: no_new_messages (nothing has been said since the active summary's coverage boundary, which conversation_summary_boundary_unique makes unrepresentable and force therefore cannot override), below_message_threshold, below_token_threshold (both overridable with force), and no_persisted_content (the messages in the backlog carry no plaintext to summarize).",
+    },
+    I18nEntry {
+        key: "moira.error.summarization_failed",
+        default_message: "The conversation could not be summarized.",
+        description: "Used when a summarization run reached the model and did not produce a storable summary — the completion call failed, or the reply was empty or exceeded the summary size ceiling. details.reason carries the failure class. Only the manual endpoint surfaces this; an automatic summarization failure is recorded on the metric and the audit row and never turns a successful response into an error.",
+    },
+    I18nEntry {
         key: "moira.error.routing_policy_provider_model_mismatch",
         default_message: "The routing policy references a provider model that does not belong to the selected provider.",
         description: "Used when a routing policy create/patch names a provider_model_id that is not owned by the given provider_id.",

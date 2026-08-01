@@ -7,41 +7,46 @@ use crate::{
     application::{
         AdminCommandIdempotency, AdminCommandMutation, AdminCommandRunner, AdminCommandSpec,
         ContextSections, EXTRACTION_TRANSCRIPT_MESSAGES, ExecutionService, ExtractionPolicy,
-        FAILURE_EXTRACTION_CALL_FAILED, MAXIMUM_CANDIDATES_PER_RUN, MoiraExecutionService,
-        NEAR_DUPLICATE_MAX_DISTANCE, RejectionReason, RequestContext, SECRET_NEEDLES,
-        assemble_context, budget_tokens, classify_candidate, effective_extraction_status,
+        FAILURE_EXTRACTION_CALL_FAILED, FAILURE_SUMMARIZATION_CALL_FAILED,
+        MAXIMUM_CANDIDATES_PER_RUN, MoiraExecutionService, NEAR_DUPLICATE_MAX_DISTANCE,
+        RejectionReason, RequestContext, SECRET_NEEDLES, SUMMARY_TRANSCRIPT_MESSAGES,
+        SummarizationBacklog, SummarizationPolicy, SummarizationSkip, assemble_context,
+        budget_tokens, classify_candidate, decide_summarization, effective_extraction_status,
         extraction_messages, extraction_output_schema, is_near_duplicate, parse_candidates,
-        render_transcript,
+        parse_summary, render_transcript, summarization_messages,
     },
     domain::{
         AuditLogInsert, AuditResult, CallerRuntimeIdentity, ConversationCreateRequest,
         ConversationMessageCreateRequest, ConversationMessageQuery, ConversationMessageRecord,
         ConversationMessageRole, ConversationMessageType, ConversationPatchRequest,
         ConversationPolicyPutRequest, ConversationPolicyRecord, ConversationQuery,
-        ConversationRecord, ConversationStatus, CursorScope, DomainMessage,
-        EmbeddingPolicyPutRequest, EmbeddingPolicyRecord, ExecutionCommand, ExecutionOptions,
-        HistoryStrategy, ListCursor, ListResponse, MemoryConsentMode, MemoryCreateRequest,
-        MemoryPatchRequest, MemoryPolicyPutRequest, MemoryPolicyRecord, MemoryQuery, MemoryRecord,
-        MemoryScope, MemoryStatus, Pagination, PublicCitation, PublicContentPart,
-        PublicInputMessage, RagCollectionCreateRequest, RagCollectionPatchRequest,
-        RagCollectionQuery, RagCollectionRecord, RagCollectionStatus, RagDocumentCreateRequest,
-        RagDocumentIngestRequest, RagDocumentRecord, ResponseConversationInput,
-        RetrievalPolicyPutRequest, RetrievalPolicyRecord, SeqCursor,
+        ConversationRecord, ConversationStatus, ConversationSummaryRecord, CursorScope,
+        DomainMessage, EmbeddingPolicyPutRequest, EmbeddingPolicyRecord, ExecutionCommand,
+        ExecutionOptions, HistoryStrategy, ListCursor, ListResponse, MemoryConsentMode,
+        MemoryCreateRequest, MemoryPatchRequest, MemoryPolicyPutRequest, MemoryPolicyRecord,
+        MemoryQuery, MemoryRecord, MemoryScope, MemoryStatus, Pagination, PublicCitation,
+        PublicContentPart, PublicInputMessage, RagCollectionCreateRequest,
+        RagCollectionPatchRequest, RagCollectionQuery, RagCollectionRecord, RagCollectionStatus,
+        RagDocumentCreateRequest, RagDocumentIngestRequest, RagDocumentRecord,
+        ResponseConversationInput, RetrievalPolicyPutRequest, RetrievalPolicyRecord, SeqCursor,
     },
     error::AppError,
     infra::repositories::{
         AdminRepository, ContextPlanInsert, ConversationAccess, ConversationInsert,
-        ConversationMessageInsert, ConversationRepository, ExtractedMemoryInsert,
-        MemoryExtractionRunInsert, MemoryExtractionRunOutcome, MemoryInsert, PgAdminRepository,
-        PgConversationRepository, RagIngestionContext, RetrievalRunInsert, RetrievalScope,
-        complete_memory_extraction_run, confirm_memory, create_rag_collection_with_connection,
-        create_rag_document_with_connection, find_application_embedding_target,
+        ConversationMessageInsert, ConversationRepository, ConversationSummaryInsert,
+        ConversationSummaryRow, ExtractedMemoryInsert, MemoryExtractionRunInsert,
+        MemoryExtractionRunOutcome, MemoryInsert, PgAdminRepository, PgConversationRepository,
+        RagIngestionContext, RetrievalRunInsert, RetrievalScope, SummarizationLock,
+        complete_memory_extraction_run, confirm_memory, count_messages_after_sequence,
+        create_rag_collection_with_connection, create_rag_document_with_connection,
+        find_active_conversation_summary, find_application_embedding_target,
         find_collection_ingestion_context, find_conversation_context_anchor,
-        find_document_ingestion_context, find_embedding_model_target, find_memory_by_content_hash,
-        find_memory_by_key, find_memory_candidates, find_nearest_memory, find_rag_chunk_candidates,
+        find_conversation_route_hint, find_document_ingestion_context, find_embedding_model_target,
+        find_memory_by_content_hash, find_memory_by_key, find_memory_candidates,
+        find_messages_after_sequence, find_nearest_memory, find_rag_chunk_candidates,
         find_recent_messages, ingest_rag_document_with_connection, insert_context_plan,
-        insert_extracted_memory, insert_memory_embedding, insert_memory_extraction_run,
-        insert_retrieval_run, resolve_embedding_credential,
+        insert_conversation_summary, insert_extracted_memory, insert_memory_embedding,
+        insert_memory_extraction_run, insert_retrieval_run, resolve_embedding_credential,
     },
     orchestration::{
         CANDIDATE_OVERFETCH, ChunkStrategy, ChunkingLimits, EmbeddingBatchPlan, EmbeddingFactory,
@@ -53,6 +58,18 @@ use crate::{
     },
     security::{Actor, ActorType, request_hash},
 };
+
+/// What `POST /api/v1/conversations/{id}/summarize` did — plan 11 Sub-Phase E.
+///
+/// An enum rather than an `Option<ConversationSummaryRecord>` because the two arms mean different
+/// things to a caller and map to different status codes: `AlreadyRunning` is a `202` and says
+/// *somebody else is doing this right now*, not *there was nothing to do*, which is the `409`
+/// `summarization_not_needed` refusal instead.
+#[derive(Debug, Clone)]
+pub enum SummarizationOutcome {
+    Summarized(ConversationSummaryRecord),
+    AlreadyRunning,
+}
 
 #[derive(Debug, Clone)]
 pub struct ConversationExecutionLink {
@@ -1051,6 +1068,11 @@ impl ConversationService {
         // has already been produced, and an extraction problem must not turn a successful
         // response into an error. Every failure is recorded on `memory_extraction_runs`.
         self.extract_memories(actor, ctx, link, response_id).await;
+        // Automatic summarization (plan 11 Sub-Phase E). After the assistant message is
+        // persisted, deliberately: the summary's `covers_through_sequence` must include the turn
+        // that just completed, or the next run would re-read it and the boundary would lag one
+        // turn behind forever. Infallible for the same reason extraction is.
+        self.maybe_summarize_after_turn(actor, ctx, link).await;
         Ok(Some(message))
     }
 
@@ -1458,6 +1480,372 @@ impl ConversationService {
         }
         let embedding = self.embed_query(application_id, content).await.ok()?;
         Some((encode_vector_literal(&embedding.vector), embedding.model_id))
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Conversation summarization (plan 11, Sub-Phase E).
+    // -----------------------------------------------------------------------------------
+
+    /// Produces a new immutable summary version for a conversation.
+    ///
+    /// Backs `POST /api/v1/conversations/{id}/summarize` and, when
+    /// [`Self::maybe_summarize_after_turn`] calls it, the automatic path.
+    ///
+    /// # What fills the slot Sub-Phase D left
+    ///
+    /// `find_conversation_context_anchor` has read the active summary since Sub-Phase D and has
+    /// reliably returned `None`, because `conversation_summaries` had two readers and no writer.
+    /// This is the writer. Nothing in the planner changes.
+    ///
+    /// # Ordering, and why every step is where it is
+    ///
+    /// 1. **Authorization and access before anything else**, through the same
+    ///    `find_conversation_authorized` predicate every other conversation write uses — a
+    ///    caller who cannot see the conversation must not be able to learn whether it has a
+    ///    backlog, which a differently-ordered policy check would leak.
+    /// 2. **The trigger decision before the lock**, so a request that was never going to
+    ///    summarise does not open a connection or contend with a run that is doing real work.
+    /// 3. **The lock before the model call**, which is the whole point of it.
+    /// 4. **`covers_through_sequence` from the messages actually read**, not from the
+    ///    conversation's current tail. When the backlog exceeds
+    ///    [`SUMMARY_TRANSCRIPT_MESSAGES`] the run summarises the *oldest* uncovered messages and
+    ///    advances the boundary only that far, so the next run continues contiguously. Setting
+    ///    the boundary from the tail would silently claim coverage of messages no summary saw.
+    pub async fn summarize_conversation(
+        &self,
+        actor: &Actor,
+        ctx: &RequestContext,
+        conversation_id: &str,
+        force: bool,
+    ) -> Result<SummarizationOutcome, AppError> {
+        self.state
+            .authz
+            .require(actor, "moira:conversations:write")?;
+        self.summarize_conversation_unscoped(actor, ctx, conversation_id, force)
+            .await
+    }
+
+    /// The summarization operation without the endpoint's scope check.
+    ///
+    /// # Why the scope check is not in here
+    ///
+    /// `moira:conversations:write` is the **endpoint's** requirement, not the operation's. The
+    /// automatic path runs on the response path, where the acting key is whatever issued
+    /// `POST /api/v1/responses`. Leaving the scope check in the shared body would make automatic
+    /// summarization silently never run for the ordinary caller while every flag said it was on:
+    /// a feature that is enabled, configured, metric-seeded and dead. That is P0-1's shape — the
+    /// finding this whole plan exists to remove — and it is the exact failure this split prevents.
+    ///
+    /// **Do not merge these two functions.** That instruction is worth nothing on its own, so
+    /// here is the evidence, checkable in ten seconds:
+    ///
+    /// * `LifecycleFixture::enable_public_streaming` (`tests/support/mod.rs`) mints the consumer
+    ///   key a caller actually uses: `moira:responses:create`, `moira:responses:stream`,
+    ///   `moira:responses:read`, `moira:execution:override-route`, `moira:conversations:create`
+    ///   and `moira:conversations:read` — and deliberately **not** `moira:conversations:write`.
+    ///   That list predates this wave; it is what a response-plane key looks like, not a fixture
+    ///   tuned to make this argument.
+    /// * Move the `require` call into this function and
+    ///   `automatic_summarization_runs_for_a_key_that_cannot_call_the_endpoint`
+    ///   (`tests/conversation_summarization.rs`) fails: no summary is written at all.
+    ///
+    ///   **That test exists because this claim was false when it was first written here.** The
+    ///   comment originally named a different test, and running the mutation showed the whole
+    ///   suite stayed green — every case drove its turns with a key that happened to hold
+    ///   `moira:conversations:write`, so nothing exercised the split. An earlier *fixture* fix
+    ///   had removed the only scope-less turn. A claim in a comment is not a guard; this one is
+    ///   now backed by a test that has been seen to fail.
+    /// * The endpoint still enforces the scope, and
+    ///   `the_summarize_endpoint_refuses_a_key_without_the_write_scope` is what proves it — so
+    ///   the split widens nothing. Deleting *that* test is the other way to break this safely
+    ///   looking change.
+    ///
+    /// Everything that is a *property of the data* stays here — the access predicate, the
+    /// archived check, the policy, the trigger. Only the caller-plane scope moves out.
+    async fn summarize_conversation_unscoped(
+        &self,
+        actor: &Actor,
+        ctx: &RequestContext,
+        conversation_id: &str,
+        force: bool,
+    ) -> Result<SummarizationOutcome, AppError> {
+        let conversation = self
+            .repo
+            .find_conversation_authorized(conversation_id, &conversation_access(actor, false)?)
+            .await?;
+        if conversation.status == ConversationStatus::Archived {
+            return Err(AppError::coded(
+                axum::http::StatusCode::CONFLICT,
+                "conversation_archived",
+                "conversation is archived",
+            ));
+        }
+        let application_id = required_application_id(actor)?;
+        let pool = self.state.pool()?;
+        let policy = self
+            .repo
+            .get_or_create_conversation_policy(application_id)
+            .await?;
+
+        let Some((conversation_uuid, _, _, _)) =
+            find_conversation_context_anchor(pool, &conversation.id).await?
+        else {
+            return Err(AppError::coded(
+                axum::http::StatusCode::NOT_FOUND,
+                "conversation_not_found",
+                "conversation not found",
+            ));
+        };
+
+        let plan = self
+            .plan_summarization(pool, conversation_uuid, &policy, force)
+            .await?;
+
+        let Some(lock) = SummarizationLock::try_acquire(pool, conversation_uuid).await? else {
+            // Another run holds this conversation's lock. Not an error: the caller's intent is
+            // already being satisfied, so nothing is started and nothing is counted.
+            return Ok(SummarizationOutcome::AlreadyRunning);
+        };
+        let outcome = self
+            .run_summarization(actor, pool, conversation_uuid, &policy, &plan)
+            .await;
+        lock.release().await;
+
+        self.state.metrics.record_summarization_run(outcome.is_ok());
+        let row = outcome?;
+        // Audited by shape, never by content: the version, the coverage boundary and the token
+        // count. `audit_logs` records that a summary was produced and how far it reaches; the
+        // summary body itself lives only in `conversation_summaries`.
+        self.audit(
+            actor,
+            ctx,
+            "conversation.summary.created",
+            "conversation_summary",
+            Some(row.id.to_string()),
+            json!({
+                "conversation_id": conversation.id,
+                "summary_version": row.summary_version,
+                "covers_through_sequence": row.covers_through_sequence,
+                "token_count": row.token_count,
+                "message_count": plan.turns.len(),
+                "forced": force,
+            }),
+        )
+        .await?;
+        Ok(SummarizationOutcome::Summarized(summary_record_from_row(
+            &conversation.id,
+            &row,
+        )))
+    }
+
+    /// Reads the backlog and applies the trigger decision.
+    ///
+    /// Split out so [`Self::summarize_conversation`] reads as gate-then-work, and so every
+    /// refusal is one `Err` with a named reason rather than a chain of early returns whose
+    /// ordering is implicit.
+    async fn plan_summarization(
+        &self,
+        pool: &sqlx::PgPool,
+        conversation_uuid: Uuid,
+        policy: &ConversationPolicyRecord,
+        force: bool,
+    ) -> Result<SummarizationPlan, AppError> {
+        let previous = find_active_conversation_summary(pool, conversation_uuid).await?;
+        let boundary = previous
+            .as_ref()
+            .map(|row| row.covers_through_sequence)
+            .unwrap_or(0);
+        // The uncapped count, deliberately: see `count_messages_after_sequence`. The token
+        // estimate below is over the *capped* fetch instead, which is conservative in the safe
+        // direction — it can only under-report the backlog, and under-reporting delays a
+        // summarization rather than triggering one over content the run would not have read.
+        let messages_since_summary =
+            count_messages_after_sequence(pool, conversation_uuid, boundary).await?;
+        let messages = find_messages_after_sequence(
+            pool,
+            conversation_uuid,
+            boundary,
+            SUMMARY_TRANSCRIPT_MESSAGES,
+        )
+        .await?;
+        let tokens_since_summary = messages
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .map(budget_tokens)
+            .sum();
+
+        let summarization_policy = SummarizationPolicy {
+            enabled: policy.summarization_enabled,
+            trigger_tokens: policy.summary_trigger_tokens,
+            minimum_messages_since_summary: policy.minimum_messages_since_summary,
+            target_tokens: policy.summary_target_tokens,
+        };
+        let backlog = SummarizationBacklog {
+            messages_since_summary,
+            tokens_since_summary,
+        };
+        decide_summarization(&summarization_policy, backlog, force)
+            .map_err(summarization_skip_error)?;
+
+        let turns: Vec<(String, String)> = messages
+            .iter()
+            .filter_map(|message| {
+                message
+                    .content
+                    .clone()
+                    .map(|content| (message.role.clone(), content))
+            })
+            .collect();
+        if turns.is_empty() {
+            // The backlog is real but carries no plaintext — an application persisting
+            // `none`/`metadata_only`/`encrypted_content`. Refused rather than sent to a model
+            // with an empty transcript, which would bill for a summary of nothing and then
+            // advance the coverage boundary over messages that were never summarised.
+            return Err(AppError::coded_with_details(
+                axum::http::StatusCode::CONFLICT,
+                "summarization_not_needed",
+                "the messages awaiting summarization carry no stored content",
+                json!({ "reason": "no_persisted_content" }),
+            ));
+        }
+        let covers_through_sequence = messages
+            .iter()
+            .map(|message| message.sequence_number)
+            .max()
+            .unwrap_or(boundary);
+
+        Ok(SummarizationPlan {
+            previous_summary: previous.and_then(|row| row.summary_text),
+            turns,
+            covers_through_sequence,
+            target_tokens: policy.summary_target_tokens,
+        })
+    }
+
+    /// The completion call and the write.
+    ///
+    /// `Err` is always a coded `summarization_failed`; every path returns one rather than
+    /// leaking a provider error, so a failing model cannot put a provider message on a
+    /// caller-visible response.
+    async fn run_summarization(
+        &self,
+        actor: &Actor,
+        pool: &sqlx::PgPool,
+        conversation_uuid: Uuid,
+        policy: &ConversationPolicyRecord,
+        plan: &SummarizationPlan,
+    ) -> Result<ConversationSummaryRow, AppError> {
+        let _ = policy;
+        // The route the conversation's own turns went to. `route_hint: None` would land on
+        // `get_default_route()`, which is decision D-F3's exact trap — a route the caller never
+        // used, and `NoEligibleModel` on a deployment with no active default.
+        let route_hint = find_conversation_route_hint(pool, conversation_uuid)
+            .await
+            .unwrap_or(None);
+        let command = ExecutionCommand {
+            request_id: format!("summarization-{conversation_uuid}"),
+            execution_id: Uuid::now_v7(),
+            identity: CallerRuntimeIdentity {
+                actor_type: format!("{:?}", actor.actor_type),
+                subject: actor.subject.clone(),
+                external_user_id: actor.external_user_id.clone(),
+                external_tenant_id: actor.external_tenant_id.clone(),
+                application_id: actor.internal_application_id,
+                scopes: actor.scopes.clone(),
+            },
+            application_id: actor.internal_application_id,
+            external_tenant_id: effective_tenant(actor),
+            external_user_id: effective_user(actor),
+            messages: summarization_messages(
+                plan.previous_summary.as_deref(),
+                &render_transcript(&plan.turns),
+                plan.target_tokens,
+            ),
+            route_hint,
+            provider_hint: None,
+            model_hint: None,
+            credential_hint: None,
+            options: ExecutionOptions {
+                // Zero temperature: two runs over the same backlog must produce the same
+                // summary, or `summary_hash` stops being a content address of anything.
+                temperature: Some(0.0),
+                stream: false,
+                ..ExecutionOptions::default()
+            },
+            metadata: json!({ "moira": { "purpose": "conversation_summarization" } }),
+        };
+
+        let service = MoiraExecutionService::new(self.state.clone())
+            .map_err(|_| summarization_failed(FAILURE_SUMMARIZATION_CALL_FAILED))?;
+        let execution = service
+            .execute(command)
+            .await
+            .map_err(|_| summarization_failed(FAILURE_SUMMARIZATION_CALL_FAILED))?;
+        // `structured_output` is not populated by the execution kernel today (finding F29) and
+        // summarization asks for prose anyway, so the reply arrives as `output_text`. Preferring
+        // `structured_output` when present costs nothing and means this call site needs no edit
+        // the day the kernel starts filling it.
+        let raw = execution
+            .structured_output
+            .as_ref()
+            .map(|value| value.to_string())
+            .or(execution.output_text)
+            .ok_or_else(|| summarization_failed(FAILURE_SUMMARIZATION_CALL_FAILED))?;
+        let summary = parse_summary(&raw).map_err(summarization_failed)?;
+
+        let summary_hash = request_hash(summary.text.as_bytes());
+        let token_count = budget_tokens(&summary.text);
+        insert_conversation_summary(
+            pool,
+            &ConversationSummaryInsert {
+                conversation_uuid,
+                covers_through_sequence: plan.covers_through_sequence,
+                summary_text: Some(summary.text.as_str()),
+                summary_hash: &summary_hash,
+                token_count: Some(token_count),
+                provider_model_id: None,
+            },
+        )
+        .await
+    }
+
+    /// Summarises after an assistant turn, if the policy says to — plan 11 Sub-Phase E.
+    ///
+    /// # Why this is inline rather than enqueued, again
+    ///
+    /// The plan body specifies summarization as *enqueued*, precisely so it does not add latency
+    /// to the response path, and that is the right design. It is nevertheless synchronous here
+    /// for the same reason decision D-F2 gave for extraction: `run_supervisor` wires
+    /// `queue::StubJobDispatcher`, so an enqueued summarization would be **claimed and dropped**
+    /// — a feature whose work never runs, behind a flag that says it does, which is P0-1's exact
+    /// shape and the thing this plan exists to remove. A detached `tokio::spawn` would outlive
+    /// the request and could not be asserted on without a `sleep`, which CONVENTIONS.md §3
+    /// forbids.
+    ///
+    /// The cost is bounded twice over: `summarization_enabled` defaults to `false`, and even
+    /// when on, a run happens only once the backlog crosses both thresholds — so the amortised
+    /// cost is one extra completion per `summary_trigger_tokens` of conversation, not one per
+    /// turn.
+    ///
+    /// **Reversal condition:** move the body behind `conversation-summarization-retry` the moment
+    /// a real `JobDispatcher` replaces the stub. [`Self::summarize_conversation`] already takes
+    /// only ids and reads everything else from the database.
+    ///
+    /// # Failure policy
+    ///
+    /// Returns `()`. Every outcome — refused by the trigger, already locked, the model failing —
+    /// is a decision, not an error. Nothing here can change the caller's status code, which is
+    /// the same fail-open rule retrieval and extraction follow: the caller's response has
+    /// already been produced.
+    async fn maybe_summarize_after_turn(
+        &self,
+        actor: &Actor,
+        ctx: &RequestContext,
+        link: &ConversationExecutionLink,
+    ) {
+        let _ = self
+            .summarize_conversation_unscoped(actor, ctx, &link.conversation_id, false)
+            .await;
     }
 
     pub async fn create_memory(
@@ -2569,6 +2957,85 @@ fn required_application_id(actor: &Actor) -> Result<Uuid, AppError> {
             "application-bound identity is required",
         )
     })
+}
+
+/// What one summarization run will feed the model, once the trigger has said yes.
+#[derive(Debug)]
+struct SummarizationPlan {
+    /// The active summary's text, when there is one and it was persisted in plaintext.
+    previous_summary: Option<String>,
+    /// `(role, text)` for the messages this run covers, oldest first.
+    turns: Vec<(String, String)>,
+    /// The `sequence_number` of the newest message this run read — never the conversation's
+    /// current tail. See `summarize_conversation`'s step 4.
+    covers_through_sequence: i64,
+    target_tokens: i32,
+}
+
+/// Maps a refusal from `decide_summarization` onto the caller-visible error.
+///
+/// Two codes, not four. `summarization_disabled` is a *policy* condition an operator can change;
+/// the other three are *state* conditions about this conversation right now, and they share
+/// `summarization_not_needed` with the specific reason in `details`. Minting a code per skip
+/// reason would put three unreachable-in-practice codes in the catalog for one distinction a
+/// caller acts on identically.
+fn summarization_skip_error(skip: SummarizationSkip) -> AppError {
+    match skip {
+        SummarizationSkip::Disabled => AppError::coded(
+            axum::http::StatusCode::FORBIDDEN,
+            "summarization_disabled",
+            "conversation summarization is disabled for this application",
+        ),
+        other => AppError::coded_with_details(
+            axum::http::StatusCode::CONFLICT,
+            "summarization_not_needed",
+            "there is nothing new to summarize in this conversation",
+            json!({ "reason": other.label() }),
+        ),
+    }
+}
+
+/// A summarization run that reached the model and produced nothing storable.
+///
+/// `reason` is one of the module-level failure classes in
+/// [`crate::application::summarization`], never a provider message: a provider body must not
+/// reach a caller-visible envelope, which is the sanitisation contract the Rig boundary already
+/// holds everywhere else.
+fn summarization_failed(reason: &'static str) -> AppError {
+    AppError::coded_with_details(
+        axum::http::StatusCode::BAD_GATEWAY,
+        "summarization_failed",
+        "the conversation could not be summarized",
+        json!({ "reason": reason }),
+    )
+}
+
+/// Maps a stored summary row onto the caller-facing DTO.
+///
+/// The public id is derived — `conversation_summaries` has no `public_id` column, and adding one
+/// would be a migration for an identifier no endpoint accepts as input. The prefix matches the
+/// convention every other public id here follows so a caller reading a log can tell what it is.
+///
+/// **`summary_hash` is deliberately not mapped.** It is an unkeyed content address over the
+/// summary bytes, and putting it on a caller-visible response would make it an offline oracle
+/// over candidate plaintexts — the first clause of finding F14's admitting rule, which is why
+/// `conversation_messages.content_hash` stayed peppered while `memory_records.content_hash`
+/// became a content address.
+fn summary_record_from_row(
+    conversation_public_id: &str,
+    row: &ConversationSummaryRow,
+) -> ConversationSummaryRecord {
+    ConversationSummaryRecord {
+        id: format!("csum_{}", row.id),
+        object: "conversation.summary".to_string(),
+        conversation_id: conversation_public_id.to_string(),
+        summary_version: row.summary_version,
+        covers_through_sequence: row.covers_through_sequence,
+        summary_text: row.summary_text.clone(),
+        token_count: row.token_count,
+        created_at: row.created_at,
+        superseded_at: row.superseded_at,
+    }
 }
 
 pub fn conversation_access(

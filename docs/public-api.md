@@ -29,7 +29,12 @@ durably and enforce policy, but:
   document reflects storage, not indexing for retrieval.
 - Conversation history, explicit memories, and RAG documents are not loaded into the
   prompt sent to a provider. `POST /v1/responses` always returns `citations: []`.
-- No summarization runs; `conversation_summaries` is never populated.
+- Conversation summarization **does** run as of plan 11 Sub-Phase E, behind
+  `application_conversation_policies.summarization_enabled`, which defaults to `false`.
+  `POST /api/v1/conversations/{id}/summarize` produces a version on demand, and an application
+  with the flag on summarizes automatically once a conversation's backlog crosses both
+  `summary_trigger_tokens` and `minimum_messages_since_summary`. See
+  `docs/conversation-summarization.md`.
 
 The RAG create/ingest/reindex routes under `/api/v1/admin/rag-collections` and
 `/api/v1/admin/rag-documents` now replay under `Idempotency-Key`, on the same

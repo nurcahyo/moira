@@ -565,6 +565,71 @@ impl LifecycleFixture {
             .expect("enable conversation extraction policy");
     }
 
+    /// Turns conversation summarization on — plan 11 Sub-Phase E.
+    ///
+    /// Call this **after** `enable_public_streaming`, which writes its own conversation policy
+    /// and would otherwise reset `summarization_enabled` back to its `false` default. The same
+    /// ordering trap `enable_memory_extraction` documents.
+    ///
+    /// The thresholds default low here (one message, one token) so a case that is about
+    /// *summarizing* does not have to manufacture eight turns of conversation first. A case that
+    /// is about the **thresholds** passes its own values, which is the only way to be sure the
+    /// threshold branch is exercised rather than assumed.
+    pub async fn enable_summarization(&self, overrides: ConversationPolicyPutRequest) {
+        ConversationService::new(&self.state)
+            .expect("conversation service")
+            .put_conversation_policy(
+                &self.actor,
+                &request_context(),
+                self.application_id,
+                ConversationPolicyPutRequest {
+                    conversations_enabled: Some(true),
+                    caller_can_create_conversations: Some(true),
+                    // `.or(…)`, not a literal. Struct-update syntax makes an explicit field win
+                    // over `..overrides`, so writing `summarization_enabled: Some(true)` here
+                    // would make the parameter *unusable* for the three fields a caller most
+                    // needs to set — and a case passing `Some(false)` would silently get `true`
+                    // and assert against a premise that never held.
+                    summarization_enabled: overrides.summarization_enabled.or(Some(true)),
+                    summary_trigger_tokens: overrides.summary_trigger_tokens.or(Some(1)),
+                    minimum_messages_since_summary: overrides
+                        .minimum_messages_since_summary
+                        .or(Some(1)),
+                    ..overrides
+                },
+            )
+            .await
+            .expect("enable summarization policy");
+    }
+
+    /// A consumer key carrying exactly the scopes given.
+    ///
+    /// `enable_public_streaming`'s key deliberately does **not** hold
+    /// `moira:conversations:write`, which is the scope
+    /// `POST /api/v1/conversations/{id}/summarize` requires — and that omission is load-bearing,
+    /// not an oversight: it is what a real caller-plane key looks like, and it is why
+    /// summarization's automatic path must not sit behind that scope check. A case that drives
+    /// the *manual* endpoint needs a key that has it, so it asks for one here rather than
+    /// widening the shared fixture and destroying the distinction.
+    pub async fn consumer_key_with_scopes(&self, scopes: &[&str]) -> String {
+        AdminService::new(&self.state)
+            .expect("admin service")
+            .create_consumer_key(
+                &self.actor,
+                &request_context(),
+                ConsumerKeyCreateRequest {
+                    application_id: self.application_id,
+                    display_name: format!("scoped client {}", Uuid::now_v7().simple()),
+                    scopes: scopes.iter().map(|scope| scope.to_string()).collect(),
+                    expires_at: None,
+                },
+            )
+            .await
+            .expect("create scoped consumer key")
+            .secret
+            .expect("consumer key secret")
+    }
+
     /// A caller-plane actor bound to this fixture's application, with an explicit scope.
     ///
     /// Built directly rather than issued as a consumer key because a consumer-key actor carries
