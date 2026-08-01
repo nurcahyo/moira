@@ -161,6 +161,39 @@ Twice a mechanism I asserted was wrong in a way that would have produced a **fal
 End every brief with *"report anything in this brief you found wrong"* — every wave that was asked,
 found something.
 
+## 2.6 SUBAGENT SPAWNING WAS BROKEN ON 2026-08-01 — check before assuming a task is at fault
+
+**Four consecutive agents died at their first action**, while the coordinator's own Bash, git and
+`gh` calls kept working normally throughout. Symptoms:
+
+| Attempt | Died doing | Failure |
+|---|---|---|
+| 1 | "study the Sub-Phase F implementation … in parallel" | `Connection closed mid-response` |
+| 2 | "read the key files in parallel" | `Connection closed mid-response` |
+| 3 | "read the main file and locate the definitions in parallel" | stalled, watchdog did not recover |
+| 4 | "read the handoff rules first" — **sequentially** | stalled, watchdog did not recover |
+
+**A hypothesis was tested and disproved.** The first three all announced *parallel* file reads, so
+attempt 4 was briefed to read strictly one file at a time. It stalled anyway, on a single read. So
+parallel tool calls are **not** the cause; record that so nobody re-tests it.
+
+**Nothing was lost in any attempt** — none had written anything. That is the one thing that went
+right, and only because the worktree was created before the agent was spawned.
+
+**What to do when this recurs:**
+
+1. **Verify it is the subagent layer, not the task.** Run a Bash and a `gh` call yourself. If those
+   work while agents die at their first action, the task is not at fault and re-briefing it will not
+   help.
+2. **Stop after the second failure, not the fourth.** Three of these four were spent on the same
+   task, and the fourth on a hypothesis that turned out wrong. The information was already in hand
+   after two.
+3. **Do not lower the bar to get something through** — a smaller brief that succeeds against a
+   broken layer proves nothing, and a partial implementation of a security-adjacent wave is worse
+   than none.
+4. Record it here, stop the loop, and let a later session retry. The work is durable in git and this
+   file; a burned cycle is not.
+
 ## 3. What remains
 
 ### 3.1 ALL PLAN WORK IS COMPLETE (2026-07-31)
