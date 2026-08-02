@@ -1411,8 +1411,25 @@ async fn slow_runtime_handle_construction_is_bounded_by_the_total_execution_dead
 /// because `insert_attempt_started` runs before the provider call) and before the provider
 /// response is released. That blocks `update_attempt` — the first of the three terminal
 /// writes — and nothing else in the database.
+///
+/// # Finding F38 — the second half of this case
+///
+/// Renamed from `terminal_persistence_timeout_is_recorded_as_output_committed_not_as_a_plain_failure`
+/// (referenced by `plans/04-durability-correctness.md`), because that name asserted the thing
+/// F38 found to be false. This execution is **not streamed**: nothing reached the caller, and
+/// the assertion below that `usage_records` is empty is proof the write group did not land
+/// either. The arm nevertheless wrote a hardcoded `"output_committed": true` into both the audit
+/// entry and the `ExecutionFailed` event — untrue in both senses the word carries in this module.
+/// It is now read from `EventCollector::output_committed`, so it is `false` here and `true` in
+/// the streamed sibling case below.
+///
+/// The rest of F38: the provider **answered**, and the outcome used to discard `output_text`,
+/// `structured_output` and `usage` while the `attempts` array in the very same outcome carried
+/// the token counts in full. This case pins the two levels agreeing. Asserting the status or the
+/// failure class alone would pass against both arrangements, which is why the outcome's payload
+/// and the emitted event are what is asserted here.
 #[tokio::test]
-async fn terminal_persistence_timeout_is_recorded_as_output_committed_not_as_a_plain_failure() {
+async fn a_terminal_persistence_breach_clamps_retry_and_keeps_the_result_it_could_not_persist() {
     let Some(fixture) = LifecycleFixture::new().await else {
         return;
     };
@@ -1512,12 +1529,44 @@ async fn terminal_persistence_timeout_is_recorded_as_output_committed_not_as_a_p
         Some(ExecutionFailureClass::DeadlineExceeded)
     );
 
+    // F38. The provider produced this; the outcome must say so even though the execution
+    // failed. `ProviderScript::HeldCompletion` replies with the text below and a usage block
+    // of prompt=2 / completion=1 / total=3.
+    assert_eq!(
+        outcome.output_text.as_deref(),
+        Some("committed-output"),
+        "F38: the provider's answer was in hand when this arm built the outcome"
+    );
+    assert_eq!(
+        outcome.usage.input_tokens,
+        Some(2),
+        "F38: the outcome must report the tokens the provider actually charged for"
+    );
+    assert_eq!(outcome.usage.output_tokens, Some(1));
+    assert_eq!(outcome.usage.total_tokens, Some(3));
+    // The asymmetry that *was* finding F38, asserted as one fact rather than two: the
+    // attempt-level and outcome-level views of the same single attempt must agree. A fix that
+    // populated only one of the two levels leaves this red.
+    assert_eq!(
+        outcome.usage.input_tokens, attempt.usage.input_tokens,
+        "F38: outcome usage and attempt usage describe the same provider call"
+    );
+    assert_eq!(outcome.usage.output_tokens, attempt.usage.output_tokens);
+    assert_eq!(outcome.usage.total_tokens, attempt.usage.total_tokens);
+
     let failed_event = events
         .iter()
         .find(|event| event.event_type == RuntimeEventType::ExecutionFailed)
         .expect("a terminal-persistence breach must emit ExecutionFailed");
     assert_eq!(failed_event.payload["phase"], "terminal_persistence");
-    assert_eq!(failed_event.payload["output_committed"], true);
+    assert_eq!(
+        failed_event.payload["output_committed"], false,
+        "F38: this execution is not streamed, so no output ever reached the caller"
+    );
+    assert_eq!(
+        failed_event.payload["terminal_state_persisted"], false,
+        "the write group is exactly what timed out"
+    );
 
     // The provider really did answer, and the terminal write group really was cut off.
     //
@@ -1551,9 +1600,203 @@ async fn terminal_persistence_timeout_is_recorded_as_output_committed_not_as_a_p
     .fetch_one(&fixture.pool)
     .await
     .expect("the terminal-persistence breach must be audited under its own action");
-    assert_eq!(audit["output_committed"], true);
+    assert_eq!(
+        audit["output_committed"], false,
+        "F38: the audit entry claimed `true` here while nothing had reached the caller and the \
+         zero-row assertion above proves nothing had reached the database either"
+    );
+    assert_eq!(audit["terminal_state_persisted"], false);
     assert_eq!(audit["attempt_id"], attempt_id.to_string());
 
+    provider.shutdown().await;
+}
+
+/// Finding F38, streamed — the arrangement where the old outcome was self-evidently wrong.
+///
+/// The caller has already received every delta by the time terminal persistence is blocked, so
+/// an outcome reporting `output_text: None` described something the caller could see had not
+/// happened. This case is the streamed sibling of the one above and exists because the two paths
+/// are genuinely separate code: `execute_rig_stream` accumulates its own text and never builds a
+/// `RuntimeCompletionOutput`, and `EventCollector::output_committed` only ever flips here.
+///
+/// Sequencing, and why each step is needed:
+///
+/// 1. `HeldStream` emits `first`, signals arrival, and waits. Consuming that delta is what makes
+///    "the caller has seen output" a fact rather than a hope — the same reasoning
+///    `ProviderScript::StreamErrorAfterDelta` documents.
+/// 2. The attempt-row lock is taken **while the stream is held**, so it is in place before the
+///    stream ends and `update_attempt` is issued.
+/// 3. Release, drain, and the terminal write group runs into the lock and the deadline.
+///
+/// The outcome must then carry `firstsecond` and the streamed usage block, and the event must say
+/// `output_committed: true` — which, unlike in the non-streamed case, is now earned rather than
+/// hardcoded.
+#[tokio::test]
+async fn a_streamed_terminal_persistence_breach_reports_the_output_the_caller_already_received() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let gate = ScriptGate::new();
+    let provider = MockOpenAiServer::start([ProviderScript::HeldStream {
+        first_delta: "first".to_string(),
+        remaining_deltas: vec!["second".to_string()],
+        gate: gate.clone(),
+    }])
+    .await;
+    fixture
+        .add_provider(provider.base_url(), 10, RuntimePolicy::default())
+        .await;
+
+    let mut command = fixture.command(true);
+    command.options.timeout_ms = Some(DEADLINE_TEST_BUDGET.as_millis() as u64);
+    let execution_id = command.execution_id;
+    let request_id = command.request_id.clone();
+    let mut handle = fixture
+        .execution_service()
+        .execute_stream(command)
+        .await
+        .expect("start stream");
+
+    // Step 1: the caller really has output in hand. Accumulated rather than asserted away,
+    // because the whole point below is to compare the outcome against what was delivered.
+    let mut streamed = String::new();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let event = handle
+                .events
+                .recv()
+                .await
+                .expect("stream ended before the first delta")
+                .expect("stream event failure");
+            if event.event_type == RuntimeEventType::OutputTextDelta {
+                streamed.push_str(event.payload["text"].as_str().unwrap_or_default());
+                return;
+            }
+        }
+    })
+    .await
+    .expect("first stream delta timed out");
+    assert_eq!(streamed, "first");
+    gate.wait_arrived().await;
+
+    // Step 2: block the first of the three terminal writes, and nothing else.
+    let attempt_id: Uuid =
+        sqlx::query_scalar("select id from execution_attempts where execution_id = $1")
+            .bind(execution_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("the attempt row must exist before the provider call completes");
+    let mut lock_tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin terminal-persistence lock transaction");
+    sqlx::query("set local lock_timeout = '5s'")
+        .execute(&mut *lock_tx)
+        .await
+        .expect("bound the attempt-row lock acquisition itself");
+    sqlx::query("select id from execution_attempts where id = $1 for update")
+        .bind(attempt_id)
+        .fetch_one(&mut *lock_tx)
+        .await
+        .expect("acquire the attempt-row gate");
+
+    // Step 3: let the stream finish and run terminal persistence into the lock.
+    let started = Instant::now();
+    gate.release();
+    gate.wait_completed().await;
+    let mut saw_failed_event = None;
+    timeout(DEADLINE_TEST_GUARD, async {
+        while let Some(event) = handle.events.recv().await {
+            let Ok(event) = event else { continue };
+            match event.event_type {
+                RuntimeEventType::OutputTextDelta => {
+                    streamed.push_str(event.payload["text"].as_str().unwrap_or_default());
+                }
+                RuntimeEventType::ExecutionFailed => saw_failed_event = Some(event.payload.clone()),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the event stream never closed; the terminal-persistence bound did not fire");
+    let outcome = timeout(DEADLINE_TEST_GUARD, &mut handle.outcome)
+        .await
+        .expect("terminal persistence was not bounded by the total execution deadline")
+        .expect("stream outcome sender dropped")
+        .expect("execution returned a transport error instead of a bounded failure");
+    let elapsed = started.elapsed();
+    lock_tx
+        .rollback()
+        .await
+        .expect("release the attempt-row gate");
+
+    assert!(
+        elapsed >= DEADLINE_TEST_MINIMUM_ELAPSED,
+        "terminal persistence returned in {elapsed:?}, too fast to have been blocked on the \
+         attempt row — this case would then be asserting nothing about F38"
+    );
+    assert_eq!(outcome.status, ExecutionStatus::Failed);
+    let failure = outcome
+        .failure
+        .as_ref()
+        .expect("a bounded terminal-persistence phase must report a failure");
+    assert_eq!(failure.class, ExecutionFailureClass::DeadlineExceeded);
+    assert!(!failure.retryable);
+    assert!(!failure.fallback_eligible);
+
+    // The caller received this. The outcome has to agree.
+    assert_eq!(streamed, "firstsecond", "the deltas the caller actually got");
+    assert_eq!(
+        outcome.output_text.as_deref(),
+        Some(streamed.as_str()),
+        "F38: an outcome saying `no output` contradicts what this caller has already been sent"
+    );
+    assert_eq!(outcome.usage.input_tokens, Some(2));
+    assert_eq!(outcome.usage.output_tokens, Some(1));
+    assert_eq!(outcome.usage.total_tokens, Some(3));
+    let attempt = outcome
+        .attempts
+        .last()
+        .expect("the successful provider attempt must still be reported");
+    assert_eq!(outcome.usage.total_tokens, attempt.usage.total_tokens);
+
+    let failed_payload =
+        saw_failed_event.expect("a terminal-persistence breach must emit ExecutionFailed");
+    assert_eq!(failed_payload["phase"], "terminal_persistence");
+    assert_eq!(
+        failed_payload["output_committed"], true,
+        "on a stream the deltas really were delivered, so this one is earned"
+    );
+    assert_eq!(failed_payload["terminal_state_persisted"], false);
+
+    let usage_rows: i64 =
+        sqlx::query_scalar("select count(*) from usage_records where execution_id = $1")
+            .bind(execution_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("count usage records");
+    assert_eq!(
+        usage_rows, 0,
+        "the usage write is part of the same bounded group and must not have landed — which is \
+         what makes the retained outcome usage the only surviving record of the spend"
+    );
+
+    let audit: Value = sqlx::query_scalar(
+        "select metadata from audit_logs
+         where resource_id = $1
+           and request_id = $2
+           and action = 'execution.terminal_persistence_deadline_exceeded'",
+    )
+    .bind(execution_id.to_string())
+    .bind(&request_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("the terminal-persistence breach must be audited under its own action");
+    assert_eq!(audit["output_committed"], true);
+    assert_eq!(audit["terminal_state_persisted"], false);
+
+    drop(handle);
     provider.shutdown().await;
 }
 
