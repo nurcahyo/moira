@@ -3171,6 +3171,21 @@ pub(crate) async fn find_application_embedding_target(
 // Each helper restates the sort key of the *list* query that uses it. Single-row call sites
 // (find/patch/insert … returning) are unaffected by an `order by` over one row.
 
+/// F30 — this query selects **both** consent columns and decides nothing.
+///
+/// It used to emit `coalesce(mp.consent_mode, 'explicit_only') as memory_behavior`, which made it
+/// a consent reader that consulted one of the two consent columns
+/// (`MemoryConsentMode::stricter_of` documents why there are two). An application whose
+/// conversation policy said `disabled` while its memory policy said `application_managed` was
+/// reported to every caller of `GET /api/v1/conversations/{id}` as `application_managed`, while
+/// extraction — which has taken the stricter of the two since Sub-Phase F — was refusing.
+///
+/// **The reason it happened here and not in Rust is the reason the fix is shaped this way.** The
+/// combining rule was an application-layer function over `Option<MemoryStatus>`; SQL could not
+/// call it and did not have to, so the second reader wrote its own answer in six words. Selecting
+/// both columns raw and combining them in `conversation_record_from_row` leaves no consent
+/// decision in SQL at all, which is the only version of "every reader goes through one place" that
+/// a query cannot walk around.
 fn conversation_select(inner: &str) -> String {
     format!(
         r#"
@@ -3181,9 +3196,11 @@ fn conversation_select(inner: &str) -> String {
                    where s.conversation_id = conversation_rows.id
                      and s.superseded_at is null
                ) as summary_available,
-               coalesce(mp.consent_mode, 'explicit_only') as memory_behavior
+               coalesce(cp.memory_consent_mode, 'explicit_only') as conversation_consent_mode,
+               coalesce(mp.consent_mode, 'explicit_only') as memory_policy_consent_mode
         from conversation_rows
         left join application_memory_policies mp on mp.application_id = conversation_rows.application_id
+        left join application_conversation_policies cp on cp.application_id = conversation_rows.application_id
         order by conversation_rows.updated_at desc, conversation_rows.id desc
         "#
     )

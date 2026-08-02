@@ -186,6 +186,31 @@ impl Case {
         )
     }
 
+    /// `memory_behavior` as a caller of `GET /api/v1/conversations` is told it.
+    ///
+    /// Read over HTTP rather than from the row mapper, because the whole of F30's second reader
+    /// lived between the two: the value was computed in SQL, and asserting on the Rust helper
+    /// would have proved the helper works while the query kept answering on its own.
+    async fn reported_memory_behavior(&self) -> String {
+        let response = tokio::time::timeout(
+            WAIT,
+            self.client
+                .get(format!("{}/api/v1/conversations", self.moira.base_url))
+                .header("x-consumer-key", &self.consumer_key)
+                .send(),
+        )
+        .await
+        .expect("conversations list timed out")
+        .expect("conversations list");
+        let status = response.status();
+        let body: Value = response.json().await.expect("conversations body");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["data"][0]["memory_behavior"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no memory_behavior on the listed conversation: {body}"))
+            .to_string()
+    }
+
     /// Every memory row this fixture's application holds, newest last.
     async fn memories(&self) -> Vec<MemoryRow> {
         sqlx::query_as::<_, MemoryRow>(
@@ -418,6 +443,74 @@ async fn explicit_only_on_the_conversation_policy_alone_still_withholds_the_memo
         "the conversation policy's consent column must bind as hard as the memory policy's"
     );
     case.shutdown().await;
+}
+
+/// F30 — what a caller is *told* about memory must be what is *enforced*, from both columns.
+///
+/// `ConversationRecord.memory_behavior` was `coalesce(mp.consent_mode, 'explicit_only')`,
+/// computed in `conversation_select`. It therefore reported the memory policy alone while
+/// extraction had, since Sub-Phase F, obeyed the stricter of the two columns — so an operator who
+/// tightened `application_conversation_policies.memory_consent_mode` was told the looser value.
+///
+/// **The columns are made to disagree, in both directions, which is the entire finding.** Every
+/// other consent case in this file that fixes both columns to the same value is blind to a reader
+/// that consults one of them; so was every test in the tree, which is why this shipped. The
+/// agreeing pair is kept as the control: it is the value the field has always reported, and it
+/// must not move.
+#[tokio::test]
+async fn the_reported_memory_behavior_is_the_stricter_of_the_two_consent_columns() {
+    for (conversation_mode, memory_mode, expected) in [
+        // The defect. Before the fix this reported "application_managed" while extraction refused.
+        (
+            MemoryConsentMode::Disabled,
+            MemoryConsentMode::ApplicationManaged,
+            "disabled",
+        ),
+        // The mirror. This one was already right, because it *is* the memory column.
+        (
+            MemoryConsentMode::ApplicationManaged,
+            MemoryConsentMode::Disabled,
+            "disabled",
+        ),
+        // Stricter-but-not-refusing on the conversation side: the second direction of the defect,
+        // and the one a `disabled`-only fix would miss.
+        (
+            MemoryConsentMode::ExplicitOnly,
+            MemoryConsentMode::ApplicationManaged,
+            "explicit_only",
+        ),
+        // The control: two agreeing columns still report what they agree on.
+        (
+            MemoryConsentMode::ApplicationManaged,
+            MemoryConsentMode::ApplicationManaged,
+            "application_managed",
+        ),
+    ] {
+        let Some(case) = Case::new(
+            conversation_mode,
+            memory_mode,
+            MemoryPolicyPutRequest::default(),
+            vec![
+                ProviderScript::Completion {
+                    text: ASSISTANT_REPLY.to_string(),
+                },
+                extraction_reply(json!([memory("preference", MEMORY_BODY, 0.95, "normal")])),
+            ],
+        )
+        .await
+        else {
+            return;
+        };
+        let (status, body) = case.respond(USER_TURN).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            case.reported_memory_behavior().await,
+            expected,
+            "conversation={conversation_mode:?} memory={memory_mode:?}: the value reported to \
+             callers must be the one enforced"
+        );
+        case.shutdown().await;
+    }
 }
 
 /// `disabled` on either consent column stops extraction before the model is ever called.

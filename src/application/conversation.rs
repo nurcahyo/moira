@@ -2001,6 +2001,19 @@ impl ConversationService {
                 "manual memory is disabled for this application",
             ));
         }
+        // F30 — this reads **one** of the two consent columns, on purpose.
+        //
+        // There are two (`MemoryConsentMode::stricter_of`), and every other consent decision in
+        // the tree takes the stricter of them. This one does not, because a manual memory is not a
+        // conversation: `POST /api/v1/memories` writes at `MemoryScope::UserApplication` and takes
+        // no conversation id, so `application_conversation_policies` is not describing it. The
+        // memory policy's own `manual_memory_enabled` gate above is the switch that governs this
+        // path.
+        //
+        // Recorded rather than assumed: `docs/memory-consent.md` states the asymmetry, and this
+        // comment is here so the next reader knows it is a decision and not the defect F30 names.
+        // Changing it would change what `POST /api/v1/memories` accepts, which is a public
+        // behaviour change and belongs in its own commit.
         if matches!(policy.consent_mode, MemoryConsentMode::Disabled) {
             return Err(AppError::coded(
                 axum::http::StatusCode::FORBIDDEN,
