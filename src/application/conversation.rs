@@ -1086,7 +1086,7 @@ impl ConversationService {
     ///
     /// # Why this is inline rather than enqueued
     ///
-    /// Sub-Phase E's summarization is specified as *enqueued*, and the same reasoning would
+    /// Sub-Phase E's summarization is *specified* as enqueued, and the same reasoning would
     /// apply here — extraction is a second completion call, so it roughly doubles the latency
     /// of a turn on an application that enables it. It is nevertheless synchronous, because the
     /// alternatives available in this tree are worse:
@@ -1103,9 +1103,35 @@ impl ConversationService {
     /// no existing application pays anything, and an operator who turns it on is opting into a
     /// second model call per turn — which is documented in `docs/memory-extraction.md`.
     ///
+    /// # Sub-Phase E did not ship enqueued either — finding F34
+    ///
+    /// Read the paragraph above as *specification*, not as description of the tree, because it
+    /// was read as description at least once and a latency budget was drawn from it.
+    /// [`Self::maybe_summarize_after_turn`] is awaited on the line **after** this call in
+    /// [`Self::record_assistant_response`], and it makes its own non-streaming completion call
+    /// for the same stub-dispatcher reason given here. So the window between the last content
+    /// delta and the terminal SSE event holds:
+    ///
+    /// | Turn | Provider calls in that window |
+    /// |---|---|
+    /// | extraction off, summarization off (both defaults) | 0 |
+    /// | extraction on | 1 |
+    /// | summarization on, backlog past both thresholds | 1 |
+    /// | both on, backlog past both thresholds | **2** |
+    ///
+    /// The last row is **three** sequential provider calls on that turn, counting the caller's
+    /// own. The summarization half is the one nobody opts into per turn:
+    /// `automatic_extraction_enabled` gates extraction, while summarization's own gate is a
+    /// policy flag whose *run* rate is amortised to one call per `summary_trigger_tokens` of
+    /// conversation rather than one per turn. What ran every turn regardless was summarization's
+    /// *read* path, until finding F37 hoisted the `summarization_enabled` gate in
+    /// [`Self::summarize_conversation`].
+    ///
     /// **Reversal condition:** move the body behind `memory-extraction-retry` the moment a real
     /// `JobDispatcher` replaces the stub. This function is already shaped for it — it takes
-    /// only ids and reads everything else from the database.
+    /// only ids and reads everything else from the database. The table above stops being true
+    /// the moment *either* feature moves off the response path, and whoever moves one should
+    /// correct it rather than leave it describing the other.
     ///
     /// # Failure policy
     ///
@@ -1509,10 +1535,16 @@ impl ConversationService {
     ///    `find_conversation_authorized` predicate every other conversation write uses — a
     ///    caller who cannot see the conversation must not be able to learn whether it has a
     ///    backlog, which a differently-ordered policy check would leak.
-    /// 2. **The trigger decision before the lock**, so a request that was never going to
-    ///    summarise does not open a connection or contend with a run that is doing real work.
-    /// 3. **The lock before the model call**, which is the whole point of it.
-    /// 4. **`covers_through_sequence` from the messages actually read**, not from the
+    /// 2. **The `summarization_enabled` gate before the backlog reads** (finding F37). It is
+    ///    `decide_summarization`'s own first condition, hoisted: on the default configuration
+    ///    the automatic path runs this function every turn and the answer is already known once
+    ///    the policy row is in hand, so reading the active summary, counting the backlog and
+    ///    fetching a transcript first was three round trips spent on a decided question. It sits
+    ///    below the anchor read on purpose — see the comment at the guard.
+    /// 3. **The rest of the trigger decision before the lock**, so a request that was never going
+    ///    to summarise does not open a connection or contend with a run that is doing real work.
+    /// 4. **The lock before the model call**, which is the whole point of it.
+    /// 5. **`covers_through_sequence` from the messages actually read**, not from the
     ///    conversation's current tail. When the backlog exceeds
     ///    [`SUMMARY_TRANSCRIPT_MESSAGES`] the run summarises the *oldest* uncovered messages and
     ///    advances the boundary only that far, so the next run continues contiguously. Setting
@@ -1602,6 +1634,41 @@ impl ConversationService {
                 "conversation not found",
             ));
         };
+
+        // **Finding F37 — the *enabled* half of the trigger, hoisted out of
+        // [`Self::plan_summarization`].** `decide_summarization`'s first line is
+        // `if !policy.enabled`, tested *before* `force`, so this is that check moved above the
+        // three backlog reads it used to sit behind and not a new rule: `force: true` did not
+        // bypass it before and does not bypass it now. `summarization_skip_error` is the same
+        // constructor `plan_summarization` reaches through `map_err`, so the envelope — 403,
+        // `summarization_disabled`, and the `moira.error.summarization_disabled` key derived from
+        // it — is byte-identical either way.
+        //
+        // Why it is worth hoisting at all: [`Self::maybe_summarize_after_turn`] calls this
+        // function on **every** conversation-linked turn, inside the caller's request, between
+        // the last SSE delta and the terminal event. With `summarization_enabled` at its `false`
+        // default that spent six database round trips reaching a verdict already settled by the
+        // second. It now spends three.
+        //
+        // Why it sits *below* the anchor read rather than immediately below the policy read,
+        // which would have saved a fourth. `find_conversation_context_anchor` returning `None` is
+        // this function's `conversation_not_found` 404, and a policy verdict must not overtake a
+        // resource-existence one. **No test pins that particular ordering, and none can**: the
+        // anchor's predicate (`public_id = $1 and deleted_at is null`) is a strict superset of
+        // `find_conversation_authorized`'s, so the only state that separates the two placements is
+        // a soft delete landing *between* the two statements. The placement is chosen on the rule,
+        // not on a measurement, and that is said here rather than dressed up as a guard.
+        //
+        // The two orderings that *are* reachable — this gate against the access predicate, and
+        // against the archived check above — are pinned by
+        // `a_disabled_policy_does_not_pre_empt_the_access_and_archived_checks`, whose two
+        // mutations were run.
+        //
+        // *Reversal condition:* if the anchor's lateral join ever measures as material on the
+        // disabled path, move this above it and accept 404 → 403 inside that window.
+        if !policy.summarization_enabled {
+            return Err(summarization_skip_error(SummarizationSkip::Disabled));
+        }
 
         let plan = self
             .plan_summarization(pool, conversation_uuid, &policy, force)

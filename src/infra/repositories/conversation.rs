@@ -3041,10 +3041,47 @@ pub(crate) fn summarization_lock_object(conversation_uuid: Uuid) -> i32 {
 ///
 /// The cost is one connection open per summarization run. That is acceptable because the run is
 /// already gated by `summarization_enabled` (default `false`) plus two thresholds, so the rate is
-/// orders of magnitude below the request rate. *Reversal condition:* if summarization ever runs
-/// per-turn on a hot path, replace this with a lock table row and a bounded lease, rather than
-/// making the lock pooled — a pooled session lock is not a cheaper version of this, it is a wrong
-/// one.
+/// orders of magnitude below the request rate.
+///
+/// # Finding F36 — checked, and the premise did not survive
+///
+/// F36 reads this guard as pinning a backend "on a per-turn path", and concludes the reversal
+/// condition below has been met. It has not. The *enclosing function* is per-turn —
+/// `maybe_summarize_after_turn` calls `summarize_conversation_unscoped` on every
+/// conversation-linked turn — but this constructor sits below `plan_summarization`'s `?`, so it is
+/// reached only once `decide_summarization` has already said yes. The paragraph above is a claim
+/// about the rate of *runs*, not of turns, and it survives unchanged. Nothing here was altered as
+/// a result, deliberately.
+///
+/// What *is* real is the shape of the exposure when a run does happen, in numbers, so the
+/// condition below can be evaluated rather than argued:
+///
+/// * **Duration is bounded.** `run_summarization` builds its command with
+///   `ExecutionOptions::default()`, so `timeout_ms` is `None` and `MoiraExecutionService::execute`
+///   falls back to `runtime.default_execution_timeout_seconds` — 120 s in `config/default.toml`,
+///   itself clamped by `maximum_execution_timeout_seconds`. That is the ceiling on one lock's
+///   lifetime, and it is a server setting: no caller can extend it.
+/// * **Count is bounded by nothing in this tree.** [`sqlx::pool::PoolConnection::detach`] removes
+///   the connection permanently and the pool opens a replacement, so a run costs one backend
+///   *beyond* `database.max_connections` (10). The caller's own execution permit is released
+///   before `record_assistant_response` runs, so `runtime.global_execution_concurrency` does not
+///   bound how many turns can be inside a summarization run at once — only the number of
+///   in-flight requests does. N conversations triggering together is N extra backends, each for
+///   up to the deadline above.
+///
+/// *Reversal condition, sharpened:* replace this with a lock-table row and a bounded lease when
+/// concurrent summarization **runs** — not turns — can approach the server's spare backend
+/// headroom. That is measurable today from `moira_summarization_runs_total` against the
+/// deployment's `max_connections`; it is not a judgement call. Three cheaper-looking answers were
+/// considered first and each is worse:
+///
+/// 1. **Make the lock pooled.** Still wrong for the re-entrancy reason above. It is not a cheaper
+///    version of this design.
+/// 2. **Drop the lock and let `conversation_summary_boundary_unique` arbitrate.** The constraint
+///    is the correctness boundary, but the loser of that race has already paid for a completion
+///    and then receives a unique violation as a 500 — worse on spend *and* on status code.
+/// 3. **Wrap the provider call in a second, tighter timeout.** It shortens the duration, which is
+///    already bounded, and does nothing to the count, which is not.
 pub(crate) struct SummarizationLock {
     session: sqlx::PgConnection,
     conversation_uuid: Uuid,
