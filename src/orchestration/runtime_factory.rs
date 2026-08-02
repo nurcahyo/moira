@@ -14,13 +14,13 @@ use rig_core::{
 };
 use secrecy::ExposeSecret;
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::{
     domain::{
         CredentialType, DomainMessage, DomainMessageContent, DomainMessageRole, ExecutionFailure,
         ExecutionFailureClass, ProviderRuntimePolicyRecord, ProviderType, ResolvedCredential,
-        ResolvedProviderConfiguration, RuntimeEventEnvelope, RuntimeEventType, UsageSummary,
+        ResolvedProviderConfiguration, UsageSummary,
     },
     error::AppError,
     orchestration::normalize_openai_base_url,
@@ -198,73 +198,6 @@ impl RuntimeModelHandle {
         }
     }
 
-    pub async fn stream(
-        &self,
-        request: CompletionRequest,
-        base_event: RuntimeEventSeed,
-    ) -> Result<RuntimeStreamOutput, ExecutionFailure> {
-        let mut stream = self.start_stream(request).await?;
-        let mut seed = base_event;
-        let mut text = String::new();
-        let mut usage = UsageSummary::default();
-        let mut provider_request_id = None;
-        let mut events = Vec::new();
-
-        while let Some(item) = stream.next().await {
-            match item? {
-                RuntimeStreamItem::TextDelta { text: delta } => {
-                    text.push_str(&delta);
-                    events.push(next_event(
-                        &mut seed,
-                        RuntimeEventType::OutputTextDelta,
-                        json!({ "text": delta }),
-                    ));
-                }
-                RuntimeStreamItem::ToolCallStarted {
-                    internal_call_id,
-                    name,
-                    ..
-                } => events.push(next_event(
-                    &mut seed,
-                    RuntimeEventType::ToolCallStarted,
-                    json!({
-                        "internal_call_id": internal_call_id,
-                        "name": name
-                    }),
-                )),
-                RuntimeStreamItem::ToolCallDelta {
-                    id,
-                    internal_call_id,
-                    ..
-                } => events.push(next_event(
-                    &mut seed,
-                    RuntimeEventType::ToolCallDelta,
-                    json!({ "id": id, "internal_call_id": internal_call_id }),
-                )),
-                RuntimeStreamItem::UsageUpdated {
-                    usage: updated_usage,
-                } => {
-                    usage = updated_usage;
-                    events.push(next_event(
-                        &mut seed,
-                        RuntimeEventType::UsageUpdated,
-                        json!({ "usage": usage }),
-                    ));
-                }
-                RuntimeStreamItem::FinalMetadata {
-                    provider_request_id: request_id,
-                } => provider_request_id = request_id,
-            }
-        }
-
-        Ok(RuntimeStreamOutput {
-            text,
-            usage,
-            provider_request_id,
-            events,
-        })
-    }
-
     pub async fn start_stream(
         &self,
         request: CompletionRequest,
@@ -303,21 +236,6 @@ pub enum RuntimeStreamItem {
     FinalMetadata {
         provider_request_id: Option<String>,
     },
-}
-
-#[derive(Debug, Clone)]
-pub struct RuntimeEventSeed {
-    pub request_id: String,
-    pub execution_id: uuid::Uuid,
-    pub next_sequence: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct RuntimeStreamOutput {
-    pub text: String,
-    pub usage: UsageSummary,
-    pub provider_request_id: Option<String>,
-    pub events: Vec<RuntimeEventEnvelope>,
 }
 
 async fn completion_with_model<M>(
@@ -558,23 +476,6 @@ fn safe_provider_error_message(class: ExecutionFailureClass, status: Option<u16>
         Some(status) => format!("provider request failed with HTTP {status} ({class:?})"),
         None => format!("provider request failed ({class:?})"),
     }
-}
-
-fn next_event(
-    seed: &mut RuntimeEventSeed,
-    event_type: RuntimeEventType,
-    payload: Value,
-) -> RuntimeEventEnvelope {
-    let event = RuntimeEventEnvelope {
-        request_id: seed.request_id.clone(),
-        execution_id: seed.execution_id,
-        sequence: seed.next_sequence,
-        timestamp: chrono::Utc::now(),
-        event_type,
-        payload,
-    };
-    seed.next_sequence += 1;
-    event
 }
 
 trait UsageSummaryExt {

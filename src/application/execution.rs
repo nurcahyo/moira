@@ -408,7 +408,7 @@ impl MoiraExecutionService {
                 let permits = match self
                     .state
                     .concurrency
-                    .acquire_scoped(
+                    .acquire(
                         candidate.provider_id,
                         candidate.runtime_policy.max_concurrent_requests.max(1) as usize,
                         command.options.stream,
@@ -1801,6 +1801,31 @@ fn record_first_token(recorded: &mut bool, stream_metrics: &StreamMetricsContext
     );
 }
 
+/// The **only** place a `RuntimeItemStream` is drained into runtime events.
+///
+/// F44 — there used to be a second one, `RuntimeModelHandle::stream` in
+/// `src/orchestration/runtime_factory.rs`: ~66 lines that drove `start_stream` through the same
+/// `RuntimeStreamItem` match and produced a `RuntimeStreamOutput { text, usage,
+/// provider_request_id, events }`. It had **zero callers** — `.stream(` occurred exactly once in
+/// the whole tree and that occurrence was Rig's own `CompletionModel::stream` inside
+/// `start_stream_with_model` — and it was kept compiling only by the re-export in
+/// `src/orchestration/mod.rs`. It is deleted, along with `RuntimeStreamOutput`,
+/// `RuntimeEventSeed` and `next_event`, which existed only to serve it.
+///
+/// The hazard was divergence, not the dead lines: this loop has since grown idle timeouts,
+/// backpressure, cancellation, TTFT metrics and `mark_output_committed`, and the duplicate had
+/// none of them. Anyone fixing streaming had a coin-flip chance of fixing the wrong one.
+///
+/// Deleting it also restored the module boundary. That cluster was the sole reason
+/// `runtime_factory.rs` imported `RuntimeEventEnvelope`, `RuntimeEventType` and `serde_json::json`
+/// at all; with it gone, the file compiles without the runtime-event vocabulary, which is what
+/// `moira-rig-integration` says the Rig seam should look like — Rig primitives there, runtime
+/// events here.
+///
+/// **Nothing mechanical prevents a second drain loop being written again.** `dead_code` cannot
+/// see it: the items were `pub` in a library crate, and `pub` items are exempt from that lint
+/// regardless of whether anything calls them, which is exactly how ~95 lines survived. Saying so
+/// is more useful than a brittle source-scan pretending otherwise.
 async fn execute_rig_stream(
     handle: Arc<RuntimeModelHandle>,
     request: CompletionRequest,

@@ -119,11 +119,14 @@ async fn the_default_build_still_enforces_rate_limits_and_concurrency() {
     let controller = moira::orchestration::ConcurrencyController::new(1, 1, 1, 16);
     let provider = Uuid::now_v7();
     let _held = controller
-        .acquire(provider, 1, None, None)
+        .acquire(provider, 1, false, 1, None, None)
         .await
         .expect("the first execution fits");
     assert!(
-        controller.acquire(provider, 1, None, None).await.is_err(),
+        controller
+            .acquire(provider, 1, false, 1, None, None)
+            .await
+            .is_err(),
         "the in-process concurrency ceiling is not being enforced"
     );
 }
