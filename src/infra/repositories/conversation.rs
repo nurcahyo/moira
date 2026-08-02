@@ -99,6 +99,8 @@ use crate::{
     },
 };
 
+use super::policy_row::get_or_create_policy_row;
+
 #[derive(Debug, Clone)]
 pub struct PgConversationRepository {
     pool: PgPool,
@@ -520,20 +522,18 @@ impl PgConversationRepository {
 
 #[async_trait]
 impl ConversationRepository for PgConversationRepository {
+    /// F47: a read, and no longer a write. See [`super::policy_row`] for what the previous
+    /// `on conflict … do update` spelling cost on every call.
     async fn get_or_create_conversation_policy(
         &self,
         application_id: Uuid,
     ) -> Result<ConversationPolicyRecord, AppError> {
-        let row = sqlx::query(
-            r#"
-            insert into application_conversation_policies (application_id)
-            values ($1)
-            on conflict (application_id) do update set application_id = excluded.application_id
-            returning *
-            "#,
+        let row = get_or_create_policy_row(
+            &self.pool,
+            "application_conversation_policies",
+            "*",
+            application_id,
         )
-        .bind(application_id)
-        .fetch_one(&self.pool)
         .await?;
         conversation_policy_record_from_row(&row)
     }
@@ -624,20 +624,17 @@ impl ConversationRepository for PgConversationRepository {
         conversation_policy_record_from_row(&row)
     }
 
+    /// F47: a read, and no longer a write. See [`super::policy_row`].
     async fn get_or_create_memory_policy(
         &self,
         application_id: Uuid,
     ) -> Result<MemoryPolicyRecord, AppError> {
-        let row = sqlx::query(
-            r#"
-            insert into application_memory_policies (application_id)
-            values ($1)
-            on conflict (application_id) do update set application_id = excluded.application_id
-            returning *
-            "#,
+        let row = get_or_create_policy_row(
+            &self.pool,
+            "application_memory_policies",
+            "*",
+            application_id,
         )
-        .bind(application_id)
-        .fetch_one(&self.pool)
         .await?;
         memory_policy_record_from_row(&row)
     }
@@ -731,20 +728,17 @@ impl ConversationRepository for PgConversationRepository {
         memory_policy_record_from_row(&row)
     }
 
+    /// F47: a read, and no longer a write. See [`super::policy_row`].
     async fn get_or_create_retrieval_policy(
         &self,
         application_id: Uuid,
     ) -> Result<RetrievalPolicyRecord, AppError> {
-        let row = sqlx::query(
-            r#"
-            insert into application_retrieval_policies (application_id)
-            values ($1)
-            on conflict (application_id) do update set application_id = excluded.application_id
-            returning *
-            "#,
+        let row = get_or_create_policy_row(
+            &self.pool,
+            "application_retrieval_policies",
+            "*",
+            application_id,
         )
-        .bind(application_id)
-        .fetch_one(&self.pool)
         .await?;
         retrieval_policy_record_from_row(&row)
     }
@@ -819,20 +813,17 @@ impl ConversationRepository for PgConversationRepository {
         retrieval_policy_record_from_row(&row)
     }
 
+    /// F47: a read, and no longer a write. See [`super::policy_row`].
     async fn get_or_create_embedding_policy(
         &self,
         application_id: Uuid,
     ) -> Result<EmbeddingPolicyRecord, AppError> {
-        let row = sqlx::query(
-            r#"
-            insert into application_embedding_policies (application_id)
-            values ($1)
-            on conflict (application_id) do update set application_id = excluded.application_id
-            returning *
-            "#,
+        let row = get_or_create_policy_row(
+            &self.pool,
+            "application_embedding_policies",
+            "*",
+            application_id,
         )
-        .bind(application_id)
-        .fetch_one(&self.pool)
         .await?;
         embedding_policy_record_from_row(&row)
     }
