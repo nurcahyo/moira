@@ -365,8 +365,9 @@ once. Current state of everything above F28:
 | **F46** | `response_format: {"type":"json_object"}` reaches the provider as a schema satisfied only by `{}` — the caller gets the **opposite** of free-form JSON, with `200 succeeded` | open, in flight `fix/f46-json-object-format` |
 | ~~**F47**~~ | ~~`get_or_create_*_policy` are `insert … on conflict do update`, i.e. **reads that write**~~ | **CLOSED** `fix/f40-f47-response-output-and-policy-reads`. Finding right and **understated**: a "read" also **bumped `version`** (the `If-Match` ETag) and fired `pg_notify('moira_runtime_config')`, which makes every replica drop its runtime-config *and provider-handle* caches — three times per conversation-linked turn. Family is **five**, not two; the fifth (`get_or_create_application_execution_policy`) already read first and so had **no** write amplification — and no `on conflict` clause either, so it raced and returned a duplicate-key error on the hot path of every `POST /v1/responses`. The brief's warning that the row lock "makes that race impossible" was **inverted** for that member. Six mutations; the `select … for update` one left the first guard green and earned a fifth case. Raised **F51** |
 | **F40** | ~~`GET /v1/responses/{id}` returns an empty `output` for a completed, persisted response~~ | **PREMISE REFUTED, two adjacent defects CLOSED**, same branch. `output_persisted` is never `true` anywhere, so `Completed` always explained itself and `[]` was reached only by non-completed statuses, where it is right. Real defects: the reason was the literal `"metadata_only_persistence"` for **all four** persistence modes, and `Completed && output_persisted` fell to `[]`. Public shape unchanged (`reason` is an unconstrained string; snapshot byte-identical) |
-| **F51** | The `moira_runtime_config` channel is attached to **`conversations` and `memory_records`**, not only config tables, and `apply_invalidation` calls three `invalidate_all()`s **unconditionally** — only the breaker reset respects `circuit_reset_scope`. One conversation created drops every replica's runtime cache and every provider client handle | open. **F47's fix does not close it** — F47 removed the *spurious* notifications; these come from legitimate writes |
-| **F52** | **A shipped, trusted guard whose list is retyped rather than pinned, and it has already drifted.** `0003`'s `alter table providers rename to legacy_providers` carried the notify trigger with it, so three `legacy_*` tables fire `moira_runtime_config` and `circuit_reset_scope` classifies none of them — `CircuitResetScope::All`, every breaker on every replica. `every_triggered_table_has_a_scope` claims to pin the classifier "against the trigger list in `migrations/`" and instead retypes 21 names against the schema's 24, omitting exactly the three that fail | open, **latent** — nothing in `src/` touches those tables. Fix shape: derive the inventory from `pg_trigger` |
+| ~~**F51**~~ | ~~The `moira_runtime_config` channel is attached to **`conversations` and `memory_records`**, and `apply_invalidation` calls three `invalidate_all()`s **unconditionally**~~ | **CLOSED** `fix/f51-f52-invalidation-scope`. **Premise held in full — every count in it was right**, including 24 triggers when counted by *function* and which table's trigger is named differently. **Both fixes taken**: `invalidation_plan` returns `{caches, circuits}` and narrows one-way (unknown payloads still clear everything), and migration `0022` drops both triggers. **Nothing depended on them notifying** — `docs/runtime-cache-invalidation.md` never listed them, no cache in the process is keyed by a conversation or memory record, and `db.rs` is the only listener. The doc comment's standing defence ("re-reading costs a query") was **true of two caches and false of the third**: `ProviderRuntimeCache` holds built Rig clients with connection pools. Five mutations; **the cheapest edit — honour the plan for `runtime_cache` only — reds only the handles assertion.** Raised **F53** |
+| ~~**F52**~~ | ~~**A shipped, trusted guard whose list is retyped rather than pinned, and it has already drifted.**~~ | **CLOSED** `fix/f51-f52-invalidation-scope`. Premise held in full; `pg_trigger` returns exactly 24 and the three `legacy_*` tables still carry their **pre-rename trigger names**, so a name-based query mis-attributes as well as misses. `TRIGGERED_RESOURCE_TYPES` is now pinned against `pg_trigger` **both directions**, counted by trigger function, floored by `MINIMUM_TRIGGERED_TABLES`. The three legacy tables **lose their triggers** (`0023`) rather than being classified — the only references in the whole tree are inside `0003` itself, as a backfill source. Four mutations; **attaching the trigger to a new table reds the inventory test — the forward drift the retyped list could never detect — and "fixing" that red by adding the name to the constant alone reds the unit guard instead.** |
+| **F53** | **F51's class, one table over and at admin rate:** `rag_documents` and `rag_collections` are content, not configuration, both carry the notify trigger and both are `caches: true`, so ingesting one document wipes every replica's runtime-config cache, provider-handle cache and auth-settings cache. A bulk import does it per document | open, **LOW**. Deliberately not fixed under F51 — the write paths are admin routes, not the public execution path, so this is operator-rate not request-rate. **Establish first whether a RAG collection's own configuration is read through any cache**; `rag_collections` and `rag_documents` may not have the same answer |
 | **F30** | `application_memory_policies.consent_mode` and `application_conversation_policies.memory_consent_mode` are independent, both default `'explicit_only'`, and nothing reconciles them | open. Sub-Phase F takes the **stricter of the two** (D4), but the schema divergence remains. *The shape that hides:* they agree in every default deployment and diverge exactly when an operator tightens one |
 | **F48** | **A third `output_schema` drop path, and it is silent even on OpenAI.** Rig also requires `tools.is_empty() \|\| history_has_tool_result`, so the schema is dropped on turn 1 of any tool-calling conversation with **no `warn!` at all** — the warning at that site fires only for the DeepSeek case. Latent only because `build_completion_request` hardcodes `tools: Vec::new()`; it goes live the day tool calling is enabled. **F39's fix does not cover it** — that reconciles per provider type, this drop is per request | **latent, now GUARDED, behaviour deliberately unchanged.** Premise re-verified: that constructor is the tree's only `CompletionRequest`, and `public.rs` refuses caller-declared tools outright. `moiras_request_still_carries_its_schema_onto_rigs_openai_wire_body` reds on the precondition |
 | **F49** | **No integration test ever built a request from an agent profile** — every fixture left `agent_profile_id` NULL, so `preamble`/`temperature`/`max_tokens`/`tool_policy` were unverified at the wire | **CLOSED** `fix/f49-agent-profile-coverage`. Premise held; the column is on `route_definitions`, not `routing_policies`. `tests/agent_profile_wire.rs` now builds from a real profile and reads the mock's body. **The branch is correct at the wire.** Eight mutations run. Under F48's mutation only the new `tool_policy` case reds — **F48's guard is not superseded.** Raised F50 |
@@ -485,8 +486,9 @@ announced. Without it the assertion would have held equally against a database w
 dropped or a listener on the wrong channel — F16's shape, in a new place.
 
 **An eleventh, found the same day and the worst of the shipped-and-trusted set, because it is a
-guard whose entire job is drift detection and it had already drifted. Recorded as F52, not
-fixed.**
+guard whose entire job is drift detection and it had already drifted. Recorded as F52, and
+since FIXED on `fix/f51-f52-invalidation-scope` — see the end of this entry for what the fix
+had to prove, which is more than "derive the list".**
 
 `every_triggered_table_has_a_scope` in `src/infra/db.rs` proves every table wired to
 `moira_runtime_config` classifies to something other than `CircuitResetScope::All` — an
@@ -513,6 +515,35 @@ reason — `POLICY_TABLES` is pinned against `information_schema`, so a sixth po
 Note the shape it shares with the seventh and tenth: **all three were sound at the moment they
 were written and were falsified by a later change elsewhere** — a migration that renamed a table,
 a fix that removed two coupled behaviours. Guards rot in the direction of passing.
+
+**What fixing it taught, and it is not "derive the list".** `TRIGGERED_RESOURCE_TYPES` is now
+pinned against `pg_trigger` in both directions. That alone is *still* not a guard, because there
+is an obvious lazy repair for the red it produces: someone attaches a trigger to a new table, the
+inventory test fails naming that table, and they add the name to the constant. Set equality is
+restored, the test is green, and **the table is still unclassified** — the original defect,
+reintroduced by the fix's own error message. What closes it is that a *second* guard iterates the
+same constant and asserts each name classifies: adding the name satisfies the first and reds the
+second, and classifying it wrongly (as per-request data, so `caches: false`) reds a third
+assertion. **A derived inventory is only a guard if something else consumes it.** Verified by
+running all three edits, and the lazy-repair one was not predicted — it was found by asking the
+§3.4 question of the finished fix.
+
+**Two other things worth carrying, both from F51 on the same branch.**
+
+*When a fix protects several things, seed and observe the most expensive one, not the easiest
+to construct.* `apply_invalidation` clears three caches. Two rebuild from a query; the third
+holds built provider clients and their connection pools, and is the reason the finding mattered.
+The test file already contained a ready-made sentinel for the cheap one — so the guard that
+wrote itself would have watched exactly the wrong cache, and stayed green against an edit that
+honoured the plan for it and kept wiping the other two. That edit was run; it reds only the
+handles assertion.
+
+*A barrier must be inert with respect to the property under test.* The ordering barrier already
+in `tests/runtime_config_invalidation.rs` establishes "the listener has caught up" by emitting a
+`provider_models` notification — which is configuration, and therefore clears the caches. Reusing
+it to bracket a cache-*survival* assertion made the guard fail for a reason that had nothing to do
+with the code. It now brackets on the invalidation counter, which moves on every notification
+including the ones that clear nothing.
 
 ---
 
