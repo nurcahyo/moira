@@ -3723,6 +3723,143 @@ The "State at a glance" block above exists precisely so a compacted context can 
 
 ## Cycle log
 
+### Cycle 17 — 2026-08-03 — F54 closed on a corrected premise; F30's recorded gap closed
+
+Branch `fix/f54-extraction-correlation`, three commits, one gate run — **ALL GATES PASSED**, 1102
+tests, the one expected allowed `RUSTSEC-2026-0221`.
+
+| item | verdict |
+|---|---|
+| **F54** | **CLOSED, premise partly REFUTED.** Migration `0025` adds `memory_extraction_runs.execution_id` |
+| **F30's recorded `stricter_of` gap** | **CLOSED — it was closable, not unclosable.** The tying pair exists in the enum |
+
+#### F54's brief was wrong in the same direction twice, and the ledger's own entry was righter
+
+The cycle-16 summary above says *"the extraction failure class is lost from
+`memory_extraction_runs`"*, and the brief that carried it repeated that. **It is not lost.**
+`memory_extraction_runs.failure_class` has existed since `0007…:312` and has carried the
+*execution's own* class since F29's third precondition — which the F54 entry two sections down
+states correctly (*"The run row now records the execution's failure class"*). The one-line summary
+drifted from the entry it was summarising, in the direction of restating the finding it had just
+narrowed.
+
+**The consequence is that the brief's first candidate fix — "persist the failure class on
+`memory_extraction_runs`" — was already shipped**, and had it been taken it would have duplicated
+a column onto itself. The second candidate ("persist the execution/response id as a real column,
+making the correlation a foreign key") was also wrong in its detail: `response_id` is **already**
+a real FK on that table and is **already taken** — it references the *triggering turn's* response,
+which is a different execution from the extraction's own. *Read the entry, not the summary of the
+entry; and check whether a proposed column already exists before costing it.*
+
+#### What the fix is, and why the cheapest option was not right
+
+`execution_id uuid` plus an index, written when the run row is **opened**.
+
+**Not a foreign key, and this is not a compromise.** There is nothing to reference: `execution_id`
+is not the primary key of any table — it is `unique` on `responses` and a plain indexed column on
+`execution_attempts`. A FK to `responses(execution_id)` would additionally fail *exactly* on the
+deployments that persist least, since a `responses` row exists only when `persistence_mode` says
+so while `execution_attempts` and `audit_logs` are written regardless.
+
+**The argument that beat "document the convention" is not that documenting is cheap-and-bad; it is
+that the schema had already answered this question twice, in the same migration.**
+`context_plans.execution_id` and `retrieval_runs.execution_id` (`0007…:448`, `0007…:467`) are both
+bare indexed uuids on run tables solving this exact problem. Extraction was the odd one out.
+Documenting the string convention would have made `memory_extraction_runs` the only run table in
+the schema that correlates differently — and the convention is a `varchar(128)` with no format
+constraint, so the documented join would still have been `like 'memory-extraction-%'` with a uuid
+parsed out of it. There was also a **fourth** option the brief did not list and which is genuinely
+the cheapest: put the id in the existing `metadata` jsonb and skip the migration entirely. It
+loses the index and the type, on a column whose only consumer is an operator writing SQL.
+
+**Written at open, not at completion.** `insert_memory_extraction_run`'s doc comment celebrates
+that a run dying mid-call leaves a `'running'` row rather than no row. That row is the one an
+operator most needs to correlate, and it never reaches `complete_memory_extraction_run` — so
+recording the id at completion would have left it null precisely there.
+
+**The barrier is the type.** `MemoryExtractionRunInsert.execution_id` is a required `Uuid`, not an
+`Option`, so no writer can open a run row without naming the execution it is about to run. The
+column is nullable only for rows predating `0025`.
+
+**Reversal condition:** if executions ever get a table of their own with `execution_id` as its
+primary key, this column becomes a real foreign key to it in the same change. Until then the type
+on the insert struct is what holds the invariant, and it must not be relaxed to `Option` to make a
+new call site compile.
+
+#### The correlation guard, and the naive version that would have shipped green
+
+`a_failed_extraction_run_names_the_execution_that_failed`. It does **not** assert the column is
+populated; it resolves it against `execution_attempts`, which the *execution kernel* wrote.
+
+| mutation | observed |
+|---|---|
+| `run_extraction` mints its own id again, ignoring the one the run row was opened with | **red** — *"the run row must name the execution that failed, not a uuid minted somewhere else"*. The column is non-null and indexed and names nothing |
+| the same mutation, against a guard weakened to `assert!(execution_id.is_some())` | **GREEN.** Run deliberately, and it is the whole reason the guard joins |
+| `insert_memory_extraction_run` binds `None` | **red** — *"a run row must name the execution it ran, even when that execution failed"*. Only this test reds; the other 22 stay green, so nothing else in the tree covered this |
+| the run row records the **caller's** execution id (the realistic confusion, since `response_id` on the same row points at that turn) | **red** on the same `assert_eq!` — and see below |
+
+**The fixture always produces two executions** — the caller's turn and the extraction — so an id
+that merely resolves to *some* attempt row proves nothing. The caller's succeeded and the
+extraction failed, which is what makes them tellable apart.
+
+**What running the fourth mutation found, and it is about the guard rather than the code.** The
+guard also carried an explicit `assert_ne!(run_execution_id, callers.execution_id)`. That
+assertion **can never be the one that fires**: with the two ids already asserted distinct, it is
+implied by the `assert_eq!` above it. It was removed in its own commit. *An arm no test can
+execute is a promise, not a guard* — §3.4's rule, applied to a guard written by an author who had
+just read it, which is the third time that sequence has happened here.
+
+**Cheapest edit that breaks the property while leaving the guard green:** none found. Writing the
+id at completion instead of at open is not cheap — it requires moving the field from the insert
+struct to the outcome struct, because the insert takes a non-optional `Uuid` and the outcome has
+no such field. That is a redesign, not an edit.
+
+#### F30's recorded gap — CLOSABLE, and now closed
+
+The gap was *"swapping `stricter_of`'s arguments at the `memory_behavior` call site survives its
+guard"*. The brief asked whether a pair of **different** values that **tie** exists in the enum,
+and said that if none did the gap would be unclosable by construction and should be left recorded.
+
+**Such a pair exists.** `permissiveness()` maps `ApplicationManaged` and
+`AutomaticWithUserControls` both to `2` — deliberately, and documented as such: they *"differ in
+who asserted consent, not in how much is permitted"*. So the gap is closable, and
+`the_reported_memory_behavior_resolves_the_consent_tie_toward_the_memory_policy` closes it with
+both argument orders of that pair.
+
+| mutation | observed |
+|---|---|
+| `stricter_of(memory, conversation)` at `effective_memory_behavior` — **the recorded gap verbatim** | **red**, and **only** the new test — *"conversation=AutomaticWithUserControls memory=ApplicationManaged: … left: "automatic_with_user_controls", right: "application_managed""*. 23 other cases green, which confirms this was genuinely the surviving edit |
+| `effective_memory_behavior` reports the memory column alone (F30's shipped defect) | **red**, and **only the sibling** `…_is_the_stricter_of_the_two_consent_columns`. The new tie test stays **green** |
+
+**The two cases are exact complements, verified in both directions rather than asserted.** The tie
+test is *blind* to a memory-column-only read — because on a tie the memory column **is** the
+answer — and the sibling is blind to the swap. Neither is a superset of the other, and the doc
+comment on the new case says so explicitly so that neither gets retired for the other later.
+
+**The value is bounded and the test states the bound in its own doc:** both tied modes permit the
+same thing, so this can only change *which of two equally-permissive labels is reported*, never a
+consent outcome. It is worth pinning because resolving the tie the other way would silently change
+the value reported to deployments where nothing is wrong.
+
+*Swapping the arguments at the **other** call site (`effective_extraction_status`) remains inert
+and is not a gap: both tied modes map to the same `MemoryStatus`, which
+`the_combined_consent_decision_is_symmetric` already pins.*
+
+#### A correction to the F54 entry's own remedy
+
+It said *"add `execution_id` … (and the summarization run equivalent)"*. **There is no
+summarization run equivalent.** `conversation_summaries` has no `status`, no `failure_class` and
+no run row at all — a summarization that fails writes **nothing** to the database beyond a metric.
+That is a different and larger gap than F54's, and it was not expanded into here. Recorded as
+**F55** rather than silently folded in.
+
+#### What remains
+
+Unchanged by this cycle, and none of it autonomous: **F50**'s fail-closed product decision, the
+**structured-output fail-hard flip**, **F33**'s envelope-encryption scoping, **PR #57** (F32), the
+**rig-core issue** in `docs/upstream/`, and the **T11 deploy**. Newly raised and also not
+autonomous: **F55**.
+
 ### Cycle 16 — 2026-08-03 — the queue is empty; what is left needs a human
 
 **Ten PRs merged across cycles 15–16.** `main` at `cddb2a5`. **Every finding that an autonomous loop
@@ -3779,9 +3916,16 @@ can honestly close is closed.**
 
 #### What remains, and none of it is autonomous work
 
-**F54** (the extraction failure class is lost from `memory_extraction_runs`) and one **bounded,
+~~**F54** (the extraction failure class is lost from `memory_extraction_runs`) and one **bounded,
 recorded gap** — swapping `stricter_of`'s arguments survives its guard, and can only change which of
-two equally-permissive labels is *reported*, never a consent outcome.
+two equally-permissive labels is *reported*, never a consent outcome.~~
+
+**Both closed on `fix/f54-extraction-correlation` (2026-08-03) — and the first clause of that
+sentence was wrong when written.** The failure class is **not** lost from `memory_extraction_runs`;
+that column has existed since `0007` and this cycle's own F54 entry says so. What F54 is actually
+about is the missing **`execution_id`**, which migration `0025` adds. The `stricter_of` gap turned
+out to be **closable** — `ApplicationManaged` and `AutomaticWithUserControls` are two distinct
+values that tie — so it is closed rather than still recorded. See cycle 17.
 
 **Needing a human:** PR **#57** (F32's 422 breaks IaC setting `encrypted_content`); **F33**'s
 encryption scoping; the **rig-core issue** drafted in `docs/upstream/`; the **T11 deploy**; **F50**'s
@@ -3888,7 +4032,7 @@ Two independent pieces, separate commits (`673f9c0`, `4824838`, `ff7f5e2`), one 
 |---|---|
 | **F30** | **premise partly REFUTED, and confirmed at a site it did not name.** "No code path reconciles them" was true when written and false by the time it was read: `effective_extraction_status` has taken the stricter of the two since Sub-Phase F, tested with the columns disagreeing in both directions. **But the reader F30 predicted had already arrived** — `ConversationRecord.memory_behavior` was one of the two columns, computed in SQL |
 | **F29 preconditions** | both remaining ones **landed**. The fail-hard flip is deliberately **not** taken; the reversal condition now holds and the flip is a separate, reviewable change |
-| **F54** | raised — a failed extraction cannot be correlated to its execution except through an unenforced `request_id` string convention |
+| **F54** | raised — a failed extraction cannot be correlated to its execution except through an unenforced `request_id` string convention. **CLOSED on `fix/f54-extraction-correlation` (2026-08-03)** by migration `0025`'s `memory_extraction_runs.execution_id`; the "failure class is lost" half of how it was later summarised is **refuted** — that column has existed since `0007` |
 
 ### F30 — the finding was right about the shape and wrong about the site
 
@@ -3947,8 +4091,17 @@ site. The function is symmetric except on the tie between the two equally-permis
 integration case that exercises a tie uses two *agreeing* values, so nothing goes red. The blast
 radius is which of `application_managed` / `automatic_with_user_controls` is reported when the two
 columns hold one each — a label difference between two modes that permit the same thing, never a
-consent difference. Closing it would need a tie case with the columns disagreeing, which is worth
-adding the next time this file is opened.
+consent difference. ~~Closing it would need a tie case with the columns disagreeing, which is worth
+adding the next time this file is opened.~~
+
+**CLOSED on `fix/f54-extraction-correlation` (2026-08-03).** The tie case with the columns
+disagreeing exists, because `ApplicationManaged` and `AutomaticWithUserControls` are two *distinct*
+values that both rank `2`.
+`the_reported_memory_behavior_resolves_the_consent_tie_toward_the_memory_policy` drives both
+argument orders of that pair; the swap reds it and **only** it, with 23 other cases green. It is
+deliberately **not** a superset of `…_is_the_stricter_of_the_two_consent_columns` — on a tie the
+memory column *is* the answer, so the new case is blind to the single-column read F30 was about,
+and the sibling is blind to the swap. Verified in both directions by running both mutations.
 
 ### F29's preconditions — the disposition question had a different answer than expected
 
@@ -4043,6 +4196,52 @@ one change:** add `execution_id uuid` to `memory_extraction_runs` (and the summa
 equivalent), write it from the `ExecutionCommand` that is already in scope, and pin the
 correlation with a test that reads the execution back through it — at which point the `request_id`
 convention becomes a convenience rather than the only route.
+
+**CLOSED on `fix/f54-extraction-correlation` (2026-08-03), migration `0025`.** Three corrections
+to the remedy as written above, all found while taking it:
+
+1. **The admin-surface question does not arise.** `memory_extraction_runs` is exposed on no route
+   and appears nowhere in `docs/openapi.json`; it is a SQL-only operator record. So there is no
+   DTO and no contract change — but it does mean the column has to be *queryable*, which rules
+   out the genuinely cheapest option of stuffing the id into the existing `metadata` jsonb.
+2. **Write it from the run-row insert, not "from the `ExecutionCommand` that is already in
+   scope".** The command is built *after* the row is opened, so taking the id from it means
+   recording at completion — and the row that never completes is the one
+   `insert_memory_extraction_run` exists to leave behind. The id is now minted in
+   `extract_memories` and handed *to* the command instead.
+3. **There is no summarization run equivalent** — see F55.
+
+### F55 — a failed summarization leaves no operator-facing record at all
+
+Raised while closing F54, whose remedy assumed a "summarization run equivalent" of
+`memory_extraction_runs` and whose entry says *"`summarization` has the same shape"*. **It does
+not, and its shape is worse.**
+
+Extraction has a run table: opened before the call, carrying `status`, `failure_class`,
+`started_at`/`completed_at`, counts, and now `execution_id`. Summarization has
+`conversation_summaries`, which is a table of **successful outputs** — no `status`, no
+`failure_class`, no `started_at`. `run_summarization` returns a `Result`; on the automatic path
+(`maybe_summarize_after_turn`) the error is swallowed so it cannot become the caller's problem,
+exactly as extraction's is. The difference is that extraction writes the reason to a row and
+summarization writes **nothing**. The only trace a failed summarization leaves anywhere is the
+`record_summarization_run(false)` metric counter — an aggregate with no conversation id, no
+failure class, and no execution to chase.
+
+So the operator question F54 was about — *"this conversation's summary is stale; why?"* — is not
+merely hard to answer here, it is unanswerable from the database. And the F54 fix does not reach
+it: there is no row to add a column to.
+
+**Not fixed here** deliberately. It is a new table, not a column, and "should a failed
+summarization be durable at all" is a design question with a real cost on the response path —
+summarization already makes a second provider call per triggering turn, and adding an
+insert-before-call plus an update-after doubles its database writes. That is a different
+conversation from F54's, which was a one-column correlation fix on a table that already existed.
+
+**Remedy if taken:** mirror extraction exactly — a `conversation_summarization_runs` table opened
+in `'running'` before the completion call, carrying `conversation_id`, `execution_id`,
+`failure_class` and the covered-sequence boundary, completed on both paths. The shape is already
+proven one module over, which is most of the argument for doing it that way rather than inventing
+a second one.
 
 ## F53 CLOSED · F50 OBSERVABLE — `fix/f53-f50-silent-degradation`, 2026-08-03
 

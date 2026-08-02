@@ -354,7 +354,7 @@ not have to carry a rotation caveat. F's remaining work is unchanged otherwise.
 
 ### 3.2b THE LEDGER IS AHEAD OF THIS TABLE — read it, not just §3.2 (2026-08-02)
 
-The table above was written when the highest finding was F28. **The ledger now runs to `F54`.**
+The table above was written when the highest finding was F28. **The ledger now runs to `F55`.**
 `plans/reports/EXECUTION-LEDGER.md` is authoritative; §3.2 is a summary that has already gone stale
 once. Current state of everything above F28:
 
@@ -377,6 +377,8 @@ once. Current state of everything above F28:
 | ~~**F42**~~ | ~~`moira.error.structured_output_invalid` asserts a model-output-non-conformance path that does not exist~~ | **CLOSED** same branch. Premise held: two emitters, both rejecting the *caller's schema*. The near-miss that made it plausible — `memory_extraction::FAILURE_STRUCTURED_OUTPUT_INVALID`, the same string for the missing case — is never returned to a caller, and the description now says so. Fail-hard variant deliberately **not** shipped; F29 still needs two of its three preconditions |
 | ~~**F43**~~ | ~~`ConcurrencyController::acquire` is dead `pub` API; every caller is inside `#[cfg(test)]`~~ | **CLOSED** same branch. **Conclusion refuted, hazard confirmed.** 9 of the 29 callers are in `tests/`, a separate crate, so private/deleted were never available — `pub` in this `publish = false` single-crate workspace means "visible to integration tests", not an external contract. Fixed by removing the *choice*: one `pub acquire`, `is_stream` mandatory, wrapper gone |
 | ~~**F44**~~ | ~~`RuntimeModelHandle::stream` / `RuntimeStreamOutput` are dead `pub` API~~ | **CLOSED** same branch. Premise held exactly; **103 lines deleted**. Not in the finding: that cluster was the sole reason `runtime_factory.rs` imported the runtime-event vocabulary, so deleting it restored the Rig/application boundary |
+| ~~**F54**~~ | ~~A failed extraction cannot be correlated to its execution except through an unenforced `request_id` string convention (`"memory-extraction-{run_id}"`)~~ | **CLOSED** `fix/f54-extraction-correlation`, migration `0025`. **Premise partly REFUTED as it was later summarised:** the failure class is *not* lost from `memory_extraction_runs` — that column has existed since `0007` — so the "persist the failure class" candidate was already shipped, and `response_id` is already a real FK that is already taken (it names the *triggering turn's* response). The real gap was the missing `execution_id`, now a bare indexed uuid **matching `context_plans` and `retrieval_runs`, which solve the identical problem in the same migration**; a FK is impossible because `execution_id` is no table's primary key. Written when the run row is **opened**, not at completion, so the `'running'` row a mid-call death leaves behind keeps its correlation. The barrier is the type: `MemoryExtractionRunInsert.execution_id` is a required `Uuid`. Four mutations; the guard **joins** `execution_attempts` rather than checking the column is populated, because the weakened `is_some()` version was verified **green** against a fresh-uuid mint. Raised **F55** |
+| **F55** | **A failed summarization leaves no operator-facing record at all** — `conversation_summaries` is a table of successful outputs with no `status`, no `failure_class` and no run row; the only trace of a failure is an aggregate metric counter. F54's remedy assumed a "summarization run equivalent" and there is none | **raised, deliberately not fixed.** It is a new table rather than a column, and whether a failed summarization should be durable at all is a design question with a real cost on the response path. Remedy shape in the ledger |
 | **F35, F37, F34, F29, F39, F46** | — | CLOSED |
 | **F36, F41** | — | REFUTED / wrong as recorded |
 
@@ -633,6 +635,57 @@ Two corollaries, both cheap:
   into a decision and was `pub`. Making it private is not tidying — it is removing the autocomplete
   that any future single-column reader would have reached for first.
 
+**F30's recorded gap is now CLOSED, and the way it closed is worth more than the fix.** The brief
+that took it asked the right question — *does a pair of different values that tie actually exist in
+this enum?* — and pre-authorised the answer **"unclosable by construction, left recorded"** as a
+good outcome. It was closable: `permissiveness()` maps `ApplicationManaged` and
+`AutomaticWithUserControls` both to `2`, deliberately and with the reason written at the function.
+**Ask that question before writing the test, not after** — it is the difference between a real
+closure and a fourteenth guard that cannot fire, and the enum's own doc comment answered it in one
+read.
+
+**A shape not on the list above, from `fix/f54-extraction-correlation`. Like F30's, it is not a
+fourteenth guard — no shipped guard failed here. It is a rule for writing one, and it is specific
+to identifier columns: asserting that a correlation key is *present* does not assert that it
+*correlates*.**
+
+The F54 guard could have read `assert!(run.execution_id.is_some())`. That version was written,
+run against the cheapest mutation — let the writer mint its own uuid again instead of using the
+one the row was opened with — and **passed**. The column was non-null, indexed, and named an
+execution that had never existed. What has teeth is resolving the id against a table some *other*
+component wrote (`execution_attempts`, written by the execution kernel), and doing it where more
+than one candidate row exists so that resolving is a *choice*: this fixture always produces two
+executions, the caller's turn and the extraction, and only the failed one is the right answer.
+
+**The rule: an id column is trivially satisfiable, so a guard on one must dereference it.** Any
+uuid satisfies "is not null"; only the right uuid satisfies a join. This is F16's shape — an
+assertion that cannot discriminate — narrowed to the case where the *type* of the thing being
+asserted is what makes it undiscriminating.
+
+**A corollary about redundant assertions, found by running a mutation on a guard that was already
+sound.** The same guard also carried an explicit `assert_ne!` against the caller's execution id.
+Running the "record the caller's id instead" mutation showed it reds on the `assert_eq!` above,
+never on the `assert_ne!` — which, with the two ids already asserted distinct, is implied and can
+**never** be the assertion that fires. It was deleted. *An arm no test can execute is a promise,
+not a guard* applies to assertions inside a working guard, not only to whole cases — and this is
+now the **third** time the §3.4 question found something in a guard whose author had just read
+§3.4 and judged it sound. Asking is still not enough; run it.
+
+**And a way to check a complementarity claim instead of asserting one.** The new F30 tie case is
+blind to a memory-column-only read, and the sibling case is blind to the argument swap. That is
+written in both doc comments — and it was *verified*, by running each mutation and observing that
+each reds exactly one of the two. **When a doc comment claims two cases are complements rather
+than one being a superset, run both mutations**, or the claim is the same kind of untested
+assertion the cases exist to prevent.
+
+**One thing not about guards at all: a one-line summary of a finding can drift from the finding.**
+F54's own ledger entry says the run row *"now records the execution's failure class"*. The
+cycle-summary bullet three sections above it says the class is *"lost from
+`memory_extraction_runs`"*, and the brief built on the summary. **The summary had drifted back
+toward the overstated claim the entry had just narrowed** — so the first of the fix's three
+candidate options was work that had already shipped. *Read the entry, not the summary of the
+entry, and check whether a column a brief proposes adding already exists before costing it.*
+
 ---
 
 **The original six — five toothless, one that pinned the defect**
@@ -666,9 +719,13 @@ Three corollaries earned the hard way:
   `main + N × ~2 GB` and grows with every agent. Below 60 GB free run `scripts/reclaim.sh`; below
   30 GB also delete finished agents' target dirs. **Delete them routinely, not only under pressure.**
   `debug = 1` took a full build from 20 GB to 2 GB and a cold rebuild to 2m21s.
-- **Migrations** are append-only; next free number is **`0025`**. This line said `0020` while the
-  tree was at `0023` — **derive it (`ls migrations/ | tail -1`) instead of trusting it**, exactly as
-  the brief for F53 instructed. `0016` is a permanent gap.
+- **Migrations** are append-only; next free number is **`0026`** (`0025` is F54's). This line said
+  `0020` while the tree was at `0023`, and `0025` after `0025` landed — **derive it
+  (`ls migrations/ | tail -1`) instead of trusting it**, exactly as the brief for F53 instructed.
+  `0016` is a permanent gap. Note the shared `moira` database is only the *origin*; each test
+  clones a migrated **template** (`moira_test_template_<hash>`), so `select max(version) from
+  _sqlx_migrations` against `moira` will lag your branch and is **not** evidence a migration
+  failed to apply.
 - **OpenAPI** is frozen: regenerate with
   `UPDATE_SNAPSHOTS=1 cargo test --lib http::tests::committed_openapi_matches_the_generated_document`.
   Two gates enforce it, plus a hardcoded route list *and an exact operation count* in
