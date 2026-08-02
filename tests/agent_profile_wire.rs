@@ -45,10 +45,26 @@
 //!    silently having taken the non-streaming path.
 //! 5. **`tool_policy` is not forwarded.** The integration counterpart of F48's unit guard —
 //!    see that case's own comment for why it is *not* a substitute for it.
-//! 6. **Finding F50, and this case DOCUMENTS CURRENT BEHAVIOUR rather than guarding it.**
-//!    Disabling an agent profile leaves the route pointing at it and silently degrades every
-//!    execution on that route to a profile-less request. Read that case's comment before
-//!    changing it.
+//! 6. **Finding F50 — the disabled profile is announced.** Disabling an agent profile leaves
+//!    the route pointing at it and degrades every execution on that route to a profile-less
+//!    request. That is now announced as a runtime event, a `warn!` and an audit row, and the
+//!    guard asserts on the event and the row: logs are easy to assert and easy to lose.
+//! 7. **The soft-delete twin of case 6**, because `delete_agent_profile` is a different admin
+//!    method and is the one that could have hard-deleted the row.
+//! 8. **The streaming twin of case 6.** Case 4's justification — "they are separate arms" —
+//!    applies to this property too, and a per-path pairing with an empty cell is HANDOFF
+//!    §3.4's twelfth entry.
+//! 9. **The control for cases 6–8, and it is load-bearing.** A route that never had a
+//!    profile must announce *nothing*. Without it, a fix that fired on `agent_profile_id`
+//!    being `Some` rather than on the lookup failing would satisfy every guard above.
+//! 10. **What F50 still has not decided, and this case DOCUMENTS CURRENT BEHAVIOUR rather
+//!     than guarding it.** The request is still served, unguarded, with a `succeeded`
+//!     status. Whether it should instead be refused is a product decision; read that case's
+//!     comment before changing it.
+//!
+//! Cases 6–9 survive that decision and case 10 does not, which is why they are separate
+//! cases rather than one — merging them would make the observability guard go red on a
+//! fail-closed fix, the pinned-defect shape HANDOFF §3.4 records twice.
 
 mod support;
 
@@ -225,11 +241,78 @@ impl Case {
         requests[0].body.clone()
     }
 
+    /// Soft-deletes the attached profile, leaving the route's reference intact.
+    ///
+    /// The twin of [`Self::disable_profile`], and it is not redundant: F50 names *two*
+    /// operations that leave a dangling reference, and they take different code paths in
+    /// `RuntimeAdminService` — `set_agent_profile_enabled` writes `status = 'disabled'`,
+    /// `delete_agent_profile` writes `status = 'deleted', deleted_at = now()`. Only the
+    /// second could plausibly have issued a real `DELETE`, which the FK's
+    /// `on delete set null` would turn into "this route has no profile" — the case that must
+    /// stay silent. The assertion below is what proves it does not.
+    async fn soft_delete_profile(&self) {
+        let profile = self
+            .profile
+            .as_ref()
+            .expect("only a case with an attached profile can delete one");
+        RuntimeAdminService::new(&self.fixture.state)
+            .expect("runtime admin service")
+            .delete_agent_profile(
+                &self.fixture.actor,
+                &request_context(),
+                profile.id,
+                profile.version,
+            )
+            .await
+            .expect("soft-delete the agent profile");
+        assert_eq!(
+            route_agent_profile_id(&self.fixture).await,
+            Some(profile.id),
+            "soft-deleting must not clear the route's reference — a NULL here would make \
+             this indistinguishable from the no-profile control, and would mean F50's \
+             premise is wrong for the delete path"
+        );
+    }
+
+    /// Every audit row this execution wrote, as `(action, result)`.
+    ///
+    /// Read from the database rather than from the response, because the audit row is the
+    /// signal that has to outlive the request — the whole reason it is one of the three.
+    async fn audit_actions(&self, execution_id: &str) -> Vec<(String, String)> {
+        sqlx::query_as::<_, (String, String)>(
+            "select action, result from audit_logs where resource_type = 'execution' \
+             and resource_id = $1 order by occurred_at",
+        )
+        .bind(execution_id)
+        .fetch_all(&self.fixture.pool)
+        .await
+        .expect("read the execution's audit rows")
+    }
+
     async fn shutdown(self) {
         self.provider.shutdown().await;
         self.moira.shutdown().await;
     }
 }
+
+/// The payloads of every runtime event of one type in a diagnose response.
+///
+/// `POST /api/v1/admin/runtime/diagnose` returns `Vec<RuntimeEventEnvelope>` verbatim, which
+/// is what makes the runtime event assertable here at all — and it is the signal worth
+/// asserting on. A guard that only proved "a `warn!` was emitted" would be weak: log lines
+/// are easy to assert and easy to lose, and nothing consumes them structurally.
+fn events_of_type<'a>(body: &'a Value, event_type: &str) -> Vec<&'a Value> {
+    body["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no events array on the diagnose response: {body}"))
+        .iter()
+        .filter(|event| event["event_type"] == event_type)
+        .map(|event| &event["payload"])
+        .collect()
+}
+
+const UNAVAILABLE_EVENT: &str = "agent_profile_unavailable";
+const UNAVAILABLE_AUDIT_ACTION: &str = "agent_profile.unavailable";
 
 /// Creates an active agent profile and points the fixture's route definition at it.
 ///
@@ -585,37 +668,338 @@ async fn an_agent_profiles_tool_policy_does_not_become_a_tool_list_on_the_wire()
     case.shutdown().await;
 }
 
-/// **Finding F50 — DOCUMENTS CURRENT BEHAVIOUR. This is not a guard, and it is expected to go
-/// red when the behaviour is decided.**
+/// **Finding F50 — the guard. A dangling `agent_profile_id` is announced, not swallowed.**
 ///
-/// `execution.rs:191` resolves the profile with `get_active_agent_profile`, whose query filters
+/// `execution.rs` resolves the profile with `get_active_agent_profile`, whose query filters
 /// `status = 'active' and deleted_at is null`. Disabling a profile
-/// (`RuntimeAdminService::set_agent_profile_enabled(.., false)`) leaves
-/// `route_definitions.agent_profile_id` pointing at the row — the FK is `on delete set null`
-/// and `soft_delete_agent_profile` never issues a `DELETE`, so neither disabling nor deleting
-/// clears it. The lookup then returns `Ok(None)` and the match arm above treats that
-/// identically to "this route has no profile": **no failure, no `warn!`, no runtime event, no
-/// audit row.** Every subsequent execution on the route silently loses its preamble, its
-/// temperature and its max_tokens.
+/// (`set_agent_profile_enabled(.., false)`) or soft-deleting it (`delete_agent_profile`, which
+/// writes `status = 'deleted', deleted_at = now()` and never a `DELETE`) leaves
+/// `route_definitions.agent_profile_id` pointing at the row. The lookup returns `Ok(None)`, and
+/// until this guard existed the match arm treated that identically to "this route has no
+/// profile": **no failure, no `warn!`, no runtime event, no audit row.** Every execution on
+/// the route lost its preamble, its temperature and its max_tokens and reported `succeeded`.
+/// A preamble is where guardrails live, so the failure mode is an unguarded model answering
+/// production traffic.
 ///
-/// A preamble is where guardrails live, so the failure mode is not a missing nicety — it is an
-/// unguarded model answering production traffic with a `succeeded` status. The comparison that
-/// makes it look wrong: an unresolvable *route* is a `RouteNotFound` failure, so the agent
-/// profile is the only runtime reference in this path whose disappearance is silent.
+/// # This guards the observability, not the outcome
 ///
-/// **It is recorded rather than fixed because the fix is a product decision**, and guessing it
-/// would be the worse error. Fail-closed (refuse the execution) is safer but breaks any
-/// deployment that disables a profile expecting its routes to keep serving; fail-open with a
-/// `warn!` and a runtime event is cheaper but still serves the unguarded request.
+/// Whether Moira should also *refuse* is an open product decision — fail-closed is safer but
+/// breaks any deployment that disables a profile expecting its routes to keep serving,
+/// observable fail-open is cheaper but still serves the unguarded request. Silence is a defect
+/// under *either* answer: both require the operator to be told and differ only in whether the
+/// request is also refused. So this case asserts the part both answers share, and it survives
+/// the decision either way. The remaining fail-open behaviour is documented — not guarded — by
+/// [`documents_current_behaviour_a_dangling_agent_profile_still_serves_the_request`], which is
+/// the case that becomes wrong when the decision lands. Keeping them apart is the
+/// `documents_`/`guards_` distinction HANDOFF §3.4 asks for: merging them would make this guard
+/// go red on a fail-closed fix, which is exactly the pinned-defect shape.
 ///
-/// **Reversal condition:** decide fail-closed vs observable-fail-open for a dangling
-/// `agent_profile_id`. On either decision this case is *wrong* and must be rewritten — a
-/// fail-closed fix makes it red at `outcome.status`, an observable fail-open fix leaves it
-/// green while the thing it documents (silence) is no longer true. It is named
-/// `documents_` and not `guards_` for exactly the reason HANDOFF §3.4 gives twice: a test that
-/// pins current behaviour can hold a defect in place as firmly as a guard holds a property.
+/// # Three controls, and each answers a different cheap edit
+///
+/// 1. **Before disabling.** The same fixture, the same route, an *active* profile: no event and
+///    no audit row. Without it, moving the announcement out of the `resolved.is_none()` branch
+///    and firing it whenever `agent_profile_id` is `Some` would leave everything below green.
+/// 2. **Liveness of the event channel.** `route_selected` must be present in both responses, so
+///    "no `agent_profile_unavailable` event" cannot pass against an empty events array.
+/// 3. **Liveness of the audit trail.** `execution.started` must be present for both executions,
+///    so "no `agent_profile.unavailable` row" cannot pass against an execution that wrote no
+///    audit rows at all.
+///
+/// Both operations that produce a dangling reference are driven — disable in this case,
+/// soft-delete in [`guards_a_soft_deleted_agent_profile_is_announced_too`] — because they are
+/// different admin methods and only one of them could ever have hard-deleted the row.
 #[tokio::test]
-async fn documents_current_behaviour_a_disabled_agent_profile_is_silently_ignored() {
+async fn guards_a_disabled_agent_profile_is_announced_rather_than_silently_ignored() {
+    let Some(case) = Case::new(
+        Profile::Attached,
+        vec![
+            ProviderScript::Completion {
+                text: "ok".to_string(),
+            },
+            ProviderScript::Completion {
+                text: "ok".to_string(),
+            },
+        ],
+    )
+    .await
+    else {
+        return;
+    };
+
+    // Control 1: the profile is still active, so nothing is announced.
+    let (status, healthy) = case.diagnose(false, ExecutionOptions::default()).await;
+    assert_eq!(status, StatusCode::OK, "diagnose failed: {healthy}");
+    let healthy_execution = healthy["outcome"]["execution_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no execution id: {healthy}"))
+        .to_string();
+    assert!(
+        events_of_type(&healthy, UNAVAILABLE_EVENT).is_empty(),
+        "a route whose agent profile resolves must announce nothing; this event fires on \
+         the resolution *failing*, not on the route having a profile: {healthy}"
+    );
+    assert!(
+        !events_of_type(&healthy, "route_selected").is_empty(),
+        "control: route_selected is missing, so the absence asserted above proves nothing \
+         about this event in particular: {healthy}"
+    );
+    let healthy_audit = case.audit_actions(&healthy_execution).await;
+    assert!(
+        !healthy_audit
+            .iter()
+            .any(|(action, _)| action == UNAVAILABLE_AUDIT_ACTION),
+        "an active profile wrote an agent_profile.unavailable audit row: {healthy_audit:?}"
+    );
+    assert!(
+        healthy_audit
+            .iter()
+            .any(|(action, _)| action == "execution.started"),
+        "control: this execution wrote no audit rows at all, so the absence asserted above \
+         proves nothing: {healthy_audit:?}"
+    );
+
+    // The finding: the route keeps pointing at a profile the runtime will not use.
+    case.disable_profile().await;
+    let (status, body) = case.diagnose(false, ExecutionOptions::default()).await;
+    assert_eq!(status, StatusCode::OK, "diagnose failed: {body}");
+    let execution_id = body["outcome"]["execution_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no execution id: {body}"))
+        .to_string();
+
+    let announced = events_of_type(&body, UNAVAILABLE_EVENT);
+    assert_eq!(
+        announced.len(),
+        1,
+        "F50: a disabled agent profile must announce itself exactly once as a structured \
+         runtime event — the request is now running without the preamble its route \
+         declares: {body}"
+    );
+    let payload = announced[0];
+    assert_eq!(
+        payload["agent_profile_id"].as_str(),
+        Some(
+            case.profile
+                .as_ref()
+                .expect("attached profile")
+                .id
+                .to_string()
+                .as_str()
+        ),
+        "the event must name the profile that vanished, or an operator cannot find it: \
+         {payload}"
+    );
+    assert_eq!(
+        payload["route_id"].as_str(),
+        Some(case.fixture.route_id.to_string().as_str()),
+        "and the route still pointing at it: {payload}"
+    );
+    assert_eq!(
+        payload["route_key"].as_str(),
+        Some(case.fixture.route_key.as_str()),
+        "and that route's key, which is what an operator actually recognises: {payload}"
+    );
+
+    let audit = case.audit_actions(&execution_id).await;
+    assert!(
+        audit
+            .iter()
+            .any(|(action, result)| action == UNAVAILABLE_AUDIT_ACTION && result == "failed"),
+        "F50: the degradation must also leave a durable audit row — the runtime event lives \
+         only as long as the response and the warn! only as long as the log: {audit:?}"
+    );
+
+    case.shutdown().await;
+}
+
+/// **F50, the second way to produce a dangling reference.**
+///
+/// Not redundant with the disable case. F50 names disabling *and* soft-deleting, and they are
+/// different `RuntimeAdminService` methods writing different `status` values. Soft-delete is
+/// the one that could plausibly have been a real `DELETE` — which the FK's
+/// `on delete set null` would have turned into "this route has no profile", the case that must
+/// stay silent — so this case is simultaneously the guard for the delete path and the proof
+/// that F50's premise holds for it. `Case::soft_delete_profile` asserts the reference survives
+/// before the execution runs.
+#[tokio::test]
+async fn guards_a_soft_deleted_agent_profile_is_announced_too() {
+    let Some(case) = Case::new(
+        Profile::Attached,
+        vec![ProviderScript::Completion {
+            text: "ok".to_string(),
+        }],
+    )
+    .await
+    else {
+        return;
+    };
+    case.soft_delete_profile().await;
+
+    let (status, body) = case.diagnose(false, ExecutionOptions::default()).await;
+    assert_eq!(status, StatusCode::OK, "diagnose failed: {body}");
+    let execution_id = body["outcome"]["execution_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no execution id: {body}"))
+        .to_string();
+
+    assert_eq!(
+        events_of_type(&body, UNAVAILABLE_EVENT).len(),
+        1,
+        "a soft-deleted agent profile degrades the route exactly as a disabled one does and \
+         must be announced exactly as loudly: {body}"
+    );
+    let audit = case.audit_actions(&execution_id).await;
+    assert!(
+        audit
+            .iter()
+            .any(|(action, _)| action == UNAVAILABLE_AUDIT_ACTION),
+        "no audit row for the soft-deleted profile: {audit:?}"
+    );
+
+    case.shutdown().await;
+}
+
+/// **F50 on the streaming arm — the empty cell in this suite's own matrix.**
+///
+/// Case 4 justifies its existence with "both arms share the one `build_completion_request`
+/// call today, but they are separate arms". HANDOFF §3.4's twelfth entry is that when a suite
+/// justifies a case by "this is a separate path", the justification applies to **every**
+/// property the suite tests, not just the one that prompted it — a per-path pairing is a
+/// matrix and this one had a hole in it.
+///
+/// The announcement is currently made in `execute_inner`, *before* the two arms diverge, and
+/// `get_active_agent_profile` has exactly one call site in `src/`. So this case cannot fail
+/// today for a reason the disable case would not also catch. It exists so that the day
+/// something moves the lookup, or the streaming task grows its own resolution, the hole is
+/// already covered — which is precisely the shape of the F49 fixture hole that made the whole
+/// branch untested for as long as it did.
+#[tokio::test]
+async fn guards_the_streaming_arm_announces_a_dangling_agent_profile_too() {
+    let Some(case) = Case::new(
+        Profile::Attached,
+        vec![ProviderScript::Stream {
+            deltas: vec!["ok".to_string()],
+        }],
+    )
+    .await
+    else {
+        return;
+    };
+    case.disable_profile().await;
+
+    let (status, body) = case.diagnose(true, ExecutionOptions::default()).await;
+    assert_eq!(status, StatusCode::OK, "diagnose failed: {body}");
+    let execution_id = body["outcome"]["execution_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no execution id: {body}"))
+        .to_string();
+
+    // The case cannot pass by silently having taken the non-streaming path, for the same
+    // reason case 4 asserts this.
+    let wire = case.only_provider_body().await;
+    assert_eq!(
+        wire["stream"], true,
+        "this case must actually stream, or it is case 6 with extra steps: {wire}"
+    );
+
+    assert_eq!(
+        events_of_type(&body, UNAVAILABLE_EVENT).len(),
+        1,
+        "the streaming arm dropped the same profile just as silently: {body}"
+    );
+    let audit = case.audit_actions(&execution_id).await;
+    assert!(
+        audit
+            .iter()
+            .any(|(action, _)| action == UNAVAILABLE_AUDIT_ACTION),
+        "no audit row on the streaming arm: {audit:?}"
+    );
+
+    case.shutdown().await;
+}
+
+/// **F50's control, and it is the one that keeps the finding from becoming noise.**
+///
+/// A route that was never given an agent profile is the *normal* case — it is what every other
+/// fixture in this tree produces, and it must stay exactly as silent as it was. The distinction
+/// is available at the call site because `route.agent_profile_id` is read before the lookup:
+/// `None` is "no profile", `Some(id)` with an unresolved lookup is "the profile vanished". A
+/// fix that could not tell them apart would announce a degradation on every profile-less
+/// execution in the deployment, which is how an operator signal becomes something nobody reads.
+///
+/// Both liveness controls are here for the reason §3.4 gives: an assertion that nothing
+/// happened is worthless unless something can happen.
+#[tokio::test]
+async fn guards_a_route_with_no_agent_profile_announces_nothing() {
+    let Some(case) = Case::new(
+        Profile::None,
+        vec![ProviderScript::Completion {
+            text: "ok".to_string(),
+        }],
+    )
+    .await
+    else {
+        return;
+    };
+
+    let (status, body) = case.diagnose(false, ExecutionOptions::default()).await;
+    assert_eq!(status, StatusCode::OK, "diagnose failed: {body}");
+    let execution_id = body["outcome"]["execution_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no execution id: {body}"))
+        .to_string();
+
+    assert!(
+        events_of_type(&body, UNAVAILABLE_EVENT).is_empty(),
+        "a route with no agent profile is not a degraded route; announcing one here makes \
+         the signal fire on every profile-less execution in the deployment: {body}"
+    );
+    assert!(
+        !events_of_type(&body, "route_selected").is_empty(),
+        "control: route_selected is missing, so the silence asserted above proves nothing: \
+         {body}"
+    );
+
+    let audit = case.audit_actions(&execution_id).await;
+    assert!(
+        !audit
+            .iter()
+            .any(|(action, _)| action == UNAVAILABLE_AUDIT_ACTION),
+        "a route with no agent profile wrote an agent_profile.unavailable audit row: \
+         {audit:?}"
+    );
+    assert!(
+        audit
+            .iter()
+            .any(|(action, _)| action == "execution.started"),
+        "control: this execution wrote no audit rows at all: {audit:?}"
+    );
+
+    case.shutdown().await;
+}
+
+/// **F50 — DOCUMENTS CURRENT BEHAVIOUR. This is not a guard and it is expected to go red when
+/// the product decision lands.**
+///
+/// What is *not* yet decided is whether Moira should refuse a request whose route points at a
+/// profile that no longer resolves. Today it serves it: `succeeded`, no failure, and a wire
+/// body with no preamble, no temperature and no max_tokens — an unguarded model answering
+/// production traffic, which is why the finding is worth a decision rather than a shrug.
+///
+/// It is named `documents_` and not `guards_` for the reason HANDOFF §3.4 gives twice: a test
+/// that pins current behaviour can hold a defect in place as firmly as a guard holds a
+/// property. Its predecessor was named
+/// `documents_current_behaviour_a_disabled_agent_profile_is_silently_ignored`, and that name
+/// stopped being true the moment the announcement shipped — the condition is observed now, it
+/// is simply not refused.
+///
+/// **Reversal condition:** when fail-closed vs fail-open is decided, this case is wrong under
+/// the fail-closed answer (it reds at `outcome.status`) and is simply redundant under the
+/// fail-open one. Delete or rewrite it then. The observability asserted by
+/// [`guards_a_disabled_agent_profile_is_announced_rather_than_silently_ignored`] is **not**
+/// revisited by that decision, which is why the two are separate cases.
+#[tokio::test]
+async fn documents_current_behaviour_a_dangling_agent_profile_still_serves_the_request() {
     let Some(case) = Case::new(
         Profile::Attached,
         vec![ProviderScript::Completion {
@@ -632,9 +1016,9 @@ async fn documents_current_behaviour_a_disabled_agent_profile_is_silently_ignore
     assert_eq!(status, StatusCode::OK, "diagnose failed: {body}");
     assert_eq!(
         body["outcome"]["status"], "succeeded",
-        "today a dangling agent_profile_id does not fail the execution — if this is now `failed`, \
-         the F50 decision has been made fail-closed and this case must be rewritten as a guard: \
-         {body}"
+        "today a dangling agent_profile_id does not fail the execution — if this is now \
+         `failed`, the F50 decision has been taken fail-closed and this case must be \
+         deleted: {body}"
     );
     assert_eq!(
         body["outcome"]["failure"],
@@ -646,15 +1030,16 @@ async fn documents_current_behaviour_a_disabled_agent_profile_is_silently_ignore
     assert_eq!(
         wire["messages"].as_array().map(Vec::len),
         Some(1),
-        "F50: the disabled profile's preamble is dropped with no signal of any kind: {wire}"
+        "the disabled profile's preamble is dropped and the request proceeds without it: \
+         {wire}"
     );
     assert!(
         wire.get("temperature").is_none(),
-        "F50: and its temperature with it: {wire}"
+        "and its temperature with it: {wire}"
     );
     assert!(
         wire.get("max_tokens").is_none(),
-        "F50: and its max_tokens: {wire}"
+        "and its max_tokens: {wire}"
     );
 
     case.shutdown().await;
