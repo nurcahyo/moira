@@ -777,6 +777,12 @@ async fn metrics_endpoint_exposes_provider_outcome_counters_with_bounded_labels(
 /// tolerance. The three exact idle observations below — `capacity`, `capacity - 1`, `0` —
 /// held 15/15 and 20/20 in direct measurement.
 ///
+/// `return_to_pool` is `pub` but `#[doc(hidden)]` in sqlx, which is a dependency worth
+/// naming rather than discovering. It is accepted here because the failure mode is benign:
+/// if sqlx removes it this file stops **compiling**, at the `clippy` gate, rather than
+/// quietly losing its determinism. A test that silently weakens is the thing to avoid; one
+/// that refuses to build is not.
+///
 /// The scrape at full saturation is not just bookkeeping: it is the incident this gauge
 /// exists for, and it also proves `/metrics` answers without a pooled connection — which is
 /// what lets this test hold every permit in the first place.
