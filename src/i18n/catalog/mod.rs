@@ -1006,6 +1006,113 @@ mod tests {
         }
     }
 
+    /// F42 — the `structured_output_invalid` catalog entry names its emitters, so the emitter
+    /// set is pinned.
+    ///
+    /// The entry used to assert a second case, "or the model's output does not conform to it",
+    /// and there is no such path: both emitters reject the *caller's schema*. The corrected
+    /// wording states that as a fact about the code, which raises the question §3.4 asks —
+    /// **what is the cheapest edit that falsifies it while leaving the guards green?**
+    ///
+    /// Neither existing guard covers it. `docs_mirror_matches_rust_catalog` proves only that the
+    /// Rust catalog and the JSON mirror agree; they can be wrong together, and were.
+    /// `a_reply_that_is_not_json_leaves_the_field_null_and_still_succeeds` watches exactly one
+    /// completion path. So the cheapest falsifying edit is a **third emitter somewhere else** —
+    /// a tool-argument validator raising the same code for a non-conforming *reply* is the
+    /// obvious one — and both stay green through it.
+    ///
+    /// This is the guard for that edit. It derives the emitter set by walking `src/` and parsing
+    /// calls (not by matching mentions, which would harvest doc comments), in both spellings the
+    /// code can reach a client: the `AppError` constructors, and
+    /// `ExecutionFailure::new(ExecutionFailureClass::StructuredOutputInvalid, …)`, which
+    /// `failure_http_status` maps to 422.
+    ///
+    /// **Honest about its limits:** it cannot prove the description *true* — prose is not
+    /// machine-checkable. It proves the emitter set has not grown, so the description cannot rot
+    /// silently; a red is a prompt to re-read it, and the message says so. `memory_extraction`'s
+    /// `FAILURE_STRUCTURED_OUTPUT_INVALID` is deliberately not counted: it is the same string for
+    /// the reply case, but it lands on `memory_extraction_runs.failure_class` and is never
+    /// returned to a caller, so it never renders this message. That near-miss is the reason the
+    /// description was plausible enough to survive.
+    #[test]
+    fn structured_output_invalid_has_only_the_two_emitters_its_catalog_entry_describes() {
+        use std::collections::BTreeSet;
+
+        // Assembled with `concat!` for the reason `CODED_CONSTRUCTORS` is: this file is walked by
+        // the scanner too, and a spelled-out needle would be found in its own source.
+        let code_needle = concat!("structured_output", "_invalid");
+        let failure_ctor = concat!("ExecutionFailure", "::new(");
+        let failure_class = concat!("ExecutionFailureClass", "::StructuredOutputInvalid");
+
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        rust_sources_under(&manifest.join("src"), &mut files);
+        assert!(
+            files.len() > 20,
+            "the source walker found only {} files under src/ — it is broken, \
+             and a broken walker asserts nothing",
+            files.len()
+        );
+
+        let mut emitters: BTreeSet<String> = BTreeSet::new();
+        for file in &files {
+            let source = std::fs::read_to_string(file)
+                .unwrap_or_else(|error| panic!("read {}: {error}", file.display()));
+            let relative = file
+                .strip_prefix(manifest)
+                .unwrap_or(file)
+                .display()
+                .to_string();
+
+            let mut record = |needle: &str, position: usize, wanted: &dyn Fn(&str) -> bool| {
+                let mut cursor = 0usize;
+                while let Some(offset) = source[cursor..].find(needle) {
+                    let start = cursor + offset;
+                    let open = start + needle.len() - 1;
+                    cursor = start + needle.len();
+
+                    // A mention inside a `//` comment is prose, not a call site.
+                    let line_start = source[..start].rfind('\n').map_or(0, |index| index + 1);
+                    if source[line_start..start].contains("//") {
+                        continue;
+                    }
+
+                    let args = top_level_args(&source[open..]);
+                    if args.get(position).is_some_and(|argument| wanted(argument)) {
+                        emitters.insert(relative.clone());
+                    }
+                }
+            };
+
+            for (needle, position) in CODED_CONSTRUCTORS {
+                record(needle, *position, &|argument| {
+                    string_literal_code(argument) == Some(code_needle)
+                });
+            }
+            record(failure_ctor, 0, &|argument| argument == failure_class);
+        }
+
+        let expected: BTreeSet<String> = [
+            // `validate_response_format` — the caller's schema exceeds
+            // `public_api.maximum_schema_bytes`.
+            "src/application/public.rs".to_string(),
+            // `build_completion_request` — the caller's schema is not a readable
+            // `schemars::Schema`. The only construction site of the failure class.
+            "src/application/execution.rs".to_string(),
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(
+            emitters, expected,
+            "the emitter set for `{code_needle}` has changed. The catalog entry for \
+             moira.error.{code_needle} states that every emitter rejects the CALLER'S SCHEMA and \
+             that no model-output-non-conformance path exists (F42). Re-read that description in \
+             src/i18n/catalog/errors.rs and docs/i18n-response-catalog.json, correct it if the \
+             new emitter is about the model's reply, and only then update this list."
+        );
+    }
+
     /// The runtime companion to the `const` gate above.
     ///
     /// The `const` version is the one that matters — it fails the *build* — but

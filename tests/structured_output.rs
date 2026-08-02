@@ -349,6 +349,49 @@ async fn a_reply_that_is_not_json_leaves_the_field_null_and_still_succeeds() {
     case.shutdown().await;
 }
 
+/// **No fail-hard, on the stream.** F42 — added because the suite's own header argues for it and
+/// then did not do it.
+///
+/// The header says `execute_rig_stream` "is a genuinely separate code path, and a fix applied at
+/// the Rig boundary would cover only case 1". That argument was applied to the *conforming*
+/// reply (case 2) and not to the non-conforming one, which left the cheapest falsifying edit
+/// unguarded: adding the fail-hard variant to the **streaming arm only** leaves all seven
+/// existing cases green — case 2 sends conforming JSON and never reaches the branch, and case 4
+/// never streams. Verified by running it, not by reading.
+///
+/// This case and the completion twin above are what make the
+/// `moira.error.structured_output_invalid` catalog entry's "no model-output-non-conformance
+/// path exists" true on *both* execution paths rather than on the one that was easy to write.
+#[tokio::test]
+async fn a_stream_whose_reply_is_not_json_leaves_the_field_null_and_still_succeeds() {
+    let Some(case) = Case::new(vec![ProviderScript::Stream {
+        deltas: vec!["I am afraid ".to_string(), "I cannot do that.".to_string()],
+    }])
+    .await
+    else {
+        return;
+    };
+
+    let (status, body) = case.diagnose(true, Some(trivial_object_schema())).await;
+    assert_eq!(status, StatusCode::OK, "diagnose failed: {body}");
+    assert_eq!(
+        body["outcome"]["status"], "succeeded",
+        "a non-conforming streamed reply must not fail the execution either. If this is now \
+         intentional (the fail-hard variant), widen the moira.error.structured_output_invalid \
+         description in src/i18n/catalog/errors.rs AND docs/i18n-response-catalog.json in the \
+         same change — it currently states that no model-output-non-conformance path exists \
+         (F42): {body}"
+    );
+    assert_eq!(body["outcome"]["structured_output"], Value::Null, "{body}");
+    assert_eq!(
+        body["outcome"]["output_text"], "I am afraid I cannot do that.",
+        "the accumulated text must survive unchanged: {body}"
+    );
+    assert_eq!(body["outcome"]["failure"], Value::Null, "{body}");
+
+    case.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Finding F39 — the capability gate reconciled against what Rig will actually send.
 // ---------------------------------------------------------------------------------------------
