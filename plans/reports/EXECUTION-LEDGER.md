@@ -2489,13 +2489,14 @@ question being investigated. That clause has now out-produced the questions them
 | **F36** | **`SummarizationLock` pins a Postgres session advisory lock across a full provider round-trip**, on a per-turn path, over a `pool.acquire().await?.detach()`ed backend. A hung provider holds one backend and one conversation lock for the whole attempt timeout. The lock's own doc comment names this reversal condition — and it has already been met. | **MED-HIGH** |
 | **F37** | **Four wasted DB reads per conversation-linked turn when summarization is disabled**, inside the caller's request, between the last SSE delta and the terminal event. Six round-trips, four of them dead, on the default configuration. | **MEDIUM** |
 | **F38** | **The terminal-persistence-deadline arm throws away a successful provider result.** `execution.rs:658` returns `failed_outcome` with `output_text: None` and a default `UsageSummary` while `output.text` and `output.usage` are in hand and `"output_committed": true` is written into both the audit entry and the `ExecutionFailed` event. On streaming the client has already received every delta. Usage is preserved at attempt level and zeroed at outcome level — **the asymmetry is the tell**. Billing and reporting divergence. Found independently by both skeptics. **Still open after `fix/f29-structured-output`**, which added `structured_output` as a third dropped value and left an explicit comment naming all three rather than fixing the divergence — see the F29 closure entry for why a billing decision was kept out of a parsing change. | **MEDIUM** |
-| **F39** | **The structured-output capability gate cannot see Rig's per-provider reality.** The gate checks a config JSON bool; DeepSeek sets `SUPPORTS_RESPONSE_FORMAT = false` and drops the schema with a `warn!`, and `OpenAiCompatible`/`Local` ship `response_format.json_schema` to arbitrary self-hosted backends with no warning at all. Config says supported, wire says otherwise, caller gets prose and a `succeeded`. **Blocks the fail-hard variant of F29.** | **MEDIUM** |
+| ~~**F39**~~ | ~~**The structured-output capability gate cannot see Rig's per-provider reality.**~~ **CLOSED** `fix/f39-structured-output-capability`. Both divergences verified true. Resolved **asymmetrically**, because they are not the same problem: DeepSeek is decidable and is now reconciled out of routing by reading Rig's own `SUPPORTS_RESPONSE_FORMAT`; `OpenAiCompatible`/`Local` is **not decidable at admission** and was deliberately left admitted. See the F39 closure section below. | **CLOSED** |
 | **F40** | **`GET /v1/responses/{id}` returns an empty `output` array for a completed, persisted response.** Falls through both branches to `Vec::new()`. The `OutputUnavailable { reason: "metadata_only_persistence" }` variant exists to explain the *other* case, which makes the silent empty array read as an oversight rather than a decision. Needs a product call. | **LOW-MED** |
 | ~~**F41**~~ | ~~**Skill-tree drift on exactly the guidance F29's implementer needs.**~~ **STRUCK — the inference was wrong.** The `.claude/` copy is a nine-line **pointer file** that says to read the `.agents/` one; all eight `.claude/skills/` entries have that shape. See "F41 is WRONG as recorded" below. | **struck** |
 | **F42** | **i18n overclaim.** `moira.error.structured_output_invalid` asserts "or the model's output does not conform to it". No such path exists. Its description even narrates a prior widening. Becomes true only if the fail-hard variant ships. | **LOW** |
 | **F43** | **`ConcurrencyController::acquire` is dead `pub` API on the concurrency-safety path** — every caller is inside `#[cfg(test)]`. It hardcodes `is_stream: false`, so a future caller reaching for the obvious-looking name on a streaming path silently takes a *request* permit. | **LOW** |
 | **F44** | **`RuntimeModelHandle::stream` / `RuntimeStreamOutput` are dead `pub` API** — ~65 lines duplicating `execute_rig_stream`, kept alive only by a re-export. Divergence hazard: someone fixing streaming will fix one of the two. | **LOW** |
 | **F45** | **`PublicResponseFormat::JsonSchema { name, strict }` — both accepted, both dropped.** Public in `docs/openapi.json`; every destructure site uses `{ schema, .. }`. Rig hardcodes `strict: true` and renames from the schema's `title`. A caller sending `strict: false` gets strict mode, unreported. | **LOW** |
+| **F48** | **A third `output_schema` drop path, latent, and it is silent even on OpenAI.** `should_apply_response_format` (`openai/completion/mod.rs`) is `output_schema.is_some() && supports_response_format && (tools.is_empty() \|\| history_has_tool_result)`. The third clause drops the schema on **turn 1 of any tool-calling conversation, for every OpenAI-family provider**, and unlike the DeepSeek path it emits **no `warn!` at all** — the warning at the same site fires only when `supports_response_format` is false. Cannot bite today: `build_completion_request` hardcodes `tools: Vec::new()`, so `tools.is_empty()` is always true. It becomes live the moment tool calling is enabled, which `.agents/skills/moira-rig-tools/SKILL.md` contemplates. **The F39 fix does not cover it** — F39 reconciles by provider type, and this drop is per-request. Rig documents the caveat itself: *"a turn-1 answer with no tool call is therefore not schema-constrained; `Native` is 'guaranteed' only once tools have run"* (issue #1928). | **MEDIUM, latent** |
 
 ### F35 — CLOSED: `text.format` is now honoured for `json_schema`, refused for the rest
 
@@ -2607,6 +2608,136 @@ in its name (HANDOFF §3.4).
 *ID allocation:* `origin/main`'s ledger topped out at **F45** immediately before this was written
 (HANDOFF §3.2). Three concurrent finding branches were live; if F46 collides, this is the
 `json_object` one.
+### F39 — **CLOSED** `fix/f39-structured-output-capability`. Reconciled at candidate selection by reading Rig's own constant — 2026-08-02
+
+**Both divergences survived verification.** `providers/deepseek.rs` sets
+`SUPPORTS_RESPONSE_FORMAT = false`, and `providers/openai/completion/mod.rs` discards
+`output_schema` with only a `tracing::warn!` when it is false. `ProviderType::OpenAi`,
+`OpenAiCompatible` and `Local` really do share one `build_completion_model` arm, so all three send
+`response_format.json_schema` to whatever backend the base URL names.
+
+**The question was "can Moira know at admission time whether a schema will reach the provider?" and
+the answer is different for the two halves. That asymmetry is the whole decision.**
+
+- **DeepSeek is decidable.** Rig encodes the answer as a public associated const on a public trait,
+  so it is a *compile-time fact* Moira can read.
+- **`OpenAiCompatible` / `Local` is not decidable, ever.** Rig does send the schema; whether the
+  backend honours it is a property of a binary Moira has never seen. Any admission-time verdict
+  there would be a guess presented as a guarantee — which is the disease F39 names, relocated
+  rather than cured.
+
+**What changed.** One function, at the one site that already answered "does this candidate have
+capability X":
+
+```rust
+fn provider_emits_output_schema(provider_type: ProviderType) -> bool {
+    use rig_core::providers::openai::OpenAICompatibleProvider;
+    match provider_type {
+        ProviderType::OpenAi | ProviderType::OpenAiCompatible | ProviderType::Local =>
+            <openai::OpenAICompletionsExt as OpenAICompatibleProvider>::SUPPORTS_RESPONSE_FORMAT,
+        ProviderType::AzureOpenAi =>
+            <azure::AzureExt as OpenAICompatibleProvider>::SUPPORTS_RESPONSE_FORMAT,
+        ProviderType::DeepSeek =>
+            <deepseek::DeepSeekExt as OpenAICompatibleProvider>::SUPPORTS_RESPONSE_FORMAT,
+        ProviderType::Anthropic | ProviderType::Gemini => true,
+        ProviderType::Custom => false,
+    }
+}
+```
+
+`capabilities_match` takes `candidate.provider_type` (already on `ModelCandidate`) and returns
+false for `structured_output` when that is false. **It only ever subtracts** — a row declaring
+`structured_output: false` stays unusable even where Rig would honour it, because that is also an
+operator decision.
+
+**Why this is not the "hardcoded table that rots" the brief warned about.** For the four
+OpenAI-family provider types nothing is restated: Moira reads Rig's constant, so a `rig-core` bump
+that changes a provider's behaviour changes Moira's admission decision **with no edit here**. The
+divergence F39 describes is not *representable* for those four, which is strictly stronger than a
+table plus a test that notices it rotted. Only `Anthropic` and `Gemini` are restated, because they
+do not implement `OpenAICompatibleProvider` and expose no constant — they map `output_schema`
+natively (`anthropic/completion.rs` `output_config`, `gemini/completion.rs` `generation_config`).
+
+Rot in the *other* direction — Rig gaining DeepSeek support, silently un-applying the fix — is
+caught by `rig_0_40_still_drops_the_schema_for_deepseek_and_sends_it_for_everyone_else`, which
+states rig 0.40.0's truth table literally. **A red there is not a defect; it means Rig changed**,
+and it says so in the assertion message.
+
+**No contract change, and that is deliberate.** A disqualified candidate falls out of routing and,
+if nothing else matches, yields the pre-existing `no_eligible_model` (404). That is **exactly** what
+a row honestly declaring `structured_output: false` already produces — so the fix makes a lying row
+behave identically to a truthful one. No new failure class, no OpenAPI drift, no catalog entry.
+
+**Options rejected.**
+
+| Rejected | Why |
+|---|---|
+| Hardcoded `ProviderType → bool` table | Duplicates Rig and rots silently on a bump. Replaced by reading Rig's const, which cannot diverge. |
+| Refuse `OpenAiCompatible`/`Local` too | Rig *does* send the schema. Refusing breaks every conforming self-hosted backend (vLLM, llama.cpp, TGI) to guard against a non-conforming one Moira cannot identify. Symmetric treatment would be the wrong fix for the half that is unknowable. |
+| Observe Rig's `warn!` at runtime | Requires a subscriber layer string-matching a dependency's log text, and fires *after* admission. F16 already shows Rig's tracing carries tenant data; adding a scraper there is the wrong direction. |
+| A dedicated failure class / 422 | More precise-looking, but it special-cases `structured_output` against every other capability — `vision` already yields `no_eligible_model` on the same path. Consistency beat precision. |
+| Validate the capability JSON on write | **Deferred, not rejected — see below.** Right idea, wrong blast radius for this change. |
+
+**The deferred half, and why it is deferred rather than done.** Refusing `structured_output: true`
+on a DeepSeek row *at write time* would stop the lie being stored at all, and gives the operator
+feedback at the only moment they can act on it. It is not done here because it would 422 a
+previously-accepted admin request and break any IaC that sets it — the **exact** shape of F32,
+which is complete, gated, and deliberately left unmerged as PR #57 pending human sight
+(HANDOFF §3.3 item 4). Landing a second one autonomously would be inconsistent with that
+precedent. The routing fix covers already-stored rows, which the write-time check would not.
+
+**Reversal condition.** This reverses if any of:
+1. `rig-core` gives DeepSeek `SUPPORTS_RESPONSE_FORMAT = true` — the fix un-applies itself
+   correctly, and the pinning test reds to force the re-read.
+2. Moira gains a way to *verify* a backend honours `json_schema` (a probe, a declared conformance
+   field on the provider row, a capability handshake). Then `OpenAiCompatible`/`Local` becomes
+   decidable and the asymmetry above is no longer justified.
+3. `capabilities_match` stops being the single site answering candidate capability — the
+   reconciliation is only sound while there is exactly one such site.
+
+**Three things found that the finding did not mention.**
+
+1. **A third drop path, recorded as F48.** `should_apply_response_format` also requires
+   `tools.is_empty() || history_has_tool_result`, so the schema is dropped on turn 1 of any
+   tool-calling conversation **on every OpenAI-family provider, with no warning at all**. Latent
+   only because `build_completion_request` hardcodes `tools: Vec::new()`. F39's provider-type
+   reconciliation does **not** cover it — that drop is per-request.
+2. **Anthropic and Gemini are fine, and had to be checked.** Neither goes through the OpenAI arm;
+   both map `output_schema` onto their own request shapes. Had either dropped it, the finding's
+   scope would have been twice what it claimed.
+3. **Moira's OpenAI mock could not serve a DeepSeek provider, and failed misleadingly.** rig's
+   DeepSeek response type declares `prompt_cache_hit_tokens` and `prompt_cache_miss_tokens` with
+   **no `#[serde(default)]`**. Omitting them makes a perfectly good 200 fail to deserialize, and it
+   surfaces as `provider_upstream_error` with the message **"provider request failed with HTTP
+   200"** — which reads as an upstream fault rather than a mock gap. Two keys added to
+   `tests/support/mock_openai.rs`; no rig `Usage` sets `deny_unknown_fields`, so nothing else moved.
+   Anyone writing the next DeepSeek test would have lost the same hour.
+
+**Guards, and the mutation that killed each — every one run, not read.**
+
+| Guard | Mutation | Result |
+|---|---|---|
+| `a_deepseek_row_claiming_structured_output_is_not_routed_a_structured_request` | remove the reconciliation | red: `left: String("succeeded")`, `right: "failed"` — **the defect verbatim** |
+| `a_structured_request_routes_past_deepseek_to_a_provider_that_sends_the_schema` | remove the reconciliation | red: `left: Null`, `right: Object {"a": 1}` |
+| `a_deepseek_candidate_cannot_satisfy_structured_output_however_it_is_configured` | `DeepSeek => true` (hardcode instead of reading the const) | red |
+| `rig_0_40_still_drops_the_schema_for_deepseek_and_sends_it_for_everyone_else` | same | red: *"rig-core changed: DeepSeek now sends response_format"* |
+| `the_reconciliation_subtracts_only_and_touches_no_other_capability` | reconcile **upward** (`return provider_emits_output_schema(..)`) | red: *"an operator's explicit false must survive the reconciliation"* — **and nothing else red**, so the guards discriminate |
+| `rig_drops_the_schema_before_the_wire_on_deepseek` | *(none — premise guard)* | green **before and after** the fix, by design |
+
+That last row is the one worth reading twice. It drives a real DeepSeek `CompletionModel` against
+the mock with `required_capabilities` deliberately **empty**, so the candidate filter never runs and
+the request still reaches the wire — which is the only way the premise stays *observable* after the
+fix starts excluding DeepSeek from routing. A guard that could only be checked before its own fix
+landed would have been a guard nobody could ever re-run.
+
+**Does this unblock the strict variant of F29? Partly — one of three, and F29's own entry says so.**
+Its reversal condition names **all three** of: F39 landed; `StructuredOutputInvalid` given an
+explicit retry/fallback disposition (today it is in *neither* `is_retryable` nor
+`is_fallback_eligible` nor `is_circuit_failure`); and `run_extraction` reading `execution.status`
+rather than inferring failure from `output_text` being `None`. **Item 1 is now true. Items 2 and 3
+are untouched, so the lenient parse must stay**, and **F42** — the i18n string that already claims a
+non-conformance path exists — becomes true on the same day as those two, not this one.
+
 ### F29 — **CLOSED** `fix/f29-structured-output`. Gated parse in `execution.rs`, not at the Rig boundary — 2026-08-02
 
 **One parse site, `structured_output_from_text` in `src/application/execution.rs`, called from both
