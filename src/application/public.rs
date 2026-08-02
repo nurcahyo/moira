@@ -916,9 +916,17 @@ impl PublicExecutionService {
         }
         let output_schema = match &request.response_format {
             PublicResponseFormat::Text => None,
+            // F46 — this arm is where the empty-object schema was born, so the refusal is
+            // repeated here rather than left to `validate_request` alone. `validate_request`
+            // gives the caller the coded 422; this makes the wrong schema unconstructible by
+            // any future entry point that reaches `prepare_execution` without it. The two are
+            // deliberately redundant: neither edit alone reintroduces the defect.
+            // The trailing `None` is not dead code with a purpose of its own: it is the
+            // fallback if someone ever weakens `refuse_json_object`. An unconstrained request
+            // is a degradation; `Some(json!({"type":"object"}))` was a wrong answer.
             PublicResponseFormat::JsonObject => {
-                required_capabilities.push("structured_output".to_string());
-                Some(json!({ "type": "object" }))
+                refuse_json_object(&request.response_format)?;
+                None
             }
             PublicResponseFormat::JsonSchema { schema, .. } => {
                 required_capabilities.push("structured_output".to_string());
@@ -1269,9 +1277,14 @@ fn validate_request(
             "vision inputs are disabled for this application",
         ));
     }
+    // F46 — refused *before* the `structured_output_enabled` check on purpose. Both refusals
+    // are honest, but `structured_output_unsupported` invites the caller to enable the policy,
+    // and enabling it would never make `json_object` work. The unconditional fact is the more
+    // actionable one, so it is the one reported.
+    refuse_json_object(&request.response_format)?;
     if matches!(
         request.response_format,
-        PublicResponseFormat::JsonObject | PublicResponseFormat::JsonSchema { .. }
+        PublicResponseFormat::JsonSchema { .. }
     ) && !policy.structured_output_enabled
     {
         return Err(AppError::unprocessable(
@@ -1556,15 +1569,11 @@ pub(crate) fn openai_compat_to_public_request(
 /// Maps OpenAI's `text.format` onto Moira's native [`PublicResponseFormat`], refusing what
 /// Moira will not honour instead of accepting it and doing something else.
 ///
-/// `json_object` is the one shape deliberately refused rather than translated.
-/// `PublicResponseFormat::JsonObject` becomes the output schema `{"type":"object"}`, which
-/// `rig-core`'s OpenAI encoder completes to
-/// `{"type":"object","properties":{},"additionalProperties":false,"required":[]}` and sends
-/// under `strict: true` — a schema satisfied only by `{}`. Translating `json_object` would
-/// therefore replace F35's silent wrong answer with a different one. That native-path
-/// behaviour is pinned on the wire by
-/// `tests/openai_compat_text_format.rs::documents_native_json_object_reaching_the_provider_as_an_empty_object_schema`
-/// so this refusal has a witness and cannot be quietly invalidated.
+/// `json_object` is the one shape deliberately refused rather than translated. It is refused
+/// because Moira cannot honour it *anywhere* — see [`refuse_json_object`] for the mechanism and
+/// the reversal condition. Since F46 the native path refuses it too, so translating it here
+/// would produce the same 422 one layer later; refusing at the translation keeps the error
+/// naming the field the caller actually sent.
 fn compat_response_format(
     text: Option<OpenAiCompatTextOptions>,
 ) -> Result<PublicResponseFormat, AppError> {
@@ -1581,11 +1590,60 @@ fn compat_response_format(
         }),
         Some(OpenAiCompatTextFormat::JsonObject) => Err(AppError::unprocessable(
             "unsupported_request_option",
-            "text.format type json_object is not supported: Moira would constrain the output \
-             to the empty object rather than to free-form JSON. Send \
-             text.format.type = json_schema with an explicit schema instead.",
+            "text.format type json_object is not supported: Moira has no way to ask a provider \
+             for free-form JSON, so it would constrain the output to the empty object instead. \
+             Send text.format.type = json_schema with an explicit schema instead.",
         )),
     }
+}
+
+/// F46 — `response_format: {"type":"json_object"}` is refused, on the native path as well as
+/// on the compat one, rather than translated into a schema that means the opposite.
+///
+/// `JsonObject` used to become the output schema `{"type":"object"}`. `rig-core` 0.40 has **no**
+/// representation of free-form JSON — the string `"json_object"` does not occur anywhere in the
+/// crate — so `CompletionRequest::output_schema` is the only structured-output seam, and every
+/// encoder reads it as a *constraint*:
+///
+/// - the OpenAI family (`OpenAi`, `AzureOpenAi`, `DeepSeek`, `OpenAiCompatible`, `Local`) runs
+///   `sanitize_schema`, which completes an object schema with `properties: {}` and
+///   `additionalProperties: false` and then sets `required` to the (empty) property key list,
+///   and sends the result under a hardcoded `strict: true`. The wire schema
+///   `{"type":"object","properties":{},"additionalProperties":false,"required":[]}` is satisfied
+///   by exactly one document, `{}`;
+/// - Anthropic maps it to `output_config.format = json_schema` and its API has no free-form JSON
+///   mode at all;
+/// - Gemini only sets `generation_config.response_mime_type` when a schema is present.
+///
+/// So a caller asking for free-form JSON was answered with the empty object, under a `200` and a
+/// `succeeded` status — the exact opposite of the request.
+///
+/// **Why refuse instead of honour.** Honouring it would mean Moira hand-building
+/// `additional_params.response_format` per provider and bypassing `output_schema` — the boundary
+/// violation `moira-rig-integration` exists to prevent, already invoked in this tree against the
+/// same temptation for F45. It is also not expressible for every provider Moira routes to
+/// (Anthropic has none), so the same request would succeed or fail by routing outcome. Opening
+/// the schema with `additionalProperties: true` survives `sanitize_schema` but is rejected by
+/// OpenAI's strict mode, which trades a silent wrong answer for a provider 400.
+///
+/// This follows F35, which already refuses this shape on `POST /v1/responses`. The two endpoints
+/// now agree.
+///
+/// *Reversal condition:* this refusal becomes a translation when `rig-core` gains a
+/// schema-free structured-output mode that Moira can set through a typed `CompletionRequest`
+/// seam — not through `additional_params` — for every provider in
+/// [`crate::domain::ProviderType`]. Until then the variant stays in the public contract so the
+/// refusal can *name* it rather than 400 on an unknown variant.
+fn refuse_json_object(format: &PublicResponseFormat) -> Result<(), AppError> {
+    if matches!(format, PublicResponseFormat::JsonObject) {
+        return Err(AppError::unprocessable(
+            "unsupported_request_option",
+            "response_format type json_object is not supported: Moira would constrain the \
+             output to the empty object rather than to free-form JSON. Send response_format \
+             {\"type\": \"json_schema\"} with an explicit schema instead.",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_response_format(
@@ -2245,11 +2303,38 @@ mod tests {
         ));
     }
 
-    /// `json_object` is refused rather than translated. Translating it would reach the provider
-    /// as `{"type":"object","properties":{},"additionalProperties":false,"required":[]}` under
-    /// `strict: true` — a schema satisfied only by `{}`. See
-    /// `tests/openai_compat_text_format.rs::documents_native_json_object_reaching_the_provider_as_an_empty_object_schema`,
-    /// which pins that behaviour on the wire.
+    /// F46 — the predicate. `json_object` is refused on the **native** representation, which is
+    /// what `prepare_execution` reads and what the compat translation produces.
+    ///
+    /// This is the predicate half of the pair HANDOFF §3.4 insists on; the wiring half is
+    /// `tests/openai_compat_text_format.rs`, which proves the refusal survives routing and that
+    /// no provider call is made. Every laundering finding in this repository has had a correct
+    /// predicate, so this test alone would prove nothing about the endpoint.
+    ///
+    /// It also asserts the refusal is *only* about `json_object`: `Text` and `JsonSchema` must
+    /// pass, or the cheapest way to make this test green would be to refuse everything.
+    #[test]
+    fn native_json_object_is_refused_and_the_other_two_formats_are_not() {
+        let err = refuse_json_object(&PublicResponseFormat::JsonObject)
+            .expect_err("json_object must be refused on the native path");
+        assert_eq!(
+            compat_error(&err),
+            Some((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported_request_option"
+            )),
+            "got {err:?}"
+        );
+        refuse_json_object(&PublicResponseFormat::Text).expect("text must stay honoured");
+        refuse_json_object(&PublicResponseFormat::JsonSchema {
+            name: "answer".to_string(),
+            schema: json!({ "type": "object" }),
+            strict: true,
+        })
+        .expect("json_schema must stay honoured");
+    }
+
+    /// `json_object` is refused rather than translated, on the compat path's own field name.
     #[test]
     fn compat_text_format_json_object_is_refused_rather_than_silently_dropped() {
         let request = compat_request(json!({

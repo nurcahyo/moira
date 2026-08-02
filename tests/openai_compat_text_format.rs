@@ -1,15 +1,21 @@
-//! F35 — the OpenAI-compat endpoint's `text.format`, over real HTTP and out to a real
-//! provider socket.
+//! F35 and F46 — response-format handling on both public endpoints, over real HTTP and out to
+//! a real provider socket.
 //!
-//! The unit tests in `src/application/public.rs` prove the *translation*. These prove the
-//! *wiring*: that the translated format survives policy validation, routing, the Rig
-//! boundary and `rig-core`'s own encoder, and lands on the provider request as
-//! `response_format`. HANDOFF §3.4 is explicit that a predicate test and a wiring test are
-//! different tests, and that every laundering finding in this repository has had a correct
-//! predicate.
+//! The unit tests in `src/application/public.rs` prove the *translation* and the *predicate*.
+//! These prove the *wiring*: that the decision survives policy validation, routing and the Rig
+//! boundary, and either lands on the provider request as `response_format` or never leaves
+//! Moira at all. HANDOFF §3.4 is explicit that a predicate test and a wiring test are different
+//! tests, and that every laundering finding in this repository has had a correct predicate.
 //!
-//! The last test in this file guards nothing — it *documents* the behaviour that decided
-//! F35's shape, and says so in its name.
+//! The two files' subjects are coupled on purpose. F35 refused `text.format.json_object` on the
+//! compat endpoint *because* the native path translated it into a schema satisfied only by
+//! `{}`; F46 removed that translation. The native cases live here so the next person to revisit
+//! either refusal sees both in one place.
+//!
+//! This file previously ended with a test that guarded nothing and documented the native defect
+//! instead — `documents_native_json_object_reaching_the_provider_as_an_empty_object_schema`. It
+//! was replaced by the native guards below when F46 was fixed, which is the outcome its own doc
+//! comment predicted.
 
 mod support;
 
@@ -304,28 +310,22 @@ async fn compat_text_format_text_still_returns_prose() {
     provider.shutdown().await;
 }
 
-/// DOCUMENTS CURRENT BEHAVIOUR — this is not a guard.
+/// One native `POST /api/v1/responses` against a fixture wired for structured output.
 ///
-/// It pins the reason F35 refuses `text.format.json_object` instead of translating it. On the
-/// *native* endpoint, `response_format: {"type":"json_object"}` becomes the output schema
-/// `{"type":"object"}`, which `rig-core`'s OpenAI encoder completes to
-/// `{"type":"object","properties":{},"additionalProperties":false,"required":[]}` and sends
-/// under `strict: true`. That schema is satisfied by exactly one document — `{}` — so a caller
-/// asking for free-form JSON is constrained to the empty object.
-///
-/// Recorded in the ledger as its own finding. If someone fixes the native path, this test goes
-/// red and the compat refusal above should be revisited in the same change; that coupling is
-/// the point of asserting it here rather than describing it in prose.
-#[tokio::test]
-async fn documents_native_json_object_reaching_the_provider_as_an_empty_object_schema() {
-    let Some(fixture) = LifecycleFixture::new().await else {
-        return;
-    };
+/// Returns `(status, body, provider_call_count)`. The count is taken *after* the response, so
+/// "no provider call" means no call was made during the whole request, not merely before it.
+async fn native_response(
+    stream: bool,
+    response_format: Value,
+) -> Option<(StatusCode, String, usize)> {
+    let fixture = LifecycleFixture::new().await?;
+    // A script with one entry: if the request were dispatched despite the refusal, the mock has
+    // a reply ready and would answer 200. The refusal is not being proven by an empty script.
     let provider = MockOpenAiServer::start([ProviderScript::Completion {
         text: "{}".to_string(),
     }])
     .await;
-    let bound = fixture
+    fixture
         .add_provider_with_capabilities(
             provider.base_url(),
             10,
@@ -333,45 +333,118 @@ async fn documents_native_json_object_reaching_the_provider_as_an_empty_object_s
             structured_output_model(),
         )
         .await;
-    bind_provider_to_the_default_route(&fixture, &bound).await;
     let consumer_key = fixture.enable_public_streaming().await;
     let moira = MoiraHttpServer::start(fixture.state.clone()).await;
 
+    let path = if stream {
+        "/api/v1/responses/stream"
+    } else {
+        "/api/v1/responses"
+    };
     let response = reqwest::Client::new()
-        .post(format!("{}/api/v1/responses", moira.base_url))
+        .post(format!("{}{path}", moira.base_url))
         .header("x-consumer-key", &consumer_key)
         .json(&json!({
             "input": [{ "role": "user", "content": [{ "type": "input_text", "text": "answer me" }] }],
             "route": fixture.route_key,
-            "response_format": { "type": "json_object" }
+            "response_format": response_format
         }))
         .send()
         .await
-        .expect("send native json_object request");
+        .expect("send native request");
     let status = response.status();
-    let body = response.text().await.expect("native json_object body");
-    assert_eq!(status, StatusCode::OK, "native json_object failed: {body}");
-
-    let requests = provider.requests().await;
-    assert_eq!(requests.len(), 1);
-    let json_schema = &requests[0].body["response_format"]["json_schema"];
-    assert_eq!(
-        json_schema["strict"], true,
-        "rig hardcodes strict: {}",
-        requests[0].body
-    );
-    assert_eq!(
-        json_schema["schema"],
-        json!({
-            "type": "object",
-            "properties": {},
-            "additionalProperties": false,
-            "required": []
-        }),
-        "json_object reached the provider as something other than the empty-object schema: {}",
-        requests[0].body
-    );
+    let body = response.text().await.expect("native response body");
+    let calls = provider.call_count().await;
 
     moira.shutdown().await;
     provider.shutdown().await;
+    Some((status, body, calls))
+}
+
+/// F46 — the whole finding in one case, on the native endpoint that carried it.
+///
+/// Before the fix this returned **200 `succeeded`** with the provider request carrying
+/// `{"type":"object","properties":{},"additionalProperties":false,"required":[]}` under
+/// `strict: true` — a schema satisfied by exactly one document, `{}`, for a caller who asked
+/// for free-form JSON.
+///
+/// **Why the control case is in the same test.** Asserting "422 and the provider was never
+/// called" is satisfiable by a fixture that could not reach the provider *at all* — a routing
+/// failure raises 422 too, and `call_count() == 0` would then be true for the wrong reason.
+/// HANDOFF §3.4's toothless guards all had that shape. The `json_schema` control proves the
+/// same fixture does reach the provider, so the zero is attributable to the refusal. The two
+/// halves are asserted as one fact, not two independent ones.
+#[tokio::test]
+async fn native_json_object_is_refused_and_never_reaches_the_provider() {
+    let Some((status, body, calls)) =
+        native_response(false, json!({ "type": "json_object" })).await
+    else {
+        return;
+    };
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "json_object must be refused on the native path, got {status}: {body}"
+    );
+    let envelope: Value = serde_json::from_str(&body).expect("coded error envelope");
+    assert_eq!(
+        envelope["error"]["code"], "unsupported_request_option",
+        "the refusal must be the json_object one, not a routing or policy failure: {body}"
+    );
+    assert_eq!(
+        envelope["error"]["message_key"], "moira.error.unsupported_request_option",
+        "{body}"
+    );
+    assert_eq!(
+        calls, 0,
+        "a refused request must not reach the provider or be billed: {body}"
+    );
+
+    // The control. Same fixture, same route, same model — a format Moira does honour must
+    // still reach the provider, or the assertions above prove only that the fixture is broken.
+    let Some((status, body, calls)) = native_response(
+        false,
+        json!({ "type": "json_schema", "name": "answer", "schema": caller_schema() }),
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the control request must succeed, or the refusal above is unattributable: {body}"
+    );
+    assert_eq!(
+        calls, 1,
+        "the control request must reach the provider: {body}"
+    );
+}
+
+/// The streaming twin, and it guards a distinct failure mode rather than repeating the last one.
+///
+/// `POST /api/v1/responses/stream` answers with SSE. A refusal raised after the response head is
+/// written cannot be a 422 — it becomes a `200 text/event-stream` carrying an error event, which
+/// is precisely the "200 that contradicts the request" shape F46 is about. Only asserting the
+/// status on the streaming path proves the refusal happens before the stream begins.
+#[tokio::test]
+async fn native_json_object_is_refused_before_the_stream_begins() {
+    let Some((status, body, calls)) = native_response(true, json!({ "type": "json_object" })).await
+    else {
+        return;
+    };
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "the streaming path must refuse before the SSE head is written, got {status}: {body}"
+    );
+    let envelope: Value = serde_json::from_str(&body).expect("coded error envelope");
+    assert_eq!(
+        envelope["error"]["code"], "unsupported_request_option",
+        "{body}"
+    );
+    assert_eq!(
+        calls, 0,
+        "a refused stream must not reach the provider: {body}"
+    );
 }

@@ -128,6 +128,16 @@ pub enum PublicContentPart {
     InputImage { image_url: String },
 }
 
+/// The native `response_format` discriminated union.
+///
+/// `json_object` is **declared but refused** with `422 unsupported_request_option`. `rig-core`
+/// 0.40 has no representation of free-form JSON, so Moira used to translate it into the output
+/// schema `{"type":"object"}`, which reaches the provider as
+/// `{"type":"object","properties":{},"additionalProperties":false,"required":[]}` under
+/// `strict: true` — a schema satisfied only by `{}`, the opposite of what the name promises,
+/// returned with a `200` and a `succeeded` status (F46). The variant is kept so the refusal can
+/// *name* it instead of failing as an unknown variant. Send `json_schema` with an explicit
+/// schema. See `application::public::refuse_json_object`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PublicResponseFormat {

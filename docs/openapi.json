@@ -6676,6 +6676,7 @@
         "type": "object"
       },
       "PublicResponseFormat": {
+        "description": "The native `response_format` discriminated union.\n\n`json_object` is **declared but refused** with `422 unsupported_request_option`. `rig-core`\n0.40 has no representation of free-form JSON, so Moira used to translate it into the output\nschema `{\"type\":\"object\"}`, which reaches the provider as\n`{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false,\"required\":[]}` under\n`strict: true` — a schema satisfied only by `{}`, the opposite of what the name promises,\nreturned with a `200` and a `succeeded` status (F46). The variant is kept so the refusal can\n*name* it instead of failing as an unknown variant. Send `json_schema` with an explicit\nschema. See `application::public::refuse_json_object`.",
         "oneOf": [
           {
             "properties": {
