@@ -537,6 +537,80 @@ async fn the_reported_memory_behavior_is_the_stricter_of_the_two_consent_columns
     }
 }
 
+/// F30's recorded gap — the tie is resolved the same way at the call site as it is in the rule.
+///
+/// # What this closes
+///
+/// F30's fix left one edit that survived every guard it shipped: **swapping `stricter_of`'s
+/// arguments** in `effective_memory_behavior` (`src/infra/pg_rows.rs`). The function is symmetric
+/// except on the tie between the two equally-permissive modes, and every case that made the
+/// columns disagree used a pair with *different* permissiveness — where swapping changes nothing.
+///
+/// `ApplicationManaged` and `AutomaticWithUserControls` are two distinct values that both rank 2,
+/// so a pair that ties while disagreeing does exist, and the gap is closable. The tie resolves to
+/// the **memory** column, so the expected value below is always the memory policy's — which means
+/// swapping the arguments flips both rows here and reds them.
+///
+/// # What this is worth, stated exactly
+///
+/// Narrow, and deliberately so. Both tied modes permit the same thing, so this can only change
+/// **which of two equally-permissive labels is reported**, never a consent outcome — nothing here
+/// can widen or narrow what extraction does. `the_combined_consent_decision_is_symmetric` covers
+/// the decision; this covers the label. The reason the label is worth pinning is stated at
+/// `the_two_equally_permissive_modes_tie_toward_the_memory_policy`: resolving the tie the other
+/// way would silently change the value reported to deployments where nothing is wrong.
+///
+/// # What this does NOT cover, so nobody retires the sibling case for it
+///
+/// It is blind to a reader that consults the **memory** column alone — the exact defect F30 was
+/// about — because on a tie the memory column *is* the answer. Only
+/// `the_reported_memory_behavior_is_the_stricter_of_the_two_consent_columns`, whose pairs differ
+/// in permissiveness, can see that. The two cases are complements, not a superset and a subset.
+///
+/// The unit test on `stricter_of` cannot close this either: it calls the function directly, and
+/// the surviving edit was at the *call site*, in the order the two columns are handed to it.
+#[tokio::test]
+async fn the_reported_memory_behavior_resolves_the_consent_tie_toward_the_memory_policy() {
+    for (conversation_mode, memory_mode, expected) in [
+        (
+            MemoryConsentMode::AutomaticWithUserControls,
+            MemoryConsentMode::ApplicationManaged,
+            "application_managed",
+        ),
+        (
+            MemoryConsentMode::ApplicationManaged,
+            MemoryConsentMode::AutomaticWithUserControls,
+            "automatic_with_user_controls",
+        ),
+    ] {
+        let Some(case) = Case::new(
+            conversation_mode,
+            memory_mode,
+            MemoryPolicyPutRequest::default(),
+            vec![
+                ProviderScript::Completion {
+                    text: ASSISTANT_REPLY.to_string(),
+                },
+                extraction_reply(json!([memory("preference", MEMORY_BODY, 0.95, "normal")])),
+            ],
+        )
+        .await
+        else {
+            return;
+        };
+        let (status, body) = case.respond(USER_TURN).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            case.reported_memory_behavior().await,
+            expected,
+            "conversation={conversation_mode:?} memory={memory_mode:?}: the two modes are equally \
+             permissive, so the reported label must come from the memory column — reporting the \
+             conversation column's would change the value for deployments where nothing is wrong"
+        );
+        case.shutdown().await;
+    }
+}
+
 /// `disabled` on either consent column stops extraction before the model is ever called.
 #[tokio::test]
 async fn disabled_consent_calls_no_extractor_and_writes_no_run_row() {
