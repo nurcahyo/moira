@@ -285,7 +285,28 @@ rather than implied. F14 was Sub-Phase F's inherited obligation and is now **clo
 (`74262ad`) — `memory_records.content_hash` is a content address, so the dedupe F will write does
 not have to carry a rotation caveat. F's remaining work is unchanged otherwise.
 
-### 3.3 Three things only the user can do
+### 3.2b THE LEDGER IS AHEAD OF THIS TABLE — read it, not just §3.2 (2026-08-02)
+
+The table above was written when the highest finding was F28. **The ledger now runs to `F47`.**
+`plans/reports/EXECUTION-LEDGER.md` is authoritative; §3.2 is a summary that has already gone stale
+once. Current state of everything above F28:
+
+| | What | State |
+|---|---|---|
+| **F33** | Five encryption-at-rest columns exist in `migrations/0007` and **nothing in `src/` writes or reads any of them** | **ESCALATED, human-only.** Envelope encryption is key custody, key rotation and plan 11's open Decision 3 — a scoping question, not an implementation gap. **Do not "finish" it autonomously** |
+| **F32** | `conversation_content_persistence` protected nothing — `'none'` still stored full plaintext | fixed on `fix/f32-content-persistence`, **PR #57, deliberately NOT auto-merged**: the 422 on the previously-accepted `encrypted_content` breaks any IaC that sets it. Loudly, which is the point — but that deserves human sight |
+| **F46** | `response_format: {"type":"json_object"}` reaches the provider as a schema satisfied only by `{}` — the caller gets the **opposite** of free-form JSON, with `200 succeeded` | open, in flight `fix/f46-json-object-format` |
+| **F47** | `get_or_create_*_policy` are `insert … on conflict do update`, i.e. **reads that write**. One conversation-linked turn rewrites two policy rows **three times**, and takes a row lock that serialises concurrent turns of the same application | open. Fix is `on conflict do nothing` + `select`, across the whole `get_or_create_*` family |
+| **F30** | `application_memory_policies.consent_mode` and `application_conversation_policies.memory_consent_mode` are independent, both default `'explicit_only'`, and nothing reconciles them | open. Sub-Phase F takes the **stricter of the two** (D4), but the schema divergence remains. *The shape that hides:* they agree in every default deployment and diverge exactly when an operator tightens one |
+| **F35, F37, F34, F29** | — | CLOSED |
+| **F36, F41** | — | REFUTED / wrong as recorded |
+
+**Finding IDs are allocated concurrently and have collided three times.** `F22` and `F28` each name
+**two** unrelated findings; `F21` has two entries; F27 was written as F26 until #47 claimed it.
+**Read `origin/main`'s ledger for the highest ID immediately before writing one down — not at the
+start of your task.**
+
+### 3.3 Things only the user can do
 
 1. **Deploy the release containing `c98aeb7`, then land T11** — removing the console's
    `ambiguous_enabled_providers` guard. **Do not wave this through.** It is gated on stage 4A being
@@ -294,7 +315,12 @@ not have to carry a rotation caveat. F's remaining work is unchanged otherwise.
    lands the console before Moira reopens exactly the window 4A closed. Correct order is 4A in
    release N, T11 in release N+1.
 2. **File the rig-core issue** for F16. Draftable, but it should go under a human's name.
-3. **Supply a Google credential** if the OAuth mock/live seam ever needs closing. Everything is
+3. **Decide F33's scope** — the five encryption-at-rest columns. Nothing in the tree encrypts, and
+   envelope encryption is key custody plus key rotation plus plan 11's open Decision 3. Recorded so
+   the columns are not mistaken for a partially-built feature by whoever finds them next.
+4. **Review PR #57 (F32)** — it is complete and gated but deliberately unmerged, because refusing the
+   previously-accepted `encrypted_content` with a 422 will break any deployment setting it in IaC.
+5. **Supply a Google credential** if the OAuth mock/live seam ever needs closing. Everything is
    verified against a real TLS mock IdP with real signed JWTs — what cannot be proven without a
    credential is Google's own token claims, consent screen and key rotation. Recorded, not implied.
    The same now applies to **GitHub**, added in wave 4B and exercised only against a purpose-built
