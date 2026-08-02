@@ -2328,7 +2328,7 @@ question being investigated. That clause has now out-produced the questions them
 
 | # | Finding | Severity |
 |---|---|---|
-| ~~**F35**~~ | ~~**The OpenAI-compat endpoint silently discards `text.format`.**~~ **CLOSED** `fix/f35-compat-text-format` — `json_schema` is honoured, `json_object` is refused (it would have reached the provider as an empty-object schema — now **F46**), every other `text` key is refused by a typed DTO. Finding verified correct in every particular; two things it did not mention made the fix sharper. See the F35 section below. | **HIGH** |
+| ~~**F35**~~ | ~~**The OpenAI-compat endpoint silently discards `text.format`.**~~ **CLOSED** `fix/f35-compat-text-format` — `json_schema` is honoured, `json_object` is refused (it would have reached the provider as an empty-object schema — that was **F46**, now **CLOSED** `a8937f4`: the native path refuses it too, so the two endpoints agree and F35's original reversal condition is superseded), every other `text` key is refused by a typed DTO. Finding verified correct in every particular; two things it did not mention made the fix sharper. See the F35 section below. | **HIGH** |
 | **F36** | **`SummarizationLock` pins a Postgres session advisory lock across a full provider round-trip**, on a per-turn path, over a `pool.acquire().await?.detach()`ed backend. A hung provider holds one backend and one conversation lock for the whole attempt timeout. The lock's own doc comment names this reversal condition — and it has already been met. | **MED-HIGH** |
 | **F37** | **Four wasted DB reads per conversation-linked turn when summarization is disabled**, inside the caller's request, between the last SSE delta and the terminal event. Six round-trips, four of them dead, on the default configuration. | **MEDIUM** |
 | **F38** | **The terminal-persistence-deadline arm throws away a successful provider result.** `execution.rs:658` returns `failed_outcome` with `output_text: None` and a default `UsageSummary` while `output.text` and `output.usage` are in hand and `"output_committed": true` is written into both the audit entry and the `ExecutionFailed` event. On streaming the client has already received every delta. Usage is preserved at attempt level and zeroed at outcome level — **the asymmetry is the tell**. Billing and reporting divergence. Found independently by both skeptics. **Still open after `fix/f29-structured-output`**, which added `structured_output` as a third dropped value and left an explicit comment naming all three rather than fixing the divergence — see the F29 closure entry for why a billing decision was kept out of a parsing change. | **MEDIUM** |
@@ -2404,10 +2404,16 @@ endpoint is opt-in (`openai_responses_compat_enabled`, default `false`), which b
 radius to deployments that chose OpenAI compatibility — the deployments most likely to be sending
 `text.format` in the first place.
 
-*Reversal condition:* the `json_object` refusal reverts to a translation the moment the native path
-stops encoding `response_format: {"type":"json_object"}` as an empty-object schema — that is, when
-`documents_native_json_object_reaching_the_provider_as_an_empty_object_schema` goes red, which it
-will do on any fix to F46. The `json_schema` honouring reverts only if `PublicResponseFormat` stops
+*Reversal condition — **SUPERSEDED by F46's closure, 2026-08-02**.* As written it said the
+`json_object` refusal reverts to a translation the moment the native path stops encoding
+`{"type":"json_object"}` as an empty-object schema, i.e. when
+`documents_native_json_object_reaching_the_provider_as_an_empty_object_schema` goes red. That test
+is now deleted and the native path **also refuses** — so the trigger fired and the correct response
+was *not* to revert. Reading the original condition literally would un-refuse the compat path into
+a native 422 one layer later. **The live condition is now F46's:** both refusals revert together,
+and only when `rig-core` gains a schema-free structured-output mode on a typed `CompletionRequest`
+seam for every `ProviderType` Moira routes to. The `json_schema` honouring reverts only if
+`PublicResponseFormat` stops
 being the native representation of a caller-supplied schema; it does **not** revert on an F45 fix,
 which would simply make it more faithful.
 
@@ -2421,10 +2427,12 @@ F35 itself, reproduced on the wire; blinding the `json_object` refusal produced 
 `"text":"must-not-be-reached"`; removing `deny_unknown_fields` produced a 200 for
 `text: {"verbosity": "low"}`.
 
-### F46 — `response_format: {"type":"json_object"}` constrains the model to the empty object
+### F46 — `response_format: {"type":"json_object"}` constrains the model to the empty object — **CLOSED** `a8937f4`
 
 Confirmed while deciding F35, on the provider socket rather than by reading. **Native path,
 `POST /api/v1/responses`** — not the compat endpoint, which now refuses this shape.
+
+*As originally recorded, below; the closure and the one clause it got wrong follow it.*
 
 `PublicResponseFormat::JsonObject` maps to the output schema `{"type":"object"}` in
 `prepare_execution`. `rig-core` 0.40's `sanitize_schema` completes any object schema with
@@ -2434,22 +2442,121 @@ key list, and the encoder wraps the result with `strict: true`. What reaches the
 only by `{}`. OpenAI's own `json_object` mode means *free-form* JSON, so a caller asking for it gets
 the exact opposite of what the name promises, with a 200 and a `succeeded` status.
 
-**Not fixed here, because it cannot be fixed at Moira's layer.** Free-form JSON is a different
-`response_format` type, not a schema, and `rig-core`'s `output_schema` seam cannot express it —
-`json_utils::merge` lets the encoder's own `response_format` win over anything Moira puts in
-`additional_params`. The options are a rig-core change, or removing `JsonObject` from
-`PublicResponseFormat`, which is a public contract break. Both need a product call.
-
-Pinned by `tests/openai_compat_text_format.rs::documents_native_json_object_reaching_the_provider_as_an_empty_object_schema`,
-which asserts the exact schema bytes and `strict: true`. It documents current behaviour and says so
-in its name (HANDOFF §3.4).
-
-*Reversal condition:* none — this is a defect, not a decision. It closes when a caller sending
-`{"type":"json_object"}` either receives free-form JSON or is refused.
-
 *ID allocation:* `origin/main`'s ledger topped out at **F45** immediately before this was written
 (HANDOFF §3.2). Three concurrent finding branches were live; if F46 collides, this is the
 `json_object` one.
+
+#### F46 — **CLOSED** `fix/f46-json-object-format` `a8937f4`. Refused, not translated — 2026-08-02
+
+**The mechanism as recorded was correct except for one clause, and that clause was the one that
+said it could not be fixed.** Verified against the vendored crate rather than assumed:
+`sanitize_schema` (`providers/openai/mod.rs:39`) does complete an object schema with
+`properties: {}` and `additionalProperties: false` and then set `required` to the empty property
+key list, and `strict: true` is hardcoded at `providers/openai/completion/mod.rs:1839`.
+
+**What the entry got wrong:** it said `json_utils::merge` lets the encoder's `response_format` win
+over `additional_params`. `merge(a, b)` does let `b` win — but it is only reached inside
+`if let Some(schema) = output_schema && should_apply_response_format` (line 1823), and
+`should_apply_response_format` requires `output_schema.is_some()` (line 1818). With **no**
+`output_schema`, `additional_params` passes through untouched and lands flattened on the wire
+(`#[serde(flatten)]`, line 1582). So a hand-built `additional_params.response_format` *would* have
+reached an OpenAI-family provider. The claim "cannot be fixed at Moira's layer" was false; it was
+refused for different reasons, below.
+
+**The decision: refuse it. `422 unsupported_request_option`, on the native path, streaming and
+non-streaming — following F35, consciously, not departing from it.** The asymmetry the brief
+warned about is now gone: both endpoints refuse the same shape for the same reason.
+
+**Why not honour it as free-form JSON**, the option the name argues for:
+
+1. **`rig-core` 0.40 has no representation of free-form JSON.** The string `"json_object"` occurs
+   **zero** times in the crate. `CompletionRequest::output_schema` is the only structured-output
+   seam and every encoder reads it as a *constraint* — OpenAI family via `sanitize_schema` +
+   `strict: true`; Anthropic via `output_config.format = json_schema` (`completion.rs:2363`);
+   Gemini only sets `generation_config.response_mime_type` when a schema is present
+   (`completion.rs:234`).
+2. **It is not expressible for every provider Moira routes to.** Anthropic's Messages API has no
+   free-form JSON mode at all. Honouring `json_object` would therefore make the same request
+   succeed or fail by *routing outcome* — a worse public contract than a consistent refusal, and
+   it would need a new `required_capabilities` entry to hide the difference.
+3. **It requires the boundary violation this tree has already refused once.** Doing it means Moira
+   hand-building `additional_params.response_format` per provider and bypassing `output_schema` —
+   named as the thing `moira-rig-integration` exists to prevent, in this ledger, in the F35 entry,
+   about F45. Applying the opposite reasoning here would be the drift the brief warned about.
+4. **The "open schema" variant was checked and rejected on evidence.** `sanitize_schema` inserts
+   `additionalProperties: false` only when the key is **absent**, so `{"type":"object",
+   "additionalProperties":true}` survives as `{"type":"object","properties":{},
+   "additionalProperties":true,"required":[]}` — semantically free-form. But `strict: true` is
+   hardcoded and OpenAI's strict mode *requires* `additionalProperties: false`, so this trades a
+   silent wrong answer for a provider 400 on the flagship provider, and would behave differently
+   on self-hosted backends. Rejected.
+
+**Why "it removes a shipped capability" does not apply.** It removes a shipped *defect*. Every
+caller who has ever sent `json_object` received a schema satisfied only by `{}`; there is no
+working behaviour to preserve and nobody can be depending on one. Nothing in-tree used it either —
+memory extraction and summarization pass explicit schemas or none.
+
+**The variant stays in `PublicResponseFormat`.** Removing it would be the actual contract break:
+requests would fail deserialization with an uncoded 400 instead of a coded, documented 422 that
+names the field and points at `json_schema`. Same shape F35 chose for `OpenAiCompatTextFormat`.
+
+**Two layers, deliberately redundant.** `validate_request` raises the coded 422 (placed *before*
+the `structured_output_enabled` check, so the caller is not told to enable a policy that would
+never help); `prepare_execution`'s match arm — where the empty-object schema was born — refuses
+again and falls back to `None`, never to a schema. `prepare_execution` calls `validate_request`
+itself, so there is no entry point that reaches one without the other.
+
+*Reversal condition:* this refusal becomes a translation when `rig-core` gains a **schema-free**
+structured-output mode reachable through a typed `CompletionRequest` seam — not through
+`additional_params` — for every variant of `ProviderType` Moira routes to. A rig-core release in
+which `"json_object"` appears in the OpenAI encoder *and* Anthropic/Gemini gain an equivalent is
+the concrete trigger. Partial support is not enough: routing-dependent semantics on a public API
+is the failure mode this refusal exists to avoid.
+
+*Verification.* Four mutations run, none read:
+
+| Mutation | Result |
+|---|---|
+| **M1** — restore both layers to pre-fix (`Some(json!({"type":"object"}))` + delete the refusal) | **RED**, and it is F46 verbatim: `got 200 OK: {…"status":"completed"…"output_text":"{}"…}`. The streaming twin returned `200` with the full SSE sequence, confirming a late refusal there becomes a 200, not a 422 |
+| **M4** — the *plausible alternative fix*: map `JsonObject` → `None`, delete the refusal | **RED**. This is the one that matters: no bad schema reaches the provider under M4, so a guard asserting "the empty-object schema is absent from the wire" would have passed while the caller still got a `200` for a request Moira cannot honour. Asserting on the **refusal** rather than on the absence of the bad schema is what gives the guard teeth |
+| **M2** — restore the `prepare_execution` translation only | **GREEN**, property held — `validate_request` still refuses |
+| **M3** — delete the `validate_request` refusal only | **GREEN**, property held — `prepare_execution` still refuses |
+
+M2/M3 green is the intended relationship, not a toothless guard: neither single edit reintroduces
+the defect, and the guard asserts the property, not the implementation.
+
+**Cheapest edit that breaks the property while leaving the guard green — none found inside the
+public request path.** The two layers are individually sufficient and `prepare_execution` funnels
+through `validate_request`, so no third entry point exists. The guard was also built against the
+two ways this repository's guards have gone toothless before: it asserts the **error code**, not
+just `422`, because a routing failure raises `422` with `call_count() == 0` for the wrong reason;
+and it carries a `json_schema` **control on the same fixture** proving the provider *is* reachable,
+so the zero is attributable to the refusal rather than to a broken fixture. The nearest surviving
+route to an empty-object schema is **outside** this property and belongs to F45: `POST
+/api/v1/admin/runtime/diagnose` takes `ExecutionOptions.output_schema` verbatim, so an admin
+sending the literal schema `{"type":"object"}` still gets it closed and `strict`-ed on the wire.
+That is rig's strict-mode rewrite of a caller-supplied schema, not a `json_object` mistranslation,
+and the endpoint is admin-gated and `false` by default.
+
+*On the provider socket, now:* `json_object` → `calls=0 status=422`. The `json_schema` control on
+the same fixture → `calls=1 status=200` carrying
+`"response_format":{"type":"json_schema","json_schema":{"name":"caller_title","strict":true,
+"schema":{"type":"object","title":"caller_title","properties":{"answer":{"type":"string"}},
+"required":["answer"],"additionalProperties":false}}}` — F45 still visible in `name` coming from
+the schema's `title` and `strict` being hardcoded, unchanged and out of scope here.
+
+*Guards:* `tests/openai_compat_text_format.rs::native_json_object_is_refused_and_never_reaches_the_provider`
+and `::native_json_object_is_refused_before_the_stream_begins` (wiring), plus
+`src/application/public.rs::tests::native_json_object_is_refused_and_the_other_two_formats_are_not`
+(predicate — it also asserts `Text` and `JsonSchema` still pass, so refusing everything is not a
+cheap way to make it green). The F35-era documentation test
+`documents_native_json_object_reaching_the_provider_as_an_empty_object_schema` is **deleted**; its
+own doc comment predicted exactly this.
+
+*OpenAPI:* regenerated; **counts unchanged**. The brief's frozen figures (151 operations / 99 paths
+/ 178 schemas) were **stale** — the tree is at **152 operations / 100 paths / 183 schemas**, which
+is also what `src/http/mod.rs:777` asserts. One line added to `docs/openapi.json`: the
+`PublicResponseFormat` schema description.
 ### F29 — **CLOSED** `fix/f29-structured-output`. Gated parse in `execution.rs`, not at the Rig boundary — 2026-08-02
 
 **One parse site, `structured_output_from_text` in `src/application/execution.rs`, called from both
