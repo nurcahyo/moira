@@ -3723,6 +3723,55 @@ The "State at a glance" block above exists precisely so a compacted context can 
 
 ## Cycle log
 
+### Cycle 17 — 2026-08-03 — F54 closed; the queue is empty; a marker-carrying commit shipped and was caught
+
+`main` at `027af93`. **Eleven PRs merged across cycles 14–17.** Nothing actionable remains.
+
+**F54 closed on a corrected premise — and the correction came from my own summary, not the finding.**
+The cycle-16 paragraph said the extraction failure class was *"lost from `memory_extraction_runs`"*.
+It was not: that column has existed since `0007` and has carried the class since F29's third
+precondition. **F54's own entry said so; my one-line summary of it said the opposite, in the same
+commit** — and the summary is what the next brief inherited, which made its first proposed fix
+already-shipped work. Corrected in `b1bb9af`.
+
+The real gap was *correlation*, closed by `0025`'s `execution_id` column. Not a FK, deliberately —
+`execution_id` is no table's primary key, and a FK to `responses` would fail on exactly the
+deployments that persist least. The argument against the cheapest option was not "documenting is
+bad": **the schema had already answered this twice in the same migration** (`context_plans` and
+`retrieval_runs` both carry bare indexed `execution_id`), so documenting the string convention would
+have made `memory_extraction_runs` the only run table correlating differently.
+
+**The `stricter_of` gap recorded as "bounded, not fixed" turned out closable** — `permissiveness()`
+maps two consent modes to the same value deliberately, so a tying pair exists.
+
+#### ⚠️ A thirteenth form of "exit codes lie", committed by this loop
+
+**A conflict-resolution script failed its assertion, and `git add; git commit` — chained with `;`
+rather than `&&` — staged, committed and pushed the file with `<<<<<<<` still in it.** The commit
+output looked entirely normal.
+
+Form 3's shape applied to a merge: *a failed step followed by a succeeding one reads as success.*
+Caught by grepping the pushed branch, fixed in `8ab8cac`, recorded as HANDOFF §2.2 form 13.
+**Two habits close it:** chain with `&&`, and make the resolver assert *zero markers remain* **before
+it writes** — a wrong line number must not be able to produce a half-resolved file.
+
+#### Two more corrections to briefs I wrote
+
+- **"the shared DB is at `0024`"** — true and misleading. `moira` is only the *origin*; each test
+  clones a migrated **template** which was at 25. `select max(version)` against `moira` reads 24 and
+  is **not** evidence a migration failed to apply. Nearly caused a real green to be read as a lie.
+- **"summarization has the same shape"** (in F54's own entry) — false. `conversation_summaries` has
+  no `status`, no `failure_class` and no run row; a failed summarization writes nothing but a metric
+  counter. Raised as **F55**, deliberately unfixed: a new table and a design question, not a column.
+
+#### The record across this run
+
+**Four findings were refuted where they aimed and real somewhere else** — F40, F43, F30, F53 — and
+F53's evidence had been destroyed by the commit that raised it. **Thirteen guards** have now been
+found that could not fire, several already shipped and trusted. The question that found nearly all of
+them: *what is the cheapest edit that breaks the property while leaving the guard green?*
+
+
 ### Cycle 17 — 2026-08-03 — F54 closed on a corrected premise; F30's recorded gap closed
 
 Branch `fix/f54-extraction-correlation`, three commits, one gate run — **ALL GATES PASSED**, 1102
