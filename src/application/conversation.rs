@@ -1258,11 +1258,21 @@ impl ConversationService {
         let input_message_ids: Vec<Uuid> =
             history.iter().map(|message| message.message_uuid).collect();
 
+        // F54 — the run row names the execution before the execution happens.
+        //
+        // Minted here rather than inside `run_extraction` so the same uuid can be written on the
+        // opening insert *and* used as the `ExecutionCommand`'s id. Recording it at completion
+        // instead would leave it null on the one run an operator most needs to chase: the row
+        // that `insert_memory_extraction_run` exists to leave behind when the process dies
+        // mid-call, which never reaches `complete_memory_extraction_run` at all.
+        let execution_id = Uuid::now_v7();
+
         let run_id = match insert_memory_extraction_run(
             pool,
             &MemoryExtractionRunInsert {
                 conversation_uuid: Some(conversation_uuid),
                 response_id: Some(response_id),
+                execution_id,
                 input_message_ids,
                 provider_model_id: None,
             },
@@ -1280,6 +1290,7 @@ impl ConversationService {
                 conversation_uuid,
                 response_id,
                 run_id,
+                execution_id,
                 status,
                 &memory_policy,
                 &turns,
@@ -1328,6 +1339,7 @@ impl ConversationService {
         conversation_uuid: Uuid,
         response_id: Uuid,
         run_id: Uuid,
+        execution_id: Uuid,
         status: MemoryStatus,
         policy: &MemoryPolicyRecord,
         turns: &[(String, String)],
@@ -1337,8 +1349,15 @@ impl ConversationService {
             return failed_extraction(FAILURE_EXTRACTION_CALL_FAILED);
         };
         let command = ExecutionCommand {
+            // A convenience, no longer the correlation — finding F54. This format was the
+            // *only* way to get from a run row to its execution until `execution_id` became a
+            // column on `memory_extraction_runs`; nothing enforces it, so nothing should depend
+            // on it. Read `memory_extraction_runs.execution_id` and join
+            // `execution_attempts`/`responses`/`audit_logs.resource_id` on that instead.
             request_id: format!("memory-extraction-{run_id}"),
-            execution_id: Uuid::now_v7(),
+            // Passed in, never minted here: the run row was opened with this value, and the two
+            // must be the same uuid or the column on that row names an execution that never ran.
+            execution_id,
             identity: CallerRuntimeIdentity {
                 actor_type: format!("{:?}", actor.actor_type),
                 subject: actor.subject.clone(),

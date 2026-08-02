@@ -127,6 +127,37 @@ Recording the execution's own class is finding F29's third precondition. Before 
 those cases was flattened to `extraction_call_failed`, so "the model did not comply" and "the call
 did not happen" were indistinguishable on the row that exists to tell them apart.
 
+### Getting from a failed run to the execution that failed
+
+`failure_class` says *why*. `memory_extraction_runs.execution_id` says *which execution*, and is
+what you join on to answer everything else — which provider, which model, how many attempts, what
+the sanitised provider message was:
+
+```sql
+select r.id, r.failure_class, a.provider_id, a.provider_model_id,
+       a.attempt_number, a.provider_status_code, a.failure_class
+from memory_extraction_runs r
+join execution_attempts a on a.execution_id = r.execution_id
+where r.status = 'failed'
+order by r.started_at desc;
+```
+
+`responses.execution_id` (unique) and `audit_logs.resource_id` where `resource_type = 'execution'`
+take the same key. Note that **`memory_extraction_runs.response_id` is not that key** — it
+references the *triggering turn's* response, the conversation turn whose completion caused
+extraction to run, which is a different execution from the extraction's own.
+
+The column is nullable, and there are exactly two reasons it can be null: the row predates
+migration `0025`, or extraction gave up before it had an execution to name (no database pool, in
+practice). It is written when the run row is *opened*, not when it completes, so a run that dies
+mid-call — the `'running'` row that never reaches a terminal state — still carries its
+correlation.
+
+This is finding **F54**. Before it the only route was the `request_id` convention
+`memory-extraction-{run_id}`, which nothing enforced, nothing tested and no document named, so
+correlating meant `request_id like 'memory-extraction-%'` and parsing a uuid out of a varchar.
+That format still exists and is still set, but it is now a convenience: **do not build on it.**
+
 ## The prompt boundary
 
 The transcript handed to the extractor is untrusted user content. Moira's guarantee is structural

@@ -228,12 +228,28 @@ impl Case {
     async fn runs(&self) -> Vec<RunRow> {
         sqlx::query_as::<_, RunRow>(
             "select id, status, candidate_count, accepted_count, rejected_count, failure_class, \
-                    metadata, (completed_at is not null) as completed \
+                    metadata, execution_id, (completed_at is not null) as completed \
              from memory_extraction_runs order by started_at asc",
         )
         .fetch_all(&self.fixture.pool)
         .await
         .expect("read memory_extraction_runs")
+    }
+
+    /// Every provider attempt this fixture made, oldest first.
+    ///
+    /// Both executions land here — the caller's own turn and the extraction's — which is what
+    /// makes this table the right thing to join against in
+    /// `a_failed_extraction_run_names_the_execution_that_failed`: an `execution_id` that
+    /// resolves to *some* row proves nothing, because there is always more than one row.
+    async fn attempts(&self) -> Vec<AttemptRow> {
+        sqlx::query_as::<_, AttemptRow>(
+            "select execution_id, status, failure_class \
+             from execution_attempts order by started_at asc",
+        )
+        .fetch_all(&self.fixture.pool)
+        .await
+        .expect("read execution_attempts")
     }
 
     async fn memory_embedding_count(&self) -> i64 {
@@ -278,7 +294,15 @@ struct RunRow {
     rejected_count: i32,
     failure_class: Option<String>,
     metadata: Value,
+    execution_id: Option<Uuid>,
     completed: bool,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct AttemptRow {
+    execution_id: Uuid,
+    status: String,
+    failure_class: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -764,6 +788,95 @@ async fn a_failed_extraction_call_leaves_the_response_untouched() {
         Some("provider_unavailable"),
         "the run row must carry the execution's own failure class; `extraction_call_failed` here \
          would mean run_extraction had gone back to ignoring execution.status"
+    );
+    case.shutdown().await;
+}
+
+/// F54 — a failed run names the execution it failed in, by a key an operator can join on.
+///
+/// `failure_class` on the run row answers *why*. This is the follow-up it could not answer:
+/// **which** execution, so that `execution_attempts`, `responses` and `audit_logs` can be read
+/// for the provider, the model, the attempt count and the sanitised provider message. Until
+/// migration `0025` the only route was `request_id like 'memory-extraction-%'` with a uuid
+/// parsed out of a varchar — a convention nothing enforced, nothing tested and no document
+/// named.
+///
+/// # Why this joins rather than checking the column is populated
+///
+/// Asserting `execution_id is not null` would stay green against the cheapest way to break
+/// this: let `run_extraction` mint its own id again instead of using the one the run row was
+/// opened with. The column would be non-null, indexed, and name an execution that never ran.
+/// So the assertion has to resolve the id against a table the *execution kernel* wrote.
+///
+/// And resolving it is not enough either, because this fixture always produces **two**
+/// executions — the caller's turn and the extraction — so an id that merely matches some
+/// attempt row proves nothing. The caller's turn succeeded and the extraction failed, which is
+/// what makes them tellable apart: the run row must point at the failed one, and must not point
+/// at the caller's.
+#[tokio::test]
+async fn a_failed_extraction_run_names_the_execution_that_failed() {
+    let Some(case) = Case::consenting(vec![
+        ProviderScript::Completion {
+            text: ASSISTANT_REPLY.to_string(),
+        },
+        ProviderScript::HttpError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: "extractor is down".to_string(),
+        },
+    ])
+    .await
+    else {
+        return;
+    };
+    let (status, body) = case.respond(USER_TURN).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let runs = case.runs().await;
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0].status, "failed");
+    let run_execution_id = runs[0]
+        .execution_id
+        .expect("a run row must name the execution it ran, even when that execution failed");
+
+    // The premise: there really are two executions here, so "it resolved" below is a choice
+    // between them rather than the only row available.
+    let attempts = case.attempts().await;
+    assert_eq!(
+        attempts.len(),
+        2,
+        "expected the caller's turn and the extraction: {attempts:?}"
+    );
+    let callers = attempts
+        .iter()
+        .find(|attempt| attempt.status == "succeeded")
+        .expect("the caller's own turn succeeded: {attempts:?}");
+    let extraction = attempts
+        .iter()
+        .find(|attempt| attempt.status == "failed")
+        .expect("the extraction's attempt failed: {attempts:?}");
+    assert_ne!(
+        callers.execution_id, extraction.execution_id,
+        "two executions, two ids: {attempts:?}"
+    );
+
+    assert_eq!(
+        run_execution_id, extraction.execution_id,
+        "the run row must name the execution that failed, not a uuid minted somewhere else"
+    );
+    assert_ne!(
+        run_execution_id, callers.execution_id,
+        "the run row must name the extraction's execution, not the turn that triggered it"
+    );
+    // The join an operator actually performs: run row -> the provider-level record of why.
+    assert_eq!(
+        extraction.failure_class.as_deref(),
+        runs[0].failure_class.as_deref(),
+        "the class on the run row and the class on the execution it names must be the same \
+         failure, or the correlation is pointing at the wrong execution"
+    );
+    assert_eq!(
+        extraction.failure_class.as_deref(),
+        Some("provider_unavailable")
     );
     case.shutdown().await;
 }
