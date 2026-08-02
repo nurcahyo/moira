@@ -2283,6 +2283,7 @@ fn failure_code(class: ExecutionFailureClass) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::ResponsePersistenceMode;
 
     /// Parses whatever a caller would actually put on the wire, so the assertion covers the
     /// DTO's own shape rather than a hand-built struct that cannot go wrong.
@@ -2885,5 +2886,55 @@ mod tests {
             unavailable_reason(&public_response_from_record(&record, None, Vec::new())),
             "metadata_only_persistence"
         );
+    }
+
+    /// The same record, with the mode written the way production writes it.
+    ///
+    /// [`completed_record`] takes a string, which is convenient and hides a coupling: the
+    /// production path builds `output_summary` with `json!({ "persistence_mode": <enum> })`, so
+    /// the key's value comes from `ResponsePersistenceMode`'s **serde** representation. A test
+    /// that hardcodes `"plain_content"` keeps passing if someone changes the `rename_all` on the
+    /// enum, while the live endpoint starts falling through to the default answer. This helper
+    /// serialises the enum instead, so the two cannot drift apart unnoticed.
+    fn completed_record_for(mode: ResponsePersistenceMode) -> PublicResponseRecord {
+        let mut record = completed_record("metadata_only");
+        record.output_summary = json!({
+            "persistence_mode": mode,
+            "output_text_bytes": 11,
+            "output_hash": "hash",
+        });
+        record
+    }
+
+    /// A fifth persistence mode must not silently inherit the default answer.
+    ///
+    /// [`every_persistence_mode_gets_its_own_reason`] iterates mode *strings*, so a new enum
+    /// variant would fall through `output_unavailable_reason`'s `_` arm, be reported as
+    /// metadata-only, and red nothing — the cheapest edit that breaks this finding's property
+    /// while leaving every other case here green. The `match` below is **exhaustive over the
+    /// enum**, so adding a variant is a compile error in this file. A compiler error is the only
+    /// guard that cannot be outrun by a change made somewhere else.
+    #[test]
+    fn every_persistence_mode_variant_is_mapped_and_reaches_the_reason() {
+        for mode in [
+            ResponsePersistenceMode::None,
+            ResponsePersistenceMode::MetadataOnly,
+            ResponsePersistenceMode::EncryptedContent,
+            ResponsePersistenceMode::PlainContent,
+        ] {
+            let expected = match mode {
+                ResponsePersistenceMode::None => "persistence_disabled",
+                ResponsePersistenceMode::MetadataOnly => "metadata_only_persistence",
+                ResponsePersistenceMode::EncryptedContent
+                | ResponsePersistenceMode::PlainContent => "content_persistence_not_implemented",
+            };
+            let response =
+                public_response_from_record(&completed_record_for(mode), None, Vec::new());
+            assert_eq!(
+                unavailable_reason(&response),
+                expected,
+                "{mode:?} did not reach its reason through the serialised output_summary"
+            );
+        }
     }
 }
