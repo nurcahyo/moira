@@ -3777,9 +3777,22 @@ can honestly close is closed.**
   Landing it inside enabling work would have meant a reviewer approving a blast-radius decision they
   did not come for. What it must do is written at `structured_output_from_text`.
 
+
+> **CORRECTION (cycle 17).** This paragraph originally described F54 as *"the extraction failure
+> class is lost from `memory_extraction_runs`"*. **That was wrong, and it contradicted F54's own
+> entry in the same commit.** `memory_extraction_runs.failure_class` has existed since `0007` and has
+> carried the execution's class since F29's third precondition. The real gap was *correlation* — the
+> run could not be tied to its execution except through an unenforced `request_id` string convention.
+> Closed by `0025`'s `execution_id` column.
+>
+> **A one-line summary of a finding can contradict the finding, in the same commit, and the summary
+> is what the next brief inherits.** The implementing agent caught it by reading the entry rather than
+> the summary — the same failure mode as F53, whose evidence its own commit had destroyed.
+
 #### What remains, and none of it is autonomous work
 
-**F54** (the extraction failure class is lost from `memory_extraction_runs`) and one **bounded,
+**F54** (a failed extraction cannot be correlated to its execution except through an unenforced
+`request_id` string convention) and one **bounded,
 recorded gap** — swapping `stricter_of`'s arguments survives its guard, and can only change which of
 two equally-permissive labels is *reported*, never a consent outcome.
 
