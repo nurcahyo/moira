@@ -2490,7 +2490,7 @@ question being investigated. That clause has now out-produced the questions them
 | **F37** | **Four wasted DB reads per conversation-linked turn when summarization is disabled**, inside the caller's request, between the last SSE delta and the terminal event. Six round-trips, four of them dead, on the default configuration. | **MEDIUM** |
 | ~~**F38**~~ | ~~**The terminal-persistence-deadline arm throws away a successful provider result.**~~ **CLOSED** `fix/f38-deadline-usage`. Finding verified correct in every particular. **Decision: the outcome carries all three values (`output_text`, `structured_output`, `usage`) and `status` stays `Failed`**; the never-retry/never-fallback clamp is untouched. Two things the finding did not know sharpened it: `UsageSummary::default()` is all-`None` ("unknown"), not zero, so retention replaces an absence rather than overwriting a claim of no spend; and `terminal_update_from_outcome` runs on the `Failed` branch too, so the zeroing was also writing "no tokens, zero bytes, no hash" onto the `responses` row. **`"output_committed": true` was inaccurate** — a hardcoded literal, false in both available senses on the non-streaming path; now derived. Reversal conditions in the closure section below. | **CLOSED** |
 | ~~**F39**~~ | ~~**The structured-output capability gate cannot see Rig's per-provider reality.**~~ **CLOSED** `fix/f39-structured-output-capability`. Both divergences verified true. Resolved **asymmetrically**, because they are not the same problem: DeepSeek is decidable and is now reconciled out of routing by reading Rig's own `SUPPORTS_RESPONSE_FORMAT`; `OpenAiCompatible`/`Local` is **not decidable at admission** and was deliberately left admitted. See the F39 closure section below. | **CLOSED** |
-| **F40** | **`GET /v1/responses/{id}` returns an empty `output` array for a completed, persisted response.** Falls through both branches to `Vec::new()`. The `OutputUnavailable { reason: "metadata_only_persistence" }` variant exists to explain the *other* case, which makes the silent empty array read as an oversight rather than a decision. Needs a product call. | **LOW-MED** |
+| ~~**F40**~~ | ~~**`GET /v1/responses/{id}` returns an empty `output` array for a completed, persisted response.**~~ **PREMISE REFUTED; two adjacent defects found and CLOSED** on `fix/f40-f47-response-output-and-policy-reads`. No persistence configuration reaches the empty array on a completed response, because **`output_persisted` is never `true`** — all three `ResponseTerminalUpdate` constructors hardcode `false`, the column defaults `false`, nothing in `src/` writes `true`. So `Completed` always took the `OutputUnavailable` branch and `Vec::new()` was reached only by `Queued`/`InProgress`/`Failed`/`Cancelled`, where it is correct. What was wrong: the **reason was a lie for three of the four persistence modes**, and `Completed && output_persisted` fell to `[]` — the inversion that produces F40's exact symptom the day content persistence lands. See the F40 closure section below. | **CLOSED** |
 | ~~**F41**~~ | ~~**Skill-tree drift on exactly the guidance F29's implementer needs.**~~ **STRUCK — the inference was wrong.** The `.claude/` copy is a nine-line **pointer file** that says to read the `.agents/` one; all eight `.claude/skills/` entries have that shape. See "F41 is WRONG as recorded" below. | **struck** |
 | **F42** | **i18n overclaim.** `moira.error.structured_output_invalid` asserts "or the model's output does not conform to it". No such path exists. Its description even narrates a prior widening. Becomes true only if the fail-hard variant ships. | **LOW** |
 | **F43** | **`ConcurrencyController::acquire` is dead `pub` API on the concurrency-safety path** — every caller is inside `#[cfg(test)]`. It hardcodes `is_stream: false`, so a future caller reaching for the obvious-looking name on a streaming path silently takes a *request* permit. | **LOW** |
@@ -2498,6 +2498,8 @@ question being investigated. That clause has now out-produced the questions them
 | **F45** | **`PublicResponseFormat::JsonSchema { name, strict }` — both accepted, both dropped.** Public in `docs/openapi.json`; every destructure site uses `{ schema, .. }`. Rig hardcodes `strict: true` and renames from the schema's `title`. A caller sending `strict: false` gets strict mode, unreported. | **LOW** |
 | **F48** | **A third `output_schema` drop path, latent, and it is silent even on OpenAI.** `should_apply_response_format` (`openai/completion/mod.rs`) is `output_schema.is_some() && supports_response_format && (tools.is_empty() \|\| history_has_tool_result)`. The third clause drops the schema on **turn 1 of any tool-calling conversation, for every OpenAI-family provider**, and unlike the DeepSeek path it emits **no `warn!` at all** — the warning at the same site fires only when `supports_response_format` is false. Cannot bite today: `build_completion_request` hardcodes `tools: Vec::new()`, so `tools.is_empty()` is always true. It becomes live the moment tool calling is enabled, which `.agents/skills/moira-rig-tools/SKILL.md` contemplates. **The F39 fix does not cover it** — F39 reconciles by provider type, and this drop is per-request. Rig documents the caveat itself: *"a turn-1 answer with no tool call is therefore not schema-constrained; `Native` is 'guaranteed' only once tools have run"* (issue #1928). **GUARDED, still latent and still not fixed** (`fix/f38-deadline-usage`). Premise re-verified: `execution.rs:1907` is the tree's **only** `CompletionRequest` construction and still hardcodes `tools: Vec::new()`, and `public.rs` refuses caller-declared tools outright (`unsupported_tool`, *"client-defined tools are not registered in this phase"*), so tools cannot reach the constructor from any direction. The drop behaviour is Rig's and is deliberately unchanged; the guard is `moiras_request_still_carries_its_schema_onto_rigs_openai_wire_body` in `src/application/execution.rs`, which hands Moira's real request to Rig's real encoder and reds the moment `tools` stops being empty. See F49 for why the obvious-looking integration coverage does not substitute for it. | **MEDIUM, latent — guarded** |
 | ~~**F49**~~ | ~~**No integration test in the tree ever builds a request from an agent profile.**~~ **CLOSED** `fix/f49-agent-profile-coverage`. **Premise held, with one correction: the column is `route_definitions.agent_profile_id`, not `routing_policies.agent_profile_id` — `RoutingPolicyRecord` has no such field.** Verified exhaustively: all six typed `RouteDefinitionCreateRequest` sites in `tests/` pass `agent_profile_id: None`, the raw-SQL insert at `tests/public_authorization.rs:693` omits the column, and the seeded `general` route at `migrations/0005_provider_runtime.sql:295` omits it too — so `agent_profile` really was `None` on every end-to-end path. `tests/agent_profile_wire.rs` (6 cases) now attaches a real profile to the fixture's route and asserts on the body that reached the scripted mock. **The branch is correct at the wire**: `preamble` arrives as the leading `system` message, `temperature` and `max_tokens` arrive top-level, caller options win over profile values, and the streaming arm carries the same three. Eight mutations run, each reverted: `preamble: None` (3 red), dropping the `temperature` `or_else` (2 red), dropping the `max_tokens` `or_else` (2 red), inverting both `or_else` orders (**only** the precedence case red — the exact indistinguishability HANDOFF §3.4's seventh entry warns about, and why that case exists), never loading the profile (3 red), **hardcoding the profile's three values into `build_completion_request`** (the no-profile control red — this is the cheapest edit that leaves the primary case green, and the control is the only thing that sees it), a streaming-arm-only rebuild without the profile (**only** the streaming case red, so it is not redundant), and F48's own mutation. **Under F48's mutation only the new `tool_policy` case goes red; the preamble/temperature/max_tokens cases stay green** — they observe a different property, and `tests/structured_output.rs` was re-run under it and stayed green through all seven cases again. **F48's guard is not superseded** and its doc comment now says why. Raised **F50**. | **closed** |
+| **F51** | **The runtime-config invalidation channel is wired to per-request data tables, and `apply_invalidation` ignores its own scope for three of the four things it clears.** `notify_moira_runtime_config_change()` is attached to **24** tables — count them by trigger *function*, not by trigger *name*: `auth_provider_settings`'s trigger is named differently and a `like '%runtime_config_notify%'` query misses it, which is how I first got 23. Two of the 24 are not configuration at all: `conversations` and `memory_records` fire it on every `INSERT`/`UPDATE`/`DELETE`. `apply_invalidation` (`src/infra/db.rs`) then calls `cache.invalidate_all()`, `runtime_handles.invalidate_all()` and `auth_settings.invalidate_all()` **unconditionally**, and only `circuits.reset_for_resource(scope)` respects `circuit_reset_scope`. So creating one conversation, or writing one extracted memory, drops every replica's entire runtime-config cache and every cached provider client handle — the connection pools included. The narrowing work `circuit_reset_scope` does for breakers has no counterpart for the three caches, and the classification test `every_triggered_table_has_a_scope` asserts only that a table is *not* `All`, which the three unconditional calls make irrelevant. **Not fixed here, and F47's fix does not close it** — F47 removed the *spurious* notifications that policy reads were emitting; these are emitted by legitimate writes and remain. *Reversal condition:* it closes when the three `invalidate_all()` calls take the same scope the breaker reset already does, or when the two data tables lose the trigger. **ID allocated against `origin/main` at `324d1b4`, whose highest was F50.** | **MEDIUM** |
+| **F52** | **Three triggered tables are unclassified, so a write to any of them resets every circuit breaker on every replica — and the guard that exists to prevent exactly this is a retyped list that has already drifted.** Migration `0003` does `alter table providers rename to legacy_providers` (and the same for `routing_policies` and `provider_credentials`). **`ALTER TABLE … RENAME` carries triggers with it**, so all three renamed tables still fire `notify_moira_runtime_config_change()` under their new names. `circuit_reset_scope` has never heard of `legacy_providers`, `legacy_routing_policies` or `legacy_provider_credentials`: they miss the `providers`/`provider_models` arms, they are absent from `CIRCUIT_UNAFFECTED_RESOURCE_TYPES` (19 entries), and they fall to the `other =>` arm — `warn!` plus **`CircuitResetScope::All`**, discarding every provider's earned breaker health cluster-wide. **The guard is the finding.** `every_triggered_table_has_a_scope` in `src/infra/db.rs` says in its own doc comment that "the list is pinned here against the trigger list in `migrations/`" — it is not pinned, it is **retyped**, 21 names by hand against the schema's 24, and the three it omits are exactly the three that fail. A guard whose list is a copy of the thing it checks cannot detect drift in that thing; this is §3.4's category, found in a shipped and trusted guard. **Latent today**: nothing in `src/` reads or writes the three tables, so the only reachable trigger is an operator or migration touching them — and `delete from legacy_providers` would emit one full-reset notification *per row*. **Not fixed here.** *Reversal condition:* it closes when the classifier's inventory is derived from `pg_trigger` rather than retyped — the same fix shape `tests/policy_reads_do_not_write.rs` uses for `POLICY_TABLES`, which is pinned against `information_schema` for this exact reason — or when the three legacy tables lose their triggers. **ID allocated against `origin/main` at `324d1b4`, whose highest was F50.** | **MEDIUM, latent** |
 | **F50** | **A disabled or soft-deleted agent profile silently degrades every execution on its route.** `execution.rs:191` resolves the profile with `get_active_agent_profile`, which filters `status = 'active' and deleted_at is null`. Neither operation clears the route's reference: the FK is `on delete set null` and `soft_delete_agent_profile` only writes `status='deleted', deleted_at=now()`, never a `DELETE`. The lookup returns `Ok(None)` and the match arm treats it identically to "this route has no profile" — **no failure, no `warn!`, no runtime event, no audit row.** Every subsequent request loses its `preamble`, `temperature` and `max_tokens` and reports `succeeded`. A preamble is where guardrails live, so the failure mode is an unguarded model answering production traffic. The agent profile is the **only** runtime reference on this path whose disappearance is silent — an unresolvable route is a `RouteNotFound` failure. **Recorded, not fixed: the fix is a product decision.** Fail-closed is safer but breaks any deployment that disables a profile expecting its routes to keep serving; observable fail-open (`warn!` + runtime event) is cheaper but still serves the unguarded request. **Reversal condition:** decide fail-closed vs observable fail-open; on either decision `documents_current_behaviour_a_disabled_agent_profile_is_silently_ignored` in `tests/agent_profile_wire.rs` is wrong and must be rewritten — it is named `documents_` and not `guards_` because it pins current behaviour and would otherwise hold the defect in place (HANDOFF §3.4). Found by F49's new coverage. **ID allocated against `origin/main` at `779104d`, whose highest was F49.** | **MEDIUM** |
 
 ### F35 — CLOSED: `text.format` is now honoured for `json_schema`, refused for the rest
@@ -3256,6 +3258,191 @@ and it touches every `get_or_create_*_policy` family rather than the two on this
 about policy reads, not about summarization. *Reversal condition:* it closes when the read path
 stops writing.
 
+### F47 — **CLOSED** `fix/f40-f47-response-output-and-policy-reads`. The read path stops writing, and the consequence was three times larger than recorded — 2026-08-02
+
+**The finding was right and understated.** It named dead-tuple churn and a row lock. Measured
+against the live schema, those are two of **four** things one `get_or_create_*_policy` call did,
+and the two it missed are the expensive ones. Every measurement below was taken with `psql`
+against the real tables, not argued from the SQL:
+
+| what a "read" did | evidence |
+|---|---|
+| wrote a new heap tuple + WAL record | `xmin` `1067657 → 1067658 → 1067659 → 1067660` and `ctid` `(0,1) → (0,2) → (0,3) → (0,4)` over three calls |
+| **bumped `version`** — the `ETag` served on `GET …/policy` and demanded back on `If-Match` | `version 1 → 2 → 3 → 4` over the same three calls, via the `<table>_bump_version` trigger; `updated_at` moved each time too |
+| **fired `pg_notify('moira_runtime_config', …)`** | `LISTEN` on the channel received **exactly three** notifications from three `do update` calls and **zero** from three `do nothing` calls |
+| took a row-level lock | as recorded |
+
+The third is the one that matters. `apply_invalidation` (`src/infra/db.rs`) calls
+`cache.invalidate_all()`, `runtime_handles.invalidate_all()` and `auth_settings.invalidate_all()`
+on **every** notification, so a conversation-linked turn — three policy reads — wiped every
+replica's runtime-config cache and every cached provider client handle **three times per turn**.
+The second means an operator's `If-Match` on a policy `PUT` could be invalidated by unrelated
+traffic on the same application.
+
+**The family is FIVE, not two, and the count in the finding's own fix sketch was the trap.** Four
+live on `PgConversationRepository` (conversation, memory, retrieval, embedding) and all four had
+the `do update` spelling. The fifth is
+`PgPublicRepository::get_or_create_application_execution_policy`, and it is the interesting one:
+it **already read first**, so it never had any of the write amplification above — and its insert
+carried **no `on conflict` clause at all**. Two concurrent first requests for a new application
+therefore raced, and the loser got
+`duplicate key value violates unique constraint "application_execution_policies_pkey"`.
+Reproduced directly in Postgres, then reproduced through the repository under a barrier. It sits
+on the hot path of every `POST /v1/responses`.
+
+That inverts the brief's warning. It said the row lock being removed "is currently what makes
+[the race] impossible" — true for the four writers, and **false for the fifth, which never had
+the lock and already had the bug.** Done properly the fix *removes* a correctness bug rather than
+trading one for throughput.
+
+**The race is closed by a fresh snapshot, not by a retry.** All five now share
+`src/infra/repositories/policy_row.rs`: `select` → `insert … on conflict do nothing returning` →
+`select`. Each statement runs on its own pooled connection at `READ COMMITTED`, so the second
+`select` takes a **new** snapshot and sees a row a concurrent inserter committed while the
+`do nothing` was waiting on its speculative insertion. Verified in Postgres: the losing session
+returns `INSERT 0 0` and the following `select` returns the row. Steady state is now **one
+`SELECT`** — cheaper than what it replaced as well as silent. The bounded `ATTEMPTS` loop exists
+only so a row deleted underneath the caller ends in a coded error rather than a spin.
+
+**Guard: `tests/policy_reads_do_not_write.rs`, five cases, and it asserts on the write.** A guard
+that checked "the policy comes back" passes in both arrangements — the returned value was never
+wrong. So the assertions are `xmin`, `version`, and the **absence of a runtime-config
+notification**, the last one closed with a sentinel `pg_notify` rather than a timeout so it is an
+acknowledgement gate and not a delay. The silence is checked against a control on the same
+listener — a genuine `put_*_policy` must still be announced — because an assertion that nothing
+arrived is worthless if nothing *can* arrive, which is F16's shape.
+
+**Six mutations run, each reverted:**
+
+| mutation | result |
+|---|---|
+| conversation policy back to `do update` | red — three notifications, naming that table |
+| **memory** policy back to `do update`, conversation left fixed | red — three notifications, naming *that* table. Per-member coverage is real, and reverting one member is the cheapest edit |
+| execution policy back to `select` + bare `insert` | red — `a concurrent first touch of application_execution_policies failed: database error` |
+| delete the insert entirely, select only | red ×3, loudly |
+| `ATTEMPTS = 1` — no re-select after a conflicting insert | **red on the concurrency case only.** This is the "cannot return `None` for a row that exists" mutation, and it proves the second select is load-bearing |
+| `select … for update` | **`a_policy_read_is_not_a_write` stayed GREEN** |
+
+The last one is the §3.4 answer and the reason there are five cases and not three. `for update`
+restores the serialisation half of F47 while writing nothing — no tuple version, no `version`
+bump, no notification — so every write assertion held. That is the cheapest edit that breaks the
+property and satisfies the guard, and it now has its own case:
+`a_policy_read_does_not_wait_for_a_row_lock` holds an exclusive lock in an uncommitted
+transaction and requires the read not to wait. **Found by asking the question and then running
+the answer**, which is the only step that has ever worked here.
+
+**The known state that collapsed two variables, and the case that separates them.** Pinning every
+row to "already exists" makes the signatures exactly comparable — and makes *read-then-insert*
+and *select-only* indistinguishable, because no policy is ever missing.
+`a_first_touch_creates_the_row_and_says_so` separates them, and
+`concurrent_first_touches_all_succeed` separates both from the bare-insert spelling that actually
+shipped. A fifth case pins `POLICY_TABLES` against `information_schema`, because every other
+assertion iterates a hardcoded list of five and a sixth `application_*_policies` table would be
+watched by nothing.
+
+*Reversal condition:* F47 reopens if any `get_or_create_*_policy` performs a heap write, takes a
+row lock, or emits a `moira_runtime_config` notification on the path where the row already
+exists — all three of which `tests/policy_reads_do_not_write.rs` now observes directly. It also
+reopens if a new `application_*_policies` table is added without being added to `POLICY_TABLES`,
+which the schema-pinned fifth case reds on.
+
+**Raised F51** while measuring the notification half: the channel is attached to `conversations`
+and `memory_records` as well as the configuration tables, and `apply_invalidation` ignores
+`circuit_reset_scope` for three of the four things it clears. F47's fix does not touch that.
+
+### F40 — **CLOSED** `fix/f40-f47-response-output-and-policy-reads`. Premise refuted; the reason it gave was the real defect — 2026-08-02
+
+**The premise does not hold, and establishing that was most of the work.** F40 says
+`GET /v1/responses/{id}` returns an empty `output` array "for a completed, persisted response".
+That state is unreachable. `output_persisted` is written by exactly three constructors —
+`terminal_update_from_outcome`, `failure_update`, and the stream-start failure arm — and **all
+three hardcode `false`**; the column defaults `false`; nothing anywhere in `src/` writes `true`.
+`docs/response-persistence.md` already said so. The old condition was
+`Completed && !output_persisted`, so `Completed` *always* produced `OutputUnavailable`, and
+`Vec::new()` was reached only by `Queued`, `InProgress`, `Failed` and `Cancelled`.
+
+**Is `[]` right for those four?** Yes, and it is left alone. They have genuinely produced no
+output, `status` already says which, and converting them would be a public-shape change with
+nothing behind it. `only_completed_responses_carry_an_explanation` pins that, so the fix cannot
+drift into "always explain".
+
+**Is the output retrievable anywhere?** No — and this is the question the product call turned on.
+There is **no column that stores response output text**. `responses.output_summary` holds
+`{persistence_mode, output_text_bytes, output_hash}` — a length and a *peppered* hash, not the
+text. The one surviving copy is `conversation_messages.content_plain`, written by
+`record_assistant_response`, and only for conversation-linked responses. **Serving it from
+`get_response` was considered and rejected**: that endpoint authorises `moira:responses:read`,
+while conversation content is governed by `moira:conversations:read` plus the conversation
+policy's `conversation_content_persistence` (which F32 shows is enforced by nothing, on a fix
+still unmerged in PR #57). Widening an authorisation boundary to improve an explanatory string is
+the wrong trade, and it is the same reasoning `citations_from_link` already gives for not
+re-resolving `context_plans` on this path.
+
+**So: not retrievable ⟹ say so, and say it accurately. Two defects, both real, both fixed.**
+
+1. **The reason was a lie for three of the four persistence modes.**
+   `reason: "metadata_only_persistence"` was a literal, emitted whatever the application had
+   configured. It is correct for the default and false for `none`, `plain_content` and
+   `encrypted_content` — worse than no explanation, because it names a cause the operator did not
+   choose and sends them to change a setting that is not the reason. Now derived from the
+   `persistence_mode` recorded in `output_summary` **at completion time**: `none` →
+   `persistence_disabled`, `plain_content`/`encrypted_content` →
+   `content_persistence_not_implemented` (nothing in the tree honours either; see also F33's five
+   unwritten encryption columns), everything else → the previous literal.
+2. **`Completed && output_persisted` fell through to `[]`** — the more the row claimed to have
+   persisted, the less the endpoint returned. Unreachable today and now named
+   `persisted_output_not_loaded` rather than left silent, so whoever implements content
+   persistence meets a string that says what happened instead of the empty array F40 reported.
+   This is the F48 shape: latent, made loud, behaviour on every reachable path unchanged.
+
+**The invariant is now stateable: a completed response never carries an empty `output`.** Either
+the text, or a reason. That matters because a completed response *can* legitimately have no
+content — a model returning an empty string — and it is served as `OutputText { text: "" }`,
+never as `[]` and never as `output_unavailable`. Pinned by
+`an_empty_model_reply_is_output_text_not_output_unavailable`, because if `Succeeded` could arrive
+with `output_text: None` the whole distinction would collapse.
+
+**Public shape: unchanged. Value: changed, narrowly, and deliberately.** `reason` is
+`{"type": "string"}` with no `enum` in `docs/openapi.json`, so no schema moved — the committed
+snapshot is byte-identical and the counts hold at **152 operations / 100 paths / 183 schemas**
+(re-derived from the document, not copied from a brief). The *value* changes only for
+applications not on the default `metadata_only`, which are exactly the ones being told something
+false today. **This is a much weaker break than F32 or F46** — F32 refused a previously-accepted
+input value with a 422 and was held for human sight; F46 refused a previously-accepted request
+shape. This changes an explanatory string on a field documented as unconstrained, and the default
+deployment sees no change at all. Recorded in the PR body; not held.
+
+**Guards, at two levels, deliberately.** Five unit cases in `src/application/public.rs` pin the
+whole mapping matrix — all four modes with a distinctness assertion, the `output_persisted` case,
+every non-completed status, the empty-completion case, and the unreadable-mode fallback. Three
+integration cases in `tests/response_output_honesty.rs` drive a real `POST` against a scripted
+mock and read the real `GET` body.
+
+**Why both, and the mutation that proves it was not redundant.** This is F49's lesson applied
+before the fact: *"it asserts on the real wire" is not "it reaches the code you changed"*, and
+its converse. The fix reads `output_summary.persistence_mode`; the unit cases build that field
+themselves, so they cannot tell whether `terminal_update_from_outcome` writes it or whether
+`find_response_authorized` selects it. Mutation **M10** removed `persistence_mode` from the
+terminal update — **all 21 unit cases stayed green while two integration cases went red.** Unit
+coverage alone would have been exactly the F49 trap.
+
+**Four mutations run, each reverted:**
+
+| mutation | result |
+|---|---|
+| re-hardcode the reason to `"metadata_only_persistence"` | red at both levels; the integration failure prints the whole response body |
+| restore `&& !record.output_persisted` | red at both levels — the integration case reports `got []`, F40's exact symptom |
+| explain every status, not only `Completed` | red — `Queued must return an empty output array` |
+| **drop `persistence_mode` from the terminal update** | **unit green ×21, integration red ×2** — the wiring is genuinely under test |
+
+*Reversal condition:* F40 reopens the moment anything writes `output_persisted = true`. At that
+point `persisted_output_not_loaded` stops being a latent-state marker and becomes a real bug
+report about `get_response`, which must then load and return the stored body —
+`a_row_claiming_persisted_output_is_not_served_as_an_empty_array` is the case to rewrite, and it
+flips the column by hand precisely so it is already sitting on that state. It also reopens if a
+fifth `ResponsePersistenceMode` variant is added without an arm in `output_unavailable_reason`,
+which falls back to the default answer silently.
+
 ## USER DECISIONS — 2026-07-31, taken interactively
 
 1. **Findings before waves 4–5.** F20, F13, F17 and the Wave 2 leftovers first. F20 is the reason:
@@ -3325,6 +3512,53 @@ If any of those is false, **make it true first** — that is cheap, and re-deriv
 The "State at a glance" block above exists precisely so a compacted context can resume from one read.
 
 ## Cycle log
+
+### Cycle 15 — 2026-08-02 — `fix/f40-f47-response-output-and-policy-reads`: one refutation, one understatement, two new findings
+
+Two independent findings closed on one branch, separate commits, one gate run.
+
+| finding | verdict |
+|---|---|
+| **F40** | **premise REFUTED** — the state it described is unreachable. Two adjacent defects in the same function were real and are fixed |
+| **F47** | **confirmed and understated by a factor of two** — it named two consequences and there were four, including a cluster-wide cache wipe |
+| **F51** | raised — the invalidation channel is attached to per-request data tables and `apply_invalidation` ignores its own scope for three of four targets |
+| **F52** | raised — three triggered tables are unclassified, and the shipped guard that exists to catch that retypes its inventory instead of deriving it |
+
+**The pattern across both closures: the finding was right about the system and wrong about the
+mechanism, in opposite directions.** F40 described a symptom that cannot occur and missed the two
+defects sitting in the branch it pointed at. F47 described a mechanism correctly and
+under-counted its effects. Neither could have been implemented from its one-liner — which is the
+third and fourth occurrence of the shape already named in "WHAT THE FINDINGS-SWEEP BRIEF GOT
+WRONG".
+
+**Everything load-bearing was measured, not argued.** `xmin`/`ctid` advance, `version` advance,
+`LISTEN` receiving exactly three notifications from three `do update` reads and zero from three
+`do nothing` reads, and the duplicate-key error from two racing first-touches — all taken with
+`psql` against the live schema before a line of Rust changed. The two claims that would have been
+easiest to get wrong by reasoning (does `on conflict do nothing` still write? does the follow-up
+`select` see a concurrently committed row?) are exactly the two that were checked directly.
+
+**Corrections to the brief this cycle worked from**, recorded because briefs here inherit each
+other's errors:
+
+1. **"The row-level lock you are removing is currently what makes [the insert/select race]
+   impossible."** True of the four `do update` members, and **inverted** for the fifth:
+   `get_or_create_application_execution_policy` never had that lock and already had the race.
+   Done properly the fix *removes* a correctness bug.
+2. **"Count the family members rather than assuming there are two."** Good instruction, and the
+   answer is five — but the interesting part is not the count, it is that the fifth member had a
+   *different* bug, so "apply the same fix to all of them" would have been wrong if the fix had
+   been "read-then-insert" as the finding suggested. That spelling is what the fifth already did.
+3. The OpenAPI counts in the brief (**152 / 100 / 183**) were **correct** — re-derived from
+   `docs/openapi.json` and unchanged by this branch. `plans/reports/HANDOFF.md` still said
+   151/99/178 and has been corrected.
+
+**One guard of my own failed before merge, and it is now HANDOFF §3.4's tenth.** F47's first
+guard asserted on the write three separate ways and stayed green under `select … for update` —
+because `do update` was removing *two* coupled things and all three assertions observed only one
+of them. Found by running the answer to "what is the cheapest edit that breaks the property while
+leaving my guard green", after having already asked it and judged the guard sound. Same sequence
+as the seventh.
 
 ### Cycle 14 — 2026-08-02 — recovery cycle: three merges, two of them other people's work
 
