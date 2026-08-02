@@ -1826,21 +1826,75 @@ fn citations_from_link(link: Option<&ConversationExecutionLink>) -> Vec<PublicCi
         .unwrap_or_default()
 }
 
+/// Why a **completed** response is being served without its output text — finding F40.
+///
+/// # This is never "the model returned nothing"
+///
+/// A completed response whose model produced an empty string still carries
+/// `OutputText { text: "" }`, because `ExecutionStatus::Succeeded` always arrives with
+/// `output_text: Some(_)`. So the caller can tell an empty answer from an absent one, which
+/// is the whole reason this variant exists and the reason a bare `[]` would be wrong here.
+///
+/// # The mode is read from the response row, not from today's policy
+///
+/// `output_summary.persistence_mode` is written by [`terminal_update_from_outcome`] at the
+/// moment the response completed. The application's policy may have changed since; the row is
+/// the historical fact and the row is what is reported.
+///
+/// The literal was previously `"metadata_only_persistence"` unconditionally, which is correct
+/// for the default configuration and **false** for the other three modes — it named a cause
+/// the operator had not configured, sending them to change a setting that was not the reason.
+/// `plain_content` and `encrypted_content` are honoured by nothing in the tree (see
+/// `docs/response-persistence.md`, and F33 for the five unused encryption-at-rest columns), so
+/// the honest answer for those is that content persistence is unimplemented, not that the
+/// application asked for metadata only.
+///
+/// An absent or unrecognised mode falls back to the previous literal: `output_summary` is
+/// always written on the completed path, so the fallback is unreachable, and if it ever became
+/// reachable the default deployment's answer is the right guess.
+fn output_unavailable_reason(record: &PublicResponseRecord) -> &'static str {
+    if record.output_persisted {
+        // Unreachable today: every `ResponseTerminalUpdate` in this file hardcodes
+        // `output_persisted: false` and the column defaults to false, so nothing sets it.
+        // It is spelled out rather than folded into the branch below because the previous
+        // shape sent exactly this state to a silent `[]` — the more the system persisted, the
+        // less it returned. Whoever implements content persistence will see this string
+        // instead of an empty array, and the string names the work left to do: this read path
+        // does not load the stored body.
+        return "persisted_output_not_loaded";
+    }
+    match record
+        .output_summary
+        .get("persistence_mode")
+        .and_then(Value::as_str)
+    {
+        Some("none") => "persistence_disabled",
+        Some("plain_content" | "encrypted_content") => "content_persistence_not_implemented",
+        _ => "metadata_only_persistence",
+    }
+}
+
 fn public_response_from_record(
     record: &PublicResponseRecord,
     output_text: Option<String>,
     citations: Vec<PublicCitation>,
 ) -> PublicResponse {
+    // The invariant: a **completed** response never carries an empty `output`. Either the
+    // text, or a reason it is absent — because `[]` on a completed response is
+    // indistinguishable from a model that returned nothing, and those are very different
+    // results. A response that is queued, in progress, failed or cancelled has genuinely
+    // produced no output, and `status` already says which; `[]` is the honest answer there
+    // and stays.
     let output = if let Some(text) = output_text {
         vec![PublicOutputItem::Message {
             role: "assistant".to_string(),
             content: vec![PublicOutputContentPart::OutputText { text }],
         }]
-    } else if record.status == PublicResponseStatus::Completed && !record.output_persisted {
+    } else if record.status == PublicResponseStatus::Completed {
         vec![PublicOutputItem::Message {
             role: "assistant".to_string(),
             content: vec![PublicOutputContentPart::OutputUnavailable {
-                reason: "metadata_only_persistence".to_string(),
+                reason: output_unavailable_reason(record).to_string(),
             }],
         }]
     } else {
@@ -2644,6 +2698,192 @@ mod tests {
         assert_ne!(
             legacy_public_actor_fingerprint(&base, effective_application_id(&base)),
             legacy_public_actor_fingerprint(&other, effective_application_id(&other)),
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // F40 — what a completed response says when it has no output text.
+    //
+    // The finding reported an empty `output` array for a completed, persisted response.
+    // That state is unreachable: nothing in the tree ever writes `output_persisted = true`.
+    // What *is* reachable is a completed response whose text was never persisted, and the
+    // single hardcoded reason it used to give was correct for one persistence mode out of
+    // four. These cases pin the whole matrix, because the cheapest edit that restores the
+    // defect is to collapse the four answers back into one literal — and a test that only
+    // exercised the default mode would not notice.
+    // ------------------------------------------------------------------
+
+    fn completed_record(persistence_mode: &str) -> PublicResponseRecord {
+        PublicResponseRecord {
+            id: Uuid::now_v7(),
+            execution_id: Uuid::now_v7(),
+            request_id: "req-f40".to_string(),
+            application_id: Some(Uuid::now_v7()),
+            external_tenant_id: None,
+            external_user_id: None,
+            conversation_id: None,
+            conversation_public_id: None,
+            status: PublicResponseStatus::Completed,
+            route_id: None,
+            route_key: None,
+            provider_id: None,
+            provider_type: None,
+            provider_model_id: None,
+            model_key: None,
+            // Exactly the shape `terminal_update_from_outcome` writes, so these cases read
+            // the same field the production path populates rather than a convenient stand-in.
+            output_summary: json!({
+                "persistence_mode": persistence_mode,
+                "output_text_bytes": 11,
+                "output_hash": "hash",
+            }),
+            usage: PublicUsageSummary::default(),
+            metadata: json!({}),
+            failure_class: None,
+            failure_message: None,
+            output_persisted: false,
+            created_at: Utc::now(),
+            started_at: None,
+            completed_at: Some(Utc::now()),
+            failed_at: None,
+            cancelled_at: None,
+            expires_at: None,
+            version: 1,
+        }
+    }
+
+    fn only_content_part(response: &PublicResponse) -> &PublicOutputContentPart {
+        let [PublicOutputItem::Message { content, .. }] = response.output.as_slice() else {
+            panic!(
+                "a completed response must carry exactly one output item, got {:?}",
+                response.output
+            );
+        };
+        let [part] = content.as_slice() else {
+            panic!("expected exactly one content part, got {content:?}");
+        };
+        part
+    }
+
+    fn unavailable_reason(response: &PublicResponse) -> &str {
+        match only_content_part(response) {
+            PublicOutputContentPart::OutputUnavailable { reason } => reason,
+            other => panic!("expected an output_unavailable part, got {other:?}"),
+        }
+    }
+
+    /// Each persistence mode gets its own answer, and no two of them share one.
+    ///
+    /// The previous code answered `"metadata_only_persistence"` for all four, which is true
+    /// only for the default. The distinctness assertion is the load-bearing half: four
+    /// separate equality checks would all pass against an implementation that returned the
+    /// same string for two modes if the expectations were ever edited to match.
+    #[test]
+    fn every_persistence_mode_gets_its_own_reason() {
+        let cases = [
+            ("metadata_only", "metadata_only_persistence"),
+            ("none", "persistence_disabled"),
+            ("plain_content", "content_persistence_not_implemented"),
+            ("encrypted_content", "content_persistence_not_implemented"),
+        ];
+
+        for (mode, expected) in cases {
+            let response = public_response_from_record(&completed_record(mode), None, Vec::new());
+            assert_eq!(
+                unavailable_reason(&response),
+                expected,
+                "persistence_mode {mode} reported the wrong reason"
+            );
+        }
+
+        // `plain_content` and `encrypted_content` deliberately share an answer — content
+        // persistence is unimplemented for both — so the distinct set is three, not four.
+        let distinct: std::collections::BTreeSet<&str> =
+            cases.iter().map(|(_, reason)| *reason).collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "the four modes collapsed into fewer than three answers: {distinct:?}"
+        );
+    }
+
+    /// The latent inversion F40 actually describes: the more the row claims to have
+    /// persisted, the less the old code returned.
+    ///
+    /// Unreachable today, and named rather than left silent so the day content persistence
+    /// lands the symptom is a string that says what happened instead of an empty array that
+    /// looks like a model with nothing to say.
+    #[test]
+    fn a_completed_response_claiming_persisted_output_says_so_rather_than_returning_nothing() {
+        let mut record = completed_record("plain_content");
+        record.output_persisted = true;
+
+        let response = public_response_from_record(&record, None, Vec::new());
+        assert!(
+            !response.output.is_empty(),
+            "a completed response must never carry an empty output array"
+        );
+        assert_eq!(unavailable_reason(&response), "persisted_output_not_loaded");
+    }
+
+    /// The other side of the invariant, so the fix cannot quietly become
+    /// "always emit an explanation".
+    ///
+    /// A response that is queued, running, failed or cancelled has genuinely produced no
+    /// output and `status` already says which. `[]` is honest there, and turning it into an
+    /// `output_unavailable` part would be a public-shape change with nothing behind it.
+    #[test]
+    fn only_completed_responses_carry_an_explanation() {
+        for status in [
+            PublicResponseStatus::Queued,
+            PublicResponseStatus::InProgress,
+            PublicResponseStatus::Failed,
+            PublicResponseStatus::Cancelled,
+        ] {
+            let mut record = completed_record("metadata_only");
+            record.status = status;
+            let response = public_response_from_record(&record, None, Vec::new());
+            assert!(
+                response.output.is_empty(),
+                "{status:?} must return an empty output array, got {:?}",
+                response.output
+            );
+        }
+    }
+
+    /// An empty model reply is not the same fact as an unavailable one, and the caller can
+    /// tell them apart.
+    ///
+    /// This is the assumption the whole finding rests on: if a succeeded execution could
+    /// arrive with `output_text: None`, then `output_unavailable` would be ambiguous no
+    /// matter what reason it carried.
+    #[test]
+    fn an_empty_model_reply_is_output_text_not_output_unavailable() {
+        let response = public_response_from_record(
+            &completed_record("metadata_only"),
+            Some(String::new()),
+            Vec::new(),
+        );
+        match only_content_part(&response) {
+            PublicOutputContentPart::OutputText { text } => assert_eq!(text, ""),
+            other => panic!("an empty completion must stay output_text, got {other:?}"),
+        }
+    }
+
+    /// An unrecognised or missing mode falls back to the value the default deployment sees.
+    #[test]
+    fn an_unreadable_persistence_mode_falls_back_to_the_default_answer() {
+        let mut record = completed_record("metadata_only");
+        record.output_summary = json!({});
+        assert_eq!(
+            unavailable_reason(&public_response_from_record(&record, None, Vec::new())),
+            "metadata_only_persistence"
+        );
+
+        record.output_summary = json!({ "persistence_mode": "a_mode_that_does_not_exist" });
+        assert_eq!(
+            unavailable_reason(&public_response_from_record(&record, None, Vec::new())),
+            "metadata_only_persistence"
         );
     }
 }
