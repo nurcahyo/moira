@@ -859,13 +859,14 @@ async fn a_failed_extraction_run_names_the_execution_that_failed() {
         "two executions, two ids: {attempts:?}"
     );
 
+    // With the two ids known to differ, this one assertion says both of the things that matter:
+    // the run row names the extraction's execution, and therefore does *not* name the caller's.
+    // An explicit `assert_ne!` against `callers` was here and has been removed — it could never
+    // be the assertion that fired, which makes it a promise rather than a guard. Verified by
+    // running the mutation that writes the caller's id onto the run row: this line reds first.
     assert_eq!(
         run_execution_id, extraction.execution_id,
         "the run row must name the execution that failed, not a uuid minted somewhere else"
-    );
-    assert_ne!(
-        run_execution_id, callers.execution_id,
-        "the run row must name the extraction's execution, not the turn that triggered it"
     );
     // The join an operator actually performs: run row -> the provider-level record of why.
     assert_eq!(
