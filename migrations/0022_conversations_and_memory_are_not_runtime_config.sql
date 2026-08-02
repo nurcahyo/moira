@@ -1,0 +1,41 @@
+-- F51 — the runtime-config invalidation channel was wired to two per-request data tables.
+--
+-- `migrations/0007_conversations_memory_rag.sql` attached
+-- `notify_moira_runtime_config_change()` to eight tables. Four of them are configuration
+-- (the `application_*_policies` family). Two more, `rag_collections` and `rag_documents`,
+-- are written from admin routes only. The last two are neither: `conversations` and
+-- `memory_records` are written on the public execution path, once per conversation created
+-- and once per extracted memory.
+--
+-- Every notification on this channel makes every replica run `apply_invalidation`
+-- (`src/infra/db.rs`), which cleared three in-process caches. Two of them rebuild from a
+-- query; the third, `ProviderRuntimeCache`, holds *built provider clients* — HTTP
+-- connection pools included. So creating one conversation dropped every replica's entire
+-- runtime-config cache and every cached provider client handle, on a write that cannot
+-- change any provider's configuration.
+--
+-- # Nothing depends on these two tables notifying
+--
+-- Verified three ways before dropping:
+--
+--   1. `docs/runtime-cache-invalidation.md` enumerates the invalidation-producing
+--      resources and lists neither. The schema drifted from the documented design in
+--      0007; this restores it.
+--   2. No cache in the process is keyed by a conversation or a memory record. The three
+--      the listener clears hold provider configuration, provider client handles and the
+--      enabled auth methods, and none of them can be changed by a row in either table.
+--   3. `src/infra/db.rs` is the only listener on `moira_runtime_config`. There is no
+--      other subscriber whose behaviour this could change.
+--
+-- The `<table>_bump_version` triggers are deliberately left in place: `version` is the
+-- `If-Match` ETag for these rows and is nothing to do with invalidation.
+--
+-- # Reversal
+--
+-- If a future cache *is* keyed by conversation or memory state, re-create the trigger and
+-- delete that table's name from `RUNTIME_DATA_RESOURCE_TYPES` in `src/infra/db.rs` in the
+-- same change — the classifier there is the second, independent barrier, and it must not
+-- be left narrowing a table that has become configuration.
+
+drop trigger if exists conversations_runtime_config_notify on conversations;
+drop trigger if exists memory_records_runtime_config_notify on memory_records;
