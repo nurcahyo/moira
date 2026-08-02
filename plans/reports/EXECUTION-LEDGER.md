@@ -2176,7 +2176,7 @@ under 4B a human's second grant is never primary and revoking "the" row leaves a
   ~21 fallible per-row `collect()` sites and 48 enum-like CHECKs remain exposed. Rollout ordering
   (Moira first) is the only mitigation and goes in the release note.
 
-### F29 — `ExecutionOutcome.structured_output` is always `None`, for every caller
+### F29 — `ExecutionOutcome.structured_output` is always `None`, for every caller — **CLOSED**, see "F29 — CLOSED `fix/f29-structured-output`" below
 
 The **request** side of structured output works: `output_schema` is honoured and
 `structured_output_invalid`/`_unsupported` are catalogued. The **response** side does not.
@@ -2331,14 +2331,114 @@ question being investigated. That clause has now out-produced the questions them
 | **F35** | **The OpenAI-compat endpoint silently discards `text.format`.** `OpenAiResponseCompatRequest.text` is declared under `#[serde(deny_unknown_fields)]` — so the request is *accepted* — and is read by **nothing**. `openai_compat_to_public` hardcodes `response_format: Text`. A caller sending standard OpenAI `text.format = {"type":"json_schema", …}` gets a 200, no schema on the wire, and no warning. `deny_unknown_fields` converts what would have been an honest 422 into a silent no-op. **Strictly worse than F29**, which is at least uniformly broken. | **HIGH** |
 | **F36** | **`SummarizationLock` pins a Postgres session advisory lock across a full provider round-trip**, on a per-turn path, over a `pool.acquire().await?.detach()`ed backend. A hung provider holds one backend and one conversation lock for the whole attempt timeout. The lock's own doc comment names this reversal condition — and it has already been met. | **MED-HIGH** |
 | **F37** | **Four wasted DB reads per conversation-linked turn when summarization is disabled**, inside the caller's request, between the last SSE delta and the terminal event. Six round-trips, four of them dead, on the default configuration. | **MEDIUM** |
-| **F38** | **The terminal-persistence-deadline arm throws away a successful provider result.** `execution.rs:658` returns `failed_outcome` with `output_text: None` and a default `UsageSummary` while `output.text` and `output.usage` are in hand and `"output_committed": true` is written into both the audit entry and the `ExecutionFailed` event. On streaming the client has already received every delta. Usage is preserved at attempt level and zeroed at outcome level — **the asymmetry is the tell**. Billing and reporting divergence. Found independently by both skeptics. | **MEDIUM** |
+| **F38** | **The terminal-persistence-deadline arm throws away a successful provider result.** `execution.rs:658` returns `failed_outcome` with `output_text: None` and a default `UsageSummary` while `output.text` and `output.usage` are in hand and `"output_committed": true` is written into both the audit entry and the `ExecutionFailed` event. On streaming the client has already received every delta. Usage is preserved at attempt level and zeroed at outcome level — **the asymmetry is the tell**. Billing and reporting divergence. Found independently by both skeptics. **Still open after `fix/f29-structured-output`**, which added `structured_output` as a third dropped value and left an explicit comment naming all three rather than fixing the divergence — see the F29 closure entry for why a billing decision was kept out of a parsing change. | **MEDIUM** |
 | **F39** | **The structured-output capability gate cannot see Rig's per-provider reality.** The gate checks a config JSON bool; DeepSeek sets `SUPPORTS_RESPONSE_FORMAT = false` and drops the schema with a `warn!`, and `OpenAiCompatible`/`Local` ship `response_format.json_schema` to arbitrary self-hosted backends with no warning at all. Config says supported, wire says otherwise, caller gets prose and a `succeeded`. **Blocks the fail-hard variant of F29.** | **MEDIUM** |
 | **F40** | **`GET /v1/responses/{id}` returns an empty `output` array for a completed, persisted response.** Falls through both branches to `Vec::new()`. The `OutputUnavailable { reason: "metadata_only_persistence" }` variant exists to explain the *other* case, which makes the silent empty array read as an oversight rather than a decision. Needs a product call. | **LOW-MED** |
-| **F41** | **Skill-tree drift on exactly the guidance F29's implementer needs.** `.agents/skills/moira-rig-completions/SKILL.md` carries the "Known gap" paragraph; the `.claude/` copy contains **zero** occurrences of "structured". CLAUDE.md points at `.claude/`. The authoritative instruction lives only in the tree nobody is told to read. | **LOW-MED** |
+| ~~**F41**~~ | ~~**Skill-tree drift on exactly the guidance F29's implementer needs.**~~ **STRUCK — the inference was wrong.** The `.claude/` copy is a nine-line **pointer file** that says to read the `.agents/` one; all eight `.claude/skills/` entries have that shape. See "F41 is WRONG as recorded" below. | **struck** |
 | **F42** | **i18n overclaim.** `moira.error.structured_output_invalid` asserts "or the model's output does not conform to it". No such path exists. Its description even narrates a prior widening. Becomes true only if the fail-hard variant ships. | **LOW** |
 | **F43** | **`ConcurrencyController::acquire` is dead `pub` API on the concurrency-safety path** — every caller is inside `#[cfg(test)]`. It hardcodes `is_stream: false`, so a future caller reaching for the obvious-looking name on a streaming path silently takes a *request* permit. | **LOW** |
 | **F44** | **`RuntimeModelHandle::stream` / `RuntimeStreamOutput` are dead `pub` API** — ~65 lines duplicating `execute_rig_stream`, kept alive only by a re-export. Divergence hazard: someone fixing streaming will fix one of the two. | **LOW** |
 | **F45** | **`PublicResponseFormat::JsonSchema { name, strict }` — both accepted, both dropped.** Public in `docs/openapi.json`; every destructure site uses `{ schema, .. }`. Rig hardcodes `strict: true` and renames from the schema's `title`. A caller sending `strict: false` gets strict mode, unreported. | **LOW** |
+
+### F29 — **CLOSED** `fix/f29-structured-output`. Gated parse in `execution.rs`, not at the Rig boundary — 2026-08-02
+
+**One parse site, `structured_output_from_text` in `src/application/execution.rs`, called from both
+`execute_rig_completion` and `execute_rig_stream`.** No change to `RuntimeCompletionOutput`,
+`RuntimeStreamItem`, `ExecutionOutcome`, or `src/orchestration/runtime_factory.rs`. No OpenAPI drift
+— `ExecutionOutcome.structured_output` is documented as a bare `{}` and its Rust type is unchanged;
+verified by running `openapi_drift` rather than assumed.
+
+**Why not the Rig boundary, which is where the in-tree skill points.**
+`.agents/skills/moira-rig-completions/SKILL.md` says *"parse from `RuntimeCompletionOutput.text`"*.
+`execute_rig_stream` **never constructs a `RuntimeCompletionOutput`** — it accumulates `text` itself
+— so `output_from_response` would have covered the non-streaming path only and forced a second,
+divergent implementation for streams, which is the "second response-narrowing site" the same
+paragraph forbids. The skill's two instructions are in tension; the one about a second narrowing
+site is the one that survives. CLAUDE.md already admits `rig_core` imports in `execution.rs`.
+
+**The gate is the safety property, not an optimisation.** `wants_structured` is
+`request.output_schema.is_some()`, captured **before** `request` is moved into
+`handle.completion(request)` / `handle.start_stream(request)`. Without it, conversation
+summarization corrupts: it sends **no** `output_schema`, `parse_summary` accepts any non-empty
+prose, and `summarize_conversation` prefers `structured_output` over `output_text` via
+`.map(|value| value.to_string())`. **Measured, not reasoned about** — an ungated build was built and
+run on purpose, and stored
+
+```
+{"decision":"ship the invoicing rewrite in March","owner":"the user"}
+```
+
+where the model had sent the pretty-printed form. `summary_hash` is `request_hash` over the stored
+bytes and is documented as a content address, so the row is internally consistent and wrong. The
+gate went in only after that red was observed.
+
+**Populate on success; do NOT fail hard.** A non-conforming reply leaves the field `None` and
+changes nothing else, against the skill's `StructuredOutputInvalid` advice, for three reasons each
+checked against the tree:
+
+1. `StructuredOutputInvalid` is in **neither** `is_retryable` nor `is_fallback_eligible` nor
+   `is_circuit_failure` — one non-conforming reply ends the execution with no retry, no fallback.
+2. DeepSeek's `SUPPORTS_RESPONSE_FORMAT = false` drops the schema before the wire (**F39**), so
+   every structured request on that route would hard-fail where it previously returned 200.
+3. `run_extraction` detects failure by `output_text` being `None` and never reads
+   `execution.status`, so `an_unparseable_extraction_reply_fails_the_run_and_writes_no_memory`
+   would flip from `structured_output_invalid` to `extraction_call_failed`.
+
+**Reversal condition — what makes someone adopt the fail-hard variant.** All three of: **F39**
+landed, so the capability gate reflects Rig's per-provider reality instead of a config bool;
+`StructuredOutputInvalid` given an explicit retry/fallback disposition (today it silently has
+neither); and `run_extraction` reading `execution.status` rather than inferring failure from
+`output_text`. Until all three hold, failing loudly trades a silent `None` for an outage on a
+provider that was never going to comply. **F42** becomes true on the same day and not before.
+
+**Strict, and deliberately not a scavenger.** `serde_json::from_str` on the trimmed text. Rig's
+balanced-brace scan is not copied and **no code fence is stripped**:
+`memory_extraction::parse_candidates` owns the one real-world tolerance, on the `output_text` it
+already falls back to. Two parsers with two accept-sets over the same bytes is the parser
+differential that module's doc comment refuses.
+
+**Guards, and the mutation that killed each.** Every one was run, not read.
+
+| Guard | Mutation | Result |
+|---|---|---|
+| `a_schema_carrying_completion_returns_the_parsed_structured_output` | unfixed code | RED — `left: Null, right: Object {"a": Number(1)}` |
+| `a_schema_carrying_stream_returns_the_parsed_structured_output` | unfixed code; **and** `wants_structured = false` in the stream path only | RED both times, and it is the **only** case that reds on the second — the two paths are independently covered |
+| `a_reply_that_is_json_is_not_parsed_when_no_schema_was_requested` | delete the gate | RED |
+| `a_summary_that_is_valid_json_is_stored_verbatim` | delete the gate | RED, with the re-serialised body quoted above |
+| `structured_output_is_parsed_only_when_a_schema_was_requested` (unit) | delete the gate | RED — and it needs no database, so the gate stays observable if a fixture stops being reachable |
+
+`a_summary_that_is_valid_json_is_stored_verbatim` **passes against unfixed code** and is a
+regression guard, not a watched-failing test. It was earned the only honest way: the ungated parse
+was implemented first, the case was watched going red, and the gate was added after. The reply in
+it is pretty-printed on purpose — a compact JSON reply round-trips through `to_string()` identically
+and the guard would pass against the defect.
+
+**F38 is NOT fixed and stays open.** `execution.rs`'s terminal-persistence-deadline arm calls
+`failed_outcome` from inside `match result { Ok(Ok(output)) => … }`, where `output` is live. F29
+turns its `structured_output: None` into a third silent drop alongside `output.text` and
+`output.usage`. **The drop is now commented rather than silent**, naming all three values and F38.
+Not fixed here because the arm's own condition is that terminal persistence did *not* complete:
+`update_attempt`, `insert_usage_record` and `touch_credential_used` may each have failed to commit,
+so promoting the usage onto the outcome asserts a billing fact whose row may be absent, and
+promoting `output_text` onto a non-`Succeeded` status changes what every consumer of a failed
+execution receives. That is a billing decision; burying it inside a parsing change would hide it.
+
+### F41 is WRONG as recorded — there is no skill-tree drift
+
+Found while following the brief that cited it. `.claude/skills/moira-rig-completions/SKILL.md` is
+**eight lines**, and its body is:
+
+> Read and follow `../../../.agents/skills/moira-rig-completions/SKILL.md` completely. That
+> canonical workflow is shared by Codex and Antigravity and is authoritative for this repository.
+
+So the zero occurrences of "structured" in the `.claude/` copy are not drift — it is a **pointer
+file**, and every one of the eight skills under `.claude/skills/` has the same shape. CLAUDE.md
+pointing at `.claude/` therefore routes an agent to `.agents/` by design; the authoritative
+instruction is exactly one hop away, not in "the tree nobody is told to read".
+
+The finding's underlying observation (a `grep` for "structured" in `.claude/` returns nothing) was
+correct; the **inference** from it was not. This is the F32/F29 shape a third time: a verified
+detail compressed into a confident generalisation. **F41 should be struck, not fixed.**
 
 ### F34 — ESCALATED: summarization is inline too, ungated, and the docstring says otherwise
 
