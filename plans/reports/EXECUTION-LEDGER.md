@@ -3928,12 +3928,8 @@ can honestly close is closed.**
 
 #### What remains, and none of it is autonomous work
 
-<<<<<<< HEAD
-~~**F54** (the extraction failure class is lost from `memory_extraction_runs`) and one **bounded,
-=======
-**F54** (a failed extraction cannot be correlated to its execution except through an unenforced
+~~**F54** (a failed extraction cannot be correlated to its execution except through an unenforced
 `request_id` string convention) and one **bounded,
->>>>>>> origin/main
 recorded gap** — swapping `stricter_of`'s arguments survives its guard, and can only change which of
 two equally-permissive labels is *reported*, never a consent outcome.~~
 
