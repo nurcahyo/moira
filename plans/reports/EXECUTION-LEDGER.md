@@ -386,6 +386,96 @@ what the property actually is — a held connection cannot be idle), or poll the
 because it is a different file from F2's change and gate runs are serialised; fixing it inside F2's
 branch would have cost another full gate cycle to prove.
 
+#### **CLOSED** 2026-08-02, `fix/shared-db-flakes` — and neither the diagnosis nor the suggested fix above was right
+
+*(This is the metrics-gauge F28. `F28` also names an unrelated finding earlier in this file —
+inline memory extraction delaying the terminal SSE event. They share only a number.)*
+
+**`num_idle()` is not approximate.** The paragraph above is wrong on the mechanism, and the wrong
+mechanism pointed at the wrong fix. `sqlx-core-0.8.6/src/pool/inner.rs` reads:
+
+```rust
+pub(super) fn num_idle(&self) -> usize {
+    // We don't use `self.idle_conns.len()` as it waits for the internal
+    // head and tail pointers to stop changing for a moment before calculating the length…
+    // By maintaining our own atomic count, we avoid that issue entirely.
+    self.num_idle.load(Ordering::Acquire)
+}
+```
+
+A dedicated `AtomicUsize` since 0.6, and `size()` is another. Both are exact reads. There is also no
+pool maintenance task to "transiently disagree" with them: `spawn_maintenance_tasks` returns
+immediately unless `max_lifetime`, `idle_timeout` or `min_connections` is set, and the fixture pool
+sets none of them.
+
+**What is actually asynchronous is the return.** `Drop for PoolConnection` *spawns* a task, and
+`Floating::return_to_pool` issues `self.raw.ping().await` — a full round-trip to PostgreSQL — before
+it re-queues the connection and increments `num_idle`. So between a `drop` and the counter moving
+there is a database RTT during which the pool is genuinely still settling, and a scrape landing
+inside it reads a low `idle`. That is the failure exactly: the baseline scrape sampled `idle = 1`
+while a second connection's return was in flight, the return landed, and the "busy" scrape read
+`idle = 1` again instead of `0` — `left: 1.0, right: 0.0`.
+
+**Reproduced deterministically before anything was changed.** Replaying the test's shape back to
+back, so that each iteration's `drop` is the only thing between it and the next baseline scrape,
+failed **8 times in 10**; the delay that made the committed test pass was incidental — fixture setup
+and the first scrape happened to give the in-flight return time to land. Instrumented output, one
+failing iteration: `pre(size=2,idle=1) base(total=2,idle=1) post_idle=2 held_idle=1
+busy(total=2,idle=1) expected_busy_idle=0`. Note `pre_idle=1` against `post_idle=2`: the return
+landed *during* the scrape it was supposed to precede.
+
+**Neither a bound nor a poll was needed.** Two properties of the pool make the numbers exactly
+knowable:
+
+* **`acquire` is a barrier.** A connection whose return is still in flight has not yet released its
+  semaphore permit, so taking *every* permit cannot return until every pending return has completed.
+* **`PoolConnection::return_to_pool().await`** runs that same return eagerly instead of spawning it.
+
+Between them the pool reaches a state with nothing in flight. Measured 20/20 and 15/15 before being
+written up. `idle` is now asserted at **`capacity`**, **`capacity - 1`** and **`0`** — three exact
+values, no tolerance, no timing — which is *stronger* than the exact assertion it replaced, not
+weaker. The suggested `idle <= baseline_idle - 1` bound would have been satisfied by a gauge frozen
+at zero.
+
+**Two false claims in the test's own doc comment, both load-bearing** (the F22 pattern — the
+investigation found them, they were not reported):
+
+1. *"Nothing else touches this pool."* sqlx does, per above.
+2. *"`LifecycleFixture` serialises the suite."* It does not, and has not since fixtures were given
+   private databases. `tests/support/mod.rs` says so in as many words at `CONCURRENT_FIXTURES`:
+   *"This is **not** an isolation device — the database is."* Four fixtures run concurrently.
+
+A third claim — *"neither `/metrics` nor `/health/live` opens a connection"* — is **true**, is now
+load-bearing rather than incidental, and is proven in passing: the test scrapes successfully while
+holding all eight permits, which it could not do if the handler needed one.
+
+**Teeth, by injection.** Four mutations of `render_prometheus`, each reverted:
+
+| Mutation | Result |
+|---|---|
+| `record_db_pool_utilization(8, 8)` — both constant | RED at `capacity - 1`: *"the idle gauge did not follow the live pool"* |
+| `(pool.size(), pool.size())` — idle wired to total | RED, `left: 8.0, right: 7.0` |
+| sampling deleted, gauges frozen at their `0.0` init | RED at the settled scrape, `left: 0.0, right: 8.0` |
+| `total` from `options().get_max_connections()` | **GREEN — a survivor.** See below |
+
+**The fourth is the one worth reading.** Driving the pool to saturation is what bought determinism,
+and it also made `pool.size()` and `max_connections` the same number in every observation the test
+made — so a `total` gauge sourced from the configured ceiling passed. Verified by running the
+committed test against the mutation: `test result: ok`. Fixed by one scrape taken **before** the
+pool is touched, where the fixture has used it but not exhausted it. Only `total` is asserted there,
+because `size` is precisely the quantity an in-flight return does *not* move.
+
+*Reversal condition:* reopens if the pre-saturation scrape is deleted, or if these gauges are
+asserted anywhere against a pool not first brought to a known state.
+
+*Left open, deliberately:* `render_prometheus` does `u32::try_from(pool.num_idle()).unwrap_or(u32::MAX)`.
+sqlx's `release()` pushes to the idle queue and releases the permit **before** `num_idle.fetch_add`,
+so on a multi-threaded runtime a waiter can `fetch_sub` first and wrap the `AtomicUsize` to
+`usize::MAX` — published as `4294967295`. `#[tokio::test]` is current-thread, so no test here can
+observe it; **production is multi-threaded**. The one-line guard is to clamp the gauge to `size()`.
+Recorded rather than fixed: it is a `src/` behaviour change, and this branch is a test-hygiene
+branch.
+
 ### F3 — the skill files still describe deleted code, and agents are briefed from them
 
 Module 9 deleted `resolver.rs`, `executor.rs` and `src/http/chat.rs`. Several skill files still
@@ -1103,6 +1193,7 @@ where a test fails *forever* until someone deletes a row by hand.
    century-backdated rows with no cleanup path, so a failure leaks rows that sort ahead of the next
    run's under `order by expires_at` — self-poisoning. Deliberately left alone: changing retention
    test semantics is a larger, riskier change than belonged in a regression fix on the plan 07 branch.
+   — **CLOSED** 2026-08-02 `fix/shared-db-flakes`; see the sub-entry below.
 
 2. **`tests/http_middleware_contract.rs:469`** — creates a `system_api_keys` row per run and never
    deletes it. Minor; no current assertion depends on the count. — **CLOSED with F26**
@@ -1115,13 +1206,79 @@ where a test fails *forever* until someone deletes a row by hand.
    leaking to the shared database; a private clone would scope `retention::run_once` to one database
    and dissolve both its global advisory lock and its exact-equality hazard at once.
 
+#### Item 1 — **CLOSED** 2026-08-02, `fix/shared-db-flakes`. The self-poisoning was measured, not argued
+
+**The leak, reproduced.** A `panic!` injected into `retention_run_respects_the_configured_batch_size`
+after its 43 rows are seeded and before any cleanup, against the pre-fix suite:
+
+```
+$ psql moira -c "select count(*), min(expires_at)::date from idempotency_records"
+ 43 | 1926-08-27
+```
+
+**The poisoning, reproduced.** The *unmodified* pre-fix suite was then run against that database and
+failed on its own:
+
+```
+assertion `left == right` failed: the remainder of the backlog must be left for the next tick
+  left: 43
+ right: 23
+```
+
+All 43 of its own rows survived, because the 43 leaked 1926-dated rows sorted ahead under
+`order by expires_at` and absorbed the entire 20-row per-tick cap. And it **escalates**: each failed
+run leaks 23 more, measured at **43 → 66 → 89** across three consecutive runs, with no code path
+anywhere that would ever clean them up. That is the finding's "permanently red suite" demonstrated
+end to end rather than predicted.
+
+**The fix, verified the same way.** The suite now uses `support::TestDatabase`. The identical
+injected failure leaves **0 rows in the shared database and 0 leftover fixture databases** — the
+whole database is discarded in `Drop`, on a dedicated thread with its own runtime, so it runs while
+the test unwinds.
+
+**Isolation does not invalidate the suite, and the allowlist's stated reason for keeping it was
+wrong.** `SHARED_DATABASE_ALLOWLIST` recorded that `run_once` is "a cluster-wide sweep" and that a
+private clone would therefore change retention test semantics. A PostgreSQL connection is scoped to
+one database: the sweep is **database**-wide, and it is database-wide on a clone over the identical
+code path. No test in the file asserted that a sweep reaches rows it did not itself seed — the
+module comment said the *opposite*, that every assertion is scoped by id. What isolation removed was
+other suites' rows, which were never the subject. The entry has been deleted, which
+`every_allowlist_entry_is_still_load_bearing` forced rather than merely permitted.
+
+**What isolation bought, beyond the leak.** Every `>=` became `==`; whole-table counts were added,
+which catch a sweep deleting *more* than it was asked to and which no number of by-id existence
+checks can; the cluster-wide advisory lock serialising every retention sweep in every test binary
+and every worktree on the machine is gone, and the suite went from serialised to **2.86 s** for
+eight tests; and the century backdating — the thing that made a leak permanent — is gone with it.
+
+**Teeth, by injection.** Each mutation reverted after observing the failure:
+
+| Mutation | Guard that fired |
+|---|---|
+| `RetentionPlan::next_batch_size` ignores the per-tick cap | `retention_run_respects_the_configured_batch_size` — *"a backlog larger than the per-tick cap must be reported as capped, got RetentionOutcome { idempotency_records_deleted: 43, batches_run: 45, hit_per_tick_cap: false }"* |
+| `TestDatabase`'s pool pointed at the shared database | `the_fixture_owns_a_disposable_database` — *"the retention suite is sweeping the shared test database `moira`"* |
+| stale `retention_worker.rs` entry re-added to the allowlist | `every_allowlist_entry_is_still_load_bearing` — *"is on SHARED_DATABASE_ALLOWLIST but no longer resolves var(…). Delete the entry"* |
+
+**One incidental gap closed.** The suite's own skip message was `skipping retention worker tests:
+MOIRA_TEST_DATABASE_URL is not set`, which matches **neither** pattern in `scripts/gates.sh`'s
+skip assertion (`skipping database` / `set MOIRA_TEST_DATABASE_URL`). A silent skip here was
+invisible to the gate built to catch silent skips. `TestDatabase` prints `skipping database-backed
+tests: …`, which matches.
+
+*Reversal condition:* reopens if any suite outside `SHARED_DATABASE_ALLOWLIST` resolves
+`MOIRA_TEST_DATABASE_URL`, or if `the_fixture_owns_a_disposable_database` is deleted from any of the
+three suites that carry it. *Known limit, unchanged from F27:* the scan is **per-file and textual**,
+so the cheapest remaining bypass is a helper added to the allowlisted `support/mod.rs` that hands
+out a shared-database pool. Nothing would notice.
+
 **The general lesson.** `migrated_pool()`-style helpers hand every `#[cfg(test)]` module in `src/` the
 *same* database, and `cargo test --workspace` runs binaries concurrently against it. Any test writing
 a singleton, a globally-unique slot, or a cluster-wide counter is sharing mutable state with every
 other test in the tree. The integration suites avoid this with `support::LifecycleFixture`'s cloned
 databases; the lib tests have no equivalent, so they need an explicit advisory lock. **A test that
 leaks a row on the panic path is worse than a flaky one** — it converts one bad run into a permanently
-red suite.
+red suite. **No integration suite writes to the shared database any more**; the `src/**/tests` unit
+tests still do, and are the reason the `moira` database must keep existing.
 
 ### F7 — the "no `rig_core` under `src/domain/`" rule has no automated gate — **CLOSED** `d7580a6`
 

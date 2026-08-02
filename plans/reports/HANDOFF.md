@@ -287,8 +287,8 @@ Migrations end at **`0020`** (next free `0021`; `0016` is a permanent gap). Open
 |---|---|---|
 | **F16** | `rig-core` logs the whole completion body, now carrying other tenants' retrieved documents. Mitigated below the `EnvFilter` — **and that mitigation's own wiring test was missing until `8bbda15`** | **proper fix is upstream; needs an issue filed by a human** |
 | ~~**F2**~~ | ~~Pre-auth query-field enumeration~~ **CLOSED** `fix/f2-query-rejection-envelope`. Two corrections to the finding: it was never `Query`-only (every extractor rejection had the shape — `Json`'s 400/415/422, `Path`'s 400, `Extension`'s 500), and it was not an "observable wire change" — `docs/openapi.json` already documented `4XX`/`5XX` on these operations as `ErrorResponse`, so the fix makes the implementation obey a contract that was already committed and the snapshot is byte-identical. Scoped by **inverting the rule**: any non-JSON 4xx/5xx is envelope-wrapped, because `AppError` is the only producer of an error body. Rejection stays pre-auth, decided and recorded | closed |
-| **F28** | `metrics_endpoint_exposes_db_pool_gauges_reflecting_the_live_pool` treats sqlx's *approximate* `num_idle()`/`size()` as exact and mutually consistent within one scrape. Failed once under CPU contention (`left: 1.0, right: 0.0`), passed 9/9 immediately after with nothing changed. Fix is a bounded assertion (`idle <= baseline_idle - 1`) or a polled scrape — **not** a sleep | open, flake |
-| **F10 item 1** | `tests/retention_worker.rs` asserts an **exact** delete count against a cluster-wide sweep, and seeds century-backdated rows with no cleanup path, so a failure leaks rows that sort ahead of the next run's — self-poisoning | open. **It is now the LAST suite on the shared database**, so it is also the only remaining source of cross-run coupling |
+| ~~**F28** (metrics gauge)~~ | ~~`metrics_endpoint_exposes_db_pool_gauges_reflecting_the_live_pool` treats sqlx's `num_idle()`/`size()` as exact and mutually consistent within one scrape~~ **CLOSED** `fix/shared-db-flakes`. **The diagnosis in the finding was wrong.** `num_idle()` is not approximate — since sqlx 0.6 it is a dedicated `AtomicUsize`, and 0.8.6's `size()` is another. What is asynchronous is the **return**: `Drop for PoolConnection` *spawns* a task, and that task issues a `ping()` round-trip **before** it re-queues the connection and increments `num_idle`. So a scrape landing in that window reads a pool that is still settling. Reproduced **8/10** by replaying the shape with the incidental delay removed. No bound and no poll were needed: `acquire` on every permit is a barrier (an in-flight return has not released its permit) and `PoolConnection::return_to_pool().await` runs the return eagerly, so `idle` is now pinned **exactly** at `capacity`, `capacity - 1` and `0` — strictly stronger than what it replaced. Also corrected two false claims in the test's own doc comment | closed |
+| ~~**F10 item 1**~~ | ~~`tests/retention_worker.rs` asserts an exact delete count against a cluster-wide sweep, and seeds century-backdated rows with no cleanup path~~ **CLOSED** `fix/shared-db-flakes`. Both halves measured rather than argued: an injected failure leaked **43** rows dated **1926-08-27**, after which the *unmodified* suite failed `left: 43, right: 23` and leaked 23 more per run — 43 → 66 → 89 across three runs, permanently. Now on `support::TestDatabase`; the same injected failure leaves **0 rows and 0 databases**. The sweep is **database**-wide, not cluster-wide, so isolation does not change what is tested — it made the counts exactly assertable, and `>=` became `==` throughout. `SHARED_DATABASE_ALLOWLIST` is down to two entries | closed |
 | ~~**F27**~~ | ~~Leaked `trusted_jwt_issuers` rows in the shared test DB~~ **CLOSED** `fix/test-row-leak`. **The recorded count was wrong**: it said ~986; the measurement was **160** — exactly ten rows (the ten `register_issuer` call sites in `tests/jwks_hardening.rs`) × sixteen runs, and it leaked them on the **happy** path, not only on a panic. `tests/http_middleware_contract.rs` was the same shape (F10 item 2) with **42** *active* `moira:admin` API keys. Both now use `support::TestDatabase`, whose `Drop` discards the whole database including while unwinding. Residue deleted by predicate; `audit_logs` residue (180 rows) left in place deliberately | hygiene |
 
 **A concurrent branch `fix/test-row-leak-2` exists on origin** — a *reclaim* approach to the same
@@ -296,11 +296,29 @@ finding (delete the rows), superseded by `cac20ff` because reclaiming leaves the
 shared database, so the next run leaks again. It was **left in place rather than deleted**: it is
 another writer's work, and this loop does not destroy branches it did not create.
 
-*Reversal condition for F27:* it reopens if any test source outside `SHARED_DATABASE_ALLOWLIST` in
-`tests/test_database_isolation.rs` resolves `MOIRA_TEST_DATABASE_URL` itself, or if either suite's
-`the_fixture_owns_a_disposable_database` is deleted or weakened. The three allowlisted files
-(`support/mod.rs`, `security_foundation.rs`, `retention_worker.rs`) are *not* covered — see F10 item 1,
-which a private clone would also fix and which remains open.
+*Reversal condition for F27 and F10 item 1:* they reopen if any test source outside
+`SHARED_DATABASE_ALLOWLIST` in `tests/test_database_isolation.rs` resolves
+`MOIRA_TEST_DATABASE_URL` itself, or if any of the **three** suites'
+`the_fixture_owns_a_disposable_database` tests is deleted or weakened. **No integration suite
+writes to the shared database any more.** The allowlist is down to two entries — `support/mod.rs`,
+which owns the mechanism, and `security_foundation.rs`, which must migrate a database built from
+nothing — and both are read-scoped or self-cleaning. The shared `moira` database is still created
+and migrated by the unit tests under `src/**/tests`, which is why it must keep existing.
+
+*Reversal condition for F28 (metrics gauge):* it reopens if the pool gauges are asserted anywhere
+against a value sampled from a pool that is not first brought to a known state, or if
+`metrics_endpoint_exposes_db_pool_gauges_reflecting_the_live_pool` loses its **pre-saturation**
+scrape. That scrape looks redundant and is not: every other observation saturates the pool, so
+`pool.size()` and `max_connections` are the same number in all of them, and sourcing the `total`
+gauge from the configured ceiling left the whole test green until it was added. **That survivor was
+found by running the mutation — the test read fine.**
+
+*Known limit, deliberately left:* `render_prometheus` does `u32::try_from(pool.num_idle())`, and
+sqlx's `release()` re-queues the connection and releases its permit **before** incrementing
+`num_idle`, so on a multi-threaded runtime a waiter can decrement first and wrap the `AtomicUsize`
+to `usize::MAX` — which the `unwrap_or(u32::MAX)` then publishes as `4294967295`. `#[tokio::test]`
+is current-thread, so no test here can observe it; production is multi-threaded. Not fixed, not
+forgotten: the one-line guard is to clamp the gauge to `size()`.
 
 **Finding IDs are being allocated concurrently and have collided three times.** `F22` names *two*
 unrelated findings (`api_keys.prefix_length`, and the second `main` flake); `F21` has two entries; and
@@ -381,10 +399,11 @@ start of your task.**
    The same now applies to **GitHub**, added in wave 4B and exercised only against a purpose-built
    mock (no discovery document, no `id_token`, `/user` + `/user/emails`).
 
-### 3.4 Six guards that failed — five toothless, one that pinned the defect
+### 3.4 Seven guards that failed — six toothless, one that pinned the defect
 
 **Read this before writing any guard.** Plan 09 produced **six**, every one found by *running the
-mutation* and none by reading the test. **Two were already shipped and trusted.**
+mutation* and none by reading the test. **Two were already shipped and trusted.** A seventh followed
+on 2026-08-02, in a *replacement* guard written by an agent who had read this section first.
 
 | Guard | Why it could not fire |
 |---|---|
@@ -405,12 +424,27 @@ outage.
 property, **say so in its name**; and **never let a conjunction be asserted as two independent
 facts.**
 
+**A seventh, and it is the one to be least comfortable about: the fix for a toothless assertion was
+itself toothless, in a new place.** F28's replacement drives the connection pool to saturation to
+make its numbers exact. That works — and it means `pool.size()` and the configured
+`max_connections` are *the same number in every observation the test makes*. Sourcing the `total`
+gauge from `options().get_max_connections()` instead of the live size therefore left the whole test
+green; verified by running it. One scrape taken **before** the pool is saturated closes it.
+
+**The lesson is narrower than "test more".** The technique that bought determinism — pin the system
+to a known extreme — is the same technique that collapsed two distinct quantities into one. *Any
+time a guard reaches a known state to make an assertion exact, ask which variables that state has
+just made indistinguishable from each other.* Determinism and discrimination pull in opposite
+directions, and this one was noticed only because the mutation was run anyway.
+
 **The common shape:** each was written against the *shape the author imagined the defect would take*
-— a direct import, one handler per file, a representable row, a changed subject, a correct predicate
-— rather than against the property.
+— a direct import, one handler per file, a representable row, a changed subject, a correct
+predicate, a saturated pool — rather than against the property.
 
 **Ask of every guard: what is the cheapest edit that breaks the property while leaving the guard
-green?** That question found all five; reading the tests found none.
+green?** That question found all six; reading the tests found none. **Asking it is not enough — the
+seventh was found by *running* the answer**, after the same author had already asked the question
+and judged the guard sound.
 
 Three corollaries earned the hard way:
 
