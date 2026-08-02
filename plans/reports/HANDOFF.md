@@ -354,7 +354,7 @@ not have to carry a rotation caveat. F's remaining work is unchanged otherwise.
 
 ### 3.2b THE LEDGER IS AHEAD OF THIS TABLE — read it, not just §3.2 (2026-08-02)
 
-The table above was written when the highest finding was F28. **The ledger now runs to `F50`.**
+The table above was written when the highest finding was F28. **The ledger now runs to `F53`.**
 `plans/reports/EXECUTION-LEDGER.md` is authoritative; §3.2 is a summary that has already gone stale
 once. Current state of everything above F28:
 
@@ -373,7 +373,11 @@ once. Current state of everything above F28:
 | **F49** | **No integration test ever built a request from an agent profile** — every fixture left `agent_profile_id` NULL, so `preamble`/`temperature`/`max_tokens`/`tool_policy` were unverified at the wire | **CLOSED** `fix/f49-agent-profile-coverage`. Premise held; the column is on `route_definitions`, not `routing_policies`. `tests/agent_profile_wire.rs` now builds from a real profile and reads the mock's body. **The branch is correct at the wire.** Eight mutations run. Under F48's mutation only the new `tool_policy` case reds — **F48's guard is not superseded.** Raised F50 |
 | **F50** | **A disabled or soft-deleted agent profile silently degrades every execution on its route** — `get_active_agent_profile` filters on `status='active'`, neither disable nor soft-delete clears the route's FK, and `Ok(None)` is treated as "no profile": preamble, temperature and max_tokens vanish with **no failure, no `warn!`, no event**, and the run reports `succeeded` | open. **Recorded, not fixed — the fix is a product decision** (fail-closed vs observable fail-open). Reversal condition and the `documents_`-named case that pins today's behaviour are in the ledger |
 | **F38** | Terminal-persistence-deadline arm discarded a successful provider result | **CLOSED** `fix/f38-deadline-usage` — all three values retained, `"output_committed"` was a hardcoded literal and is now derived. Reversal conditions in the ledger |
-| **F35, F37, F34, F29, F39** | — | CLOSED |
+| ~~**F45**~~ | ~~`PublicResponseFormat::JsonSchema { name, strict }` — both accepted, both dropped~~ | **CLOSED** `fix/f42-f45-declared-vs-true`. Premise held; **neither field is expressible in rig-core 0.40 on any provider** (`strict: true` hardcoded and unreachable via `additional_params`; `name` derived from the schema's `title`; Anthropic and Gemini have neither field). Resolved **asymmetrically**: `strict` **refused**, `name` **documented**. **PUBLIC CONTRACT CHANGE** — `strict` is now `Option<bool>` and an explicit `false` is `422` on both endpoints; omitted and `true` are unchanged. That is what makes refusing available at all, and F35 was right to decline it while the field was a defaulting `bool`. `name` cannot be refused (required field) and is not smuggled through `title`. OpenAPI counts **hand-verified, unchanged: 152 / 100 / 183** |
+| ~~**F42**~~ | ~~`moira.error.structured_output_invalid` asserts a model-output-non-conformance path that does not exist~~ | **CLOSED** same branch. Premise held: two emitters, both rejecting the *caller's schema*. The near-miss that made it plausible — `memory_extraction::FAILURE_STRUCTURED_OUTPUT_INVALID`, the same string for the missing case — is never returned to a caller, and the description now says so. Fail-hard variant deliberately **not** shipped; F29 still needs two of its three preconditions |
+| ~~**F43**~~ | ~~`ConcurrencyController::acquire` is dead `pub` API; every caller is inside `#[cfg(test)]`~~ | **CLOSED** same branch. **Conclusion refuted, hazard confirmed.** 9 of the 29 callers are in `tests/`, a separate crate, so private/deleted were never available — `pub` in this `publish = false` single-crate workspace means "visible to integration tests", not an external contract. Fixed by removing the *choice*: one `pub acquire`, `is_stream` mandatory, wrapper gone |
+| ~~**F44**~~ | ~~`RuntimeModelHandle::stream` / `RuntimeStreamOutput` are dead `pub` API~~ | **CLOSED** same branch. Premise held exactly; **103 lines deleted**. Not in the finding: that cluster was the sole reason `runtime_factory.rs` imported the runtime-event vocabulary, so deleting it restored the Rig/application boundary |
+| **F35, F37, F34, F29, F39, F46** | — | CLOSED |
 | **F36, F41** | — | REFUTED / wrong as recorded |
 
 **F39 closed 2026-08-02** (`fix/f39-structured-output-capability`). Both divergences verified true,
@@ -409,7 +413,7 @@ start of your task.**
    The same now applies to **GitHub**, added in wave 4B and exercised only against a purpose-built
    mock (no discovery document, no `id_token`, `/user` + `/user/emails`).
 
-### 3.4 Eleven guards that failed — nine toothless, two that pinned the defect
+### 3.4 Twelve guards that failed — ten toothless, two that pinned the defect
 
 **Read this before writing any guard.** Plan 09 produced **six**, every one found by *running the
 mutation* and none by reading the test. **Two were already shipped and trusted.** A seventh followed
@@ -544,6 +548,35 @@ in `tests/runtime_config_invalidation.rs` establishes "the listener has caught u
 it to bracket a cache-*survival* assertion made the guard fail for a reason that had nothing to do
 with the code. It now brackets on the invalidation counter, which moves on every notification
 including the ones that clear nothing.
+
+**A twelfth, from `fix/f42-f45-declared-vs-true`, and its shape is new to this list: the suite
+stated the right principle in its own header and then applied it to half its cases.**
+
+`tests/structured_output.rs` opens by arguing that `execute_rig_stream` is *"a genuinely separate
+code path, and a fix applied at the Rig boundary would cover only case 1"*. That argument is
+correct, and it produced case 2 — the streaming twin of the **conforming** reply. It was never
+applied to the **non-conforming** one. So the cheapest edit that falsifies F42's corrected catalog
+entry — add the fail-hard variant to the streaming arm only — left **all seven** existing cases
+green: case 2 sends conforming JSON and never reaches the branch, and case 4 never streams.
+Verified by running it; the new twin is then the only case that reds.
+
+**The rule this adds: when a suite justifies a case by "this is a separate path", that
+justification applies to every property the suite tests on the other path, not just the one that
+prompted it.** A per-path pairing is a matrix, and this one had a hole in it that the header's own
+reasoning would have filled. It is cheap to check — list the properties, list the paths, look for
+the empty cell — and nothing else in the suite could have found it.
+
+*Two things from the same branch that are not new failures but are worth carrying.* The F43 fix
+was guarded by a test that **already existed and did have teeth** —
+`stream_capacity_is_independent_from_request_capacity` reds alone when the streaming flag stops
+being wired — and it works precisely because it sets `max_concurrent_requests: 2` against
+`max_concurrent_streams: 1`. **Three other fixtures in the same file set both to 1** and could
+never have distinguished the two ceilings: the seventh entry's lesson (a state reached for
+determinism can collapse two quantities into one) sitting in the tree in triplicate, with one
+counter-example that happens to be the one that matters. And for F45, the *only* thing that caught
+the cheapest edit — collapsing an omitted `strict` back into an explicit `false` at the compat
+translation — was a **control** case asserting that the omitted spelling still succeeds. Every
+primary refusal assertion stayed green through it. Controls are not padding.
 
 ---
 

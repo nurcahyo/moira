@@ -2492,10 +2492,10 @@ question being investigated. That clause has now out-produced the questions them
 | ~~**F39**~~ | ~~**The structured-output capability gate cannot see Rig's per-provider reality.**~~ **CLOSED** `fix/f39-structured-output-capability`. Both divergences verified true. Resolved **asymmetrically**, because they are not the same problem: DeepSeek is decidable and is now reconciled out of routing by reading Rig's own `SUPPORTS_RESPONSE_FORMAT`; `OpenAiCompatible`/`Local` is **not decidable at admission** and was deliberately left admitted. See the F39 closure section below. | **CLOSED** |
 | ~~**F40**~~ | ~~**`GET /v1/responses/{id}` returns an empty `output` array for a completed, persisted response.**~~ **PREMISE REFUTED; two adjacent defects found and CLOSED** on `fix/f40-f47-response-output-and-policy-reads`. No persistence configuration reaches the empty array on a completed response, because **`output_persisted` is never `true`** — all three `ResponseTerminalUpdate` constructors hardcode `false`, the column defaults `false`, nothing in `src/` writes `true`. So `Completed` always took the `OutputUnavailable` branch and `Vec::new()` was reached only by `Queued`/`InProgress`/`Failed`/`Cancelled`, where it is correct. What was wrong: the **reason was a lie for three of the four persistence modes**, and `Completed && output_persisted` fell to `[]` — the inversion that produces F40's exact symptom the day content persistence lands. See the F40 closure section below. | **CLOSED** |
 | ~~**F41**~~ | ~~**Skill-tree drift on exactly the guidance F29's implementer needs.**~~ **STRUCK — the inference was wrong.** The `.claude/` copy is a nine-line **pointer file** that says to read the `.agents/` one; all eight `.claude/skills/` entries have that shape. See "F41 is WRONG as recorded" below. | **struck** |
-| **F42** | **i18n overclaim.** `moira.error.structured_output_invalid` asserts "or the model's output does not conform to it". No such path exists. Its description even narrates a prior widening. Becomes true only if the fail-hard variant ships. | **LOW** |
-| **F43** | **`ConcurrencyController::acquire` is dead `pub` API on the concurrency-safety path** — every caller is inside `#[cfg(test)]`. It hardcodes `is_stream: false`, so a future caller reaching for the obvious-looking name on a streaming path silently takes a *request* permit. | **LOW** |
-| **F44** | **`RuntimeModelHandle::stream` / `RuntimeStreamOutput` are dead `pub` API** — ~65 lines duplicating `execute_rig_stream`, kept alive only by a re-export. Divergence hazard: someone fixing streaming will fix one of the two. | **LOW** |
-| **F45** | **`PublicResponseFormat::JsonSchema { name, strict }` — both accepted, both dropped.** Public in `docs/openapi.json`; every destructure site uses `{ schema, .. }`. Rig hardcodes `strict: true` and renames from the schema's `title`. A caller sending `strict: false` gets strict mode, unreported. | **LOW** |
+| ~~**F42**~~ | ~~**i18n overclaim.** `moira.error.structured_output_invalid` asserts "or the model's output does not conform to it".~~ **CLOSED** `fix/f42-f45-declared-vs-true` `871889f`, `4551ba3`. **Premise held.** Enumerated: the code has exactly **two** emitters and both reject the *caller's schema* — `validate_response_format` (over `maximum_schema_bytes`) and `build_completion_request` (not a readable `schemars::Schema`, the only construction site of the class). `classify_completion_error` never produces it, so there is no third route in from the Rig boundary. **The near-miss the finding did not mention, and the reason the sentence was plausible enough to survive:** `memory_extraction::FAILURE_STRUCTURED_OUTPUT_INVALID` is the same string for exactly the missing case, but its own doc says it is never returned to a caller — it lands on `memory_extraction_runs.failure_class` and never renders an i18n message. Description corrected and the fail-hard variant deliberately **not** shipped (F29 needs three preconditions; only F39 has landed). `default_message` was wrong in the same direction and is now *"The structured output schema is invalid."* Two guards added, both from asking §3.4's question of the fix. | **closed** |
+| ~~**F43**~~ | ~~**`ConcurrencyController::acquire` is dead `pub` API** — every caller is inside `#[cfg(test)]`.~~ **CLOSED** `fix/f42-f45-declared-vs-true` `8729068`. **Half right, and the actionable half was wrong.** 29 call sites, every one test code — but **9 are in `tests/cluster_coordination.rs` and `tests/coordination_default_path.rs`, which are separate crates**, so `pub(crate)` and deletion were never available. "Dead `pub` API" in a `publish = false` service crate means "visible to integration tests", not an external contract. **The hazard was the real finding.** Resolved by removing the *choice* rather than the code: the wrapper is gone, `acquire_scoped` is now `pub` and named `acquire`, and there is exactly one admission function which cannot be called without stating `is_stream`. | **closed** |
+| ~~**F44**~~ | ~~**`RuntimeModelHandle::stream` / `RuntimeStreamOutput` are dead `pub` API.**~~ **CLOSED** `fix/f42-f45-declared-vs-true` `f83437c`. **Premise held in every particular**, verified by enumeration: `.stream(` occurs **exactly once** outside `target/` and that occurrence is Rig's own `CompletionModel::stream`; `RuntimeStreamOutput` occurred four times, all of them the method's own definition, return type, construction and re-export. `RuntimeEventSeed` and `next_event` existed only to serve it. 103 lines deleted. **What the finding did not know:** that cluster was the *sole* reason `runtime_factory.rs` imported `RuntimeEventEnvelope`, `RuntimeEventType` and `serde_json::json`; deleting it restored the Rig/runtime-event module boundary. | **closed** |
+| ~~**F45**~~ | ~~**`PublicResponseFormat::JsonSchema { name, strict }` — both accepted, both dropped.**~~ **CLOSED** `fix/f42-f45-declared-vs-true` `b516c4e`. **Premise held.** Neither is expressible in `rig-core` 0.40 on any provider. **Resolved asymmetrically, because the two fields are not the same problem: `strict` is refused, `name` is documented.** `strict` became `Option<bool>` and an explicit `false` is now `422 unsupported_request_option` on both endpoints — a stated **public contract change**. `name` cannot be refused (a required field of the variant) and is not smuggled through the schema's `title`. OpenAPI counts verified by hand and unchanged at **152 / 100 / 183**. | **closed** |
 | **F48** | **A third `output_schema` drop path, latent, and it is silent even on OpenAI.** `should_apply_response_format` (`openai/completion/mod.rs`) is `output_schema.is_some() && supports_response_format && (tools.is_empty() \|\| history_has_tool_result)`. The third clause drops the schema on **turn 1 of any tool-calling conversation, for every OpenAI-family provider**, and unlike the DeepSeek path it emits **no `warn!` at all** — the warning at the same site fires only when `supports_response_format` is false. Cannot bite today: `build_completion_request` hardcodes `tools: Vec::new()`, so `tools.is_empty()` is always true. It becomes live the moment tool calling is enabled, which `.agents/skills/moira-rig-tools/SKILL.md` contemplates. **The F39 fix does not cover it** — F39 reconciles by provider type, and this drop is per-request. Rig documents the caveat itself: *"a turn-1 answer with no tool call is therefore not schema-constrained; `Native` is 'guaranteed' only once tools have run"* (issue #1928). **GUARDED, still latent and still not fixed** (`fix/f38-deadline-usage`). Premise re-verified: `execution.rs:1907` is the tree's **only** `CompletionRequest` construction and still hardcodes `tools: Vec::new()`, and `public.rs` refuses caller-declared tools outright (`unsupported_tool`, *"client-defined tools are not registered in this phase"*), so tools cannot reach the constructor from any direction. The drop behaviour is Rig's and is deliberately unchanged; the guard is `moiras_request_still_carries_its_schema_onto_rigs_openai_wire_body` in `src/application/execution.rs`, which hands Moira's real request to Rig's real encoder and reds the moment `tools` stops being empty. See F49 for why the obvious-looking integration coverage does not substitute for it. | **MEDIUM, latent — guarded** |
 | ~~**F49**~~ | ~~**No integration test in the tree ever builds a request from an agent profile.**~~ **CLOSED** `fix/f49-agent-profile-coverage`. **Premise held, with one correction: the column is `route_definitions.agent_profile_id`, not `routing_policies.agent_profile_id` — `RoutingPolicyRecord` has no such field.** Verified exhaustively: all six typed `RouteDefinitionCreateRequest` sites in `tests/` pass `agent_profile_id: None`, the raw-SQL insert at `tests/public_authorization.rs:693` omits the column, and the seeded `general` route at `migrations/0005_provider_runtime.sql:295` omits it too — so `agent_profile` really was `None` on every end-to-end path. `tests/agent_profile_wire.rs` (6 cases) now attaches a real profile to the fixture's route and asserts on the body that reached the scripted mock. **The branch is correct at the wire**: `preamble` arrives as the leading `system` message, `temperature` and `max_tokens` arrive top-level, caller options win over profile values, and the streaming arm carries the same three. Eight mutations run, each reverted: `preamble: None` (3 red), dropping the `temperature` `or_else` (2 red), dropping the `max_tokens` `or_else` (2 red), inverting both `or_else` orders (**only** the precedence case red — the exact indistinguishability HANDOFF §3.4's seventh entry warns about, and why that case exists), never loading the profile (3 red), **hardcoding the profile's three values into `build_completion_request`** (the no-profile control red — this is the cheapest edit that leaves the primary case green, and the control is the only thing that sees it), a streaming-arm-only rebuild without the profile (**only** the streaming case red, so it is not redundant), and F48's own mutation. **Under F48's mutation only the new `tool_policy` case goes red; the preamble/temperature/max_tokens cases stay green** — they observe a different property, and `tests/structured_output.rs` was re-run under it and stayed green through all seven cases again. **F48's guard is not superseded** and its doc comment now says why. Raised **F50**. | **closed** |
 | ~~**F51**~~ | ~~**The runtime-config invalidation channel is wired to per-request data tables, and `apply_invalidation` ignores its own scope for three of the four things it clears.**~~ **CLOSED** `fix/f51-f52-invalidation-scope` `f97d4f1`. **Premise held in full, and every count in it was right** — 24 tables when counted by trigger *function* (`auth_provider_settings`'s trigger really is named `auth_provider_settings_notify`, so a name-based query returns 23), `conversations` and `memory_records` really do fire on every `INSERT`/`UPDATE`/`DELETE`, and the three `invalidate_all()` calls really were unconditional while only the breaker reset was scoped. **Both candidate fixes taken, because they are independent barriers and the brief was right that they are not exclusive.** (1) `invalidation_plan` now returns an `InvalidationPlan { caches, circuits }` from one parse, and `RUNTIME_DATA_RESOURCE_TYPES` names the resource types that clear no cache; the narrowing is one-way, so an unparseable payload, a non-uuid id or an unrecognised `resource_type` still clears everything and resets every breaker. (2) Migration `0022` drops the trigger from both data tables. **Nothing depends on those two tables notifying**, established three ways: `docs/runtime-cache-invalidation.md` enumerates the invalidation-producing resources and lists neither — the schema drifted from the documented design in `0007`, not the other way round; **no cache in the process is keyed by a conversation or a memory record** (there is no `ConversationCache`/`MemoryCache` anywhere in `src/`), and the three the listener clears hold provider configuration, built provider clients and the enabled auth methods; and `src/infra/db.rs` is the **only** listener on the channel, so there is no other subscriber whose behaviour could change. **The most expensive consequence was under-stated by the original entry's own framing**: the standing justification in `apply_invalidation`'s doc comment was that the caches "rebuild on the next read, so re-reading them costs a query" — true of `RuntimeConfigCache` and `AuthProviderSettingsCache`, **false of `ProviderRuntimeCache`**, which holds built Rig clients with their connection pools and is keyed by a tuple that already contains every version number, so the config-write case it was defending never needed the wipe either. **Five mutations, each reverted.** Reverting the scoping reds the integration guard; **honouring the plan for `cache` but not `runtime_handles`/`auth_settings` — the cheapest edit that preserves the defect — reds it on the handles assertion specifically**, which is why the guard seeds a real `RuntimeModelHandle` and observes all three caches rather than the one that is easy to observe; leaving the trigger attached reds the trigger guard (and showed all three of INSERT/UPDATE/DELETE firing, which is why the test does all three); eating the fail-safe on the unknown arm reds the unit guard. **Under mutation 1 the unit guard stayed green and only the integration guard fired** — the correct-predicate/wrong-wiring split of F16's shape, and the reason both exist. *Reversal condition:* re-attaching either trigger requires deleting that table from `RUNTIME_DATA_RESOURCE_TYPES` in the same change, because a table that has become configuration must not stay classified as data — `every_triggered_table_has_a_scope` asserts `plan.caches` for every triggered table and reds if it is. | **closed** |
@@ -2851,6 +2851,204 @@ own doc comment predicted exactly this.
 / 178 schemas) were **stale** — the tree is at **152 operations / 100 paths / 183 schemas**, which
 is also what `src/http/mod.rs:777` asserts. One line added to `docs/openapi.json`: the
 `PublicResponseFormat` schema description.
+### F42, F43, F44, F45 — **CLOSED** `fix/f42-f45-declared-vs-true` — 2026-08-02
+
+Four LOW findings sharing one shape: *the API declares something it does not do.* Independent
+commits. **All four premises survived verification; one had a wrong conclusion (F43).**
+
+#### F45 — `strict` refused, `name` documented. The public contract changed, deliberately. `b516c4e`
+
+**Can Rig express either? No — established against the vendored crate before deciding.**
+
+| Field | Provider | Verdict |
+|---|---|---|
+| `strict` | OpenAI family | `"strict": true` **hardcoded**, `providers/openai/completion/mod.rs:1838`. Not reachable via `additional_params`: with an `output_schema` present the encoder's object is the `b` argument to `json_utils::merge` and wins |
+| `strict` | Anthropic | `OutputConfig { format: JsonSchema { schema } }` — no strictness field exists |
+| `strict` | Gemini | `response_mime_type` + `response_json_schema` — no strictness field exists |
+| `strict` | DeepSeek | schema dropped before the wire entirely (`SUPPORTS_RESPONSE_FORMAT = false`, F39) |
+| `name` | OpenAI family | derived from the **schema's `title`**, falling back to `"response_schema"` (line 1826) |
+| `name` | Anthropic, Gemini | no name field of any kind |
+
+**The two fields got different answers, and that asymmetry is the decision.**
+
+**`strict` is refused**, following F46. The silent upgrade is not harmless over-delivery:
+`sanitize_schema` promotes **every declared property to `required`**, so a caller's optional
+fields come back mandatory, and OpenAI's strict mode rejects schemas outside its supported
+subset, so a caller who asked for best-effort can receive a provider error. That is measured, not
+argued — `rig_0_40_still_hardcodes_strict_true_and_promotes_optional_properties_to_required`
+sends a schema whose `note` property is optional and reads `required: ["answer","note"]` back off
+the socket.
+
+**PUBLIC CONTRACT CHANGE, weighed as F32 and F46 were.** `strict` is now `Option<bool>`; omitted
+(`null`) and `true` are accepted exactly as before, an explicit `false` is `422
+unsupported_request_option` on the native path and the compat path, streaming and non-streaming.
+**F35 considered this refusal and rejected it** — *"OpenAI's own default for `strict` is falsy, so
+it would refuse the common case"* — and F35 was **right about the field as it then stood**:
+`#[serde(default)] strict: bool` made an omitted `strict` and an explicit `false` the same value.
+Making the field nullable is what makes refusing available, and it is a **restoration rather than
+an invention**: `OpenAiCompatTextFormat` already carried `Option<bool>`, and
+`strict.unwrap_or(false)` in `compat_response_format` was destroying the distinction at the one
+boundary that still had it. It removes a shipped *defect*, not a capability: nobody can depend on
+`strict: false` working, because it never did.
+
+**`name` is documented, not refused, and not honoured.** Refusing is impossible — it is a
+*required* field of the variant, so refusing it refuses every request. Honouring means writing it
+into the schema's `title`, which is the only thing `rig-core` reads: that mutates caller-supplied
+data to pass a value through a field meaning something else — a subtler form of the boundary
+violation F46 refused, abusing the typed field rather than bypassing it — and it works on one
+provider family only, making the contract's truthfulness depend on routing, **which is F46's
+objection #2 verbatim**. Unlike `strict`, `name` has no observable effect on the answer. The
+documentation now points callers at the lever that does work: put it in the schema's `title`.
+
+*Out of scope, and stated so it is not mistaken for an oversight:* `POST
+/api/v1/admin/runtime/diagnose` takes `ExecutionOptions.output_schema` verbatim and never
+constructs a `PublicResponseFormat`, so neither refusal applies there. There is no `strict` field
+on that path to drop — an admin supplying a schema directly is not making a claim Moira is
+ignoring.
+
+*Reversal conditions.* The `strict` refusal becomes an honouring when `rig-core` exposes
+strictness on a typed `CompletionRequest` seam — not `additional_params` — for **every**
+`ProviderType` Moira routes to; a release in which the OpenAI encoder reads a strictness input
+instead of hardcoding `true` *and* Anthropic and Gemini gain an equivalent is the concrete
+trigger. `name` becomes honourable on the same all-providers condition, for a response-format
+name. Partial support is not enough for either: routing-dependent semantics on a public API is
+the failure mode both refusals exist to avoid. **Both triggers are mechanical**, not a diary
+note: `rig_0_40_still_hardcodes_strict_true_and_promotes_optional_properties_to_required` reds
+when either fact changes, and its message says so.
+
+*OpenAPI:* regenerated. Counts **verified by hand from the committed document** and unchanged —
+**152 operations / 100 paths / 183 schemas**, which is what `src/http/mod.rs:777` asserts. The
+only drift was `PublicResponseFormat`'s description, two new property descriptions, and
+`strict`'s type becoming `["boolean","null"]` and leaving `required`.
+
+*Six mutations, each reverted, each run:*
+
+| Mutation | Result |
+|---|---|
+| **M1** — blind both refusal layers | **RED**, F45 verbatim: `got 200 OK` … `"status":"completed"` on a `strict: false` request. All three wiring cases |
+| **M2** — remove the `prepare_execution` layer only | **GREEN**, property held — `validate_request` still refuses |
+| **M3** — remove the `validate_request` layer only | **GREEN**, property held — `prepare_execution` still refuses |
+| **M4** — the *plausible alternative fix*: map `strict: Some(false)` to `output_schema: None` instead of refusing | **RED.** No bad schema reaches the provider under M4, so a guard asserting "the wrong schema is absent from the wire" would have passed while the caller still got a 200 for a request Moira cannot honour. Asserting on the **refusal** is what gives it teeth — F46's lesson, re-earned |
+| **M5** — the cheapest edit: `strict.or(Some(false))` at the compat translation, restoring the old collapse of omitted-into-false | **RED, and only the omitted-`strict` CONTROL reds.** Every primary refusal assertion stays green. This is why the controls exist |
+| **M6** — refuse the whole `json_schema` variant (the classic cheap green) | **RED** in 5 wiring cases *and* the predicate, which reports `an omitted strict must stay honoured — it is the common case` |
+
+M2/M3 green is the intended relationship, not a toothless guard: neither single edit reintroduces
+the defect, and the guards assert the property rather than the implementation.
+
+#### F42 — the string described a path that does not exist; corrected, not widened. `871889f`, `4551ba3`
+
+**Premise held.** Two emitters, both rejecting the *caller's schema*:
+`validate_response_format` (over `maximum_schema_bytes`) and `build_completion_request` (not a
+readable `schemars::Schema`) — the latter being the **only** construction site of
+`ExecutionFailureClass::StructuredOutputInvalid`. `classify_completion_error` never produces the
+class, so nothing arrives from the Rig boundary either.
+
+**The near-miss the finding did not mention.** `memory_extraction::FAILURE_STRUCTURED_OUTPUT_INVALID`
+is the identical string for exactly the case the description claimed — a model reply that does
+not parse. It is *not* a counter-example, because its own doc comment says it is never returned
+to a caller: it lands on `memory_extraction_runs.failure_class` and never renders an i18n
+message. The corrected description says this explicitly, so the next reader does not "fix" the
+wording back by pointing at it.
+
+**The fail-hard variant was deliberately not shipped.** F29's reversal condition needs all three
+of: F39 landed (true), `StructuredOutputInvalid` given a retry/fallback disposition (still
+false — the mutation output confirms `retryable: false, fallback_eligible: false`), and
+`run_extraction` reading `execution.status` (still false).
+
+`default_message` was wrong in the same direction and was changed too: *"The structured output is
+invalid."* points at the model on a path that only ever rejects the caller's schema. It is now
+*"The structured output schema is invalid."*
+
+*Guards, and the two gaps that asking §3.4's question found:*
+
+1. **The corrected description is a claim about the code, and nothing observed it.**
+   `docs_mirror_matches_rust_catalog` proves only that the Rust catalog and the JSON mirror
+   agree — they can be wrong together, and were. So a **third emitter** added anywhere (a
+   tool-argument validator raising the same code for a non-conforming *reply* is the obvious
+   one) falsifies the description with every test green.
+   `structured_output_invalid_has_only_the_two_emitters_its_catalog_entry_describes` derives the
+   emitter set by walking `src/` and **parsing calls** — not matching mentions, which would
+   harvest doc comments — in both spellings the code reaches a client. It is honest about its
+   limit: it cannot prove prose true, it makes prose unable to rot silently.
+2. **The suite's own header argues that `execute_rig_stream` is a separate path, then does not
+   apply that argument to the non-conforming reply.** Adding the fail-hard variant to the
+   **streaming arm only** left all seven existing cases green — case 2 sends conforming JSON and
+   never reaches the branch, case 4 never streams. Verified by running it.
+   `a_stream_whose_reply_is_not_json_leaves_the_field_null_and_still_succeeds` is the missing
+   twin, and under that mutation it is the **only** case that reds.
+
+*Mutations:* reverting the mirror description reds `docs_mirror_matches_rust_catalog` naming the
+field; renaming the `AppError` code in `public.rs` and adding a third emitter in
+`runtime_factory.rs` each red the new inventory test in the correct direction; the fail-hard
+variant reds the completion case, and the streaming-only fail-hard reds the new stream case
+alone. Both behavioural reds print a message naming **both** catalog files.
+
+*Reversal condition:* the description is widened when the fail-hard variant ships, i.e. when all
+three of F29's preconditions hold. The two behavioural guards are the trigger — they red on that
+change and their failure messages say which files to edit.
+
+#### F43 — the finding's conclusion was wrong; the hazard it named was real. `8729068`
+
+**"Every caller is inside `#[cfg(test)]`" is true only if `tests/` counts as `#[cfg(test)]`.**
+Enumerated: 29 call sites, all test code — 20 in `controls.rs`'s two `#[cfg(test)]` modules and
+**9 in `tests/cluster_coordination.rs` and `tests/coordination_default_path.rs`, which are
+separate crates and genuinely require a `pub` entry point.** So the implied remedies — make it
+private, delete it — were never available. It is also worth stating once for the next
+dead-`pub`-API finding: this crate is `publish = false` and is the only crate in the workspace,
+so `pub` here means "visible to integration tests", not an external contract.
+
+**The hazard was real and is what got fixed.** `acquire` supplied `is_stream: false` and
+`provider_stream_limit = provider_limit` itself, and it was the shorter, more obvious name than
+`acquire_scoped` — the one a future streaming caller reaches for, silently taking a *request*
+permit and leaving `max_concurrent_streams` unenforced. **The fix removes the choice, not the
+code:** `acquire_scoped` is now `pub` and named `acquire`, the wrapper is gone, and there is one
+admission function that cannot be called without stating which ceiling is wanted.
+`CapacityExhaustion`/`CapacityScope` became `pub` because that entry point returns the type that
+*names* the ceiling — strictly more information than the wrapper's `ExecutionFailure`, which had
+already discarded it. Production behaviour is unchanged: `execute_attempt` already called
+`acquire_scoped` with the real `command.options.stream`.
+
+*The guard already existed and has teeth.* `stream_capacity_is_independent_from_request_capacity`
+in `tests/execution_lifecycle.rs` runs `max_concurrent_requests: 2` against
+`max_concurrent_streams: 1` — two **distinct** numbers, so the ceilings stay distinguishable,
+which is not true of the three other fixtures in that file that set both to 1 and therefore could
+never have seen this. **Mutation: pass `false` instead of `command.options.stream` at the one
+production call site. It is the only test in the suite that reds**, with `left: Succeeded, right:
+Failed` — a second stream admitted against a ceiling of 1, F43's hazard exactly.
+
+*What stops it coming back:* **nothing mechanical, and that is stated in the code.** No lint
+catches a new four-argument convenience wrapper — it would have test callers immediately, which
+is precisely how the old one survived. What changed is that the obvious name is now taken by the
+function that demands the answer, and the wiring is guarded.
+
+#### F44 — deleted; the hazard was divergence, and it is gone by construction. `f83437c`
+
+**Premise held in every particular, verified by enumeration over the whole tree.** `.stream(`
+occurs **exactly once** outside `target/`, at `runtime_factory.rs:347`, and that occurrence is
+Rig's own `CompletionModel::stream` inside `start_stream_with_model` —
+`RuntimeModelHandle::stream` had **zero** callers. `RuntimeStreamOutput` occurred four times: its
+definition, its use as that method's return type, its construction inside it, and the re-export.
+`RuntimeEventSeed` and `next_event` existed only to serve it. Nothing in `tests/`, `docs/` or the
+skills references any of them, and nothing outside the crate can. **103 lines removed.**
+
+**What the finding did not know, and it sharpens the case:** that cluster was the *sole* reason
+`runtime_factory.rs` imported `RuntimeEventEnvelope`, `RuntimeEventType` and `serde_json::json`.
+With it gone the file compiles without the runtime-event vocabulary at all — Rig primitives in
+the factory, runtime events in the application layer, which is the boundary
+`moira-rig-integration` describes.
+
+*Which one to keep was not a coin flip, and it was measured.* Deleting all 103 lines left the
+build and every suite green — nothing linked to them. A one-line mutation to the **surviving**
+`execute_rig_stream` (dropping `text.push_str(&delta)`) reds two integration tests immediately.
+The surviving loop is also the one carrying idle timeouts, backpressure, cancellation, TTFT
+metrics and `mark_output_committed`; the duplicate had none of them, which is the divergence
+hazard stated concretely.
+
+*What stops it coming back:* **nothing mechanical, stated as such in the surviving function's doc
+comment.** `dead_code` cannot see it — `pub` items in a library crate are exempt from that lint
+whether or not anything calls them, which is exactly how ~95 lines survived. A source-scan
+pretending otherwise would be a guard written to have a guard, which is what §3.4 is a list of.
+
 ### F29 — **CLOSED** `fix/f29-structured-output`. Gated parse in `execution.rs`, not at the Rig boundary — 2026-08-02
 
 **One parse site, `structured_output_from_text` in `src/application/execution.rs`, called from both
