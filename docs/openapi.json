@@ -5570,6 +5570,82 @@
         ],
         "type": "string"
       },
+      "OpenAiCompatTextFormat": {
+        "description": "The `text.format` discriminated union.\n\n`json_object` is declared so it can be *named* in the refusal rather than rejected as an\nunknown variant; the translation itself refuses it. See\n`application::public::openai_compat_to_public_request`.",
+        "oneOf": [
+          {
+            "properties": {
+              "type": {
+                "enum": [
+                  "text"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "type": {
+                "enum": [
+                  "json_object"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "schema": {},
+              "strict": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "type": {
+                "enum": [
+                  "json_schema"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "schema",
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "OpenAiCompatTextOptions": {
+        "additionalProperties": false,
+        "description": "OpenAI's `text` object on the Responses API, narrowed to what Moira actually honours.\n\nIt is typed rather than `Value` on purpose. `OpenAiResponseCompatRequest` carries\n`deny_unknown_fields`, so an *undeclared* `text` would have been an honest 422; declaring\nit as a free-form `Value` and reading nothing turned that refusal into a silent no-op\n(F35), and published `\"text\": {}` in `docs/openapi.json` as if any shape were supported.\nEvery key Moira cannot honour is therefore absent from this type, so serde refuses it.",
+        "properties": {
+          "format": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OpenAiCompatTextFormat"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
       "OpenAiResponseCompatRequest": {
         "additionalProperties": false,
         "properties": {
@@ -5599,7 +5675,16 @@
               "null"
             ]
           },
-          "text": {}
+          "text": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OpenAiCompatTextOptions"
+              }
+            ]
+          }
         },
         "required": [
           "input"
@@ -28912,6 +28997,7 @@
     },
     "/v1/responses": {
       "post": {
+        "description": "OpenAI Responses compatibility adapter. `text.format` is honoured: `text` maps to the native `response_format`, `json_schema` carries the caller's schema through, and `json_object` is refused with 422 `unsupported_request_option` because Moira would constrain the output to the empty object rather than to free-form JSON. Any `text` key Moira does not honour — including `verbosity` — is refused rather than ignored. Honouring a schema makes the request a structured-output request, so it becomes subject to the application's `structured_output_enabled` policy and the model's `structured_output` capability. This endpoint carries no route field and always resolves through the default route. See docs/openai-compatibility.md.",
         "operationId": "openai_responses_compat",
         "parameters": [
           {
@@ -29038,7 +29124,7 @@
                 }
               }
             },
-            "description": "Request violates execution policy",
+            "description": "Request violates execution policy, or carries a `text.format` Moira will not honour",
             "headers": {
               "X-Request-Id": {
                 "description": "Request correlation identifier",
