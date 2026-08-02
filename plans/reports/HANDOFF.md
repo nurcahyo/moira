@@ -104,6 +104,44 @@ applied to the very tool built to defeat form 1). Redirect to a file instead. Th
 `ALL GATES PASSED` is emitted only when the failures array is empty, so it is a sounder signal than
 `$?` in every case where the two could disagree.
 
+### 2.2a You may not be the only Claude session on this repo
+
+**Discovered 2026-08-02 the expensive way.** A coordinator briefed its agent "you are the only agent
+running gates". That was false: a *second Claude Code session* was running its own agents on the same
+checkout. Load average peaked at **96**, and two gate runs failed on timing-sensitive concurrency
+tests (`a_concurrent_summarization…`, `concurrent_key_create…`) with no relationship to the change
+under test. A coordinator cannot see another session's agents in its own context — it can only see
+their artifacts.
+
+**Check for peers before claiming exclusivity, and before deleting anything:**
+
+```bash
+git worktree list                     # worktrees under a DIFFERENT session id are not yours
+pgrep -f 'scripts/gates\.sh'          # a live gate run, whoever owns it
+gh pr list --state open               # PRs you did not open
+uptime                                # load >20 means you are not alone
+```
+
+**Never delete a target directory you did not create.** `scripts/reclaim.sh` L1 walks
+`$TARGET_ROOT/*/debug/incremental` and would drop a *peer's* cache mid-build. Under contention,
+reclaim only your own, and prefer waiting.
+
+**`pgrep -fc 'cargo-targets/moira-<name>'` is a FALSE NEGATIVE.** `CARGO_TARGET_DIR` is an
+*environment variable* — it never appears in a cargo process's argv, so this reports "clear" while a
+peer's gate run is live. It is form 10's cousin: a peer check that always passes. Key on
+`pgrep -f 'scripts/gates\.sh$'` or on a recorded PID.
+
+### 2.2c Form 9 is broader than documented: the hook rewrites `grep` and `tail` too
+
+The `rtk` `PreToolUse` hook does not only rewrite `cargo`. Observed 2026-08-02: a `grep` over the
+ledger returned rtk's *summary* (`3496 matches in 589F`) instead of the matching lines, and a
+`tail -3` was rewritten into `/usr/bin/read`.
+
+So a search can silently return a digest of the answer rather than the answer — and a coordinator
+reading that digest may conclude a symbol is absent when it is present, or miss the second of two
+call sites. **Wrap `grep`/`tail` in a script file whenever the exact output matters**, the same way
+`cargo` already must be. The immunity rule is unchanged: the hook only sees the outer command.
+
 ### 2.2b `scripts/gates.sh` CANNOT run concurrently with another gates run
 
 Found 2026-08-01, after two runs sat **wedged for 40+ minutes**.
@@ -114,6 +152,13 @@ own digest. Two runs with different migration sets therefore sweep each other in
 shared template locks for live fixtures blocks another's exclusive request, while its own next
 fixture queues behind that exclusive request. Clear it with `pg_terminate_backend` on the idle lock
 holders.
+
+**The memory signal to watch is SWAP, not `vm_stat` free.** Measured 2026-08-02 with three
+concurrent `cargo test --workspace` runs: `vm_stat` reported **13 MB free** while
+`memory_pressure` said **34% free** — the free page list is not the constraint on macOS. What was
+genuinely nearly exhausted was swap: **15.5 GB used of 16 GB, 903 MB left**. An earlier note here
+recorded "~56 MB free" as the OOM threshold; that used the misleading metric. Check
+`sysctl vm.swapusage` and `memory_pressure`, and treat swap above ~90% as the stop signal.
 
 **Consequence for the loop: serialise gate runs.** Parallel agents are fine while they are reading,
 designing, or editing — but only one may be in `scripts/gates.sh` at a time. Stagger them, or give an
@@ -299,8 +344,17 @@ once. Current state of everything above F28:
 | **F46** | `response_format: {"type":"json_object"}` reaches the provider as a schema satisfied only by `{}` — the caller gets the **opposite** of free-form JSON, with `200 succeeded` | open, in flight `fix/f46-json-object-format` |
 | **F47** | `get_or_create_*_policy` are `insert … on conflict do update`, i.e. **reads that write**. One conversation-linked turn rewrites two policy rows **three times**, and takes a row lock that serialises concurrent turns of the same application | open. Fix is `on conflict do nothing` + `select`, across the whole `get_or_create_*` family |
 | **F30** | `application_memory_policies.consent_mode` and `application_conversation_policies.memory_consent_mode` are independent, both default `'explicit_only'`, and nothing reconciles them | open. Sub-Phase F takes the **stricter of the two** (D4), but the schema divergence remains. *The shape that hides:* they agree in every default deployment and diverge exactly when an operator tightens one |
-| **F35, F37, F34, F29** | — | CLOSED |
+| **F48** | **A third `output_schema` drop path, and it is silent even on OpenAI.** Rig also requires `tools.is_empty() \|\| history_has_tool_result`, so the schema is dropped on turn 1 of any tool-calling conversation with **no `warn!` at all** — the warning at that site fires only for the DeepSeek case. Latent only because `build_completion_request` hardcodes `tools: Vec::new()`; it goes live the day tool calling is enabled. **F39's fix does not cover it** — that reconciles per provider type, this drop is per request | open, latent |
+| **F35, F37, F34, F29, F39** | — | CLOSED |
 | **F36, F41** | — | REFUTED / wrong as recorded |
+
+**F39 closed 2026-08-02** (`fix/f39-structured-output-capability`). Both divergences verified true,
+and fixed **asymmetrically because they are not the same problem**: DeepSeek is decidable — Moira
+now reads Rig's own `SUPPORTS_RESPONSE_FORMAT` associated const rather than restating it, so a
+`rig-core` bump cannot silently rot the answer — while `OpenAiCompatible`/`Local` is **undecidable
+at admission** (Rig does send the schema; whether a self-hosted backend honours it is unknowable)
+and is deliberately still admitted. Unblocks **one of the three** preconditions F29's reversal
+condition names, so **the lenient parse stays** — see the ledger's F39 section.
 
 **Finding IDs are allocated concurrently and have collided three times.** `F22` and `F28` each name
 **two** unrelated findings; `F21` has two entries; F27 was written as F26 until #47 claimed it.
