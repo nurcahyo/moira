@@ -2579,14 +2579,23 @@ mod tests {
     ///    Rig's own public conversion, configured (`supports_response_format: true`,
     ///    `supports_tools: true`) exactly as the OpenAI family is.
     ///
-    /// **Measured, not assumed: this case is the only coverage of the edit in point 1.** The
+    /// **Measured, not assumed: this case is the only coverage of the *drop* in point 1.** The
     /// mutation above was run against the whole suite, and `tests/structured_output.rs` — which
     /// reads `response_format.type` off the body that actually reached a mock provider, and which
-    /// looks like it should be the stronger guard — stayed **green** through it. Every fixture in
-    /// the tree sets `routing_policies.agent_profile_id = NULL`, so `agent_profile` is `None` on
-    /// every integration path and no end-to-end test has ever built a request from a profile at
-    /// all. Those wire tests catch an *unconditional* tool list and nothing else. Do not delete
-    /// this case in favour of them.
+    /// looks like it should be the stronger guard — stayed **green** through it. At the time,
+    /// every fixture in the tree left `route_definitions.agent_profile_id` NULL, so
+    /// `agent_profile` was `None` on every integration path and no end-to-end test had ever
+    /// built a request from a profile at all. (The column is on `route_definitions`;
+    /// `RoutingPolicyRecord` has no such field, and F48's original wording said
+    /// `routing_policies`. Corrected under F49.)
+    ///
+    /// **`tests/agent_profile_wire.rs` (finding F49) now closes that fixture hole, and it still
+    /// does not replace this case.** Its
+    /// `an_agent_profiles_tool_policy_does_not_become_a_tool_list_on_the_wire` does go red under
+    /// the same mutation — but it reds saying *tools appeared on the wire*, which is not the
+    /// dangerous half. No case in that file sends an `output_schema`, so none of them can
+    /// observe `response_format` disappearing alongside the tools. This case is the only one
+    /// that names the silent drop. Do not delete it in favour of either suite.
     ///
     /// The one gap that remains: a tool list attached to the request *after*
     /// `build_completion_request` returns, between the build and `handle.completion(request)`.
