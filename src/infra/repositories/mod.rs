@@ -3,6 +3,10 @@ mod auth_settings;
 mod cluster;
 mod conversation;
 mod identity;
+// F47. The auto-provisioning read behind every `get_or_create_*_policy`, in one place
+// because the five members live in two repositories and had drifted into two different
+// wrong answers — four that wrote on every read, one that raced on first touch.
+mod policy_row;
 mod public;
 mod runtime;
 mod setup;

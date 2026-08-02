@@ -279,7 +279,10 @@ merged in the final cycle, each CI-verified with every job running steps:
 | #44 | F6 — allow-list on the OTLP bridge | `f2c24a8` |
 
 Migrations end at **`0020`** (next free `0021`; `0016` is a permanent gap). OpenAPI is stable at
-**151 operations / 99 paths / 178 schemas**.
+**152 operations / 100 paths / 183 schemas** — corrected 2026-08-02, re-derived from
+`docs/openapi.json` itself. This line said 151/99/178 for two cycles after it stopped being true;
+the ledger's cycle-14 entry already carried the correction and this one did not, which is how the
+wrong numbers kept reaching briefs. **Derive them, do not copy them.**
 
 ### 3.2 Open findings
 
@@ -360,7 +363,10 @@ once. Current state of everything above F28:
 | **F33** | Five encryption-at-rest columns exist in `migrations/0007` and **nothing in `src/` writes or reads any of them** | **ESCALATED, human-only.** Envelope encryption is key custody, key rotation and plan 11's open Decision 3 — a scoping question, not an implementation gap. **Do not "finish" it autonomously** |
 | **F32** | `conversation_content_persistence` protected nothing — `'none'` still stored full plaintext | fixed on `fix/f32-content-persistence`, **PR #57, deliberately NOT auto-merged**: the 422 on the previously-accepted `encrypted_content` breaks any IaC that sets it. Loudly, which is the point — but that deserves human sight |
 | **F46** | `response_format: {"type":"json_object"}` reaches the provider as a schema satisfied only by `{}` — the caller gets the **opposite** of free-form JSON, with `200 succeeded` | open, in flight `fix/f46-json-object-format` |
-| **F47** | `get_or_create_*_policy` are `insert … on conflict do update`, i.e. **reads that write**. One conversation-linked turn rewrites two policy rows **three times**, and takes a row lock that serialises concurrent turns of the same application | open. Fix is `on conflict do nothing` + `select`, across the whole `get_or_create_*` family |
+| ~~**F47**~~ | ~~`get_or_create_*_policy` are `insert … on conflict do update`, i.e. **reads that write**~~ | **CLOSED** `fix/f40-f47-response-output-and-policy-reads`. Finding right and **understated**: a "read" also **bumped `version`** (the `If-Match` ETag) and fired `pg_notify('moira_runtime_config')`, which makes every replica drop its runtime-config *and provider-handle* caches — three times per conversation-linked turn. Family is **five**, not two; the fifth (`get_or_create_application_execution_policy`) already read first and so had **no** write amplification — and no `on conflict` clause either, so it raced and returned a duplicate-key error on the hot path of every `POST /v1/responses`. The brief's warning that the row lock "makes that race impossible" was **inverted** for that member. Six mutations; the `select … for update` one left the first guard green and earned a fifth case. Raised **F51** |
+| **F40** | ~~`GET /v1/responses/{id}` returns an empty `output` for a completed, persisted response~~ | **PREMISE REFUTED, two adjacent defects CLOSED**, same branch. `output_persisted` is never `true` anywhere, so `Completed` always explained itself and `[]` was reached only by non-completed statuses, where it is right. Real defects: the reason was the literal `"metadata_only_persistence"` for **all four** persistence modes, and `Completed && output_persisted` fell to `[]`. Public shape unchanged (`reason` is an unconstrained string; snapshot byte-identical) |
+| **F51** | The `moira_runtime_config` channel is attached to **`conversations` and `memory_records`**, not only config tables, and `apply_invalidation` calls three `invalidate_all()`s **unconditionally** — only the breaker reset respects `circuit_reset_scope`. One conversation created drops every replica's runtime cache and every provider client handle | open. **F47's fix does not close it** — F47 removed the *spurious* notifications; these come from legitimate writes |
+| **F52** | **A shipped, trusted guard whose list is retyped rather than pinned, and it has already drifted.** `0003`'s `alter table providers rename to legacy_providers` carried the notify trigger with it, so three `legacy_*` tables fire `moira_runtime_config` and `circuit_reset_scope` classifies none of them — `CircuitResetScope::All`, every breaker on every replica. `every_triggered_table_has_a_scope` claims to pin the classifier "against the trigger list in `migrations/`" and instead retypes 21 names against the schema's 24, omitting exactly the three that fail | open, **latent** — nothing in `src/` touches those tables. Fix shape: derive the inventory from `pg_trigger` |
 | **F30** | `application_memory_policies.consent_mode` and `application_conversation_policies.memory_consent_mode` are independent, both default `'explicit_only'`, and nothing reconciles them | open. Sub-Phase F takes the **stricter of the two** (D4), but the schema divergence remains. *The shape that hides:* they agree in every default deployment and diverge exactly when an operator tightens one |
 | **F48** | **A third `output_schema` drop path, and it is silent even on OpenAI.** Rig also requires `tools.is_empty() \|\| history_has_tool_result`, so the schema is dropped on turn 1 of any tool-calling conversation with **no `warn!` at all** — the warning at that site fires only for the DeepSeek case. Latent only because `build_completion_request` hardcodes `tools: Vec::new()`; it goes live the day tool calling is enabled. **F39's fix does not cover it** — that reconciles per provider type, this drop is per request | **latent, now GUARDED, behaviour deliberately unchanged.** Premise re-verified: that constructor is the tree's only `CompletionRequest`, and `public.rs` refuses caller-declared tools outright. `moiras_request_still_carries_its_schema_onto_rigs_openai_wire_body` reds on the precondition |
 | **F49** | **No integration test ever built a request from an agent profile** — every fixture left `agent_profile_id` NULL, so `preamble`/`temperature`/`max_tokens`/`tool_policy` were unverified at the wire | **CLOSED** `fix/f49-agent-profile-coverage`. Premise held; the column is on `route_definitions`, not `routing_policies`. `tests/agent_profile_wire.rs` now builds from a real profile and reads the mock's body. **The branch is correct at the wire.** Eight mutations run. Under F48's mutation only the new `tool_policy` case reds — **F48's guard is not superseded.** Raised F50 |
@@ -402,11 +408,13 @@ start of your task.**
    The same now applies to **GitHub**, added in wave 4B and exercised only against a purpose-built
    mock (no discovery document, no `id_token`, `/user` + `/user/emails`).
 
-### 3.4 Nine guards that failed — seven toothless, two that pinned the defect
+### 3.4 Eleven guards that failed — nine toothless, two that pinned the defect
 
 **Read this before writing any guard.** Plan 09 produced **six**, every one found by *running the
 mutation* and none by reading the test. **Two were already shipped and trusted.** A seventh followed
-on 2026-08-02, in a *replacement* guard written by an agent who had read this section first.
+on 2026-08-02, in a *replacement* guard written by an agent who had read this section first. A
+**tenth** followed later the same day, in a *brand-new* guard written by an agent who had read this
+section first and had already asked its question — see the end of this section.
 
 | Guard | Why it could not fire |
 |---|---|
@@ -441,7 +449,7 @@ just made indistinguishable from each other.* Determinism and discrimination pul
 directions, and this one was noticed only because the mutation was run anyway.
 
 **An eighth and a ninth, from `fix/f38-deadline-usage` — both already shipped and trusted.** That
-brings the shipped-and-trusted count to **four**.
+brings the shipped-and-trusted count to **four**, and an eleventh below takes it to **five**.
 
 | Guard | Why it could not fire |
 |---|---|
@@ -452,6 +460,59 @@ The lesson from the first: **"it asserts on the real wire" is not the same as "i
 you changed."** Before trusting an end-to-end guard, check that its fixture populates the input
 your edit reads. The lesson from the second is §3.4's existing one, now twice-earned: a content
 literal in a test is code, and it can pin a defect just as firmly as an assertion can guard one.
+
+**A tenth, from `fix/f40-f47-response-output-and-policy-reads` — caught before merge, and a shape
+not yet on this list: the fix removed two coupled things and the guard observed only one.**
+
+F47's `on conflict do update` was both **a write** and **a row lock**. The guard asserted on the
+write, three ways — `xmin`, `version`, and the absence of a `moira_runtime_config` notification —
+which felt exhaustive because those are three independent observations of the same event. They
+are three observations of *one* of the two things being removed. Adding `for update` to the
+replacement `select` restores the serialisation with **no** new tuple version, **no** `version`
+bump and **no** notification, and left every one of those assertions green. Verified by running
+it, after the question had already been asked and the guard judged sound — the same sequence as
+the seventh.
+
+**The rule this adds: when a fix removes a construct, enumerate everything that construct was
+doing, and check the guard covers each one separately.** Three assertions on one consequence are
+one assertion. `do update` was doing two jobs; the guard needed a case per job, and
+`a_policy_read_does_not_wait_for_a_row_lock` is the second.
+
+A corollary that also came out of that suite, and is cheap everywhere: **an assertion that
+nothing happened is worthless unless something *can* happen.** The no-notification case now
+performs a real write on the same listener immediately afterwards and requires *that* to be
+announced. Without it the assertion would have held equally against a database with the triggers
+dropped or a listener on the wrong channel — F16's shape, in a new place.
+
+**An eleventh, found the same day and the worst of the shipped-and-trusted set, because it is a
+guard whose entire job is drift detection and it had already drifted. Recorded as F52, not
+fixed.**
+
+`every_triggered_table_has_a_scope` in `src/infra/db.rs` proves every table wired to
+`moira_runtime_config` classifies to something other than `CircuitResetScope::All` — an
+unclassified table means a write to it discards every provider's earned breaker health on every
+replica. Its doc comment says: *"the list is pinned here against the trigger list in
+`migrations/`."*
+
+**It is not pinned. It is retyped** — 21 table names as a Rust array literal, checked against a
+schema that has **24**. The three it omits are `legacy_providers`, `legacy_routing_policies` and
+`legacy_provider_credentials`, created by migration `0003`'s
+`alter table providers rename to legacy_providers`, which **carries the trigger with it**. All
+three fall to the classifier's `other =>` arm. The guard passes, and has always passed, because
+it is comparing the classifier to a copy of the classifier.
+
+**The rule: a guard that pins X against a hand-written list of X is not a guard, it is a
+duplicate.** The inventory must come from an independent source — `pg_trigger`,
+`information_schema`, `read_dir`, the generated document — or the guard only proves the author
+typed the same thing twice. This project already gets it right in three places
+(`suites_opening_the_shared_database` scans the filesystem, `if_match_inventory` reads the
+generated OpenAPI, and `MINIMUM_SUITES_SCANNED` floors the scan against an empty set), and
+`tests/policy_reads_do_not_write.rs` was given the same treatment on this branch for exactly this
+reason — `POLICY_TABLES` is pinned against `information_schema`, so a sixth policy table reds it.
+
+Note the shape it shares with the seventh and tenth: **all three were sound at the moment they
+were written and were falsified by a later change elsewhere** — a migration that renamed a table,
+a fix that removed two coupled behaviours. Guards rot in the direction of passing.
 
 ---
 

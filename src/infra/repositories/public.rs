@@ -19,6 +19,21 @@ use crate::{
     security::IdempotencyHasher,
 };
 
+use super::policy_row::get_or_create_policy_row;
+
+/// The execution-policy projection, spelled out rather than `*`.
+///
+/// Named because [`get_or_create_policy_row`] interpolates it into two statements and both
+/// must agree: a `select` and a `returning` that disagreed on columns would fail only on
+/// whichever path happened to run second.
+const APPLICATION_EXECUTION_POLICY_COLUMNS: &str = "id, application_id, responses_enabled, \
+     streaming_enabled, tools_enabled, vision_enabled, structured_output_enabled, \
+     caller_system_instructions_allowed, model_overrides_allowed, route_overrides_allowed, \
+     provider_overrides_allowed, credential_overrides_allowed, timeout_overrides_allowed, \
+     persistence_mode, response_retention_seconds, maximum_request_bytes, maximum_input_items, \
+     maximum_output_tokens, maximum_timeout_ms, rate_limit_requests_per_minute, \
+     rate_limit_streams_per_minute, metadata, updated_at, version";
+
 #[derive(Debug, Clone)]
 pub struct PgPublicRepository {
     pool: PgPool,
@@ -197,49 +212,21 @@ impl PgPublicRepository {
 
 #[async_trait]
 impl PublicRepository for PgPublicRepository {
+    /// F47. This member never had the other four's write amplification — it already read
+    /// first — but its insert carried no `on conflict` clause, so two concurrent first
+    /// requests for a new application raced and one failed with a duplicate-key error on
+    /// the hot path of `POST /v1/responses`. [`super::policy_row`] closes that without
+    /// reintroducing a write on the steady-state path.
     async fn get_or_create_application_execution_policy(
         &self,
         application_id: Uuid,
     ) -> Result<ApplicationExecutionPolicyRecord, AppError> {
-        if let Some(row) = sqlx::query(
-            r#"
-            select id, application_id, responses_enabled, streaming_enabled, tools_enabled,
-                   vision_enabled, structured_output_enabled,
-                   caller_system_instructions_allowed, model_overrides_allowed,
-                   route_overrides_allowed, provider_overrides_allowed,
-                   credential_overrides_allowed, timeout_overrides_allowed,
-                   persistence_mode, response_retention_seconds, maximum_request_bytes,
-                   maximum_input_items, maximum_output_tokens, maximum_timeout_ms,
-                   rate_limit_requests_per_minute, rate_limit_streams_per_minute,
-                   metadata, updated_at, version
-            from application_execution_policies
-            where application_id = $1
-            "#,
+        let row = get_or_create_policy_row(
+            &self.pool,
+            "application_execution_policies",
+            APPLICATION_EXECUTION_POLICY_COLUMNS,
+            application_id,
         )
-        .bind(application_id)
-        .fetch_optional(&self.pool)
-        .await?
-        {
-            return application_execution_policy_record_from_row(&row);
-        }
-
-        let row = sqlx::query(
-            r#"
-            insert into application_execution_policies (application_id)
-            values ($1)
-            returning id, application_id, responses_enabled, streaming_enabled, tools_enabled,
-                      vision_enabled, structured_output_enabled,
-                      caller_system_instructions_allowed, model_overrides_allowed,
-                      route_overrides_allowed, provider_overrides_allowed,
-                      credential_overrides_allowed, timeout_overrides_allowed,
-                      persistence_mode, response_retention_seconds, maximum_request_bytes,
-                      maximum_input_items, maximum_output_tokens, maximum_timeout_ms,
-                      rate_limit_requests_per_minute, rate_limit_streams_per_minute,
-                      metadata, updated_at, version
-            "#,
-        )
-        .bind(application_id)
-        .fetch_one(&self.pool)
         .await?;
         application_execution_policy_record_from_row(&row)
     }
