@@ -8364,6 +8364,7 @@
           "execution_started",
           "routing_started",
           "route_selected",
+          "agent_profile_unavailable",
           "model_selected",
           "provider_attempt_started",
           "output_text_delta",

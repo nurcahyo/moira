@@ -10,7 +10,7 @@ use tokio::{
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::Instrument;
+use tracing::{Instrument, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -189,7 +189,14 @@ impl MoiraExecutionService {
         .await?;
 
         let agent_profile = match route.agent_profile_id {
-            Some(id) => self.runtime_repo.get_active_agent_profile(id).await?,
+            Some(id) => {
+                let resolved = self.runtime_repo.get_active_agent_profile(id).await?;
+                if resolved.is_none() {
+                    self.announce_dangling_agent_profile(&command, &route, id, events)
+                        .await?;
+                }
+                resolved
+            }
             None => None,
         };
 
@@ -1215,6 +1222,79 @@ impl MoiraExecutionService {
                 metadata: json!({ "failure_class": failure.class }),
             })
             .await
+    }
+
+    /// F50 — the route names an agent profile that no longer resolves.
+    ///
+    /// # What this does and, just as deliberately, what it does not
+    ///
+    /// `get_active_agent_profile` filters `status = 'active' and deleted_at is null`.
+    /// Disabling a profile or soft-deleting it leaves `route_definitions.agent_profile_id`
+    /// pointing at the row — the FK is `on delete set null` and `soft_delete_agent_profile`
+    /// only writes `status = 'deleted', deleted_at = now()`, never a `DELETE` — so the
+    /// lookup returns `Ok(None)` and the caller's request proceeds without the profile's
+    /// `preamble`, `temperature` and `max_tokens`, reporting `succeeded`. A preamble is
+    /// where guardrails live, so the failure mode is an unguarded model answering
+    /// production traffic.
+    ///
+    /// Until this function existed there was **no failure, no `warn!`, no runtime event and
+    /// no audit row** — the agent profile was the only runtime reference on this path whose
+    /// disappearance was silent, where an unresolvable *route* is a `RouteNotFound` failure.
+    ///
+    /// **The request's behaviour is unchanged.** Whether Moira should also *refuse* is a
+    /// product decision that has not been taken: fail-closed is safer but breaks any
+    /// deployment that disables a profile expecting its routes to keep serving, and
+    /// observable fail-open still serves the unguarded request. Silence, however, is a
+    /// defect under *either* answer — both require the operator to be told, and they differ
+    /// only in whether the request is also refused. So the observability is not half of one
+    /// option; it is the part both options share, and it ships first.
+    ///
+    /// *Reversal condition:* when that decision is taken this becomes "observe and refuse"
+    /// or stays as it is. The observability itself is not revisited.
+    ///
+    /// # It cannot fire for a route that has no profile
+    ///
+    /// Called only from the `Some(id)` arm above, so "this route was never given a profile"
+    /// — the normal case, and the one every fixture in the tree exercises — stays exactly as
+    /// silent as it was. The two are distinguishable because `route.agent_profile_id` is the
+    /// thing that differs, and it is read before the lookup rather than inferred from it.
+    ///
+    /// # Three signals, because they have three different consumers
+    ///
+    /// The `warn!` reaches whoever is tailing logs. The runtime event is structured, carries
+    /// the ids, and is returned verbatim by `POST /api/v1/admin/runtime/diagnose` — it is
+    /// deliberately *not* mapped onto the public SSE contract, see `map_runtime_event`. The
+    /// audit row is the durable one: it survives log rotation and is queryable by
+    /// `resource_id = execution_id` alongside `execution.started`.
+    async fn announce_dangling_agent_profile(
+        &self,
+        command: &ExecutionCommand,
+        route: &RouteDecision,
+        agent_profile_id: Uuid,
+        events: &mut EventCollector,
+    ) -> Result<(), AppError> {
+        warn!(
+            execution_id = %command.execution_id,
+            request_id = %command.request_id,
+            route_id = %route.route_id,
+            route_key = %route.route_key,
+            %agent_profile_id,
+            "route references an agent profile that is disabled or deleted; the execution \
+             proceeds without its preamble, temperature and max_tokens"
+        );
+        let detail = json!({
+            "agent_profile_id": agent_profile_id,
+            "route_id": route.route_id,
+            "route_key": route.route_key,
+        });
+        events.push(RuntimeEventType::AgentProfileUnavailable, detail.clone());
+        self.audit_runtime_event(
+            command,
+            "agent_profile.unavailable",
+            AuditResult::Failed,
+            detail,
+        )
+        .await
     }
 
     async fn audit_runtime_event(

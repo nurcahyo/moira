@@ -2034,6 +2034,15 @@ fn map_runtime_event(
         | RuntimeEventType::ToolCallDelta
         | RuntimeEventType::ToolCallCompleted
         | RuntimeEventType::ToolResult => return None,
+        // F50 — deliberately not on the caller's stream.
+        //
+        // A dangling `agent_profile_id` is an operator fault in this deployment's
+        // configuration, and its payload names a route and a profile the caller has no
+        // relationship with. Putting it on the public SSE contract would leak the shape of
+        // the admin plane to every API consumer and would say nothing they could act on.
+        // The audiences that need it are the diagnostic endpoint (which returns every
+        // `RuntimeEventEnvelope` verbatim), the `warn!` and the audit row.
+        RuntimeEventType::AgentProfileUnavailable => return None,
     };
     Some(public_sse(
         response_id,
@@ -2649,6 +2658,48 @@ mod tests {
             };
             assert!(map_runtime_event(response_id, &event, 1).is_none());
         }
+    }
+
+    /// F50 — the dangling-agent-profile signal stays on the operator side.
+    ///
+    /// `AgentProfileUnavailable` reports that *this deployment's* route points at a
+    /// disabled or deleted agent profile, and its payload names a route id, a route key and
+    /// a profile id. That is admin-plane shape, and a caller can do nothing with it, so it
+    /// must not appear on the public SSE contract even though the caller's own request is
+    /// the thing degraded by it. The operator reads it from
+    /// `POST /api/v1/admin/runtime/diagnose`, the `warn!` and the audit row instead.
+    ///
+    /// The control is in the same test and is load-bearing: without it this assertion holds
+    /// equally against a `map_runtime_event` that returns `None` for everything, which is
+    /// the F16 shape §3.4 records — an assertion that nothing happened is worthless unless
+    /// something can happen.
+    #[test]
+    fn the_agent_profile_unavailable_event_is_not_a_public_sse_event() {
+        let response_id = Uuid::now_v7();
+        let envelope = |event_type| RuntimeEventEnvelope {
+            request_id: "req-test".to_string(),
+            execution_id: Uuid::now_v7(),
+            sequence: 1,
+            timestamp: Utc::now(),
+            event_type,
+            payload: json!({ "route_key": "general" }),
+        };
+
+        assert!(
+            map_runtime_event(
+                response_id,
+                &envelope(RuntimeEventType::AgentProfileUnavailable),
+                1
+            )
+            .is_none(),
+            "F50's operator signal reached the caller's stream; its payload names an \
+             internal route and agent profile"
+        );
+        assert!(
+            map_runtime_event(response_id, &envelope(RuntimeEventType::RouteSelected), 1).is_some(),
+            "route_selected is a public event, so the exclusion asserted above proves \
+             nothing about this event in particular"
+        );
     }
 
     #[test]

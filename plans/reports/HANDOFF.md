@@ -367,11 +367,11 @@ once. Current state of everything above F28:
 | **F40** | ~~`GET /v1/responses/{id}` returns an empty `output` for a completed, persisted response~~ | **PREMISE REFUTED, two adjacent defects CLOSED**, same branch. `output_persisted` is never `true` anywhere, so `Completed` always explained itself and `[]` was reached only by non-completed statuses, where it is right. Real defects: the reason was the literal `"metadata_only_persistence"` for **all four** persistence modes, and `Completed && output_persisted` fell to `[]`. Public shape unchanged (`reason` is an unconstrained string; snapshot byte-identical) |
 | ~~**F51**~~ | ~~The `moira_runtime_config` channel is attached to **`conversations` and `memory_records`**, and `apply_invalidation` calls three `invalidate_all()`s **unconditionally**~~ | **CLOSED** `fix/f51-f52-invalidation-scope`. **Premise held in full — every count in it was right**, including 24 triggers when counted by *function* and which table's trigger is named differently. **Both fixes taken**: `invalidation_plan` returns `{caches, circuits}` and narrows one-way (unknown payloads still clear everything), and migration `0022` drops both triggers. **Nothing depended on them notifying** — `docs/runtime-cache-invalidation.md` never listed them, no cache in the process is keyed by a conversation or memory record, and `db.rs` is the only listener. The doc comment's standing defence ("re-reading costs a query") was **true of two caches and false of the third**: `ProviderRuntimeCache` holds built Rig clients with connection pools. Five mutations; **the cheapest edit — honour the plan for `runtime_cache` only — reds only the handles assertion.** Raised **F53** |
 | ~~**F52**~~ | ~~**A shipped, trusted guard whose list is retyped rather than pinned, and it has already drifted.**~~ | **CLOSED** `fix/f51-f52-invalidation-scope`. Premise held in full; `pg_trigger` returns exactly 24 and the three `legacy_*` tables still carry their **pre-rename trigger names**, so a name-based query mis-attributes as well as misses. `TRIGGERED_RESOURCE_TYPES` is now pinned against `pg_trigger` **both directions**, counted by trigger function, floored by `MINIMUM_TRIGGERED_TABLES`. The three legacy tables **lose their triggers** (`0023`) rather than being classified — the only references in the whole tree are inside `0003` itself, as a backfill source. Four mutations; **attaching the trigger to a new table reds the inventory test — the forward drift the retyped list could never detect — and "fixing" that red by adding the name to the constant alone reds the unit guard instead.** |
-| **F53** | **F51's class, one table over and at admin rate:** `rag_documents` and `rag_collections` are content, not configuration, both carry the notify trigger and both are `caches: true`, so ingesting one document wipes every replica's runtime-config cache, provider-handle cache and auth-settings cache. A bulk import does it per document | open, **LOW**. Deliberately not fixed under F51 — the write paths are admin routes, not the public execution path, so this is operator-rate not request-rate. **Establish first whether a RAG collection's own configuration is read through any cache**; `rag_collections` and `rag_documents` may not have the same answer |
+| ~~**F53**~~ | ~~**F51's class, one table over and at admin rate:** `rag_documents` and `rag_collections` are content, not configuration, both carry the notify trigger and both are `caches: true`~~ | **CLOSED** `fix/f53-f50-silent-degradation`. **The gating question was answered before the fix was chosen, and both tables have the same answer: no.** `rag_collections` carries no runtime configuration at all — the embedding model and dimension the entry guessed at live in `application_embedding_policies`, and the collection is joined only to reach `application_id`. The three caches are closed types (`HashMap<Uuid, ProviderConfig>`, one `Vec<PublicAuthMethod>`, and a map keyed by `RuntimeCacheKey`'s seven provider/model/credential/policy fields), so no RAG row can be in any of them. Both lose the trigger (`0024`) **and** move into `RUNTIME_DATA_RESOURCE_TYPES`. Five mutations; the two that matter — reverting the classifier for **one** table — red only the integration guard and **leave every unit test green**, because a guard that iterates a constant cannot see a name removed from it |
 | **F30** | `application_memory_policies.consent_mode` and `application_conversation_policies.memory_consent_mode` are independent, both default `'explicit_only'`, and nothing reconciles them | open. Sub-Phase F takes the **stricter of the two** (D4), but the schema divergence remains. *The shape that hides:* they agree in every default deployment and diverge exactly when an operator tightens one |
 | **F48** | **A third `output_schema` drop path, and it is silent even on OpenAI.** Rig also requires `tools.is_empty() \|\| history_has_tool_result`, so the schema is dropped on turn 1 of any tool-calling conversation with **no `warn!` at all** — the warning at that site fires only for the DeepSeek case. Latent only because `build_completion_request` hardcodes `tools: Vec::new()`; it goes live the day tool calling is enabled. **F39's fix does not cover it** — that reconciles per provider type, this drop is per request | **latent, now GUARDED, behaviour deliberately unchanged.** Premise re-verified: that constructor is the tree's only `CompletionRequest`, and `public.rs` refuses caller-declared tools outright. `moiras_request_still_carries_its_schema_onto_rigs_openai_wire_body` reds on the precondition |
 | **F49** | **No integration test ever built a request from an agent profile** — every fixture left `agent_profile_id` NULL, so `preamble`/`temperature`/`max_tokens`/`tool_policy` were unverified at the wire | **CLOSED** `fix/f49-agent-profile-coverage`. Premise held; the column is on `route_definitions`, not `routing_policies`. `tests/agent_profile_wire.rs` now builds from a real profile and reads the mock's body. **The branch is correct at the wire.** Eight mutations run. Under F48's mutation only the new `tool_policy` case reds — **F48's guard is not superseded.** Raised F50 |
-| **F50** | **A disabled or soft-deleted agent profile silently degrades every execution on its route** — `get_active_agent_profile` filters on `status='active'`, neither disable nor soft-delete clears the route's FK, and `Ok(None)` is treated as "no profile": preamble, temperature and max_tokens vanish with **no failure, no `warn!`, no event**, and the run reports `succeeded` | open. **Recorded, not fixed — the fix is a product decision** (fail-closed vs observable fail-open). Reversal condition and the `documents_`-named case that pins today's behaviour are in the ledger |
+| **F50** | **A disabled or soft-deleted agent profile silently degrades every execution on its route** — `get_active_agent_profile` filters on `status='active'`, neither disable nor soft-delete clears the route's FK, and `Ok(None)` is treated as "no profile": preamble, temperature and max_tokens vanish, and the run reports `succeeded` | **OBSERVABLE; the product decision is STILL OPEN.** `fix/f53-f50-silent-degradation` ships a `warn!`, a `RuntimeEventType::AgentProfileUnavailable` runtime event and an `agent_profile.unavailable` audit row. **The request's behaviour is unchanged** — fail-closed vs fail-open is **not** decided here, because silence is a defect under either answer and the observability is the part they share, not half of one. "No profile" and "profile vanished" are distinguished at the call site by reading `route.agent_profile_id` *before* the lookup. *Reversal condition:* the decision makes this "observe and refuse" or leaves it as is; **the observability is not revisited.** The `documents_`-named case is now scoped to the fail-open behaviour alone, so the three observability guards survive either answer |
 | **F38** | Terminal-persistence-deadline arm discarded a successful provider result | **CLOSED** `fix/f38-deadline-usage` — all three values retained, `"output_committed"` was a hardcoded literal and is now derived. Reversal conditions in the ledger |
 | ~~**F45**~~ | ~~`PublicResponseFormat::JsonSchema { name, strict }` — both accepted, both dropped~~ | **CLOSED** `fix/f42-f45-declared-vs-true`. Premise held; **neither field is expressible in rig-core 0.40 on any provider** (`strict: true` hardcoded and unreachable via `additional_params`; `name` derived from the schema's `title`; Anthropic and Gemini have neither field). Resolved **asymmetrically**: `strict` **refused**, `name` **documented**. **PUBLIC CONTRACT CHANGE** — `strict` is now `Option<bool>` and an explicit `false` is `422` on both endpoints; omitted and `true` are unchanged. That is what makes refusing available at all, and F35 was right to decline it while the field was a defaulting `bool`. `name` cannot be refused (required field) and is not smuggled through `title`. OpenAPI counts **hand-verified, unchanged: 152 / 100 / 183** |
 | ~~**F42**~~ | ~~`moira.error.structured_output_invalid` asserts a model-output-non-conformance path that does not exist~~ | **CLOSED** same branch. Premise held: two emitters, both rejecting the *caller's schema*. The near-miss that made it plausible — `memory_extraction::FAILURE_STRUCTURED_OUTPUT_INVALID`, the same string for the missing case — is never returned to a caller, and the description now says so. Fail-hard variant deliberately **not** shipped; F29 still needs two of its three preconditions |
@@ -413,7 +413,7 @@ start of your task.**
    The same now applies to **GitHub**, added in wave 4B and exercised only against a purpose-built
    mock (no discovery document, no `id_token`, `/user` + `/user/emails`).
 
-### 3.4 Twelve guards that failed — ten toothless, two that pinned the defect
+### 3.4 Thirteen guards that failed — eleven toothless, two that pinned the defect
 
 **Read this before writing any guard.** Plan 09 produced **six**, every one found by *running the
 mutation* and none by reading the test. **Two were already shipped and trusted.** A seventh followed
@@ -566,6 +566,35 @@ prompted it.** A per-path pairing is a matrix, and this one had a hole in it tha
 reasoning would have filled. It is cheap to check — list the properties, list the paths, look for
 the empty cell — and nothing else in the suite could have found it.
 
+**A thirteenth, from `fix/f53-f50-silent-degradation`, and it is the sharpening F52 needed: a
+guard that iterates a constant cannot see a name being REMOVED from that constant.**
+
+F52's rule is *a derived inventory is only a guard if something else consumes it*, and the
+consumer it produced — `only_configuration_changes_invalidate_the_configuration_caches` — loops
+over `RUNTIME_DATA_RESOURCE_TYPES` asserting each name classifies to `caches: false`. That is a
+real guard against a name being *added* wrongly. It is **structurally blind** to a name being
+taken out: the cheapest edit that reintroduces half of F53 is to move `rag_documents` back to
+`CIRCUIT_UNAFFECTED_RESOURCE_TYPES`, and **all eight `infra::db` unit tests stayed green** through
+it, because the loop no longer had that name to iterate. Only the integration guard, which names
+the table literally, reds. Verified by running it, for each of the two tables separately.
+
+**The rule: set-membership guards are one-directional by construction.** If a constant's contents
+are the property, something must also assert the *behaviour* of each specific member by name —
+otherwise the guard covers additions and silently permits deletions, which is the direction a
+regression actually travels. This is the same shape as the tenth entry (one construct, two jobs,
+guard covers one) applied to a list rather than a statement.
+
+**A second thing from the same branch, about `documents_` versus `guards_` when a fix is
+deliberately partial.** F50's coordinator decision was "ship the observability, do not take the
+product decision". The existing case was named
+`documents_current_behaviour_a_disabled_agent_profile_is_silently_ignored`, and shipping made its
+name false without making it fail. The temptation is to widen it into one case asserting both
+"it is announced" and "it still succeeds". **Do not** — the first survives whichever way the
+product decision goes and the second does not, so a merged case would go red on a correct
+fail-closed fix. Split by *lifetime*: what the pending decision cannot change is a `guards_`, what
+it will change is a `documents_` with the reversal condition on it. A `documents_` case is a
+liability with an expiry date, and the expiry date belongs in its name's scope.
+
 *Two things from the same branch that are not new failures but are worth carrying.* The F43 fix
 was guarded by a test that **already existed and did have teeth** —
 `stream_capacity_is_independent_from_request_capacity` reds alone when the streaming flag stops
@@ -611,7 +640,9 @@ Three corollaries earned the hard way:
   `main + N × ~2 GB` and grows with every agent. Below 60 GB free run `scripts/reclaim.sh`; below
   30 GB also delete finished agents' target dirs. **Delete them routinely, not only under pressure.**
   `debug = 1` took a full build from 20 GB to 2 GB and a cold rebuild to 2m21s.
-- **Migrations** are append-only; next free number is **`0020`**.
+- **Migrations** are append-only; next free number is **`0025`**. This line said `0020` while the
+  tree was at `0023` — **derive it (`ls migrations/ | tail -1`) instead of trusting it**, exactly as
+  the brief for F53 instructed. `0016` is a permanent gap.
 - **OpenAPI** is frozen: regenerate with
   `UPDATE_SNAPSHOTS=1 cargo test --lib http::tests::committed_openapi_matches_the_generated_document`.
   Two gates enforce it, plus a hardcoded route list *and an exact operation count* in

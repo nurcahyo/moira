@@ -1495,7 +1495,9 @@ nobody had noticed), the wave-2 leftovers, and `cargo-mutants` adoption. CI-veri
 merge commit: five jobs, steps executed (`rust` 13, `console` 16, `console-container-and-helm` 14,
 `container-and-helm` 13, `supply-chain` 10).
 
-**Migrations: `main` is now at `0019`. Next free is `0020`.** `0016` is a permanent gap.
+**Migrations: the tree is now at `0024` (F53). Next free is `0025`.** `0016` is a permanent gap.
+This line said `0019`/`0020` for four migrations' worth of drift — **derive it with
+`ls migrations/ | tail -1` rather than trusting it.**
 
 ## ✅ ALL PLAN WORK IS COMPLETE — plan 09 finished 2026-07-31. Only T11 remains, and it is the user's.
 
@@ -1510,8 +1512,10 @@ merge commit: five jobs, steps executed (`rust` 13, `console` 16, `console-conta
 | **#43** | wave 5 — invitations and ownership UI | `820a5a8` |
 
 **The forced plan order `02b → 03 → 04 → 05 → 06 → 07 → {08 ∥ 10} → 11 → 09` is now fully executed.**
-Migrations end at `0020`; `0016` is a permanent gap. OpenAPI is stable at **151 operations / 99
-paths / 178 schemas**.
+~~Migrations end at `0020`~~ — **stale; see "STATE AT A GLANCE" above and derive it from
+`migrations/`.** `0016` is a permanent gap. ~~OpenAPI is stable at **151 / 99 / 178**~~ — also
+stale; it is **152 operations / 100 paths / 183 schemas**, and F50 added one `RuntimeEventType`
+enum member without changing any of the three counts.
 
 **The one piece of plan 09 the loop could not do is T11**, removing the console's
 `ambiguous_enabled_providers` guard. It is gated on stage 4A being **deployed**, not merged, and
@@ -2500,8 +2504,8 @@ question being investigated. That clause has now out-produced the questions them
 | ~~**F49**~~ | ~~**No integration test in the tree ever builds a request from an agent profile.**~~ **CLOSED** `fix/f49-agent-profile-coverage`. **Premise held, with one correction: the column is `route_definitions.agent_profile_id`, not `routing_policies.agent_profile_id` — `RoutingPolicyRecord` has no such field.** Verified exhaustively: all six typed `RouteDefinitionCreateRequest` sites in `tests/` pass `agent_profile_id: None`, the raw-SQL insert at `tests/public_authorization.rs:693` omits the column, and the seeded `general` route at `migrations/0005_provider_runtime.sql:295` omits it too — so `agent_profile` really was `None` on every end-to-end path. `tests/agent_profile_wire.rs` (6 cases) now attaches a real profile to the fixture's route and asserts on the body that reached the scripted mock. **The branch is correct at the wire**: `preamble` arrives as the leading `system` message, `temperature` and `max_tokens` arrive top-level, caller options win over profile values, and the streaming arm carries the same three. Eight mutations run, each reverted: `preamble: None` (3 red), dropping the `temperature` `or_else` (2 red), dropping the `max_tokens` `or_else` (2 red), inverting both `or_else` orders (**only** the precedence case red — the exact indistinguishability HANDOFF §3.4's seventh entry warns about, and why that case exists), never loading the profile (3 red), **hardcoding the profile's three values into `build_completion_request`** (the no-profile control red — this is the cheapest edit that leaves the primary case green, and the control is the only thing that sees it), a streaming-arm-only rebuild without the profile (**only** the streaming case red, so it is not redundant), and F48's own mutation. **Under F48's mutation only the new `tool_policy` case goes red; the preamble/temperature/max_tokens cases stay green** — they observe a different property, and `tests/structured_output.rs` was re-run under it and stayed green through all seven cases again. **F48's guard is not superseded** and its doc comment now says why. Raised **F50**. | **closed** |
 | ~~**F51**~~ | ~~**The runtime-config invalidation channel is wired to per-request data tables, and `apply_invalidation` ignores its own scope for three of the four things it clears.**~~ **CLOSED** `fix/f51-f52-invalidation-scope` `f97d4f1`. **Premise held in full, and every count in it was right** — 24 tables when counted by trigger *function* (`auth_provider_settings`'s trigger really is named `auth_provider_settings_notify`, so a name-based query returns 23), `conversations` and `memory_records` really do fire on every `INSERT`/`UPDATE`/`DELETE`, and the three `invalidate_all()` calls really were unconditional while only the breaker reset was scoped. **Both candidate fixes taken, because they are independent barriers and the brief was right that they are not exclusive.** (1) `invalidation_plan` now returns an `InvalidationPlan { caches, circuits }` from one parse, and `RUNTIME_DATA_RESOURCE_TYPES` names the resource types that clear no cache; the narrowing is one-way, so an unparseable payload, a non-uuid id or an unrecognised `resource_type` still clears everything and resets every breaker. (2) Migration `0022` drops the trigger from both data tables. **Nothing depends on those two tables notifying**, established three ways: `docs/runtime-cache-invalidation.md` enumerates the invalidation-producing resources and lists neither — the schema drifted from the documented design in `0007`, not the other way round; **no cache in the process is keyed by a conversation or a memory record** (there is no `ConversationCache`/`MemoryCache` anywhere in `src/`), and the three the listener clears hold provider configuration, built provider clients and the enabled auth methods; and `src/infra/db.rs` is the **only** listener on the channel, so there is no other subscriber whose behaviour could change. **The most expensive consequence was under-stated by the original entry's own framing**: the standing justification in `apply_invalidation`'s doc comment was that the caches "rebuild on the next read, so re-reading them costs a query" — true of `RuntimeConfigCache` and `AuthProviderSettingsCache`, **false of `ProviderRuntimeCache`**, which holds built Rig clients with their connection pools and is keyed by a tuple that already contains every version number, so the config-write case it was defending never needed the wipe either. **Five mutations, each reverted.** Reverting the scoping reds the integration guard; **honouring the plan for `cache` but not `runtime_handles`/`auth_settings` — the cheapest edit that preserves the defect — reds it on the handles assertion specifically**, which is why the guard seeds a real `RuntimeModelHandle` and observes all three caches rather than the one that is easy to observe; leaving the trigger attached reds the trigger guard (and showed all three of INSERT/UPDATE/DELETE firing, which is why the test does all three); eating the fail-safe on the unknown arm reds the unit guard. **Under mutation 1 the unit guard stayed green and only the integration guard fired** — the correct-predicate/wrong-wiring split of F16's shape, and the reason both exist. *Reversal condition:* re-attaching either trigger requires deleting that table from `RUNTIME_DATA_RESOURCE_TYPES` in the same change, because a table that has become configuration must not stay classified as data — `every_triggered_table_has_a_scope` asserts `plan.caches` for every triggered table and reds if it is. | **closed** |
 | ~~**F52**~~ | ~~**Three triggered tables are unclassified … and the guard that exists to prevent exactly this is a retyped list that has already drifted.**~~ **CLOSED** `fix/f51-f52-invalidation-scope` `9f243a6`. **Premise held in full and every specific was verified against the live catalogue**: `pg_trigger` returns exactly 24 tables for `notify_moira_runtime_config_change`, the three `legacy_*` tables are among them, their triggers still carry their *pre-rename* names (`legacy_providers`'s trigger is `providers_runtime_config_notify`) — so a name-based query mis-attributes them as well as missing `auth_provider_settings` — and the test's array really did hold 21 hand-typed names. **The fix is the shape the entry named**: `TRIGGERED_RESOURCE_TYPES` is now a real constant and `tests/runtime_notify_inventory.rs` pins it against `pg_trigger` **in both directions**, counted by trigger *function* and excluding `tgisinternal`, with a `MINIMUM_TRIGGERED_TABLES` floor against the empty-set failure a derived list is most exposed to. **The three legacy tables lose their triggers** (migration `0023`) rather than being classified: the finding's claim that nothing in `src/` reads or writes them is **correct and stronger than stated** — the only references anywhere in the tree are inside `0003_security_foundation.sql` itself, as a one-time backfill source guarded by `to_regclass(…) is not null`. The tables themselves are kept; they are an operator's record of the pre-0003 world and dropping them is irreversible. `legacy_applications` is renamed by the same migration and correctly absent — `0002` only ever attached the trigger to three tables. **Four mutations, each reverted, and the two halves interlock.** Leaving one legacy trigger attached reds both new tests — *the exact original defect, where the old guard was green*. **Attaching the trigger to a brand-new table (`responses`) reds the inventory test — the forward drift the retyped list could never detect, which is the whole property.** Then the cheapest edit: **"fix" that red by adding `responses` to `TRIGGERED_RESOURCE_TYPES` and nothing else — the inventory test goes green and the unit guard goes red**, because it iterates the constant and asserts the scope; and classifying it as `RUNTIME_DATA_RESOURCE_TYPES` instead leaves the scope assertion satisfied and reds the new `plan.caches` assertion. There is no way to satisfy one half without the other. *Reversal condition:* it re-opens if the inventory is ever satisfied by editing the constant alone — i.e. if `every_triggered_table_has_a_scope` stops iterating `TRIGGERED_RESOURCE_TYPES`, or if `tests/runtime_notify_inventory.rs` stops reading `pg_trigger`. | **closed** |
-| **F53** | **The same defect class F51 closed, one table over and at admin rate rather than request rate: `rag_documents` and `rag_collections` are content, not configuration, and every write to one wipes every replica's cache.** Both carry `notify_moira_runtime_config_change()` (added by `0007` in the same block that added the two tables F51 removed) and both are classified `caches: true`, so ingesting one document drops every replica's runtime-config cache, every built provider client handle and the auth-settings cache. A bulk import of N documents does it N times. **Deliberately not fixed under F51**, and the reason is the one thing that makes it a smaller finding rather than the same one: the write paths are `POST /api/v1/admin/rag-collections/{id}/documents`, its `/reindex` alias and the delete path — **admin routes, not the public execution path** — so this is operator-rate, whereas `conversations`/`memory_records` fired on every conversation-linked turn. `docs/runtime-cache-invalidation.md` does not list either table as an invalidation-producing resource, exactly as it did not list the two F51 removed. **Establish before fixing whether a RAG collection's *configuration* (its embedding model, its dimensions) is read through any cache** — `rag_collections` is more plausibly configuration than `rag_documents` is, and the two may not have the same answer. *Reversal condition:* it closes when `rag_documents` (and `rag_collections`, if the check above clears it) either lose the trigger or move into `RUNTIME_DATA_RESOURCE_TYPES` — and, per F52's guard, a table cannot do the second without doing the first. **ID allocated against `origin/main` at `d295f9e`, whose highest was F52.** | **LOW** |
-| **F50** | **A disabled or soft-deleted agent profile silently degrades every execution on its route.** `execution.rs:191` resolves the profile with `get_active_agent_profile`, which filters `status = 'active' and deleted_at is null`. Neither operation clears the route's reference: the FK is `on delete set null` and `soft_delete_agent_profile` only writes `status='deleted', deleted_at=now()`, never a `DELETE`. The lookup returns `Ok(None)` and the match arm treats it identically to "this route has no profile" — **no failure, no `warn!`, no runtime event, no audit row.** Every subsequent request loses its `preamble`, `temperature` and `max_tokens` and reports `succeeded`. A preamble is where guardrails live, so the failure mode is an unguarded model answering production traffic. The agent profile is the **only** runtime reference on this path whose disappearance is silent — an unresolvable route is a `RouteNotFound` failure. **Recorded, not fixed: the fix is a product decision.** Fail-closed is safer but breaks any deployment that disables a profile expecting its routes to keep serving; observable fail-open (`warn!` + runtime event) is cheaper but still serves the unguarded request. **Reversal condition:** decide fail-closed vs observable fail-open; on either decision `documents_current_behaviour_a_disabled_agent_profile_is_silently_ignored` in `tests/agent_profile_wire.rs` is wrong and must be rewritten — it is named `documents_` and not `guards_` because it pins current behaviour and would otherwise hold the defect in place (HANDOFF §3.4). Found by F49's new coverage. **ID allocated against `origin/main` at `779104d`, whose highest was F49.** | **MEDIUM** |
+| ~~**F53**~~ | ~~**The same defect class F51 closed, one table over and at admin rate rather than request rate: `rag_documents` and `rag_collections` are content, not configuration, and every write to one wipes every replica's cache.**~~ **CLOSED** `fix/f53-f50-silent-degradation` `31a23a2`. **Premise held in full**, and the gating question it was recorded with has one answer for both tables — reached, as instructed, before choosing the fix. **Neither table's configuration is read through any cache the listener clears, and for `rag_collections` the reason is stronger than the entry expected: it carries no runtime configuration at all.** Its columns are `collection_key`, `display_name`, `description`, `status`, `visibility`, `metadata` and the lifecycle fields; the embedding model, dimension, batch size and timeout the entry guessed might live there live in `application_embedding_policies`, keyed by `application_id`, and `find_document_ingestion_context`/`find_collection_ingestion_context` join the collection **only** to reach `application_id`. That policy table is configuration, keeps its trigger and keeps `caches: true`. The three caches make the answer type-level rather than argumentative: `RuntimeConfigCache` is `HashMap<Uuid, ProviderConfig>`, `AuthProviderSettingsCache` is one `Vec<PublicAuthMethod>`, `ProviderRuntimeCache` is keyed by `RuntimeCacheKey` (provider/model/credential/runtime-policy ids and versions) — none can hold either row, and no `RuntimeCacheKey` field derives from either table. Every read of both, including the `visibility`/`status` predicates that carry tenant isolation, goes to PostgreSQL on the spot, so dropping the trigger cannot make an authorization decision stale either. **So both lose the trigger, and both barriers are taken as under F51**: migration `0024` drops them, and `RUNTIME_DATA_RESOURCE_TYPES` gains both names while `TRIGGERED_RESOURCE_TYPES` loses them. **Five mutations, each reverted.** Honouring the plan for `runtime_cache` only and still wiping `runtime_handles`/`auth_settings` reds the new integration guard **on the handles assertion**, which is why it seeds a real `RuntimeModelHandle`. Reverting the classifier for `rag_documents` alone, and separately for `rag_collections` alone, each red only its own leg — **and every unit test stayed green through both**, so the integration guard is the only thing that sees them. Re-attaching the `rag_documents` trigger reds the trigger guard (showing all three of INSERT/UPDATE/DELETE) *and* the `pg_trigger` inventory; then "fixing" the inventory the lazy way — adding the name back to `TRIGGERED_RESOURCE_TYPES` — turns the inventory green and reds `every_triggered_table_has_a_scope` on its `caches` half, so F52's interlock holds for these tables too. **Two corrections to the entry.** Its claim that `docs/runtime-cache-invalidation.md` "does not list either table" was true when written and **false by the time it was committed**: the F51/F52 commit added *"and the RAG collection and document tables"* to that paragraph while making it match `TRIGGERED_RESOURCE_TYPES`. And "its embedding model, its dimensions" describes columns `rag_collections` does not have. *Reversal condition:* if a collection ever acquires configuration a cache holds, re-create its trigger and delete its name from `RUNTIME_DATA_RESOURCE_TYPES` in the same change. | **closed** |
+| **F50** | **A disabled or soft-deleted agent profile silently degrades every execution on its route.** `execution.rs:191` resolves the profile with `get_active_agent_profile`, which filters `status = 'active' and deleted_at is null`. Neither operation clears the route's reference: the FK is `on delete set null` and `soft_delete_agent_profile` only writes `status='deleted', deleted_at=now()`, never a `DELETE`. The lookup returns `Ok(None)` and the match arm treats it identically to "this route has no profile" — **no failure, no `warn!`, no runtime event, no audit row.** Every subsequent request loses its `preamble`, `temperature` and `max_tokens` and reports `succeeded`. A preamble is where guardrails live, so the failure mode is an unguarded model answering production traffic. The agent profile is the **only** runtime reference on this path whose disappearance is silent — an unresolvable route is a `RouteNotFound` failure. **Recorded, not fixed: the fix is a product decision.** Fail-closed is safer but breaks any deployment that disables a profile expecting its routes to keep serving; observable fail-open (`warn!` + runtime event) is cheaper but still serves the unguarded request. **Reversal condition:** decide fail-closed vs observable fail-open; on either decision `documents_current_behaviour_a_disabled_agent_profile_is_silently_ignored` in `tests/agent_profile_wire.rs` is wrong and must be rewritten — it is named `documents_` and not `guards_` because it pins current behaviour and would otherwise hold the defect in place (HANDOFF §3.4). Found by F49's new coverage. **ID allocated against `origin/main` at `779104d`, whose highest was F49.** **→ THE SILENCE IS FIXED; THE PRODUCT DECISION IS STILL OPEN.** See the F50 section below (`fix/f53-f50-silent-degradation` `da8a936`). | **OBSERVABLE — product decision open** |
 
 ### F35 — CLOSED: `text.format` is now honoured for `json_schema`, refused for the rest
 
@@ -3776,11 +3780,16 @@ must have passed"* is exactly the inference §2.2 exists to prevent.
 
 #### What remains, and it is short
 
-**F50** and **F53** are open and both deliberately unfixed — F50 is a product decision (fail-closed vs
-observable fail-open), F53 needs one question answered first (whether a RAG collection's own config is
-read through any cache; the two tables may not have the same answer). The two remaining
-strict-structured-output preconditions are unshipped by design. **PR #57 (F32) is still held for human
-sight.**
+~~**F50** and **F53** are open and both deliberately unfixed~~ — **both were taken on
+`fix/f53-f50-silent-degradation` (2026-08-03).** F53 is **CLOSED**: the question it was gated on was
+answered first and neither RAG table's configuration is read through any cache, so both lose the
+trigger. F50's **silence is fixed** — `warn!`, runtime event, audit row — while the fail-closed vs
+fail-open **product decision is deliberately still open**, because observability is the part both
+answers share rather than half of one of them. The two remaining strict-structured-output
+preconditions are unshipped by design. **PR #57 (F32) is still held for human sight.**
+
+**The only thing still needing a human on the findings queue is therefore F50's product decision**,
+plus the pre-existing F33 (envelope encryption scoping) and F32's held PR.
 
 
 ### Cycle 15 — 2026-08-02 — `fix/f40-f47-response-output-and-policy-reads`: one refutation, one understatement, two new findings
@@ -3793,6 +3802,131 @@ Two independent findings closed on one branch, separate commits, one gate run.
 | **F47** | **confirmed and understated by a factor of two** — it named two consequences and there were four, including a cluster-wide cache wipe |
 | **F51** | raised — the invalidation channel is attached to per-request data tables and `apply_invalidation` ignores its own scope for three of four targets |
 | **F52** | raised — three triggered tables are unclassified, and the shipped guard that exists to catch that retypes its inventory instead of deriving it |
+
+## F53 CLOSED · F50 OBSERVABLE — `fix/f53-f50-silent-degradation`, 2026-08-03
+
+Two findings, separate commits (`31a23a2`, `da8a936`), one gate run.
+
+| finding | verdict |
+|---|---|
+| **F53** | **confirmed in full.** The gating question — is a RAG collection's own configuration read through any cache the listener clears? — has the **same answer for both tables, and it is no.** Both lose the trigger, exactly as `conversations` and `memory_records` did |
+| **F50** | **confirmed in full.** The silence is fixed — `warn!`, runtime event, audit row. **The fail-closed/fail-open decision is deliberately NOT taken and is still open** |
+
+### F53 — the question decided the fix, and the answer was stronger than "no"
+
+The entry's own hypothesis was that `rag_collections` might carry an embedding model and a
+dimension, which a cached read could then serve stale. **It carries neither. It carries no
+runtime configuration at all** — `collection_key`, `display_name`, `description`, `status`,
+`visibility`, `metadata` and lifecycle columns, and nothing else. Every embedding value is in
+`application_embedding_policies`, keyed by `application_id`; `find_collection_ingestion_context`
+and `find_document_ingestion_context` join the collection **only** to obtain that id. So the
+table that looked like the plausible configuration candidate turned out to be the clearer of
+the two.
+
+**The general answer is type-level rather than argumentative,** which is why it is worth
+writing down once: `apply_invalidation` clears exactly three caches, and all three are closed
+types. `RuntimeConfigCache` is `HashMap<Uuid, ProviderConfig>`. `AuthProviderSettingsCache` is
+one `Vec<PublicAuthMethod>`. `ProviderRuntimeCache` is keyed by `RuntimeCacheKey`, whose seven
+fields are provider, model, credential and runtime-policy ids and versions. **No RAG row can be
+in any of them and no key field derives from either table**, so the question "is it read through
+a cache?" cannot be answered yes for anything outside those three shapes. That argument is
+reusable for the next table anyone asks about.
+
+A second reason the answer is safe: the collection's `visibility` and `status` carry the
+tenant-isolation predicate, and they are evaluated in the retrieval SQL on every query rather
+than read from anywhere cached — so removing the notification cannot leave an authorization
+decision stale, which was the only way "content" could have been the wrong classification.
+
+**Corrections to the F53 entry, both worth recording because briefs here inherit each other's
+errors:**
+
+1. *"`docs/runtime-cache-invalidation.md` does not list either table as an invalidation-producing
+   resource, exactly as it did not list the two F51 removed."* **True when written, false by the
+   time it was committed.** The F51/F52 commit (`e16cb0c`) rewrote that paragraph to match
+   `TRIGGERED_RESOURCE_TYPES` and in doing so *added* "and the RAG collection and document
+   tables". The finding's supporting evidence was destroyed by the commit that raised it. Checked
+   with `git show e16cb0c^:docs/…` rather than trusting either version.
+2. *"its embedding model, its dimensions"* — columns that do not exist on that table.
+
+**Five mutations, each reverted.**
+
+| mutation | result |
+|---|---|
+| honour `plan.caches` for `runtime_cache` only; always clear `runtime_handles` and `auth_settings` | **red** on the handles assertion in both the F51 and F53 integration guards — *"dropped every built provider client handle, connection pools included"*. This is why the guard seeds a real `RuntimeModelHandle` rather than the trivially-seedable config sentinel |
+| move `rag_documents` back to `CIRCUIT_UNAFFECTED_RESOURCE_TYPES` | **red** on the `rag_documents` leg only — **and all eight `infra::db` unit tests stayed green**, because they iterate the constant the name was removed from. The integration guard is the only thing that sees this |
+| the same for `rag_collections` | **red** on the `rag_collections` leg only. The two legs are independent, which is the point of asserting per resource type |
+| re-attach the `rag_documents` trigger (a scratch `0025`) | **red** on the trigger guard, showing all three of INSERT/UPDATE/DELETE, **and** red on `the_notify_trigger_inventory_is_exactly_the_classified_set` naming the table |
+| then the **lazy repair**: add `rag_documents` back to `TRIGGERED_RESOURCE_TYPES` and stop | inventory test **green**, `every_triggered_table_has_a_scope` **red** on its `caches` half. F52's interlock holds for these tables without any new machinery |
+
+**What the second mutation adds to §3.4, and it is a sharpening rather than a new rule.** F52's
+lesson is *a derived inventory is only a guard if something else consumes it*. The corollary
+this run produced: **a guard that iterates a constant cannot see a name being removed from that
+constant.** `only_configuration_changes_invalidate_the_configuration_caches` is a real guard and
+it went green under the edit that reintroduced half the defect, because the edit deleted the
+name it would have iterated. Set-membership guards are one-directional by construction; the
+behavioural guard that names the table literally is what closes the other direction, and both
+are needed.
+
+### F50 — the silence is fixed; the product decision is untouched and still open
+
+**The coordinator's decision, implemented as given: observability only.** A `warn!`, a
+`RuntimeEventType::AgentProfileUnavailable` runtime event and an `agent_profile.unavailable`
+audit row. **The request's behaviour is byte-for-byte what it was** — `succeeded`, no failure,
+no preamble, no temperature, no max_tokens.
+
+**The rationale, recorded with its reversal condition.** Silence is a defect under *either*
+product answer. Fail-closed and observable fail-open both require the operator to be told; they
+differ only in whether the request is *also* refused. Shipping observability is therefore not a
+partial implementation of one option — it is the part both options share. **Reversal condition:**
+when the fail-closed/fail-open decision is taken, this changes from "observe and proceed" to
+"observe and refuse" *or* stays as it is. **The observability itself is not revisited.**
+
+**"No profile" and "the profile vanished" are cleanly distinguishable, and the distinction is
+free.** `route.agent_profile_id` is read *before* the lookup: `None` is "this route never had
+one" — the normal case, and what every other fixture in the tree produces — and only
+`Some(id)` with an unresolved lookup announces. No inference from the lookup's own result is
+needed. The one way the two could have collapsed is a **hard** delete, which the FK's
+`on delete set null` would turn into `None`; `soft_delete_agent_profile` writes
+`status = 'deleted', deleted_at = now()` and never issues a `DELETE`, so it cannot happen, and
+`guards_a_soft_deleted_agent_profile_is_announced_too` asserts the reference survives before it
+asserts anything else.
+
+**The event is deliberately not on the public SSE contract.** `map_runtime_event` returns `None`
+for it. Its payload names a route id, a route key and an agent profile id — admin-plane shape a
+caller can do nothing with — and the operator's channels are the diagnostic endpoint (which
+returns every envelope verbatim), the log and the audit row. `docs/openapi.json` gains exactly
+one enum member and nothing else; 152 / 100 / 183 unchanged.
+
+**`documents_current_behaviour_a_disabled_agent_profile_is_silently_ignored` is gone**, because
+its name stopped being true: the condition *is* observed now, it is simply not refused. It is
+replaced by four cases that keep the `documents_`/`guards_` line honest — three guards that
+survive the product decision, and one `documents_` case that the decision makes wrong. **Merging
+them would have made the observability guard go red on a fail-closed fix**, which is precisely
+the pinned-defect shape §3.4 records twice.
+
+**Six mutations, each reverted.**
+
+| mutation | result |
+|---|---|
+| drop the audit row, keep the event and the `warn!` | **red** on the disable and soft-delete guards |
+| drop the runtime event, keep the audit row and the `warn!` | **red** on all three announcement guards |
+| announce whenever `agent_profile_id` is `Some`, rather than when the lookup fails | **red** on the *within-test* active-profile control only — **`guards_a_route_with_no_agent_profile_announces_nothing` stayed green**, because that route never enters the arm. This is the edit that justifies having both controls |
+| empty payload (`json!({})`) | **red** on `agent_profile_id`; the ids are asserted, not just the event's presence |
+| `AuditResult::Success` instead of `Failed` | **red** — the disable guard asserts the row's `result`, not only its action |
+| map the event onto the public SSE contract | **red** on the new unit guard, which carries its own liveness control (`route_selected` must still map) |
+
+**The one gap, chosen rather than missed: nothing asserts the `warn!`.** That is deliberate —
+a log assertion is weak, and capturing `tracing` output requires a process-global subscriber that
+would fight every other test in the binary. Deleting the `warn!` alone leaves every guard green.
+The two signals that *are* guarded are the structured one and the durable one, which is the right
+two of the three.
+
+**A hole closed that nothing asked for, from §3.4's twelfth entry.** `tests/agent_profile_wire.rs`
+justifies its streaming case with *"both arms share the one call today, but they are separate
+arms"*. That justification applies to **every** property the suite tests, and F50's observability
+had no streaming twin. `get_active_agent_profile` has exactly one call site in `src/`, so the
+case cannot fail today for a reason the disable case would not also catch — it exists so the cell
+is filled before something moves the lookup. Adding it is the whole cost of not repeating F49.
 
 ## F51 CLOSED · F52 CLOSED — `fix/f51-f52-invalidation-scope`, 2026-08-02
 

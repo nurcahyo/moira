@@ -89,16 +89,17 @@ impl RuntimeInvalidationTargets {
 
 /// Applies one invalidation, whichever channel delivered it.
 ///
-/// # Every target is scoped, not just the breakers (F51)
+/// # Every target is scoped, not just the breakers (F51, F53)
 ///
 /// The three caches were once cleared unconditionally, on the argument that they
 /// are keyed by version and rebuild on the next read "so re-reading them costs a
 /// query". That argument is sound for a *configuration* write and false for
-/// everything else: the channel is also attached to tables whose rows are
-/// per-request data, and `runtime_handles` does not hold query results — it holds
-/// built provider clients, connection pools included. One conversation row
-/// therefore dropped every replica's entire runtime-config cache and every cached
-/// provider client handle, on a write that cannot change any of them.
+/// everything else: the channel was also attached to tables whose rows are
+/// per-request data (F51) and to the two that hold RAG *content* (F53), and
+/// `runtime_handles` does not hold query results — it holds built provider
+/// clients, connection pools included. One conversation row, or one ingested
+/// document, therefore dropped every replica's entire runtime-config cache and
+/// every cached provider client handle, on a write that cannot change any of them.
 ///
 /// So [`invalidation_plan`] now decides all four targets from one parse of the
 /// payload, and the caches are skipped for the resource types that are declared
@@ -292,19 +293,38 @@ const CIRCUIT_UNAFFECTED_RESOURCE_TYPES: &[&str] = &[
     "consumer_api_keys",
     "provider_credentials",
     "provider_runtime_policies",
-    "rag_collections",
-    "rag_documents",
     "route_definitions",
     "routing_policies",
     "system_api_keys",
     "trusted_jwt_issuers",
 ];
 
-/// Resource types whose rows are **per-request data rather than configuration** (F51).
+/// Resource types whose rows are **data or content rather than configuration** (F51, F53).
 ///
 /// A write to one of these cannot change anything the three in-process caches hold —
 /// provider configuration, built provider client handles, or the enabled auth methods —
 /// so it must clear none of them, and it cannot change provider health either.
+///
+/// # Two arrival rates, one property
+///
+/// `conversations` and `memory_records` (F51) are *per-request* data: they are written on
+/// the public execution path, once per conversation created and once per extracted memory.
+/// `rag_collections` and `rag_documents` (F53) are *content*: admin-written, so
+/// operator-rate rather than request-rate, but a bulk import is still one full
+/// cross-replica cache wipe per document. The rate is why F53 was a smaller finding than
+/// F51; it is not why either belongs here. What puts a name here is that no cache the
+/// listener clears can hold the row.
+///
+/// # `rag_collections` was the one that had to be checked rather than assumed
+///
+/// It is the plausible candidate for real configuration — a collection could reasonably
+/// own an embedding model and a dimension, and if it did, a cached read of one would go
+/// stale here. It does not. The table carries `collection_key`, `display_name`,
+/// `description`, `status`, `visibility` and `metadata`; every embedding value lives in
+/// `application_embedding_policies`, keyed by `application_id`, which keeps its trigger
+/// and its `caches: true` classification. `find_collection_ingestion_context` in
+/// `src/infra/repositories/conversation.rs` joins the collection solely to reach
+/// `application_id` and reads the configuration from the policy row.
 ///
 /// # This asks a different question from [`CIRCUIT_UNAFFECTED_RESOURCE_TYPES`]
 ///
@@ -322,11 +342,18 @@ const CIRCUIT_UNAFFECTED_RESOURCE_TYPES: &[&str] = &[
 /// # These tables no longer carry the trigger either
 ///
 /// `migrations/0022_conversations_and_memory_are_not_runtime_config.sql` drops the NOTIFY
-/// trigger from both, so on the Postgres path this arm is unreachable today. It is kept
+/// trigger from the first two and `migrations/0024_rag_content_is_not_runtime_config.sql`
+/// from the second two, so on the Postgres path this arm is unreachable today. It is kept
 /// as the second of two independent barriers: the classifier still narrows correctly if
 /// the trigger is ever re-attached, and it covers the Redis publish path, which is not
-/// gated by any trigger at all. Either barrier alone closes F51; neither is load-bearing.
-const RUNTIME_DATA_RESOURCE_TYPES: &[&str] = &["conversations", "memory_records"];
+/// gated by any trigger at all. Either barrier alone closes F51 and F53; neither is
+/// load-bearing.
+const RUNTIME_DATA_RESOURCE_TYPES: &[&str] = &[
+    "conversations",
+    "memory_records",
+    "rag_collections",
+    "rag_documents",
+];
 
 /// Every table wired to the `moira_runtime_config` channel, as the classifier below must
 /// be able to handle it.
@@ -363,8 +390,6 @@ pub const TRIGGERED_RESOURCE_TYPES: &[&str] = &[
     "provider_models",
     "provider_runtime_policies",
     "providers",
-    "rag_collections",
-    "rag_documents",
     "route_definitions",
     "routing_policies",
     "system_api_keys",
@@ -508,7 +533,13 @@ mod tests {
     fn only_configuration_changes_invalidate_the_configuration_caches() {
         let id = Uuid::now_v7();
 
-        // Per-request data: the finding. Clears no cache and no breaker.
+        // Data and content: the finding, twice over. Clears no cache and no breaker.
+        //
+        // Iterating the constant rather than naming the four tables is the point. F52's
+        // rule is that a derived list is only a guard if something else consumes it, and
+        // this is one of the two consumers: adding a name to RUNTIME_DATA_RESOURCE_TYPES
+        // is not free, because it has to satisfy this assertion and
+        // `no_resource_type_is_in_both_classification_lists` below.
         for resource_type in RUNTIME_DATA_RESOURCE_TYPES {
             let plan = invalidation_plan(&payload(resource_type, id));
             assert_eq!(
@@ -517,9 +548,9 @@ mod tests {
                     caches: false,
                     circuits: CircuitResetScope::Unaffected,
                 },
-                "a {resource_type} write is per-request data; invalidating the caches on it \
-                 drops every replica's runtime config and every built provider client, \
-                 connection pools included"
+                "a {resource_type} write is data or content, not configuration; \
+                 invalidating the caches on it drops every replica's runtime config and \
+                 every built provider client, connection pools included"
             );
         }
 
@@ -634,8 +665,17 @@ mod tests {
     /// The `caches` assertion is what stops a *configuration* table being quietly moved
     /// into [`RUNTIME_DATA_RESOURCE_TYPES`]: that would leave its scope `Unaffected` and
     /// so satisfy the breaker assertion, while stopping every replica from ever noticing
-    /// the config change. A table that genuinely is per-request data loses its trigger in
+    /// the config change. A table that genuinely is data or content loses its trigger in
     /// the same change, which takes it out of this list and out of this test's reach.
+    ///
+    /// It is also the half that closes F52's lazy repair, and F53 is the case that
+    /// exercises it: attach the trigger to `rag_documents` again, watch
+    /// `the_notify_trigger_inventory_is_exactly_the_classified_set` red naming the table,
+    /// then "fix" it by adding the name back to [`TRIGGERED_RESOURCE_TYPES`]. Set equality
+    /// is restored and *this* test fails instead, because the name is still in
+    /// [`RUNTIME_DATA_RESOURCE_TYPES`] and so classifies `caches: false`. The two halves
+    /// can only be satisfied together, which is the whole property a derived inventory
+    /// needs.
     #[test]
     fn every_triggered_table_has_a_scope() {
         let resource_id = Uuid::now_v7();
@@ -652,7 +692,7 @@ mod tests {
                 plan.caches,
                 "{table} still carries the NOTIFY trigger but no longer invalidates the \
                  caches, so a change to it never reaches another replica; a table that is \
-                 really per-request data must lose its trigger in the same change"
+                 really data or content must lose its trigger in the same change"
             );
         }
     }

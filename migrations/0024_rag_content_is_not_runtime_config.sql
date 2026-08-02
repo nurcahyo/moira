@@ -1,0 +1,71 @@
+-- F53 — the last two content tables leave the runtime-config invalidation channel.
+--
+-- `migrations/0007_conversations_memory_rag.sql` attached
+-- `notify_moira_runtime_config_change()` to eight tables in one block. Four are genuinely
+-- configuration (the `application_*_policies` family). Two were per-request data and lost
+-- the trigger under F51 (`0022`). The last two are these: `rag_collections` and
+-- `rag_documents`, which are **content** — the corpus an application retrieves over, not
+-- anything that configures how it is retrieved.
+--
+-- Every notification on this channel makes every replica run `apply_invalidation`
+-- (`src/infra/db.rs`), which drops the runtime-config cache, the auth-settings cache and
+-- `ProviderRuntimeCache` — the last of which holds *built provider clients*, HTTP
+-- connection pools included. Ingesting one document therefore did that on every replica,
+-- and a bulk import of N documents did it N times.
+--
+-- These write paths are admin routes (`POST /api/v1/admin/rag-collections/{id}/documents`,
+-- its `/reindex` alias, and the delete path), so this is operator-rate rather than the
+-- request-rate F51 closed. That is the whole reason it was left as a separate finding.
+--
+-- # The question F53 required answering first, and the answer for each table
+--
+-- F53 was recorded with an instruction not to fix it until someone established whether a
+-- RAG collection's *own configuration* is read through one of the caches the listener
+-- clears — because `rag_collections` is more plausibly configuration than `rag_documents`
+-- is, and the two might not have the same answer.
+--
+-- They have the same answer, and the reason is stronger than expected: **`rag_collections`
+-- carries no runtime configuration at all.** Its columns are `collection_key`,
+-- `display_name`, `description`, `status`, `visibility`, `metadata` and the usual
+-- lifecycle fields. The embedding provider, embedding model, dimension, batch size and
+-- timeout that the ledger entry guessed might live here live in
+-- `application_embedding_policies`, keyed by `application_id` — see
+-- `find_document_ingestion_context` and `find_collection_ingestion_context` in
+-- `src/infra/repositories/conversation.rs`, which join the collection **only** to reach
+-- `application_id` and take every configuration value from the policy row. That table
+-- keeps its trigger and its `caches: true` classification; nothing about this migration
+-- touches it.
+--
+-- # Verified the same three ways `0022` was
+--
+--   1. The three caches the listener clears are `RuntimeConfigCache`
+--      (`HashMap<Uuid, ProviderConfig>`), `AuthProviderSettingsCache`
+--      (`Vec<PublicAuthMethod>`) and `ProviderRuntimeCache` (keyed by
+--      `RuntimeCacheKey`: provider, model, credential and runtime-policy ids and
+--      versions). None of the three can hold a collection or a document, and no
+--      `RuntimeCacheKey` field is derived from either table — so no read of either is
+--      served from a cache this channel invalidates. Every read of both goes to
+--      PostgreSQL on the spot, including the `visibility`/`status` predicates that carry
+--      the tenant-isolation contract, so dropping the trigger cannot make an
+--      authorization decision stale either.
+--   2. `src/infra/db.rs` is the only listener on `moira_runtime_config`, and neither
+--      table is in `PUBLISHABLE_RESOURCE_TYPES`, so nothing publishes them on the Redis
+--      channel either.
+--   3. `docs/runtime-cache-invalidation.md` is updated in the same change. Note it did
+--      *not* need correcting for `0022`'s pair but does for this one: the F51/F52 commit
+--      added "and the RAG collection and document tables" to that paragraph to make it
+--      match `TRIGGERED_RESOURCE_TYPES` as it then stood.
+--
+-- The `<table>_bump_version` triggers stay. `version` is the `If-Match` ETag for these
+-- rows and has nothing to do with invalidation — same reasoning as `0022`.
+--
+-- # Reversal
+--
+-- If a collection ever acquires configuration that a cache holds — a per-collection
+-- embedding model, say, cached in process — re-create that table's trigger and delete its
+-- name from `RUNTIME_DATA_RESOURCE_TYPES` in `src/infra/db.rs` in the same change. The
+-- classifier is the second, independent barrier and must not be left narrowing a table
+-- that has become configuration; `every_triggered_table_has_a_scope` fails if it is.
+
+drop trigger if exists rag_collections_runtime_config_notify on rag_collections;
+drop trigger if exists rag_documents_runtime_config_notify on rag_documents;
