@@ -76,10 +76,32 @@ landing an agent's commit on the wrong branch — that happened twice.
    keep using it rather than hand-rolling.
 10. `pgrep -fc` is **not valid on macOS** — it prints usage to stderr and yields `0`, so a
     concurrency check reports "no peers" during a busy run
+11. **`gates.sh`'s own test phase looks like it is still compiling when it is not.** The script
+    redirects `cargo test` to a `mktemp` file, so the outer log sits on `── test` for the whole
+    phase and then shows *release-build* output — visually indistinguishable from a test phase
+    still running. **Editing sources during that window silently splits the run:** `fmt` and
+    `clippy` pass against the old tree while `release` builds the new one, and the reported test
+    count belongs to neither. Found 2026-08-02 when a run reported a plausible number that was not
+    that branch's. **Do not edit sources while `gates.sh` is running**; if you did, the run proves
+    nothing about what you edited. Corollary: `grep "Running tests/"` on the *outer* log returns
+    zero by design — the completeness assertion reads the temp log, and `ALL GATES PASSED` is the
+    only trustworthy summary of it.
+12. **`gh pr view --json statusCheckRollup` can report the PREVIOUS commit's verdict.** Right after
+    a push it returned five `SUCCESS` checks for a commit that had just been superseded; the real
+    checks for the new head were all pending. Found 2026-08-02, one command before an unwarranted
+    merge. **Key the wait on the head SHA:** `gh pr view --json headRefOid -q .headRefOid`, then
+    `gh api repos/{owner}/{repo}/commits/$SHA/check-runs`. Also note `.conclusion//"pending"` does
+    **not** substitute for an empty string — queued checks carry `""`, not `null`, so a
+    `grep -q pending` loop exits immediately on the first poll.
 
 **Redirect to a file, capture `$?` immediately, then read the file — and run cargo from inside a
 script.** Use `scripts/gates.sh`, which handles all of this and asserts log completeness against
 `ls tests/*.rs`.
+
+**And never pipe the gate runner.** `scripts/gates.sh | tail -25` yields `tail`'s exit code (form 1
+applied to the very tool built to defeat form 1). Redirect to a file instead. The content marker
+`ALL GATES PASSED` is emitted only when the failures array is empty, so it is a sounder signal than
+`$?` in every case where the two could disagree.
 
 ### 2.2b `scripts/gates.sh` CANNOT run concurrently with another gates run
 
