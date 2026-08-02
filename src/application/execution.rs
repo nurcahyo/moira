@@ -600,6 +600,24 @@ impl MoiraExecutionService {
                             Ok(result) => result?,
                             Err(_) => {
                                 let failure = terminal_persistence_deadline_failure();
+                                // **What "committed" means here, and why it is read rather
+                                // than asserted (finding F38).**
+                                //
+                                // `EventCollector::output_committed` is this module's own
+                                // definition of the word: it flips on the first chunk that is
+                                // *accepted by the consumer*, so it is `true` on a streamed
+                                // answer the caller has already seen and `false` on every
+                                // non-streaming execution, where the caller receives nothing
+                                // but the outcome. It says nothing about the database — the
+                                // three terminal writes are precisely what timed out.
+                                //
+                                // This used to be the literal `true` in both the audit entry
+                                // and the `ExecutionFailed` event, which was wrong in both
+                                // available senses on the non-streaming path: nothing had
+                                // reached the caller, and the write group had not completed.
+                                // The `tracing` line below always said "may", and it was the
+                                // honest one.
+                                let delivered_to_caller = events.output_committed();
                                 tracing::error!(
                                     request_id = %command.request_id,
                                     execution_id = %command.execution_id,
@@ -607,6 +625,7 @@ impl MoiraExecutionService {
                                     provider_id = %candidate.provider_id,
                                     provider_model_id = %candidate.provider_model_id,
                                     latency_ms,
+                                    delivered_to_caller,
                                     "terminal persistence exceeded the execution deadline after a successful provider call; output may already be committed"
                                 );
                                 // The database is by definition slow at this point, so the
@@ -623,7 +642,8 @@ impl MoiraExecutionService {
                                         "provider_model_id": candidate.provider_model_id,
                                         "latency_ms": latency_ms,
                                         "failure_class": failure.class,
-                                        "output_committed": true
+                                        "output_committed": delivered_to_caller,
+                                        "terminal_state_persisted": false
                                     }),
                                 );
                                 match tokio::time::timeout(TERMINAL_PERSISTENCE_AUDIT_BUDGET, audit)
@@ -652,44 +672,87 @@ impl MoiraExecutionService {
                                     json!({
                                         "failure_class": failure.class,
                                         "phase": "terminal_persistence",
-                                        "output_committed": true
+                                        "output_committed": delivered_to_caller,
+                                        "terminal_state_persisted": false
                                     }),
                                 );
-                                // **`output` is live here, and `failed_outcome` discards it.**
+                                // **Finding F38 — the outcome keeps what the provider produced.**
                                 //
-                                // This is the one `failed_outcome` call site reached from
-                                // `Ok(Ok(output))`, so the outcome it builds drops three values
-                                // that are in hand and already reported elsewhere:
-                                // `output.text` (the client has received every delta of it on
-                                // the streaming path), `output.structured_output` (finding F29,
-                                // populated since this commit), and `output.usage` — which the
-                                // `attempt_summary` two statements above records in full while
-                                // the outcome carries `UsageSummary::default()`. That asymmetry
-                                // is finding **F38**, a billing and reporting divergence, and
-                                // both audit metadata and the `ExecutionFailed` event assert
-                                // `"output_committed": true` right beside it.
+                                // This is the one arm reached from `Ok(Ok(output))` that does
+                                // not return `Succeeded`, and it used to call `failed_outcome`,
+                                // which hardcodes `output_text: None`, `structured_output: None`
+                                // and `usage: UsageSummary::default()`. Three values that were
+                                // live in `output` were dropped, while the `attempt_summary`
+                                // pushed a few statements above recorded the usage in full. The
+                                // outcome and its own `attempts` array contradicted each other
+                                // inside a single serialised document; that asymmetry was the
+                                // whole finding.
                                 //
-                                // **Deliberately not fixed here, and F38 stays open.** The
-                                // condition this arm reports is that terminal persistence did
-                                // *not* complete: `update_attempt`, `insert_usage_record` and
-                                // `touch_credential_used` may each have failed to commit. So
-                                // promoting the usage onto the outcome would assert a billing
-                                // fact whose row may be absent, and promoting `output_text` onto
-                                // a non-`Succeeded` status changes what every consumer of a
-                                // failed execution receives. Deciding which of the two levels is
-                                // authoritative is F38's own change, with its own tests; making
-                                // it a side effect of F29 would bury a billing decision inside a
-                                // parsing one.
+                                // **Decision: report the provider's result, keep the failure.**
+                                // `status` stays `Failed` and the retry/fallback clamp is
+                                // untouched — terminal state genuinely did not persist and this
+                                // execution must never be re-run. But `output_text`,
+                                // `structured_output` and `usage` are facts about a provider
+                                // call that *succeeded*, and discarding them made the failure
+                                // report less true, not safer:
                                 //
-                                // What this comment buys: the drop is no longer silent. It was
-                                // inert only while `structured_output` was universally `None`.
-                                return Ok(failed_outcome(
-                                    command,
-                                    Some(route),
-                                    Some(model),
+                                // - `UsageSummary::default()` is all-`None`, i.e. "unknown",
+                                //   not "zero". Retaining the real counts replaces an absence
+                                //   of information with information; it does not overwrite a
+                                //   deliberate claim that nothing was spent.
+                                // - `terminal_update_from_outcome` in `application/public.rs`
+                                //   runs on the `Failed` branch too and copies `usage`,
+                                //   `output_text.len()` and the output hash straight onto the
+                                //   `responses` row. Dropping them wrote "no tokens, zero
+                                //   bytes, no hash" for a request the provider answered and
+                                //   will invoice. Retaining them makes that row faithful, and
+                                //   makes `responses.usage` populated while `usage_records` has
+                                //   no row the detectable signature of exactly this condition —
+                                //   which is otherwise invisible.
+                                // - On the streaming path the caller has already received every
+                                //   delta. An outcome reporting no output described something
+                                //   the caller could see had not happened.
+                                //
+                                // **What this deliberately does not do.** No `usage_records`
+                                // row is written, so nothing is double-counted; billing that
+                                // reads `usage_records` still under-counts this execution, and
+                                // that under-count is now *detectable* rather than silent.
+                                //
+                                // **Reversal condition.** Zero the usage again the day
+                                // `ExecutionOutcome.usage` (or `responses.usage`) becomes an
+                                // input to customer invoicing rather than a reporting surface.
+                                // Today its only readers are `terminal_update_from_outcome` and
+                                // the runtime diagnostic endpoint, both reporting; invoicing
+                                // reads `usage_records`. Once a billing job sums the response
+                                // rows, a `Failed` response carrying usage would charge a
+                                // caller who received an HTTP error, and the deployment must
+                                // then decide explicitly whether this arm is chargeable instead
+                                // of inheriting the answer from a struct literal.
+                                //
+                                // **Second reversal condition, for the text.** Two consumers —
+                                // `ConversationService::run_extraction` and
+                                // `summarize_conversation` — infer "the model answered" from
+                                // `output_text`/`structured_output` being `Some`, never from
+                                // `status`. Retaining the text therefore lets both proceed on a
+                                // reply that is genuinely present, which is the correct answer
+                                // to the question they are asking. If a *delivery* path (rather
+                                // than an interpretation path) ever starts treating
+                                // `output_text.is_some()` as "show this to the end user" without
+                                // checking `status`, this arm must stop carrying text and the
+                                // two inference sites must read `status` instead — which is also
+                                // the third precondition of F29's own reversal condition.
+                                return Ok(ExecutionOutcome {
+                                    request_id: command.request_id,
+                                    execution_id: command.execution_id,
+                                    status: execution_status_for_failure(failure.class),
+                                    output_text: Some(output.text),
+                                    structured_output: output.structured_output,
+                                    usage: output.usage,
+                                    route: Some(route),
+                                    model: Some(model),
                                     attempts,
-                                    failure,
-                                ));
+                                    failure: Some(failure),
+                                });
                             }
                         }
                         self.state
@@ -2258,10 +2321,20 @@ fn terminal_persistence_budget(deadline: Instant) -> Duration {
 /// Failure raised when terminal persistence overruns the deadline.
 ///
 /// Built through `attempt_timeout_failure(bounded_by_total_deadline = true,
-/// output_committed = true)` so it inherits the existing "output is already committed,
-/// never retry and never fall back" clamp rather than introducing a parallel scheme. The
-/// message is specialised so the condition is distinguishable from a plain
-/// `deadline_failure()` in logs, audit metadata, and the outcome envelope.
+/// output_committed = true)` so it inherits the existing "never retry and never fall back"
+/// clamp rather than introducing a parallel scheme. The message is specialised so the
+/// condition is distinguishable from a plain `deadline_failure()` in logs, audit metadata,
+/// and the outcome envelope.
+///
+/// **The `true` here is not the same claim the audit entry makes** (finding F38). The clamp
+/// argument is unconditionally `true` because the *provider call already completed and its
+/// tokens are already spent*, so a retry or a fallback would buy a second answer at a second
+/// cost — that is true whether or not a single byte reached the caller. The
+/// `"output_committed"` key in the audit entry and the `ExecutionFailed` event answers the
+/// different question "has the caller seen this output", and is read from
+/// [`EventCollector::output_committed`] rather than asserted. Keep the two apart: making this
+/// argument conditional would let a non-streaming execution be retried against a provider
+/// that has already billed for the answer.
 fn terminal_persistence_deadline_failure() -> ExecutionFailure {
     let mut failure = attempt_timeout_failure(true, true);
     failure.message =
@@ -2458,6 +2531,148 @@ mod tests {
             assert!(
                 provider_emits_output_schema(provider_type),
                 "rig-core changed: {provider_type:?} no longer sends the schema — re-read F39"
+            );
+        }
+    }
+
+    /// **Finding F48 — a guard on the precondition, not on the behaviour.**
+    ///
+    /// `rig-core` 0.40's OpenAI encoder computes
+    ///
+    /// ```text
+    /// should_apply_response_format =
+    ///     output_schema.is_some() && supports_response_format
+    ///     && (tools.is_empty() || history_has_tool_result)
+    /// ```
+    ///
+    /// (`providers/openai/completion/mod.rs`). The third clause discards `output_schema` on
+    /// **turn 1 of any tool-calling conversation, for every OpenAI-family provider**, and —
+    /// unlike the `supports_response_format == false` path a few lines above it — emits **no
+    /// `warn!` at all**. Rig documents the caveat itself (issue #1928) and Moira's own
+    /// `composes_native_output_with_tools` comment restates it. **That behaviour is Rig's and is
+    /// deliberately not changed here.**
+    ///
+    /// It cannot bite today: [`build_completion_request`] hardcodes `tools: Vec::new()`, and the
+    /// public plane refuses caller-declared tools outright — `application/public.rs` answers
+    /// `unsupported_tool` / *"client-defined tools are not registered in this phase"* before an
+    /// `ExecutionCommand` is ever built. So the drop is unreachable, which is exactly why it
+    /// would ship unnoticed.
+    ///
+    /// This case therefore guards the *precondition*. It hands the request Moira really builds
+    /// to Rig's real encoder and asserts the schema survived onto the wire body. The moment
+    /// `tools` stops being empty, Rig drops `response_format` and this reds — naming F48, so
+    /// whoever enables tool calling confronts the silent drop instead of discovering it in
+    /// production.
+    ///
+    /// **Three things this fixture does on purpose**, each answering "what is the cheapest edit
+    /// that breaks the property while leaving the guard green?":
+    ///
+    /// 1. **The profile carries a `tool_policy`.** `AgentProfileRecord::tool_policy` is the
+    ///    field a tool-calling implementation reads first, so the cheapest enabling edit is
+    ///    "populate `tools` from the profile". A fixture passing `agent_profile: None` would
+    ///    sail straight through it.
+    /// 2. **Both `stream` settings.** `build_completion_request` ignores `stream` today; an
+    ///    implementation that enabled tools on one path only would otherwise stay green.
+    /// 3. **Rig's encoder, not a restatement of Rig's predicate.** Re-implementing
+    ///    `should_apply_response_format` in the test module would be the F16 shape — a correct
+    ///    predicate, tested against itself. `CompletionRequest::try_from((model, request))` is
+    ///    Rig's own public conversion, configured (`supports_response_format: true`,
+    ///    `supports_tools: true`) exactly as the OpenAI family is.
+    ///
+    /// **Measured, not assumed: this case is the only coverage of the edit in point 1.** The
+    /// mutation above was run against the whole suite, and `tests/structured_output.rs` — which
+    /// reads `response_format.type` off the body that actually reached a mock provider, and which
+    /// looks like it should be the stronger guard — stayed **green** through it. Every fixture in
+    /// the tree sets `routing_policies.agent_profile_id = NULL`, so `agent_profile` is `None` on
+    /// every integration path and no end-to-end test has ever built a request from a profile at
+    /// all. Those wire tests catch an *unconditional* tool list and nothing else. Do not delete
+    /// this case in favour of them.
+    ///
+    /// The one gap that remains: a tool list attached to the request *after*
+    /// `build_completion_request` returns, between the build and `handle.completion(request)`.
+    /// That the wire tests would catch, because it needs no profile.
+    #[test]
+    fn moiras_request_still_carries_its_schema_onto_rigs_openai_wire_body() {
+        use rig_core::providers::openai::completion::CompletionRequest as OpenAiWireRequest;
+
+        let profile = AgentProfileRecord {
+            id: Uuid::now_v7(),
+            profile_key: "f48-guard".to_string(),
+            display_name: "F48 guard".to_string(),
+            preamble: Some("you are a guard".to_string()),
+            temperature: Some(0.0),
+            max_tokens: Some(64),
+            // The field a tool-calling implementation reads first. See point 1 above.
+            tool_policy: json!({
+                "tools": [{
+                    "name": "lookup",
+                    "description": "look something up",
+                    "parameters": { "type": "object", "properties": {} }
+                }]
+            }),
+            context_policy: Value::Null,
+            memory_policy: Value::Null,
+            status: crate::domain::ResourceStatus::Active,
+            metadata: Value::Null,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            deleted_at: None,
+            version: 1,
+        };
+
+        for stream in [false, true] {
+            let command = ExecutionCommand {
+                request_id: "f48".to_string(),
+                execution_id: Uuid::now_v7(),
+                identity: CallerRuntimeIdentity {
+                    actor_type: format!("{:?}", ActorType::SystemKey),
+                    subject: None,
+                    external_user_id: None,
+                    external_tenant_id: None,
+                    application_id: None,
+                    scopes: vec!["moira:admin".to_string()],
+                },
+                application_id: None,
+                external_tenant_id: None,
+                external_user_id: None,
+                messages: vec![DomainMessage::user("hello")],
+                route_hint: None,
+                provider_hint: None,
+                model_hint: None,
+                credential_hint: None,
+                options: ExecutionOptions {
+                    stream,
+                    output_schema: Some(json!({
+                        "title": "Answer",
+                        "type": "object",
+                        "properties": { "a": { "type": "integer" } },
+                        "required": ["a"]
+                    })),
+                    ..ExecutionOptions::default()
+                },
+                // Non-null so `additional_params` is already `Some`, which forces Rig's
+                // *merge* branch rather than its plain-assignment branch.
+                metadata: json!({ "moira": { "purpose": "f48_guard" } }),
+            };
+
+            let request = build_completion_request(&command, Some(&profile))
+                .expect("the guard's own request must be buildable");
+            assert!(
+                request.output_schema.is_some(),
+                "the fixture must actually carry a schema, or this guard proves nothing"
+            );
+
+            let wire = OpenAiWireRequest::try_from(("gpt-4o".to_string(), request))
+                .expect("rig-core must encode a schema-carrying request");
+            let params = wire.additional_params.unwrap_or(Value::Null);
+            assert!(
+                params.get("response_format").is_some(),
+                "finding F48: rig-core dropped output_schema before the wire (stream={stream}). \
+                 `should_apply_response_format` also requires `tools.is_empty() || \
+                 history_has_tool_result`, so this is what a non-empty tool list looks like on \
+                 turn 1 — and rig emits no warning for it. Enabling tool calling means deciding \
+                 what happens to structured output on turn 1 first; see F48 in \
+                 plans/reports/EXECUTION-LEDGER.md. Encoded params: {params}"
             );
         }
     }

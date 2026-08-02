@@ -2488,7 +2488,7 @@ question being investigated. That clause has now out-produced the questions them
 | ~~**F35**~~ | ~~**The OpenAI-compat endpoint silently discards `text.format`.**~~ **CLOSED** `fix/f35-compat-text-format` — `json_schema` is honoured, `json_object` is refused (it would have reached the provider as an empty-object schema — that was **F46**, now **CLOSED** `a8937f4`: the native path refuses it too, so the two endpoints agree and F35's original reversal condition is superseded), every other `text` key is refused by a typed DTO. Finding verified correct in every particular; two things it did not mention made the fix sharper. See the F35 section below. | **HIGH** |
 | **F36** | **`SummarizationLock` pins a Postgres session advisory lock across a full provider round-trip**, on a per-turn path, over a `pool.acquire().await?.detach()`ed backend. A hung provider holds one backend and one conversation lock for the whole attempt timeout. The lock's own doc comment names this reversal condition — and it has already been met. | **MED-HIGH** |
 | **F37** | **Four wasted DB reads per conversation-linked turn when summarization is disabled**, inside the caller's request, between the last SSE delta and the terminal event. Six round-trips, four of them dead, on the default configuration. | **MEDIUM** |
-| **F38** | **The terminal-persistence-deadline arm throws away a successful provider result.** `execution.rs:658` returns `failed_outcome` with `output_text: None` and a default `UsageSummary` while `output.text` and `output.usage` are in hand and `"output_committed": true` is written into both the audit entry and the `ExecutionFailed` event. On streaming the client has already received every delta. Usage is preserved at attempt level and zeroed at outcome level — **the asymmetry is the tell**. Billing and reporting divergence. Found independently by both skeptics. **Still open after `fix/f29-structured-output`**, which added `structured_output` as a third dropped value and left an explicit comment naming all three rather than fixing the divergence — see the F29 closure entry for why a billing decision was kept out of a parsing change. | **MEDIUM** |
+| ~~**F38**~~ | ~~**The terminal-persistence-deadline arm throws away a successful provider result.**~~ **CLOSED** `fix/f38-deadline-usage`. Finding verified correct in every particular. **Decision: the outcome carries all three values (`output_text`, `structured_output`, `usage`) and `status` stays `Failed`**; the never-retry/never-fallback clamp is untouched. Two things the finding did not know sharpened it: `UsageSummary::default()` is all-`None` ("unknown"), not zero, so retention replaces an absence rather than overwriting a claim of no spend; and `terminal_update_from_outcome` runs on the `Failed` branch too, so the zeroing was also writing "no tokens, zero bytes, no hash" onto the `responses` row. **`"output_committed": true` was inaccurate** — a hardcoded literal, false in both available senses on the non-streaming path; now derived. Reversal conditions in the closure section below. | **CLOSED** |
 | ~~**F39**~~ | ~~**The structured-output capability gate cannot see Rig's per-provider reality.**~~ **CLOSED** `fix/f39-structured-output-capability`. Both divergences verified true. Resolved **asymmetrically**, because they are not the same problem: DeepSeek is decidable and is now reconciled out of routing by reading Rig's own `SUPPORTS_RESPONSE_FORMAT`; `OpenAiCompatible`/`Local` is **not decidable at admission** and was deliberately left admitted. See the F39 closure section below. | **CLOSED** |
 | **F40** | **`GET /v1/responses/{id}` returns an empty `output` array for a completed, persisted response.** Falls through both branches to `Vec::new()`. The `OutputUnavailable { reason: "metadata_only_persistence" }` variant exists to explain the *other* case, which makes the silent empty array read as an oversight rather than a decision. Needs a product call. | **LOW-MED** |
 | ~~**F41**~~ | ~~**Skill-tree drift on exactly the guidance F29's implementer needs.**~~ **STRUCK — the inference was wrong.** The `.claude/` copy is a nine-line **pointer file** that says to read the `.agents/` one; all eight `.claude/skills/` entries have that shape. See "F41 is WRONG as recorded" below. | **struck** |
@@ -2496,7 +2496,8 @@ question being investigated. That clause has now out-produced the questions them
 | **F43** | **`ConcurrencyController::acquire` is dead `pub` API on the concurrency-safety path** — every caller is inside `#[cfg(test)]`. It hardcodes `is_stream: false`, so a future caller reaching for the obvious-looking name on a streaming path silently takes a *request* permit. | **LOW** |
 | **F44** | **`RuntimeModelHandle::stream` / `RuntimeStreamOutput` are dead `pub` API** — ~65 lines duplicating `execute_rig_stream`, kept alive only by a re-export. Divergence hazard: someone fixing streaming will fix one of the two. | **LOW** |
 | **F45** | **`PublicResponseFormat::JsonSchema { name, strict }` — both accepted, both dropped.** Public in `docs/openapi.json`; every destructure site uses `{ schema, .. }`. Rig hardcodes `strict: true` and renames from the schema's `title`. A caller sending `strict: false` gets strict mode, unreported. | **LOW** |
-| **F48** | **A third `output_schema` drop path, latent, and it is silent even on OpenAI.** `should_apply_response_format` (`openai/completion/mod.rs`) is `output_schema.is_some() && supports_response_format && (tools.is_empty() \|\| history_has_tool_result)`. The third clause drops the schema on **turn 1 of any tool-calling conversation, for every OpenAI-family provider**, and unlike the DeepSeek path it emits **no `warn!` at all** — the warning at the same site fires only when `supports_response_format` is false. Cannot bite today: `build_completion_request` hardcodes `tools: Vec::new()`, so `tools.is_empty()` is always true. It becomes live the moment tool calling is enabled, which `.agents/skills/moira-rig-tools/SKILL.md` contemplates. **The F39 fix does not cover it** — F39 reconciles by provider type, and this drop is per-request. Rig documents the caveat itself: *"a turn-1 answer with no tool call is therefore not schema-constrained; `Native` is 'guaranteed' only once tools have run"* (issue #1928). | **MEDIUM, latent** |
+| **F48** | **A third `output_schema` drop path, latent, and it is silent even on OpenAI.** `should_apply_response_format` (`openai/completion/mod.rs`) is `output_schema.is_some() && supports_response_format && (tools.is_empty() \|\| history_has_tool_result)`. The third clause drops the schema on **turn 1 of any tool-calling conversation, for every OpenAI-family provider**, and unlike the DeepSeek path it emits **no `warn!` at all** — the warning at the same site fires only when `supports_response_format` is false. Cannot bite today: `build_completion_request` hardcodes `tools: Vec::new()`, so `tools.is_empty()` is always true. It becomes live the moment tool calling is enabled, which `.agents/skills/moira-rig-tools/SKILL.md` contemplates. **The F39 fix does not cover it** — F39 reconciles by provider type, and this drop is per-request. Rig documents the caveat itself: *"a turn-1 answer with no tool call is therefore not schema-constrained; `Native` is 'guaranteed' only once tools have run"* (issue #1928). **GUARDED, still latent and still not fixed** (`fix/f38-deadline-usage`). Premise re-verified: `execution.rs:1907` is the tree's **only** `CompletionRequest` construction and still hardcodes `tools: Vec::new()`, and `public.rs` refuses caller-declared tools outright (`unsupported_tool`, *"client-defined tools are not registered in this phase"*), so tools cannot reach the constructor from any direction. The drop behaviour is Rig's and is deliberately unchanged; the guard is `moiras_request_still_carries_its_schema_onto_rigs_openai_wire_body` in `src/application/execution.rs`, which hands Moira's real request to Rig's real encoder and reds the moment `tools` stops being empty. See F49 for why the obvious-looking integration coverage does not substitute for it. | **MEDIUM, latent — guarded** |
+| **F49** | **No integration test in the tree ever builds a request from an agent profile.** Every fixture sets `routing_policies.agent_profile_id = NULL`, so `agent_profile` is `None` on every end-to-end path and the whole `AgentProfileRecord` branch of `build_completion_request` — `preamble`, `temperature`, `max_tokens`, and any field a future change reads from `tool_policy` — is unverified at the wire. Found by running F48's mutation against the full suite: the mutation populated `tools` from `AgentProfileRecord::tool_policy`, the new unit guard went red, and `tests/structured_output.rs` — which reads `response_format.type` off the body that actually reached a mock provider and looks like the stronger guard — stayed **green through all seven cases**. Those wire tests catch an *unconditional* tool list and nothing else. **ID allocated against `origin/main` at `c938d5c`, whose highest was F48.** | **MEDIUM** |
 
 ### F35 — CLOSED: `text.format` is now honoured for `json_schema`, refused for the rest
 
@@ -2919,6 +2920,13 @@ was implemented first, the case was watched going red, and the gate was added af
 it is pretty-printed on purpose — a compact JSON reply round-trips through `to_string()` identically
 and the guard would pass against the defect.
 
+**[SUPERSEDED 2026-08-02 — F38 is now CLOSED on `fix/f38-deadline-usage`; see the F38 closure
+section above. The reasoning below is preserved because it is what deferred the decision, and two
+of its premises turned out to be weaker than they read: `UsageSummary::default()` is `None`
+("unknown"), not a zero that retention would overwrite, and `terminal_update_from_outcome` already
+runs on the `Failed` branch, so the outcome was *already* the source of the response row's usage
+and output hash.]**
+
 **F38 is NOT fixed and stays open.** `execution.rs`'s terminal-persistence-deadline arm calls
 `failed_outcome` from inside `match result { Ok(Ok(output)) => … }`, where `output` is live. F29
 turns its `structured_output: None` into a third silent drop alongside `output.text` and
@@ -2928,6 +2936,113 @@ Not fixed here because the arm's own condition is that terminal persistence did 
 so promoting the usage onto the outcome asserts a billing fact whose row may be absent, and
 promoting `output_text` onto a non-`Succeeded` status changes what every consumer of a failed
 execution receives. That is a billing decision; burying it inside a parsing change would hide it.
+
+### F38 — **CLOSED** `fix/f38-deadline-usage`. The outcome keeps what the provider produced — 2026-08-02
+
+**The finding was right, and two facts it did not have made the decision easier than it looked.**
+
+**Decision: `output_text`, `structured_output` and `usage` are all retained on the outcome;
+`status` stays `Failed`; the retry/fallback clamp is untouched.** One arm changed, in
+`src/application/execution.rs` — the `Err(_)` branch of the terminal-persistence timeout, the only
+`failed_outcome` call site reachable from `Ok(Ok(output))`.
+
+**Why the "this asserts a billing fact whose row may be absent" objection does not survive
+contact.** Three things, each checked against the tree rather than reasoned about:
+
+1. **`UsageSummary::default()` is all-`None`, not zero.** Every field is `Option<u64>`. The old
+   outcome did not claim the execution was free — it claimed the token count was *unknown*, while
+   the `attempts` array **in the same serialised document** carried the exact numbers. Retention
+   replaces an absence of information with information. The mutation run confirmed the shape:
+   `left: None, right: Some(2)`.
+2. **The outcome is already the write path for the response row.**
+   `terminal_update_from_outcome` in `application/public.rs` runs on the `Failed` branch as well
+   as the `Succeeded` one, and copies `usage`, `output_text.len()` and the output hash straight
+   onto `responses`. The zeroing was writing *"no tokens, zero bytes, no hash"* for a call the
+   provider answered and will invoice. Nothing new is asserted; a wrong assertion is corrected.
+3. **No `usage_records` row is created, so nothing is double-counted.** Billing reads
+   `usage_records`, which on this arm is empty — the integration test asserts `count(*) = 0`. So
+   invoicing still under-counts this execution. The difference is that `responses.usage`
+   populated while `usage_records` has no row is now the **detectable signature** of exactly this
+   condition, which was previously invisible in every surface at once.
+
+**What it costs.** The deployment still eats the provider cost — this change does not bill anyone
+for anything. It buys the ability to *find out*, and to reconcile against the provider invoice.
+
+**Reversal condition — usage.** Re-zero it the day `ExecutionOutcome.usage` or `responses.usage`
+becomes an input to customer invoicing rather than a reporting surface. Today the only readers are
+`terminal_update_from_outcome` and the runtime diagnostic endpoint, both reporting. Once a billing
+job sums the response rows, a `Failed` response carrying usage charges a caller who received an
+HTTP error, and the deployment must decide explicitly whether this arm is chargeable instead of
+inheriting the answer from a struct literal. **The trigger is concrete: any new reader of
+`responses.usage` that is not a reporting or reconciliation surface.**
+
+**Reversal condition — text.** `ConversationService::run_extraction` and `summarize_conversation`
+infer "the model answered" from `output_text`/`structured_output` being `Some`, never from
+`status`. Retaining the text lets both proceed on a reply that genuinely exists, which is the
+correct answer to the question they are asking — the model *did* answer; only Moira's own
+bookkeeping failed. If a **delivery** path (rather than an interpretation path) ever treats
+`output_text.is_some()` as "show this to the end user" without checking `status`, this arm must
+stop carrying text and those two sites must read `status` — which is also the third precondition of
+F29's own reversal condition. The public plane is not such a path today: both `create_response` and
+the streaming terminal branch dispatch on `outcome.status` first, and the `Failed` arm never
+*delivers* the text — it returns `Err(AppError::coded(…))` / a `terminal_failure` SSE, and it does
+not call `record_conversation_assistant`, so no conversation message is written from it. It does
+**read** `output_text` on that arm, through `terminal_update_from_outcome`, but only to record
+`output_text_bytes` and `output_hash` — which is the improvement, not the risk.
+
+**`"output_committed": true` was inaccurate, and the audit entry was the wrong one — not the
+outcome.** The brief asked which of the two is wrong. Neither, exactly: the value was a **hardcoded
+literal**, never derived from anything, and the module uses the word in two incompatible senses.
+
+- `EventCollector::output_committed` — the module's own definition — flips on the first chunk
+  *accepted by the consumer*. On the non-streaming path nothing reaches the caller, so it is
+  `false`.
+- The `tracing::error!` line two statements above the audit call always said output *may* already
+  be committed. It was the honest one.
+- The existing integration test asserted `usage_records` count `= 0` in the same body, so the
+  write group had not landed either.
+
+So on a non-streaming execution the literal was false in **both** available senses, and the test
+shipped in the tree **pinned it** — an instance of HANDOFF §3.4's "a test's own content literal,
+not code". It is now read from `EventCollector::output_committed`, and a second key
+`terminal_state_persisted: false` records what the arm actually knows.
+
+**The clamp keeps its unconditional `true`, for a third and different reason, now documented.**
+`terminal_persistence_deadline_failure()` passes `output_committed = true` into
+`attempt_timeout_failure` to force `retryable = false` / `fallback_eligible = false`. That is not a
+claim about delivery — it is the fact that *the provider's tokens are already spent*, so a retry
+buys a second answer at a second cost whether or not a byte reached the caller. Making that
+argument conditional would let a non-streaming execution be retried against a provider that has
+already billed for the answer. **`ExecutionFailure` classification is otherwise unchanged**, as the
+brief scoped it: nothing here required it, and the three preconditions for strict structured-output
+failure still have only one landed.
+
+**Guards, and the mutation that killed each.** Every one was run, not read.
+
+| Guard | Mutation | Result |
+|---|---|---|
+| `a_terminal_persistence_breach_clamps_retry_and_keeps_the_result_it_could_not_persist` | restore `failed_outcome(...)` | RED — `left: None, right: Some("committed-output")` |
+| `a_streamed_terminal_persistence_breach_reports_the_output_the_caller_already_received` | restore `failed_outcome(...)` | RED — `left: None, right: Some("firstsecond")` |
+| both | retain the text, re-zero **only** `usage` | RED both — `left: None, right: Some(2)`. The billing half is independently pinned; the text assertion is not shadowing it |
+| non-streamed case | restore the hardcoded `"output_committed": true` | RED — `left: Bool(true), right: false` |
+| streamed case | *same mutation* | **GREEN, correctly** — the caller really did receive the deltas there. The pair is what proves the value is derived rather than constant; one case asserting `false` everywhere would have been the toothless version |
+
+**Renamed test.** `terminal_persistence_timeout_is_recorded_as_output_committed_not_as_a_plain_failure`
+→ `a_terminal_persistence_breach_clamps_retry_and_keeps_the_result_it_could_not_persist`. The old
+name asserted the thing F38 found to be false. It is cited in
+`plans/04-durability-correctness.md:359`, which is now stale on the name only.
+
+**Cheapest edit that breaks the property while leaving the guards green.** Populate the outcome
+from a *different* successful-attempt source than `output` — e.g. re-reading the attempt row —
+which would produce the right numbers here and diverge whenever the row did not commit. The
+`outcome.usage == attempt.usage` conjunction is asserted as one fact for that reason. The residual
+gap is the `responses` row: neither case drives `PublicService`, so
+`terminal_update_from_outcome`'s handling of a `Failed` outcome carrying usage is reasoned about
+above but not pinned by a test. A public-plane case that forces a terminal-persistence breach would
+close it.
+
+**Gates:** `ALL GATES PASSED` — fmt, clippy, **test (1049 passed, 42/42 integration targets logged,
+zero DB-skip lines)**, release, deny, audit (the one expected allowed warning, RUSTSEC-2026-0221).
 
 ### F41 is WRONG as recorded — there is no skill-tree drift
 

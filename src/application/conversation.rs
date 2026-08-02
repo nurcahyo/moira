@@ -1331,10 +1331,18 @@ impl ConversationService {
         let Ok(execution) = service.execute(command).await else {
             return failed_extraction(FAILURE_EXTRACTION_CALL_FAILED);
         };
-        // `structured_output` is not populated by the execution kernel today — it is `None` on
-        // both the streaming and non-streaming paths — so the schema-constrained reply arrives
-        // as `output_text` and is parsed here. Preferring `structured_output` when it is
-        // present means this call site needs no edit the day the kernel starts filling it.
+        // `structured_output` is populated by the execution kernel since F29
+        // (`structured_output_from_text`, gated on the request carrying an `output_schema`),
+        // which this call does. It falls back to `output_text` for a reply that is not valid
+        // JSON, which F29 deliberately does not fail hard on.
+        //
+        // **This is one of two sites that infer "the model answered" from these two fields
+        // rather than from `execution.status`** (finding F38's second reversal condition; the
+        // other is `summarize_conversation`). Since F38 a terminal-persistence-deadline failure
+        // carries the provider's real reply here instead of `None`, so an extraction whose only
+        // failure was Moira's own bookkeeping now proceeds on a reply that genuinely exists —
+        // which is the correct answer to the question this site is asking. If that ever stops
+        // being true, read `status` here rather than re-zeroing the outcome.
         let raw = match execution
             .structured_output
             .as_ref()
@@ -1854,10 +1862,15 @@ impl ConversationService {
             .execute(command)
             .await
             .map_err(|_| summarization_failed(FAILURE_SUMMARIZATION_CALL_FAILED))?;
-        // `structured_output` is not populated by the execution kernel today (finding F29) and
-        // summarization asks for prose anyway, so the reply arrives as `output_text`. Preferring
-        // `structured_output` when present costs nothing and means this call site needs no edit
-        // the day the kernel starts filling it.
+        // Summarization sends **no** `output_schema`, and F29's parse is gated on one, so
+        // `structured_output` is always `None` on this path however JSON-shaped the prose is —
+        // that gate is the whole reason `summary_hash` stays a content address of the bytes the
+        // model actually sent. The `structured_output` arm therefore never fires here; it is
+        // kept only so the two inference sites read identically.
+        //
+        // Like `run_extraction`, this infers "the model answered" from the fields rather than
+        // from `execution.status`, so since F38 a terminal-persistence-deadline failure supplies
+        // real prose here instead of `None`. See F38's second reversal condition.
         let raw = execution
             .structured_output
             .as_ref()
