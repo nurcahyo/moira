@@ -491,7 +491,21 @@ fn completion_response(text: String) -> Response {
             "usage": {
                 "prompt_tokens": 2,
                 "completion_tokens": 1,
-                "total_tokens": 3
+                "total_tokens": 3,
+                // DeepSeek-only fields, required so this mock can also serve a
+                // `ProviderType::DeepSeek` provider (finding F39).
+                //
+                // DeepSeek is OpenAI-compatible on the *request* side, but rig-core 0.40 gives it
+                // its own response type whose `Usage` declares `prompt_cache_hit_tokens` and
+                // `prompt_cache_miss_tokens` with **no** `#[serde(default)]`. Omitting them makes
+                // an otherwise perfect 200 fail to deserialize, which surfaces as
+                // `provider_upstream_error` with the message "provider request failed with HTTP
+                // 200" — a genuinely misleading signal, since the HTTP exchange succeeded.
+                //
+                // Neither rig `Usage` sets `deny_unknown_fields`, so the two extra keys are
+                // ignored by every other provider and no existing expectation moves.
+                "prompt_cache_hit_tokens": 0,
+                "prompt_cache_miss_tokens": 2
             }
         })
         .to_string(),

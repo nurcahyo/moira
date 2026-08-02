@@ -38,6 +38,10 @@ Two limits are inherited from the native path rather than introduced here, and a
 
 Any request whose `text.format` is honoured is a structured-output request, so it is subject to the application's `structured_output_enabled` policy and requires a model advertising the `structured_output` capability. A request that previously returned prose because `text.format` was discarded may therefore now return `422 structured_output_unsupported` or `model_capability_mismatch` instead. That is the intended outcome: the caller asked for a schema and Moira is now telling them whether it can deliver one.
 
+Advertising the capability is **necessary but not sufficient** (ledger F39). The capability is a value on the provider-model row, and for some provider types `rig-core` will not put the schema on the wire whatever that row says — `DeepSeek` sets `SUPPORTS_RESPONSE_FORMAT = false` and its schema is discarded before the request is built. Routing therefore reconciles the advertised capability against the provider type and skips candidates that cannot receive a schema, so a structured request falls through to a provider that can, or fails with `no_eligible_model` if none is configured — exactly as it already behaves for a row that honestly declares `structured_output: false`. A row that claims the capability on such a provider is not merely ignored: it is treated as though it had never claimed it.
+
+The converse case is not decidable here. `openai_compatible` and `local` providers do receive `response_format.json_schema` on the wire, but whether a self-hosted backend honours it is a property of that backend, which Moira has no way to check at admission time. Those provider types are therefore admitted, and a non-conforming reply surfaces the same way it does anywhere else — `structured_output` is left absent rather than fabricated.
+
 `POST /v1/responses` carries no route field, so every compat request resolves through the default route (`general`, seeded by migration `0005`). A provider must be bound to that route for the endpoint to serve anything.
 
 No `/v1/chat/completions` route is registered in Phase 4.
