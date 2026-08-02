@@ -22,13 +22,14 @@ use crate::{
         ConversationPolicyPutRequest, ConversationPolicyRecord, ConversationQuery,
         ConversationRecord, ConversationStatus, ConversationSummaryRecord, CursorScope,
         DomainMessage, EmbeddingPolicyPutRequest, EmbeddingPolicyRecord, ExecutionCommand,
-        ExecutionOptions, HistoryStrategy, ListCursor, ListResponse, MemoryConsentMode,
-        MemoryCreateRequest, MemoryPatchRequest, MemoryPolicyPutRequest, MemoryPolicyRecord,
-        MemoryQuery, MemoryRecord, MemoryScope, MemoryStatus, Pagination, PublicCitation,
-        PublicContentPart, PublicInputMessage, RagCollectionCreateRequest,
-        RagCollectionPatchRequest, RagCollectionQuery, RagCollectionRecord, RagCollectionStatus,
-        RagDocumentCreateRequest, RagDocumentIngestRequest, RagDocumentRecord,
-        ResponseConversationInput, RetrievalPolicyPutRequest, RetrievalPolicyRecord, SeqCursor,
+        ExecutionOptions, ExecutionOutcome, ExecutionStatus, HistoryStrategy, ListCursor,
+        ListResponse, MemoryConsentMode, MemoryCreateRequest, MemoryPatchRequest,
+        MemoryPolicyPutRequest, MemoryPolicyRecord, MemoryQuery, MemoryRecord, MemoryScope,
+        MemoryStatus, Pagination, PublicCitation, PublicContentPart, PublicInputMessage,
+        RagCollectionCreateRequest, RagCollectionPatchRequest, RagCollectionQuery,
+        RagCollectionRecord, RagCollectionStatus, RagDocumentCreateRequest,
+        RagDocumentIngestRequest, RagDocumentRecord, ResponseConversationInput,
+        RetrievalPolicyPutRequest, RetrievalPolicyRecord, SeqCursor,
     },
     error::AppError,
     infra::repositories::{
@@ -213,6 +214,46 @@ fn failed_extraction(failure_class: &'static str) -> MemoryExtractionRunOutcome 
         status: "failed",
         failure_class: Some(failure_class),
         metadata: json!({}),
+    }
+}
+
+/// The label for an extraction run whose execution came back with nothing to parse.
+///
+/// # F29's third precondition — `run_extraction` now reads `execution.status`
+///
+/// `run_extraction` used to answer this question with the constant
+/// [`FAILURE_EXTRACTION_CALL_FAILED`], which made every failed execution look the same on
+/// `memory_extraction_runs.failure_class`: a route that resolves to nothing, a provider returning
+/// 500, and — once the structured-output fail-hard variant ships — a model that did not comply
+/// were all recorded as *"the call did not happen"*. Recording the execution's own class instead
+/// keeps the distinction the run row exists to make, and gives
+/// [`FAILURE_EXTRACTION_CALL_FAILED`] back its literal meaning: it is now written **only** when
+/// there was no execution to ask — no pool, no service, or `execute` itself returned `Err`.
+///
+/// **Why the general form rather than one arm for `StructuredOutputInvalid`.** A special case for
+/// that one class would be code no test in this tree can reach: extraction builds its own schema
+/// from [`extraction_output_schema`], which is always readable, and never crosses
+/// `validate_response_format`, so neither of the class's two live emitters is on this path. An
+/// arm that cannot be executed is not a guard, it is a promise. Recording whatever the execution
+/// reports is reachable today — `a_failed_extraction_call_leaves_the_response_untouched` drives a
+/// real provider 500 through it — and it produces the right answer for the fail-hard variant
+/// without a second edit.
+///
+/// **The consequence worth stating: the flip becomes invisible here.** A non-conforming reply is
+/// recorded as `structured_output_invalid` today, by `parse_candidates` refusing prose. Under the
+/// fail-hard variant the same string arrives from the execution instead. The run row says the
+/// same thing before and after, which is exactly what F29's doc comment was worried about losing.
+///
+/// # This does **not** re-open F38
+///
+/// The status is consulted only on the branch that has already decided to fail — the reply is
+/// missing, so the run is over either way, and the only open question is what to call it. The
+/// decision to *proceed* still comes from the fields, so a terminal-persistence-deadline failure
+/// that carries a real reply is still extracted from. See the call site.
+fn extraction_failure_class(execution: &ExecutionOutcome) -> &'static str {
+    match (execution.status, execution.failure.as_ref()) {
+        (ExecutionStatus::Succeeded, _) | (_, None) => FAILURE_EXTRACTION_CALL_FAILED,
+        (_, Some(failure)) => failure.class.code(),
     }
 }
 
@@ -1336,13 +1377,20 @@ impl ConversationService {
         // which this call does. It falls back to `output_text` for a reply that is not valid
         // JSON, which F29 deliberately does not fail hard on.
         //
-        // **This is one of two sites that infer "the model answered" from these two fields
-        // rather than from `execution.status`** (finding F38's second reversal condition; the
-        // other is `summarize_conversation`). Since F38 a terminal-persistence-deadline failure
-        // carries the provider's real reply here instead of `None`, so an extraction whose only
-        // failure was Moira's own bookkeeping now proceeds on a reply that genuinely exists —
-        // which is the correct answer to the question this site is asking. If that ever stops
-        // being true, read `status` here rather than re-zeroing the outcome.
+        // **Whether to proceed is still inferred from these two fields rather than from
+        // `execution.status`** (finding F38's second reversal condition; the other site is
+        // `summarize_conversation`). Since F38 a terminal-persistence-deadline failure carries
+        // the provider's real reply here instead of `None`, so an extraction whose only failure
+        // was Moira's own bookkeeping proceeds on a reply that genuinely exists — which is the
+        // correct answer to the question this site is asking, and F29's third precondition does
+        // not change it.
+        //
+        // What *did* change: the failure **label** on the branch where there is nothing to parse
+        // now comes from `execution.status` and `execution.failure` via
+        // `extraction_failure_class`, instead of being the constant `extraction_call_failed`. The
+        // status is read only after the reply has already been found missing, so it can rename a
+        // failure but never cause one.
+        let missing_reply_class = extraction_failure_class(&execution);
         let raw = match execution
             .structured_output
             .as_ref()
@@ -1350,7 +1398,7 @@ impl ConversationService {
             .or(execution.output_text)
         {
             Some(raw) => raw,
-            None => return failed_extraction(FAILURE_EXTRACTION_CALL_FAILED),
+            None => return failed_extraction(missing_reply_class),
         };
         let candidates = match parse_candidates(&raw) {
             Ok(candidates) => candidates,
@@ -3299,8 +3347,87 @@ fn contains_secret_like_text(content: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{application::FAILURE_STRUCTURED_OUTPUT_INVALID, domain::ExecutionFailureClass};
 
     const TEST_SCOPE: CursorScope = CursorScope::new("test.pagination");
+
+    fn outcome(
+        status: ExecutionStatus,
+        failure: Option<ExecutionFailureClass>,
+    ) -> crate::domain::ExecutionOutcome {
+        crate::domain::ExecutionOutcome {
+            request_id: "memory-extraction-test".to_string(),
+            execution_id: Uuid::nil(),
+            status,
+            output_text: None,
+            structured_output: None,
+            usage: crate::domain::UsageSummary::default(),
+            route: None,
+            model: None,
+            attempts: Vec::new(),
+            failure: failure
+                .map(|class| crate::domain::ExecutionFailure::new(class, "failure message")),
+        }
+    }
+
+    /// F29's third precondition: the run row keeps the execution's own failure class.
+    ///
+    /// The four cases are the whole decision. The `StructuredOutputInvalid` row is the one the
+    /// precondition is about, and it is deliberately *not* a special case in the code — see
+    /// [`extraction_failure_class`].
+    #[test]
+    fn a_failed_execution_is_labelled_with_its_own_class_not_extraction_call_failed() {
+        assert_eq!(
+            extraction_failure_class(&outcome(
+                ExecutionStatus::Failed,
+                Some(ExecutionFailureClass::StructuredOutputInvalid)
+            )),
+            FAILURE_STRUCTURED_OUTPUT_INVALID,
+            "the signal that distinguishes 'the model did not comply' from 'the call did not \
+             happen' must survive, and it must be the same string parse_candidates writes"
+        );
+        assert_eq!(
+            extraction_failure_class(&outcome(
+                ExecutionStatus::Failed,
+                Some(ExecutionFailureClass::ProviderUpstreamError)
+            )),
+            "provider_upstream_error"
+        );
+        assert_eq!(
+            extraction_failure_class(&outcome(
+                ExecutionStatus::Cancelled,
+                Some(ExecutionFailureClass::RequestCancelled)
+            )),
+            "request_cancelled"
+        );
+    }
+
+    /// `extraction_call_failed` now means only what it says.
+    ///
+    /// A succeeded execution that somehow carried no text, and a failed one with no failure
+    /// attached, are both "there is nothing here to name" — the constant is the honest answer,
+    /// and it is also what the three pre-execution guards (`pool`, service construction, `execute`
+    /// returning `Err`) still return.
+    #[test]
+    fn only_an_execution_with_nothing_to_report_is_called_extraction_call_failed() {
+        assert_eq!(
+            extraction_failure_class(&outcome(ExecutionStatus::Succeeded, None)),
+            FAILURE_EXTRACTION_CALL_FAILED
+        );
+        assert_eq!(
+            extraction_failure_class(&outcome(ExecutionStatus::Failed, None)),
+            FAILURE_EXTRACTION_CALL_FAILED
+        );
+        // A *succeeded* execution is never relabelled, even if a failure is somehow attached:
+        // reading `status` is the point of the precondition, not reading `failure` alone.
+        assert_eq!(
+            extraction_failure_class(&outcome(
+                ExecutionStatus::Succeeded,
+                Some(ExecutionFailureClass::StructuredOutputInvalid)
+            )),
+            FAILURE_EXTRACTION_CALL_FAILED
+        );
+    }
 
     fn list_keys(count: usize) -> Vec<(String, ListCursor)> {
         (0..count)

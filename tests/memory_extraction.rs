@@ -629,7 +629,16 @@ async fn an_unparseable_extraction_reply_fails_the_run_and_writes_no_memory() {
     case.shutdown().await;
 }
 
-/// The extractor being unreachable must not disturb the caller's response.
+/// The extractor being unreachable must not disturb the caller's response — **and the run row
+/// must say what actually went wrong**.
+///
+/// The second half is F29's third precondition, on the real wire. `run_extraction` used to write
+/// the constant `extraction_call_failed` for every execution that came back without a reply, so a
+/// provider returning 500, a route that resolves to nothing and (under the structured-output
+/// fail-hard variant) a model that did not comply were all recorded identically — on the one row
+/// whose job is to tell them apart. It now records `execution.failure.class`, and this case is
+/// what proves the read is reached rather than merely written: the assertion below is
+/// `provider_unavailable`, and it was `extraction_call_failed` before the change.
 #[tokio::test]
 async fn a_failed_extraction_call_leaves_the_response_untouched() {
     let Some(case) = Case::consenting(vec![
@@ -659,7 +668,9 @@ async fn a_failed_extraction_call_leaves_the_response_untouched() {
     assert_eq!(runs[0].status, "failed");
     assert_eq!(
         runs[0].failure_class.as_deref(),
-        Some("extraction_call_failed")
+        Some("provider_unavailable"),
+        "the run row must carry the execution's own failure class; `extraction_call_failed` here \
+         would mean run_extraction had gone back to ignoring execution.status"
     );
     case.shutdown().await;
 }

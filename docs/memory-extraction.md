@@ -111,9 +111,21 @@ labels — see `ALLOWED_LABEL_KEYS` in `src/infra/metrics.rs`.
 
 Extraction cannot change a response. A failed extractor, an unparseable reply, or a database
 error leaves the response exactly as the model produced it and records the reason on
-`memory_extraction_runs.failure_class` (`extraction_call_failed`, `structured_output_invalid`).
-That is why the three `moira_memory_extraction_*` metric families exist: without them, "extraction
-silently stopped working" and "nobody enabled extraction" look identical.
+`memory_extraction_runs.failure_class`. That is why the three `moira_memory_extraction_*` metric
+families exist: without them, "extraction silently stopped working" and "nobody enabled
+extraction" look identical.
+
+The values that column can hold are:
+
+| value | meaning |
+|---|---|
+| `structured_output_invalid` | the model replied, and the reply was not the declared envelope |
+| any `ExecutionFailureClass` code — `provider_upstream_error`, `provider_timeout`, `capacity_exhausted`, `route_not_found`, … | the extraction call reached the execution kernel and that is what it reported |
+| `extraction_call_failed` | there was no execution to ask: no database pool, the execution service could not be constructed, or `execute` itself returned an error |
+
+Recording the execution's own class is finding F29's third precondition. Before it, every one of
+those cases was flattened to `extraction_call_failed`, so "the model did not comply" and "the call
+did not happen" were indistinguishable on the row that exists to tell them apart.
 
 ## The prompt boundary
 
