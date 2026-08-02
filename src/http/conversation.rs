@@ -59,7 +59,7 @@ fn etag_headers(version: i64) -> HeaderMap {
     post,
     path = "/api/v1/conversations",
     tag = "conversations",
-    description = "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.",
+    description = "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.",
     request_body = ConversationCreateRequest,
     responses(
         (status = 201, description = "Conversation created", body = ConversationRecord),
@@ -356,7 +356,7 @@ pub async fn list_messages(
     post,
     path = "/api/v1/conversations/{id}/messages",
     tag = "conversation-messages",
-    description = "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.",
+    description = "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.",
     request_body = ConversationMessageCreateRequest,
     params(("id" = String, Path, description = "Conversation identifier")),
     responses(
@@ -388,7 +388,7 @@ pub async fn create_message(
     post,
     path = "/api/v1/memories",
     tag = "memories",
-    description = "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.",
+    description = "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.",
     request_body = MemoryCreateRequest,
     responses(
         (status = 201, description = "Memory created", body = MemoryRecord),
@@ -558,7 +558,7 @@ pub async fn get_conversation_policy(
     put,
     path = "/api/v1/admin/applications/{application_id}/conversation-policy",
     tag = "admin-policies",
-    description = "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.",
+    description = "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.",
     request_body = ConversationPolicyPutRequest,
     params(("application_id" = Uuid, Path, description = "Application identifier")),
     responses(
@@ -610,7 +610,7 @@ pub async fn get_memory_policy(
     put,
     path = "/api/v1/admin/applications/{application_id}/memory-policy",
     tag = "admin-policies",
-    description = "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.",
+    description = "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.",
     request_body = MemoryPolicyPutRequest,
     params(("application_id" = Uuid, Path, description = "Application identifier")),
     responses(
@@ -662,7 +662,7 @@ pub async fn get_retrieval_policy(
     put,
     path = "/api/v1/admin/applications/{application_id}/retrieval-policy",
     tag = "admin-policies",
-    description = "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.",
+    description = "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.",
     request_body = RetrievalPolicyPutRequest,
     params(("application_id" = Uuid, Path, description = "Application identifier")),
     responses(
@@ -714,7 +714,7 @@ pub async fn get_embedding_policy(
     put,
     path = "/api/v1/admin/applications/{application_id}/embedding-policy",
     tag = "admin-policies",
-    description = "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.",
+    description = "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.",
     request_body = EmbeddingPolicyPutRequest,
     params(("application_id" = Uuid, Path, description = "Application identifier")),
     responses(
@@ -742,7 +742,7 @@ pub async fn put_embedding_policy(
     post,
     path = "/api/v1/admin/rag-collections",
     tag = "admin-rag",
-    description = "Persistence primitive: no retrieval, chunking, or embedding pipeline runs, and stored content is not used to influence model responses. See docs/conversation-memory-rag-api.md.",
+    description = "Ingested content is chunked, embedded, and indexed for retrieval; ingestion_status reports that pipeline's real progress rather than storage. Indexed chunks reach the prompt on POST /api/v1/responses for applications whose retrieval policy enables RAG, and appear in that response's citations. See docs/conversation-memory-rag-api.md.",
     request_body = RagCollectionCreateRequest,
     params(("Idempotency-Key" = Option<String>, Header, description = "Optional replay key. A repeated request with the same key and body replays the original response; the same key with a different body returns 409.")),
     responses(
@@ -924,7 +924,7 @@ pub async fn disable_rag_collection(
     post,
     path = "/api/v1/admin/rag-collections/{collection_id}/documents",
     tag = "admin-rag",
-    description = "Persistence primitive: no retrieval, chunking, or embedding pipeline runs, and stored content is not used to influence model responses. See docs/conversation-memory-rag-api.md.",
+    description = "Ingested content is chunked, embedded, and indexed for retrieval; ingestion_status reports that pipeline's real progress rather than storage. Indexed chunks reach the prompt on POST /api/v1/responses for applications whose retrieval policy enables RAG, and appear in that response's citations. See docs/conversation-memory-rag-api.md.",
     request_body = RagDocumentCreateRequest,
     params(
         ("collection_id" = String, Path, description = "RAG collection identifier"),
@@ -1054,7 +1054,7 @@ pub async fn delete_rag_document(
     post,
     path = "/api/v1/admin/rag-documents/{id}/ingest",
     tag = "admin-rag",
-    description = "Persistence primitive: no retrieval, chunking, or embedding pipeline runs, and stored content is not used to influence model responses. See docs/conversation-memory-rag-api.md.",
+    description = "Ingested content is chunked, embedded, and indexed for retrieval; ingestion_status reports that pipeline's real progress rather than storage. Indexed chunks reach the prompt on POST /api/v1/responses for applications whose retrieval policy enables RAG, and appear in that response's citations. See docs/conversation-memory-rag-api.md.",
     request_body = RagDocumentIngestRequest,
     params(
         ("id" = String, Path, description = "RAG document identifier"),
@@ -1086,7 +1086,7 @@ pub async fn ingest_rag_document(
     post,
     path = "/api/v1/admin/rag-documents/{id}/reindex",
     tag = "admin-rag",
-    description = "Persistence primitive: no retrieval, chunking, or embedding pipeline runs, and stored content is not used to influence model responses. See docs/conversation-memory-rag-api.md.",
+    description = "Ingested content is chunked, embedded, and indexed for retrieval; ingestion_status reports that pipeline's real progress rather than storage. Indexed chunks reach the prompt on POST /api/v1/responses for applications whose retrieval policy enables RAG, and appear in that response's citations. See docs/conversation-memory-rag-api.md.",
     request_body = RagDocumentIngestRequest,
     params(
         ("id" = String, Path, description = "RAG document identifier"),

@@ -2176,7 +2176,7 @@ under 4B a human's second grant is never primary and revoking "the" row leaves a
   ~21 fallible per-row `collect()` sites and 48 enum-like CHECKs remain exposed. Rollout ordering
   (Moira first) is the only mitigation and goes in the release note.
 
-### F29 — `ExecutionOutcome.structured_output` is always `None`, for every caller
+### F29 — `ExecutionOutcome.structured_output` is always `None`, for every caller — **CLOSED**, see "F29 — CLOSED `fix/f29-structured-output`" below
 
 The **request** side of structured output works: `output_schema` is honoured and
 `structured_output_invalid`/`_unsupported` are catalogued. The **response** side does not.
@@ -2351,6 +2351,482 @@ Plan 11 says to dedupe against existing **active** memories. Retrieval is `activ
 dedupe the same way reads as consistent — and makes an `explicit_only` application accumulate **one
 unconfirmed duplicate per turn**, because unconfirmed candidates are never `active` and therefore
 never match. Caught by implementing it, not by reading it.
+
+### F28/F29 RE-VERIFICATION — 2026-08-02, twelve agents, six claims, each conclusion challenged
+
+Run before writing any code, because this project's recurring failure is a **finding whose premise is
+wrong** (F32's was backwards; F15's recommended fix would have leaked; F2's mechanism was wrong
+twice). Six claims investigated independently, each verdict then handed to a skeptic told to break
+it. Read-only — no cargo, no gates — so it parallelised without touching the serialisation rule.
+
+**F28's permit half is FALSE.** Two agents, independently, returned REFUTED. `permits` is a local in
+the per-candidate retry loop in `MoiraExecutionService::execute_inner`, and `drop(permits)` runs on
+every exit — including the cancellation arm, checked specifically for a `?` that could escape with
+the permit alive. There is none. `extract_memories` runs after `execute_inner` has fully returned,
+so **no permit is held across the second model call**. There is exactly one non-test acquisition
+site in the tree.
+
+**F28's SSE half is TRUE**, confirmed twice, and the escape hatch I offered in the brief — "streaming
+may take a different route" — is false. Both SSE routes converge on `supervise_public_stream`, whose
+body ends with the terminal `send_public_event`; `record_conversation_assistant` is **awaited**
+between the last delta and that event, with no timeout wrapper. The `tokio::spawn` does not detach
+the latency: the client's stream is fed by `public_rx` and cannot end until `public_tx` drops.
+
+**And the real finding is bigger than F28** — see F34.
+
+**F29 is three-quarters right and wrong in the part that sets the fix's scope.** Genuine defect count
+is **2, not 3**: the third literal is in `failed_outcome`, which constructs `ExecutionOutcome` — a
+different type — alongside `output_text: None` and a default `UsageSummary`.
+
+> **CORRECTION, same day, by the synthesis pass.** The sentence that stood here — *"a failed
+> execution carries no committed output, so `None` there is correct; it has 13 call sites, all
+> failure paths"* — **was wrong**, and it was wrong in this ledger for about half an hour before
+> anyone caught it. `failed_outcome` is called at `execution.rs:658` from inside
+> `match result { Ok(Ok(output)) => … }` — the terminal-persistence-deadline arm — where `output` is
+> **live**, and `output.usage.clone()` is read on the surrounding lines to feed `update_attempt` and
+> `attempt_summary`. So one of the 13 is not a failure path, and its `None` is inert *only because
+> the field is universally `None` today*. **The moment F29 lands it becomes a silent drop site.**
+> Recorded as F38.
+>
+> This is the second time in one day that a *summary* of a finding was worse than the finding — see
+> F32. Both times the error entered when a verified detail was compressed into a confident
+> generalisation ("all failure paths", "emergent protection"). The tell in both cases was a
+> universal quantifier that nobody had actually enumerated.
+
+**The value does not exist to forward.** `rig-core` 0.40's `CompletionResponse` is
+`{choice, usage, raw_response, message_id}` and `AssistantContent` is `Text | ToolCall | Reasoning |
+Image` — no structured variant. `git log -S structured_output -- src/orchestration/runtime_factory.rs`
+returns **zero commits over the whole history**. So F29 is not a plumbing gap; populating the field
+means *parsing text as JSON*, and the only question is where.
+
+**`StructuredOutputInvalid` is a JSON type-check wearing a validator's name.** Exactly one emitter,
+in `build_completion_request`. `schemars` accepts any `Value::Object` or `Value::Bool`, so
+`{"type":"banana"}`, `{"$ref":"http://x"}` and bare `true` all pass and go to the provider. Moira has
+**no JSON Schema validation crate in `Cargo.toml` at all**. The name promises validation the code
+never performs — the same shape as F32.
+
+### F35–F45 — eleven findings nobody asked for, surfaced by the same twelve agents
+
+Every one came from the "report anything you found that nobody asked about" clause. None was the
+question being investigated. That clause has now out-produced the questions themselves twice.
+
+| # | Finding | Severity |
+|---|---|---|
+| ~~**F35**~~ | ~~**The OpenAI-compat endpoint silently discards `text.format`.**~~ **CLOSED** `fix/f35-compat-text-format` — `json_schema` is honoured, `json_object` is refused (it would have reached the provider as an empty-object schema — now **F46**), every other `text` key is refused by a typed DTO. Finding verified correct in every particular; two things it did not mention made the fix sharper. See the F35 section below. | **HIGH** |
+| **F36** | **`SummarizationLock` pins a Postgres session advisory lock across a full provider round-trip**, on a per-turn path, over a `pool.acquire().await?.detach()`ed backend. A hung provider holds one backend and one conversation lock for the whole attempt timeout. The lock's own doc comment names this reversal condition — and it has already been met. | **MED-HIGH** |
+| **F37** | **Four wasted DB reads per conversation-linked turn when summarization is disabled**, inside the caller's request, between the last SSE delta and the terminal event. Six round-trips, four of them dead, on the default configuration. | **MEDIUM** |
+| **F38** | **The terminal-persistence-deadline arm throws away a successful provider result.** `execution.rs:658` returns `failed_outcome` with `output_text: None` and a default `UsageSummary` while `output.text` and `output.usage` are in hand and `"output_committed": true` is written into both the audit entry and the `ExecutionFailed` event. On streaming the client has already received every delta. Usage is preserved at attempt level and zeroed at outcome level — **the asymmetry is the tell**. Billing and reporting divergence. Found independently by both skeptics. **Still open after `fix/f29-structured-output`**, which added `structured_output` as a third dropped value and left an explicit comment naming all three rather than fixing the divergence — see the F29 closure entry for why a billing decision was kept out of a parsing change. | **MEDIUM** |
+| **F39** | **The structured-output capability gate cannot see Rig's per-provider reality.** The gate checks a config JSON bool; DeepSeek sets `SUPPORTS_RESPONSE_FORMAT = false` and drops the schema with a `warn!`, and `OpenAiCompatible`/`Local` ship `response_format.json_schema` to arbitrary self-hosted backends with no warning at all. Config says supported, wire says otherwise, caller gets prose and a `succeeded`. **Blocks the fail-hard variant of F29.** | **MEDIUM** |
+| **F40** | **`GET /v1/responses/{id}` returns an empty `output` array for a completed, persisted response.** Falls through both branches to `Vec::new()`. The `OutputUnavailable { reason: "metadata_only_persistence" }` variant exists to explain the *other* case, which makes the silent empty array read as an oversight rather than a decision. Needs a product call. | **LOW-MED** |
+| ~~**F41**~~ | ~~**Skill-tree drift on exactly the guidance F29's implementer needs.**~~ **STRUCK — the inference was wrong.** The `.claude/` copy is a nine-line **pointer file** that says to read the `.agents/` one; all eight `.claude/skills/` entries have that shape. See "F41 is WRONG as recorded" below. | **struck** |
+| **F42** | **i18n overclaim.** `moira.error.structured_output_invalid` asserts "or the model's output does not conform to it". No such path exists. Its description even narrates a prior widening. Becomes true only if the fail-hard variant ships. | **LOW** |
+| **F43** | **`ConcurrencyController::acquire` is dead `pub` API on the concurrency-safety path** — every caller is inside `#[cfg(test)]`. It hardcodes `is_stream: false`, so a future caller reaching for the obvious-looking name on a streaming path silently takes a *request* permit. | **LOW** |
+| **F44** | **`RuntimeModelHandle::stream` / `RuntimeStreamOutput` are dead `pub` API** — ~65 lines duplicating `execute_rig_stream`, kept alive only by a re-export. Divergence hazard: someone fixing streaming will fix one of the two. | **LOW** |
+| **F45** | **`PublicResponseFormat::JsonSchema { name, strict }` — both accepted, both dropped.** Public in `docs/openapi.json`; every destructure site uses `{ schema, .. }`. Rig hardcodes `strict: true` and renames from the schema's `title`. A caller sending `strict: false` gets strict mode, unreported. | **LOW** |
+
+### F35 — CLOSED: `text.format` is now honoured for `json_schema`, refused for the rest
+
+`fix/f35-compat-text-format`. The finding was verified before acting and was **correct in every
+particular**: `#[serde(deny_unknown_fields)]` really is on `OpenAiResponseCompatRequest`,
+`request.text` really had **zero** reads anywhere in the tree (`git log -S` shows the field arrived
+in the baseline commit `227d90f` with no intent recorded), and `openai_compat_to_public` really did
+hardcode `PublicResponseFormat::Text`.
+
+Two things the finding did not mention, both of which sharpened the fix:
+
+- **`docs/openai-compatibility.md` already stated the contract `text` was violating.** It lists the
+  six mapped fields — `text` not among them — and then asserts "Unsupported options are rejected by
+  `deny_unknown_fields` or public validation." So this was not an undecided question; it was a
+  declared policy with one field quietly exempt from it.
+- **`docs/openapi.json` published `"text": {}`** — an accepted field of unconstrained shape. The
+  contract was not merely silent about the drop, it advertised the field as supported.
+
+#### The decision: honour the subset that maps cleanly, refuse the rest
+
+Neither of the two options in the brief was taken whole.
+
+| `text` | Result |
+|---|---|
+| absent, `{}`, or `format.type = "text"` | `PublicResponseFormat::Text` — unchanged behaviour |
+| `format.type = "json_schema"` | `PublicResponseFormat::JsonSchema`, carrying `name`, `schema`, `strict` |
+| `format.type = "json_object"` | **422 `unsupported_request_option`** |
+| any other key — `verbosity`, `format.description`, unknown `format.type` | **422**, from `deny_unknown_fields` on the now-typed DTO |
+
+**Pure rejection was rejected because it would refuse requests Moira already satisfies.** A caller
+sending `text.format = {"type": "text"}` is asking for exactly what the endpoint does. Failing that
+is cost with no safety return.
+
+**Pure honouring was rejected because of `json_object`, and the brief's unverified lead is why.**
+It is now **confirmed, mechanically, on the provider socket**. `PublicResponseFormat::JsonObject`
+becomes the output schema `{"type":"object"}`; `rig-core` 0.40's `sanitize_schema` inserts
+`properties: {}`, `additionalProperties: false` and `required: []`, and the encoder sends it under
+`strict: true`. The resulting schema is satisfied by exactly one document — `{}`. Translating
+`json_object` would therefore have replaced F35's silent wrong answer with a different silent wrong
+answer. `tests/openai_compat_text_format.rs::documents_native_json_object_reaching_the_provider_as_an_empty_object_schema`
+asserts the exact bytes, so this is pinned rather than described.
+
+**The `text` field is now typed rather than `Value`.** That is what makes "any key Moira does not
+honour is refused" true by construction instead of by a list someone has to maintain, and it
+replaces `"text": {}` in the published contract with the three real shapes. Two schemas were added;
+operation and path counts are unchanged.
+
+**This widens F45 rather than fixing it, and that is deliberate.** `name` and `strict` reach
+`PublicResponseFormat::JsonSchema` and are then dropped by the native path — `rig-core` derives the
+name from the schema's `title` and hardcodes `strict: true`, rewriting the schema to suit (every
+declared property becomes required). Overriding that would mean Moira hand-building
+`additional_params.response_format` and bypassing `output_schema` entirely, which is the boundary
+violation `moira-rig-integration` exists to prevent. Refusing `strict: false` on the compat path
+only was considered and dropped: it would make `/v1/responses` stricter than `/api/v1/responses`
+for no reason, and OpenAI's own default for `strict` is falsy, so it would refuse the common case.
+One contract, one defect, one place to fix it. Both limits are now written down in
+`docs/openai-compatibility.md`.
+
+**Known behaviour change, and it is the point.** An honoured `text.format` makes the request a
+structured-output request, so it becomes subject to `structured_output_enabled` and the model's
+`structured_output` capability. A caller who previously got a 200 and prose may now get a 422. The
+endpoint is opt-in (`openai_responses_compat_enabled`, default `false`), which bounds the blast
+radius to deployments that chose OpenAI compatibility — the deployments most likely to be sending
+`text.format` in the first place.
+
+*Reversal condition:* the `json_object` refusal reverts to a translation the moment the native path
+stops encoding `response_format: {"type":"json_object"}` as an empty-object schema — that is, when
+`documents_native_json_object_reaching_the_provider_as_an_empty_object_schema` goes red, which it
+will do on any fix to F46. The `json_schema` honouring reverts only if `PublicResponseFormat` stops
+being the native representation of a caller-supplied schema; it does **not** revert on an F45 fix,
+which would simply make it more faithful.
+
+*Verification:* four unit assertions watched failing against unfixed code — `text.format.json_schema
+must not be discarded, got Text`; `json_object must not be accepted and ignored` printing a whole
+`PublicResponseRequest` with `response_format: Text`; `{"input":"hello","text":{"verbosity":"low"}}
+must not deserialize into a request Moira silently ignores`. Three mutations killed:
+deleting the `json_schema` arm turned the wiring test's provider body into
+`{"messages":[…],"model":"test-model","moira":{…}}` with **no `response_format` key at all** —
+F35 itself, reproduced on the wire; blinding the `json_object` refusal produced a 200 carrying
+`"text":"must-not-be-reached"`; removing `deny_unknown_fields` produced a 200 for
+`text: {"verbosity": "low"}`.
+
+### F46 — `response_format: {"type":"json_object"}` constrains the model to the empty object
+
+Confirmed while deciding F35, on the provider socket rather than by reading. **Native path,
+`POST /api/v1/responses`** — not the compat endpoint, which now refuses this shape.
+
+`PublicResponseFormat::JsonObject` maps to the output schema `{"type":"object"}` in
+`prepare_execution`. `rig-core` 0.40's `sanitize_schema` completes any object schema with
+`properties: {}` and `additionalProperties: false`, then sets `required` to the (empty) property
+key list, and the encoder wraps the result with `strict: true`. What reaches the provider is
+`{"type":"object","properties":{},"additionalProperties":false,"required":[]}` — a schema satisfied
+only by `{}`. OpenAI's own `json_object` mode means *free-form* JSON, so a caller asking for it gets
+the exact opposite of what the name promises, with a 200 and a `succeeded` status.
+
+**Not fixed here, because it cannot be fixed at Moira's layer.** Free-form JSON is a different
+`response_format` type, not a schema, and `rig-core`'s `output_schema` seam cannot express it —
+`json_utils::merge` lets the encoder's own `response_format` win over anything Moira puts in
+`additional_params`. The options are a rig-core change, or removing `JsonObject` from
+`PublicResponseFormat`, which is a public contract break. Both need a product call.
+
+Pinned by `tests/openai_compat_text_format.rs::documents_native_json_object_reaching_the_provider_as_an_empty_object_schema`,
+which asserts the exact schema bytes and `strict: true`. It documents current behaviour and says so
+in its name (HANDOFF §3.4).
+
+*Reversal condition:* none — this is a defect, not a decision. It closes when a caller sending
+`{"type":"json_object"}` either receives free-form JSON or is refused.
+
+*ID allocation:* `origin/main`'s ledger topped out at **F45** immediately before this was written
+(HANDOFF §3.2). Three concurrent finding branches were live; if F46 collides, this is the
+`json_object` one.
+### F29 — **CLOSED** `fix/f29-structured-output`. Gated parse in `execution.rs`, not at the Rig boundary — 2026-08-02
+
+**One parse site, `structured_output_from_text` in `src/application/execution.rs`, called from both
+`execute_rig_completion` and `execute_rig_stream`.** No change to `RuntimeCompletionOutput`,
+`RuntimeStreamItem`, `ExecutionOutcome`, or `src/orchestration/runtime_factory.rs`. No OpenAPI drift
+— `ExecutionOutcome.structured_output` is documented as a bare `{}` and its Rust type is unchanged;
+verified by running `openapi_drift` rather than assumed.
+
+**Why not the Rig boundary, which is where the in-tree skill points.**
+`.agents/skills/moira-rig-completions/SKILL.md` says *"parse from `RuntimeCompletionOutput.text`"*.
+`execute_rig_stream` **never constructs a `RuntimeCompletionOutput`** — it accumulates `text` itself
+— so `output_from_response` would have covered the non-streaming path only and forced a second,
+divergent implementation for streams, which is the "second response-narrowing site" the same
+paragraph forbids. The skill's two instructions are in tension; the one about a second narrowing
+site is the one that survives. CLAUDE.md already admits `rig_core` imports in `execution.rs`.
+
+**The gate is the safety property, not an optimisation.** `wants_structured` is
+`request.output_schema.is_some()`, captured **before** `request` is moved into
+`handle.completion(request)` / `handle.start_stream(request)`. Without it, conversation
+summarization corrupts: it sends **no** `output_schema`, `parse_summary` accepts any non-empty
+prose, and `summarize_conversation` prefers `structured_output` over `output_text` via
+`.map(|value| value.to_string())`. **Measured, not reasoned about** — an ungated build was built and
+run on purpose, and stored
+
+```
+{"decision":"ship the invoicing rewrite in March","owner":"the user"}
+```
+
+where the model had sent the pretty-printed form. `summary_hash` is `request_hash` over the stored
+bytes and is documented as a content address, so the row is internally consistent and wrong. The
+gate went in only after that red was observed.
+
+**Populate on success; do NOT fail hard.** A non-conforming reply leaves the field `None` and
+changes nothing else, against the skill's `StructuredOutputInvalid` advice, for three reasons each
+checked against the tree:
+
+1. `StructuredOutputInvalid` is in **neither** `is_retryable` nor `is_fallback_eligible` nor
+   `is_circuit_failure` — one non-conforming reply ends the execution with no retry, no fallback.
+2. DeepSeek's `SUPPORTS_RESPONSE_FORMAT = false` drops the schema before the wire (**F39**), so
+   every structured request on that route would hard-fail where it previously returned 200.
+3. `run_extraction` detects failure by `output_text` being `None` and never reads
+   `execution.status`, so `an_unparseable_extraction_reply_fails_the_run_and_writes_no_memory`
+   would flip from `structured_output_invalid` to `extraction_call_failed`.
+
+**Reversal condition — what makes someone adopt the fail-hard variant.** All three of: **F39**
+landed, so the capability gate reflects Rig's per-provider reality instead of a config bool;
+`StructuredOutputInvalid` given an explicit retry/fallback disposition (today it silently has
+neither); and `run_extraction` reading `execution.status` rather than inferring failure from
+`output_text`. Until all three hold, failing loudly trades a silent `None` for an outage on a
+provider that was never going to comply. **F42** becomes true on the same day and not before.
+
+**Strict, and deliberately not a scavenger.** `serde_json::from_str` on the trimmed text. Rig's
+balanced-brace scan is not copied and **no code fence is stripped**:
+`memory_extraction::parse_candidates` owns the one real-world tolerance, on the `output_text` it
+already falls back to. Two parsers with two accept-sets over the same bytes is the parser
+differential that module's doc comment refuses.
+
+**Guards, and the mutation that killed each.** Every one was run, not read.
+
+| Guard | Mutation | Result |
+|---|---|---|
+| `a_schema_carrying_completion_returns_the_parsed_structured_output` | unfixed code | RED — `left: Null, right: Object {"a": Number(1)}` |
+| `a_schema_carrying_stream_returns_the_parsed_structured_output` | unfixed code; **and** `wants_structured = false` in the stream path only | RED both times, and it is the **only** case that reds on the second — the two paths are independently covered |
+| `a_reply_that_is_json_is_not_parsed_when_no_schema_was_requested` | delete the gate | RED |
+| `a_summary_that_is_valid_json_is_stored_verbatim` | delete the gate | RED, with the re-serialised body quoted above |
+| `structured_output_is_parsed_only_when_a_schema_was_requested` (unit) | delete the gate | RED — and it needs no database, so the gate stays observable if a fixture stops being reachable |
+
+`a_summary_that_is_valid_json_is_stored_verbatim` **passes against unfixed code** and is a
+regression guard, not a watched-failing test. It was earned the only honest way: the ungated parse
+was implemented first, the case was watched going red, and the gate was added after. The reply in
+it is pretty-printed on purpose — a compact JSON reply round-trips through `to_string()` identically
+and the guard would pass against the defect.
+
+**F38 is NOT fixed and stays open.** `execution.rs`'s terminal-persistence-deadline arm calls
+`failed_outcome` from inside `match result { Ok(Ok(output)) => … }`, where `output` is live. F29
+turns its `structured_output: None` into a third silent drop alongside `output.text` and
+`output.usage`. **The drop is now commented rather than silent**, naming all three values and F38.
+Not fixed here because the arm's own condition is that terminal persistence did *not* complete:
+`update_attempt`, `insert_usage_record` and `touch_credential_used` may each have failed to commit,
+so promoting the usage onto the outcome asserts a billing fact whose row may be absent, and
+promoting `output_text` onto a non-`Succeeded` status changes what every consumer of a failed
+execution receives. That is a billing decision; burying it inside a parsing change would hide it.
+
+### F41 is WRONG as recorded — there is no skill-tree drift
+
+Found while following the brief that cited it. `.claude/skills/moira-rig-completions/SKILL.md` is
+**eight lines**, and its body is:
+
+> Read and follow `../../../.agents/skills/moira-rig-completions/SKILL.md` completely. That
+> canonical workflow is shared by Codex and Antigravity and is authoritative for this repository.
+
+So the zero occurrences of "structured" in the `.claude/` copy are not drift — it is a **pointer
+file**, and every one of the eight skills under `.claude/skills/` has the same shape. CLAUDE.md
+pointing at `.claude/` therefore routes an agent to `.agents/` by design; the authoritative
+instruction is exactly one hop away, not in "the tree nobody is told to read".
+
+The finding's underlying observation (a `grep` for "structured" in `.claude/` returns nothing) was
+correct; the **inference** from it was not. This is the F32/F29 shape a third time: a verified
+detail compressed into a confident generalisation. **F41 should be struck, not fixed.**
+
+### F34 — ESCALATED: summarization is inline too, ungated, and the docstring says otherwise
+
+Found by the F28 re-verification, and **worse than the finding that turned it up**.
+
+`record_assistant_response` awaits `extract_memories` and then, on the very next line,
+`maybe_summarize_after_turn` — which builds its own `ExecutionCommand` and makes a second
+non-streaming completion call. So the window between the last content delta and the terminal SSE
+event can hold **two serial provider round-trips, not one**.
+
+**The docstring above `extract_memories` states that summarization is "specified as *enqueued*".**
+It is not; it is inline, on the same path, in the same await chain. Any latency budget derived from
+that comment is understated by an entire model call. This is the F31 shape again: prose in the tree
+asserting a behaviour the code contradicts.
+
+**Extraction is gated by `automatic_extraction_enabled` (default false). Summarization has no
+equivalent gate.** So the half of this cost that nobody opted into is the half that runs by default.
+
+**Reversal condition:** none — this is a defect, not a decision. It closes when summarization is
+either gated to match extraction or moved off the response path.
+
+### F33 — ESCALATED: five encryption-at-rest columns exist and nothing writes or reads any of them
+
+`migrations/0007` creates `conversation_messages.content_encrypted`,
+`conversation_summaries.summary_text_encrypted`, `memory_records.content_encrypted`,
+`rag_document_versions.content_encrypted` and `rag_chunks.chunk_text_encrypted`.
+
+**Nothing in `src/` touches any of them.** The schema says content can be encrypted at rest; no
+cipher exists anywhere in the tree.
+
+**Needs a human, not an autonomous change.** Envelope encryption is key custody, key rotation, and
+plan 11's still-open Decision 3 — a scoping question, not an implementation gap. Recorded here so
+the columns are not mistaken for a partially-built feature by whoever finds them next.
+
+### F32 — a data-protection policy that protected nothing — **CORRECTED, then fixed**
+
+**My own framing of this finding was wrong in the direction that mattered, and the correction is the
+finding.** I briefed it as an *unused column* whose effect was "emergent": setting `'none'` yielded
+no extraction because there was no plaintext to extract.
+
+**There was no plaintext protection at all.** `add_message` binds `content_plain` unconditionally —
+verified on `main`, the write path never mentions the policy. So a deployment setting
+`conversation_content_persistence = 'none'` stored **full message plaintext**, and extraction ran
+exactly as under `'plain_content'`. An operator configuring PII or data-residency controls received
+none, with the API reporting success. Proven by mutation M1, which reintroduces the pre-fix line.
+
+The ledger's *original* F32 wording was right — "a state no configuration can currently produce."
+The gloss I added on top of it was not. **A finding's later summary can be worse than its first
+draft**, and mine was.
+
+**`encrypted_content` was accepted while nothing encrypts** (see F33). Storing plaintext under a
+value literally named for encryption meant the *API itself* was doing the misleading, not merely
+failing to act. It is now refused on write (`conversation_content_persistence_unsupported`, 422) and
+**fails closed** for rows that already hold it.
+
+**Enforcement sits at `add_message`**, in the existing `for update` lock query — the only path into
+`conversation_messages`, so a fourth writer *inherits* the policy rather than having to remember it.
+Having to remember it is what F32 was.
+
+**Not auto-merged.** A 422 on a previously-accepted value will break any deployment setting
+`encrypted_content` in IaC — loudly, which is the point, but that deserves human sight.
+
+### F37 CLOSED · F34 CLOSED · F36 REFUTED — `fix/f36-summarization-path`, 2026-08-02
+
+Three items on one path — the tail of `record_assistant_response`. Two needed code. The third's
+premise did not survive being checked, so it is documented and left open with a condition that can
+be measured instead of argued.
+
+**F37 — CLOSED, but three dead reads removed, not four.** Both load-bearing claims hold.
+`decide_summarization`'s first line is `if !policy.enabled`, tested **before** the `force`
+short-circuit, so `force: true` never bypassed it and still does not; the hoisted guard calls
+`summarization_skip_error(SummarizationSkip::Disabled)`, the same constructor `plan_summarization`
+reaches through `map_err`, so the 403 / `summarization_disabled` /
+`moira.error.summarization_disabled` envelope is byte-identical; and authorization and the archived
+check are above the policy read and are untouched.
+
+**The proposed placement was not semantics-preserving, and that is the correction.** Immediately
+after the policy read puts the guard *above* `find_conversation_context_anchor`, whose `None` is
+this function's `conversation_not_found` 404. `find_conversation_authorized` filters
+`public_id = $1 and deleted_at is null and <access>`; the anchor filters
+`public_id = $1 and deleted_at is null` — a strict superset — so the two disagree only when a soft
+delete lands **between the two statements**. Narrow, but it turns a resource verdict into a policy
+one, and no test can pin the difference precisely because no reachable state produces it. The guard
+sits one statement lower.
+
+`summarize_conversation_unscoped` goes from **6 database round-trips to 3** on the default
+configuration. Counting the whole tail — `extract_memories` pays two policy upserts before its own
+flags are read — a conversation-linked turn goes from **8 to 5**.
+
+**The test story, stated rather than dressed up.** There is no watched-failing test for a refactor
+that preserves semantics and none is claimed.
+`force_does_not_bypass_a_disabled_summarization_policy` passes identically either side and is what
+pins the envelope. **No query-count test was added**, deliberately: the two available instruments
+are `pg_stat_database`, whose asynchronous flush is exactly F28's flake shape, and an in-process
+`tracing` counter, which cannot see these queries at all because the HTTP server and the response
+path run on spawned tasks that do not inherit a scoped subscriber and the process holds one global
+default. Both would trade a real flake for a signal the existing suite already constrains.
+
+**What was added guards the mutation that actually threatens the change.**
+`a_disabled_policy_does_not_pre_empt_the_access_and_archived_checks` asserts both refusals under
+`summarization_enabled: false`, the only configuration in which the new guard fires. **Both
+mutations were run and watched**: hoisting the guard and its policy read above
+`find_conversation_authorized` reds the first assertion (403 where 404 is expected); above the
+archived check reds the second (403 where 409 is expected).
+`an_archived_conversation_is_refused_with_conversation_archived` re-enables the policy before
+archiving, so it stays green through both and could not stand in.
+
+*Reversal condition:* if the anchor's lateral join ever measures as material on the disabled path,
+move the guard above it and accept 404 → 403 inside the delete window.
+
+**F34 — CLOSED, with one qualification to the finding's arithmetic.** The docstring above
+`extract_memories` said Sub-Phase E's summarization "is specified as *enqueued*" and offered that
+as the reason extraction alone doubles a turn. E did not ship enqueued either:
+`maybe_summarize_after_turn` is awaited on the next line of `record_assistant_response` and makes
+its own completion call. Corrected in the docstring and in `docs/memory-extraction.md`, which now
+carry the same table. (`docs/conversation-summarization.md` was already correct — it says inline
+under "Known limits" — so the drift was in two places, not three.)
+
+**"A fully-enabled turn issues three provider calls" is true only on the turns that trigger.**
+Extraction is per turn; summarization runs only once `minimum_messages_since_summary` **and**
+`summary_trigger_tokens` are both crossed, so its amortised cost is one call per
+`summary_trigger_tokens` of conversation. What ran every turn regardless was summarization's *read*
+path — which is F37. *Reversal condition:* the tables stop being true the moment either feature
+moves off the response path; whoever moves one corrects both.
+
+**F36 — REFUTED as stated. Documented, not fixed, and left open with a sharper condition.** The
+finding says the lock is held "on a path now reached every turn". The *enclosing function* is
+per-turn; `SummarizationLock::try_acquire` is not — it sits below `plan_summarization`'s `?`, so it
+is reached only once `decide_summarization` has said yes. That is exactly the rate the lock's own
+doc comment argues about, so **its reversal condition has not been met** and nothing about the lock
+was changed. Two things are real and are now written down in numbers:
+
+- **Duration is bounded.** `run_summarization` uses `ExecutionOptions::default()`, so `timeout_ms`
+  is `None` and `execute` falls back to `runtime.default_execution_timeout_seconds` — 120 s in
+  `config/default.toml`, clamped by `maximum_execution_timeout_seconds`. No caller can extend it.
+  The finding's "for the entire attempt timeout" reads as unbounded; it is not.
+- **Count is bounded by nothing in the tree.** `detach` removes the connection permanently and the
+  pool opens a replacement, so a run costs one backend *beyond* `database.max_connections` (10).
+  The caller's execution permit is released before `record_assistant_response` runs, so
+  `runtime.global_execution_concurrency` does not bound how many turns are inside a run at once —
+  only the in-flight request count does.
+
+Three cheaper-looking fixes were considered and each is worse; all three are recorded on the type
+so the next reader does not re-derive them. A **pooled** session lock is re-entrant, so the next
+checkout would believe it holds someone else's lock. **Dropping the lock** and letting
+`conversation_summary_boundary_unique` arbitrate makes the loser pay for a completion and then
+receive a unique violation as a 500. A **second, tighter timeout** shortens a duration that is
+already bounded and does nothing to the count.
+
+*Reversal condition, sharpened:* replace the advisory lock with a lock-table row and a bounded
+lease when concurrent summarization **runs** — not turns — can approach the server's spare backend
+headroom, measurable from `moira_summarization_runs_total` against the deployment's
+`max_connections`.
+
+**The briefed baseline was wrong.** It stated `main` at **1021** tests as of `7bb5f15`. Measured
+directly in this worktree — the four touched files replaced with `git show origin/main:` content,
+then `cargo test --workspace --all-features`, 41/41 targets logged and zero skip lines — `main` is
+**1027**. This branch is **1028**, exactly one more: the diff adds one `#[tokio::test]` and removes
+none. Anyone reconciling a count against 1021 will chase a phantom of six.
+
+**And a gate-log hazard worth adding to HANDOFF §2.2.** The first run here was started before the
+edits landed and reported a *plausible* 1027 for this branch. It was wrong: `scripts/gates.sh`
+redirects `cargo test` to a `mktemp` file and only the summary line reaches the outer log, so the
+outer log's tail sits on `── test` for the whole phase and then shows release-build output — which
+reads exactly like the test phase still compiling. Editing sources during that window silently
+splits the run: `fmt` and `clippy` had already passed against the *old* tree while `release` built
+the new one. **Do not edit sources while `scripts/gates.sh` is running**, and if you did, the run
+proves nothing about what you edited.
+
+### F47 — the `get_or_create_*_policy` readers are UPDATEs, and one turn issues three of them
+
+Found while counting F37's round-trips; nobody asked for it. Both
+`get_or_create_conversation_policy` and `get_or_create_memory_policy` are
+
+```sql
+insert into … (application_id) values ($1)
+on conflict (application_id) do update set application_id = excluded.application_id
+returning *
+```
+
+The `do update` is the usual trick for getting `returning` on the conflict path, and it is a real
+heap write: a new row version and a WAL record on **one row per application**, every call.
+
+A conversation-linked turn calls `get_or_create_conversation_policy` **twice** — once in
+`extract_memories`, once in `summarize_conversation_unscoped` — and `get_or_create_memory_policy`
+once. So an application's two policy rows are rewritten three times per turn on the default
+configuration, where every one of those reads ends in an early return. Two consequences:
+dead-tuple churn concentrated on two rows, and a row-level lock that briefly serialises concurrent
+turns of the *same* application against each other.
+
+Not fixed here. The honest fix is `on conflict do nothing` plus a `select`, or read-then-insert,
+and it touches every `get_or_create_*_policy` family rather than the two on this path — a change
+about policy reads, not about summarization. *Reversal condition:* it closes when the read path
+stops writing.
 
 ## USER DECISIONS — 2026-07-31, taken interactively
 

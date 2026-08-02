@@ -136,6 +136,17 @@ pub struct LifecycleFixture {
 
 impl LifecycleFixture {
     pub async fn new() -> Option<Self> {
+        Self::with_settings(|_| {}).await
+    }
+
+    /// As [`Self::new`], letting the caller adjust `Settings` before the `AppState` is built.
+    ///
+    /// Some settings are read once at construction — `public_api.openai_responses_compat_enabled`
+    /// gates whether `POST /v1/responses` exists at all — so they cannot be turned on after the
+    /// fact. Building a *second* `AppState` on the same pool is not an equivalent workaround:
+    /// the two would not share this state's caches, and a test would silently exercise a
+    /// different object graph from the one that wrote its fixtures.
+    pub async fn with_settings(customize: impl FnOnce(&mut Settings)) -> Option<Self> {
         let database = TestDatabase::create().await?;
         let pool = database.pool.clone();
         let mut settings = Settings::default();
@@ -152,6 +163,7 @@ impl LifecycleFixture {
         settings.runtime.application_execution_concurrency = 64;
         settings.runtime.external_user_execution_concurrency = 64;
         settings.runtime.internal_stream_queue_capacity = 64;
+        customize(&mut settings);
         let state = AppState::new(settings, Some(pool.clone())).expect("test app state");
         let actor = admin_actor();
         let suffix = Uuid::now_v7().simple().to_string();
@@ -210,6 +222,29 @@ impl LifecycleFixture {
         priority: i32,
         policy: RuntimePolicy,
     ) -> ProviderFixture {
+        self.add_provider_with_capabilities(
+            base_url,
+            priority,
+            policy,
+            json!({ "streaming": true }),
+        )
+        .await
+    }
+
+    /// As [`Self::add_provider`], with the provider model's advertised capabilities under the
+    /// caller's control.
+    ///
+    /// Routing filters candidates through `capabilities_match`, so an execution that requires
+    /// `structured_output` — which every non-`text` response format does — cannot resolve
+    /// against the default model. Without this the request fails at routing and a test would
+    /// never reach the assertion it was written for.
+    pub async fn add_provider_with_capabilities(
+        &self,
+        base_url: String,
+        priority: i32,
+        policy: RuntimePolicy,
+        capabilities: Value,
+    ) -> ProviderFixture {
         let suffix = Uuid::now_v7().simple().to_string();
         let admin = AdminService::new(&self.state).expect("admin service");
         let provider = admin
@@ -233,7 +268,7 @@ impl LifecycleFixture {
                 ProviderModelCreateRequest {
                     model_key: "test-model".to_string(),
                     display_name: Some("Lifecycle model".to_string()),
-                    capabilities: json!({ "streaming": true }),
+                    capabilities,
                 },
             )
             .await

@@ -5571,6 +5571,82 @@
         ],
         "type": "string"
       },
+      "OpenAiCompatTextFormat": {
+        "description": "The `text.format` discriminated union.\n\n`json_object` is declared so it can be *named* in the refusal rather than rejected as an\nunknown variant; the translation itself refuses it. See\n`application::public::openai_compat_to_public_request`.",
+        "oneOf": [
+          {
+            "properties": {
+              "type": {
+                "enum": [
+                  "text"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "type": {
+                "enum": [
+                  "json_object"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "schema": {},
+              "strict": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "type": {
+                "enum": [
+                  "json_schema"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "schema",
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "OpenAiCompatTextOptions": {
+        "additionalProperties": false,
+        "description": "OpenAI's `text` object on the Responses API, narrowed to what Moira actually honours.\n\nIt is typed rather than `Value` on purpose. `OpenAiResponseCompatRequest` carries\n`deny_unknown_fields`, so an *undeclared* `text` would have been an honest 422; declaring\nit as a free-form `Value` and reading nothing turned that refusal into a silent no-op\n(F35), and published `\"text\": {}` in `docs/openapi.json` as if any shape were supported.\nEvery key Moira cannot honour is therefore absent from this type, so serde refuses it.",
+        "properties": {
+          "format": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OpenAiCompatTextFormat"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
       "OpenAiResponseCompatRequest": {
         "additionalProperties": false,
         "properties": {
@@ -5600,7 +5676,16 @@
               "null"
             ]
           },
-          "text": {}
+          "text": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OpenAiCompatTextOptions"
+              }
+            ]
+          }
         },
         "required": [
           "input"
@@ -6507,7 +6592,7 @@
       "PublicResponse": {
         "properties": {
           "citations": {
-            "description": "Always an empty array: RAG retrieval is not wired into response generation in\nthis release, so no citation is ever produced. See\nplans/11-rag-memory-intelligence.md for the tracked follow-up.",
+            "description": "Provenance for the retrieved context that reached the model on this request: one\nentry per memory or RAG chunk that was actually included in the assembled prompt,\nnever per candidate the token budget dropped.\n\nPopulated on `POST /api/v1/responses` and the OpenAI-compatible `POST /v1/responses`\nwhen the request carries a `conversation`, the caller's application has retrieval\nenabled with an embedding model configured, and at least one memory or chunk scores\nabove the configured threshold. An empty array is the normal result whenever any of\nthose does not hold: no conversation on the request, retrieval disabled for the\napplication, nothing matched, or a retrieval failure absorbed by the default\n`continue_without_semantic_retrieval` policy.\n\nOnly retrieved memories and RAG chunks are cited. Replayed conversation history and\nthe conversation summary are injected into the prompt without citations, so an empty\narray does not mean the model saw no conversation context.\n\n`GET /api/v1/responses/{response_id}` returns an empty array for every response:\ncitations come from the context plan computed during the originating request and are\ndeliberately not re-resolved afterwards. Serialises as `[]`, never `null`. See\ndocs/retrieval-citations.md.",
             "items": {
               "$ref": "#/components/schemas/PublicCitation"
             },
@@ -11991,7 +12076,7 @@
         ]
       },
       "put": {
-        "description": "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.",
+        "description": "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.",
         "operationId": "put_conversation_policy",
         "parameters": [
           {
@@ -12204,7 +12289,7 @@
         ]
       },
       "put": {
-        "description": "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.",
+        "description": "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.",
         "operationId": "put_embedding_policy",
         "parameters": [
           {
@@ -12417,7 +12502,7 @@
         ]
       },
       "put": {
-        "description": "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.",
+        "description": "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.",
         "operationId": "put_memory_policy",
         "parameters": [
           {
@@ -12630,7 +12715,7 @@
         ]
       },
       "put": {
-        "description": "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.",
+        "description": "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.",
         "operationId": "put_retrieval_policy",
         "parameters": [
           {
@@ -20268,7 +20353,7 @@
         ]
       },
       "post": {
-        "description": "Persistence primitive: no retrieval, chunking, or embedding pipeline runs, and stored content is not used to influence model responses. See docs/conversation-memory-rag-api.md.",
+        "description": "Ingested content is chunked, embedded, and indexed for retrieval; ingestion_status reports that pipeline's real progress rather than storage. Indexed chunks reach the prompt on POST /api/v1/responses for applications whose retrieval policy enables RAG, and appear in that response's citations. See docs/conversation-memory-rag-api.md.",
         "operationId": "create_rag_collection",
         "parameters": [
           {
@@ -20533,7 +20618,7 @@
         ]
       },
       "post": {
-        "description": "Persistence primitive: no retrieval, chunking, or embedding pipeline runs, and stored content is not used to influence model responses. See docs/conversation-memory-rag-api.md.",
+        "description": "Ingested content is chunked, embedded, and indexed for retrieval; ingestion_status reports that pipeline's real progress rather than storage. Indexed chunks reach the prompt on POST /api/v1/responses for applications whose retrieval policy enables RAG, and appear in that response's citations. See docs/conversation-memory-rag-api.md.",
         "operationId": "create_rag_document",
         "parameters": [
           {
@@ -21360,7 +21445,7 @@
     },
     "/api/v1/admin/rag-documents/{id}/ingest": {
       "post": {
-        "description": "Persistence primitive: no retrieval, chunking, or embedding pipeline runs, and stored content is not used to influence model responses. See docs/conversation-memory-rag-api.md.",
+        "description": "Ingested content is chunked, embedded, and indexed for retrieval; ingestion_status reports that pipeline's real progress rather than storage. Indexed chunks reach the prompt on POST /api/v1/responses for applications whose retrieval policy enables RAG, and appear in that response's citations. See docs/conversation-memory-rag-api.md.",
         "operationId": "ingest_rag_document",
         "parameters": [
           {
@@ -21502,7 +21587,7 @@
     },
     "/api/v1/admin/rag-documents/{id}/reindex": {
       "post": {
-        "description": "Persistence primitive: no retrieval, chunking, or embedding pipeline runs, and stored content is not used to influence model responses. See docs/conversation-memory-rag-api.md.",
+        "description": "Ingested content is chunked, embedded, and indexed for retrieval; ingestion_status reports that pipeline's real progress rather than storage. Indexed chunks reach the prompt on POST /api/v1/responses for applications whose retrieval policy enables RAG, and appear in that response's citations. See docs/conversation-memory-rag-api.md.",
         "operationId": "reindex_rag_document",
         "parameters": [
           {
@@ -25824,7 +25909,7 @@
         ]
       },
       "post": {
-        "description": "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.",
+        "description": "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.",
         "operationId": "create_conversation",
         "parameters": [
           {
@@ -26438,7 +26523,7 @@
         ]
       },
       "post": {
-        "description": "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.",
+        "description": "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.",
         "operationId": "create_message",
         "parameters": [
           {
@@ -27175,7 +27260,7 @@
         ]
       },
       "post": {
-        "description": "Persistence/configuration primitive; conversation history, memory, and RAG are not yet used to influence model responses.",
+        "description": "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.",
         "operationId": "create_memory",
         "parameters": [
           {
@@ -28913,6 +28998,7 @@
     },
     "/v1/responses": {
       "post": {
+        "description": "OpenAI Responses compatibility adapter. `text.format` is honoured: `text` maps to the native `response_format`, `json_schema` carries the caller's schema through, and `json_object` is refused with 422 `unsupported_request_option` because Moira would constrain the output to the empty object rather than to free-form JSON. Any `text` key Moira does not honour — including `verbosity` — is refused rather than ignored. Honouring a schema makes the request a structured-output request, so it becomes subject to the application's `structured_output_enabled` policy and the model's `structured_output` capability. This endpoint carries no route field and always resolves through the default route. See docs/openai-compatibility.md.",
         "operationId": "openai_responses_compat",
         "parameters": [
           {
@@ -29039,7 +29125,7 @@
                 }
               }
             },
-            "description": "Request violates execution policy",
+            "description": "Request violates execution policy, or carries a `text.format` Moira will not honour",
             "headers": {
               "X-Request-Id": {
                 "description": "Request correlation identifier",
