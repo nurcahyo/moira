@@ -2579,10 +2579,18 @@ mod tests {
     ///    Rig's own public conversion, configured (`supports_response_format: true`,
     ///    `supports_tools: true`) exactly as the OpenAI family is.
     ///
-    /// The other half of the property — a tool list injected *after* `build_completion_request`,
-    /// which this unit case cannot see — is already covered end-to-end by
-    /// `tests/structured_output.rs`, which reads `response_format.type` off the body that
-    /// actually reached the mock provider.
+    /// **Measured, not assumed: this case is the only coverage of the edit in point 1.** The
+    /// mutation above was run against the whole suite, and `tests/structured_output.rs` — which
+    /// reads `response_format.type` off the body that actually reached a mock provider, and which
+    /// looks like it should be the stronger guard — stayed **green** through it. Every fixture in
+    /// the tree sets `routing_policies.agent_profile_id = NULL`, so `agent_profile` is `None` on
+    /// every integration path and no end-to-end test has ever built a request from a profile at
+    /// all. Those wire tests catch an *unconditional* tool list and nothing else. Do not delete
+    /// this case in favour of them.
+    ///
+    /// The one gap that remains: a tool list attached to the request *after*
+    /// `build_completion_request` returns, between the build and `handle.completion(request)`.
+    /// That the wire tests would catch, because it needs no profile.
     #[test]
     fn moiras_request_still_carries_its_schema_onto_rigs_openai_wire_body() {
         use rig_core::providers::openai::completion::CompletionRequest as OpenAiWireRequest;

@@ -1746,7 +1746,10 @@ async fn a_streamed_terminal_persistence_breach_reports_the_output_the_caller_al
     assert!(!failure.fallback_eligible);
 
     // The caller received this. The outcome has to agree.
-    assert_eq!(streamed, "firstsecond", "the deltas the caller actually got");
+    assert_eq!(
+        streamed, "firstsecond",
+        "the deltas the caller actually got"
+    );
     assert_eq!(
         outcome.output_text.as_deref(),
         Some(streamed.as_str()),

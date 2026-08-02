@@ -333,7 +333,7 @@ not have to carry a rotation caveat. F's remaining work is unchanged otherwise.
 
 ### 3.2b THE LEDGER IS AHEAD OF THIS TABLE — read it, not just §3.2 (2026-08-02)
 
-The table above was written when the highest finding was F28. **The ledger now runs to `F47`.**
+The table above was written when the highest finding was F28. **The ledger now runs to `F49`.**
 `plans/reports/EXECUTION-LEDGER.md` is authoritative; §3.2 is a summary that has already gone stale
 once. Current state of everything above F28:
 
@@ -344,7 +344,9 @@ once. Current state of everything above F28:
 | **F46** | `response_format: {"type":"json_object"}` reaches the provider as a schema satisfied only by `{}` — the caller gets the **opposite** of free-form JSON, with `200 succeeded` | open, in flight `fix/f46-json-object-format` |
 | **F47** | `get_or_create_*_policy` are `insert … on conflict do update`, i.e. **reads that write**. One conversation-linked turn rewrites two policy rows **three times**, and takes a row lock that serialises concurrent turns of the same application | open. Fix is `on conflict do nothing` + `select`, across the whole `get_or_create_*` family |
 | **F30** | `application_memory_policies.consent_mode` and `application_conversation_policies.memory_consent_mode` are independent, both default `'explicit_only'`, and nothing reconciles them | open. Sub-Phase F takes the **stricter of the two** (D4), but the schema divergence remains. *The shape that hides:* they agree in every default deployment and diverge exactly when an operator tightens one |
-| **F48** | **A third `output_schema` drop path, and it is silent even on OpenAI.** Rig also requires `tools.is_empty() \|\| history_has_tool_result`, so the schema is dropped on turn 1 of any tool-calling conversation with **no `warn!` at all** — the warning at that site fires only for the DeepSeek case. Latent only because `build_completion_request` hardcodes `tools: Vec::new()`; it goes live the day tool calling is enabled. **F39's fix does not cover it** — that reconciles per provider type, this drop is per request | open, latent |
+| **F48** | **A third `output_schema` drop path, and it is silent even on OpenAI.** Rig also requires `tools.is_empty() \|\| history_has_tool_result`, so the schema is dropped on turn 1 of any tool-calling conversation with **no `warn!` at all** — the warning at that site fires only for the DeepSeek case. Latent only because `build_completion_request` hardcodes `tools: Vec::new()`; it goes live the day tool calling is enabled. **F39's fix does not cover it** — that reconciles per provider type, this drop is per request | **latent, now GUARDED, behaviour deliberately unchanged.** Premise re-verified: that constructor is the tree's only `CompletionRequest`, and `public.rs` refuses caller-declared tools outright. `moiras_request_still_carries_its_schema_onto_rigs_openai_wire_body` reds on the precondition |
+| **F49** | **No integration test ever builds a request from an agent profile** — every fixture sets `agent_profile_id = NULL`, so `preamble`/`temperature`/`max_tokens`/`tool_policy` are unverified at the wire | open. Found by running F48's mutation: the unit guard went red and all seven `tests/structured_output.rs` wire cases stayed **green** |
+| **F38** | Terminal-persistence-deadline arm discarded a successful provider result | **CLOSED** `fix/f38-deadline-usage` — all three values retained, `"output_committed"` was a hardcoded literal and is now derived. Reversal conditions in the ledger |
 | **F35, F37, F34, F29, F39** | — | CLOSED |
 | **F36, F41** | — | REFUTED / wrong as recorded |
 
@@ -381,7 +383,25 @@ start of your task.**
    The same now applies to **GitHub**, added in wave 4B and exercised only against a purpose-built
    mock (no discovery document, no `id_token`, `/user` + `/user/emails`).
 
-### 3.4 Six guards that failed — five toothless, one that pinned the defect
+### 3.4 Eight guards that failed — six toothless, two that pinned the defect
+
+**Two more from `fix/f38-deadline-usage` (2026-08-02), both already shipped and trusted, and
+both found by running the mutation.** Running total of shipped-and-trusted guards that could not
+fire: **four**.
+
+| Guard | Why it could not fire |
+|---|---|
+| all seven cases in `tests/structured_output.rs` | they read `response_format` off the body that actually reached a mock provider, which looks unassailable — but every fixture in the tree sets `routing_policies.agent_profile_id = NULL`. The realistic way to enable tool calling is to read `AgentProfileRecord::tool_policy`, and **that mutation left all seven green**. Recorded as **F49**: no end-to-end test has ever built a request from an agent profile, so `preamble`, `temperature` and `max_tokens` are equally unpinned |
+| `terminal_persistence_timeout_is_recorded_as_output_committed_not_as_a_plain_failure` | **PINNED the defect**, the second of that kind. It asserted `"output_committed": true` in both the event and the audit row on a **non-streaming** execution — and asserted `usage_records` count `= 0` a few lines away, which is the proof nothing was committed in either sense. The literal in the *test* was the thing keeping the wrong literal in the *code* |
+
+The lesson from the first: **"it asserts on the real wire" is not the same as "it reaches the code
+you changed."** Before trusting an end-to-end guard, check that its fixture populates the input
+your edit reads. The lesson from the second is §3.4's existing one, now twice-earned: a content
+literal in a test is code, and it can pin a defect just as firmly as an assertion can guard one.
+
+---
+
+**The original six — five toothless, one that pinned the defect**
 
 **Read this before writing any guard.** Plan 09 produced **six**, every one found by *running the
 mutation* and none by reading the test. **Two were already shipped and trusted.**
