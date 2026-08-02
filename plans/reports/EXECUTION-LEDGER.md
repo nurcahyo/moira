@@ -2718,7 +2718,7 @@ splits the run: `fmt` and `clippy` had already passed against the *old* tree whi
 the new one. **Do not edit sources while `scripts/gates.sh` is running**, and if you did, the run
 proves nothing about what you edited.
 
-### F46 — the `get_or_create_*_policy` readers are UPDATEs, and one turn issues three of them
+### F47 — the `get_or_create_*_policy` readers are UPDATEs, and one turn issues three of them
 
 Found while counting F37's round-trips; nobody asked for it. Both
 `get_or_create_conversation_policy` and `get_or_create_memory_policy` are
