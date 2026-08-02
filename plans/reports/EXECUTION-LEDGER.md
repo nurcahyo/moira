@@ -2763,6 +2763,13 @@ was implemented first, the case was watched going red, and the gate was added af
 it is pretty-printed on purpose — a compact JSON reply round-trips through `to_string()` identically
 and the guard would pass against the defect.
 
+**[SUPERSEDED 2026-08-02 — F38 is now CLOSED on `fix/f38-deadline-usage`; see the F38 closure
+section above. The reasoning below is preserved because it is what deferred the decision, and two
+of its premises turned out to be weaker than they read: `UsageSummary::default()` is `None`
+("unknown"), not a zero that retention would overwrite, and `terminal_update_from_outcome` already
+runs on the `Failed` branch, so the outcome was *already* the source of the response row's usage
+and output hash.]**
+
 **F38 is NOT fixed and stays open.** `execution.rs`'s terminal-persistence-deadline arm calls
 `failed_outcome` from inside `match result { Ok(Ok(output)) => … }`, where `output` is live. F29
 turns its `structured_output: None` into a third silent drop alongside `output.text` and
@@ -2819,9 +2826,12 @@ correct answer to the question they are asking — the model *did* answer; only 
 bookkeeping failed. If a **delivery** path (rather than an interpretation path) ever treats
 `output_text.is_some()` as "show this to the end user" without checking `status`, this arm must
 stop carrying text and those two sites must read `status` — which is also the third precondition of
-F29's own reversal condition. The public plane is not such a path today: both
-`create_response` and the streaming terminal branch dispatch on `outcome.status` first, and the
-`Failed` arm returns `Err(AppError::coded(...))` without ever reading `output_text`.
+F29's own reversal condition. The public plane is not such a path today: both `create_response` and
+the streaming terminal branch dispatch on `outcome.status` first, and the `Failed` arm never
+*delivers* the text — it returns `Err(AppError::coded(…))` / a `terminal_failure` SSE, and it does
+not call `record_conversation_assistant`, so no conversation message is written from it. It does
+**read** `output_text` on that arm, through `terminal_update_from_outcome`, but only to record
+`output_text_bytes` and `output_hash` — which is the improvement, not the risk.
 
 **`"output_committed": true` was inaccurate, and the audit entry was the wrong one — not the
 outcome.** The brief asked which of the two is wrong. Neither, exactly: the value was a **hardcoded
@@ -2873,6 +2883,9 @@ gap is the `responses` row: neither case drives `PublicService`, so
 `terminal_update_from_outcome`'s handling of a `Failed` outcome carrying usage is reasoned about
 above but not pinned by a test. A public-plane case that forces a terminal-persistence breach would
 close it.
+
+**Gates:** `ALL GATES PASSED` — fmt, clippy, **test (1049 passed, 42/42 integration targets logged,
+zero DB-skip lines)**, release, deny, audit (the one expected allowed warning, RUSTSEC-2026-0221).
 
 ### F41 is WRONG as recorded — there is no skill-tree drift
 
