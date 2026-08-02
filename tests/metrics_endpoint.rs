@@ -801,6 +801,37 @@ async fn metrics_endpoint_exposes_db_pool_gauges_reflecting_the_live_pool() {
     let total = [("service", service.as_str()), ("state", "total")];
     let idle = [("service", service.as_str()), ("state", "idle")];
 
+    // One scrape before the pool is touched, for one reason: every observation after this
+    // saturates the pool, so in all of them `pool.size()` and the configured ceiling are the
+    // same number. A `total` gauge sourced from `max_connections` instead of the live size
+    // would agree with every one of them and be wrong in production, where the two differ
+    // for as long as the pool is warming. Here they still differ — the fixture has used the
+    // pool but not exhausted it.
+    //
+    // Only `total` is asserted here. `idle` is deliberately left alone: this is the one
+    // sample in the test taken from a pool that may still be settling, which is the whole
+    // subject of F28, and `pool.size()` is the number that is *not* affected by it — a
+    // connection whose return is in flight is already counted in `size` and not yet counted
+    // in `num_idle`.
+    let initial = scrape(&client, &server).await;
+    assert_eq!(
+        declared_type(&initial, DB_POOL),
+        Some("gauge"),
+        "{DB_POOL} must be a gauge:\n{initial}"
+    );
+    let initial_total = series_value(&initial, DB_POOL, &total);
+    assert!(
+        initial_total >= 1.0,
+        "the fixture has already run queries through this pool, so at least one connection \
+         must exist:\n{initial}"
+    );
+    assert!(
+        initial_total < f64::from(capacity),
+        "the fixture opened all {capacity} connections before this test started, so no \
+         scrape below can tell a `total` gauge sourced from `pool.size()` apart from one \
+         sourced from the configured ceiling, and the test would pass either way:\n{initial}"
+    );
+
     // Take every permit, then hand every connection back eagerly. The acquisitions wait out
     // any return still in flight from fixture setup; the eager returns replace the spawned
     // ones, so nothing is pending when the loop ends. `capacity` connections are open and
@@ -827,11 +858,6 @@ async fn metrics_endpoint_exposes_db_pool_gauges_reflecting_the_live_pool() {
     }
 
     let settled = scrape(&client, &server).await;
-    assert_eq!(
-        declared_type(&settled, DB_POOL),
-        Some("gauge"),
-        "{DB_POOL} must be a gauge:\n{settled}"
-    );
     assert_eq!(
         series_value(&settled, DB_POOL, &total),
         f64::from(capacity),
