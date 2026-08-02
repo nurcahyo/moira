@@ -965,7 +965,7 @@ fn template_database() -> String {
 /// opened its own pool on it.
 ///
 /// Exposed so a suite can assert it is *not* connected to that database without resolving
-/// the variable itself. `tests/test_database_isolation.rs` permits exactly three files to
+/// the variable itself. `tests/test_database_isolation.rs` permits exactly two files to
 /// make that lookup, and this module is the one that owns the mechanism; a suite doing it
 /// inline would be a new entry on that allowlist for no reason beyond a diagnostic.
 pub fn shared_database_name() -> Option<String> {
