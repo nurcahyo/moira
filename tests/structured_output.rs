@@ -312,6 +312,14 @@ async fn a_reply_that_is_json_is_not_parsed_when_no_schema_was_requested() {
 ///
 /// The tripwire for anyone who adopts the fail-hard variant without also doing F39: this case
 /// and `an_unparseable_extraction_reply_fails_the_run_and_writes_no_memory` both go red.
+///
+/// **F42 — this case is also what makes the `moira.error.structured_output_invalid` catalog
+/// entry true.** That entry used to assert a second emitter, "or the model's output does not
+/// conform to it", and there is none: both real emitters reject the *caller's schema*
+/// (`validate_response_format`, `build_completion_request`). The catalog description now says
+/// so, and this is the assertion that would have to change first if it ever stopped being so —
+/// hence the pointer in the failure message below. A prose claim nothing observes is not a
+/// claim; this is the thing that observes it.
 #[tokio::test]
 async fn a_reply_that_is_not_json_leaves_the_field_null_and_still_succeeds() {
     let Some(case) = Case::new(vec![ProviderScript::Completion {
@@ -326,7 +334,10 @@ async fn a_reply_that_is_not_json_leaves_the_field_null_and_still_succeeds() {
     assert_eq!(status, StatusCode::OK, "diagnose failed: {body}");
     assert_eq!(
         body["outcome"]["status"], "succeeded",
-        "a non-conforming reply must not fail the execution: {body}"
+        "a non-conforming reply must not fail the execution. If this is now intentional (the \
+         fail-hard variant), widen the moira.error.structured_output_invalid description in \
+         src/i18n/catalog/errors.rs AND docs/i18n-response-catalog.json in the same change — it \
+         currently states that no model-output-non-conformance path exists (F42): {body}"
     );
     assert_eq!(body["outcome"]["structured_output"], Value::Null, "{body}");
     assert_eq!(

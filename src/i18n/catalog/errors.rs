@@ -368,8 +368,8 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
     },
     I18nEntry {
         key: "moira.error.structured_output_invalid",
-        default_message: "The structured output is invalid.",
-        description: "Used when a structured-output request cannot be honoured: either the response schema the caller supplied is rejected, or the model's output does not conform to it. The previous wording covered only the second case, so it did not describe the request-validation emitter at all.",
+        default_message: "The structured output schema is invalid.",
+        description: "Used when a structured-output request cannot be honoured because of the schema the caller supplied — never because of the model's reply. Two emitters, both on the request: validate_response_format rejects a schema over public_api.maximum_schema_bytes, and build_completion_request rejects one that is not a readable schemars::Schema (as ExecutionFailureClass::StructuredOutputInvalid, mapped to 422). An earlier wording also claimed 'or the model's output does not conform to it'; no such path exists (F42). F29 made the parse lenient, so a non-conforming reply leaves structured_output null and still succeeds — pinned by a_reply_that_is_not_json_leaves_the_field_null_and_still_succeeds in tests/structured_output.rs. memory_extraction::FAILURE_STRUCTURED_OUTPUT_INVALID is the same string for the reply case, but it is written to memory_extraction_runs.failure_class and never returned to a caller, so it never renders this message. Widen this wording only when the fail-hard variant ships, which needs all three of F29's preconditions: F39 landed, a retry/fallback disposition for StructuredOutputInvalid, and run_extraction reading execution.status.",
     },
     I18nEntry {
         key: "moira.error.structured_output_unsupported",
