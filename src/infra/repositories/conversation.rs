@@ -2271,7 +2271,24 @@ pub(crate) async fn insert_memory_embedding(
 #[derive(Debug, Clone)]
 pub struct MemoryExtractionRunInsert {
     pub conversation_uuid: Option<Uuid>,
+    /// The **triggering turn's** response — the conversation turn whose completion caused
+    /// extraction to run. Not the extraction's own execution; see [`Self::execution_id`].
     pub response_id: Option<Uuid>,
+    /// The id of the completion the extraction is about to issue — finding F54.
+    ///
+    /// Required, not `Option`. The column is nullable for rows written before migration `0025`,
+    /// but no *writer* may omit it: an operator reading a failed run asks "which provider, which
+    /// model, what did it say", and every one of those answers is keyed by `execution_id` on
+    /// `execution_attempts`, `responses` and `audit_logs.resource_id`. Making the field
+    /// non-optional is the barrier — a caller that has not decided on an execution id cannot
+    /// open a run row.
+    ///
+    /// The caller therefore mints the id *before* the run row exists and hands the same value to
+    /// the `ExecutionCommand`. Writing it here rather than on
+    /// [`complete_memory_extraction_run`] is deliberate and is the whole point: a run that dies
+    /// mid-call is exactly the run an operator most needs to correlate, and it never reaches
+    /// completion.
+    pub execution_id: Uuid,
     pub input_message_ids: Vec<Uuid>,
     pub provider_model_id: Option<Uuid>,
 }
@@ -2291,14 +2308,16 @@ pub(crate) async fn insert_memory_extraction_run(
     sqlx::query(
         r#"
             insert into memory_extraction_runs (
-                id, conversation_id, response_id, status, input_message_ids, provider_model_id
+                id, conversation_id, response_id, execution_id, status, input_message_ids,
+                provider_model_id
             )
-            values ($1, $2, $3, 'running', $4, $5)
+            values ($1, $2, $3, $4, 'running', $5, $6)
             "#,
     )
     .bind(id)
     .bind(insert.conversation_uuid)
     .bind(insert.response_id)
+    .bind(insert.execution_id)
     .bind(&insert.input_message_ids)
     .bind(insert.provider_model_id)
     .execute(pool)
