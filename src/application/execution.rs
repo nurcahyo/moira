@@ -655,6 +655,34 @@ impl MoiraExecutionService {
                                         "output_committed": true
                                     }),
                                 );
+                                // **`output` is live here, and `failed_outcome` discards it.**
+                                //
+                                // This is the one `failed_outcome` call site reached from
+                                // `Ok(Ok(output))`, so the outcome it builds drops three values
+                                // that are in hand and already reported elsewhere:
+                                // `output.text` (the client has received every delta of it on
+                                // the streaming path), `output.structured_output` (finding F29,
+                                // populated since this commit), and `output.usage` — which the
+                                // `attempt_summary` two statements above records in full while
+                                // the outcome carries `UsageSummary::default()`. That asymmetry
+                                // is finding **F38**, a billing and reporting divergence, and
+                                // both audit metadata and the `ExecutionFailed` event assert
+                                // `"output_committed": true` right beside it.
+                                //
+                                // **Deliberately not fixed here, and F38 stays open.** The
+                                // condition this arm reports is that terminal persistence did
+                                // *not* complete: `update_attempt`, `insert_usage_record` and
+                                // `touch_credential_used` may each have failed to commit. So
+                                // promoting the usage onto the outcome would assert a billing
+                                // fact whose row may be absent, and promoting `output_text` onto
+                                // a non-`Succeeded` status changes what every consumer of a
+                                // failed execution receives. Deciding which of the two levels is
+                                // authoritative is F38's own change, with its own tests; making
+                                // it a side effect of F29 would bury a billing decision inside a
+                                // parsing one.
+                                //
+                                // What this comment buys: the drop is no longer silent. It was
+                                // inert only while `structured_output` was universally `None`.
                                 return Ok(failed_outcome(
                                     command,
                                     Some(route),
@@ -1603,14 +1631,81 @@ impl EventCollector {
     }
 }
 
+/// Parses a schema-constrained reply into [`ExecutionRunOutput::structured_output`] — finding F29.
+///
+/// # Why the parse lives here rather than at the Rig boundary
+///
+/// There is no value to forward. `rig_core` 0.40's `CompletionResponse` is
+/// `{choice, usage, raw_response, message_id}` and `AssistantContent` is
+/// `Text | ToolCall | Reasoning | Image` — **no structured variant** — so populating this field
+/// means parsing text as JSON, and the only question is where. `output_from_response` in
+/// `src/orchestration/runtime_factory.rs` is the wrong place because
+/// [`execute_rig_stream`] never constructs a `RuntimeCompletionOutput` at all: it accumulates
+/// text itself. Parsing at the boundary would cover the non-streaming path only and force a
+/// divergent second implementation for streams — which is precisely the "second
+/// response-narrowing site" `.agents/skills/moira-rig-completions/SKILL.md` forbids. One helper
+/// called from both run paths is exactly one parse site covering both.
+///
+/// # `wants_structured` is the whole safety property, not a fast path
+///
+/// Populating this field unconditionally **corrupts conversation summarization.** Summarization
+/// sends no `output_schema`, `summarization::parse_summary` accepts any non-empty prose, and
+/// `ConversationService::summarize_conversation` prefers `structured_output` over `output_text`
+/// via `.map(|value| value.to_string())`. So a summary that merely *happened* to be valid JSON
+/// would be stored as `Value::to_string()` of itself — reflowed, and quote-and-backslash-escaped
+/// when the reply is a bare JSON string — silently changing `summary_hash`, which is documented
+/// as a content address of the summary body. Observed, not theorised: an ungated build stored
+/// `{"decision":"…"}` in place of the pretty-printed bytes the model sent
+/// (`a_summary_that_is_valid_json_is_stored_verbatim`). The caller asking for a schema is what
+/// makes re-serialisation safe, because a caller asking for a schema wants the value, not the
+/// bytes.
+///
+/// # Why a non-conforming reply is `None` rather than `StructuredOutputInvalid`
+///
+/// Three reasons, each verified against the tree rather than assumed:
+///
+/// 1. `StructuredOutputInvalid` is in **neither** `is_retryable` nor `is_fallback_eligible` nor
+///    `is_circuit_failure`, so one non-conforming reply would end the execution with no retry
+///    and no fallback.
+/// 2. On DeepSeek the schema never reaches the wire — Rig's `SUPPORTS_RESPONSE_FORMAT = false`
+///    drops it — so *every* structured request on that route would hard-fail where it previously
+///    returned 200. Failing loudly is the right end state; it must follow the capability fix
+///    (finding F39), not precede it.
+/// 3. `ConversationService::run_extraction` detects failure by `output_text` being `None` and
+///    never inspects `execution.status`, so a hard failure would reclassify an unparseable
+///    extraction reply from `structured_output_invalid` to `extraction_call_failed` — losing the
+///    only signal that distinguishes "the model did not comply" from "the call did not happen".
+///
+/// **Reversal condition:** adopt the fail-hard variant once F39 has landed *and*
+/// `StructuredOutputInvalid` has been given a retry/fallback disposition *and* `run_extraction`
+/// reads `execution.status`. Until all three hold, failing here trades a silent `None` for a
+/// loud outage on a provider that was never going to comply.
+///
+/// # Strict, and deliberately not a scavenger
+///
+/// `serde_json::from_str` over the trimmed text and nothing else. Rig's own balanced-brace scan
+/// is **not** copied, and no code fence is stripped: `memory_extraction::parse_candidates`
+/// documents the refusal to hunt JSON inside prose ("a heuristic extractor over untrusted text
+/// is a parser differential waiting to happen") and owns the one real-world tolerance — a
+/// ```` ```json ```` fence — on the `output_text` it already falls back to. Duplicating that
+/// tolerance here would give the tree two parsers with two accept-sets over the same bytes.
+fn structured_output_from_text(wants_structured: bool, text: &str) -> Option<Value> {
+    if !wants_structured {
+        return None;
+    }
+    serde_json::from_str(text.trim()).ok()
+}
+
 async fn execute_rig_completion(
     handle: Arc<RuntimeModelHandle>,
     request: CompletionRequest,
 ) -> Result<ExecutionRunOutput, ExecutionFailure> {
+    let wants_structured = request.output_schema.is_some();
     let output = handle.completion(request).await?;
+    let structured_output = structured_output_from_text(wants_structured, &output.text);
     Ok(ExecutionRunOutput {
         text: output.text,
-        structured_output: None,
+        structured_output,
         usage: output.usage,
         provider_request_id: output.provider_request_id,
         events: Vec::new(),
@@ -1649,6 +1744,8 @@ async fn execute_rig_stream(
     if let Some(failure) = events.delivery_failure() {
         return Err(failure);
     }
+    // Captured before `request` is moved into `start_stream` below.
+    let wants_structured = request.output_schema.is_some();
     let cancellation = events.cancellation();
     let mut stream = tokio::select! {
         _ = cancellation.cancelled() => return Err(cancelled_failure()),
@@ -1769,9 +1866,10 @@ async fn execute_rig_stream(
         }
     }
 
+    let structured_output = structured_output_from_text(wants_structured, &text);
     Ok(ExecutionRunOutput {
         text,
-        structured_output: None,
+        structured_output,
         usage,
         provider_request_id,
         events: Vec::new(),
@@ -2332,6 +2430,60 @@ mod tests {
         assert_eq!(failure.class, inherited.class);
         assert_eq!(failure.retryable, inherited.retryable);
         assert_eq!(failure.fallback_eligible, inherited.fallback_eligible);
+    }
+
+    /// Finding F29 — the gate, stated as a unit fact.
+    ///
+    /// The three integration cases that cover this
+    /// (`tests/structured_output.rs`, and `a_summary_that_is_valid_json_is_stored_verbatim`)
+    /// each need a database, a mock provider and an HTTP server. This one needs none of them,
+    /// so the gate cannot become unobservable if a fixture stops being reachable.
+    #[test]
+    fn structured_output_is_parsed_only_when_a_schema_was_requested() {
+        // The property: identical bytes, opposite results, decided solely by the flag.
+        assert_eq!(
+            structured_output_from_text(true, "{\"a\":1}"),
+            Some(json!({ "a": 1 }))
+        );
+        assert_eq!(structured_output_from_text(false, "{\"a\":1}"), None);
+
+        // The corruption shape easiest to reach in practice, and the reason the flag is not
+        // merely an optimisation: a model that wraps its prose reply in quotes has emitted a
+        // valid JSON *string*. Ungated, summarization would store `"\"…\""` — the quotes, and
+        // any interior escaping, now part of the body and of `summary_hash` with it.
+        // Summarization sends no schema, so it takes the second branch.
+        assert_eq!(
+            structured_output_from_text(true, "\"a quoted summary\""),
+            Some(json!("a quoted summary"))
+        );
+        assert_eq!(
+            structured_output_from_text(false, "\"a quoted summary\""),
+            None
+        );
+
+        // Whitespace is trimmed before the parse, and only around the document.
+        assert_eq!(
+            structured_output_from_text(true, "  \n{\"a\":1}\n  "),
+            Some(json!({ "a": 1 }))
+        );
+
+        // A non-conforming reply is `None`, never an error: see the doc comment's three
+        // reasons. If this ever becomes a `Result`, `run_extraction`'s failure class flips.
+        assert_eq!(structured_output_from_text(true, "I cannot do that."), None);
+        assert_eq!(structured_output_from_text(true, ""), None);
+
+        // Strict, not a scavenger. Both of these are what Rig's balanced-brace scan and
+        // `memory_extraction::strip_code_fence` would accept; neither is accepted here, so
+        // they keep flowing to the caller through `output_text` and are handled by the one
+        // parser that documents its tolerance.
+        assert_eq!(
+            structured_output_from_text(true, "here you go: {\"a\":1}"),
+            None
+        );
+        assert_eq!(
+            structured_output_from_text(true, "```json\n{\"a\":1}\n```"),
+            None
+        );
     }
 
     #[tokio::test]
