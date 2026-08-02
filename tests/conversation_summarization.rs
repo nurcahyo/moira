@@ -35,7 +35,7 @@ mod support;
 use std::{sync::Arc, time::Duration};
 
 use axum::http::StatusCode;
-use moira::domain::ConversationPolicyPutRequest;
+use moira::{domain::ConversationPolicyPutRequest, security::request_hash};
 use serde_json::{Value, json};
 use support::{
     LifecycleFixture, MoiraHttpServer, RuntimePolicy,
@@ -1079,6 +1079,73 @@ async fn a_successful_automatic_summarization_counts_as_succeeded() {
         case.summarization_runs("failed").await,
         0.0,
         "nothing failed, so the failed series must still read zero"
+    );
+
+    case.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Finding F29 — the summary body must survive the structured-output parse untouched.
+// ---------------------------------------------------------------------------
+
+/// A summary that happens to be a valid JSON document is stored **byte for byte**.
+///
+/// # What this guards, and why it is not obvious
+///
+/// Summarization sends **no** `output_schema`, `parse_summary` accepts any non-empty prose
+/// under a size cap, and `summarize_conversation` prefers `execution.structured_output` over
+/// `execution.output_text` via `.map(|value| value.to_string())`. Those three facts are
+/// individually harmless and jointly a corruption channel the moment anything populates
+/// `structured_output`: a summary that parses as JSON would be replaced by
+/// `serde_json::Value::to_string()` of itself — reflowed, and for a bare JSON string literal
+/// wrapped in quotes and backslash-escaped. `summary_hash` is `request_hash` over the stored
+/// bytes and is documented as a content address, so the corruption is silent: the row looks
+/// well-formed and its hash is internally consistent with the wrong text.
+///
+/// F29's fix is what makes that reachable, and the `output_schema.is_some()` gate in
+/// `structured_output_from_text` is the whole of what prevents it. This case was written
+/// against an **ungated** parse and observed failing — the stored body came back as the
+/// re-serialised compact form — before the gate was added.
+///
+/// # Why a JSON *document*, not prose
+///
+/// A prose reply cannot exercise this at all: it does not parse, so `structured_output` stays
+/// `None` whether the gate exists or not, and the assertion would be vacuous. The reply below
+/// is deliberately pretty-printed so that re-serialisation is *visible*: `to_string()` emits
+/// the compact form, which differs from the raw bytes in whitespace alone. A compact reply
+/// would round-trip identically and this guard would pass against the defect.
+#[tokio::test]
+async fn a_summary_that_is_valid_json_is_stored_verbatim() {
+    // Valid JSON, and pretty-printed: re-serialisation changes it.
+    const JSON_SUMMARY: &str =
+        "{\n  \"decision\": \"ship the invoicing rewrite in March\",\n  \"owner\": \"the user\"\n}";
+
+    let Some(case) =
+        Case::enabled(vec![completion(ASSISTANT_REPLY), completion(JSON_SUMMARY)]).await
+    else {
+        return;
+    };
+
+    let (status, body) = case.respond(USER_TURN).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let summaries = case.summaries().await;
+    assert_eq!(
+        summaries.len(),
+        1,
+        "the fixture must summarise, or this case asserts nothing"
+    );
+    assert_eq!(
+        summaries[0].summary_text_plain.as_deref(),
+        Some(JSON_SUMMARY),
+        "the summary body must be stored exactly as the model sent it — no re-serialisation, \
+         no added quotes, no escaping"
+    );
+    assert_eq!(
+        summaries[0].summary_hash,
+        request_hash(JSON_SUMMARY.as_bytes()),
+        "`summary_hash` must be a content address of the raw reply; a hash that is merely \
+         consistent with a corrupted body is exactly the failure this case exists to catch"
     );
 
     case.shutdown().await;
