@@ -9,9 +9,10 @@ mod runtime_factory;
 
 pub use chunking::{ChunkCandidate, ChunkStrategy, ChunkingError, ChunkingLimits, chunk};
 pub use controls::{
-    CircuitBreakerRegistry, CircuitResetScope, CircuitState, ClusterCoordinator,
-    ClusterRateLimiter, ConcurrencyController, ExecutionPermits, InMemoryRateLimiter,
-    ProviderRuntimeCache, RateLimiterBackend, RuntimeCacheKey, is_fallback_eligible, is_retryable,
+    CapacityExhaustion, CapacityScope, CircuitBreakerRegistry, CircuitResetScope, CircuitState,
+    ClusterCoordinator, ClusterRateLimiter, ConcurrencyController, ExecutionPermits,
+    InMemoryRateLimiter, ProviderRuntimeCache, RateLimiterBackend, RuntimeCacheKey,
+    is_fallback_eligible, is_retryable,
 };
 pub use embedding::{
     EMBEDDING_PROVIDER_UNSUPPORTED, EMBEDDING_REQUEST_FAILED, EMBEDDING_RESPONSE_INVALID,

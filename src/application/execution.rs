@@ -408,7 +408,7 @@ impl MoiraExecutionService {
                 let permits = match self
                     .state
                     .concurrency
-                    .acquire_scoped(
+                    .acquire(
                         candidate.provider_id,
                         candidate.runtime_policy.max_concurrent_requests.max(1) as usize,
                         command.options.stream,

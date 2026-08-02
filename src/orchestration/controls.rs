@@ -308,7 +308,7 @@ struct DynamicPermit {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CapacityScope {
+pub enum CapacityScope {
     Global,
     ProviderRequest,
     ProviderStream,
@@ -318,7 +318,7 @@ pub(crate) enum CapacityScope {
 }
 
 #[derive(Debug)]
-pub(crate) struct CapacityExhaustion {
+pub struct CapacityExhaustion {
     scope: CapacityScope,
 }
 
@@ -390,26 +390,39 @@ impl ConcurrencyController {
         self.cluster.is_some()
     }
 
+    /// The **only** admission entry point. `is_stream` is a required argument and has no
+    /// default, deliberately.
+    ///
+    /// F43 — there used to be a second, `pub` one called `acquire`, which took four arguments
+    /// and supplied `is_stream: false` and `provider_stream_limit = provider_limit` itself.
+    /// Every one of its 29 call sites was test code (20 in this file's `#[cfg(test)]` modules,
+    /// 9 across `tests/cluster_coordination.rs` and `tests/coordination_default_path.rs`), so
+    /// the hardcoded `false` was never wrong in practice — but it was the shorter name, the
+    /// obvious name, and the one a future streaming caller would reach for, and reaching for it
+    /// would silently take a **request** permit and leave `max_concurrent_streams` unenforced.
+    ///
+    /// The fix is not "delete the dead code": the 9 integration-test call sites are a separate
+    /// crate and genuinely need a `pub` entry, so deleting it was never available. What was
+    /// available was removing the *choice*. There is now one function, it cannot be called
+    /// without stating which ceiling the caller wants, and `CapacityExhaustion`/`CapacityScope`
+    /// are `pub` so a caller can tell the two apart.
+    ///
+    /// The one production call site is `ExecutionService::execute_attempt`, which passes
+    /// `command.options.stream`. That *wiring* — not this predicate — is the thing worth
+    /// guarding, because a correct predicate with wrong wiring is this repository's most
+    /// repeated defect shape, and it is already guarded:
+    /// `stream_capacity_is_independent_from_request_capacity` in `tests/execution_lifecycle.rs`
+    /// runs `max_concurrent_requests: 2` against `max_concurrent_streams: 1` — two *distinct*
+    /// numbers, so the two ceilings stay distinguishable — holds one stream open, proves a
+    /// non-streaming execution still passes, and then requires a second stream to be refused
+    /// with `CapacityExhausted` and `call_count` unchanged. Passing `false` here instead of
+    /// `command.options.stream` reds it. Verified by running that edit, not by reading.
+    ///
+    /// **What does not stop this coming back:** nothing prevents a new four-argument
+    /// convenience wrapper being added above. There is no dead-code lint that would catch one
+    /// (it would have callers in tests immediately, which is exactly how the old one survived).
+    /// What changed is that the obvious name is taken by the function that demands the answer.
     pub async fn acquire(
-        &self,
-        provider_id: Uuid,
-        provider_limit: usize,
-        application_id: Option<Uuid>,
-        external_user_id: Option<&str>,
-    ) -> Result<ExecutionPermits, ExecutionFailure> {
-        self.acquire_scoped(
-            provider_id,
-            provider_limit,
-            false,
-            provider_limit,
-            application_id,
-            external_user_id,
-        )
-        .await
-        .map_err(Into::into)
-    }
-
-    pub(crate) async fn acquire_scoped(
         &self,
         provider_id: Uuid,
         provider_request_limit: usize,
@@ -1114,14 +1127,28 @@ mod tests {
     async fn global_concurrency_rejects_when_full() {
         let controller = ConcurrencyController::new(1, 1, 1, 8);
         let provider = Uuid::now_v7();
-        let first = controller.acquire(provider, 1, None, None).await.unwrap();
+        let first = controller
+            .acquire(provider, 1, false, 1, None, None)
+            .await
+            .unwrap();
         let second = controller
-            .acquire(provider, 1, None, None)
+            .acquire(provider, 1, false, 1, None, None)
             .await
             .unwrap_err();
-        assert_eq!(second.class, ExecutionFailureClass::CapacityExhausted);
+        // F43 — the entry point now returns `CapacityExhaustion`, which names the ceiling that
+        // was hit; the old wrapper returned an `ExecutionFailure` that had already thrown that
+        // away. Both are asserted: the scope, because it is the discriminating fact, and the
+        // conversion, because it is what the execution path actually reports to a caller.
+        assert_eq!(second.scope(), CapacityScope::Global);
+        let failure: ExecutionFailure = second.into();
+        assert_eq!(failure.class, ExecutionFailureClass::CapacityExhausted);
         drop(first);
-        assert!(controller.acquire(provider, 1, None, None).await.is_ok());
+        assert!(
+            controller
+                .acquire(provider, 1, false, 1, None, None)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -1130,12 +1157,12 @@ mod tests {
         let first_provider = Uuid::now_v7();
         let second_provider = Uuid::now_v7();
         let first = controller
-            .acquire_scoped(first_provider, 1, false, 1, None, None)
+            .acquire(first_provider, 1, false, 1, None, None)
             .await
             .unwrap();
 
         let exhausted = controller
-            .acquire_scoped(second_provider, 1, false, 1, None, None)
+            .acquire(second_provider, 1, false, 1, None, None)
             .await
             .unwrap_err();
         assert_eq!(exhausted.scope(), CapacityScope::LimiterRegistry);
@@ -1150,7 +1177,7 @@ mod tests {
         drop(first);
         assert!(
             controller
-                .acquire_scoped(second_provider, 1, false, 1, None, None)
+                .acquire(second_provider, 1, false, 1, None, None)
                 .await
                 .is_ok()
         );
@@ -1164,36 +1191,36 @@ mod tests {
         let controller = ConcurrencyController::new(8, 1, 1, 8);
         let provider = Uuid::now_v7();
         let first = controller
-            .acquire_scoped(provider, 2, false, 1, None, None)
+            .acquire(provider, 2, false, 1, None, None)
             .await
             .unwrap();
         let second = controller
-            .acquire_scoped(provider, 2, false, 1, None, None)
+            .acquire(provider, 2, false, 1, None, None)
             .await
             .unwrap();
 
         let lowered = controller
-            .acquire_scoped(provider, 1, false, 1, None, None)
+            .acquire(provider, 1, false, 1, None, None)
             .await
             .unwrap_err();
         assert_eq!(lowered.scope(), CapacityScope::ProviderRequest);
 
         drop(first);
         let still_full = controller
-            .acquire_scoped(provider, 1, false, 1, None, None)
+            .acquire(provider, 1, false, 1, None, None)
             .await
             .unwrap_err();
         assert_eq!(still_full.scope(), CapacityScope::ProviderRequest);
 
         let raised = controller
-            .acquire_scoped(provider, 2, false, 1, None, None)
+            .acquire(provider, 2, false, 1, None, None)
             .await
             .unwrap();
         drop(second);
         drop(raised);
         assert!(
             controller
-                .acquire_scoped(provider, 1, false, 1, None, None)
+                .acquire(provider, 1, false, 1, None, None)
                 .await
                 .is_ok()
         );
@@ -1204,24 +1231,24 @@ mod tests {
         let controller = ConcurrencyController::new(8, 1, 1, 8);
         let provider = Uuid::now_v7();
         let stream = controller
-            .acquire_scoped(provider, 3, true, 1, None, None)
+            .acquire(provider, 3, true, 1, None, None)
             .await
             .unwrap();
 
         let second_stream = controller
-            .acquire_scoped(provider, 3, true, 1, None, None)
+            .acquire(provider, 3, true, 1, None, None)
             .await
             .unwrap_err();
         assert_eq!(second_stream.scope(), CapacityScope::ProviderStream);
 
         let request = controller
-            .acquire_scoped(provider, 3, false, 1, None, None)
+            .acquire(provider, 3, false, 1, None, None)
             .await
             .unwrap();
         drop(stream);
         assert!(
             controller
-                .acquire_scoped(provider, 3, true, 1, None, None)
+                .acquire(provider, 3, true, 1, None, None)
                 .await
                 .is_ok()
         );
@@ -1235,12 +1262,12 @@ mod tests {
 
         let global_controller = ConcurrencyController::new(1, 2, 2, 8);
         let _global = global_controller
-            .acquire_scoped(provider, 2, false, 1, None, None)
+            .acquire(provider, 2, false, 1, None, None)
             .await
             .unwrap();
         assert_eq!(
             global_controller
-                .acquire_scoped(provider, 2, false, 1, None, None)
+                .acquire(provider, 2, false, 1, None, None)
                 .await
                 .unwrap_err()
                 .scope(),
@@ -1249,12 +1276,12 @@ mod tests {
 
         let provider_controller = ConcurrencyController::new(4, 2, 2, 8);
         let _provider = provider_controller
-            .acquire_scoped(provider, 1, false, 1, None, None)
+            .acquire(provider, 1, false, 1, None, None)
             .await
             .unwrap();
         assert_eq!(
             provider_controller
-                .acquire_scoped(provider, 1, false, 1, None, None)
+                .acquire(provider, 1, false, 1, None, None)
                 .await
                 .unwrap_err()
                 .scope(),
@@ -1263,12 +1290,12 @@ mod tests {
 
         let application_controller = ConcurrencyController::new(4, 1, 2, 8);
         let _application = application_controller
-            .acquire_scoped(provider, 4, false, 1, Some(application), None)
+            .acquire(provider, 4, false, 1, Some(application), None)
             .await
             .unwrap();
         assert_eq!(
             application_controller
-                .acquire_scoped(provider, 4, false, 1, Some(application), None)
+                .acquire(provider, 4, false, 1, Some(application), None)
                 .await
                 .unwrap_err()
                 .scope(),
@@ -1277,12 +1304,12 @@ mod tests {
 
         let user_controller = ConcurrencyController::new(4, 2, 1, 8);
         let _user = user_controller
-            .acquire_scoped(provider, 4, false, 1, None, Some("user-1"))
+            .acquire(provider, 4, false, 1, None, Some("user-1"))
             .await
             .unwrap();
         assert_eq!(
             user_controller
-                .acquire_scoped(provider, 4, false, 1, None, Some("user-1"))
+                .acquire(provider, 4, false, 1, None, Some("user-1"))
                 .await
                 .unwrap_err()
                 .scope(),
@@ -1297,18 +1324,18 @@ mod tests {
         let blocked_application = Uuid::now_v7();
         let available_application = Uuid::now_v7();
         let held = controller
-            .acquire_scoped(provider, 2, false, 1, Some(blocked_application), None)
+            .acquire(provider, 2, false, 1, Some(blocked_application), None)
             .await
             .unwrap();
 
         let failure = controller
-            .acquire_scoped(provider, 2, false, 1, Some(blocked_application), None)
+            .acquire(provider, 2, false, 1, Some(blocked_application), None)
             .await
             .unwrap_err();
         assert_eq!(failure.scope(), CapacityScope::Application);
 
         let recovered = controller
-            .acquire_scoped(provider, 2, false, 1, Some(available_application), None)
+            .acquire(provider, 2, false, 1, Some(available_application), None)
             .await
             .unwrap();
         drop(held);
@@ -1316,7 +1343,7 @@ mod tests {
 
         assert!(
             controller
-                .acquire_scoped(provider, 1, false, 1, Some(blocked_application), None)
+                .acquire(provider, 1, false, 1, Some(blocked_application), None)
                 .await
                 .is_ok()
         );
@@ -1696,17 +1723,23 @@ mod cluster_tests {
         assert!(!controller.is_cluster_wide());
         let provider = Uuid::now_v7();
 
-        let first = controller.acquire(provider, 2, None, None).await;
-        let second = controller.acquire(provider, 2, None, None).await;
+        let first = controller.acquire(provider, 2, false, 2, None, None).await;
+        let second = controller.acquire(provider, 2, false, 2, None, None).await;
         assert!(first.is_ok() && second.is_ok());
         assert!(
-            controller.acquire(provider, 2, None, None).await.is_err(),
+            controller
+                .acquire(provider, 2, false, 2, None, None)
+                .await
+                .is_err(),
             "the third acquire exceeds the global limit of 2"
         );
 
         drop(first);
         assert!(
-            controller.acquire(provider, 2, None, None).await.is_ok(),
+            controller
+                .acquire(provider, 2, false, 2, None, None)
+                .await
+                .is_ok(),
             "a released permit must be reusable"
         );
     }
@@ -1724,15 +1757,23 @@ mod cluster_tests {
         let replica_b = controller(2).with_cluster(coordinator.clone(), ttl);
         let provider = Uuid::now_v7();
 
-        let a1 = replica_a.acquire(provider, 2, None, None).await;
-        let b1 = replica_b.acquire(provider, 2, None, None).await;
+        let a1 = replica_a.acquire(provider, 2, false, 2, None, None).await;
+        let b1 = replica_b.acquire(provider, 2, false, 2, None, None).await;
         assert!(a1.is_ok() && b1.is_ok());
 
         assert!(
-            replica_a.acquire(provider, 2, None, None).await.is_err(),
+            replica_a
+                .acquire(provider, 2, false, 2, None, None)
+                .await
+                .is_err(),
             "without the cluster layer this replica would still have a local slot free"
         );
-        assert!(replica_b.acquire(provider, 2, None, None).await.is_err());
+        assert!(
+            replica_b
+                .acquire(provider, 2, false, 2, None, None)
+                .await
+                .is_err()
+        );
     }
 
     /// The same scenario with **no** coordinator is the documented cost of the
@@ -1744,8 +1785,8 @@ mod cluster_tests {
         let replica_b = controller(1);
         let provider = Uuid::now_v7();
 
-        let a = replica_a.acquire(provider, 1, None, None).await;
-        let b = replica_b.acquire(provider, 1, None, None).await;
+        let a = replica_a.acquire(provider, 1, false, 1, None, None).await;
+        let b = replica_b.acquire(provider, 1, false, 1, None, None).await;
         assert!(
             a.is_ok() && b.is_ok(),
             "this is the per-replica multiplier §0.4b accepts, bounded by the \
@@ -1762,7 +1803,10 @@ mod cluster_tests {
         let provider = Uuid::now_v7();
         let key = format!("moira:permit:provider:{provider}");
 
-        let permit = controller.acquire(provider, 1, None, None).await.unwrap();
+        let permit = controller
+            .acquire(provider, 1, false, 1, None, None)
+            .await
+            .unwrap();
         assert_eq!(coordinator.value(&key), 1);
         drop(permit);
 
@@ -1794,7 +1838,7 @@ mod cluster_tests {
         let provider = Uuid::now_v7();
 
         let held = controller
-            .acquire(provider, 8, None, Some("user-a"))
+            .acquire(provider, 8, false, 8, None, Some("user-a"))
             .await
             .expect("the first acquire fits");
 
@@ -1802,7 +1846,7 @@ mod cluster_tests {
         // global and provider slots have already been taken.
         assert!(
             controller
-                .acquire(provider, 8, None, Some("user-a"))
+                .acquire(provider, 8, false, 8, None, Some("user-a"))
                 .await
                 .is_err()
         );
@@ -1828,7 +1872,7 @@ mod cluster_tests {
             controller(64).with_cluster(FakeCoordinator::failing(), Duration::from_secs(60));
         assert!(
             controller
-                .acquire(Uuid::now_v7(), 64, None, None)
+                .acquire(Uuid::now_v7(), 64, false, 64, None, None)
                 .await
                 .is_err(),
             "an unreachable coordinator must not admit unbounded concurrency"
@@ -1845,7 +1889,7 @@ mod cluster_tests {
         let user = "person@example.com";
 
         let _permit = controller
-            .acquire(Uuid::now_v7(), 4, None, Some(user))
+            .acquire(Uuid::now_v7(), 4, false, 4, None, Some(user))
             .await
             .unwrap();
 

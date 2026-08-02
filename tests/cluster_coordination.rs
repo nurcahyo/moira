@@ -150,16 +150,19 @@ async fn concurrency_permits_are_enforced_across_two_replicas() {
     let provider = Uuid::now_v7();
 
     let _a = replica_a
-        .acquire(provider, 2, None, None)
+        .acquire(provider, 2, false, 2, None, None)
         .await
         .expect("replica A's first permit");
     let _b = replica_b
-        .acquire(provider, 2, None, None)
+        .acquire(provider, 2, false, 2, None, None)
         .await
         .expect("replica B's first permit");
 
     assert!(
-        replica_b.acquire(provider, 2, None, None).await.is_err(),
+        replica_b
+            .acquire(provider, 2, false, 2, None, None)
+            .await
+            .is_err(),
         "replica B admitted a third execution against a cluster ceiling of 2; without \
          the shared counter it would still have had a local slot free"
     );
@@ -178,10 +181,15 @@ async fn a_permit_released_on_one_replica_frees_the_slot_on_another() {
     let provider = Uuid::now_v7();
 
     let held = replica_a
-        .acquire(provider, 1, None, None)
+        .acquire(provider, 1, false, 1, None, None)
         .await
         .expect("replica A takes the only slot");
-    assert!(replica_b.acquire(provider, 1, None, None).await.is_err());
+    assert!(
+        replica_b
+            .acquire(provider, 1, false, 1, None, None)
+            .await
+            .is_err()
+    );
 
     drop(held);
 
@@ -190,7 +198,7 @@ async fn a_permit_released_on_one_replica_frees_the_slot_on_another() {
     // observation is of the resulting state rather than of elapsed time.
     let mut acquired = false;
     for _ in 0..200 {
-        if let Ok(permit) = replica_b.acquire(provider, 1, None, None).await {
+        if let Ok(permit) = replica_b.acquire(provider, 1, false, 1, None, None).await {
             drop(permit);
             acquired = true;
             break;
@@ -234,7 +242,7 @@ async fn an_unreachable_redis_refuses_rather_than_admitting_unlimited_traffic() 
     let controller = ConcurrencyController::new(64, 64, 64, 64).with_cluster(coordinator, TTL);
     assert!(
         controller
-            .acquire(Uuid::now_v7(), 64, None, None)
+            .acquire(Uuid::now_v7(), 64, false, 64, None, None)
             .await
             .is_err(),
         "an unreachable Redis admitted unbounded concurrency"
@@ -288,7 +296,7 @@ async fn no_redis_key_carries_a_raw_caller_identifier() {
     let user = "person@example.com";
 
     let _permit = controller
-        .acquire(Uuid::now_v7(), 4, None, Some(user))
+        .acquire(Uuid::now_v7(), 4, false, 4, None, Some(user))
         .await
         .expect("permit");
 
