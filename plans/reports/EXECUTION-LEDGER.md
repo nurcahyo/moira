@@ -2268,6 +2268,65 @@ dedupe the same way reads as consistent — and makes an `explicit_only` applica
 unconfirmed duplicate per turn**, because unconfirmed candidates are never `active` and therefore
 never match. Caught by implementing it, not by reading it.
 
+### F28/F29 RE-VERIFICATION — 2026-08-02, twelve agents, six claims, each conclusion challenged
+
+Run before writing any code, because this project's recurring failure is a **finding whose premise is
+wrong** (F32's was backwards; F15's recommended fix would have leaked; F2's mechanism was wrong
+twice). Six claims investigated independently, each verdict then handed to a skeptic told to break
+it. Read-only — no cargo, no gates — so it parallelised without touching the serialisation rule.
+
+**F28's permit half is FALSE.** Two agents, independently, returned REFUTED. `permits` is a local in
+the per-candidate retry loop in `MoiraExecutionService::execute_inner`, and `drop(permits)` runs on
+every exit — including the cancellation arm, checked specifically for a `?` that could escape with
+the permit alive. There is none. `extract_memories` runs after `execute_inner` has fully returned,
+so **no permit is held across the second model call**. There is exactly one non-test acquisition
+site in the tree.
+
+**F28's SSE half is TRUE**, confirmed twice, and the escape hatch I offered in the brief — "streaming
+may take a different route" — is false. Both SSE routes converge on `supervise_public_stream`, whose
+body ends with the terminal `send_public_event`; `record_conversation_assistant` is **awaited**
+between the last delta and that event, with no timeout wrapper. The `tokio::spawn` does not detach
+the latency: the client's stream is fed by `public_rx` and cannot end until `public_tx` drops.
+
+**And the real finding is bigger than F28** — see F34.
+
+**F29 is three-quarters right and wrong in the part that sets the fix's scope.** Genuine defect count
+is **2, not 3**: the third literal is in `failed_outcome`, which constructs `ExecutionOutcome` — a
+different type — alongside `output_text: None` and a default `UsageSummary`. A failed execution
+carries no committed output, so `None` there is correct. It has 13 call sites, all failure paths.
+
+**The value does not exist to forward.** `rig-core` 0.40's `CompletionResponse` is
+`{choice, usage, raw_response, message_id}` and `AssistantContent` is `Text | ToolCall | Reasoning |
+Image` — no structured variant. `git log -S structured_output -- src/orchestration/runtime_factory.rs`
+returns **zero commits over the whole history**. So F29 is not a plumbing gap; populating the field
+means *parsing text as JSON*, and the only question is where.
+
+**`StructuredOutputInvalid` is a JSON type-check wearing a validator's name.** Exactly one emitter,
+in `build_completion_request`. `schemars` accepts any `Value::Object` or `Value::Bool`, so
+`{"type":"banana"}`, `{"$ref":"http://x"}` and bare `true` all pass and go to the provider. Moira has
+**no JSON Schema validation crate in `Cargo.toml` at all**. The name promises validation the code
+never performs — the same shape as F32.
+
+### F34 — ESCALATED: summarization is inline too, ungated, and the docstring says otherwise
+
+Found by the F28 re-verification, and **worse than the finding that turned it up**.
+
+`record_assistant_response` awaits `extract_memories` and then, on the very next line,
+`maybe_summarize_after_turn` — which builds its own `ExecutionCommand` and makes a second
+non-streaming completion call. So the window between the last content delta and the terminal SSE
+event can hold **two serial provider round-trips, not one**.
+
+**The docstring above `extract_memories` states that summarization is "specified as *enqueued*".**
+It is not; it is inline, on the same path, in the same await chain. Any latency budget derived from
+that comment is understated by an entire model call. This is the F31 shape again: prose in the tree
+asserting a behaviour the code contradicts.
+
+**Extraction is gated by `automatic_extraction_enabled` (default false). Summarization has no
+equivalent gate.** So the half of this cost that nobody opted into is the half that runs by default.
+
+**Reversal condition:** none — this is a defect, not a decision. It closes when summarization is
+either gated to match extraction or moved off the response path.
+
 ### F33 — ESCALATED: five encryption-at-rest columns exist and nothing writes or reads any of them
 
 `migrations/0007` creates `conversation_messages.content_encrypted`,
