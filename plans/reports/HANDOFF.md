@@ -115,6 +115,13 @@ shared template locks for live fixtures blocks another's exclusive request, whil
 fixture queues behind that exclusive request. Clear it with `pg_terminate_backend` on the idle lock
 holders.
 
+**The memory signal to watch is SWAP, not `vm_stat` free.** Measured 2026-08-02 with three
+concurrent `cargo test --workspace` runs: `vm_stat` reported **13 MB free** while
+`memory_pressure` said **34% free** — the free page list is not the constraint on macOS. What was
+genuinely nearly exhausted was swap: **15.5 GB used of 16 GB, 903 MB left**. An earlier note here
+recorded "~56 MB free" as the OOM threshold; that used the misleading metric. Check
+`sysctl vm.swapusage` and `memory_pressure`, and treat swap above ~90% as the stop signal.
+
 **Consequence for the loop: serialise gate runs.** Parallel agents are fine while they are reading,
 designing, or editing — but only one may be in `scripts/gates.sh` at a time. Stagger them, or give an
 agent its own database.
