@@ -408,9 +408,41 @@ pub struct OpenAiResponseCompatRequest {
     pub temperature: Option<f64>,
     pub max_output_tokens: Option<u64>,
     #[serde(default)]
-    pub text: Option<Value>,
+    pub text: Option<OpenAiCompatTextOptions>,
     #[serde(default = "empty_object")]
     pub metadata: Value,
+}
+
+/// OpenAI's `text` object on the Responses API, narrowed to what Moira actually honours.
+///
+/// It is typed rather than `Value` on purpose. `OpenAiResponseCompatRequest` carries
+/// `deny_unknown_fields`, so an *undeclared* `text` would have been an honest 422; declaring
+/// it as a free-form `Value` and reading nothing turned that refusal into a silent no-op
+/// (F35), and published `"text": {}` in `docs/openapi.json` as if any shape were supported.
+/// Every key Moira cannot honour is therefore absent from this type, so serde refuses it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OpenAiCompatTextOptions {
+    #[serde(default)]
+    pub format: Option<OpenAiCompatTextFormat>,
+}
+
+/// The `text.format` discriminated union.
+///
+/// `json_object` is declared so it can be *named* in the refusal rather than rejected as an
+/// unknown variant; the translation itself refuses it. See
+/// `application::public::openai_compat_to_public_request`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OpenAiCompatTextFormat {
+    Text,
+    JsonObject,
+    JsonSchema {
+        name: String,
+        schema: Value,
+        #[serde(default)]
+        strict: Option<bool>,
+    },
 }
 
 fn empty_object() -> Value {

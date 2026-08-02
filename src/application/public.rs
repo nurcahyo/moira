@@ -18,12 +18,13 @@ use crate::{
         AuditResult, CallerRuntimeIdentity, DomainMessage, DomainMessageContent, DomainMessageRole,
         ExecutionCommand, ExecutionFailure, ExecutionFailureClass, ExecutionOptions,
         ExecutionOutcome, ExecutionQuery, ExecutionStatus, IdempotencyRecord, ListResponse,
-        OpenAiResponseCompatRequest, PublicCapabilities, PublicCitation, PublicContentPart,
-        PublicConversationRef, PublicExecutionSummary, PublicInputMessage, PublicMessageRole,
-        PublicModelRef, PublicModelResource, PublicOutputContentPart, PublicOutputItem,
-        PublicResponse, PublicResponseFormat, PublicResponseRecord, PublicResponseRequest,
-        PublicResponseStatus, PublicRouteRef, PublicRouteResource, PublicSseEnvelope,
-        PublicUsageRecord, PublicUsageSummary, RuntimeEventEnvelope, RuntimeEventType, UsageQuery,
+        OpenAiCompatTextFormat, OpenAiCompatTextOptions, OpenAiResponseCompatRequest,
+        PublicCapabilities, PublicCitation, PublicContentPart, PublicConversationRef,
+        PublicExecutionSummary, PublicInputMessage, PublicMessageRole, PublicModelRef,
+        PublicModelResource, PublicOutputContentPart, PublicOutputItem, PublicResponse,
+        PublicResponseFormat, PublicResponseRecord, PublicResponseRequest, PublicResponseStatus,
+        PublicRouteRef, PublicRouteResource, PublicSseEnvelope, PublicUsageRecord,
+        PublicUsageSummary, RuntimeEventEnvelope, RuntimeEventType, UsageQuery,
     },
     error::AppError,
     infra::repositories::{
@@ -890,38 +891,7 @@ impl PublicExecutionService {
         &self,
         request: OpenAiResponseCompatRequest,
     ) -> Result<PublicResponseRequest, AppError> {
-        let input = if let Some(text) = request.input.as_str() {
-            vec![PublicInputMessage {
-                role: PublicMessageRole::User,
-                content: vec![PublicContentPart::InputText {
-                    text: text.to_string(),
-                }],
-            }]
-        } else {
-            serde_json::from_value(request.input).map_err(|err| {
-                AppError::unprocessable(
-                    "unsupported_request_option",
-                    format!("unsupported compatibility input shape: {err}"),
-                )
-            })?
-        };
-        Ok(PublicResponseRequest {
-            input,
-            route: None,
-            model: request.model,
-            provider: None,
-            credential_id: None,
-            conversation: None,
-            temperature: request.temperature,
-            top_p: None,
-            max_output_tokens: request.max_output_tokens,
-            timeout_ms: None,
-            response_format: PublicResponseFormat::Text,
-            tools: Vec::new(),
-            tool_choice: None,
-            metadata: request.metadata,
-            seed: None,
-        })
+        openai_compat_to_public_request(request)
     }
 
     async fn prepare_execution(
@@ -1539,6 +1509,85 @@ fn validate_metadata_value(
     Ok(())
 }
 
+/// Translates an OpenAI Responses-shaped request into Moira's native
+/// [`PublicResponseRequest`].
+///
+/// A free function rather than a method because it reads nothing from the service: the
+/// method on [`PublicExecutionService`] delegates here so the translation can be asserted
+/// without an `AppState`, a database, or a provider.
+pub(crate) fn openai_compat_to_public_request(
+    request: OpenAiResponseCompatRequest,
+) -> Result<PublicResponseRequest, AppError> {
+    let response_format = compat_response_format(request.text)?;
+    let input = if let Some(text) = request.input.as_str() {
+        vec![PublicInputMessage {
+            role: PublicMessageRole::User,
+            content: vec![PublicContentPart::InputText {
+                text: text.to_string(),
+            }],
+        }]
+    } else {
+        serde_json::from_value(request.input).map_err(|err| {
+            AppError::unprocessable(
+                "unsupported_request_option",
+                format!("unsupported compatibility input shape: {err}"),
+            )
+        })?
+    };
+    Ok(PublicResponseRequest {
+        input,
+        route: None,
+        model: request.model,
+        provider: None,
+        credential_id: None,
+        conversation: None,
+        temperature: request.temperature,
+        top_p: None,
+        max_output_tokens: request.max_output_tokens,
+        timeout_ms: None,
+        response_format,
+        tools: Vec::new(),
+        tool_choice: None,
+        metadata: request.metadata,
+        seed: None,
+    })
+}
+
+/// Maps OpenAI's `text.format` onto Moira's native [`PublicResponseFormat`], refusing what
+/// Moira will not honour instead of accepting it and doing something else.
+///
+/// `json_object` is the one shape deliberately refused rather than translated.
+/// `PublicResponseFormat::JsonObject` becomes the output schema `{"type":"object"}`, which
+/// `rig-core`'s OpenAI encoder completes to
+/// `{"type":"object","properties":{},"additionalProperties":false,"required":[]}` and sends
+/// under `strict: true` — a schema satisfied only by `{}`. Translating `json_object` would
+/// therefore replace F35's silent wrong answer with a different one. That native-path
+/// behaviour is pinned on the wire by
+/// `tests/openai_compat_text_format.rs::documents_native_json_object_reaching_the_provider_as_an_empty_object_schema`
+/// so this refusal has a witness and cannot be quietly invalidated.
+fn compat_response_format(
+    text: Option<OpenAiCompatTextOptions>,
+) -> Result<PublicResponseFormat, AppError> {
+    match text.and_then(|options| options.format) {
+        None | Some(OpenAiCompatTextFormat::Text) => Ok(PublicResponseFormat::Text),
+        Some(OpenAiCompatTextFormat::JsonSchema {
+            name,
+            schema,
+            strict,
+        }) => Ok(PublicResponseFormat::JsonSchema {
+            name,
+            schema,
+            strict: strict.unwrap_or(false),
+        }),
+        Some(OpenAiCompatTextFormat::JsonObject) => Err(AppError::unprocessable(
+            "unsupported_request_option",
+            "text.format type json_object is not supported: Moira would constrain the output \
+             to the empty object rather than to free-form JSON. Send \
+             text.format.type = json_schema with an explicit schema instead.",
+        )),
+    }
+}
+
 fn validate_response_format(
     state: &AppState,
     format: &PublicResponseFormat,
@@ -2122,6 +2171,141 @@ fn failure_code(class: ExecutionFailureClass) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parses whatever a caller would actually put on the wire, so the assertion covers the
+    /// DTO's own shape rather than a hand-built struct that cannot go wrong.
+    fn compat_request(body: Value) -> Result<OpenAiResponseCompatRequest, serde_json::Error> {
+        serde_json::from_value(body)
+    }
+
+    use axum::http::StatusCode;
+
+    fn compat_error(err: &AppError) -> Option<(StatusCode, &'static str)> {
+        match err {
+            AppError::Api { status, code, .. } => Some((*status, code)),
+            _ => None,
+        }
+    }
+
+    /// F35. `text.format` was declared on a `deny_unknown_fields` struct and read by nothing,
+    /// so a schema request was accepted, dropped, and answered 200 with prose.
+    #[test]
+    fn compat_text_format_json_schema_becomes_a_structured_response_format() {
+        let request = compat_request(json!({
+            "input": "hello",
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "answer",
+                    "schema": { "type": "object", "properties": { "answer": { "type": "string" } } }
+                }
+            }
+        }))
+        .expect("json_schema text.format should deserialize");
+
+        let public = openai_compat_to_public_request(request)
+            .expect("json_schema text.format should map to a public request");
+
+        let PublicResponseFormat::JsonSchema {
+            name,
+            schema,
+            strict,
+        } = public.response_format
+        else {
+            panic!(
+                "text.format.json_schema must not be discarded, got {:?}",
+                public.response_format
+            );
+        };
+        assert_eq!(name, "answer");
+        assert!(!strict, "strict defaults to false when the caller omits it");
+        assert_eq!(schema["properties"]["answer"]["type"], "string");
+    }
+
+    /// The caller's `strict` reaches the native request rather than being replaced by a default.
+    #[test]
+    fn compat_text_format_json_schema_carries_the_callers_strict_flag() {
+        let request = compat_request(json!({
+            "input": "hello",
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "answer",
+                    "schema": { "type": "object" },
+                    "strict": true
+                }
+            }
+        }))
+        .expect("strict json_schema text.format should deserialize");
+
+        let public = openai_compat_to_public_request(request).expect("strict schema should map");
+        assert!(matches!(
+            public.response_format,
+            PublicResponseFormat::JsonSchema { strict: true, .. }
+        ));
+    }
+
+    /// `json_object` is refused rather than translated. Translating it would reach the provider
+    /// as `{"type":"object","properties":{},"additionalProperties":false,"required":[]}` under
+    /// `strict: true` — a schema satisfied only by `{}`. See
+    /// `tests/openai_compat_text_format.rs::documents_native_json_object_reaching_the_provider_as_an_empty_object_schema`,
+    /// which pins that behaviour on the wire.
+    #[test]
+    fn compat_text_format_json_object_is_refused_rather_than_silently_dropped() {
+        let request = compat_request(json!({
+            "input": "hello",
+            "text": { "format": { "type": "json_object" } }
+        }))
+        .expect("json_object text.format should deserialize");
+
+        let err = openai_compat_to_public_request(request)
+            .expect_err("json_object must not be accepted and ignored");
+        assert_eq!(
+            compat_error(&err),
+            Some((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported_request_option"
+            )),
+            "got {err:?}"
+        );
+    }
+
+    /// The two shapes that mean "prose", which is what Moira already does. Neither may start
+    /// failing: rejecting a request whose semantics are already satisfied buys nothing.
+    #[test]
+    fn compat_text_format_text_and_absent_text_both_stay_prose() {
+        for body in [
+            json!({ "input": "hello" }),
+            json!({ "input": "hello", "text": {} }),
+            json!({ "input": "hello", "text": { "format": { "type": "text" } } }),
+        ] {
+            let request =
+                compat_request(body.clone()).unwrap_or_else(|err| panic!("{body} -> {err}"));
+            let public = openai_compat_to_public_request(request)
+                .unwrap_or_else(|err| panic!("{body} -> {err:?}"));
+            assert!(
+                matches!(public.response_format, PublicResponseFormat::Text),
+                "{body} must stay Text"
+            );
+        }
+    }
+
+    /// Every `text` key Moira does not honour is refused by `deny_unknown_fields` rather than
+    /// accepted and ignored — the defect F35 named, generalised past `format`.
+    #[test]
+    fn compat_text_rejects_options_moira_does_not_honour() {
+        for body in [
+            json!({ "input": "hello", "text": { "verbosity": "low" } }),
+            json!({ "input": "hello", "text": { "format": { "type": "yaml" } } }),
+            json!({ "input": "hello", "text": { "format": { "type": "json_schema", "name": "a", "schema": {}, "description": "d" } } }),
+            json!({ "input": "hello", "text": "json" }),
+        ] {
+            assert!(
+                compat_request(body.clone()).is_err(),
+                "{body} must not deserialize into a request Moira silently ignores"
+            );
+        }
+    }
 
     #[test]
     fn pipeline_names_match_phase_four_order() {

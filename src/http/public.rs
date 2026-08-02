@@ -358,6 +358,7 @@ pub async fn capabilities(
     post,
     path = "/v1/responses",
     tag = "compatibility",
+    description = "OpenAI Responses compatibility adapter. `text.format` is honoured: `text` maps to the native `response_format`, `json_schema` carries the caller's schema through, and `json_object` is refused with 422 `unsupported_request_option` because Moira would constrain the output to the empty object rather than to free-form JSON. Any `text` key Moira does not honour — including `verbosity` — is refused rather than ignored. Honouring a schema makes the request a structured-output request, so it becomes subject to the application's `structured_output_enabled` policy and the model's `structured_output` capability. This endpoint carries no route field and always resolves through the default route. See docs/openai-compatibility.md.",
     request_body = OpenAiResponseCompatRequest,
     responses(
         (
@@ -372,7 +373,7 @@ pub async fn capabilities(
         (status = 401, description = "Authentication failed", body = ErrorResponse),
         (status = 403, description = "Operation is not permitted", body = ErrorResponse),
         (status = 404, description = "Compatibility endpoint is disabled", body = ErrorResponse),
-        (status = 422, description = "Request violates execution policy", body = ErrorResponse),
+        (status = 422, description = "Request violates execution policy, or carries a `text.format` Moira will not honour", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
         (status = 502, description = "Upstream provider failed", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
