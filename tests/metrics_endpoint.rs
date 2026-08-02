@@ -774,11 +774,17 @@ async fn metrics_endpoint_exposes_provider_outcome_counters_with_bounded_labels(
 /// has completed. And [`PoolConnection::return_to_pool`] runs that same return eagerly and
 /// awaits it, instead of spawning it. Between them the pool reaches a state with no
 /// in-flight work at all, and its numbers are then exactly known — no sleep, no retry, no
-/// tolerance. The three observations below held 15/15 and 20/20 in direct measurement.
+/// tolerance. The three exact idle observations below — `capacity`, `capacity - 1`, `0` —
+/// held 15/15 and 20/20 in direct measurement.
 ///
 /// The scrape at full saturation is not just bookkeeping: it is the incident this gauge
 /// exists for, and it also proves `/metrics` answers without a pooled connection — which is
 /// what lets this test hold every permit in the first place.
+///
+/// A fourth scrape, taken *before* any of that, carries the one thing saturation destroys:
+/// while the pool is saturated `pool.size()` and `max_connections` are the same number, so
+/// nothing after the barrier can tell a live `total` gauge from one hard-wired to the
+/// configured ceiling. That mutation left this test green until the early scrape was added.
 #[tokio::test]
 async fn metrics_endpoint_exposes_db_pool_gauges_reflecting_the_live_pool() {
     let Some(fixture) = LifecycleFixture::new().await else {
