@@ -51,21 +51,44 @@ Extraction takes the **more restrictive** of the two:
 ## Cost
 
 Extraction issues a **second completion call per assistant turn**, through the same route the
-caller's own turn used — same provider, same credential, same model policy. An application that
-enables extraction should expect roughly double the per-turn model cost and latency. There is no
-separate extraction route today; see the reversal condition on
-`ConversationExecutionLink::route_hint`.
+caller's own turn used — same provider, same credential, same model policy. There is no separate
+extraction route today; see the reversal condition on `ConversationExecutionLink::route_hint`.
 
-Two consequences worth planning for (finding F28):
+**Extraction is not the only inline call on that path.** `record_assistant_response` awaits
+extraction and then, on the next line, `maybe_summarize_after_turn` — which is *also* inline
+(`docs/conversation-summarization.md`, "Known limits") and makes its own completion call. So the
+per-turn model cost is:
 
-- **Concurrency headroom halves.** The extraction call takes a permit from the same
-  per-provider / per-application / per-user pool the caller's own request used — two permits per
-  turn instead of one. There is no deadlock, because the caller's permit is released before
-  extraction starts; under saturation the extraction call is simply refused and recorded as
-  `extraction_call_failed`, leaving the response untouched.
+| Turn | Provider calls |
+|---|---|
+| both features off — the defaults | 1 |
+| extraction on | 2 |
+| summarization on, and the backlog past **both** its thresholds | 2 |
+| both on, backlog past both thresholds | **3** |
+
+Extraction's cost is per turn. Summarization's is amortised — a run happens only once
+`minimum_messages_since_summary` and `summary_trigger_tokens` are both crossed, so it is roughly
+one extra call per `summary_trigger_tokens` of conversation, not one per turn. An application
+with both switched on should budget for *at least* double the per-turn model cost and latency,
+with a third call on the turns that trigger a summary.
+
+Three consequences worth planning for (findings F28 and F34):
+
+- **Permit demand doubles per turn, and triples on a turn that also summarises.** Each extra call
+  takes a permit from the same per-provider / per-application / per-user pool the caller's own
+  request used. The permits are taken **one after another and never held together**: the caller's
+  is released before extraction starts, and extraction's before summarization starts, so there is
+  no deadlock. Under saturation the extra call is simply refused — recorded as
+  `extraction_call_failed`, or for summarization as a
+  `moira_summarization_runs_total{outcome="failed"}` increment — leaving the response untouched.
 - **On the streaming path, the terminal event is delayed.** Tokens stream live and are unaffected,
-  but `response.completed` is emitted *after* extraction finishes, so a client that waits for it
-  sees the last token, then a pause of roughly one extraction round-trip, then completion.
+  but `response.completed` is emitted *after* both extraction and summarization finish, so a
+  client that waits for it sees the last token, then a pause of one extraction round-trip — two
+  round-trips on a turn that also summarises — then completion.
+- **A conversation-linked turn also pays database round-trips.** Summarization's read path runs on
+  every such turn even when the feature is off. Finding F37 cut that from six round-trips to three
+  by hoisting the `summarization_enabled` gate above the backlog reads; the remaining three are
+  the authorization predicate, the policy upsert and the conversation anchor.
 
 ## What it will not write
 

@@ -817,6 +817,78 @@ async fn an_archived_conversation_is_refused_with_conversation_archived() {
     case.shutdown().await;
 }
 
+/// A disabled policy does not overtake the access predicate or the archived check.
+///
+/// **The ordering guard for finding F37's hoisted gate.** `summarization_enabled` is now tested in
+/// `summarize_conversation_unscoped` itself rather than only inside `decide_summarization`, which
+/// puts a *policy* verdict into a function that also produces two *resource* verdicts. The
+/// cheapest edit that breaks the property while leaving every other case in this file green is
+/// moving that guard — with the policy read it depends on — a few lines further up. Two placements
+/// are plausible and both are wrong:
+///
+/// * **above `find_conversation_authorized`**, and a caller that cannot see a conversation stops
+///   getting the `conversation_not_found` every other cross-user request gets. It is not an
+///   existence oracle — the answer no longer depends on the conversation at all — but it does make
+///   one endpoint answer a question about a resource before establishing the caller may ask;
+/// * **above the archived check**, and `conversation_archived` becomes unreachable on an
+///   application with summarization off, so that contract would hold only while the feature is on.
+///
+/// Both assertions run under `summarization_enabled: false`, which is the only configuration in
+/// which the guard fires at all.
+/// `an_archived_conversation_is_refused_with_conversation_archived` re-enables the policy before
+/// archiving, so it stays green through both mutations and cannot stand in for this.
+#[tokio::test]
+async fn a_disabled_policy_does_not_pre_empt_the_access_and_archived_checks() {
+    let Some(case) = Case::new(
+        ConversationPolicyPutRequest {
+            summarization_enabled: Some(false),
+            ..ConversationPolicyPutRequest::default()
+        },
+        vec![completion(ASSISTANT_REPLY), completion(ASSISTANT_REPLY)],
+    )
+    .await
+    else {
+        return;
+    };
+    let key = case.summarize_key.clone();
+
+    // `conversation_access` derives `external_user_id` from the actor, so a conversation created
+    // by a different consumer key belongs to a different *user* and is invisible rather than
+    // forbidden — the trap documented on `Case::summarize_key`, used here on purpose.
+    let (_, body) = case.respond_as(&case.response_key, USER_TURN, None).await;
+    let other_conversation = body["conversation"]["id"]
+        .as_str()
+        .expect("a conversation id")
+        .to_string();
+    let (status, _, body) = case.summarize(&key, &other_conversation, true).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "conversation_not_found");
+
+    // The archived check, on a conversation this key does own, with the policy still off.
+    let (_, body) = case.respond(USER_TURN).await;
+    let own_conversation = body["conversation"]["id"]
+        .as_str()
+        .expect("a conversation id")
+        .to_string();
+    sqlx::query("update conversations set status = 'archived' where public_id = $1")
+        .bind(&own_conversation)
+        .execute(&case.fixture.pool)
+        .await
+        .expect("archive the conversation");
+    let (status, _, body) = case.summarize(&key, &own_conversation, true).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "conversation_archived");
+
+    assert!(case.summaries().await.is_empty());
+    assert_eq!(
+        case.completion.call_count().await,
+        2,
+        "neither refusal may reach the model"
+    );
+
+    case.shutdown().await;
+}
+
 /// A conversation with nothing new since its summary is refused even when forced.
 ///
 /// `conversation_summary_boundary_unique` makes a second summary at the same coverage boundary

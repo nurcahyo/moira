@@ -2611,6 +2611,139 @@ Having to remember it is what F32 was.
 **Not auto-merged.** A 422 on a previously-accepted value will break any deployment setting
 `encrypted_content` in IaC — loudly, which is the point, but that deserves human sight.
 
+### F37 CLOSED · F34 CLOSED · F36 REFUTED — `fix/f36-summarization-path`, 2026-08-02
+
+Three items on one path — the tail of `record_assistant_response`. Two needed code. The third's
+premise did not survive being checked, so it is documented and left open with a condition that can
+be measured instead of argued.
+
+**F37 — CLOSED, but three dead reads removed, not four.** Both load-bearing claims hold.
+`decide_summarization`'s first line is `if !policy.enabled`, tested **before** the `force`
+short-circuit, so `force: true` never bypassed it and still does not; the hoisted guard calls
+`summarization_skip_error(SummarizationSkip::Disabled)`, the same constructor `plan_summarization`
+reaches through `map_err`, so the 403 / `summarization_disabled` /
+`moira.error.summarization_disabled` envelope is byte-identical; and authorization and the archived
+check are above the policy read and are untouched.
+
+**The proposed placement was not semantics-preserving, and that is the correction.** Immediately
+after the policy read puts the guard *above* `find_conversation_context_anchor`, whose `None` is
+this function's `conversation_not_found` 404. `find_conversation_authorized` filters
+`public_id = $1 and deleted_at is null and <access>`; the anchor filters
+`public_id = $1 and deleted_at is null` — a strict superset — so the two disagree only when a soft
+delete lands **between the two statements**. Narrow, but it turns a resource verdict into a policy
+one, and no test can pin the difference precisely because no reachable state produces it. The guard
+sits one statement lower.
+
+`summarize_conversation_unscoped` goes from **6 database round-trips to 3** on the default
+configuration. Counting the whole tail — `extract_memories` pays two policy upserts before its own
+flags are read — a conversation-linked turn goes from **8 to 5**.
+
+**The test story, stated rather than dressed up.** There is no watched-failing test for a refactor
+that preserves semantics and none is claimed.
+`force_does_not_bypass_a_disabled_summarization_policy` passes identically either side and is what
+pins the envelope. **No query-count test was added**, deliberately: the two available instruments
+are `pg_stat_database`, whose asynchronous flush is exactly F28's flake shape, and an in-process
+`tracing` counter, which cannot see these queries at all because the HTTP server and the response
+path run on spawned tasks that do not inherit a scoped subscriber and the process holds one global
+default. Both would trade a real flake for a signal the existing suite already constrains.
+
+**What was added guards the mutation that actually threatens the change.**
+`a_disabled_policy_does_not_pre_empt_the_access_and_archived_checks` asserts both refusals under
+`summarization_enabled: false`, the only configuration in which the new guard fires. **Both
+mutations were run and watched**: hoisting the guard and its policy read above
+`find_conversation_authorized` reds the first assertion (403 where 404 is expected); above the
+archived check reds the second (403 where 409 is expected).
+`an_archived_conversation_is_refused_with_conversation_archived` re-enables the policy before
+archiving, so it stays green through both and could not stand in.
+
+*Reversal condition:* if the anchor's lateral join ever measures as material on the disabled path,
+move the guard above it and accept 404 → 403 inside the delete window.
+
+**F34 — CLOSED, with one qualification to the finding's arithmetic.** The docstring above
+`extract_memories` said Sub-Phase E's summarization "is specified as *enqueued*" and offered that
+as the reason extraction alone doubles a turn. E did not ship enqueued either:
+`maybe_summarize_after_turn` is awaited on the next line of `record_assistant_response` and makes
+its own completion call. Corrected in the docstring and in `docs/memory-extraction.md`, which now
+carry the same table. (`docs/conversation-summarization.md` was already correct — it says inline
+under "Known limits" — so the drift was in two places, not three.)
+
+**"A fully-enabled turn issues three provider calls" is true only on the turns that trigger.**
+Extraction is per turn; summarization runs only once `minimum_messages_since_summary` **and**
+`summary_trigger_tokens` are both crossed, so its amortised cost is one call per
+`summary_trigger_tokens` of conversation. What ran every turn regardless was summarization's *read*
+path — which is F37. *Reversal condition:* the tables stop being true the moment either feature
+moves off the response path; whoever moves one corrects both.
+
+**F36 — REFUTED as stated. Documented, not fixed, and left open with a sharper condition.** The
+finding says the lock is held "on a path now reached every turn". The *enclosing function* is
+per-turn; `SummarizationLock::try_acquire` is not — it sits below `plan_summarization`'s `?`, so it
+is reached only once `decide_summarization` has said yes. That is exactly the rate the lock's own
+doc comment argues about, so **its reversal condition has not been met** and nothing about the lock
+was changed. Two things are real and are now written down in numbers:
+
+- **Duration is bounded.** `run_summarization` uses `ExecutionOptions::default()`, so `timeout_ms`
+  is `None` and `execute` falls back to `runtime.default_execution_timeout_seconds` — 120 s in
+  `config/default.toml`, clamped by `maximum_execution_timeout_seconds`. No caller can extend it.
+  The finding's "for the entire attempt timeout" reads as unbounded; it is not.
+- **Count is bounded by nothing in the tree.** `detach` removes the connection permanently and the
+  pool opens a replacement, so a run costs one backend *beyond* `database.max_connections` (10).
+  The caller's execution permit is released before `record_assistant_response` runs, so
+  `runtime.global_execution_concurrency` does not bound how many turns are inside a run at once —
+  only the in-flight request count does.
+
+Three cheaper-looking fixes were considered and each is worse; all three are recorded on the type
+so the next reader does not re-derive them. A **pooled** session lock is re-entrant, so the next
+checkout would believe it holds someone else's lock. **Dropping the lock** and letting
+`conversation_summary_boundary_unique` arbitrate makes the loser pay for a completion and then
+receive a unique violation as a 500. A **second, tighter timeout** shortens a duration that is
+already bounded and does nothing to the count.
+
+*Reversal condition, sharpened:* replace the advisory lock with a lock-table row and a bounded
+lease when concurrent summarization **runs** — not turns — can approach the server's spare backend
+headroom, measurable from `moira_summarization_runs_total` against the deployment's
+`max_connections`.
+
+**The briefed baseline was wrong.** It stated `main` at **1021** tests as of `7bb5f15`. Measured
+directly in this worktree — the four touched files replaced with `git show origin/main:` content,
+then `cargo test --workspace --all-features`, 41/41 targets logged and zero skip lines — `main` is
+**1027**. This branch is **1028**, exactly one more: the diff adds one `#[tokio::test]` and removes
+none. Anyone reconciling a count against 1021 will chase a phantom of six.
+
+**And a gate-log hazard worth adding to HANDOFF §2.2.** The first run here was started before the
+edits landed and reported a *plausible* 1027 for this branch. It was wrong: `scripts/gates.sh`
+redirects `cargo test` to a `mktemp` file and only the summary line reaches the outer log, so the
+outer log's tail sits on `── test` for the whole phase and then shows release-build output — which
+reads exactly like the test phase still compiling. Editing sources during that window silently
+splits the run: `fmt` and `clippy` had already passed against the *old* tree while `release` built
+the new one. **Do not edit sources while `scripts/gates.sh` is running**, and if you did, the run
+proves nothing about what you edited.
+
+### F47 — the `get_or_create_*_policy` readers are UPDATEs, and one turn issues three of them
+
+Found while counting F37's round-trips; nobody asked for it. Both
+`get_or_create_conversation_policy` and `get_or_create_memory_policy` are
+
+```sql
+insert into … (application_id) values ($1)
+on conflict (application_id) do update set application_id = excluded.application_id
+returning *
+```
+
+The `do update` is the usual trick for getting `returning` on the conflict path, and it is a real
+heap write: a new row version and a WAL record on **one row per application**, every call.
+
+A conversation-linked turn calls `get_or_create_conversation_policy` **twice** — once in
+`extract_memories`, once in `summarize_conversation_unscoped` — and `get_or_create_memory_policy`
+once. So an application's two policy rows are rewritten three times per turn on the default
+configuration, where every one of those reads ends in an early return. Two consequences:
+dead-tuple churn concentrated on two rows, and a row-level lock that briefly serialises concurrent
+turns of the *same* application against each other.
+
+Not fixed here. The honest fix is `on conflict do nothing` plus a `select`, or read-then-insert,
+and it touches every `get_or_create_*_policy` family rather than the two on this path — a change
+about policy reads, not about summarization. *Reversal condition:* it closes when the read path
+stops writing.
+
 ## USER DECISIONS — 2026-07-31, taken interactively
 
 1. **Findings before waves 4–5.** F20, F13, F17 and the Wave 2 leftovers first. F20 is the reason:
