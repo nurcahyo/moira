@@ -2292,8 +2292,22 @@ the latency: the client's stream is fed by `public_rx` and cannot end until `pub
 
 **F29 is three-quarters right and wrong in the part that sets the fix's scope.** Genuine defect count
 is **2, not 3**: the third literal is in `failed_outcome`, which constructs `ExecutionOutcome` — a
-different type — alongside `output_text: None` and a default `UsageSummary`. A failed execution
-carries no committed output, so `None` there is correct. It has 13 call sites, all failure paths.
+different type — alongside `output_text: None` and a default `UsageSummary`.
+
+> **CORRECTION, same day, by the synthesis pass.** The sentence that stood here — *"a failed
+> execution carries no committed output, so `None` there is correct; it has 13 call sites, all
+> failure paths"* — **was wrong**, and it was wrong in this ledger for about half an hour before
+> anyone caught it. `failed_outcome` is called at `execution.rs:658` from inside
+> `match result { Ok(Ok(output)) => … }` — the terminal-persistence-deadline arm — where `output` is
+> **live**, and `output.usage.clone()` is read on the surrounding lines to feed `update_attempt` and
+> `attempt_summary`. So one of the 13 is not a failure path, and its `None` is inert *only because
+> the field is universally `None` today*. **The moment F29 lands it becomes a silent drop site.**
+> Recorded as F38.
+>
+> This is the second time in one day that a *summary* of a finding was worse than the finding — see
+> F32. Both times the error entered when a verified detail was compressed into a confident
+> generalisation ("all failure paths", "emergent protection"). The tell in both cases was a
+> universal quantifier that nobody had actually enumerated.
 
 **The value does not exist to forward.** `rig-core` 0.40's `CompletionResponse` is
 `{choice, usage, raw_response, message_id}` and `AssistantContent` is `Text | ToolCall | Reasoning |
@@ -2306,6 +2320,25 @@ in `build_completion_request`. `schemars` accepts any `Value::Object` or `Value:
 `{"type":"banana"}`, `{"$ref":"http://x"}` and bare `true` all pass and go to the provider. Moira has
 **no JSON Schema validation crate in `Cargo.toml` at all**. The name promises validation the code
 never performs — the same shape as F32.
+
+### F35–F45 — eleven findings nobody asked for, surfaced by the same twelve agents
+
+Every one came from the "report anything you found that nobody asked about" clause. None was the
+question being investigated. That clause has now out-produced the questions themselves twice.
+
+| # | Finding | Severity |
+|---|---|---|
+| **F35** | **The OpenAI-compat endpoint silently discards `text.format`.** `OpenAiResponseCompatRequest.text` is declared under `#[serde(deny_unknown_fields)]` — so the request is *accepted* — and is read by **nothing**. `openai_compat_to_public` hardcodes `response_format: Text`. A caller sending standard OpenAI `text.format = {"type":"json_schema", …}` gets a 200, no schema on the wire, and no warning. `deny_unknown_fields` converts what would have been an honest 422 into a silent no-op. **Strictly worse than F29**, which is at least uniformly broken. | **HIGH** |
+| **F36** | **`SummarizationLock` pins a Postgres session advisory lock across a full provider round-trip**, on a per-turn path, over a `pool.acquire().await?.detach()`ed backend. A hung provider holds one backend and one conversation lock for the whole attempt timeout. The lock's own doc comment names this reversal condition — and it has already been met. | **MED-HIGH** |
+| **F37** | **Four wasted DB reads per conversation-linked turn when summarization is disabled**, inside the caller's request, between the last SSE delta and the terminal event. Six round-trips, four of them dead, on the default configuration. | **MEDIUM** |
+| **F38** | **The terminal-persistence-deadline arm throws away a successful provider result.** `execution.rs:658` returns `failed_outcome` with `output_text: None` and a default `UsageSummary` while `output.text` and `output.usage` are in hand and `"output_committed": true` is written into both the audit entry and the `ExecutionFailed` event. On streaming the client has already received every delta. Usage is preserved at attempt level and zeroed at outcome level — **the asymmetry is the tell**. Billing and reporting divergence. Found independently by both skeptics. | **MEDIUM** |
+| **F39** | **The structured-output capability gate cannot see Rig's per-provider reality.** The gate checks a config JSON bool; DeepSeek sets `SUPPORTS_RESPONSE_FORMAT = false` and drops the schema with a `warn!`, and `OpenAiCompatible`/`Local` ship `response_format.json_schema` to arbitrary self-hosted backends with no warning at all. Config says supported, wire says otherwise, caller gets prose and a `succeeded`. **Blocks the fail-hard variant of F29.** | **MEDIUM** |
+| **F40** | **`GET /v1/responses/{id}` returns an empty `output` array for a completed, persisted response.** Falls through both branches to `Vec::new()`. The `OutputUnavailable { reason: "metadata_only_persistence" }` variant exists to explain the *other* case, which makes the silent empty array read as an oversight rather than a decision. Needs a product call. | **LOW-MED** |
+| **F41** | **Skill-tree drift on exactly the guidance F29's implementer needs.** `.agents/skills/moira-rig-completions/SKILL.md` carries the "Known gap" paragraph; the `.claude/` copy contains **zero** occurrences of "structured". CLAUDE.md points at `.claude/`. The authoritative instruction lives only in the tree nobody is told to read. | **LOW-MED** |
+| **F42** | **i18n overclaim.** `moira.error.structured_output_invalid` asserts "or the model's output does not conform to it". No such path exists. Its description even narrates a prior widening. Becomes true only if the fail-hard variant ships. | **LOW** |
+| **F43** | **`ConcurrencyController::acquire` is dead `pub` API on the concurrency-safety path** — every caller is inside `#[cfg(test)]`. It hardcodes `is_stream: false`, so a future caller reaching for the obvious-looking name on a streaming path silently takes a *request* permit. | **LOW** |
+| **F44** | **`RuntimeModelHandle::stream` / `RuntimeStreamOutput` are dead `pub` API** — ~65 lines duplicating `execute_rig_stream`, kept alive only by a re-export. Divergence hazard: someone fixing streaming will fix one of the two. | **LOW** |
+| **F45** | **`PublicResponseFormat::JsonSchema { name, strict }` — both accepted, both dropped.** Public in `docs/openapi.json`; every destructure site uses `{ schema, .. }`. Rig hardcodes `strict: true` and renames from the schema's `title`. A caller sending `strict: false` gets strict mode, unreported. | **LOW** |
 
 ### F34 — ESCALATED: summarization is inline too, ungated, and the docstring says otherwise
 
