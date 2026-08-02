@@ -41,7 +41,7 @@ landing an agent's commit on the wrong branch — that happened twice.
 **Any agent that will commit gets its own `git worktree`.** The coordinator must never run
 `git checkout` in a tree an agent is using.
 
-### 2.2 Exit codes lie here, in TWELVE observed forms — and form 4's cause is now known
+### 2.2 Exit codes lie here, in THIRTEEN observed forms — and form 4's cause is now known
 
 1. `cmd | tail` reports `tail`'s status — hid a genuinely failed `docker build`
 2. `grep -c` returns 1 on **zero** matches — made a fully green gate run look failed
@@ -94,6 +94,16 @@ landing an agent's commit on the wrong branch — that happened twice.
     `gh api repos/{owner}/{repo}/commits/$SHA/check-runs`. Also note `.conclusion//"pending"` does
     **not** substitute for an empty string — queued checks carry `""`, not `null`, so a
     `grep -q pending` loop exits immediately on the first poll.
+
+13. **A conflict-resolution script that fails, followed by `git add; git commit`, commits the
+    markers.** Done 2026-08-03: a resolve script hit an assertion, and because the next commands were
+    chained with `;` rather than `&&`, the unresolved file was staged, committed and **pushed** with
+    `<<<<<<<` still in it. The commit output looked entirely normal. This is form 3's shape applied to
+    a merge: *a failed step followed by a succeeding one reads as success.*
+    **Two habits close it:** chain with `&&`, and make the resolver itself assert
+    `zero markers remain` **before it writes**, so a wrong line number cannot silently produce a
+    half-resolved file. Verifying afterwards with `grep -c '^<<<<<<<'` costs one command — and note
+    it exits **1** on zero matches (form 2), so read the printed count, not `$?`.
 
 **Redirect to a file, capture `$?` immediately, then read the file — and run cargo from inside a
 script.** Use `scripts/gates.sh`, which handles all of this and asserts log completeness against
