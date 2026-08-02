@@ -80,7 +80,9 @@ const READS: usize = 3;
 
 /// Every table in the `get_or_create_*_policy` family, paired with a call that reads it.
 ///
-/// Kept as data so no member can be covered by one test and missed by another.
+/// Kept as data so no member can be covered by one test and missed by another, and pinned
+/// against the schema by [`the_family_is_these_five_and_no_others`] so a sixth policy table
+/// cannot be added with the old spelling and simply go unwatched.
 const POLICY_TABLES: [&str; 5] = [
     "application_conversation_policies",
     "application_memory_policies",
@@ -318,6 +320,88 @@ async fn a_first_touch_creates_the_row_and_says_so() {
             "expected exactly one creation notification for {table}, saw {announced:?}"
         );
     }
+}
+
+/// The other half of F47, and the one the write assertions cannot see.
+///
+/// Removing `do update` removed a row-level lock as well as a heap write, and the two are
+/// separable: `select … for update` would restore the serialisation with **no** new tuple
+/// version, no `version` bump and no notification, leaving every assertion in
+/// [`a_policy_read_is_not_a_write`] green. That is the cheapest edit that breaks this
+/// finding's property while satisfying the rest of this file, so it gets its own test.
+///
+/// A conflicting exclusive lock is held on the row by an uncommitted transaction on another
+/// connection. A read that takes no lock finishes immediately; one that takes any lock blocks
+/// until the holder resolves, and the bound below turns that into a failure instead of a hang.
+/// The bound is not an interleaving delay — the correct implementation never waits at all.
+#[tokio::test]
+async fn a_policy_read_does_not_wait_for_a_row_lock() {
+    let Some(db) = database(8).await else {
+        return;
+    };
+    let pool = db.pool.clone();
+    let application_id = seed_application(&pool).await;
+    read_every_policy(&pool, application_id).await;
+
+    for table in POLICY_TABLES {
+        let mut holder = pool.begin().await.expect("open the lock holder");
+        sqlx::query(&format!(
+            "select 1 from {table} where application_id = $1 for update"
+        ))
+        .bind(application_id)
+        .fetch_one(&mut *holder)
+        .await
+        .unwrap_or_else(|error| panic!("hold an exclusive lock on {table}: {error}"));
+
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_every_policy(&pool, application_id),
+        )
+        .await;
+
+        // Released before the assertion so a failure does not leave the fixture wedged.
+        holder.rollback().await.expect("release the lock holder");
+        assert!(
+            read.is_ok(),
+            "reading policies blocked on an exclusive row lock held on {table}, so these \
+             reads still serialise concurrent turns of the same application"
+        );
+    }
+}
+
+/// The family is defined by the schema, not by the list at the top of this file.
+///
+/// Every assertion here iterates [`POLICY_TABLES`]. A sixth `application_*_policies` table
+/// with a `get_or_create_*_policy` of its own would be covered by nothing and this suite
+/// would stay green — the shape `MINIMUM_SUITES_SCANNED` exists to prevent one file over in
+/// `tests/test_database_isolation.rs`. So the list is pinned against `information_schema`,
+/// which is an independent source: adding the table is what reds this, before anyone has to
+/// remember the convention.
+#[tokio::test]
+async fn the_family_is_these_five_and_no_others() {
+    let Some(db) = database(8).await else {
+        return;
+    };
+    let mut actual: Vec<String> = sqlx::query(
+        "select table_name from information_schema.tables \
+         where table_schema = 'public' and table_name like 'application\\_%\\_policies'",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("list policy tables")
+    .into_iter()
+    .map(|row| row.get::<String, _>("table_name"))
+    .collect();
+    actual.sort();
+
+    let mut expected: Vec<String> = POLICY_TABLES.iter().map(|t| (*t).to_string()).collect();
+    expected.sort();
+
+    assert_eq!(
+        actual, expected,
+        "the set of application policy tables changed; add the new member to POLICY_TABLES \
+         and give it a `get_or_create_*_policy` that reads without writing (F47)"
+    );
 }
 
 /// The race the row lock used to hide.
