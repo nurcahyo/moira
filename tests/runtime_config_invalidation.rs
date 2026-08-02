@@ -982,6 +982,225 @@ async fn writing_a_conversation_announces_no_runtime_config_change() {
     );
 }
 
+/// F53, the classifier half: a RAG **content** notification clears nothing either.
+///
+/// # Why this is a separate finding from F51 and not a separate property
+///
+/// `rag_collections` and `rag_documents` came from the same `0007` block as
+/// `conversations` and `memory_records` and had the same defect, at a different rate:
+/// these two are written from admin routes, so a bulk import of N documents is N
+/// cross-replica cache wipes rather than one per conversation turn. The rate is why it
+/// was recorded separately. The property is identical, so this test is deliberately the
+/// twin of [`a_conversation_notification_invalidates_no_cache`] — including seeding a
+/// real [`RuntimeModelHandle`], because `runtime_handles` holds built provider clients
+/// with their connection pools and is the expensive thing the fix protects. A guard that
+/// watched only `runtime_cache` stays green against an edit that honours the plan for
+/// that one cache and keeps wiping the other two.
+///
+/// # Both tables, not one
+///
+/// F53 required establishing whether a collection's own configuration is read through a
+/// cache before either could lose its trigger, precisely because the two might have had
+/// different answers. They did not — a collection carries no runtime configuration at all
+/// — so both are narrowed, and the cheapest edit that preserves half the defect is to
+/// revert half the classifier. Each resource type is therefore asserted on its own.
+///
+/// # Hand-built payloads, for the reason its twin gives
+///
+/// `migrations/0024` drops both triggers, so a real document write emits nothing and this
+/// test would pass without the classifier ever being consulted. This one bypasses the
+/// trigger and tests only the classifier;
+/// [`writing_rag_content_announces_no_runtime_config_change`] writes real rows and
+/// therefore tests only the trigger.
+#[tokio::test]
+async fn a_rag_content_notification_invalidates_no_cache() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let cache = fixture.state.runtime_cache.clone();
+    let handles = fixture.state.runtime_handles.clone();
+    let auth_settings = fixture.state.auth_settings_cache.clone();
+    let _listener = Listener::start(&fixture).await;
+
+    let sentinel = sentinel_provider();
+    cache.put_provider(sentinel.clone()).await;
+    let handle_key = sentinel_cache_key();
+    handles.insert(handle_key.clone(), sentinel_handle()).await;
+    auth_settings
+        .put_enabled_methods(vec![sentinel_auth_method()])
+        .await;
+
+    assert!(
+        cache.get_provider(sentinel.id).await.is_some(),
+        "runtime config cache was not seeded"
+    );
+    assert!(
+        handles.get(&handle_key).await.is_some(),
+        "provider runtime handle cache was not seeded"
+    );
+    assert!(
+        auth_settings.enabled_methods().await.is_some(),
+        "auth settings cache was not seeded"
+    );
+
+    for resource_type in ["rag_documents", "rag_collections"] {
+        notify_and_await(&fixture, &change_payload(resource_type, Uuid::now_v7())).await;
+
+        assert!(
+            cache.get_provider(sentinel.id).await.is_some(),
+            "a {resource_type} notification dropped the runtime config cache; a bulk \
+             import does this once per document, on every replica"
+        );
+        assert!(
+            handles.get(&handle_key).await.is_some(),
+            "a {resource_type} notification dropped every built provider client handle, \
+             connection pools included — this is F53's most expensive consequence and the \
+             reason the guard does not stop at the config cache"
+        );
+        assert!(
+            auth_settings.enabled_methods().await.is_some(),
+            "a {resource_type} notification dropped the auth settings cache"
+        );
+    }
+
+    // The control, on the same listener and the same seeds. Without it every assertion
+    // above would hold just as well against a listener that was never attached.
+    notify_and_await(
+        &fixture,
+        &change_payload("applications", fixture.application_id),
+    )
+    .await;
+
+    assert!(
+        cache.get_provider(sentinel.id).await.is_none(),
+        "an applications notification left the runtime config cache in place, so the \
+         survival asserted above proves nothing about scoping"
+    );
+    assert!(
+        handles.get(&handle_key).await.is_none(),
+        "an applications notification left the provider handle cache in place, so the \
+         survival asserted above proves nothing about scoping"
+    );
+    assert!(
+        auth_settings.enabled_methods().await.is_none(),
+        "an applications notification left the auth settings cache in place, so the \
+         survival asserted above proves nothing about scoping"
+    );
+}
+
+/// F53, the trigger half: writing a RAG collection or document announces nothing at all.
+///
+/// The twin of [`writing_a_conversation_announces_no_runtime_config_change`], and it
+/// observes the other barrier — `migrations/0024` — with the same sentinel technique:
+/// Postgres delivers notifications on one connection in commit order, so if this test's
+/// own sentinel is the first thing received, everything committed before it announced
+/// nothing. No sleep, no timeout, exact.
+///
+/// INSERT, UPDATE **and** DELETE on both tables, because the trigger fired on all three
+/// operations and dropping it for one is not dropping it. The document is written and
+/// removed before the collection, since `rag_documents.collection_id` is
+/// `on delete cascade` and a cascaded delete would fire the document trigger from the
+/// collection's own `delete` — which is exactly the shape that would otherwise leave one
+/// of the two tables' triggers untested.
+#[tokio::test]
+async fn writing_rag_content_announces_no_runtime_config_change() {
+    const SENTINEL: &str = "f53-sentinel";
+
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let mut listener = sqlx::postgres::PgListener::connect_with(&fixture.pool)
+        .await
+        .expect("attach a listener");
+    listener
+        .listen("moira_runtime_config")
+        .await
+        .expect("listen");
+
+    let collection_id = Uuid::now_v7();
+    sqlx::query(
+        "insert into rag_collections (id, public_id, application_id, collection_key, \
+         display_name, metadata) values ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(collection_id)
+    .bind(format!("collection_{collection_id}"))
+    .bind(fixture.application_id)
+    .bind(format!("f53_{}", Uuid::now_v7().simple()))
+    .bind("F53 collection")
+    .bind(json!({ "test_fixture": true }))
+    .execute(&fixture.pool)
+    .await
+    .expect("insert a rag collection");
+
+    let document_id = Uuid::now_v7();
+    sqlx::query(
+        "insert into rag_documents (id, public_id, collection_id, title, source_type, \
+         mime_type, metadata) values ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(document_id)
+    .bind(format!("doc_{document_id}"))
+    .bind(collection_id)
+    .bind("F53 document")
+    .bind("inline")
+    .bind("text/plain")
+    .bind(json!({ "test_fixture": true }))
+    .execute(&fixture.pool)
+    .await
+    .expect("insert a rag document");
+
+    sqlx::query("update rag_documents set title = $2 where id = $1")
+        .bind(document_id)
+        .bind("F53 document renamed")
+        .execute(&fixture.pool)
+        .await
+        .expect("update the rag document");
+    sqlx::query("delete from rag_documents where id = $1")
+        .bind(document_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("delete the rag document");
+
+    sqlx::query("update rag_collections set display_name = $2 where id = $1")
+        .bind(collection_id)
+        .bind("F53 collection renamed")
+        .execute(&fixture.pool)
+        .await
+        .expect("update the rag collection");
+    sqlx::query("delete from rag_collections where id = $1")
+        .bind(collection_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("delete the rag collection");
+
+    let announced = drain_until_sentinel(&mut listener, &fixture.pool, SENTINEL).await;
+    let rag_notifications: Vec<&String> = announced
+        .iter()
+        .filter(|payload| payload.contains("rag_collections") || payload.contains("rag_documents"))
+        .collect();
+    assert!(
+        rag_notifications.is_empty(),
+        "a RAG content write announced a runtime-config change, so every replica dropped \
+         its runtime config, auth settings and provider-handle caches — once per document \
+         in a bulk import: {rag_notifications:?}"
+    );
+
+    // The control: the channel is live and this listener is on it.
+    sqlx::query("update applications set display_name = $2 where id = $1")
+        .bind(fixture.application_id)
+        .bind("f53 liveness probe")
+        .execute(&fixture.pool)
+        .await
+        .expect("update the application");
+    let announced = drain_until_sentinel(&mut listener, &fixture.pool, SENTINEL).await;
+    assert!(
+        announced
+            .iter()
+            .any(|payload| payload.contains("applications")),
+        "the notification channel is not live, so the silence asserted above proves \
+         nothing; saw {announced:?}"
+    );
+}
+
 /// The fail-safe. A payload the listener cannot understand must behave exactly as the
 /// code did before scoping existed, because the alternative — narrowing a payload that
 /// was misread — is a breaker that stays stale with no signal that anything is wrong.
