@@ -3723,6 +3723,71 @@ The "State at a glance" block above exists precisely so a compacted context can 
 
 ## Cycle log
 
+### Cycle 16 — 2026-08-03 — the queue is empty; what is left needs a human
+
+**Ten PRs merged across cycles 15–16.** `main` at `cddb2a5`. **Every finding that an autonomous loop
+can honestly close is closed.**
+
+| PR | Findings | Merge |
+|---|---|---|
+| #66 | F53, F50 made observable | `8d983aa` |
+| #67 | F30 (partly refuted), both structured-output preconditions, F54 raised | `cddb2a5` |
+
+#### Two more findings were refuted where they aimed and real somewhere else
+
+- **F53's own evidence was destroyed by the commit that raised it.** It argued
+  `docs/runtime-cache-invalidation.md` "lists neither table" — true when drafted, **false when
+  committed**, because `e16cb0c` added the RAG tables to that paragraph. *A finding that cites a
+  document its own commit edits cannot be re-verified later by reading that document.* It also named
+  columns (`embedding model`, `dimensions`) that `rag_collections` does not have.
+- **F30 is refuted as an extraction defect** — "takes the stricter" *is* implemented. But **its own
+  predicted third reader had already arrived**: `conversation_select` reads the memory column alone,
+  in SQL, so `GET /api/v1/conversations` reported `application_managed` while extraction refused
+  under a conversation policy of `disabled`.
+
+#### The rules earned this cycle
+
+1. **A single point of truth is only a barrier if it is reachable from every layer that needs the
+   answer, in the type that layer needs.** F30's rule was already in one place — an application-layer
+   function over `Option<MemoryStatus>` that a SQL query could neither call nor use.
+2. **A guard that iterates a constant cannot see a name being *removed* from it.** Set-membership
+   guards are one-directional by construction; deleting `rag_documents` from the derived inventory
+   left every unit test green.
+3. **An arm no test can execute is a promise, not a guard.** Why `run_extraction` records the
+   execution's own failure class rather than special-casing an unreachable variant.
+4. **Checking a claim can change the fix.** Precondition 3's "the only signal" was overstated — the
+   class survives in `audit_logs` and `execution_attempts`. The narrower truth (lost from the
+   operator-facing `memory_extraction_runs`) is now **F54**.
+
+#### Decisions taken, each with what would reverse it
+
+- **F50: observability shipped, product decision untouched.** Silence is a defect under *either*
+  answer; fail-closed and observable fail-open differ only in whether the request is *also* refused.
+  **Recommendation if the decision is taken: a per-route opt-in, not a global mode** — a disabled
+  profile is a configuration state an operator chose, and refusing turns one admin toggle into a
+  route-wide outage. Fail-closed is defensible only if the preamble is a *security control* rather
+  than a behaviour default, and nothing in the tree frames it that way.
+- **`StructuredOutputInvalid` stays out of all three dispositions**, now recorded and guarded rather
+  than true by omission. Fallback was **nearly yes** and flipped to no because **F39 already removed
+  the real case at routing time**, and because a class carries one disposition while this class has
+  two emitters — admitting it lets one malformed caller schema walk the whole fallback chain.
+- **The fail-hard flip is NOT shipped.** Its reversal condition now holds in full, so it is a choice
+  rather than a wait — but it turns a silent `None` into a terminal 422 for every caller whose model
+  returns prose, and it *must* turn F42's emitter guard red (that red is the interlock working).
+  Landing it inside enabling work would have meant a reviewer approving a blast-radius decision they
+  did not come for. What it must do is written at `structured_output_from_text`.
+
+#### What remains, and none of it is autonomous work
+
+**F54** (the extraction failure class is lost from `memory_extraction_runs`) and one **bounded,
+recorded gap** — swapping `stricter_of`'s arguments survives its guard, and can only change which of
+two equally-permissive labels is *reported*, never a consent outcome.
+
+**Needing a human:** PR **#57** (F32's 422 breaks IaC setting `encrypted_content`); **F33**'s
+encryption scoping; the **rig-core issue** drafted in `docs/upstream/`; the **T11 deploy**; **F50**'s
+fail-closed call; and the **fail-hard flip**.
+
+
 ### Cycle 15 — 2026-08-02/03 — the findings queue emptied: eight PRs, three refutations
 
 **Every finding on the inherited queue is closed.** `main` moved `eb9b988 → 20efdfa`.
