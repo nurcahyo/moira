@@ -5,7 +5,8 @@ work resumes. Read it, then read `plans/reports/EXECUTION-LEDGER.md` — the led
 truth for state; this file is the source of truth for *how to work here*.
 
 Written 2026-07-31. **All plan work is complete** — the forced order `02b → … → 09` is fully
-executed. What remains is a short findings queue and three things only the user can do, both in §3.
+executed. What remains is a short findings queue and **four** things only the user can do, both in §3.
+Updated 2026-08-02: F29, F31, F35 and F37 closed; F36 and F41 **refuted rather than fixed**.
 
 ---
 
@@ -40,7 +41,7 @@ landing an agent's commit on the wrong branch — that happened twice.
 **Any agent that will commit gets its own `git worktree`.** The coordinator must never run
 `git checkout` in a tree an agent is using.
 
-### 2.2 Exit codes lie here, in TEN observed forms — and form 4's cause is now known
+### 2.2 Exit codes lie here, in TWELVE observed forms — and form 4's cause is now known
 
 1. `cmd | tail` reports `tail`'s status — hid a genuinely failed `docker build`
 2. `grep -c` returns 1 on **zero** matches — made a fully green gate run look failed
