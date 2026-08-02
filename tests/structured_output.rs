@@ -29,6 +29,14 @@
 //!    `is_fallback_eligible` nor `is_circuit_failure`, so failing here would kill the execution
 //!    with no retry and no fallback — and on DeepSeek, where Rig drops the schema before the
 //!    wire (finding F39), it would fail *every* structured request. See the ledger's F29 entry.
+//!
+//!    **This is now a policy choice rather than a blocked one.** All three of F29's preconditions
+//!    have been discharged — F39 landed, the disposition above is recorded and guarded in
+//!    `src/orchestration/controls.rs` rather than merely true by omission, and `run_extraction`
+//!    reads `execution.status`. The fail-hard variant is deliberately left unshipped so that the
+//!    blast-radius decision gets its own diff; the two cases below (and the streaming twin) are
+//!    what it has to replace when it does. The doc comment on `structured_output_from_text` in
+//!    `src/application/execution.rs` carries the full argument.
 
 mod support;
 

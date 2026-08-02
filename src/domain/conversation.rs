@@ -61,6 +61,69 @@ pub enum MemoryConsentMode {
     AutomaticWithUserControls,
 }
 
+impl MemoryConsentMode {
+    /// How much this mode permits, as a rank. Higher is more permissive.
+    ///
+    /// Deliberately **not** a `PartialOrd`/`Ord` derive. A derive would order the variants by
+    /// declaration position, which puts `ApplicationManaged` below `AutomaticWithUserControls`
+    /// for no reason anyone chose, and would silently make `<` mean something on a type where the
+    /// only meaningful comparison is this one. The rank is also not total: the two consenting
+    /// modes differ in *who* asserted consent, not in how much is permitted, and pretending
+    /// otherwise would invent a precedence the schema does not have.
+    const fn permissiveness(self) -> u8 {
+        match self {
+            // Consent withheld. There is no weaker thing to do.
+            Self::Disabled => 0,
+            // Memories may be written, but not used until a human confirms each one.
+            Self::ExplicitOnly => 1,
+            // Both mean "usable on arrival"; they differ in who asserted consent, not in scope.
+            Self::AutomaticWithUserControls | Self::ApplicationManaged => 2,
+        }
+    }
+
+    /// The effective consent mode for an application, given its **two** consent columns.
+    ///
+    /// # Why this exists on the domain type — finding F30
+    ///
+    /// `application_conversation_policies.memory_consent_mode` and
+    /// `application_memory_policies.consent_mode` (`migrations/0007…:20-21` and `:40-41`) are
+    /// independent `varchar(64)` columns over the same four values, both defaulting to
+    /// `'explicit_only'`. **Nothing in the schema reconciles them** — a cross-table `CHECK` is not
+    /// something Postgres offers — so the reconciliation has to be a code rule, and F30's whole
+    /// point is that a code rule holds only as long as every reader goes through it.
+    ///
+    /// It did not. `effective_extraction_status` took the stricter of the two from the day
+    /// Sub-Phase F landed, but two later readers consulted the memory column alone: the manual
+    /// memory API (deliberately — see `ConversationService::create_memory`), and
+    /// `conversation_select`'s `memory_behavior`, which was `coalesce(mp.consent_mode,
+    /// 'explicit_only')` **in SQL**, where no Rust helper could have been in its way. That is the
+    /// failure mode F30 predicted, arriving as predicted, in the one language the prediction did
+    /// not cover.
+    ///
+    /// Putting the rule here rather than in `application::memory_extraction` is what lets
+    /// `src/infra/pg_rows.rs` use it, which is what removes the last consent decision from SQL.
+    ///
+    /// # The tie, and why it resolves toward the memory policy
+    ///
+    /// `application_managed` and `automatic_with_user_controls` are equally permissive
+    /// ([`Self::permissiveness`]), so on that pair "stricter" does not pick a winner and this
+    /// returns `memory`. That is not arbitrary: `memory_behavior` has always reported the memory
+    /// policy's value, so a tie leaves every existing deployment's reported value byte-identical
+    /// and the only value that changes is the one that was wrong — where the conversation policy
+    /// is genuinely stricter than the memory policy.
+    ///
+    /// The asymmetry is confined to the *label*. The extraction decision is symmetric, because
+    /// both tied modes map to the same `MemoryStatus`; `the_combined_consent_decision_is_symmetric`
+    /// pins that over all sixteen pairs.
+    pub fn stricter_of(conversation: Self, memory: Self) -> Self {
+        if conversation.permissiveness() < memory.permissiveness() {
+            conversation
+        } else {
+            memory
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryType {
@@ -152,6 +215,11 @@ pub struct ConversationRecord {
     pub message_count: i64,
     pub last_message_at: Option<DateTime<Utc>>,
     pub summary_available: bool,
+    // The consent mode actually in force: `MemoryConsentMode::stricter_of` over both consent
+    // columns, or `"policy_controlled"` when the query did not select them. Computed by
+    // `effective_memory_behavior` in `src/infra/pg_rows.rs` — deliberately not in SQL, see F30.
+    // A `//` comment rather than `///` on purpose: this struct is `ToSchema`, so a doc comment
+    // would land in `docs/openapi.json` and drift from it.
     pub memory_behavior: String,
     pub retention_expires_at: Option<DateTime<Utc>>,
     pub metadata: Value,

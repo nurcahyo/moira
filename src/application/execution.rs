@@ -1809,24 +1809,59 @@ impl EventCollector {
 ///
 /// # Why a non-conforming reply is `None` rather than `StructuredOutputInvalid`
 ///
-/// Three reasons, each verified against the tree rather than assumed:
+/// Three reasons, each verified against the tree rather than assumed. **All three have since
+/// been discharged** — see "the reversal condition now holds" below. They are kept because they
+/// are the argument the flip has to answer, not a changelog.
 ///
-/// 1. `StructuredOutputInvalid` is in **neither** `is_retryable` nor `is_fallback_eligible` nor
-///    `is_circuit_failure`, so one non-conforming reply would end the execution with no retry
-///    and no fallback.
+/// 1. `StructuredOutputInvalid` was in **neither** `is_retryable` nor `is_fallback_eligible` nor
+///    `is_circuit_failure` — by omission, with nothing recording whether that was a decision — so
+///    one non-conforming reply would end the execution with no retry and no fallback.
 /// 2. On DeepSeek the schema never reaches the wire — Rig's `SUPPORTS_RESPONSE_FORMAT = false`
 ///    drops it — so *every* structured request on that route would hard-fail where it previously
 ///    returned 200. Failing loudly is the right end state; it must follow the capability fix
 ///    (finding F39), not precede it.
-/// 3. `ConversationService::run_extraction` detects failure by `output_text` being `None` and
-///    never inspects `execution.status`, so a hard failure would reclassify an unparseable
+/// 3. `ConversationService::run_extraction` detected failure by `output_text` being `None` and
+///    never inspected `execution.status`, so a hard failure would reclassify an unparseable
 ///    extraction reply from `structured_output_invalid` to `extraction_call_failed` — losing the
-///    only signal that distinguishes "the model did not comply" from "the call did not happen".
+///    signal that distinguishes "the model did not comply" from "the call did not happen".
 ///
-/// **Reversal condition:** adopt the fail-hard variant once F39 has landed *and*
-/// `StructuredOutputInvalid` has been given a retry/fallback disposition *and* `run_extraction`
-/// reads `execution.status`. Until all three hold, failing here trades a silent `None` for a
-/// loud outage on a provider that was never going to comply.
+/// # The reversal condition now holds, and the flip is still not taken here
+///
+/// All three preconditions are discharged:
+///
+/// 1. **Done.** The absence is now a recorded disposition rather than an omission:
+///    `is_retryable`, `is_fallback_eligible` and `is_circuit_failure` in
+///    `src/orchestration/controls.rs` each carry the reason `StructuredOutputInvalid` is excluded,
+///    and `every_failure_class_has_a_recorded_retry_fallback_and_circuit_disposition` fails on a
+///    change in either direction. The disposition is *stay out of all three*, and the load-bearing
+///    reason is that a class carries exactly one disposition while this class has two emitters —
+///    a caller's unusable schema and (under the flip) a model's non-conforming reply. Admitting it
+///    to `is_fallback_eligible` would let one 2 MB schema walk the whole fallback chain.
+/// 2. **Done.** F39 landed. A model that cannot carry a schema is no longer routed a
+///    schema-carrying request, so the failure the flip introduces is a model declining to comply,
+///    not a provider structurally unable to.
+/// 3. **Done.** `run_extraction` reads `execution.status` and labels the run row with the
+///    execution's own failure class (`extraction_failure_class` in
+///    `src/application/conversation.rs`). A non-conforming reply is recorded as
+///    `structured_output_invalid` **before and after** the flip: today `parse_candidates` writes
+///    it by refusing prose, afterwards the execution writes it. The signal reason 3 was protecting
+///    survives the flip rather than being traded for it.
+///
+/// **The flip is deliberately a separate change.** Landing the preconditions and flipping the
+/// behaviour together would bury a blast-radius decision inside enabling work: the flip turns a
+/// silent `None` into a terminal 422 for every caller whose model returns prose, on a class that
+/// by design neither retries nor falls back. What it needs is its own diff, its own tests, and its
+/// own review of that consequence.
+///
+/// **What the flip must still do**, none of which is done here:
+/// - Widen the `moira.error.structured_output_invalid` catalog description, which currently states
+///   as fact that the class is never raised for a model's reply, and update
+///   `structured_output_invalid_has_only_the_two_emitters_its_catalog_entry_describes`
+///   (`src/i18n/catalog/mod.rs`), which pins the emitter count at two and *will* go red — that red
+///   is the interlock working, not a broken test.
+/// - Re-read the disposition above with three emitters in view rather than two.
+/// - Replace `a_reply_that_is_not_json_leaves_the_field_null_and_still_succeeds` and its streaming
+///   twin in `tests/structured_output.rs`, which pin the current behaviour on both run paths.
 ///
 /// # Strict, and deliberately not a scavenger
 ///

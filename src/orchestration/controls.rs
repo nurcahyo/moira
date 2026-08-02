@@ -1042,6 +1042,35 @@ impl ExecutionFailure {
     }
 }
 
+/// Whether the same provider and model are worth trying again for this failure.
+///
+/// # `StructuredOutputInvalid` is deliberately absent — F29's first precondition
+///
+/// Membership here means "the next attempt has a materially different chance of succeeding
+/// *without changing anything about the request*". That is true of a timeout, a 429 and a
+/// connection reset; it is false of every structured-output failure, in both directions, and the
+/// reasons differ per direction so they are recorded separately:
+///
+/// **The emitters that exist today are caller errors.** Both of them reject the *caller's
+/// schema* before the model ever sees it — `validate_response_format` over
+/// `public_api.maximum_schema_bytes`, and `build_completion_request` over a schema that is not a
+/// readable `schemars::Schema`. F42 pins that emitter set at exactly two
+/// (`structured_output_invalid_has_only_the_two_emitters_its_catalog_entry_describes`). A schema
+/// that is too large or unreadable is exactly as large and unreadable on the second attempt, so
+/// a retry is a guaranteed-identical failure paid for in latency.
+///
+/// **The emitter the fail-hard variant would add is a model error, and the answer is still no.**
+/// A reply that did not satisfy the schema *might* satisfy it on a second sample — but Moira
+/// pins `temperature: Some(0.0)` on its own schema-carrying calls (memory extraction), where a
+/// second sample is bit-identical; and where a caller did choose a non-zero temperature, a retry
+/// is a coin flip charged to them. Worse, the retry budget is shared: spending an attempt on a
+/// chatty model leaves fewer for the transport failure that arrives later in the same execution,
+/// which is the failure retries exist for.
+///
+/// See [`is_fallback_eligible`] for why the *other* provider question gets the same answer for a
+/// different reason, and [`is_circuit_failure`] for why counting this against a breaker would be
+/// a caller-triggered denial of service. The disposition is pinned by
+/// `structured_output_invalid_is_in_none_of_the_three_dispositions`.
 pub fn is_retryable(class: ExecutionFailureClass) -> bool {
     matches!(
         class,
@@ -1055,6 +1084,34 @@ pub fn is_retryable(class: ExecutionFailureClass) -> bool {
     )
 }
 
+/// Whether a *different* provider is worth trying for this failure.
+///
+/// # `StructuredOutputInvalid` is deliberately absent — and this is the direction that had a real
+/// case for inclusion
+///
+/// "Retry the same provider" and "try another one" are genuinely different questions, and the
+/// argument for fallback here was the strongest one in the family: a provider that *structurally
+/// cannot* send a schema will never comply, while the next provider in the chain might. That was
+/// concretely true of DeepSeek, where `rig-core`'s `SUPPORTS_RESPONSE_FORMAT = false` dropped the
+/// schema before the wire.
+///
+/// **F39 answered that question at routing time instead, which is why the answer here is no.**
+/// A model row that cannot carry a schema is no longer *selected* for a schema-carrying request
+/// (`a_deepseek_row_claiming_structured_output_is_not_routed_a_structured_request` and
+/// `a_structured_request_routes_past_deepseek_to_a_provider_that_sends_the_schema`, both in
+/// `tests/structured_output.rs`). What remains after F39 is not a capability failure that another
+/// provider fixes — it is either the caller's schema being unusable, which is unusable everywhere,
+/// or a model declining to comply, which is a quality question. Moira's fallback chain is a
+/// reliability mechanism: it answers "this provider is unavailable", not "this model's prose was
+/// disappointing", and silently answering from a different model because the first was chatty
+/// changes who produced the answer with nothing on the wire to say so.
+///
+/// **The decisive constraint: a class carries exactly one disposition, and this class has two
+/// emitters.** `is_fallback_eligible` cannot distinguish "the model replied badly" from "the
+/// caller sent a 2 MB schema". Admitting the class would let one caller's malformed schema walk
+/// the entire fallback chain on every request — a caller-triggered amplification against every
+/// provider the route lists. Whatever the reply case deserves, the request case must not pay for
+/// it, and today they share a class.
 pub fn is_fallback_eligible(class: ExecutionFailureClass) -> bool {
     matches!(
         class,
@@ -1069,6 +1126,20 @@ pub fn is_fallback_eligible(class: ExecutionFailureClass) -> bool {
     )
 }
 
+/// Whether this failure is evidence that the provider itself is unhealthy.
+///
+/// # `StructuredOutputInvalid` is deliberately absent, and here the reason is blast radius
+///
+/// Every class in this set is a statement *about the provider*: it timed out, it refused the
+/// connection, it returned a body that is not a completion. A breaker entry is keyed on
+/// `(provider_id, model_id)` and, once open, refuses traffic for **every** caller on that pair.
+///
+/// A structured-output failure is a statement about the *request* — the caller's schema today,
+/// and a model's reply if the fail-hard variant ships. Admitting it would let a single tenant
+/// posting an unreadable schema in a loop trip `circuit_failure_threshold` and take a healthy
+/// provider offline for everyone routed through it. That is a caller-triggered denial of service
+/// wearing a health check's clothes, and it is the reason this exclusion is the least arguable of
+/// the three.
 fn is_circuit_failure(class: ExecutionFailureClass) -> bool {
     matches!(
         class,
@@ -1102,6 +1173,122 @@ mod tests {
     use super::*;
     use crate::domain::RuntimePolicyStatus;
     use chrono::Utc;
+
+    /// The disposition every failure class is *supposed* to have, written out independently of
+    /// the three `matches!` blocks it guards.
+    ///
+    /// Hand-written rather than derived, for F52's reason: a table computed from the thing it
+    /// checks agrees with it by construction and proves nothing. The `match` is exhaustive, so a
+    /// new [`ExecutionFailureClass`] variant does not compile until someone has decided what it
+    /// means for retry, fallback and the breaker.
+    fn expected_disposition(class: ExecutionFailureClass) -> (bool, bool, bool) {
+        use ExecutionFailureClass as C;
+        // (retryable, fallback_eligible, circuit_failure)
+        match class {
+            // Caller and configuration errors: identical on the next attempt, identical on the
+            // next provider, and no evidence about provider health.
+            C::InvalidExecutionRequest
+            | C::ApplicationUnavailable
+            | C::RouteNotFound
+            | C::RouteForbidden
+            | C::ModelNotFound
+            | C::ModelForbidden
+            | C::ModelCapabilityMismatch
+            | C::NoEligibleModel
+            | C::CredentialForbidden
+            | C::CredentialExpired
+            | C::CredentialDisabled
+            | C::CredentialDecryptionFailed
+            | C::ProviderConfigurationInvalid
+            | C::RequestCancelled
+            | C::DeadlineExceeded
+            | C::ProviderAuthenticationFailed
+            | C::StreamBackpressureExceeded
+            | C::InternalError => (false, false, false),
+            // F29's first precondition. See the three `is_*` doc comments: no retry (the schema
+            // is the same schema; a zero-temperature resample is the same reply), no fallback
+            // (F39 moved the capability question to routing, and the class cannot tell a bad
+            // caller schema from a bad model reply), no breaker (a caller must not be able to
+            // take a healthy provider offline for everyone).
+            C::StructuredOutputInvalid => (false, false, false),
+            // This provider cannot serve the request but another may hold a usable credential.
+            C::CredentialNotFound => (false, true, false),
+            // Operational: worth another attempt, worth another provider.
+            C::ProviderTimeout
+            | C::ProviderConnectionFailed
+            | C::ProviderUnavailable
+            | C::ProviderRateLimited
+            | C::ProviderUpstreamError => (true, true, true),
+            // Retry and fallback, but the breaker is what raised it — feeding it back would keep
+            // it open on its own output.
+            C::CircuitOpen | C::CapacityExhausted => (true, true, false),
+            // A body that is not a completion is provider health evidence, but replaying the same
+            // request at the same provider is not expected to change it.
+            C::ProviderInvalidResponse => (false, false, true),
+        }
+    }
+
+    /// F29's first precondition, stated as the property rather than as a membership check.
+    ///
+    /// **Why the whole table and not three asserts about one variant.** HANDOFF §3.4's thirteenth
+    /// shape is that a guard which iterates a constant cannot see a name being *removed* from it;
+    /// membership guards are one-directional. Asserting the full `(retry, fallback, circuit)`
+    /// triple for every class is bidirectional by construction — an addition and a removal both
+    /// go red — and it makes the disposition of `StructuredOutputInvalid` a recorded decision
+    /// sitting next to every other class's, which is what "give it a disposition" has to mean if
+    /// it is to survive the next edit.
+    ///
+    /// **Honest about its limit.** The loop walks [`ExecutionFailureClass::ALL`], and that array
+    /// can rot — its own doc comment says so. The exhaustive `match` in [`expected_disposition`]
+    /// is the backstop: a variant missing from `ALL` is still a compile error here.
+    #[test]
+    fn every_failure_class_has_a_recorded_retry_fallback_and_circuit_disposition() {
+        for class in ExecutionFailureClass::ALL {
+            let actual = (
+                is_retryable(class),
+                is_fallback_eligible(class),
+                is_circuit_failure(class),
+            );
+            assert_eq!(
+                actual,
+                expected_disposition(class),
+                "{class:?}: (retryable, fallback_eligible, circuit_failure) changed. \
+                 This table is the record of the decision, not a mirror of the code — \
+                 if the new behaviour is intended, change the table and say why in the \
+                 is_retryable / is_fallback_eligible / is_circuit_failure doc comments."
+            );
+        }
+    }
+
+    /// The precondition itself, said out loud so a reader grepping for it finds a test.
+    ///
+    /// Redundant with the table above *by design*: the table is what catches a drive-by edit, and
+    /// this is what tells whoever caused the red which decision they walked into. Deleting the
+    /// table would leave this one-directional; deleting this would leave the reason implicit.
+    #[test]
+    fn structured_output_invalid_is_in_none_of_the_three_dispositions() {
+        let class = ExecutionFailureClass::StructuredOutputInvalid;
+        assert!(
+            !is_retryable(class),
+            "a schema that is unreadable is unreadable on the second attempt too, and a \
+             zero-temperature resample of a non-conforming reply is the same reply"
+        );
+        assert!(
+            !is_fallback_eligible(class),
+            "F39 moved the capability question to routing; what is left is a caller schema that \
+             fails everywhere, and this class cannot tell that apart from a model's reply — so \
+             admitting it lets one bad schema walk the whole fallback chain"
+        );
+        assert!(
+            !is_circuit_failure(class),
+            "breaker entries are per (provider, model) and refuse traffic for every caller; a \
+             request-shaped failure must never be able to open one"
+        );
+        // The disposition is only safe while the emitter set is what the catalog says it is.
+        // `structured_output_invalid_has_only_the_two_emitters_its_catalog_entry_describes`
+        // (src/i18n/catalog/mod.rs) is the interlock: a third emitter goes red there, which is
+        // the prompt to re-read this decision rather than inherit it.
+    }
 
     fn policy(threshold: i32) -> ProviderRuntimePolicyRecord {
         ProviderRuntimePolicyRecord {
