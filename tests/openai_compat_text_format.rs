@@ -448,3 +448,336 @@ async fn native_json_object_is_refused_before_the_stream_begins() {
         "a refused stream must not reach the provider: {body}"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// F45 — `json_schema.strict = false` is refused rather than accepted and inverted.
+// ---------------------------------------------------------------------------------------------
+
+/// A schema with an **optional** property, so the strict-mode rewrite is observable.
+///
+/// `caller_schema()` declares its only property required, which makes it useless for seeing what
+/// strict mode does to a schema: `required` comes back identical either way. This one declares
+/// `note` optional, and `sanitize_schema` promotes it.
+fn schema_with_an_optional_property() -> Value {
+    json!({
+        "type": "object",
+        "title": "caller_title",
+        "properties": {
+            "answer": { "type": "string" },
+            "note": { "type": "string" }
+        },
+        "required": ["answer"],
+        "additionalProperties": false
+    })
+}
+
+/// **The premise, measured on the socket rather than cited.**
+///
+/// F45's refusal rests on two facts about `rig-core` 0.40 that a reader has to take on trust
+/// otherwise: `"strict": true` is hardcoded in the OpenAI encoder, and `sanitize_schema`
+/// rewrites `required` to the full property-key list. This drives Moira's real request through
+/// Rig's real encoder to a real socket and reads what left the process.
+///
+/// The second assertion is the one that matters, and it is why `strict: false` is refused rather
+/// than documented: **the caller's optional property came back mandatory.** A caller asking for
+/// non-strict validation is not asking for a slightly stricter version of their schema; they are
+/// asking for a schema Moira will not send. `additionalProperties` is asserted too because
+/// OpenAI's strict mode requires it and a schema that omitted it would be rewritten as well.
+///
+/// A red here means `rig-core` changed and F45's premise no longer holds — which is precisely
+/// the reversal condition on `refuse_non_strict_json_schema`. Check the vendored crate's
+/// `providers/openai/completion/mod.rs` before touching the refusal.
+#[tokio::test]
+async fn rig_0_40_still_hardcodes_strict_true_and_promotes_optional_properties_to_required() {
+    let Some(fixture) = compat_fixture().await else {
+        return;
+    };
+    let provider = MockOpenAiServer::start([ProviderScript::Completion {
+        text: "{\"answer\":\"yes\",\"note\":\"n\"}".to_string(),
+    }])
+    .await;
+    let bound = fixture
+        .add_provider_with_capabilities(
+            provider.base_url(),
+            10,
+            RuntimePolicy::default(),
+            structured_output_model(),
+        )
+        .await;
+    bind_provider_to_the_default_route(&fixture, &bound).await;
+    let consumer_key = fixture.enable_public_streaming().await;
+    let moira = MoiraHttpServer::start(fixture.state.clone()).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/api/v1/responses", moira.base_url))
+        .header("x-consumer-key", &consumer_key)
+        .json(&json!({
+            "input": [{ "role": "user", "content": [{ "type": "input_text", "text": "answer me" }] }],
+            "route": fixture.route_key,
+            // Accepted: this is the value Moira can actually deliver.
+            "response_format": {
+                "type": "json_schema",
+                "name": "caller_name",
+                "schema": schema_with_an_optional_property(),
+                "strict": true
+            }
+        }))
+        .send()
+        .await
+        .expect("send native strict request");
+    let status = response.status();
+    let body = response.text().await.expect("native response body");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "strict=true must be honoured: {body}"
+    );
+
+    let requests = provider.requests().await;
+    assert_eq!(
+        requests.len(),
+        1,
+        "the provider must be called exactly once"
+    );
+    let sent = &requests[0].body;
+    let json_schema = &sent["response_format"]["json_schema"];
+
+    assert_eq!(
+        json_schema["strict"], true,
+        "rig-core 0.40 hardcodes strict: true. If this is now false, the encoder gained a \
+         strictness input and F45's refusal must be revisited: {sent}"
+    );
+    assert_eq!(
+        json_schema["schema"]["required"],
+        json!(["answer", "note"]),
+        "sanitize_schema must still promote every declared property to required — this is the \
+         concrete harm a silently-upgraded strict: false inflicts on a caller's schema: {sent}"
+    );
+    assert_eq!(
+        json_schema["schema"]["additionalProperties"], false,
+        "{sent}"
+    );
+    // F45's other half, unchanged and deliberately so: the provider-side name comes from the
+    // schema's `title`, never from `response_format.name`. Documented on `PublicResponseFormat`.
+    assert_eq!(
+        json_schema["name"], "caller_title",
+        "the wire name still comes from the schema's title, not from the caller's `name`. If \
+         this is now `caller_name`, something started rewriting the schema: {sent}"
+    );
+
+    moira.shutdown().await;
+    provider.shutdown().await;
+}
+
+/// F45 on the native endpoint, with both controls on the same helper.
+///
+/// The control structure is F46's and it is load-bearing twice over. "422 and the provider was
+/// never called" is satisfiable by a fixture that cannot reach the provider at all — a routing
+/// failure is also a 422 — so a case that *does* reach the provider is what makes the zero
+/// attributable. And because the refusal is on a value rather than a variant, refusing the whole
+/// `json_schema` variant would be the cheapest way to make the first assertion green: the two
+/// controls (`strict` omitted, `strict: true`) are what stop that.
+#[tokio::test]
+async fn native_json_schema_strict_false_is_refused_and_never_reaches_the_provider() {
+    let Some((status, body, calls)) = native_response(
+        false,
+        json!({
+            "type": "json_schema",
+            "name": "answer",
+            "schema": caller_schema(),
+            "strict": false
+        }),
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "strict=false must be refused, not silently answered in strict mode, got {status}: {body}"
+    );
+    let envelope: Value = serde_json::from_str(&body).expect("coded error envelope");
+    assert_eq!(
+        envelope["error"]["code"], "unsupported_request_option",
+        "the refusal must be the strict one, not a routing or policy failure: {body}"
+    );
+    assert_eq!(
+        envelope["error"]["message_key"], "moira.error.unsupported_request_option",
+        "{body}"
+    );
+    assert_eq!(
+        calls, 0,
+        "a refused request must not reach the provider or be billed: {body}"
+    );
+
+    // Control 1 — `strict` omitted. The common case, and the one F35 was right to protect.
+    let Some((status, body, calls)) = native_response(
+        false,
+        json!({ "type": "json_schema", "name": "answer", "schema": caller_schema() }),
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an omitted strict must still be accepted, or the refusal above is a contract break \
+         rather than a fix: {body}"
+    );
+    assert_eq!(
+        calls, 1,
+        "the omitted-strict control must reach the provider: {body}"
+    );
+
+    // Control 2 — an explicit `strict: true`, which is what rig actually sends.
+    let Some((status, body, calls)) = native_response(
+        false,
+        json!({
+            "type": "json_schema",
+            "name": "answer",
+            "schema": caller_schema(),
+            "strict": true
+        }),
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "strict=true must still be accepted: {body}"
+    );
+    assert_eq!(
+        calls, 1,
+        "the strict=true control must reach the provider: {body}"
+    );
+}
+
+/// The streaming twin. A refusal raised after the SSE head is written becomes a `200
+/// text/event-stream` carrying an error event — the "200 that contradicts the request" shape
+/// this whole family exists to prevent — so only asserting the status on the streaming path
+/// proves the refusal happens before the stream begins.
+#[tokio::test]
+async fn native_json_schema_strict_false_is_refused_before_the_stream_begins() {
+    let Some((status, body, calls)) = native_response(
+        true,
+        json!({
+            "type": "json_schema",
+            "name": "answer",
+            "schema": caller_schema(),
+            "strict": false
+        }),
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "the streaming path must refuse before the SSE head is written, got {status}: {body}"
+    );
+    let envelope: Value = serde_json::from_str(&body).expect("coded error envelope");
+    assert_eq!(
+        envelope["error"]["code"], "unsupported_request_option",
+        "{body}"
+    );
+    assert_eq!(
+        calls, 0,
+        "a refused stream must not reach the provider: {body}"
+    );
+}
+
+/// The two endpoints must refuse the same shape, which is the property F35 and F46 both
+/// insisted on and the reason F35 declined to refuse `strict: false` on the compat path alone.
+///
+/// This is also the case that would have caught the old `strict.unwrap_or(false)` in
+/// `compat_response_format`: the compat DTO always carried `Option<bool>`, and the translation
+/// was where "the caller omitted it" became "the caller asked for non-strict".
+#[tokio::test]
+async fn compat_text_format_strict_false_is_refused_over_http() {
+    let Some(fixture) = compat_fixture().await else {
+        return;
+    };
+    let provider = MockOpenAiServer::start([ProviderScript::Completion {
+        text: "must-not-be-reached".to_string(),
+    }])
+    .await;
+    let bound = fixture
+        .add_provider_with_capabilities(
+            provider.base_url(),
+            10,
+            RuntimePolicy::default(),
+            structured_output_model(),
+        )
+        .await;
+    bind_provider_to_the_default_route(&fixture, &bound).await;
+    let consumer_key = fixture.enable_public_streaming().await;
+    let moira = MoiraHttpServer::start(fixture.state.clone()).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("{}/v1/responses", moira.base_url))
+        .header("x-consumer-key", &consumer_key)
+        .json(&json!({
+            "input": "answer me",
+            "text": { "format": {
+                "type": "json_schema",
+                "name": "answer",
+                "schema": caller_schema(),
+                "strict": false
+            } }
+        }))
+        .send()
+        .await
+        .expect("send compat strict=false request");
+    let status = response.status();
+    let body = response.text().await.expect("compat response body");
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "the compat endpoint must refuse strict=false exactly as the native one does, got \
+         {status}: {body}"
+    );
+    let envelope: Value = serde_json::from_str(&body).expect("coded error envelope");
+    assert_eq!(
+        envelope["error"]["code"], "unsupported_request_option",
+        "{body}"
+    );
+    assert_eq!(
+        provider.call_count().await,
+        0,
+        "a refused compat request must not reach the provider: {body}"
+    );
+
+    // Control on the same fixture: omitting `strict` must still work, or the assertion above is
+    // proving the fixture is broken rather than that the refusal fired.
+    let response = client
+        .post(format!("{}/v1/responses", moira.base_url))
+        .header("x-consumer-key", &consumer_key)
+        .json(&json!({
+            "input": "answer me",
+            "text": { "format": {
+                "type": "json_schema",
+                "name": "answer",
+                "schema": caller_schema()
+            } }
+        }))
+        .send()
+        .await
+        .expect("send compat control request");
+    let status = response.status();
+    let body = response.text().await.expect("compat control body");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the omitted-strict control must succeed: {body}"
+    );
+    assert_eq!(provider.call_count().await, 1, "{body}");
+
+    moira.shutdown().await;
+    provider.shutdown().await;
+}

@@ -928,7 +928,13 @@ impl PublicExecutionService {
                 refuse_json_object(&request.response_format)?;
                 None
             }
+            // F45 — the second layer, deliberately redundant with `validate_request`, exactly as
+            // the `json_object` arm above is. This is the site that turns a caller's
+            // `response_format` into the `output_schema` rig will encode under a hardcoded
+            // `strict: true`, so it is the last point at which "the caller said false" is still
+            // knowable. Neither edit alone reintroduces the defect.
             PublicResponseFormat::JsonSchema { schema, .. } => {
+                refuse_non_strict_json_schema(&request.response_format)?;
                 required_capabilities.push("structured_output".to_string());
                 Some(schema.clone())
             }
@@ -1282,6 +1288,10 @@ fn validate_request(
     // and enabling it would never make `json_object` work. The unconditional fact is the more
     // actionable one, so it is the one reported.
     refuse_json_object(&request.response_format)?;
+    // F45 — placed beside the `json_object` refusal and, for the same reason, *before* the
+    // `structured_output_enabled` check: enabling that policy would never make `strict: false`
+    // work, so the unconditional fact is the more actionable one to report.
+    refuse_non_strict_json_schema(&request.response_format)?;
     if matches!(
         request.response_format,
         PublicResponseFormat::JsonSchema { .. }
@@ -1583,10 +1593,15 @@ fn compat_response_format(
             name,
             schema,
             strict,
+            // F45 — `strict` is carried across as the `Option` it arrived as. It used to be
+            // `strict.unwrap_or(false)`, which collapsed "the caller omitted it" into "the caller
+            // asked for non-strict" at the only boundary where the two were still distinguishable,
+            // and then the native path dropped the result anyway. Both endpoints now refuse an
+            // explicit `false` and accept an omitted one.
         }) => Ok(PublicResponseFormat::JsonSchema {
             name,
             schema,
-            strict: strict.unwrap_or(false),
+            strict,
         }),
         Some(OpenAiCompatTextFormat::JsonObject) => Err(AppError::unprocessable(
             "unsupported_request_option",
@@ -1641,6 +1656,65 @@ fn refuse_json_object(format: &PublicResponseFormat) -> Result<(), AppError> {
             "response_format type json_object is not supported: Moira would constrain the \
              output to the empty object rather than to free-form JSON. Send response_format \
              {\"type\": \"json_schema\"} with an explicit schema instead.",
+        ));
+    }
+    Ok(())
+}
+
+/// F45 — `response_format.json_schema.strict = false` is refused rather than accepted and
+/// inverted.
+///
+/// **`strict` is not expressible anywhere.** Verified against the vendored `rig-core` 0.40, not
+/// assumed:
+///
+/// - the OpenAI family (`OpenAi`, `AzureOpenAi`, `OpenAiCompatible`, `Local`) hardcodes
+///   `"strict": true` in the `response_format` it builds (`providers/openai/completion/mod.rs:1838`).
+///   `additional_params` cannot override it: the encoder's object is the `b` argument to
+///   `json_utils::merge`, so it wins whenever an `output_schema` is present;
+/// - Anthropic builds `OutputConfig { format: JsonSchema { schema } }` — no strictness field;
+/// - Gemini sets `generation_config.response_mime_type` and `response_json_schema` — no
+///   strictness field;
+/// - DeepSeek drops the schema before the wire entirely (`SUPPORTS_RESPONSE_FORMAT = false`),
+///   which is why F39 reconciles it out of routing at admission.
+///
+/// **Why this is not a harmless over-delivery.** Strict mode is not "the same answer, checked
+/// harder". `sanitize_schema` sets `required` to the full property-key list, so every field the
+/// caller declared optional becomes mandatory and the model is forced to invent one; and
+/// OpenAI's strict mode rejects schemas outside its supported subset, so a caller who asked for
+/// best-effort validation of a schema using, say, `pattern` receives a provider error. The
+/// caller asked for one contract and silently got a different one that can fail.
+///
+/// **Why refusing is now available when F35 judged it unavailable.** F35 considered refusing
+/// `strict: false` and rejected it because "OpenAI's own default for `strict` is falsy, so it
+/// would refuse the common case". That was correct against the field as it stood — `#[serde(default)]
+/// strict: bool` made an omitted `strict` indistinguishable from an explicit `false`. The field
+/// is now `Option<bool>`, so only an explicit `false` is refused and the common case is
+/// untouched. The compat DTO `OpenAiCompatTextFormat` already carried `Option<bool>`; the
+/// information was being destroyed by `strict.unwrap_or(false)` at the translation, and that
+/// `unwrap_or` is gone.
+///
+/// **Both endpoints refuse the same shape**, which is the property F35 and F46 both insisted on.
+/// This is the third member of that family: `json_object` (F46) and non-strict `json_schema`
+/// (here) are both refused natively and on `/v1/responses`.
+///
+/// *Reversal condition:* this refusal becomes an honouring when `rig-core` exposes strictness on
+/// a typed `CompletionRequest` seam — not through `additional_params` — for every variant of
+/// [`crate::domain::ProviderType`] Moira routes to. A release in which the OpenAI encoder reads
+/// a strictness input instead of hardcoding `true`, *and* Anthropic and Gemini gain an
+/// equivalent, is the concrete trigger. Partial support is not enough: routing-dependent
+/// semantics on a public API is the failure mode this refusal exists to avoid.
+fn refuse_non_strict_json_schema(format: &PublicResponseFormat) -> Result<(), AppError> {
+    if let PublicResponseFormat::JsonSchema {
+        strict: Some(false),
+        ..
+    } = format
+    {
+        return Err(AppError::unprocessable(
+            "unsupported_request_option",
+            "response_format json_schema strict=false is not supported: Moira has no way to ask \
+             a provider for non-strict structured output, so the request would be answered in \
+             strict mode instead — which makes every declared property required and can be \
+             rejected outright by the provider. Omit strict, or send strict=true.",
         ));
     }
     Ok(())
@@ -2331,7 +2405,12 @@ mod tests {
             );
         };
         assert_eq!(name, "answer");
-        assert!(!strict, "strict defaults to false when the caller omits it");
+        assert_eq!(
+            strict, None,
+            "F45 — an omitted strict must stay None. Under the previous `#[serde(default)] bool` it
+             collapsed to `false`, which is the value that is now refused, so the distinction is
+             the whole fix"
+        );
         assert_eq!(schema["properties"]["answer"]["type"], "string");
     }
 
@@ -2354,7 +2433,10 @@ mod tests {
         let public = openai_compat_to_public_request(request).expect("strict schema should map");
         assert!(matches!(
             public.response_format,
-            PublicResponseFormat::JsonSchema { strict: true, .. }
+            PublicResponseFormat::JsonSchema {
+                strict: Some(true),
+                ..
+            }
         ));
     }
 
@@ -2384,9 +2466,43 @@ mod tests {
         refuse_json_object(&PublicResponseFormat::JsonSchema {
             name: "answer".to_string(),
             schema: json!({ "type": "object" }),
-            strict: true,
+            strict: Some(true),
         })
         .expect("json_schema must stay honoured");
+    }
+
+    /// F45 — the predicate. Only an **explicit** `strict: false` is refused.
+    ///
+    /// The three cases are the whole point and none is padding. `None` is the common case and
+    /// the reason F35 judged this refusal unavailable — under the previous `#[serde(default)]
+    /// bool` it was the same value as `Some(false)`, so refusing would have refused everyone.
+    /// `Some(true)` is the case that matches what rig actually sends. If either regressed to a
+    /// refusal the endpoint would be broken for every structured-output caller, and refusing
+    /// everything would otherwise be the cheapest way to make the first assertion green.
+    #[test]
+    fn native_strict_false_is_refused_and_an_omitted_or_true_strict_is_not() {
+        let refused = |strict: Option<bool>| {
+            refuse_non_strict_json_schema(&PublicResponseFormat::JsonSchema {
+                name: "answer".to_string(),
+                schema: json!({ "type": "object" }),
+                strict,
+            })
+        };
+
+        let err = refused(Some(false)).expect_err("strict=false must be refused");
+        assert_eq!(
+            compat_error(&err),
+            Some((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported_request_option"
+            )),
+            "got {err:?}"
+        );
+
+        refused(None).expect("an omitted strict must stay honoured — it is the common case");
+        refused(Some(true)).expect("strict=true must stay honoured — it is what rig sends");
+        refuse_non_strict_json_schema(&PublicResponseFormat::Text)
+            .expect("text carries no schema and must be untouched");
     }
 
     /// `json_object` is refused rather than translated, on the compat path's own field name.
