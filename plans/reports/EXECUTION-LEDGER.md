@@ -2352,7 +2352,14 @@ because the preference never fires.
 Not Sub-Phase F's to close, and recorded rather than fixed in passing: it changes what every caller
 of the execution API receives, which deserves its own change and its own tests.
 
-### F30 — there are TWO memory-consent columns, and nothing makes them agree
+**The fail-hard variant F29 chose *not* to adopt has its own three preconditions, and all three now
+hold** — F39 landed; `StructuredOutputInvalid` has a recorded, guarded disposition (in none of
+`is_retryable`, `is_fallback_eligible`, `is_circuit_failure`); and `run_extraction` reads
+`execution.status`. The last two landed on `fix/f30-consent-columns` (2026-08-03). **The flip is
+still deliberately unshipped**; see "F30 CLOSED (partly refuted) · F29's last two preconditions
+LANDED" below and the doc comment on `structured_output_from_text`.
+
+### F30 — there are TWO memory-consent columns, and nothing makes them agree — **CLOSED, premise partly REFUTED**, see "F30 CLOSED (partly refuted)" below
 
 `application_memory_policies.consent_mode` and
 `application_conversation_policies.memory_consent_mode` are **independent**, both default
@@ -3785,11 +3792,16 @@ must have passed"* is exactly the inference §2.2 exists to prevent.
 answered first and neither RAG table's configuration is read through any cache, so both lose the
 trigger. F50's **silence is fixed** — `warn!`, runtime event, audit row — while the fail-closed vs
 fail-open **product decision is deliberately still open**, because observability is the part both
-answers share rather than half of one of them. The two remaining strict-structured-output
-preconditions are unshipped by design. **PR #57 (F32) is still held for human sight.**
+answers share rather than half of one of them. ~~The two remaining strict-structured-output
+preconditions are unshipped by design.~~ — **both landed on `fix/f30-consent-columns`
+(2026-08-03); the flip itself is still deliberately unshipped, and its reversal condition now
+holds.** **F30** closed on the same branch, its premise partly refuted. **PR #57 (F32) is still
+held for human sight.**
 
-**The only thing still needing a human on the findings queue is therefore F50's product decision**,
-plus the pre-existing F33 (envelope encryption scoping) and F32's held PR.
+**The things still needing a human on the findings queue are therefore F50's product decision** and
+**the structured-output fail-hard flip** — now unblocked rather than blocked, which makes it a
+choice about blast radius rather than a wait — plus the pre-existing F33 (envelope encryption
+scoping), the newly raised F54 (extraction runs carry no `execution_id`), and F32's held PR.
 
 
 ### Cycle 15 — 2026-08-02 — `fix/f40-f47-response-output-and-policy-reads`: one refutation, one understatement, two new findings
@@ -3802,6 +3814,170 @@ Two independent findings closed on one branch, separate commits, one gate run.
 | **F47** | **confirmed and understated by a factor of two** — it named two consequences and there were four, including a cluster-wide cache wipe |
 | **F51** | raised — the invalidation channel is attached to per-request data tables and `apply_invalidation` ignores its own scope for three of four targets |
 | **F52** | raised — three triggered tables are unclassified, and the shipped guard that exists to catch that retypes its inventory instead of deriving it |
+
+## F30 CLOSED (partly refuted) · F29's last two preconditions LANDED — `fix/f30-consent-columns`, 2026-08-03
+
+Two independent pieces, separate commits (`673f9c0`, `4824838`, `ff7f5e2`), one gate run.
+
+| finding | verdict |
+|---|---|
+| **F30** | **premise partly REFUTED, and confirmed at a site it did not name.** "No code path reconciles them" was true when written and false by the time it was read: `effective_extraction_status` has taken the stricter of the two since Sub-Phase F, tested with the columns disagreeing in both directions. **But the reader F30 predicted had already arrived** — `ConversationRecord.memory_behavior` was one of the two columns, computed in SQL |
+| **F29 preconditions** | both remaining ones **landed**. The fail-hard flip is deliberately **not** taken; the reversal condition now holds and the flip is a separate, reviewable change |
+| **F54** | raised — a failed extraction cannot be correlated to its execution except through an unenforced `request_id` string convention |
+
+### F30 — the finding was right about the shape and wrong about the site
+
+The entry said *"no constraint or code path reconciles them"*. **One does**, and has since plan 11
+Sub-Phase F: `effective_extraction_status` takes the stricter of the two, and
+`explicit_only_on_the_conversation_policy_alone_still_withholds_the_memory` and
+`disabled_consent_calls_no_extractor_and_writes_no_run_row` already drove the columns *apart* in
+both directions. As an extraction defect F30 is **refuted**.
+
+**Its own predicted failure mode had happened anyway.** `conversation_select` emitted
+`coalesce(mp.consent_mode, 'explicit_only') as memory_behavior`, and that value is returned to
+every caller of `GET /api/v1/conversations` and `GET /api/v1/conversations/{id}`. An application
+with `memory_consent_mode = 'disabled'` on the conversation policy and
+`consent_mode = 'application_managed'` on the memory policy was **told `application_managed`
+while extraction was refusing**. Exactly the shape the entry named — two columns that agree in
+every default deployment and disagree only where an operator deliberately tightened one — and
+every test in the tree set them to the same value, which is why it shipped.
+
+**The reason it happened in SQL is the whole lesson, and it is a sharpening of "reconcile in one
+place".** The combining rule *was* in one place: an application-layer function over
+`Option<MemoryStatus>`. A query cannot call an application-layer function, and the value
+`memory_behavior` needed was a *mode*, not a status — so the second reader could not reuse the
+rule even if its author had wanted to, and wrote its own in six words. **"One place in code" is
+only a barrier if it is reachable from every layer that needs the answer, in the type that layer
+needs.** The rule now lives on `MemoryConsentMode` as `stricter_of`, which is why
+`src/infra/pg_rows.rs` can apply it and `conversation_select` can go back to selecting two raw
+columns and deciding nothing.
+
+Three barriers, in decreasing strength:
+
+1. **There is no consent decision in SQL any more.** The query hands both columns up.
+2. **`status_for_consent_mode` is private and no longer re-exported.** It turned *one* column into
+   a decision, which made it the autocomplete answer for anyone holding one. The only exported
+   entry point takes both.
+3. **Two guards on the data layer**, because 1 and 2 constrain the code that exists and F30 is
+   about the code that does not yet.
+
+`create_memory` still reads the memory column alone. That is deliberate — a manual memory is
+`user_application`-scoped and carries no conversation id, so the conversation policy is not
+describing it — and it is now labelled as a decision in code and in `docs/memory-consent.md`
+rather than sitting there looking like the defect.
+
+**The mutation that mattered**, and it is the one the brief named: a guard that sets both columns
+to the same value cannot see a reader consulting one of them.
+
+| mutation | observed |
+|---|---|
+| `effective_memory_behavior` reports the memory column alone (the shipped defect, restored) | `the_reported_memory_behavior_is_the_stricter_of_the_two_consent_columns` **red** — *"conversation=Disabled memory=ApplicationManaged: the value reported to callers must be the one enforced; left: "application_managed", right: "disabled""*. Every other consent test in the file stayed green, which is precisely how this shipped |
+| a new single-column read added to `conversation_select` (a fourth reader appearing) | both data-layer guards **red**; the count guard named the file and the direction — `("src/infra/repositories/conversation.rs", 8, 7)` against an expected `(7, 7)` |
+| the conversation-policy read **removed** from `conversation_select` | both **red**; the count guard went `(6, 6)` against `(7, 7)`. This is the direction a membership guard cannot see — §3.4's thirteenth shape — and is why the table is compared as a whole rather than asserted upward |
+| `stricter_of` ignores its conversation argument (the rule neutered, SQL untouched) | four unit guards **red**, including `the_combined_consent_decision_is_symmetric`, which was already in the tree and is the one no single-column implementation can pass. The two data-layer guards stayed **green**, correctly — they guard the shape of the query, not the rule |
+
+**Cheapest edit that breaks the property while leaving the guards green** — one found, bounded and
+recorded rather than fixed: **swapping `stricter_of`'s arguments** at the `memory_behavior` call
+site. The function is symmetric except on the tie between the two equally-permissive modes, and the
+integration case that exercises a tie uses two *agreeing* values, so nothing goes red. The blast
+radius is which of `application_managed` / `automatic_with_user_controls` is reported when the two
+columns hold one each — a label difference between two modes that permit the same thing, never a
+consent difference. Closing it would need a tie case with the columns disagreeing, which is worth
+adding the next time this file is opened.
+
+### F29's preconditions — the disposition question had a different answer than expected
+
+Precondition 1 asked for a retry/fallback disposition for `StructuredOutputInvalid`. The answer is
+**stay out of all three sets** — the same *behaviour* it had by omission, now a recorded decision —
+but the reasoning is not the same in the three directions, and one of them nearly went the other
+way.
+
+- **Retry: no.** The two live emitters reject the *caller's schema* before the model is called, and
+  an unreadable schema is unreadable on the second attempt. For the reply case the flip would add,
+  Moira pins `temperature: Some(0.0)` on its own schema-carrying calls, so a resample is
+  bit-identical; and a retry budget spent on a chatty model is an attempt not available to the
+  transport failure retries exist for.
+- **Fallback: nearly yes.** The real argument was DeepSeek — a provider that *structurally cannot*
+  send a schema will never comply, and the next one might. **F39 answered that at routing time**, so
+  a model that cannot carry a schema is no longer selected for a schema-carrying request. What is
+  left is a caller schema that fails everywhere, or a model declining, which is a quality question
+  the fallback chain is not scoped for.
+- **The decisive constraint, and it is worth stating on its own: a class carries exactly one
+  disposition, and this class has two emitters.** `is_fallback_eligible` cannot tell "the model
+  replied badly" from "the caller sent a 2 MB schema". Admitting it would let one malformed schema
+  walk the entire fallback chain on every request — caller-triggered amplification against every
+  provider the route lists.
+- **Circuit: no, and least arguable.** Breaker entries are per `(provider, model)` and refuse
+  traffic for *every* caller. A request-shaped failure that can open one is a denial of service
+  wearing a health check's clothes.
+
+**The claim in precondition 3 was overstated, and checking it changed the fix.** The doc comment
+said reclassifying would lose *"the only signal"* distinguishing "the model did not comply" from
+"the call did not happen". It is not the only one: `audit_execution` writes an `audit_logs` row with
+`metadata.failure_class`, and `complete_failed_attempt` writes `execution_attempts.failure_class`.
+What is true is narrower and still bad — the signal is lost from `memory_extraction_runs`, the
+operator-facing record for extraction, and recovering it needs an undocumented string-format join
+(**F54**).
+
+**The fix is deliberately general rather than one arm for `StructuredOutputInvalid`.** A special
+case for that class would be **unreachable by any test in this tree**: extraction builds its own
+always-readable schema and never crosses `validate_response_format`, so neither live emitter is on
+that path. An arm no test can execute is a promise, not a guard. `run_extraction` now records the
+execution's own failure class, which *is* reachable — and the proof is that
+`a_failed_extraction_call_leaves_the_response_untouched` went red on a real provider 500 and now
+asserts `provider_unavailable` where it asserted `extraction_call_failed`.
+
+**The consequence worth keeping:** a non-conforming reply is recorded as `structured_output_invalid`
+**before and after the flip** — today by `parse_candidates` refusing prose, afterwards by the
+execution. The signal precondition 3 was protecting survives the flip instead of being traded for it.
+
+**Mutations.**
+
+| mutation | observed |
+|---|---|
+| `StructuredOutputInvalid` added to `is_fallback_eligible` | both disposition guards **red**; the table one printed *"StructuredOutputInvalid: (retryable, fallback_eligible, circuit_failure) changed … left: (false, true, false), right: (false, false, false)"* |
+| `ProviderTimeout` **removed** from `is_retryable` | the single-variant guard **green**, the table guard **red** — §3.4's thirteenth shape, demonstrated on the guard written to survive it |
+| the `run_extraction` call site reverted to the constant, leaving the helper and its unit tests intact | unit guards **green**, integration guard **red**. This is F49's lesson in one line, and it is *why* the general form was chosen: had the fix special-cased `StructuredOutputInvalid`, this mutation would have had no red at all |
+
+**Cheapest edit that breaks the property while leaving the guards green:** for the disposition,
+adding a **third emitter** of `StructuredOutputInvalid` on a model-output path without revisiting
+the decision. Not a new gap — F42's
+`structured_output_invalid_has_only_the_two_emitters_its_catalog_entry_describes` is the interlock,
+and the disposition guard's body now points at it so a red there is read as "re-open this decision"
+rather than "fix the count".
+
+### Why the flip is still not shipped
+
+The reversal condition holds in full: F39 landed, the disposition is recorded and guarded, and
+`run_extraction` reads `execution.status`. **It is still not taken here, and that is the point.**
+The flip turns a silent `None` into a terminal 422 for every caller whose model returns prose, on a
+class that by design neither retries nor falls back — a blast-radius decision that deserves its own
+diff and its own review rather than arriving inside the work that unblocked it.
+
+What it must still do is written down at `structured_output_from_text`: widen the catalog
+description, expect F42's emitter guard to go **red** (that red is the interlock working), re-read
+the disposition with three emitters in view, and replace the two `tests/structured_output.rs` cases
+that pin the current behaviour on both run paths.
+
+### F54 — a failed extraction cannot be correlated to its execution
+
+Found while discharging F29's third precondition. `memory_extraction_runs` has **no
+`execution_id` column**. The run row now records the execution's failure class, which is the
+question an operator asks first — but the follow-up ("show me that execution: which provider,
+which model, which attempts, what the sanitised provider message was") has no join key.
+
+The only correlation that exists is a **string convention**: `run_extraction` sets
+`request_id = format!("memory-extraction-{run_id}")`, and `audit_execution` writes that into
+`audit_logs.request_id`. Nothing enforces the format, no test asserts it, and no doc names it, so
+an operator can only find the execution by knowing to `like 'memory-extraction-%'` and parsing a
+uuid out of a string. `summarization` has the same shape.
+
+**Not fixed here**: it is a migration plus a writer plus an admin-surface question about whether
+the id is exposed, in a change whose subject was consent columns and failure labels. **Remedy in
+one change:** add `execution_id uuid` to `memory_extraction_runs` (and the summarization run
+equivalent), write it from the `ExecutionCommand` that is already in scope, and pin the
+correlation with a test that reads the execution back through it — at which point the `request_id`
+convention becomes a convenience rather than the only route.
 
 ## F53 CLOSED · F50 OBSERVABLE — `fix/f53-f50-silent-degradation`, 2026-08-03
 

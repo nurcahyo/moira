@@ -354,7 +354,7 @@ not have to carry a rotation caveat. F's remaining work is unchanged otherwise.
 
 ### 3.2b THE LEDGER IS AHEAD OF THIS TABLE — read it, not just §3.2 (2026-08-02)
 
-The table above was written when the highest finding was F28. **The ledger now runs to `F53`.**
+The table above was written when the highest finding was F28. **The ledger now runs to `F54`.**
 `plans/reports/EXECUTION-LEDGER.md` is authoritative; §3.2 is a summary that has already gone stale
 once. Current state of everything above F28:
 
@@ -368,7 +368,7 @@ once. Current state of everything above F28:
 | ~~**F51**~~ | ~~The `moira_runtime_config` channel is attached to **`conversations` and `memory_records`**, and `apply_invalidation` calls three `invalidate_all()`s **unconditionally**~~ | **CLOSED** `fix/f51-f52-invalidation-scope`. **Premise held in full — every count in it was right**, including 24 triggers when counted by *function* and which table's trigger is named differently. **Both fixes taken**: `invalidation_plan` returns `{caches, circuits}` and narrows one-way (unknown payloads still clear everything), and migration `0022` drops both triggers. **Nothing depended on them notifying** — `docs/runtime-cache-invalidation.md` never listed them, no cache in the process is keyed by a conversation or memory record, and `db.rs` is the only listener. The doc comment's standing defence ("re-reading costs a query") was **true of two caches and false of the third**: `ProviderRuntimeCache` holds built Rig clients with connection pools. Five mutations; **the cheapest edit — honour the plan for `runtime_cache` only — reds only the handles assertion.** Raised **F53** |
 | ~~**F52**~~ | ~~**A shipped, trusted guard whose list is retyped rather than pinned, and it has already drifted.**~~ | **CLOSED** `fix/f51-f52-invalidation-scope`. Premise held in full; `pg_trigger` returns exactly 24 and the three `legacy_*` tables still carry their **pre-rename trigger names**, so a name-based query mis-attributes as well as misses. `TRIGGERED_RESOURCE_TYPES` is now pinned against `pg_trigger` **both directions**, counted by trigger function, floored by `MINIMUM_TRIGGERED_TABLES`. The three legacy tables **lose their triggers** (`0023`) rather than being classified — the only references in the whole tree are inside `0003` itself, as a backfill source. Four mutations; **attaching the trigger to a new table reds the inventory test — the forward drift the retyped list could never detect — and "fixing" that red by adding the name to the constant alone reds the unit guard instead.** |
 | ~~**F53**~~ | ~~**F51's class, one table over and at admin rate:** `rag_documents` and `rag_collections` are content, not configuration, both carry the notify trigger and both are `caches: true`~~ | **CLOSED** `fix/f53-f50-silent-degradation`. **The gating question was answered before the fix was chosen, and both tables have the same answer: no.** `rag_collections` carries no runtime configuration at all — the embedding model and dimension the entry guessed at live in `application_embedding_policies`, and the collection is joined only to reach `application_id`. The three caches are closed types (`HashMap<Uuid, ProviderConfig>`, one `Vec<PublicAuthMethod>`, and a map keyed by `RuntimeCacheKey`'s seven provider/model/credential/policy fields), so no RAG row can be in any of them. Both lose the trigger (`0024`) **and** move into `RUNTIME_DATA_RESOURCE_TYPES`. Five mutations; the two that matter — reverting the classifier for **one** table — red only the integration guard and **leave every unit test green**, because a guard that iterates a constant cannot see a name removed from it |
-| **F30** | `application_memory_policies.consent_mode` and `application_conversation_policies.memory_consent_mode` are independent, both default `'explicit_only'`, and nothing reconciles them | open. Sub-Phase F takes the **stricter of the two** (D4), but the schema divergence remains. *The shape that hides:* they agree in every default deployment and diverge exactly when an operator tightens one |
+| ~~**F30**~~ | ~~`application_memory_policies.consent_mode` and `application_conversation_policies.memory_consent_mode` are independent, both default `'explicit_only'`, and nothing reconciles them~~ | **CLOSED, premise partly REFUTED** `fix/f30-consent-columns`. *Extraction* has reconciled them since Sub-Phase F and is tested with the columns **disagreeing** in both directions — as an extraction defect this is refuted. **But the reader it predicted had already arrived:** `ConversationRecord.memory_behavior` was `coalesce(mp.consent_mode, …)` **in SQL**, so `GET /api/v1/conversations` reported `application_managed` while extraction refused under a conversation policy of `disabled`. The lesson is a sharpening of *reconcile in one place*: the rule was in one place, in the **application layer**, and a query could not call it — it now lives on `MemoryConsentMode::stricter_of` so `pg_rows` can, and `conversation_select` decides nothing. `status_for_consent_mode` is private so no single-column answer has a ready-made caller. Four mutations; the one that matters restores the shipped defect and reds **only** the guard whose columns disagree |
 | **F48** | **A third `output_schema` drop path, and it is silent even on OpenAI.** Rig also requires `tools.is_empty() \|\| history_has_tool_result`, so the schema is dropped on turn 1 of any tool-calling conversation with **no `warn!` at all** — the warning at that site fires only for the DeepSeek case. Latent only because `build_completion_request` hardcodes `tools: Vec::new()`; it goes live the day tool calling is enabled. **F39's fix does not cover it** — that reconciles per provider type, this drop is per request | **latent, now GUARDED, behaviour deliberately unchanged.** Premise re-verified: that constructor is the tree's only `CompletionRequest`, and `public.rs` refuses caller-declared tools outright. `moiras_request_still_carries_its_schema_onto_rigs_openai_wire_body` reds on the precondition |
 | **F49** | **No integration test ever built a request from an agent profile** — every fixture left `agent_profile_id` NULL, so `preamble`/`temperature`/`max_tokens`/`tool_policy` were unverified at the wire | **CLOSED** `fix/f49-agent-profile-coverage`. Premise held; the column is on `route_definitions`, not `routing_policies`. `tests/agent_profile_wire.rs` now builds from a real profile and reads the mock's body. **The branch is correct at the wire.** Eight mutations run. Under F48's mutation only the new `tool_policy` case reds — **F48's guard is not superseded.** Raised F50 |
 | **F50** | **A disabled or soft-deleted agent profile silently degrades every execution on its route** — `get_active_agent_profile` filters on `status='active'`, neither disable nor soft-delete clears the route's FK, and `Ok(None)` is treated as "no profile": preamble, temperature and max_tokens vanish, and the run reports `succeeded` | **OBSERVABLE; the product decision is STILL OPEN.** `fix/f53-f50-silent-degradation` ships a `warn!`, a `RuntimeEventType::AgentProfileUnavailable` runtime event and an `agent_profile.unavailable` audit row. **The request's behaviour is unchanged** — fail-closed vs fail-open is **not** decided here, because silence is a defect under either answer and the observability is the part they share, not half of one. "No profile" and "profile vanished" are distinguished at the call site by reading `route.agent_profile_id` *before* the lookup. *Reversal condition:* the decision makes this "observe and refuse" or leaves it as is; **the observability is not revisited.** The `documents_`-named case is now scoped to the fail-open behaviour alone, so the three observability guards survive either answer |
@@ -385,8 +385,15 @@ and fixed **asymmetrically because they are not the same problem**: DeepSeek is 
 now reads Rig's own `SUPPORTS_RESPONSE_FORMAT` associated const rather than restating it, so a
 `rig-core` bump cannot silently rot the answer — while `OpenAiCompatible`/`Local` is **undecidable
 at admission** (Rig does send the schema; whether a self-hosted backend honours it is unknowable)
-and is deliberately still admitted. Unblocks **one of the three** preconditions F29's reversal
-condition names, so **the lenient parse stays** — see the ledger's F39 section.
+and is deliberately still admitted. Unblocked **one of the three** preconditions F29's reversal
+condition names — see the ledger's F39 section. **The other two landed on
+`fix/f30-consent-columns` (2026-08-03), so the reversal condition now holds in full and the flip is
+a choice rather than a wait.** `StructuredOutputInvalid`'s disposition is *stay out of all three*
+sets, recorded at each function and guarded bidirectionally; `run_extraction` reads
+`execution.status` and records the execution's own failure class. **The lenient parse still stays**
+— the flip turns a silent `None` into a terminal 422 on a class that neither retries nor falls
+back, and that blast radius deserves its own diff. What it must do is written at
+`structured_output_from_text`.
 
 **Finding IDs are allocated concurrently and have collided three times.** `F22` and `F28` each name
 **two** unrelated findings; `F21` has two entries; F27 was written as F26 until #47 claimed it.
@@ -606,6 +613,25 @@ counter-example that happens to be the one that matters. And for F45, the *only*
 the cheapest edit — collapsing an omitted `strict` back into an explicit `false` at the compat
 translation — was a **control** case asserting that the omitted spelling still succeeds. Every
 primary refusal assertion stayed green through it. Controls are not padding.
+
+**A sharpening about *barriers*, from F30 — it is not a fourteenth guard, it is the thing guards
+are supposed to be protecting.** The standing advice for "two inputs that must be read together" is
+*reconcile in one place in code that every reader must go through*. F30 had that: the
+stricter-of-two-consent-columns rule lived in exactly one function. A second reader appeared anyway,
+in **SQL**, and got it wrong — because the one place was an application-layer function over a type
+(`Option<MemoryStatus>`) that the layer needing the answer could neither call nor use. **A single
+point of truth is only a barrier if it is reachable from every layer that needs the answer, in the
+type that layer needs.** Otherwise the next reader is not being disciplined; it is being locked out,
+and it will reimplement.
+
+Two corollaries, both cheap:
+
+- **Ask which layers need the answer before choosing where the rule lives.** F30's fix was to move
+  the rule *down* to the domain type, which let `src/infra` apply it and let the query go back to
+  selecting raw columns and deciding nothing. Moving it up would have had the same failure.
+- **Delete the convenient wrong answer.** `status_for_consent_mode` turned *one* of the two columns
+  into a decision and was `pub`. Making it private is not tidying — it is removing the autocomplete
+  that any future single-column reader would have reached for first.
 
 ---
 
