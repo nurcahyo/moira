@@ -10,15 +10,48 @@
 //! disappear. Without it the whole dispatch path is untested and the sweep could
 //! be correct but never invoked.
 //!
-//! **Shared-database discipline.** These tests run against the same database as
-//! every other suite, and the sweep is global by construction — it deletes every
-//! expired row it can claim, not only this test's. So each test seeds rows carrying
-//! a unique marker and asserts on *those* rows by id, never on table-wide counts.
-//! Where a test needs its rows chosen first, it backdates them a century so no
-//! plausible concurrent fixture sorts ahead of them under `order by expires_at`.
-//! Tests that assert on a sweep's *counts* additionally take [`sweep_guard`], since
-//! no marker can stop a sibling sweep from deleting this test's rows and counting
-//! them as its own.
+//! # Every test owns a private database (finding F10 item 1)
+//!
+//! This was the last suite writing to the long-lived database
+//! `MOIRA_TEST_DATABASE_URL` names, and so the last source of cross-run coupling
+//! in `tests/`. It now uses [`support::TestDatabase`] like every other suite: a
+//! clone of the migrated template, dropped in `Drop` — including while the test
+//! is unwinding from a panic, which is exactly when a leak would otherwise be
+//! permanent.
+//!
+//! **That change was not cosmetic; it fixed two defects that fed each other.**
+//!
+//! 1. *An exact count against a sweep that was not this test's.* A sweep deletes
+//!    every expired row in the database it is connected to, not only the rows the
+//!    calling test seeded. On a shared database a sibling suite's expired rows
+//!    landed in this test's `RetentionOutcome`, so the counts could only be
+//!    asserted with `>=`, and the one place that genuinely needed equality — the
+//!    per-tick cap — was defended by a cluster-wide advisory lock that serialised
+//!    every sweep in every test binary and every worktree on the machine.
+//! 2. *A leak that poisoned later runs.* Rows were backdated a century so that
+//!    `order by expires_at` reached them before anything a concurrent fixture had
+//!    left expired. Cleanup was a `delete` at the end of the test body, which a
+//!    failing assertion skips. So one bad run left century-backdated rows behind
+//!    permanently, and they then sorted *ahead* of the next run's — the failure
+//!    reproduced itself for ever, against a database no test could clean.
+//!
+//! On a private clone neither exists. The table contains exactly what the test put
+//! in it, the counts are asserted with `==`, the advisory lock is gone, the century
+//! backdating is gone, and there is no cleanup path to skip: the whole database is
+//! discarded either way.
+//!
+//! **Isolation does not weaken what is under test.** A PostgreSQL connection is
+//! scoped to one database, so `run_once` was never *cluster*-wide — it is
+//! database-wide, and it is database-wide on a clone in exactly the same way, over
+//! the same code path. No test here asserts that a sweep reaches rows it did not
+//! itself seed; the original module comment said the opposite, that every
+//! assertion is scoped by id. What isolation removes is other suites' rows, which
+//! were never the subject.
+//!
+//! [`the_fixture_owns_a_disposable_database`] is the guard that says it has not
+//! been moved back.
+
+mod support;
 
 use std::{future::Future, time::Duration};
 
@@ -30,9 +63,11 @@ use moira::{
         workers::{self, retention},
     },
 };
-use sqlx::{PgPool, Postgres, Transaction, postgres::PgPoolOptions};
+use sqlx::PgPool;
 use tokio::{sync::oneshot, time::timeout};
 use uuid::Uuid;
+
+use support::TestDatabase;
 
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -42,68 +77,16 @@ const DATABASE_TIMEOUT: Duration = Duration::from_secs(30);
 /// budget is only ever spent by an actual failure.
 const SUPERVISOR_OBSERVATION_BUDGET: Duration = Duration::from_secs(15);
 
-/// Advisory-lock key serialising every retention sweep in the test suite.
-const RETENTION_SWEEP_LOCK: i64 = 0x4D4F_4952_4152_4554;
-
-/// Serialises the tests in this file against each other.
+/// A private, migrated database for one test.
 ///
-/// A retention sweep is **global**: it deletes every expired row it can claim,
-/// including rows a sibling test seeded a millisecond ago. Run in parallel, these
-/// tests steal each other's rows and each one's `RetentionOutcome` counts a mixture
-/// of both — which is not a bug in the worker, it is the worker behaving exactly as
-/// specified while two tests share one table. So each test takes this lock for its
-/// whole body and the sweeps run one at a time.
-///
-/// It is a **transaction-scoped** advisory lock deliberately: PostgreSQL releases it
-/// when the transaction ends, including the implicit rollback `sqlx` performs when
-/// the guard is dropped by a panicking test. A session-scoped lock would survive the
-/// connection's return to the pool and deadlock every later test.
-///
-/// This serialises across test binaries and processes too, not just within this file.
-async fn sweep_guard(pool: &PgPool) -> Transaction<'static, Postgres> {
-    let mut guard = pool.begin().await.expect("begin sweep guard transaction");
-    timeout(
-        DATABASE_TIMEOUT,
-        sqlx::query("select pg_advisory_xact_lock($1)")
-            .bind(RETENTION_SWEEP_LOCK)
-            .execute(&mut *guard),
-    )
-    .await
-    .expect("timed out waiting for the retention sweep lock")
-    .expect("acquire the retention sweep lock");
-    guard
-}
-
-/// Fail-closed exactly as `tests/support/mod.rs` does — matching on the **value**
-/// of `CI`, never merely on the variable being present (`CONVENTIONS.md` §3).
-async fn test_pool() -> Option<PgPool> {
-    let database_url = match std::env::var("MOIRA_TEST_DATABASE_URL") {
-        Ok(value) if !value.trim().is_empty() => value,
-        _ if std::env::var("CI").is_ok_and(|value| value.eq_ignore_ascii_case("true")) => {
-            panic!("MOIRA_TEST_DATABASE_URL is required when CI=true for retention worker tests")
-        }
-        _ => {
-            eprintln!("skipping retention worker tests: MOIRA_TEST_DATABASE_URL is not set");
-            return None;
-        }
-    };
-
-    let pool = timeout(
-        DATABASE_TIMEOUT,
-        PgPoolOptions::new()
-            .max_connections(4)
-            .connect(&database_url),
-    )
-    .await
-    .expect("retention database connection timed out")
-    .expect("connect retention test database");
-
-    timeout(DATABASE_TIMEOUT, sqlx::migrate!().run(&pool))
-        .await
-        .expect("retention migrations timed out")
-        .expect("run retention migrations");
-
-    Some(pool)
+/// Returns `None` — and the caller returns early — when `MOIRA_TEST_DATABASE_URL`
+/// is unset outside CI, which is [`support::TestDatabase`]'s own fail-closed
+/// behaviour: it panics when `CI=true` and prints the `skipping database-backed
+/// tests` line `scripts/gates.sh` asserts on otherwise. The skip message this
+/// suite used to print, `skipping retention worker tests: …`, matched neither of
+/// the gate's two patterns, so a silent skip here was invisible to the gate.
+async fn test_database() -> Option<TestDatabase> {
+    TestDatabase::create().await
 }
 
 fn settings(batch_size: usize) -> WorkerSettings {
@@ -170,6 +153,25 @@ async fn row_exists(pool: &PgPool, table: &str, id: Uuid) -> bool {
         .expect("existence check")
 }
 
+/// Every row in a retention table, not only this test's.
+///
+/// Meaningless on a shared database and precise on a private one: the table holds
+/// exactly what the test put there, so a whole-table count is a direct statement
+/// about what the sweep did and did not delete. It is the assertion that catches a
+/// sweep deleting *more* than the rows named below — which a set of by-id
+/// existence checks, however many, cannot.
+async fn table_count(pool: &PgPool, table: &str) -> i64 {
+    let sql = match table {
+        "idempotency_records" => "select count(*) from idempotency_records",
+        "responses" => "select count(*) from responses",
+        other => panic!("unexpected table {other}"),
+    };
+    sqlx::query_scalar::<_, i64>(sql)
+        .fetch_one(pool)
+        .await
+        .expect("table count")
+}
+
 /// Bounded polling. Returns `true` as soon as `condition` holds, `false` once
 /// `budget` is spent.
 ///
@@ -177,7 +179,7 @@ async fn row_exists(pool: &PgPool, table: &str, id: Uuid) -> bool {
 /// *observed* state change, so a working supervisor satisfies it on the first or
 /// second iteration and the test costs milliseconds. Only a genuine failure pays
 /// the full budget. The paced tick exists solely so the loop does not spin the
-/// four-connection pool that the supervisor itself must acquire from — the first
+/// connection pool that the supervisor itself must acquire from — the first
 /// `interval` tick completes immediately, so it adds no latency to the happy path.
 async fn poll_until<F, Fut>(budget: Duration, mut condition: F) -> bool
 where
@@ -209,19 +211,19 @@ async fn surviving(pool: &PgPool, table: &str, ids: &[Uuid]) -> usize {
 
 #[tokio::test]
 async fn retention_run_deletes_expired_idempotency_records_and_keeps_live_rows() {
-    let Some(pool) = test_pool().await else {
+    let Some(database) = test_database().await else {
         return;
     };
-    let _sweep_guard = sweep_guard(&pool).await;
+    let pool = &database.pool;
     let marker = format!("ret-{}", Uuid::now_v7());
 
     // Expired an hour ago.
-    let expired = insert_idempotency_record(&pool, &marker, 1, 3_600).await;
+    let expired = insert_idempotency_record(pool, &marker, 1, 3_600).await;
     // Expires in an hour (negative age => future).
-    let live = insert_idempotency_record(&pool, &marker, 2, -3_600).await;
+    let live = insert_idempotency_record(pool, &marker, 2, -3_600).await;
 
     let outcome = retention::run_once(
-        &pool,
+        pool,
         &settings(500),
         &MetricsRegistry::new("moira-retention-test", None),
     )
@@ -229,41 +231,44 @@ async fn retention_run_deletes_expired_idempotency_records_and_keeps_live_rows()
     .expect("retention sweep");
 
     assert!(
-        !row_exists(&pool, "idempotency_records", expired).await,
+        !row_exists(pool, "idempotency_records", expired).await,
         "an expired idempotency record must be pruned"
     );
     assert!(
-        row_exists(&pool, "idempotency_records", live).await,
+        row_exists(pool, "idempotency_records", live).await,
         "an unexpired idempotency record must survive the sweep"
     );
-    assert!(
-        outcome.idempotency_records_deleted >= 1,
-        "the sweep must report the row it deleted, got {outcome:?}"
+    assert_eq!(
+        outcome.idempotency_records_deleted, 1,
+        "one row was expired, so the sweep must report exactly one deletion, got {outcome:?}"
     );
-
-    sqlx::query("delete from idempotency_records where id = $1")
-        .bind(live)
-        .execute(&pool)
-        .await
-        .expect("cleanup");
+    assert_eq!(
+        outcome.responses_deleted, 0,
+        "no `responses` row was seeded, so the sweep must report none deleted, got {outcome:?}"
+    );
+    assert_eq!(
+        table_count(pool, "idempotency_records").await,
+        1,
+        "the live row must be the only one left in the table"
+    );
 }
 
 #[tokio::test]
 async fn retention_run_deletes_expired_responses_and_keeps_rows_with_null_or_future_expires_at() {
-    let Some(pool) = test_pool().await else {
+    let Some(database) = test_database().await else {
         return;
     };
-    let _sweep_guard = sweep_guard(&pool).await;
+    let pool = &database.pool;
     let marker = format!("ret-{}", Uuid::now_v7());
 
-    let expired = insert_response(&pool, &marker, 1, "now() - interval '1 hour'").await;
-    let future = insert_response(&pool, &marker, 2, "now() + interval '1 hour'").await;
+    let expired = insert_response(pool, &marker, 1, "now() - interval '1 hour'").await;
+    let future = insert_response(pool, &marker, 2, "now() + interval '1 hour'").await;
     // The common case: no retention policy configured, so `expires_at` is NULL.
     // A NULL must never be treated as "expired long ago".
-    let never = insert_response(&pool, &marker, 3, "null").await;
+    let never = insert_response(pool, &marker, 3, "null").await;
 
     let outcome = retention::run_once(
-        &pool,
+        pool,
         &settings(500),
         &MetricsRegistry::new("moira-retention-test", None),
     )
@@ -271,35 +276,34 @@ async fn retention_run_deletes_expired_responses_and_keeps_rows_with_null_or_fut
     .expect("retention sweep");
 
     assert!(
-        !row_exists(&pool, "responses", expired).await,
+        !row_exists(pool, "responses", expired).await,
         "an expired response must be pruned"
     );
     assert!(
-        row_exists(&pool, "responses", future).await,
+        row_exists(pool, "responses", future).await,
         "a response expiring in the future must survive"
     );
     assert!(
-        row_exists(&pool, "responses", never).await,
+        row_exists(pool, "responses", never).await,
         "a response with a NULL expires_at must survive"
     );
-    assert!(
-        outcome.responses_deleted >= 1,
-        "the sweep must report the response it deleted, got {outcome:?}"
+    assert_eq!(
+        outcome.responses_deleted, 1,
+        "one response was expired, so the sweep must report exactly one deletion, got {outcome:?}"
     );
-
-    sqlx::query("delete from responses where id = any($1)")
-        .bind(vec![future, never])
-        .execute(&pool)
-        .await
-        .expect("cleanup");
+    assert_eq!(
+        table_count(pool, "responses").await,
+        2,
+        "the future-dated and NULL rows must both be left behind"
+    );
 }
 
 #[tokio::test]
 async fn retention_run_respects_the_configured_batch_size() {
-    let Some(pool) = test_pool().await else {
+    let Some(database) = test_database().await else {
         return;
     };
-    let _sweep_guard = sweep_guard(&pool).await;
+    let pool = &database.pool;
     let marker = format!("ret-{}", Uuid::now_v7());
 
     // `batch_size = 1` gives a per-tick cap of 1 * PER_TICK_BATCH_BUDGET, which is
@@ -307,15 +311,18 @@ async fn retention_run_respects_the_configured_batch_size() {
     let per_tick_cap = retention::RetentionPlan::PER_TICK_BATCH_BUDGET as usize;
     let seeded = per_tick_cap * 2 + 3;
 
-    // Backdated a century so `order by expires_at` reaches these rows before any
-    // row a concurrent suite might have left expired.
+    // Expired an hour ago. These used to be backdated a century so that
+    // `order by expires_at` reached them before whatever a concurrent suite had
+    // left expired on the shared database; on a private clone they are the only
+    // expired rows there are, and the backdating was also what made a leak from a
+    // failed run poison every later one.
     let mut ids = Vec::with_capacity(seeded);
     for nth in 0..seeded {
-        ids.push(insert_idempotency_record(&pool, &marker, nth, 3_153_600_000).await);
+        ids.push(insert_idempotency_record(pool, &marker, nth, 3_600).await);
     }
 
     let first = retention::run_once(
-        &pool,
+        pool,
         &settings(1),
         &MetricsRegistry::new("moira-retention-test", None),
     )
@@ -330,15 +337,20 @@ async fn retention_run_respects_the_configured_batch_size() {
         "one sweep must delete exactly the per-tick cap, not the whole backlog"
     );
     assert_eq!(
-        surviving(&pool, "idempotency_records", &ids).await,
+        surviving(pool, "idempotency_records", &ids).await,
         seeded - per_tick_cap,
         "the remainder of the backlog must be left for the next tick"
+    );
+    assert_eq!(
+        table_count(pool, "idempotency_records").await,
+        (seeded - per_tick_cap) as i64,
+        "the cap bounds the whole sweep, so no row outside the seeded backlog may go either"
     );
 
     // Repeated ticks drain the backlog rather than stalling on it.
     for _ in 0..4 {
         retention::run_once(
-            &pool,
+            pool,
             &settings(1),
             &MetricsRegistry::new("moira-retention-test", None),
         )
@@ -346,7 +358,7 @@ async fn retention_run_respects_the_configured_batch_size() {
         .expect("drain sweep");
     }
     assert_eq!(
-        surviving(&pool, "idempotency_records", &ids).await,
+        surviving(pool, "idempotency_records", &ids).await,
         0,
         "successive ticks must drain the whole backlog"
     );
@@ -373,20 +385,18 @@ async fn retention_run_respects_the_configured_batch_size() {
 /// the join shape asserts the invariant directly: the victim set is computed once,
 /// so no plan can exceed the bound. `set local` keeps the forcing inside this
 /// transaction, so the connection returns to the pool unmodified, and the rollback
-/// puts the deleted rows back for the cleanup below to find.
+/// puts the deleted rows back for the next iteration to find.
 #[tokio::test]
 async fn a_retention_batch_never_deletes_more_rows_than_its_limit_under_a_hostile_plan() {
-    let Some(pool) = test_pool().await else {
+    let Some(database) = test_database().await else {
         return;
     };
-    let _sweep_guard = sweep_guard(&pool).await;
+    let pool = &database.pool;
     let marker = format!("ret-{}", Uuid::now_v7());
 
-    // Backdated a century so every plan under test reaches these rows first under
-    // `order by expires_at`, whatever else the shared database has left expired.
     let mut ids = Vec::new();
     for nth in 0..24 {
-        ids.push(insert_idempotency_record(&pool, &marker, nth, 3_153_600_000).await);
+        ids.push(insert_idempotency_record(pool, &marker, nth, 3_600).await);
     }
 
     let sql = retention::batch_delete_sql("idempotency_records")
@@ -425,25 +435,26 @@ async fn a_retention_batch_never_deletes_more_rows_than_its_limit_under_a_hostil
         tx.rollback().await.expect("restore the batch's rows");
     }
 
-    sqlx::query("delete from idempotency_records where id = any($1)")
-        .bind(&ids)
-        .execute(&pool)
-        .await
-        .expect("cleanup");
+    assert_eq!(
+        surviving(pool, "idempotency_records", &ids).await,
+        ids.len(),
+        "every batch above was rolled back, so all {} rows must still be present",
+        ids.len()
+    );
 }
 
 #[tokio::test]
 async fn retention_run_does_not_block_a_concurrent_idempotency_claim() {
-    let Some(pool) = test_pool().await else {
+    let Some(database) = test_database().await else {
         return;
     };
-    let _sweep_guard = sweep_guard(&pool).await;
+    let pool = &database.pool;
     let marker = format!("ret-{}", Uuid::now_v7());
 
     // Two expired rows. One will be locked by a simulated claim transaction; the
     // other must still be swept while that lock is held.
-    let locked = insert_idempotency_record(&pool, &marker, 1, 3_600).await;
-    let unlocked = insert_idempotency_record(&pool, &marker, 2, 3_600).await;
+    let locked = insert_idempotency_record(pool, &marker, 1, 3_600).await;
+    let unlocked = insert_idempotency_record(pool, &marker, 2, 3_600).await;
 
     // Acknowledgement gates, not sleeps: `locked_tx` fires once the row lock is
     // definitely held, `release_tx` releases the holder once the sweep has run.
@@ -473,7 +484,7 @@ async fn retention_run_does_not_block_a_concurrent_idempotency_claim() {
     let outcome = timeout(
         Duration::from_secs(5),
         retention::run_once(
-            &pool,
+            pool,
             &settings(500),
             &MetricsRegistry::new("moira-retention-test", None),
         ),
@@ -483,14 +494,17 @@ async fn retention_run_does_not_block_a_concurrent_idempotency_claim() {
     .expect("retention sweep");
 
     assert!(
-        row_exists(&pool, "idempotency_records", locked).await,
+        row_exists(pool, "idempotency_records", locked).await,
         "a row locked by a concurrent claim must be skipped, not stolen"
     );
     assert!(
-        !row_exists(&pool, "idempotency_records", unlocked).await,
+        !row_exists(pool, "idempotency_records", unlocked).await,
         "an unlocked expired row must still be swept while another row is locked"
     );
-    assert!(outcome.idempotency_records_deleted >= 1);
+    assert_eq!(
+        outcome.idempotency_records_deleted, 1,
+        "exactly one of the two expired rows was claimable, got {outcome:?}"
+    );
 
     release_tx.send(()).expect("release the claim transaction");
     holder.await.expect("claim transaction task");
@@ -498,33 +512,33 @@ async fn retention_run_does_not_block_a_concurrent_idempotency_claim() {
     // Once the lock is gone the skipped row is picked up on the next tick — the
     // skip defers work, it does not drop it.
     retention::run_once(
-        &pool,
+        pool,
         &settings(500),
         &MetricsRegistry::new("moira-retention-test", None),
     )
     .await
     .expect("follow-up sweep");
     assert!(
-        !row_exists(&pool, "idempotency_records", locked).await,
+        !row_exists(pool, "idempotency_records", locked).await,
         "a previously locked row must be swept on a later tick"
     );
 }
 
 #[tokio::test]
 async fn retention_run_records_deleted_counts_for_observability() {
-    let Some(pool) = test_pool().await else {
+    let Some(database) = test_database().await else {
         return;
     };
-    let _sweep_guard = sweep_guard(&pool).await;
+    let pool = &database.pool;
     let marker = format!("ret-{}", Uuid::now_v7());
 
-    insert_idempotency_record(&pool, &marker, 1, 3_600).await;
-    insert_response(&pool, &marker, 1, "now() - interval '1 hour'").await;
+    insert_idempotency_record(pool, &marker, 1, 3_600).await;
+    insert_response(pool, &marker, 1, "now() - interval '1 hour'").await;
 
     let metrics = MetricsRegistry::new("moira-retention-test", None);
     let before = counters(&metrics);
 
-    let outcome = retention::run_once(&pool, &settings(500), &metrics)
+    let outcome = retention::run_once(pool, &settings(500), &metrics)
         .await
         .expect("retention sweep");
 
@@ -544,9 +558,22 @@ async fn retention_run_records_deleted_counts_for_observability() {
         outcome.responses_deleted,
         "the responses counter must match what the sweep reported"
     );
-    assert!(
-        outcome.total_deleted() >= 2,
-        "both seeded rows should have been swept, got {outcome:?}"
+    // Exact, not `>= 2`: the database holds exactly the two rows seeded above, so a
+    // counter that over-reports is as much a defect as one that under-reports.
+    assert_eq!(
+        after.idempotency_deleted - before.idempotency_deleted,
+        1,
+        "one expired idempotency record was seeded, got {outcome:?}"
+    );
+    assert_eq!(
+        after.responses_deleted - before.responses_deleted,
+        1,
+        "one expired response was seeded, got {outcome:?}"
+    );
+    assert_eq!(
+        outcome.total_deleted(),
+        2,
+        "both seeded rows and only those should have been swept, got {outcome:?}"
     );
 }
 
@@ -610,26 +637,24 @@ fn counter_value(rendered: &str, metric: &str, label: Option<&str>) -> u64 {
 /// `WorkerSupervisor` over a real [`AppState`] and never calls `run_once` at all.
 /// If the supervisor stops dispatching sweeps, this is the test that notices.
 ///
-/// It takes [`sweep_guard`] like its siblings, and for a stronger reason: unlike
-/// a direct `run_once` call, the supervisor keeps sweeping on a timer until it is
-/// shut down, so it would happily delete rows a sibling test seeded. It is shut
-/// down the instant the observation lands, before any assertion can panic out of
-/// the test and strand it.
+/// The supervisor keeps sweeping on a timer until it is shut down. On the shared
+/// database that made it a hazard to every sibling test and the reason this file
+/// held a cluster-wide advisory lock; on its own database it can only reach its
+/// own rows. It is still shut down the instant the observation lands, before any
+/// assertion can panic out of the test and strand it.
 #[tokio::test]
 async fn a_running_supervisor_dispatches_a_retention_sweep() {
-    let Some(pool) = test_pool().await else {
+    let Some(database) = test_database().await else {
         return;
     };
-    let _sweep_guard = sweep_guard(&pool).await;
+    let pool = &database.pool;
     let marker = format!("ret-{}", Uuid::now_v7());
 
     // Seeded before the supervisor starts, so the very first tick can claim it.
-    // Backdated a century for the usual reason: `order by expires_at` reaches this
-    // row in the first batch whatever else this shared database has left expired.
-    let expired = insert_idempotency_record(&pool, &marker, 1, 3_153_600_000).await;
+    let expired = insert_idempotency_record(pool, &marker, 1, 3_600).await;
     // A live row, so a passing test means "the worker ran and swept correctly",
     // not merely "something deleted rows".
-    let live = insert_idempotency_record(&pool, &marker, 2, -3_600).await;
+    let live = insert_idempotency_record(pool, &marker, 2, -3_600).await;
 
     let mut settings = Settings::default();
     settings.workers.enabled = true;
@@ -656,12 +681,12 @@ async fn a_running_supervisor_dispatches_a_retention_sweep() {
         .expect("workers are enabled, so a supervisor must be spawned");
 
     let swept = poll_until(SUPERVISOR_OBSERVATION_BUDGET, || async {
-        !row_exists(&pool, "idempotency_records", expired).await
+        !row_exists(pool, "idempotency_records", expired).await
     })
     .await;
 
     // Before the assertions, so a failure cannot leave a live sweeper running
-    // against the shared database while the guard unwinds.
+    // while the test unwinds.
     supervisor.shutdown().await;
 
     assert!(
@@ -670,19 +695,96 @@ async fn a_running_supervisor_dispatches_a_retention_sweep() {
          within {SUPERVISOR_OBSERVATION_BUDGET:?}; it did not, so the dispatch wiring is dead"
     );
     // `AppState::new` mints a fresh registry, so this counter observes only sweeps
-    // this supervisor dispatched — no other suite can inflate it.
+    // this supervisor dispatched.
     assert!(
         counters(&state.metrics).runs >= 1,
         "the supervisor's sweep must be counted, so an operator can see the worker is alive"
     );
     assert!(
-        row_exists(&pool, "idempotency_records", live).await,
+        row_exists(pool, "idempotency_records", live).await,
         "the supervisor's sweep must spare an unexpired row"
     );
+    assert_eq!(
+        table_count(pool, "idempotency_records").await,
+        1,
+        "a supervisor sweeping on a timer must delete the expired row and stop there"
+    );
+}
 
-    sqlx::query("delete from idempotency_records where id = $1")
-        .bind(live)
-        .execute(&pool)
-        .await
-        .expect("cleanup");
+// ---------------------------------------------------------------------------
+// Anti-leak guard
+// ---------------------------------------------------------------------------
+
+/// Finding F10 item 1: every row this suite writes must land in a database that is
+/// thrown away when the test ends, not in the long-lived one
+/// `MOIRA_TEST_DATABASE_URL` names.
+///
+/// **What this establishes.** That [`test_database`] hands out a per-test clone owned
+/// by [`support::TestDatabase`], whose `Drop` drops the database unconditionally — on
+/// a dedicated thread with its own runtime, so it runs while the test is unwinding
+/// from a panic. That is the case that mattered here: this suite seeds expired rows
+/// and had no cleanup path a failing assertion did not skip, so before this change one
+/// failed run left rows behind permanently.
+///
+/// **What it does not establish.** Not that `idempotency_records` is empty anywhere
+/// else; on a shared database "the table is empty" would prove nothing, and assertion
+/// (c) is meaningful *only* because (a) and (b) have established the database is
+/// private and freshly cloned. Not that teardown succeeds — a `SIGKILL`ed process
+/// never runs `Drop` and leaves a whole database for `sweep_leaked_databases` to
+/// collect an hour later. And not that any other suite is leak-free:
+/// `tests/test_database_isolation.rs` carries that, and it fails in both directions,
+/// so leaving `retention_worker.rs` on its `SHARED_DATABASE_ALLOWLIST` after this
+/// change would itself be an assertion failure.
+#[tokio::test]
+async fn the_fixture_owns_a_disposable_database() {
+    let Some(database) = test_database().await else {
+        return;
+    };
+    let live = timeout(
+        DATABASE_TIMEOUT,
+        sqlx::query_scalar::<_, String>("select current_database()").fetch_one(&database.pool),
+    )
+    .await
+    .expect("current_database timed out")
+    .expect("current_database");
+
+    // (a) Not the shared database. This is the assertion that turns red the moment
+    //     this suite is pointed back at `MOIRA_TEST_DATABASE_URL`.
+    let shared = support::shared_database_name().expect("a fixture was built, so the URL parses");
+    assert_ne!(
+        live, shared,
+        "the retention suite is sweeping the shared test database `{shared}`. That is \
+         finding F10 item 1 in both of its halves: every expired row any other suite left \
+         behind lands in this suite's delete counts, and every row this suite seeds \
+         survives a failed assertion for ever"
+    );
+
+    // (b) It is this test's own clone, named in the shape `TestDatabase::drop` tears
+    //     down and `sweep_leaked_databases` collects if the process dies first.
+    assert_eq!(
+        live,
+        database.name(),
+        "the pool must be connected to the database `TestDatabase` owns and drops; a pool \
+         pointing anywhere else outlives the teardown"
+    );
+    assert!(
+        live.starts_with("moira_test_") && !live.starts_with("moira_test_template_"),
+        "a fixture database must carry the disposable `moira_test_<unix>_<uuid>` name that \
+         teardown and the leak sweep both key on, found `{live}`"
+    );
+
+    // (c) Cloned from the empty template, so nothing an earlier run of this suite wrote
+    //     is visible to this one — which is what makes every `==` count above exact.
+    assert_eq!(
+        table_count(&database.pool, "idempotency_records").await,
+        0,
+        "a freshly cloned database must hold no idempotency records; anything here came \
+         from an earlier run, and the exact delete counts asserted above would be reading \
+         it"
+    );
+    assert_eq!(
+        table_count(&database.pool, "responses").await,
+        0,
+        "a freshly cloned database must hold no responses"
+    );
 }
