@@ -104,6 +104,44 @@ applied to the very tool built to defeat form 1). Redirect to a file instead. Th
 `ALL GATES PASSED` is emitted only when the failures array is empty, so it is a sounder signal than
 `$?` in every case where the two could disagree.
 
+### 2.2a You may not be the only Claude session on this repo
+
+**Discovered 2026-08-02 the expensive way.** A coordinator briefed its agent "you are the only agent
+running gates". That was false: a *second Claude Code session* was running its own agents on the same
+checkout. Load average peaked at **96**, and two gate runs failed on timing-sensitive concurrency
+tests (`a_concurrent_summarization…`, `concurrent_key_create…`) with no relationship to the change
+under test. A coordinator cannot see another session's agents in its own context — it can only see
+their artifacts.
+
+**Check for peers before claiming exclusivity, and before deleting anything:**
+
+```bash
+git worktree list                     # worktrees under a DIFFERENT session id are not yours
+pgrep -f 'scripts/gates\.sh'          # a live gate run, whoever owns it
+gh pr list --state open               # PRs you did not open
+uptime                                # load >20 means you are not alone
+```
+
+**Never delete a target directory you did not create.** `scripts/reclaim.sh` L1 walks
+`$TARGET_ROOT/*/debug/incremental` and would drop a *peer's* cache mid-build. Under contention,
+reclaim only your own, and prefer waiting.
+
+**`pgrep -fc 'cargo-targets/moira-<name>'` is a FALSE NEGATIVE.** `CARGO_TARGET_DIR` is an
+*environment variable* — it never appears in a cargo process's argv, so this reports "clear" while a
+peer's gate run is live. It is form 10's cousin: a peer check that always passes. Key on
+`pgrep -f 'scripts/gates\.sh$'` or on a recorded PID.
+
+### 2.2c Form 9 is broader than documented: the hook rewrites `grep` and `tail` too
+
+The `rtk` `PreToolUse` hook does not only rewrite `cargo`. Observed 2026-08-02: a `grep` over the
+ledger returned rtk's *summary* (`3496 matches in 589F`) instead of the matching lines, and a
+`tail -3` was rewritten into `/usr/bin/read`.
+
+So a search can silently return a digest of the answer rather than the answer — and a coordinator
+reading that digest may conclude a symbol is absent when it is present, or miss the second of two
+call sites. **Wrap `grep`/`tail` in a script file whenever the exact output matters**, the same way
+`cargo` already must be. The immunity rule is unchanged: the hook only sees the outer command.
+
 ### 2.2b `scripts/gates.sh` CANNOT run concurrently with another gates run
 
 Found 2026-08-01, after two runs sat **wedged for 40+ minutes**.
