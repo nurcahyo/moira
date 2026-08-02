@@ -41,7 +41,7 @@
 
 mod support;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::http::{StatusCode, header};
 use moira::{application::ExecutionService, domain::ExecutionStatus};
@@ -49,6 +49,7 @@ use reqwest::Client;
 use serde_json::Value;
 use support::mock_openai::{MockOpenAiServer, ProviderScript};
 use support::{LifecycleFixture, MoiraHttpServer, RuntimePolicy};
+use tokio::time::timeout;
 use uuid::Uuid;
 
 /// Every metric family `/metrics` emitted before plan 05, with the `# TYPE` the hand-rolled
@@ -82,6 +83,16 @@ const DB_POOL: &str = "moira_db_pool_connections";
 /// byte-unchanged by plan 05; this pins that from the outside so a future edit cannot
 /// quietly drop the Prometheus text-format version token that scrapers negotiate on.
 const EXPOSITION_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+
+/// Ceiling on the pool-permit barrier in
+/// `metrics_endpoint_exposes_db_pool_gauges_reflecting_the_live_pool`.
+///
+/// **This bounds a deadlock, not a race.** Every acquisition it guards either completes in
+/// microseconds or never completes at all — the only way to miss this budget is for
+/// something to hold a fixture-pool permit for the fixture's whole lifetime, in which case
+/// waiting longer would not help. It exists so that failure reports a diagnosis instead of
+/// hanging anonymously until the harness gives up.
+const POOL_BARRIER: Duration = Duration::from_secs(20);
 
 // ---------------------------------------------------------------------------------------
 // Harness
@@ -726,13 +737,48 @@ async fn metrics_endpoint_exposes_provider_outcome_counters_with_bounded_labels(
 /// A gauge that is exposed but frozen is worse than a missing one: it reads as a healthy
 /// pool during the exact incident — connection exhaustion — it exists to diagnose. Because
 /// the pool is sampled once per scrape inside `render_prometheus`, the only way to prove the
-/// sampling is live is to change the pool's state between two scrapes and watch the numbers
+/// sampling is live is to change the pool's state between scrapes and watch the numbers
 /// move.
 ///
-/// Holding a connection is deterministic and needs no timing: `PgPool::acquire` hands back
-/// an idle connection if one exists, so `idle` must drop by exactly one while `total` stays
-/// put. Nothing else touches this pool — `LifecycleFixture` serialises the suite and neither
-/// `/metrics` nor `/health/live` opens a connection.
+/// # Why this test drives the pool to saturation instead of borrowing one connection
+///
+/// The previous version took a baseline scrape, acquired one connection, and asserted the
+/// idle gauge had dropped by *exactly* one. It failed once under CPU contention with
+/// `left: 1.0, right: 0.0` and passed nine reruns immediately afterwards (finding **F28**,
+/// the metrics-gauge flake — not the unrelated F28 about inline memory extraction delaying
+/// the terminal SSE event). Its doc comment asserted two things that are not true:
+///
+/// * *"Nothing else touches this pool."* **sqlx does.** Returning a `PoolConnection` is
+///   asynchronous: `Drop` spawns a task, and that task issues a `ping()` round-trip to
+///   PostgreSQL *before* it puts the connection back and increments `num_idle`
+///   (`sqlx-core-0.8.6/src/pool/connection.rs`, `Floating::return_to_pool`). So between a
+///   `drop` and the counter moving there is a whole database round-trip, and a scrape
+///   landing inside that window reads a pool that is still settling. That is precisely what
+///   the observed failure was: the baseline scrape sampled `idle = 1` while a second
+///   connection's return was still in flight, the return landed, and the "busy" scrape then
+///   read `idle = 1` again instead of `0`.
+/// * *"`LifecycleFixture` serialises the suite."* It does not, and has not since fixtures
+///   were given private databases — `tests/support/mod.rs` says so in as many words
+///   (`CONCURRENT_FIXTURES`: *"This is **not** an isolation device"*). Four fixtures run at
+///   once; what makes them safe is the private database, not serialisation.
+///
+/// Measured: replaying the old shape back to back, with nothing between the `drop` and the
+/// next baseline scrape, reproduced the failure **8 times in 10**. The delay that made it
+/// pass in practice was incidental — fixture setup and the first scrape happened to give
+/// the in-flight return time to land.
+///
+/// # What makes the numbers below exact rather than bounded
+///
+/// **`acquire` is a barrier.** A connection whose return is still in flight has not yet
+/// released its semaphore permit, so taking *every* permit cannot return until every return
+/// has completed. And [`PoolConnection::return_to_pool`] runs that same return eagerly and
+/// awaits it, instead of spawning it. Between them the pool reaches a state with no
+/// in-flight work at all, and its numbers are then exactly known — no sleep, no retry, no
+/// tolerance. The three observations below held 15/15 and 20/20 in direct measurement.
+///
+/// The scrape at full saturation is not just bookkeeping: it is the incident this gauge
+/// exists for, and it also proves `/metrics` answers without a pooled connection — which is
+/// what lets this test hold every permit in the first place.
 #[tokio::test]
 async fn metrics_endpoint_exposes_db_pool_gauges_reflecting_the_live_pool() {
     let Some(fixture) = LifecycleFixture::new().await else {
@@ -742,38 +788,67 @@ async fn metrics_endpoint_exposes_db_pool_gauges_reflecting_the_live_pool() {
     let server = start_server(&fixture, true).await;
     let client = Client::new();
 
-    // Guarantee at least one established connection to observe.
-    sqlx::query("select 1")
-        .execute(&fixture.pool)
-        .await
-        .expect("warm the fixture pool");
+    let capacity = fixture.pool.options().get_max_connections();
+    // Three distinct idle readings are what makes this test able to fail: `capacity`,
+    // `capacity - 1` and `0`. At a capacity of one the first two collapse into each other
+    // and the middle observation stops carrying information.
+    assert!(
+        capacity >= 2,
+        "the fixture pool must allow at least two connections for the idle gauge to be \
+         observed at three distinct values, got {capacity}"
+    );
 
     let total = [("service", service.as_str()), ("state", "total")];
     let idle = [("service", service.as_str()), ("state", "idle")];
 
-    let body = scrape(&client, &server).await;
+    // Take every permit, then hand every connection back eagerly. The acquisitions wait out
+    // any return still in flight from fixture setup; the eager returns replace the spawned
+    // ones, so nothing is pending when the loop ends. `capacity` connections are open and
+    // all of them are idle — exactly, not approximately.
+    let mut held = Vec::with_capacity(capacity as usize);
+    for slot in 0..capacity {
+        held.push(
+            timeout(POOL_BARRIER, fixture.pool.acquire())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "fixture connection {slot} could not be acquired within \
+                         {POOL_BARRIER:?}: something holds a permit on the fixture pool for \
+                         the fixture's lifetime (a PgListener?), so the pool cannot be \
+                         brought to a known state and none of the assertions below would \
+                         mean what they say"
+                    )
+                })
+                .unwrap_or_else(|error| panic!("acquire fixture connection {slot}: {error}")),
+        );
+    }
+    for mut connection in held {
+        connection.return_to_pool().await;
+    }
+
+    let settled = scrape(&client, &server).await;
     assert_eq!(
-        declared_type(&body, DB_POOL),
+        declared_type(&settled, DB_POOL),
         Some("gauge"),
-        "{DB_POOL} must be a gauge:\n{body}"
+        "{DB_POOL} must be a gauge:\n{settled}"
     );
-    let baseline_total = series_value(&body, DB_POOL, &total);
-    let baseline_idle = series_value(&body, DB_POOL, &idle);
-    assert!(
-        baseline_total >= 1.0,
-        "a warmed pool must report at least one connection, got {baseline_total}:\n{body}"
+    assert_eq!(
+        series_value(&settled, DB_POOL, &total),
+        f64::from(capacity),
+        "every permit was taken and every connection returned, so the pool holds exactly \
+         {capacity} connections:\n{settled}"
     );
-    assert!(
-        baseline_idle >= 1.0,
-        "an unused warmed pool must report at least one idle connection, got \
-         {baseline_idle}:\n{body}"
-    );
-    assert!(
-        baseline_idle <= baseline_total,
-        "idle ({baseline_idle}) cannot exceed total ({baseline_total}):\n{body}"
+    assert_eq!(
+        series_value(&settled, DB_POOL, &idle),
+        f64::from(capacity),
+        "nothing is checked out and no return is in flight, so all {capacity} connections \
+         are idle. A gauge reporting anything else is not reading `num_idle`:\n{settled}"
     );
 
-    let held = fixture
+    // One connection checked out of a settled pool: `idle` must fall by exactly one and
+    // `total` must not move, because `acquire` reuses an idle connection rather than
+    // opening another.
+    let one = fixture
         .pool
         .acquire()
         .await
@@ -781,17 +856,45 @@ async fn metrics_endpoint_exposes_db_pool_gauges_reflecting_the_live_pool() {
     let busy = scrape(&client, &server).await;
     assert_eq!(
         series_value(&busy, DB_POOL, &total),
-        baseline_total,
+        f64::from(capacity),
         "acquiring an already-idle connection must not change the pool size:\n{busy}"
     );
     assert_eq!(
         series_value(&busy, DB_POOL, &idle),
-        baseline_idle - 1.0,
+        f64::from(capacity) - 1.0,
         "the idle gauge did not follow the live pool; it is sampled from a stale or constant \
          source:\n{busy}"
     );
-    drop(held);
 
+    // Full exhaustion — the incident the gauge exists to diagnose. `idle` must reach zero,
+    // and it must reach zero *for the right reason*: a gauge frozen at its construction
+    // value of zero would satisfy this line alone, which is why the settled scrape above
+    // pins it at `capacity` first.
+    let mut all = vec![one];
+    for slot in 1..capacity {
+        all.push(
+            timeout(POOL_BARRIER, fixture.pool.acquire())
+                .await
+                .unwrap_or_else(|_| panic!("exhausting connection {slot} timed out"))
+                .unwrap_or_else(|error| panic!("acquire exhausting connection {slot}: {error}")),
+        );
+    }
+    let exhausted = scrape(&client, &server).await;
+    assert_eq!(
+        series_value(&exhausted, DB_POOL, &total),
+        f64::from(capacity),
+        "exhausting the pool must not change how many connections exist:\n{exhausted}"
+    );
+    assert_eq!(
+        series_value(&exhausted, DB_POOL, &idle),
+        0.0,
+        "with every connection checked out the idle gauge must read zero; a gauge that still \
+         reports spare capacity during exhaustion is worse than no gauge at all:\n{exhausted}"
+    );
+
+    for mut connection in all {
+        connection.return_to_pool().await;
+    }
     server.shutdown().await;
 }
 
