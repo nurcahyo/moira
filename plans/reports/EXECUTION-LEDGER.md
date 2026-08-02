@@ -3712,6 +3712,77 @@ The "State at a glance" block above exists precisely so a compacted context can 
 
 ## Cycle log
 
+### Cycle 15 — 2026-08-02/03 — the findings queue emptied: eight PRs, three refutations
+
+**Every finding on the inherited queue is closed.** `main` moved `eb9b988 → 20efdfa`.
+
+| PR | Findings | Merge |
+|---|---|---|
+| #59 | F39 — structured-output capability | `655494a` — **the stopped peer's**, adopted |
+| #58 | F46 — refuse `json_object` | `c938d5c` |
+| #60 | F28, F10 item 1 | `71b7dba` — **my stopped agent's**, recovered and re-gated |
+| #61 | F38, F48 guard, F49 raised | `779104d` |
+| #62 | F49, F50 raised | `324d1b4` |
+| #63 | F47 confirmed, **F40 refuted**, F51/F52 raised | `d295f9e` |
+| #64 | F51, F52, F53 raised | `e16cb0c` |
+| #65 | F42, F43 **refuted**, F44, F45 | `20efdfa` |
+
+**Three findings were refuted rather than fixed, and each refutation was worth more than a fix
+would have been:**
+
+- **F40** — no configuration reaches the empty array at all; `output_persisted` is never `true`
+  anywhere, so `Completed` *always* took the `OutputUnavailable` branch. Going to check turned up two
+  real defects next door: a hardcoded reason literal that was false for three of four modes, and a
+  fall-through to `[]` where the row claimed *more* persistence.
+- **F43** — "every caller is inside `#[cfg(test)]`" is true only if `tests/` counts. **9 of 29 callers
+  are in a separate crate**, so private/deleted were never available. **`pub` in this
+  `publish = false` single-crate workspace means "visible to integration tests", not "external
+  contract"** — that reframes every dead-`pub` finding.
+- **F41, F36** were refuted in the prior cycle; the pattern is now established enough to expect it.
+
+**Two findings were understated by their own entries:**
+
+- **F47** — the family is **five**, not two, and the cost was not dead tuples. Each "read" fired
+  `pg_notify`, so a conversation-linked turn wiped every replica's caches **three times**. Measured:
+  3 notifications from 3 `do update` calls, 0 from 3 `do nothing`.
+- **F51** — its standing defence was that caches "rebuild on the next read." True of two of three;
+  **false of `ProviderRuntimeCache`, which holds built Rig clients with their connection pools** —
+  and it is keyed by a tuple already containing every version number, so even the config-write case
+  that defence was written for never needed the wipe.
+
+#### The rules earned this cycle
+
+1. **A derived inventory is only a guard if something else consumes it.** (F52) Deriving a list from
+   `pg_trigger` stops it drifting from the schema; it does not stop someone editing the list to make
+   the test pass. Closed only because a second guard consumes the same constant.
+2. **A barrier must be inert with respect to the property it brackets.** `drain_listener` emits a
+   `provider_models` payload — configuration — so it cleared the very caches under observation.
+3. **Observe the most expensive thing a fix protects, not the easiest to construct.**
+4. **Two CI runs can exist on one commit.** A `workflow_dispatch` alongside the automatic
+   `pull_request` event makes `check-runs` report a job as *both* `completed/success` and
+   `in_progress`. Form 12 warns about the previous *commit*; this is its sibling on the *same* commit.
+   **Select the run by `event == "pull_request"`, and do not fire a redundant dispatch.**
+5. **`pgrep` for a live build is too coarse to gate a reclaim on.** The build that blocked one was the
+   Moira **server** (`cargo run` in the main checkout on `./target`), unrelated to every
+   `~/.cargo-targets/*`. Resolve with `lsof -a -p <pid> -d cwd -Fn` and the process's
+   `CARGO_TARGET_DIR` before acting.
+
+#### On recovering stopped work
+
+Two sessions stopped mid-flight this cycle and both left work worth finishing. The recovered branch
+carried five commits *including its own ledger closures*, which reads like completion — **but no gates
+log existed anywhere.** Gates were re-run from scratch before it was PR'd. *"It committed, so gates
+must have passed"* is exactly the inference §2.2 exists to prevent.
+
+#### What remains, and it is short
+
+**F50** and **F53** are open and both deliberately unfixed — F50 is a product decision (fail-closed vs
+observable fail-open), F53 needs one question answered first (whether a RAG collection's own config is
+read through any cache; the two tables may not have the same answer). The two remaining
+strict-structured-output preconditions are unshipped by design. **PR #57 (F32) is still held for human
+sight.**
+
+
 ### Cycle 15 — 2026-08-02 — `fix/f40-f47-response-output-and-policy-reads`: one refutation, one understatement, two new findings
 
 Two independent findings closed on one branch, separate commits, one gate run.
