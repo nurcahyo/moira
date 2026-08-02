@@ -328,6 +328,49 @@ const CIRCUIT_UNAFFECTED_RESOURCE_TYPES: &[&str] = &[
 /// gated by any trigger at all. Either barrier alone closes F51; neither is load-bearing.
 const RUNTIME_DATA_RESOURCE_TYPES: &[&str] = &["conversations", "memory_records"];
 
+/// Every table wired to the `moira_runtime_config` channel, as the classifier below must
+/// be able to handle it.
+///
+/// # This list is pinned, not retyped — and the distinction is F52
+///
+/// The predecessor of this constant lived inside a unit test whose doc comment claimed it
+/// was "pinned here against the trigger list in `migrations/`". It was not pinned; it was
+/// **retyped** — 21 names written by hand against a schema that had 24 — and the three it
+/// omitted were exactly the three that fell through to the `other =>` arm and reset every
+/// breaker on every replica. A guard that compares the classifier to a hand-written copy
+/// of the classifier cannot detect drift in either; it only proves someone typed the same
+/// thing twice.
+///
+/// So the inventory is now pinned against `pg_trigger`, which is an independent source,
+/// by `the_notify_trigger_inventory_is_exactly_the_classified_set` in
+/// `tests/runtime_notify_inventory.rs`. Attaching the trigger to a new table reds that
+/// test until the table is added here and classified below — which is the obligation
+/// `CIRCUIT_UNAFFECTED_RESOURCE_TYPES` already states in prose and, until now, nothing
+/// enforced.
+///
+/// Exported for that test, and for no other reason.
+pub const TRIGGERED_RESOURCE_TYPES: &[&str] = &[
+    "agent_profiles",
+    "application_conversation_policies",
+    "application_embedding_policies",
+    "application_execution_policies",
+    "application_memory_policies",
+    "application_retrieval_policies",
+    "applications",
+    "auth_provider_settings",
+    "consumer_api_keys",
+    "provider_credentials",
+    "provider_models",
+    "provider_runtime_policies",
+    "providers",
+    "rag_collections",
+    "rag_documents",
+    "route_definitions",
+    "routing_policies",
+    "system_api_keys",
+    "trusted_jwt_issuers",
+];
+
 /// Table names that Moira itself publishes onto the Redis invalidation channel.
 ///
 /// Declared **here, beside the classifier**, and referenced by
@@ -570,42 +613,46 @@ mod tests {
         );
     }
 
-    /// Every table wired to the `moira_runtime_config` channel must be classified.
-    /// A table this function has never heard of is treated as unknown and falls back
-    /// to a full reset, which is safe but silently undoes the narrowing — so the list
-    /// is pinned here against the trigger list in `migrations/`.
+    /// Every table wired to the `moira_runtime_config` channel must be fully classified.
+    ///
+    /// A table the classifier has never heard of falls to the `other =>` arm, which is
+    /// safe but silently undoes every bit of narrowing at once: a full breaker reset and
+    /// a full cache wipe, on every replica, per row.
+    ///
+    /// # What this test is and is not
+    ///
+    /// It proves every name in [`TRIGGERED_RESOURCE_TYPES`] classifies correctly. It does
+    /// **not** prove that constant matches the schema — it cannot, because it has no
+    /// database, and a version of this test that carried its own copy of the list is
+    /// exactly the F52 defect. The schema half is
+    /// `the_notify_trigger_inventory_is_exactly_the_classified_set` in
+    /// `tests/runtime_notify_inventory.rs`, which reads `pg_trigger`. Neither half is
+    /// sufficient alone and neither duplicates the other.
+    ///
+    /// # Both halves of the plan, not just the breaker scope
+    ///
+    /// The `caches` assertion is what stops a *configuration* table being quietly moved
+    /// into [`RUNTIME_DATA_RESOURCE_TYPES`]: that would leave its scope `Unaffected` and
+    /// so satisfy the breaker assertion, while stopping every replica from ever noticing
+    /// the config change. A table that genuinely is per-request data loses its trigger in
+    /// the same change, which takes it out of this list and out of this test's reach.
     #[test]
     fn every_triggered_table_has_a_scope() {
-        let triggered = [
-            "agent_profiles",
-            "application_conversation_policies",
-            "application_embedding_policies",
-            "application_execution_policies",
-            "application_memory_policies",
-            "application_retrieval_policies",
-            "applications",
-            "auth_provider_settings",
-            "consumer_api_keys",
-            "provider_credentials",
-            "provider_models",
-            "provider_runtime_policies",
-            "providers",
-            "rag_collections",
-            "rag_documents",
-            "route_definitions",
-            "routing_policies",
-            "system_api_keys",
-            "trusted_jwt_issuers",
-        ];
         let resource_id = Uuid::now_v7();
-        for table in triggered {
-            let scope = circuit_reset_scope(&format!(
+        for table in TRIGGERED_RESOURCE_TYPES {
+            let plan = invalidation_plan(&format!(
                 r#"{{"resource_type":"{table}","resource_id":"{resource_id}"}}"#
             ));
             assert_ne!(
-                scope,
+                plan.circuits,
                 CircuitResetScope::All,
                 "{table} is triggered but unclassified, so it still resets every circuit"
+            );
+            assert!(
+                plan.caches,
+                "{table} still carries the NOTIFY trigger but no longer invalidates the \
+                 caches, so a change to it never reaches another replica; a table that is \
+                 really per-request data must lose its trigger in the same change"
             );
         }
     }

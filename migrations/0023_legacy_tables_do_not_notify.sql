@@ -1,0 +1,44 @@
+-- F52 — three renamed tables kept a trigger nobody classified.
+--
+-- `migrations/0003_security_foundation.sql` renames the pre-security-foundation tables out
+-- of the way:
+--
+--     alter table routing_policies      rename to legacy_routing_policies;
+--     alter table provider_credentials  rename to legacy_provider_credentials;
+--     alter table providers             rename to legacy_providers;
+--
+-- `ALTER TABLE … RENAME` carries triggers with it. All three therefore still fire
+-- `notify_moira_runtime_config_change()` under their new names — and still under their
+-- *old* trigger names, which is why `pg_trigger` has to be counted by trigger **function**
+-- rather than by trigger name (`legacy_providers`'s trigger is still called
+-- `providers_runtime_config_notify`).
+--
+-- The payload carries `tg_table_name`, so what arrives is `legacy_providers`, which
+-- `circuit_reset_scope` has never heard of: it is not the `providers` arm, it is not in
+-- `CIRCUIT_UNAFFECTED_RESOURCE_TYPES`, and it falls to the `other =>` arm — a `warn!` plus
+-- `CircuitResetScope::All`, discarding every provider's earned breaker health on every
+-- replica. `delete from legacy_providers` would emit one full reset **per row**.
+--
+-- # Nothing reads or writes these three tables
+--
+-- Verified before dropping: the only references anywhere in the tree are inside
+-- `0003_security_foundation.sql` itself, which reads them as a one-time backfill source
+-- (`insert into providers … from legacy_providers`, guarded by `to_regclass(…) is not
+-- null`). Nothing in `src/`, `tests/` or `console/` names them. The tables are left in
+-- place — they are an operator's record of the pre-0003 world and dropping them is
+-- destructive and irreversible — but the trigger is pure liability and goes.
+--
+-- `legacy_applications` is renamed by the same migration and is deliberately absent here:
+-- `0002` only ever attached the trigger to three tables, so that one never carried it.
+--
+-- # Reversal
+--
+-- If these tables are ever brought back into service, classify them in
+-- `src/infra/db.rs` — add them to `TRIGGERED_RESOURCE_TYPES` and to the appropriate
+-- classification list — in the same change that re-creates the trigger. The inventory
+-- guard in `tests/runtime_notify_inventory.rs` reads `pg_trigger` directly, so it fails
+-- until that is done rather than after someone notices.
+
+drop trigger if exists providers_runtime_config_notify on legacy_providers;
+drop trigger if exists routing_policies_runtime_config_notify on legacy_routing_policies;
+drop trigger if exists provider_credentials_runtime_config_notify on legacy_provider_credentials;
