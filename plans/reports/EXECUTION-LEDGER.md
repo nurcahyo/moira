@@ -3210,6 +3210,75 @@ The "State at a glance" block above exists precisely so a compacted context can 
 
 ## Cycle log
 
+### Cycle 14 — 2026-08-02 — recovery cycle: three merges, two of them other people's work
+
+**A peer session and one of my own agents both stopped mid-flight. Neither left the tree broken, and
+both left work worth finishing rather than redoing.**
+
+| PR | What | Merge | Provenance |
+|---|---|---|---|
+| **#59** | F39 — structured-output capability reconciled against what Rig will actually send | `655494a` | **the stopped peer's**, adopted and finished |
+| **#58** | F46 — refuse `json_object` rather than send a schema only `{}` satisfies | `c938d5c` | mine |
+| **#60** | F28 + F10 item 1 — bound the pool-gauge assertion; retention suite off the shared DB | `71b7dba` | **my stopped agent's**, recovered and re-verified |
+
+**`SHARED_DATABASE_ALLOWLIST` is down to two entries** — `support/mod.rs` (owns the mechanism) and
+`security_foundation.rs` (must apply migrations to a real database to assert the migration contract).
+**Cross-run coupling through the shared test database is gone.**
+
+#### The recovered agent had committed but never gated — and the distinction mattered
+
+`fix/shared-db-flakes` carried five commits including its own ledger closures, which reads like
+finished work. **There was no gates log anywhere in the scratchpad.** "It committed, so gates must
+have passed" is precisely the inference §2.2 exists to prevent, so gates were re-run from scratch:
+`ALL GATES PASSED`, 1046 tests. Only then was it PR'd.
+
+#### A hazard one level below form 12: TWO runs on the SAME commit
+
+Form 12 warns that `statusCheckRollup` can report the *previous commit's* verdict. This cycle
+produced its sibling. A `workflow_dispatch` I triggered and the automatic `pull_request` event both
+ran on the **same head SHA**, so `check-runs` returned `rust: completed/success` **and**
+`rust: in_progress` simultaneously — both true, for different runs.
+
+Keying on the head SHA is **not sufficient**. Select the run by `event == "pull_request"` (the one
+that actually gates the PR) and read *its* jobs:
+
+```bash
+gh api "repos/{owner}/{repo}/actions/runs?per_page=15" \
+  --jq --arg s "$SHA" '[.workflow_runs[] | select(.head_sha==$s and .event=="pull_request")][0].id'
+```
+
+**Corollary: do not fire a redundant `workflow_dispatch` when the `pull_request` event will run
+anyway.** It buys nothing and creates an ambiguous signal at the moment you are deciding to merge.
+
+#### `pgrep` for a live build is too coarse to gate a reclaim on
+
+Disk hit 40 GB and `pgrep -f 'cargo|rustc'` said a build was live — which would normally abort any
+reclaim, per the rule against deleting a target directory you did not create.
+
+**It was the Moira server itself**, `cargo run` from the main checkout using `./target`, unrelated to
+every `~/.cargo-targets/*` directory. Resolve the ambiguity before acting on it:
+
+```bash
+lsof -a -p <pid> -d cwd -Fn      # which tree is it in?
+ps -Eww -p <pid> | tr ' ' '\n' | grep CARGO_TARGET_DIR   # which target dir?
+```
+
+22 GB reclaimed from two finished target dirs (one the stopped peer's, whose PR had merged), and a
+further 13 GB later — 40 GB → 63 GB — with `./target` and the running server untouched.
+
+#### Corrections to the briefing this cycle worked from
+
+- **F46 was listed as a user-only item needing "a rig-core change or a public contract break".** It
+  was already fixed and open as #58 — and the approach taken *was* the contract break, a 422 chosen
+  to match F35's precedent, with a reversal condition.
+- **The OpenAPI counts in circulation were stale**: the tree asserts **152 operations / 100 paths /
+  183 schemas**, not 151/99/178.
+- **F46's own recorded mechanism contained a false clause — the one implying it could not be fixed.**
+  `json_utils::merge` is only reached inside a branch requiring `output_schema.is_some()`, so with no
+  schema `additional_params` passes through untouched and *would* have reached an OpenAI-family
+  provider. It was refused on principle, not impossibility.
+
+
 ### Cycle 11 — 2026-07-31 — findings sweep (`fix/findings-sweep`, `a6d2984`)
 
 F20, F13 and the wave-2 leftovers, plus `cargo-mutants` adopted. Details in each finding's section
