@@ -344,8 +344,17 @@ once. Current state of everything above F28:
 | **F46** | `response_format: {"type":"json_object"}` reaches the provider as a schema satisfied only by `{}` — the caller gets the **opposite** of free-form JSON, with `200 succeeded` | open, in flight `fix/f46-json-object-format` |
 | **F47** | `get_or_create_*_policy` are `insert … on conflict do update`, i.e. **reads that write**. One conversation-linked turn rewrites two policy rows **three times**, and takes a row lock that serialises concurrent turns of the same application | open. Fix is `on conflict do nothing` + `select`, across the whole `get_or_create_*` family |
 | **F30** | `application_memory_policies.consent_mode` and `application_conversation_policies.memory_consent_mode` are independent, both default `'explicit_only'`, and nothing reconciles them | open. Sub-Phase F takes the **stricter of the two** (D4), but the schema divergence remains. *The shape that hides:* they agree in every default deployment and diverge exactly when an operator tightens one |
-| **F35, F37, F34, F29** | — | CLOSED |
+| **F48** | **A third `output_schema` drop path, and it is silent even on OpenAI.** Rig also requires `tools.is_empty() \|\| history_has_tool_result`, so the schema is dropped on turn 1 of any tool-calling conversation with **no `warn!` at all** — the warning at that site fires only for the DeepSeek case. Latent only because `build_completion_request` hardcodes `tools: Vec::new()`; it goes live the day tool calling is enabled. **F39's fix does not cover it** — that reconciles per provider type, this drop is per request | open, latent |
+| **F35, F37, F34, F29, F39** | — | CLOSED |
 | **F36, F41** | — | REFUTED / wrong as recorded |
+
+**F39 closed 2026-08-02** (`fix/f39-structured-output-capability`). Both divergences verified true,
+and fixed **asymmetrically because they are not the same problem**: DeepSeek is decidable — Moira
+now reads Rig's own `SUPPORTS_RESPONSE_FORMAT` associated const rather than restating it, so a
+`rig-core` bump cannot silently rot the answer — while `OpenAiCompatible`/`Local` is **undecidable
+at admission** (Rig does send the schema; whether a self-hosted backend honours it is unknowable)
+and is deliberately still admitted. Unblocks **one of the three** preconditions F29's reversal
+condition names, so **the lenient parse stays** — see the ledger's F39 section.
 
 **Finding IDs are allocated concurrently and have collided three times.** `F22` and `F28` each name
 **two** unrelated findings; `F21` has two entries; F27 was written as F26 until #47 claimed it.

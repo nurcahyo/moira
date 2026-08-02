@@ -1441,7 +1441,11 @@ impl ModelRouter for DefaultModelRouter<'_> {
                 && command
                     .model_hint
                     .is_none_or(|model_id| candidate.provider_model_id == model_id)
-                && capabilities_match(&candidate.capabilities, &policy.required_capabilities)
+                && capabilities_match(
+                    candidate.provider_type,
+                    &candidate.capabilities,
+                    &policy.required_capabilities,
+                )
         });
         if candidates.is_empty() {
             return Err(ExecutionFailure::new(
@@ -1980,8 +1984,77 @@ fn effective_runtime_policy(
     }
 }
 
-fn capabilities_match(capabilities: &Value, required: &[String]) -> bool {
+/// The one capability key whose configured value Rig is able to contradict (finding F39).
+///
+/// `application/public.rs` pushes this string for every non-`text` response format. It is
+/// duplicated there rather than shared because `public.rs` may not import `rig_core`
+/// (`.agents/skills/moira-rig-integration/SKILL.md`), and this module is where the
+/// reconciliation has to live.
+const STRUCTURED_OUTPUT_CAPABILITY: &str = "structured_output";
+
+/// Whether Rig 0.40 will actually put a request's `output_schema` on the wire for this provider.
+///
+/// **Read from Rig, not restated.** Every provider Moira builds through the OpenAI-compatible
+/// arm answers with Rig's own public associated const,
+/// `openai::completion::OpenAICompatibleProvider::SUPPORTS_RESPONSE_FORMAT`. A `rig-core` bump
+/// that flips one of those constants therefore flips Moira's admission decision with no edit
+/// here — for those four provider types the config/wire divergence F39 describes is not
+/// *representable*, which is strictly stronger than a table plus a test that notices it rotted.
+///
+/// This matters because the drop is otherwise invisible. When the const is false,
+/// `providers/openai/completion/mod.rs` discards `output_schema` with only a `tracing::warn!`
+/// and builds the request anyway, so nothing observable at Moira's layer distinguishes "the
+/// schema was sent and the model ignored it" from "the schema was never sent". The const is the
+/// only signal available *before* the request goes out.
+///
+/// `Anthropic` and `Gemini` do not implement `OpenAICompatibleProvider` — they map
+/// `output_schema` natively onto their own request shapes (`anthropic/completion.rs`
+/// `output_config`, `gemini/completion.rs` `generation_config`) and expose no constant to read.
+/// `true` is restated for those two and pinned by
+/// `the_two_native_providers_still_map_output_schema` below; that test is the thing that reds if
+/// a bump makes the restatement false.
+///
+/// `Custom` never constructs a model at all — `build_completion_model` returns
+/// `AppError::Config` — so no schema can reach any provider on that arm.
+fn provider_emits_output_schema(provider_type: ProviderType) -> bool {
+    use rig_core::providers::openai::OpenAICompatibleProvider;
+
+    match provider_type {
+        ProviderType::OpenAi | ProviderType::OpenAiCompatible | ProviderType::Local => {
+            <rig_core::providers::openai::OpenAICompletionsExt as OpenAICompatibleProvider>::SUPPORTS_RESPONSE_FORMAT
+        }
+        ProviderType::AzureOpenAi => {
+            <rig_core::providers::azure::AzureExt as OpenAICompatibleProvider>::SUPPORTS_RESPONSE_FORMAT
+        }
+        ProviderType::DeepSeek => {
+            <rig_core::providers::deepseek::DeepSeekExt as OpenAICompatibleProvider>::SUPPORTS_RESPONSE_FORMAT
+        }
+        ProviderType::Anthropic | ProviderType::Gemini => true,
+        ProviderType::Custom => false,
+    }
+}
+
+/// Whether a routing candidate can satisfy every capability the policy requires.
+///
+/// The configured capability JSON is necessary but **not sufficient** for `structured_output`:
+/// it is an operator's claim about a model, and for some provider types Rig will drop the schema
+/// regardless of what the row says. Reconciling here — at the one site that already answers
+/// "does this candidate have capability X" — keeps the answer single-sourced and lets an
+/// unqualified candidate fall out of routing rather than fail mid-flight.
+///
+/// The reconciliation only ever **subtracts**. A row that declares `structured_output: false`
+/// stays unusable for structured requests even on a provider Rig would honour, because that
+/// declaration is also an operator decision to disable it.
+fn capabilities_match(
+    provider_type: ProviderType,
+    capabilities: &Value,
+    required: &[String],
+) -> bool {
     required.iter().all(|required| {
+        if required == STRUCTURED_OUTPUT_CAPABILITY && !provider_emits_output_schema(provider_type)
+        {
+            return false;
+        }
         capabilities
             .get(required)
             .and_then(Value::as_bool)
@@ -2265,6 +2338,128 @@ mod tests {
             attempt_status_for_failure(ExecutionFailureClass::ProviderUnavailable),
             AttemptStatus::Failed
         );
+    }
+
+    /// Finding F39. A `structured_output: true` capability row is an operator's claim; on
+    /// DeepSeek it is false whatever the row says, because Rig drops the schema before the wire.
+    ///
+    /// The cheapest edit that breaks the property is deleting the `STRUCTURED_OUTPUT_CAPABILITY`
+    /// early return in `capabilities_match` — that edit turns this case red.
+    #[test]
+    fn a_deepseek_candidate_cannot_satisfy_structured_output_however_it_is_configured() {
+        let required = vec![STRUCTURED_OUTPUT_CAPABILITY.to_string()];
+
+        // Both spellings the capability JSON supports — the bool key and the array form — so a
+        // fix that reconciled only one of them is caught.
+        for capabilities in [
+            json!({ "structured_output": true }),
+            json!({ "capabilities": ["structured_output"] }),
+        ] {
+            assert!(
+                !capabilities_match(ProviderType::DeepSeek, &capabilities, &required),
+                "a DeepSeek row must not satisfy structured_output: {capabilities}"
+            );
+        }
+    }
+
+    /// The other half of the same property: the reconciliation must not disqualify providers
+    /// whose schema Rig really does send, or every structured request would lose its routing.
+    #[test]
+    fn the_providers_rig_sends_a_schema_for_still_satisfy_structured_output() {
+        let required = vec![STRUCTURED_OUTPUT_CAPABILITY.to_string()];
+        let capabilities = json!({ "structured_output": true });
+
+        for provider_type in [
+            ProviderType::OpenAi,
+            ProviderType::OpenAiCompatible,
+            ProviderType::Local,
+            ProviderType::AzureOpenAi,
+            ProviderType::Anthropic,
+            ProviderType::Gemini,
+        ] {
+            assert!(
+                capabilities_match(provider_type, &capabilities, &required),
+                "{provider_type:?} sends the schema and must stay eligible"
+            );
+        }
+    }
+
+    /// The reconciliation only ever subtracts, and only for the one key it owns.
+    ///
+    /// Two ways a plausible implementation goes wrong: reconciling *upward* (letting the
+    /// provider type grant a capability the row denies), and applying the provider-type check to
+    /// every capability rather than to `structured_output` alone. `vision` is the witness for
+    /// the second — it is the only other key `public.rs` ever pushes.
+    #[test]
+    fn the_reconciliation_subtracts_only_and_touches_no_other_capability() {
+        // Declared false stays false even where Rig would send the schema.
+        assert!(
+            !capabilities_match(
+                ProviderType::OpenAi,
+                &json!({ "structured_output": false }),
+                &[STRUCTURED_OUTPUT_CAPABILITY.to_string()],
+            ),
+            "an operator's explicit false must survive the reconciliation"
+        );
+
+        // `vision` is unaffected on the provider whose structured output is dropped.
+        assert!(
+            capabilities_match(
+                ProviderType::DeepSeek,
+                &json!({ "vision": true }),
+                &["vision".to_string()],
+            ),
+            "the reconciliation must not spill onto other capabilities"
+        );
+
+        // A DeepSeek row keeps every capability except the reconciled one.
+        assert!(
+            !capabilities_match(
+                ProviderType::DeepSeek,
+                &json!({ "vision": true, "structured_output": true }),
+                &[
+                    "vision".to_string(),
+                    STRUCTURED_OUTPUT_CAPABILITY.to_string()
+                ],
+            ),
+            "one unsatisfiable capability must disqualify the candidate"
+        );
+    }
+
+    /// **Anti-rot tripwire for the `rig-core` pin.**
+    ///
+    /// `provider_emits_output_schema` reads Rig's own `SUPPORTS_RESPONSE_FORMAT` for every
+    /// OpenAI-compatible arm, so a bump that changes Rig's behaviour changes Moira's silently
+    /// and correctly. That is the right default, but "silently" also means nobody re-reads F39
+    /// or the deliberately lenient F29 parse that depends on it. This test states rig 0.40.0's
+    /// truth table literally, so a bump that moves any entry reds here and forces that read.
+    ///
+    /// A red in this test is **not** a defect: it means Rig changed. Verify the new constant in
+    /// the vendored crate, update the expectation, and revisit the F29 reversal condition in
+    /// `plans/reports/EXECUTION-LEDGER.md`.
+    #[test]
+    fn rig_0_40_still_drops_the_schema_for_deepseek_and_sends_it_for_everyone_else() {
+        assert!(
+            !provider_emits_output_schema(ProviderType::DeepSeek),
+            "rig-core changed: DeepSeek now sends response_format — re-read finding F39"
+        );
+        assert!(
+            !provider_emits_output_schema(ProviderType::Custom),
+            "custom providers never construct a model, so no schema can reach a wire"
+        );
+        for provider_type in [
+            ProviderType::OpenAi,
+            ProviderType::OpenAiCompatible,
+            ProviderType::Local,
+            ProviderType::AzureOpenAi,
+            ProviderType::Anthropic,
+            ProviderType::Gemini,
+        ] {
+            assert!(
+                provider_emits_output_schema(provider_type),
+                "rig-core changed: {provider_type:?} no longer sends the schema — re-read F39"
+            );
+        }
     }
 
     #[test]
