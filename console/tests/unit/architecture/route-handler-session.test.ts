@@ -83,6 +83,19 @@ const EXEMPT: ReadonlyArray<{ readonly path: string; readonly why: string }> = [
       "a liveness probe. It reads nothing, returns no deployment state, and is called by a " +
       "kubelet that has no session and never will.",
   },
+  {
+    path: "app/api/setup/route.ts",
+    why:
+      "first-run setup, which by definition runs BEFORE the first admin exists. There is no " +
+      "`admin_identities` grant to check against, no operator to be signed in as, and this " +
+      "handler's `claim` action is the request that CREATES the first grant — so requiring a " +
+      "session here would require the outcome as its own precondition. It runs `withSetupWindow` " +
+      "instead, which is narrower rather than weaker: it refuses 404 without the bootstrap " +
+      "system key, and 409 once Moira's claim-status reports the deployment claimed — re-read " +
+      "from Moira on every request rather than cached. THE THIRD ENTRY, and the ceiling " +
+      "assertion below is now binding: a fourth means the shared behaviour belongs behind a " +
+      "guarded wrapper.",
+  },
 ];
 
 const EXEMPT_PATHS = EXEMPT.map((entry) => entry.path);
