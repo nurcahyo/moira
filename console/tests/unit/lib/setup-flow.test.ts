@@ -25,9 +25,11 @@ import {
   SetupProvisioningError,
   assertB1Invariant,
   buildProviderCreateBody,
+  buildProviderPatchBody,
   claimAdminIdentity,
   claimIdempotencyKey,
   consoleIssuerConfigFor,
+  deriveProvisioningState,
   isProvisioningComplete,
   provisioningDeficiencies,
   reachableSetupStep,
@@ -456,6 +458,238 @@ describe("partial states are resumable, never restarted", () => {
 });
 
 /* -------------------------------------------------------------------------- */
+/* The update path — a resume that names a provider row PATCHES it            */
+/* -------------------------------------------------------------------------- */
+
+describe("a resume that names a provider row is an update, never a second create", () => {
+  const resumedComplete: SetupProvisioningState = {
+    trustedJwtIssuerId: ISSUER_ID,
+    trustedJwtIssuerVersion: 1,
+    providerId: PROVIDER_ID,
+    providerVersion: 2,
+    providerTrustedJwtIssuerId: ISSUER_ID,
+    providerEnabled: true,
+    allowedEmailDomainCount: 1,
+    consoleSecretStored: true,
+  };
+
+  function updateHandlers(overrides: Record<string, StubHandler> = {}) {
+    return happyPathHandlers({
+      "GET /api/v1/admin/jwt-issuers": () => ({
+        status: 200,
+        body: { data: [issuerRecord()], pagination: { has_more: false, next_cursor: null } },
+      }),
+      [`GET /api/v1/admin/auth/providers/${PROVIDER_ID}`]: () => ({
+        status: 200,
+        body: providerRecord({ enabled: true, version: 3 }),
+      }),
+      [`PATCH /api/v1/admin/auth/providers/${PROVIDER_ID}`]: () => ({
+        status: 200,
+        body: providerRecord({
+          enabled: true,
+          version: 4,
+          allowed_email_domains: ["example.com", "gmail.com"],
+        }),
+      }),
+      "POST /api/v1/admin/auth/providers": () => {
+        throw new Error("a resume with a providerId must never re-create the provider");
+      },
+      ...overrides,
+    });
+  }
+
+  test("the domain-refusal re-save PATCHes the existing row with a fresh If-Match", async () => {
+    // The scenario the `console.setup.domain_not_allowed.*` copy prescribes:
+    // add the domain, save again, retry the claim. Replaying the CREATE here
+    // would 409 on the submission's idempotency key (changed body); a fresh
+    // create would mint a second row that the partial unique index refuses at
+    // enable. The PATCH is what makes the instruction followable.
+    const stub = createMoiraStub(updateHandlers());
+    const result = await runSetupProvisioning(
+      clientFor(stub),
+      provisioningRequest({
+        provider: { ...providerConfig, allowedEmailDomains: ["example.com", "gmail.com"] },
+        resume: resumedComplete,
+      }),
+    );
+
+    const patch = stub.requestsFor(`PATCH /api/v1/admin/auth/providers/${PROVIDER_ID}`)[0];
+    expect(patch).toBeDefined();
+    // Read-then-patch: the If-Match is the FRESH version from the read, not the
+    // possibly-stale recorded one.
+    expect(patch?.headers["If-Match"]).toBe("3");
+    const body = stub.bodyOf(
+      `PATCH /api/v1/admin/auth/providers/${PROVIDER_ID}`,
+    ) as Record<string, unknown>;
+    expect(body["allowed_email_domains"]).toEqual(["example.com", "gmail.com"]);
+    // Enable is never patched directly, and the binding is not re-asserted.
+    expect("enabled" in body).toBe(false);
+    expect("trusted_jwt_issuer_id" in body).toBe(false);
+
+    expect(stub.requestsFor("POST /api/v1/admin/auth/providers")).toHaveLength(0);
+    // Already enabled: the commit point is not re-run.
+    expect(stub.routes()).not.toContain(
+      `POST /api/v1/admin/auth/providers/${PROVIDER_ID}/enable`,
+    );
+    expect(isProvisioningComplete(result.state)).toBe(true);
+    expect(result.state.allowedEmailDomainCount).toBe(2);
+    expect(result.trace.map((entry) => entry.step)).toContain("update_auth_provider");
+  });
+
+  test("a partial resume with a DISABLED row patches, stores, then enables it", async () => {
+    const stub = createMoiraStub(
+      updateHandlers({
+        [`GET /api/v1/admin/auth/providers/${PROVIDER_ID}`]: () => ({
+          status: 200,
+          body: providerRecord({ enabled: false, version: 2 }),
+        }),
+        [`PATCH /api/v1/admin/auth/providers/${PROVIDER_ID}`]: () => ({
+          status: 200,
+          body: providerRecord({ enabled: false, version: 3 }),
+        }),
+        [`POST /api/v1/admin/auth/providers/${PROVIDER_ID}/enable`]: () => ({
+          status: 200,
+          body: providerRecord({ enabled: true, version: 4 }),
+        }),
+      }),
+    );
+    const result = await runSetupProvisioning(
+      clientFor(stub),
+      provisioningRequest({
+        resume: { ...resumedComplete, providerEnabled: false, consoleSecretStored: false },
+      }),
+    );
+
+    expect(result.trace.map((entry) => entry.step)).toEqual([
+      "ensure_trusted_jwt_issuer",
+      "update_auth_provider",
+      "store_console_secret",
+      "enable_auth_provider",
+    ]);
+    expect(isProvisioningComplete(result.state)).toBe(true);
+  });
+
+  test("a failed patch names the update step, keeps the resume state, and remedies with retry", async () => {
+    const stub = createMoiraStub(
+      updateHandlers({
+        [`PATCH /api/v1/admin/auth/providers/${PROVIDER_ID}`]: () => ({
+          status: 400,
+          body: errorEnvelope("auth_provider_url_not_allowed"),
+        }),
+      }),
+    );
+    const error = (await runSetupProvisioning(
+      clientFor(stub),
+      provisioningRequest({ resume: resumedComplete }),
+    ).catch((caught: unknown) => caught)) as SetupProvisioningError;
+
+    expect(error).toBeInstanceOf(SetupProvisioningError);
+    expect(error.step).toBe("update_auth_provider");
+    expect(error.remedy).toBe("retry");
+    // The state is the COMPLETE resume, untouched: the working provider did not
+    // vanish from the model because one save of it failed.
+    expect(isProvisioningComplete(error.state)).toBe(true);
+  });
+
+  test("buildProviderPatchBody omits empty URL members rather than clearing them", () => {
+    const body = buildProviderPatchBody({
+      ...providerConfig,
+      issuer: null,
+      discoveryUrl: "",
+    }) as Record<string, unknown>;
+    expect("issuer" in body).toBe(false);
+    expect("discovery_url" in body).toBe(false);
+    expect(body["display_name"]).toBe("Google Workspace");
+    expect(() =>
+      buildProviderPatchBody({ ...providerConfig, allowedEmailDomains: [] }),
+    ).toThrow(SetupOrderingError);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Rehydration — deriveProvisioningState                                      */
+/* -------------------------------------------------------------------------- */
+
+describe("deriveProvisioningState reads the truth back from Moira and the store", () => {
+  const providerList = (rows: unknown[]): StubHandler => () => ({
+    status: 200,
+    body: { data: rows, pagination: { has_more: false, next_cursor: null } },
+  });
+
+  test("an unprovisioned deployment derives the empty state", async () => {
+    const stub = createMoiraStub({ "GET /api/v1/admin/jwt-issuers": emptyIssuerList });
+    const state = await deriveProvisioningState(clientFor(stub), async () => false, CONSOLE_ISSUER);
+    expect(state).toEqual(EMPTY_PROVISIONING_STATE);
+  });
+
+  test("a fully provisioned deployment derives a COMPLETE state — this is what survives the OAuth round trip", async () => {
+    const stub = createMoiraStub({
+      "GET /api/v1/admin/jwt-issuers": () => ({
+        status: 200,
+        body: { data: [issuerRecord()], pagination: { has_more: false, next_cursor: null } },
+      }),
+      "GET /api/v1/admin/auth/providers": providerList([
+        providerRecord({ enabled: true, version: 2 }),
+      ]),
+    });
+    const state = await deriveProvisioningState(clientFor(stub), async () => true, CONSOLE_ISSUER);
+    expect(isProvisioningComplete(state)).toBe(true);
+    expect(state.providerId).toBe(PROVIDER_ID);
+    expect(state.allowedEmailDomainCount).toBe(1);
+  });
+
+  test("a provider bound to a DIFFERENT issuer does not count", async () => {
+    const stub = createMoiraStub({
+      "GET /api/v1/admin/jwt-issuers": () => ({
+        status: 200,
+        body: { data: [issuerRecord()], pagination: { has_more: false, next_cursor: null } },
+      }),
+      "GET /api/v1/admin/auth/providers": providerList([
+        providerRecord({
+          enabled: true,
+          trusted_jwt_issuer_id: "99999999-9999-4999-8999-999999999999",
+        }),
+      ]),
+    });
+    const state = await deriveProvisioningState(clientFor(stub), async () => true, CONSOLE_ISSUER);
+    expect(state.providerId).toBeNull();
+    expect(state.trustedJwtIssuerId).toBe(ISSUER_ID);
+    expect(isProvisioningComplete(state)).toBe(false);
+  });
+
+  test("a missing console secret keeps the derived state incomplete", async () => {
+    const stub = createMoiraStub({
+      "GET /api/v1/admin/jwt-issuers": () => ({
+        status: 200,
+        body: { data: [issuerRecord()], pagination: { has_more: false, next_cursor: null } },
+      }),
+      "GET /api/v1/admin/auth/providers": providerList([
+        providerRecord({ enabled: true, version: 2 }),
+      ]),
+    });
+    const state = await deriveProvisioningState(clientFor(stub), async () => false, CONSOLE_ISSUER);
+    expect(state.consoleSecretStored).toBe(false);
+    expect(provisioningDeficiencies(state)).toEqual(["console_secret_not_stored"]);
+  });
+
+  test("the ENABLED bound row wins over a disabled leftover", async () => {
+    const stub = createMoiraStub({
+      "GET /api/v1/admin/jwt-issuers": () => ({
+        status: 200,
+        body: { data: [issuerRecord()], pagination: { has_more: false, next_cursor: null } },
+      }),
+      "GET /api/v1/admin/auth/providers": providerList([
+        providerRecord({ id: "44444444-4444-4444-8444-444444444444", enabled: false }),
+        providerRecord({ enabled: true, version: 2 }),
+      ]),
+    });
+    const state = await deriveProvisioningState(clientFor(stub), async () => true, CONSOLE_ISSUER);
+    expect(state.providerId).toBe(PROVIDER_ID);
+    expect(state.providerEnabled).toBe(true);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
 /* Gates                                                                      */
 /* -------------------------------------------------------------------------- */
 
@@ -467,7 +701,7 @@ describe("the claim step is navigation state, not advice", () => {
     providerVersion: 2,
     providerTrustedJwtIssuerId: ISSUER_ID,
     providerEnabled: true,
-    allowedEmailDomains: ["example.com"],
+    allowedEmailDomainCount: 1,
     consoleSecretStored: true,
   };
 
@@ -500,7 +734,7 @@ describe("the claim step is navigation state, not advice", () => {
   });
 
   test("an_empty_allow_list_never_opens_the_claim_step", () => {
-    const denyAll = { ...committed, allowedEmailDomains: [] };
+    const denyAll = { ...committed, allowedEmailDomainCount: 0 };
     expect(provisioningDeficiencies(denyAll)).toEqual(["allowed_email_domains_empty"]);
     expect(reachableSetupStep(wizard({ provisioning: denyAll }))).toBe("auth_settings");
   });
@@ -549,7 +783,7 @@ describe("the claim body", () => {
       providerVersion: 2,
       providerTrustedJwtIssuerId: ISSUER_ID,
       providerEnabled: true,
-      allowedEmailDomains: ["example.com"],
+      allowedEmailDomainCount: 1,
       consoleSecretStored: true,
     },
     signedInWithAllowedIdentity: true,

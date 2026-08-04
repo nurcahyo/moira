@@ -68,18 +68,29 @@ function envWith(overrides: EnvSource = {}): ConsoleEnv {
   return readConsoleEnv({ ...BASE_ENV, ...overrides });
 }
 
-/** A `ConsoleSecretStore` that records `put()` and nothing else. */
+/** A `ConsoleSecretStore` that records `put()` and reports sealed PRESENCE. */
 class RecordingSecretStore implements ConsoleSecretStore {
   readonly puts: Array<{ providerId: string; clientId: string; plaintext: string }> = [];
+  /** Provider ids the store claims to hold a sealed secret for. */
+  readonly sealedIds = new Set<string>();
   /** Set to make `put` fail, so the store step of the sequence can be exercised. */
   failure: Error | null = null;
 
   async put(providerId: string, clientId: string, plaintext: string): Promise<void> {
     if (this.failure !== null) throw this.failure;
     this.puts.push({ providerId, clientId, plaintext });
+    this.sealedIds.add(providerId);
   }
-  async read(): Promise<SealedClientSecret | null> {
-    return null;
+  async read(providerId: string): Promise<SealedClientSecret | null> {
+    if (!this.sealedIds.has(providerId)) return null;
+    // Presence is all the route may consult; the members are inert fixtures.
+    return {
+      version: 1,
+      iv: "AAAA",
+      ciphertext: "AAAA",
+      clientId: CLIENT_ID,
+      updatedAt: "2026-08-04T00:00:00Z",
+    };
   }
   async reveal(): Promise<string | null> {
     return null;
@@ -135,7 +146,10 @@ function providerRecord(overrides: Record<string, unknown> = {}) {
 const CLAIM_STATUS_ROUTE = "GET /api/v1/admin/setup/claim-status";
 const ISSUER_LIST_ROUTE = "GET /api/v1/admin/jwt-issuers";
 const ISSUER_CREATE_ROUTE = "POST /api/v1/admin/jwt-issuers";
+const PROVIDER_LIST_ROUTE = "GET /api/v1/admin/auth/providers";
 const PROVIDER_CREATE_ROUTE = "POST /api/v1/admin/auth/providers";
+const PROVIDER_GET_ROUTE = `GET /api/v1/admin/auth/providers/${PROVIDER_ID}`;
+const PROVIDER_PATCH_ROUTE = `PATCH /api/v1/admin/auth/providers/${PROVIDER_ID}`;
 const PROVIDER_ENABLE_ROUTE = `POST /api/v1/admin/auth/providers/${PROVIDER_ID}/enable`;
 const AUTH_METHODS_ROUTE = "GET /api/v1/admin/setup/auth-methods";
 const CLAIM_ROUTE = "POST /api/v1/admin/setup/claim";
@@ -150,11 +164,25 @@ const populatedIssuerList: StubHandler = () => ({
   body: { data: [issuerRecord()], pagination: { has_more: false, next_cursor: null } },
 });
 
+const emptyProviderList: StubHandler = () => ({
+  status: 200,
+  body: { data: [], pagination: { has_more: false, next_cursor: null } },
+});
+
+const enabledProviderList: StubHandler = () => ({
+  status: 200,
+  body: {
+    data: [providerRecord({ enabled: true, version: 2 })],
+    pagination: { has_more: false, next_cursor: null },
+  },
+});
+
 function handlers(overrides: Record<string, StubHandler> = {}): Record<string, StubHandler> {
   return {
     [CLAIM_STATUS_ROUTE]: () => ({ status: 200, body: { claimed: false } }),
     [ISSUER_LIST_ROUTE]: emptyIssuerList,
     [ISSUER_CREATE_ROUTE]: () => ({ status: 201, body: issuerRecord() }),
+    [PROVIDER_LIST_ROUTE]: emptyProviderList,
     [PROVIDER_CREATE_ROUTE]: () => ({ status: 201, body: providerRecord() }),
     [PROVIDER_ENABLE_ROUTE]: () => ({
       status: 200,
@@ -233,6 +261,30 @@ function install(
   });
 }
 
+/**
+ * Wire the route to a FULLY PROVISIONED deployment: the trusted issuer and the
+ * enabled bound provider exist in Moira's records, and the console holds a
+ * sealed secret for the row. This is what the claim action derives its state
+ * from — the browser no longer sends one.
+ */
+function installProvisioned(
+  options: {
+    readonly handlers?: Record<string, StubHandler>;
+    readonly session?: SessionCheck;
+    readonly secretSealed?: boolean;
+  } = {},
+): void {
+  install({
+    handlers: handlers({
+      [ISSUER_LIST_ROUTE]: populatedIssuerList,
+      [PROVIDER_LIST_ROUTE]: enabledProviderList,
+      ...options.handlers,
+    }),
+    ...(options.session === undefined ? {} : { session: options.session }),
+  });
+  if (options.secretSealed !== false) store.sealedIds.add(PROVIDER_ID);
+}
+
 function post(body: unknown): Request {
   return new Request("https://console.example.com/api/setup", {
     method: "POST",
@@ -298,7 +350,7 @@ describe("the setup window is the gate, and it is checked before anything else",
     const responses = [
       await GET(),
       await POST(post(PROVISION_BODY)),
-      await POST(post({ action: "claim", state: COMPLETE_STATE })),
+      await POST(post({ action: "claim" })),
     ];
     for (const response of responses) {
       expect(response.status).toBe(409);
@@ -343,7 +395,9 @@ describe("GET aggregates server-side and publishes a narrowed view", () => {
     expect(response.status).toBe(200);
     const body = await json(response);
 
-    expect(stub.routes()).toEqual([CLAIM_STATUS_ROUTE, AUTH_METHODS_ROUTE]);
+    // Claim-status (the guard), the aggregation, then the rehydration lookup —
+    // which stops at the issuer list when no issuer is registered yet.
+    expect(stub.routes()).toEqual([CLAIM_STATUS_ROUTE, AUTH_METHODS_ROUTE, ISSUER_LIST_ROUTE]);
     expect(stub.requestsFor(AUTH_METHODS_ROUTE)[0]?.headers["X-Moira-System-Key"]).toBe(
       "sk_test_bootstrap",
     );
@@ -362,6 +416,28 @@ describe("GET aggregates server-side and publishes a narrowed view", () => {
         allowed_email_domain_count: 2,
       },
     ]);
+    // Nothing provisioned yet: the derived state is empty, and the wizard will
+    // start from the auth-settings step.
+    expect(body["state"]).toMatchObject({ providerId: null, trustedJwtIssuerId: null });
+  });
+
+  test("a provisioned deployment REHYDRATES the display-safe state — the OAuth round trip depends on it", async () => {
+    // Sign-in navigates the operator away from /setup and back; the fresh
+    // document knows only what this response tells it. Without these fields the
+    // claim step is permanently unreachable after the very sign-in it requires.
+    installProvisioned();
+    const body = await json(await GET());
+    expect(body["state"]).toEqual({
+      trustedJwtIssuerId: ISSUER_ID,
+      trustedJwtIssuerVersion: 1,
+      providerId: PROVIDER_ID,
+      providerVersion: 2,
+      providerTrustedJwtIssuerId: ISSUER_ID,
+      providerEnabled: true,
+      allowedEmailDomainCount: 1,
+      consoleSecretStored: true,
+    });
+    expect(body["provider_id"]).toBeString();
   });
 
   test("the raw auth-methods response does not cross to the browser", async () => {
@@ -369,7 +445,10 @@ describe("GET aggregates server-side and publishes a narrowed view", () => {
     // without a session, so `allowed_email_domains` — the deny-by-default
     // admin-claim policy — must not be published here, and neither must the IdP
     // endpoint set. Moira withholds the same field from its ANONYMOUS projection
-    // for exactly this reason.
+    // for exactly this reason. Run against a PROVISIONED deployment on purpose:
+    // the rehydrated `state` reads the raw provider rows, and it too must
+    // publish a domain COUNT, never a domain.
+    installProvisioned();
     const serialised = JSON.stringify(await json(await GET()));
     expect(serialised).not.toContain("ops.example.com");
     expect(serialised).not.toContain("allowed_email_domains");
@@ -593,6 +672,94 @@ describe("a partial write comes back resumable, with the remedy for its step", (
     );
     expect(stub.routes()).toEqual([CLAIM_STATUS_ROUTE]);
   });
+
+  test("a resume that names a provider row PATCHes it and needs NO secret re-entry", async () => {
+    // The domain-refusal remedy, at the wire: "add {domain} below, save the
+    // provider again". Replaying the create against the same submission id with
+    // a changed body would be `409 idempotency_conflict`; a fresh create would
+    // mint a second row that the partial unique index refuses at enable. And
+    // the operator is NOT asked to re-type a secret the console already sealed.
+    install({
+      handlers: handlers({
+        [ISSUER_LIST_ROUTE]: populatedIssuerList,
+        [PROVIDER_GET_ROUTE]: () => ({
+          status: 200,
+          body: providerRecord({ enabled: true, version: 2 }),
+        }),
+        [PROVIDER_PATCH_ROUTE]: () => ({
+          status: 200,
+          body: providerRecord({
+            enabled: true,
+            version: 3,
+            allowed_email_domains: ["example.com", "gmail.com"],
+          }),
+        }),
+      }),
+    });
+    store.sealedIds.add(PROVIDER_ID);
+    const resume = {
+      trustedJwtIssuerId: ISSUER_ID,
+      trustedJwtIssuerVersion: 1,
+      providerId: PROVIDER_ID,
+      providerVersion: 2,
+      providerTrustedJwtIssuerId: ISSUER_ID,
+      providerEnabled: true,
+      allowedEmailDomainCount: 1,
+      consoleSecretStored: true,
+    };
+
+    const response = await POST(
+      post({
+        ...PROVISION_BODY,
+        client_secret: "",
+        allowed_email_domains: ["example.com", "gmail.com"],
+        resume,
+      }),
+    );
+    expect(response.status).toBe(201);
+
+    // Reuse the issuer, read the row for a fresh If-Match, patch it. No create,
+    // no enable (the row is already the committed one).
+    expect(stub.routes()).toEqual([
+      CLAIM_STATUS_ROUTE,
+      ISSUER_LIST_ROUTE,
+      PROVIDER_GET_ROUTE,
+      PROVIDER_PATCH_ROUTE,
+    ]);
+    const patched = stub.bodyOf(PROVIDER_PATCH_ROUTE) as Record<string, unknown>;
+    expect(patched["allowed_email_domains"]).toEqual(["example.com", "gmail.com"]);
+    expect("enabled" in patched).toBe(false);
+    // The sealed secret still stands; nothing was re-written and nothing asked.
+    expect(store.puts).toEqual([]);
+
+    const body = await json(response);
+    expect(body["state"]).toMatchObject({
+      providerEnabled: true,
+      allowedEmailDomainCount: 2,
+      consoleSecretStored: true,
+    });
+  });
+
+  test("an empty client_secret WITHOUT a sealed one on record is still refused", async () => {
+    // The relaxation is exactly one shape wide: no resume, or a resume whose
+    // `consoleSecretStored` is false, still requires the secret.
+    const resume = {
+      trustedJwtIssuerId: ISSUER_ID,
+      trustedJwtIssuerVersion: 1,
+      providerId: PROVIDER_ID,
+      providerVersion: 2,
+      providerTrustedJwtIssuerId: ISSUER_ID,
+      providerEnabled: false,
+      allowedEmailDomainCount: 1,
+      consoleSecretStored: false,
+    };
+    const response = await POST(post({ ...PROVISION_BODY, client_secret: "", resume }));
+    expect(response.status).toBe(400);
+    expect(errorOf(await json(response))["message_key"]).toBe(
+      CONSOLE_MESSAGE_KEYS.setup_client_secret_required,
+    );
+    expect(stub.routes()).toEqual([CLAIM_STATUS_ROUTE]);
+  });
 });
 
 /* -------------------------------------------------------------------------- */
@@ -688,22 +855,24 @@ describe("provision input is validated before the first Moira write", () => {
 /* claim                                                                      */
 /* -------------------------------------------------------------------------- */
 
-/** A provisioning state that satisfies every gate condition. */
-const COMPLETE_STATE = {
-  trustedJwtIssuerId: ISSUER_ID,
-  trustedJwtIssuerVersion: 1,
-  providerId: PROVIDER_ID,
-  providerVersion: 2,
-  providerTrustedJwtIssuerId: ISSUER_ID,
-  providerEnabled: true,
-  allowedEmailDomains: ["example.com"],
-  consoleSecretStored: true,
-} as const;
+describe("POST claim derives the provisioning state SERVER-SIDE", () => {
+  // The browser sends `{action: "claim"}` and nothing else. Its own memory of
+  // the provisioning state did not survive the OAuth round trip — sign-in is a
+  // full navigation away from /setup and back — so the gate is computed from
+  // Moira's records plus the console's secret store, on every claim.
 
-describe("POST claim", () => {
   test("claims with the CONSOLE's issuer and the session's own subject", async () => {
-    const response = await POST(post({ action: "claim", state: COMPLETE_STATE }));
+    installProvisioned();
+    const response = await POST(post({ action: "claim" }));
     expect(response.status).toBe(201);
+
+    // The derivation went to the source of truth before the claim went out.
+    expect(stub.routes()).toEqual([
+      CLAIM_STATUS_ROUTE,
+      ISSUER_LIST_ROUTE,
+      PROVIDER_LIST_ROUTE,
+      CLAIM_ROUTE,
+    ]);
 
     const body = stub.bodyOf(CLAIM_ROUTE) as Record<string, unknown>;
     expect(body).toEqual({
@@ -731,14 +900,15 @@ describe("POST claim", () => {
     // `SetupOrderingError` from `claimAdminIdentity`, which is the defence in
     // depth in front of Moira's own `admin_claim_email_not_verified`. The
     // session check normally refuses first; this asserts the second gate holds
-    // when it does not.
-    install({
+    // when it does not. The deployment IS provisioned, so the refusal cannot be
+    // the unreachable-step one.
+    installProvisioned({
       session: {
         ok: true,
         identity: { email: "ops@example.com", emailVerified: false, idpSubject: "sub-abc" },
       },
     });
-    const response = await POST(post({ action: "claim", state: COMPLETE_STATE }));
+    const response = await POST(post({ action: "claim" }));
     expect(response.status).toBe(400);
     expect(errorOf(await json(response))["message_key"]).toBe(
       CONSOLE_MESSAGE_KEYS.setup_email_not_verified,
@@ -746,10 +916,19 @@ describe("POST claim", () => {
     expect(stub.routes()).not.toContain(CLAIM_ROUTE);
   });
 
-  test("an incomplete provisioning state makes the claim step unreachable", async () => {
-    const response = await POST(
-      post({ action: "claim", state: { ...COMPLETE_STATE, providerEnabled: false } }),
-    );
+  test("a provider Moira reports DISABLED makes the claim step unreachable — whatever the browser believes", async () => {
+    installProvisioned({
+      handlers: {
+        [PROVIDER_LIST_ROUTE]: () => ({
+          status: 200,
+          body: {
+            data: [providerRecord({ enabled: false })],
+            pagination: { has_more: false, next_cursor: null },
+          },
+        }),
+      },
+    });
+    const response = await POST(post({ action: "claim" }));
     expect(response.status).toBe(409);
     expect(errorOf(await json(response))["message_key"]).toBe(
       CONSOLE_MESSAGE_KEYS.setup_claim_step_unreachable,
@@ -757,15 +936,39 @@ describe("POST claim", () => {
     expect(stub.routes()).not.toContain(CLAIM_ROUTE);
   });
 
+  test("a missing console secret makes the claim step unreachable", async () => {
+    installProvisioned({ secretSealed: false });
+    const response = await POST(post({ action: "claim" }));
+    expect(response.status).toBe(409);
+    expect(errorOf(await json(response))["message_key"]).toBe(
+      CONSOLE_MESSAGE_KEYS.setup_claim_step_unreachable,
+    );
+    expect(stub.routes()).not.toContain(CLAIM_ROUTE);
+  });
+
+  test("an UNPROVISIONED deployment refuses the claim as unreachable, from its own records", async () => {
+    // Nothing registered in Moira at all: the derived state is empty and the
+    // claim step is not reachable. Previously this was a 400 about an
+    // unreadable body-state; the body no longer carries one to misread.
+    const response = await POST(post({ action: "claim" }));
+    expect(response.status).toBe(409);
+    expect(errorOf(await json(response))["message_key"]).toBe(
+      CONSOLE_MESSAGE_KEYS.setup_claim_step_unreachable,
+    );
+    expect(stub.routes()).toEqual([CLAIM_STATUS_ROUTE, ISSUER_LIST_ROUTE]);
+  });
+
   test("no session is a 401 carrying the session check's own key", async () => {
     install({
       session: { ok: false, rejection: "no_session", messageKey: "console.error.session_required" },
     });
-    const response = await POST(post({ action: "claim", state: COMPLETE_STATE }));
+    const response = await POST(post({ action: "claim" }));
     expect(response.status).toBe(401);
     const error = errorOf(await json(response));
     expect(error["code"]).toBe("no_session");
     expect(error["message_key"]).toBe(CONSOLE_MESSAGE_KEYS.session_required);
+    // Refused before the derivation spent anything on Moira.
+    expect(stub.routes()).toEqual([CLAIM_STATUS_ROUTE]);
   });
 
   test("a session that may not act is a 403, not a 401", async () => {
@@ -776,19 +979,19 @@ describe("POST claim", () => {
         messageKey: CONSOLE_MESSAGE_KEYS.email_domain_not_allowed,
       },
     });
-    expect((await POST(post({ action: "claim", state: COMPLETE_STATE }))).status).toBe(403);
+    expect((await POST(post({ action: "claim" }))).status).toBe(403);
   });
 
   test("403 admin_claim_domain_not_allowed is re-keyed WITH the offending domain", async () => {
-    install({
-      handlers: handlers({
+    installProvisioned({
+      handlers: {
         [CLAIM_ROUTE]: () => ({
           status: 403,
           body: errorEnvelope("admin_claim_domain_not_allowed"),
         }),
-      }),
+      },
     });
-    const response = await POST(post({ action: "claim", state: COMPLETE_STATE }));
+    const response = await POST(post({ action: "claim" }));
     expect(response.status).toBe(403);
     const error = errorOf(await json(response));
     expect(error["code"]).toBe("admin_claim_domain_not_allowed");
@@ -802,28 +1005,38 @@ describe("POST claim", () => {
   });
 
   test("any other Moira refusal is passed through as the client-safe union", async () => {
-    install({
-      handlers: handlers({
+    installProvisioned({
+      handlers: {
         [CLAIM_ROUTE]: () => ({
           status: 409,
           body: errorEnvelope("admin_identity_already_claimed"),
         }),
-      }),
+      },
     });
-    const response = await POST(post({ action: "claim", state: COMPLETE_STATE }));
+    const response = await POST(post({ action: "claim" }));
     expect(response.status).toBe(409);
     const error = errorOf(await json(response));
     expect(error["remedy"]).toBe("already_complete");
     expect(JSON.stringify(error)).not.toContain("req_stub_0001");
   });
 
-  test("a claim with no readable state is refused", async () => {
-    const response = await POST(post({ action: "claim" }));
-    expect(response.status).toBe(400);
-    expect(errorOf(await json(response))["message_key"]).toBe(
-      CONSOLE_MESSAGE_KEYS.setup_resume_state_invalid,
-    );
-    expect(stub.routes()).toEqual([CLAIM_STATUS_ROUTE]);
+  test("a fabricated client state cannot open the gate — the body's state is ignored", async () => {
+    // The old contract let the browser ECHO a state; a fabricated COMPLETE one
+    // must not reach further than an honest empty one now that the server
+    // derives its own.
+    const fabricated = {
+      trustedJwtIssuerId: ISSUER_ID,
+      trustedJwtIssuerVersion: 1,
+      providerId: PROVIDER_ID,
+      providerVersion: 2,
+      providerTrustedJwtIssuerId: ISSUER_ID,
+      providerEnabled: true,
+      allowedEmailDomainCount: 1,
+      consoleSecretStored: true,
+    };
+    const response = await POST(post({ action: "claim", state: fabricated }));
+    expect(response.status).toBe(409);
+    expect(stub.routes()).not.toContain(CLAIM_ROUTE);
   });
 });
 

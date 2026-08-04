@@ -17,7 +17,7 @@ import userEvent from "@testing-library/user-event";
 
 import { CONSOLE_CATALOG } from "@/lib/i18n";
 import { CONSOLE_MESSAGE_KEYS, type ConsoleMessageKey } from "@/lib/i18n/keys";
-import type { SetupProvisioningState } from "@/lib/setup-steps";
+import { EMPTY_PROVISIONING_STATE, type SetupProvisioningState } from "@/lib/setup-steps";
 import { SetupWizard, type SetupViewModel } from "@/modules/setup/SetupWizard";
 
 const K = CONSOLE_MESSAGE_KEYS;
@@ -35,11 +35,36 @@ const COMPLETE_STATE: SetupProvisioningState = {
   providerVersion: 2,
   providerTrustedJwtIssuerId: ISSUER_ID,
   providerEnabled: true,
-  allowedEmailDomains: ["example.com"],
+  allowedEmailDomainCount: 1,
   consoleSecretStored: true,
 };
 
-const READY: SetupViewModel = { kind: "ready", claimed: false, methods: [] };
+const READY: SetupViewModel = {
+  kind: "ready",
+  claimed: false,
+  methods: [],
+  provisioning: EMPTY_PROVISIONING_STATE,
+  oauthProviderId: null,
+};
+
+/** The view a REVISIT of a provisioned-but-unclaimed deployment resolves. */
+const READY_PROVISIONED: SetupViewModel = {
+  kind: "ready",
+  claimed: false,
+  methods: [
+    {
+      id: PROVIDER_ID,
+      method: "google_oauth",
+      displayName: "Google Workspace",
+      interactive: true,
+      clientIdConfigured: true,
+      discoveryUrlConfigured: true,
+      allowedEmailDomainCount: 1,
+    },
+  ],
+  provisioning: COMPLETE_STATE,
+  oauthProviderId: "moira-console-idp",
+};
 
 interface RecordedCall {
   readonly url: string;
@@ -133,7 +158,7 @@ describe("the claim step is unreachable until the gate conditions are CONFIRMED"
       provision: {
         status: 201,
         body: {
-          state: { ...COMPLETE_STATE, allowedEmailDomains: [] },
+          state: { ...COMPLETE_STATE, allowedEmailDomainCount: 0 },
           provider_id: "moira-console-idp",
         },
       },
@@ -196,6 +221,8 @@ describe("the claim step is unreachable until the gate conditions are CONFIRMED"
               allowedEmailDomainCount: 1,
             },
           ],
+          provisioning: EMPTY_PROVISIONING_STATE,
+          oauthProviderId: null,
         }}
         fetchImpl={fetchImpl}
         navigate={() => {}}
@@ -204,6 +231,59 @@ describe("the claim step is unreachable until the gate conditions are CONFIRMED"
     await provisionThroughForm();
 
     expect(await screen.findByText(copy(K.setup_sign_in_intro))).toBeInTheDocument();
+    expect(claimButton()).toBeNull();
+  });
+});
+
+describe("the wizard survives the OAuth round trip: a FRESH DOCUMENT rehydrates from the view", () => {
+  // Sign-in is `location.assign` to the IdP and back — the wizard REMOUNTS with
+  // empty React state on return. Everything it needs must come back through the
+  // server-derived view model, not through anything this component remembered.
+
+  test("a remount with a rehydrated COMPLETE state and a session reaches the claim step directly", async () => {
+    const { calls, fetchImpl } = makeFetch({
+      session: { status: 200, body: { user: { email: "ops@example.com" } } },
+    });
+    render(<SetupWizard view={READY_PROVISIONED} fetchImpl={fetchImpl} navigate={() => {}} />);
+
+    // No provisioning happened in THIS document — the claim is reachable purely
+    // from the rehydrated state plus the session probe.
+    expect(
+      await screen.findByRole("button", { name: copy(K.setup_claim_button) }),
+    ).toBeInTheDocument();
+    expect(calls.filter((call) => call.body?.["action"] === "provision")).toHaveLength(0);
+  });
+
+  test("a remount with a rehydrated COMPLETE state but no session offers sign-in, not welcome", async () => {
+    const { fetchImpl } = makeFetch({ session: { status: 200, body: null } });
+    render(<SetupWizard view={READY_PROVISIONED} fetchImpl={fetchImpl} navigate={() => {}} />);
+
+    expect(await screen.findByText(copy(K.setup_sign_in_intro))).toBeInTheDocument();
+    expect(claimButton()).toBeNull();
+    // The welcome organism stays mounted (state preservation) but HIDDEN — the
+    // active step is sign-in, not the beginning of the wizard.
+    expect(screen.getByText(copy(K.setup_welcome_heading)).closest("div[hidden]")).not.toBeNull();
+  });
+
+  test("the claim request carries NO client-side state — the BFF derives its own", async () => {
+    const { calls, fetchImpl } = makeFetch({
+      session: { status: 200, body: { user: { email: "ops@example.com" } } },
+      claim: { status: 201, body: { identity: { email: "ops@example.com" } } },
+    });
+    render(<SetupWizard view={READY_PROVISIONED} fetchImpl={fetchImpl} navigate={() => {}} />);
+    await userEvent.click(
+      await screen.findByRole("button", { name: copy(K.setup_claim_button) }),
+    );
+
+    expect(await screen.findByText(copy(K.setup_done_heading))).toBeInTheDocument();
+    const claim = calls.find((call) => call.body?.["action"] === "claim");
+    expect(claim).toBeDefined();
+    expect(claim!.body).toEqual({ action: "claim" });
+  });
+
+  test("a rehydrated INCOMPLETE state still starts at welcome with no claim surface", () => {
+    render(<SetupWizard view={READY} fetchImpl={makeFetch({}).fetchImpl} navigate={() => {}} />);
+    expect(screen.getByText(copy(K.setup_welcome_heading))).toBeInTheDocument();
     expect(claimButton()).toBeNull();
   });
 });
@@ -268,6 +348,36 @@ describe("admin_claim_domain_not_allowed is an actionable instruction, not a ban
     await waitFor(() =>
       expect(document.activeElement).toBe(field(K.setup_auth_allowed_domains_label)),
     );
+  });
+
+  test("the instruction is FOLLOWABLE: add the domain, save again without the secret, claim reopens", async () => {
+    // The whole remedy, end to end. The re-save must not replay the finished
+    // submission's idempotency keys (that is 409 idempotency_conflict), must
+    // not demand a secret the console already sealed, and must reopen the
+    // claim surface when it lands.
+    const calls = await refuseClaim();
+    await screen.findByText(copy(K.setup_domain_not_allowed_title));
+
+    const user = userEvent.setup();
+    await user.type(field(K.setup_auth_allowed_domains_label), ", gmail.com");
+    await user.click(screen.getByRole("button", { name: copy(K.setup_auth_submit) }));
+
+    // Back on the claim step, ready to retry.
+    expect(
+      await screen.findByRole("button", { name: copy(K.setup_claim_button) }),
+    ).toBeInTheDocument();
+
+    const saves = calls.filter((call) => call.body?.["action"] === "provision");
+    expect(saves).toHaveLength(2);
+    // No secret re-entry: the console still holds it, and the operator was not
+    // asked for it (the field was emptied on the first success).
+    expect(saves[1]!.body!["client_secret"]).toBe("");
+    // The save resumes against the existing row instead of re-creating it…
+    expect(saves[1]!.body!["resume"]).toMatchObject({ providerId: PROVIDER_ID });
+    // …under a NEW submission, so the finished submission's idempotency keys
+    // are never replayed against a changed body.
+    expect(saves[1]!.body!["submission_id"]).not.toBe(saves[0]!.body!["submission_id"]);
+    expect(saves[1]!.body!["allowed_email_domains"]).toEqual(["example.com", "gmail.com"]);
   });
 });
 

@@ -20,7 +20,11 @@ import userEvent from "@testing-library/user-event";
 
 import { CONSOLE_CATALOG } from "@/lib/i18n";
 import { CONSOLE_MESSAGE_KEYS, type ConsoleMessageKey } from "@/lib/i18n/keys";
-import { isProvisioningComplete, type SetupProvisioningState } from "@/lib/setup-steps";
+import {
+  EMPTY_PROVISIONING_STATE,
+  isProvisioningComplete,
+  type SetupProvisioningState,
+} from "@/lib/setup-steps";
 import { AuthSettingsStep } from "@/modules/setup/AuthSettingsStep";
 import type { SetupMethodSummary } from "@/modules/setup/setup-view";
 
@@ -42,7 +46,7 @@ const COMPLETE_STATE: SetupProvisioningState = {
   providerVersion: 2,
   providerTrustedJwtIssuerId: ISSUER_ID,
   providerEnabled: true,
-  allowedEmailDomains: ["example.com"],
+  allowedEmailDomainCount: 1,
   consoleSecretStored: true,
 };
 
@@ -109,6 +113,7 @@ describe("the client secret is write-only", () => {
     render(
       <AuthSettingsStep
         methods={[EXISTING_METHOD]}
+        provisioning={EMPTY_PROVISIONING_STATE}
         refusedDomain={null}
         onProvisioned={() => {}}
         fetchImpl={makeFetch([]).fetchImpl}
@@ -126,6 +131,7 @@ describe("the client secret is write-only", () => {
     render(
       <AuthSettingsStep
         methods={[EXISTING_METHOD]}
+        provisioning={EMPTY_PROVISIONING_STATE}
         refusedDomain={null}
         onProvisioned={() => {}}
         fetchImpl={makeFetch([]).fetchImpl}
@@ -141,6 +147,7 @@ describe("the client secret is write-only", () => {
     render(
       <AuthSettingsStep
         methods={[{ ...EXISTING_METHOD, clientIdConfigured: false }]}
+        provisioning={EMPTY_PROVISIONING_STATE}
         refusedDomain={null}
         onProvisioned={() => {}}
         fetchImpl={makeFetch([]).fetchImpl}
@@ -156,6 +163,7 @@ describe("an empty submission is blocked, not sent", () => {
     render(
       <AuthSettingsStep
         methods={[]}
+        provisioning={EMPTY_PROVISIONING_STATE}
         refusedDomain={null}
         onProvisioned={() => {}}
         fetchImpl={fetchImpl}
@@ -175,6 +183,7 @@ describe("an empty submission is blocked, not sent", () => {
     render(
       <AuthSettingsStep
         methods={[]}
+        provisioning={EMPTY_PROVISIONING_STATE}
         refusedDomain={null}
         onProvisioned={() => {}}
         fetchImpl={fetchImpl}
@@ -211,7 +220,7 @@ describe("the step is not complete until all four conditions are confirmed", () 
       },
       {
         what: "the allow-list came back empty",
-        state: { ...COMPLETE_STATE, allowedEmailDomains: [] },
+        state: { ...COMPLETE_STATE, allowedEmailDomainCount: 0 },
       },
     ];
 
@@ -224,7 +233,8 @@ describe("the step is not complete until all four conditions are confirmed", () 
       render(
         <AuthSettingsStep
           methods={[]}
-          refusedDomain={null}
+          provisioning={EMPTY_PROVISIONING_STATE}
+        refusedDomain={null}
           onProvisioned={(state) => reported.push(state)}
           fetchImpl={fetchImpl}
         />,
@@ -251,6 +261,7 @@ describe("the step is not complete until all four conditions are confirmed", () 
     render(
       <AuthSettingsStep
         methods={[]}
+        provisioning={EMPTY_PROVISIONING_STATE}
         refusedDomain={null}
         onProvisioned={(state) => reported.push(state)}
         fetchImpl={fetchImpl}
@@ -291,6 +302,7 @@ describe("a forced secret-write failure is incomplete, with Retry AND Discard", 
     render(
       <AuthSettingsStep
         methods={[]}
+        provisioning={EMPTY_PROVISIONING_STATE}
         refusedDomain={null}
         onProvisioned={(state) => reported.push(state)}
         fetchImpl={fetchImpl}
@@ -334,6 +346,7 @@ describe("a forced secret-write failure is incomplete, with Retry AND Discard", 
     render(
       <AuthSettingsStep
         methods={[]}
+        provisioning={EMPTY_PROVISIONING_STATE}
         refusedDomain={null}
         onProvisioned={() => {}}
         fetchImpl={fetchImpl}
@@ -364,6 +377,7 @@ describe("the secret reaches the BFF and nothing else", () => {
     render(
       <AuthSettingsStep
         methods={[]}
+        provisioning={EMPTY_PROVISIONING_STATE}
         refusedDomain={null}
         onProvisioned={() => {}}
         fetchImpl={fetchImpl}
@@ -381,11 +395,117 @@ describe("the secret reaches the BFF and nothing else", () => {
   });
 });
 
+describe("a re-save of an already-provisioned provider — the domain-refusal remedy", () => {
+  async function fillWithoutSecret(domains: string): Promise<void> {
+    const user = userEvent.setup();
+    await user.type(field(K.setup_auth_display_name_label), "Google Workspace");
+    await user.type(field(K.setup_auth_client_id_label), "client-123.apps.example");
+    await user.type(
+      field(K.setup_auth_discovery_url_label),
+      "https://accounts.google.com/.well-known/openid-configuration",
+    );
+    await user.type(field(K.setup_auth_allowed_domains_label), domains);
+  }
+
+  test("saves WITHOUT re-entering the sealed secret, resuming against the existing row", async () => {
+    // The instruction the domain-refusal copy gives — "add {domain} below, save
+    // the provider again, then retry the claim" — must be followable by an
+    // operator who no longer holds the OAuth client secret: the console sealed
+    // it on the earlier save, and `consoleSecretStored` says so.
+    const updated = { ...COMPLETE_STATE, allowedEmailDomainCount: 2 };
+    const { calls, fetchImpl } = makeFetch([
+      { status: 201, body: { state: updated, provider_id: "moira-console-idp" } },
+    ]);
+    const reported: SetupProvisioningState[] = [];
+    render(
+      <AuthSettingsStep
+        methods={[]}
+        provisioning={COMPLETE_STATE}
+        refusedDomain="gmail.com"
+        onProvisioned={(state) => reported.push(state)}
+        fetchImpl={fetchImpl}
+      />,
+    );
+    await fillWithoutSecret("example.com, gmail.com");
+    await submit();
+
+    // NOT blocked on the empty secret field, and nothing asked for it.
+    await waitFor(() => expect(calls).toHaveLength(1));
+    expect(screen.queryByText(copy(K.setup_client_secret_required))).not.toBeInTheDocument();
+    // The save RESUMES against the known row — this is what routes the BFF to
+    // the PATCH path instead of a second create.
+    expect(calls[0]!.body["resume"]).toEqual(COMPLETE_STATE as unknown as Record<string, unknown>);
+    expect(calls[0]!.body["client_secret"]).toBe("");
+    expect(calls[0]!.body["allowed_email_domains"]).toEqual(["example.com", "gmail.com"]);
+
+    await waitFor(() => expect(reported).toHaveLength(1));
+    expect(isProvisioningComplete(reported[0]!)).toBe(true);
+  });
+
+  test("a FRESH form still requires the secret — nothing provisioned means nothing sealed", async () => {
+    const { calls, fetchImpl } = makeFetch([{ status: 201, body: {} }]);
+    render(
+      <AuthSettingsStep
+        methods={[]}
+        provisioning={EMPTY_PROVISIONING_STATE}
+        refusedDomain={null}
+        onProvisioned={() => {}}
+        fetchImpl={fetchImpl}
+      />,
+    );
+    await fillWithoutSecret("example.com");
+    await submit();
+    expect(calls).toHaveLength(0);
+    expect(screen.getByText(copy(K.setup_client_secret_required))).toBeInTheDocument();
+  });
+
+  test("a failed re-save keeps the complete provider in the wizard's model", async () => {
+    // The compounding failure the review named: a failed save used to report a
+    // PARTIAL state upward and erase the already-working provider from the
+    // wizard for the rest of the session.
+    const { fetchImpl } = makeFetch([
+      {
+        status: 400,
+        body: {
+          error: {
+            code: "setup_provisioning_failed",
+            step: "update_auth_provider",
+            remedy: "retry",
+            message_key: K.auth_provider_update_failed,
+            message_args: null,
+            requires_client_secret_re_entry: false,
+            state: COMPLETE_STATE,
+            moira: null,
+          },
+        },
+      },
+    ]);
+    const reported: SetupProvisioningState[] = [];
+    render(
+      <AuthSettingsStep
+        methods={[]}
+        provisioning={COMPLETE_STATE}
+        refusedDomain="gmail.com"
+        onProvisioned={(state) => reported.push(state)}
+        fetchImpl={fetchImpl}
+      />,
+    );
+    await fillWithoutSecret("example.com, gmail.com");
+    await submit();
+
+    expect(await screen.findByText(copy(K.auth_provider_update_failed))).toBeInTheDocument();
+    // The COMPLETE state was not re-reported: the wizard's model keeps the
+    // provider it already confirmed, and the cursor stays on this failure.
+    expect(reported).toHaveLength(0);
+  });
+});
+
 describe("a claim-time domain refusal focuses the allow-list with the instruction", () => {
   test("refusedDomain renders the actionable copy and moves focus", async () => {
     const { rerender } = render(
       <AuthSettingsStep
         methods={[]}
+        provisioning={EMPTY_PROVISIONING_STATE}
         refusedDomain={null}
         onProvisioned={() => {}}
         fetchImpl={makeFetch([]).fetchImpl}
@@ -396,6 +516,7 @@ describe("a claim-time domain refusal focuses the allow-list with the instructio
     rerender(
       <AuthSettingsStep
         methods={[]}
+        provisioning={EMPTY_PROVISIONING_STATE}
         refusedDomain="gmail.com"
         onProvisioned={() => {}}
         fetchImpl={makeFetch([]).fetchImpl}
