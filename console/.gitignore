@@ -13,6 +13,9 @@ dist/
 playwright-report/
 test-results/
 coverage/
+# The setup-wizard e2e fixture's generated TLS material. Regenerated on demand
+# by e2e/support/setup-fixture.ts; a private key never belongs in the tree.
+.setup-e2e/
 
 # env
 .env
