@@ -5,6 +5,12 @@
 - **Findings closed:** **P0-1**, **P0-3** (`plans/00-audit-report.md`). **P0-2 is deliberately not addressed** — it is closed by [`plans/02b-idempotency-replay.md`](../02b-idempotency-replay.md) per CONVENTIONS.md §0 decisions D1/D2.
 - **Commits:** `60b2efd`, `f206b62`, `cd10096`, then review fixes `9677e8a`, `8dca73f`, `193308d`.
 
+> **Editorial note added after the fact (issue #96).** This is a point-in-time report and its body is
+> left as written. The `NEED_CONFIRMATION.md` references below pointed at that file's plan-02a
+> contents as they stood at merge time; that file has since been reorganised. The decisions it
+> carried are still open and still listed there, and the assembled evidence for each now lives in
+> [`../../docs/decisions-taken.md`](../../docs/decisions-taken.md). None of them has been signed off.
+
 ---
 
 ## 1. Files changed

@@ -1,18 +1,44 @@
-# Decisions taken
+# Decisions taken by plan runners — evidence record, **not yet confirmed by a human**
 
-Resolved record of the decisions that plan runners flagged for a human while executing plans 02a
-and 02b. Each one was recorded in the repo-root `NEED_CONFIRMATION.md` with a recommendation; this
-document is the signed-off version of that file.
+Record of the decisions that plan runners took unilaterally while executing plans 02a and 02b, each
+of which the runner flagged for a human in the repo-root `NEED_CONFIRMATION.md`. This document
+collects, per decision, the recommendation the runner made, the evidence that it was in fact
+executed in the tree, and the condition under which it should be reversed.
 
-**Sign-off provenance.** Issue [#96](https://github.com/nurcahyo/moira/issues/96). The maintainer
-delegated these decisions rather than answering them individually: the instruction was to proceed on
-the recommendation already written next to each one. So the "Answer taken" column below is the
-recommendation, confirmed — not a fresh judgement.
+> **Confirmation status: none of the decisions below has been signed off.**
+>
+> Issue [#96](https://github.com/nurcahyo/moira/issues/96) asks for exactly that sign-off. At the
+> time of writing it is **open, unassigned, and carries no comments** — so there is no written
+> maintainer approval to cite, and this document does not claim one. Verified with:
+>
+> ```
+> $ gh issue view 96 -R nurcahyo/moira --json comments,state,assignees,closedAt
+> {"assignees":[],"closedAt":null,"comments":[],"state":"OPEN"}   # 2026-08-04T18:19:09Z
+> ```
+>
+> The "Runner recommendation" column below is therefore **a runner's proposal awaiting
+> confirmation**, not an approved answer. Two of these decisions are not cosmetic — decision 1
+> rewrites existing production audit values via migration `0009`, and decision 3 is a breaking
+> response/`ETag` contract change — and both are already shipped. That is precisely why they need a
+> human signature rather than an inferred one.
+>
+> Until a maintainer records an answer on issue #96, the decisions stay open in
+> [`NEED_CONFIRMATION.md`](../NEED_CONFIRMATION.md). When they are answered, update the
+> "Confirmed?" column here with a permalink to the comment that answered them, and only then empty
+> `NEED_CONFIRMATION.md`.
 
 **Verification.** Every claim below was re-checked against the tree at commit `40acb6e`
 (`origin/develop`, 2026-08-04) before it was written here. Where a claim could not be verified from
 the tree, this document says so instead of asserting it. Line numbers are from that commit and will
 drift; the identifiers and file paths are the durable part.
+
+**Why this file lives in `docs/` and not `plans/reports/`.** Issue #96's acceptance criterion
+suggests `plans/reports/` as the archive destination. That directory holds point-in-time artefacts
+of a single plan run (`02a-…-qa.md`, `EXECUTION-LEDGER.md`); this record spans two plans, is
+expected to be updated as decisions are confirmed or reversed, and is referenced from `TODO.md` and
+`plans/RUNNER-PROMPT.md` §10 as the standing destination for answered decisions. It is a deviation
+from the issue text and is called out here rather than passed over; moving it is a `git mv` plus
+four link updates if the maintainer prefers the stated location.
 
 Open items that still need doing live in [`TODO.md`](../TODO.md). New decisions still go to
 [`NEED_CONFIRMATION.md`](../NEED_CONFIRMATION.md) in the format `plans/RUNNER-PROMPT.md` §10
@@ -20,16 +46,21 @@ specifies.
 
 ## Summary
 
-| # | Decision | Answer taken | Executed? |
-|---|----------|--------------|-----------|
-| 1 | Backfill migration `0009` shipped under a plan advertising no migrations | Keep it | Yes |
-| 2 | Plan 02a verified on PostgreSQL 18.3, not the pinned 16 | Accept, CI on PG16 is the authoritative gate | Yes |
-| 3 | Inline-content create now returns `version: 2` / `ETag: "2"` | Keep it, pinned by test | Yes |
-| 4 | Plan 02a/02b's `Idempotency-Key` grep guard is unsatisfiable | Fix the plan text | **No — still open**, owned by issue #82 |
-| 5 | Plan 02b's DoD requires one `actor_fingerprint`, its Excluded scope forbids the fix | Defer the unification to plan 06 | Yes, and plan 06 then did the unification |
-| 6 | Plan 02b verified on PostgreSQL 18.3, not the pinned 16 | Accept, same rationale as #2 | Yes |
-| 7a | Plan §8 said *replace* a docs line; the implementation *appended* | Accept | Yes |
-| 7b | Sentence-A test asserts a stricter property than the plan's literal wording | Accept | Yes |
+"Executed?" is a fact about the tree and is verifiable from the evidence in each section.
+"Confirmed?" is a fact about a human signature and is **"not yet"** for every row — see the
+confirmation-status note above. The two are independent: everything except decision 4 is already
+live in `main` *without* having been approved, which is the risk this record exists to make visible.
+
+| # | Decision | Runner recommendation | Executed? | Confirmed? |
+|---|----------|-----------------------|-----------|------------|
+| 1 | Backfill migration `0009` shipped under a plan advertising no migrations | Keep it | Yes | Not yet — **rewrites existing audit values** |
+| 2 | Plan 02a verified on PostgreSQL 18.3, not the pinned 16 | Accept, CI on PG16 is the authoritative gate | Yes | Not yet |
+| 3 | Inline-content create now returns `version: 2` / `ETag: "2"` | Keep it, pinned by test | Yes | Not yet — **breaking contract change** |
+| 4 | Plan 02a/02b's `Idempotency-Key` grep guard contradicted the same plan's own §5(b) | Fix the plan text | **No — still open**, owned by issue #82 | Not yet |
+| 5 | Plan 02b's DoD requires one `actor_fingerprint`, its Excluded scope forbids the fix | Defer the unification to plan 06 | Yes, and plan 06 then did the unification | Not yet |
+| 6 | Plan 02b verified on PostgreSQL 18.3, not the pinned 16 | Accept, same rationale as #2 | Yes | Not yet |
+| 7a | Plan §8 said *replace* a docs line; the implementation *appended* | Accept | Yes | Not yet |
+| 7b | Sentence-A test asserts a stricter property than the plan's literal wording | Accept | Yes | Not yet |
 
 ---
 
@@ -40,10 +71,14 @@ have left every `rag_document_versions` row already on disk carrying the hardcod
 status — the exact false value finding P0-1 exists to remove. Should a data migration ship anyway,
 and is rewriting existing audit-trail values wanted?
 
-**Answer taken.** Keep it. The audit's position is that `'indexed'` was never true for those rows —
-`rag_chunks` and `rag_chunk_embeddings` had no writer — so there is no legitimate prior state being
-destroyed. Without the backfill the API keeps serving the false value with no way for a caller to
-tell a legacy row from a genuinely indexed one.
+**Runner recommendation (not yet confirmed).** Keep it. The audit's position is that `'indexed'`
+was never true for those rows — `rag_chunks` and `rag_chunk_embeddings` had no writer — so there is
+no legitimate prior state being destroyed. Without the backfill the API keeps serving the false
+value with no way for a caller to tell a legacy row from a genuinely indexed one.
+
+This is the decision with the largest blast radius if the recommendation is wrong: `0009` has
+already run, so a maintainer who disagrees is choosing between the reversal below and living with
+rewritten history. It should not be treated as settled until it is answered on issue #96.
 
 **Evidence it was executed.**
 
@@ -71,8 +106,9 @@ safer direction.
 both verified locally against native PostgreSQL 18.3 with pgvector 0.8.5. Is merging on PG18-verified
 evidence acceptable with CI on PG16 as the authoritative gate?
 
-**Answer taken.** Accept. Neither plan introduces version-specific SQL: 02a exercises plain DML, a
-`varchar` CHECK, a primary-key `LEFT JOIN` and a `BEFORE UPDATE` trigger; 02b exercises
+**Runner recommendation (not yet confirmed).** Accept. Neither plan introduces version-specific
+SQL: 02a exercises plain DML, a `varchar` CHECK, a primary-key `LEFT JOIN` and a
+`BEFORE UPDATE` trigger; 02b exercises
 `pg_try_advisory_xact_lock`, savepoints, `select … for update`, a unique index, `on conflict do
 nothing` and a plpgsql `BEFORE` trigger. All long-settled between 16 and 18. CI on PG16 is the gate
 that actually decides.
@@ -113,9 +149,12 @@ reads the row after `update rag_documents set current_version_id = …`, which f
 version `2`, and the ETag derived from it becomes `"2"`. Is the corrected-but-changed value wanted,
 or should the old `1` be preserved by re-selecting before the trigger fires?
 
-**Answer taken.** Keep it. The old `"1"` was stale against the committed row; an immediate
-`If-Match` round-trip using it would have spuriously conflicted. It is a correction, not a
-regression — and it is pinned by a test so it cannot drift back unnoticed.
+**Runner recommendation (not yet confirmed).** Keep it. The old `"1"` was stale against the
+committed row; an immediate `If-Match` round-trip using it would have spuriously conflicted. It is a
+correction, not a regression — and it is pinned by a test so it cannot drift back unnoticed.
+
+This one is a breaking change to a shipped response contract, made without a human signature. It is
+recorded here as a proposal, not as an approved deviation.
 
 **Evidence it was executed.**
 
@@ -144,9 +183,9 @@ src/http/conversation.rs` to return `4`, treating anything else as a hard review
 literally contains the string `Idempotency-Key`, to those same four operations — which makes the
 grep return `8`. Both requirements could not hold at once. Plan 02b repeats the same command.
 
-**Answer taken.** Fix the plan text to count parameter *declarations* rather than string
-occurrences. The runner substituted the declaration-scoped guard at review time and did **not** edit
-the plan files, since the plans are owned elsewhere.
+**Runner recommendation (not yet confirmed).** Fix the plan text to count parameter *declarations*
+rather than string occurrences. The runner substituted the declaration-scoped guard at review time
+and did **not** edit the plan files, since the plans are owned elsewhere.
 
 **Status: the plan text was never fixed.** Verified at `40acb6e`:
 
@@ -164,21 +203,27 @@ occurrence of the header name. On the current tree both counts now agree:
 So the guard as written is satisfiable today. The contradiction was real but time-bound to the
 window between 02a and 02b. The plan text is stale rather than actively breaking a reviewer.
 
-**A second guard in the same list is now the unsatisfiable one.**
-`plans/02b-idempotency-replay.md:396` check (3) says `actor_fingerprint` must have "exactly one
-definition in the crate (`grep -rn 'fn actor_fingerprint' src/`)". That command returns **5** lines
-at `40acb6e` — one real definition (`src/application/admin/shared.rs:344`) and four test function
-names beginning `fn actor_fingerprint_…` in the same file. The substantive property the check cares
-about does hold (see decision 5); the literal command does not report it. Whoever fixes the 02a/02b
-plan text should fix this line in the same pass.
+**A second guard in the same list has the same defect — in its command, not its requirement.**
+`plans/02b-idempotency-replay.md:396` check (3) reads: "`actor_fingerprint` has exactly one
+definition in the crate (`grep -rn 'fn actor_fingerprint' src/`)". The *requirement* is satisfied
+today and a reviewer reading it plainly would pass the tree — there is exactly one definition
+(`src/application/admin/shared.rs:344`). It is the *suggested command* that misreports: it returns
+**5** lines at `40acb6e`, because `grep 'fn actor_fingerprint'` also matches the four test functions
+named `fn actor_fingerprint_…` in the same file.
+
+So this is a bad hint attached to a good check, not an impossible check — a reviewer who runs the
+parenthetical literally and treats `5 != 1` as a failure will be misled, which is worth fixing, but
+the guard is not unsatisfiable. Whoever fixes the 02a/02b plan text should narrow this command in
+the same pass (`grep -rn 'pub(crate) fn actor_fingerprint' src/` returns 1).
 
 **Owner.** Issue [#82](https://github.com/nurcahyo/moira/issues/82) — "[docs] Sync stale documents:
 TODO.md, docs/todo.md, docs/scaling.md, plan 02a/02b text". Not duplicated into a new issue, and
 deliberately not fixed here: issue #96's scope is sign-off and archiving, not editing plan text.
 
-**Reversal condition.** None on the decision itself — the plan text as written cannot be satisfied
-by any implementation for guard (3), and was self-contradictory for guard (1) at the time. What
-remains is execution, not judgement.
+**Reversal condition.** None on the decision itself. Guard (1) was genuinely self-contradictory at
+the time it was written — the plan mandated text that made its own count fail — and guard (3)'s
+requirement is fine while its suggested command over-counts. Neither is a judgement call that could
+sensibly be reversed; what remains is execution, under issue #82.
 
 ---
 
@@ -189,8 +234,9 @@ definition in the crate, while the same plan's Excluded scope said "No change to
 The reviewer was asked to certify something the plan forbade fixing. Defer the unification to plan
 06, or pull it into 02b?
 
-**Answer taken.** Correct the DoD wording and leave `runtime_admin.rs` alone in 02b; plan 06 owns
-the unification. The divergence was pre-existing on `main` — a 3-field fingerprint in
+**Runner recommendation (not yet confirmed).** Correct the DoD wording and leave `runtime_admin.rs`
+alone in 02b; plan 06 owns the unification. The divergence was pre-existing on `main` — a 3-field
+fingerprint in
 `runtime_admin.rs` writing into the *same* `idempotency_records` table as the 10-field one in
 `admin.rs`, so two `TrustedJwt` actors sharing a `sub` across different registered issuers could
 replay each other's runtime-policy responses. 02b neither introduced nor widened it, and 02b's own
@@ -237,8 +283,9 @@ ledger row and executes a second time. If in doubt, wait longer.
 ("OpenAPI includes schemas…"). The implementation appended a new section and left that line intact.
 Acceptable?
 
-**Answer taken.** Accept. The retained line is not false, so the outcome satisfies the plan's intent
-— the reader gets the new information without losing accurate information.
+**Runner recommendation (not yet confirmed).** Accept. The retained line is not false, so the
+outcome satisfies the plan's intent — the reader gets the new information without losing accurate
+information.
 
 **Evidence it was executed.** The line survives at `docs/conversation-memory-rag-api.md:14`
 ("OpenAPI includes schemas for these resources and omits embeddings, extraction prompts, protected
@@ -260,7 +307,8 @@ routes and a shortened form for the other seven. The implementation asserted the
 both (`used to influence model responses`) across all eleven, *plus* the exact per-group sentence.
 Stronger than the wording, but an interpretation. Acceptable?
 
-**Answer taken.** Accept. Neither reading changes behaviour, and the stricter one catches more.
+**Runner recommendation (not yet confirmed).** Accept. Neither reading changes behaviour, and the
+stricter one catches more.
 
 **Evidence it was executed — and that the shape survived a later inversion.** The per-group
 structure is still there in `src/http/mod.rs`: `SENTENCE_A_RAG_WRITE` (`:1487`) and
@@ -272,13 +320,19 @@ group-independent requirements that every description name `POST /api/v1/respons
 The common-phrase half of the original assertion is **gone, deliberately**. Plan 11 wired chunking,
 embedding, retrieval, context injection and citations, which made 02a's "these routes are inert"
 phrasing false on eleven shipped operations at once — and the original test was holding that
-falsehood in place. The test was inverted (commit `270df5e`, F31): the phrase
-`used to influence model responses` moved into `INERT_PRIMITIVE_CLAIMS` (`:1497-1504`), a list of
-claims a description must **not** contain. The test's own doc comment (`:1608-1622`) records the
-inversion and why.
+falsehood in place. The test was inverted (commit `270df5e`, F31): the invariant is now
+`INERT_PRIMITIVE_CLAIMS` (`src/http/mod.rs:1497-1504`), a six-entry list of claims a description
+must **not** contain.
 
-So the interpretation was accepted, and the part of it that later became wrong was corrected rather
-than preserved. This is not a decision that still needs guarding.
+Precisely: the bare phrase `used to influence model responses` is *not itself* an entry in that
+array — it only ever read naturally inside a negation, so what became forbidden are the two negated
+forms that carry it, `"not yet used to influence model responses"` (`:1498`) and
+`"is not used to influence model responses"` (`:1499`), alongside four other inert-primitive
+phrasings. The test's own doc comment (`:1608-1622`) records the inversion and says the same thing.
+
+So the stricter interpretation was taken, and the part of it that later became wrong was corrected
+rather than preserved. Of the eight, this is the one whose confirmation matters least: the shape it
+proposed has already been superseded by F31 on its own merits.
 
 **Reversal condition.** None meaningful. The stricter per-group assertion is what a future plan
 would keep; if a plan wants a weaker check it can relax `check()` in that test, but doing so would
@@ -286,13 +340,22 @@ re-open the door F31 closed.
 
 ---
 
-## Still open after this sign-off
+## Still open
 
-1. **Decision 4** — the 02a/02b plan text still contains the grep guard, and 02b's
-   `fn actor_fingerprint` guard is now the literally-unsatisfiable one. Owned by issue #82.
+### Awaiting a human answer
+
+All eight decisions above. They remain listed in [`NEED_CONFIRMATION.md`](../NEED_CONFIRMATION.md)
+and issue [#96](https://github.com/nurcahyo/moira/issues/96) is the place to answer them. Answering
+is cheap — the evidence is assembled here — but it has not happened, so nothing above may be cited
+as approved.
+
+### Awaiting an owner, not an answer
+
+1. **Decision 4** — the 02a/02b plan text still contains the string-counting grep guard, and 02b's
+   `fn actor_fingerprint` guard still suggests a command that over-counts. Owned by issue #82.
 2. **Post-deploy removal of the legacy fingerprint fallbacks** (from decision 5) — four
    `TODO(post-deploy)` markers: `src/application/runtime_admin.rs:938` and `:1039`,
-   `src/application/public.rs:1060` and `:2239`. Gated on a production deploy plus 24 hours, owned by
-   nobody, not scheduled anywhere.
-
-Neither is a decision awaiting an answer. Both are execution awaiting an owner.
+   `src/application/public.rs:1060` and `:2239`. Gated on a production deploy plus 24 hours.
+   Issue #96 explicitly asked for this to be scheduled; it is now carried as an item in
+   [`TODO.md`](../TODO.md) with its trigger condition written down, which is as far as a docs change
+   can take it. It still needs a named owner and a date, and neither can be invented here.

@@ -5,6 +5,12 @@ Merged as [#24](https://github.com/nurcahyo/moira/pull/24), commit `e1c2658`.
 Four adversarial lenses reviewed the implementation before merge: correctness, security,
 test-integrity, and conventions compliance. Eleven agents total, ~4.5M tokens.
 
+> **Editorial note added after the fact (issue #96).** This is a point-in-time report and its body is
+> left as written. The `NEED_CONFIRMATION.md` reference below pointed at that file's plan-02b
+> contents as they stood at merge time; that file has since been reorganised. The decisions it
+> carried are still open and still listed there, and the assembled evidence for each now lives in
+> [`../../docs/decisions-taken.md`](../../docs/decisions-taken.md). None of them has been signed off.
+
 ## Verdict
 
 The implementation was **substantively correct**. The *evidence* for two of its Definition-of-Done
