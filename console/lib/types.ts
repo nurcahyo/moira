@@ -45,11 +45,26 @@ type ExactKeys<TShape, TRequired extends string, TOptional extends string> =
     : never;
 
 /**
+ * `true` only when `TShape`'s required keys are exactly `TRequired` and its
+ * optional keys are exactly `TOptional`.
+ *
+ * Exported so `lib/moira-credential-types.ts` — the SERVER-ONLY home of the
+ * credential DTOs, which may not live here (see the note on
+ * `SCHEMA_CONTRACTS`) — welds its interfaces to its descriptors with the same
+ * machinery. Two copies of this would be two places for it to be subtly wrong.
+ */
+export type ExactKeysOf<TShape, TRequired extends string, TOptional extends string> = ExactKeys<
+  TShape,
+  TRequired,
+  TOptional
+>;
+
+/**
  * Compile-time assertion. Instantiating it with anything but `true` — which
  * `ExactKeys` produces as `never` on any mismatch — is a type error.
  * The runtime body is deliberately empty.
  */
-const assertKeyContract = <T extends true>(_ok?: T): void => {};
+export const assertKeyContract = <T extends true>(_ok?: T): void => {};
 
 /** The shape every `*_CONTRACT` descriptor takes. */
 export interface SchemaContract {
@@ -990,6 +1005,484 @@ assertKeyContract<
 >();
 
 /* -------------------------------------------------------------------------- */
+/* LLM runtime configuration — providers, models, routes, routing policies     */
+/* -------------------------------------------------------------------------- */
+//
+// ============================================================================
+// WHAT IS HERE AND WHAT IS DELIBERATELY NOT (issue #73)
+// ============================================================================
+//
+// The LLM settings surface has five resource families. FOUR of them are here;
+// the fifth — provider credentials — is in `lib/moira-credential-types.ts`,
+// which carries `import "server-only"`.
+//
+// The split is not organisational. This module is asserted CLIENT-SAFE by
+// `tests/unit/architecture/server-only-guards.test.ts` (`CLIENT_SAFE_MODULES`),
+// which means a `"use client"` component may import it and Next may bundle it
+// for the browser. `CredentialCreateRequest.secret` carries a raw API key and
+// `CredentialRecord` carries `masked_secret` and `secret_fingerprint`; a shape
+// that models any of those must not be in a module the browser can load, and
+// the same test's `no Moira DTO in lib/types.ts declares a secret-shaped field`
+// rule says so mechanically.
+//
+// That rule's exemption list is capped at THREE by decision W5-D4, and it is
+// full. The recorded remedy at the cap is "introduce a newtype instead, not a
+// fourth carve-out" — see `ApiKeyCredentialSecret` in the credential module.
+// Adding a fourth exemption here would have been the cheaper edit and the wrong
+// one: it would relax the guard on the console's whole DTO surface in exchange
+// for one file's convenience.
+
+/**
+ * `#/components/schemas/ProviderType`.
+ *
+ * `open_ai_compatible` is the vLLM/Ollama/LM-Studio arm and is the one the
+ * local-runtime path uses. It is NOT interchangeable with `open_ai`: the latter
+ * ignores nothing but still defaults its base URL to OpenAI's own API, so an
+ * `open_ai` row created without a `base_url` silently sends the operator's
+ * prompts to api.openai.com. `assertLlmProviderCreateIsSafe` refuses the
+ * compatible arm without a base URL for exactly that reason.
+ */
+export type ProviderType =
+  | "open_ai_compatible"
+  | "open_ai"
+  | "anthropic"
+  | "gemini"
+  | "deep_seek"
+  | "azure_open_ai"
+  | "local"
+  | "custom";
+
+/**
+ * `#/components/schemas/ProviderCreateRequest`. `additionalProperties: false`.
+ *
+ * NOTE WHAT IS ABSENT: there is no `enabled` field at all, unlike
+ * `AuthProviderSettingsCreateRequest`. A provider row's lifecycle is moved only
+ * by `POST .../enable` and `POST .../disable`, both of which require `If-Match`,
+ * so the "created disabled" convention this console enforces by hand on the auth
+ * surface is a property of the schema here and needs no type-level removal.
+ */
+export interface ProviderCreateRequest {
+  provider_type: ProviderType;
+  display_name: string;
+  base_url?: string | null;
+  metadata?: JsonValue;
+}
+
+export const PROVIDER_CREATE_REQUEST_CONTRACT = {
+  schema: "ProviderCreateRequest",
+  required: ["provider_type", "display_name"],
+  optional: ["base_url", "metadata"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ProviderCreateRequest,
+    (typeof PROVIDER_CREATE_REQUEST_CONTRACT)["required"][number],
+    (typeof PROVIDER_CREATE_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/ProviderPatchRequest`. `additionalProperties: false`.
+ *
+ * `provider_type` IS IMMUTABLE, and the evidence is its absence from this
+ * schema rather than a documented 4xx: `additionalProperties: false` makes a
+ * patch body carrying it a flat `400`, with no error code that says "immutable".
+ * `assertLlmProviderPatchIsSafe` refuses it in the console so the operator is
+ * told the rule instead of being shown a generic validation failure.
+ */
+export interface ProviderPatchRequest {
+  base_url?: string | null;
+  display_name?: string | null;
+  metadata?: JsonValue;
+}
+
+export const PROVIDER_PATCH_REQUEST_CONTRACT = {
+  schema: "ProviderPatchRequest",
+  required: [],
+  optional: ["base_url", "display_name", "metadata"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ProviderPatchRequest,
+    (typeof PROVIDER_PATCH_REQUEST_CONTRACT)["required"][number],
+    (typeof PROVIDER_PATCH_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/ProviderRecord` */
+export interface ProviderRecord {
+  id: string;
+  provider_type: ProviderType;
+  display_name: string;
+  status: ResourceStatus;
+  metadata: JsonValue;
+  created_at: string;
+  updated_at: string;
+  version: number;
+  base_url?: string | null;
+  deleted_at?: string | null;
+}
+
+export const PROVIDER_RECORD_CONTRACT = {
+  schema: "ProviderRecord",
+  required: [
+    "id",
+    "provider_type",
+    "display_name",
+    "status",
+    "metadata",
+    "created_at",
+    "updated_at",
+    "version",
+  ],
+  optional: ["base_url", "deleted_at"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ProviderRecord,
+    (typeof PROVIDER_RECORD_CONTRACT)["required"][number],
+    (typeof PROVIDER_RECORD_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/ProviderModelCreateRequest`. `additionalProperties: false`.
+ *
+ * `capabilities` IS OPTIONAL IN THE SCHEMA AND MUST NOT BE OMITTED. An absent
+ * `capabilities` is stored as SQL `null`, and routing's capability filter then
+ * matches the row against nothing — the request fails with an opaque
+ * `no_eligible_model` that names neither the model nor the missing field. The
+ * console never constructs this type directly; it constructs
+ * `ConsoleProviderModelCreateRequest` below, where the field is required.
+ */
+export interface ProviderModelCreateRequest {
+  model_key: string;
+  capabilities?: JsonValue;
+  display_name?: string | null;
+}
+
+export const PROVIDER_MODEL_CREATE_REQUEST_CONTRACT = {
+  schema: "ProviderModelCreateRequest",
+  required: ["model_key"],
+  optional: ["capabilities", "display_name"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ProviderModelCreateRequest,
+    (typeof PROVIDER_MODEL_CREATE_REQUEST_CONTRACT)["required"][number],
+    (typeof PROVIDER_MODEL_CREATE_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * The only model-create body this console may construct: `capabilities` is
+ * promoted to REQUIRED and non-nullable, which makes the `no_eligible_model`
+ * defect above unrepresentable rather than merely documented.
+ */
+export type ConsoleProviderModelCreateRequest = Omit<
+  ProviderModelCreateRequest,
+  "capabilities"
+> & {
+  capabilities: JsonValue;
+};
+
+/**
+ * `#/components/schemas/ProviderModelRecord`.
+ *
+ * `status` is a PLAIN STRING here, not `ResourceStatus`. Transcribed, not
+ * assumed: the neighbouring `ProviderRecord.status` is `$ref`'d to the enum and
+ * this one is `{"type": "string"}`, so narrowing it would be a type that lies
+ * about what Moira can put on the wire.
+ */
+export interface ProviderModelRecord {
+  id: string;
+  provider_id: string;
+  model_key: string;
+  capabilities: JsonValue;
+  status: string;
+  created_at: string;
+  updated_at: string;
+  version: number;
+  deleted_at?: string | null;
+  display_name?: string | null;
+}
+
+export const PROVIDER_MODEL_RECORD_CONTRACT = {
+  schema: "ProviderModelRecord",
+  required: [
+    "id",
+    "provider_id",
+    "model_key",
+    "capabilities",
+    "status",
+    "created_at",
+    "updated_at",
+    "version",
+  ],
+  optional: ["deleted_at", "display_name"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ProviderModelRecord,
+    (typeof PROVIDER_MODEL_RECORD_CONTRACT)["required"][number],
+    (typeof PROVIDER_MODEL_RECORD_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/RouteSelectionStrategy` */
+export type RouteSelectionStrategy = "explicit" | "rules" | "default";
+
+/**
+ * `#/components/schemas/RouteDefinitionRecord` — READ-ONLY in this console.
+ *
+ * There is no create, patch or delete route operation in the registry, and that
+ * is deliberate rather than incomplete: migration `0005` seeds the `general`
+ * route, `POST /api/v1/admin/routes` documents no 409 for a duplicate
+ * `route_key`, and a console that creates a second `general` produces two rows
+ * that routing must choose between with no rule that says which. The console
+ * reads the seeded route and binds policies to it.
+ */
+export interface RouteDefinitionRecord {
+  id: string;
+  route_key: string;
+  display_name: string;
+  status: ResourceStatus;
+  selection_strategy: RouteSelectionStrategy;
+  metadata: JsonValue;
+  created_at: string;
+  updated_at: string;
+  version: number;
+  agent_profile_id?: string | null;
+  deleted_at?: string | null;
+  description?: string | null;
+}
+
+export const ROUTE_DEFINITION_RECORD_CONTRACT = {
+  schema: "RouteDefinitionRecord",
+  required: [
+    "id",
+    "route_key",
+    "display_name",
+    "status",
+    "selection_strategy",
+    "metadata",
+    "created_at",
+    "updated_at",
+    "version",
+  ],
+  optional: ["agent_profile_id", "deleted_at", "description"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    RouteDefinitionRecord,
+    (typeof ROUTE_DEFINITION_RECORD_CONTRACT)["required"][number],
+    (typeof ROUTE_DEFINITION_RECORD_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/RoutingPolicyCreateRequest`. `additionalProperties: false`.
+ *
+ * The three required fields are all FOREIGN KEYS, and none of them may be taken
+ * from a browser-supplied body without being resolved and re-checked on the
+ * server first — a policy pointing at a provider the operator never chose is a
+ * privileged write choosing its own target. `assertRoutingPolicyCreateIsSafe`
+ * enforces the shape; resolving the ids is the caller's obligation, stated on
+ * `createRoutingPolicy`.
+ *
+ * `POST /routing-policies` documents NO 409. Two identical policies on one route
+ * are both stored and both eligible, so the caller deduplicates by listing first
+ * — there is no server-side uniqueness to lean on.
+ */
+export interface RoutingPolicyCreateRequest {
+  route_id: string;
+  provider_id: string;
+  provider_model_id: string;
+  application_id?: string | null;
+  cost_weight?: number;
+  external_tenant_id?: string | null;
+  latency_weight?: number;
+  maximum_cost_per_request?: number | null;
+  maximum_input_tokens?: number | null;
+  maximum_output_tokens?: number | null;
+  metadata?: JsonValue;
+  priority?: number;
+  privacy_class?: string | null;
+  quality_weight?: number;
+  required_capabilities?: string[];
+  retry_policy?: JsonValue;
+  timeout_ms?: number | null;
+  weight?: number;
+}
+
+export const ROUTING_POLICY_CREATE_REQUEST_CONTRACT = {
+  schema: "RoutingPolicyCreateRequest",
+  required: ["route_id", "provider_id", "provider_model_id"],
+  optional: [
+    "application_id",
+    "cost_weight",
+    "external_tenant_id",
+    "latency_weight",
+    "maximum_cost_per_request",
+    "maximum_input_tokens",
+    "maximum_output_tokens",
+    "metadata",
+    "priority",
+    "privacy_class",
+    "quality_weight",
+    "required_capabilities",
+    "retry_policy",
+    "timeout_ms",
+    "weight",
+  ],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    RoutingPolicyCreateRequest,
+    (typeof ROUTING_POLICY_CREATE_REQUEST_CONTRACT)["required"][number],
+    (typeof ROUTING_POLICY_CREATE_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/RoutingPolicyPatchRequest` — EVERY field optional, and
+ * the three foreign keys are patchable (they are required on create and
+ * nullable here).
+ *
+ * A patch that repoints `provider_id` moves live traffic to a different
+ * provider, so the same "resolve the id server-side" obligation applies to it as
+ * to create.
+ */
+export interface RoutingPolicyPatchRequest {
+  application_id?: string | null;
+  cost_weight?: number | null;
+  external_tenant_id?: string | null;
+  latency_weight?: number | null;
+  maximum_cost_per_request?: number | null;
+  maximum_input_tokens?: number | null;
+  maximum_output_tokens?: number | null;
+  metadata?: JsonValue;
+  priority?: number | null;
+  privacy_class?: string | null;
+  provider_id?: string | null;
+  provider_model_id?: string | null;
+  quality_weight?: number | null;
+  required_capabilities?: string[] | null;
+  retry_policy?: JsonValue;
+  route_id?: string | null;
+  timeout_ms?: number | null;
+  weight?: number | null;
+}
+
+export const ROUTING_POLICY_PATCH_REQUEST_CONTRACT = {
+  schema: "RoutingPolicyPatchRequest",
+  required: [],
+  optional: [
+    "application_id",
+    "cost_weight",
+    "external_tenant_id",
+    "latency_weight",
+    "maximum_cost_per_request",
+    "maximum_input_tokens",
+    "maximum_output_tokens",
+    "metadata",
+    "priority",
+    "privacy_class",
+    "provider_id",
+    "provider_model_id",
+    "quality_weight",
+    "required_capabilities",
+    "retry_policy",
+    "route_id",
+    "timeout_ms",
+    "weight",
+  ],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    RoutingPolicyPatchRequest,
+    (typeof ROUTING_POLICY_PATCH_REQUEST_CONTRACT)["required"][number],
+    (typeof ROUTING_POLICY_PATCH_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/RoutingPolicyRecord` */
+export interface RoutingPolicyRecord {
+  id: string;
+  route_id: string;
+  provider_id: string;
+  provider_model_id: string;
+  priority: number;
+  weight: number;
+  cost_weight: number;
+  latency_weight: number;
+  quality_weight: number;
+  required_capabilities: string[];
+  retry_policy: JsonValue;
+  status: ResourceStatus;
+  metadata: JsonValue;
+  created_at: string;
+  updated_at: string;
+  version: number;
+  application_id?: string | null;
+  deleted_at?: string | null;
+  external_tenant_id?: string | null;
+  maximum_cost_per_request?: number | null;
+  maximum_input_tokens?: number | null;
+  maximum_output_tokens?: number | null;
+  privacy_class?: string | null;
+  timeout_ms?: number | null;
+}
+
+export const ROUTING_POLICY_RECORD_CONTRACT = {
+  schema: "RoutingPolicyRecord",
+  required: [
+    "id",
+    "route_id",
+    "provider_id",
+    "provider_model_id",
+    "priority",
+    "weight",
+    "cost_weight",
+    "latency_weight",
+    "quality_weight",
+    "required_capabilities",
+    "retry_policy",
+    "status",
+    "metadata",
+    "created_at",
+    "updated_at",
+    "version",
+  ],
+  optional: [
+    "application_id",
+    "deleted_at",
+    "external_tenant_id",
+    "maximum_cost_per_request",
+    "maximum_input_tokens",
+    "maximum_output_tokens",
+    "privacy_class",
+    "timeout_ms",
+  ],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    RoutingPolicyRecord,
+    (typeof ROUTING_POLICY_RECORD_CONTRACT)["required"][number],
+    (typeof ROUTING_POLICY_RECORD_CONTRACT)["optional"][number]
+  >
+>();
+
+/* -------------------------------------------------------------------------- */
 /* Error envelope (server-side shape — never crosses to the browser)          */
 /* -------------------------------------------------------------------------- */
 
@@ -1050,6 +1543,14 @@ assertKeyContract<
  * re-derives everything from the spec" quietly stops being true for that one
  * DTO. `tests/contract/openapi-contract.test.ts` source-scans this file for
  * `export const *_CONTRACT` and asserts every one appears here, with a count.
+ *
+ * IT IS NOT THE WHOLE SET. The credential descriptors live in
+ * `lib/moira-credential-types.ts` and are registered in that module's own
+ * `CREDENTIAL_SCHEMA_CONTRACTS`; the contract test scans BOTH files with the
+ * same completeness rule and shape-checks the concatenation. A descriptor that
+ * reaches neither array is checked by nothing, which is the hazard the scan
+ * exists for — moving DTOs to a second module must not create a second way to
+ * fall out of the gate.
  */
 export const SCHEMA_CONTRACTS: readonly SchemaContract[] = [
   RESPONSE_TEXT_CONTRACT,
@@ -1072,6 +1573,15 @@ export const SCHEMA_CONTRACTS: readonly SchemaContract[] = [
   AUTH_PROVIDER_SETTINGS_RECORD_CONTRACT,
   TRUSTED_JWT_ISSUER_CREATE_REQUEST_CONTRACT,
   TRUSTED_JWT_ISSUER_RECORD_CONTRACT,
+  PROVIDER_CREATE_REQUEST_CONTRACT,
+  PROVIDER_PATCH_REQUEST_CONTRACT,
+  PROVIDER_RECORD_CONTRACT,
+  PROVIDER_MODEL_CREATE_REQUEST_CONTRACT,
+  PROVIDER_MODEL_RECORD_CONTRACT,
+  ROUTE_DEFINITION_RECORD_CONTRACT,
+  ROUTING_POLICY_CREATE_REQUEST_CONTRACT,
+  ROUTING_POLICY_PATCH_REQUEST_CONTRACT,
+  ROUTING_POLICY_RECORD_CONTRACT,
   ERROR_DETAIL_CONTRACT,
   ERROR_RESPONSE_CONTRACT,
 ];
