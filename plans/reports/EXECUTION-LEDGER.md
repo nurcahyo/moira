@@ -4273,6 +4273,68 @@ to the remedy as written above, all found while taking it:
    `extract_memories` and handed *to* the command instead.
 3. **There is no summarization run equivalent** — see F55.
 
+### F56 — a reasoning model's chain-of-thought is stored as the conversation summary
+
+**Measured against a real provider, not inferred.** The user's vLLM moved to
+`https://local-llm.motrait.com` (`Qwen/Qwen3-4B`, OpenAI-compatible, no key) on 2026-08-04, which
+made this testable for the first time. Every number below came off that wire.
+
+Moira's **actual** summarization call — `SUMMARIZATION_INSTRUCTION`, the real transcript shape, **no
+`output_schema`**, temperature 0 — returned:
+
+```
+<think>
+Okay, let's see. The user wants to ship the invoicing rewrite before the March board meeting…
+</think>
+
+The user aims to complete the invoicing rewrite ahead of the March board meeting but faces…
+```
+
+**808 of 1282 bytes — 63% — is chain-of-thought**, and `parse_summary` stores all of it.
+`parse_summary` trims, strips a **code fence**, then checks empty and size. There were **zero** code
+fences. Nothing in `src/` handles a reasoning block; `grep -rn "think" src/` returns nothing.
+
+**The prompt already tries to prevent this and fails.** `SUMMARIZATION_INSTRUCTION` says *"Return
+only the summary text — no preamble, no headings, no JSON, no code fences."* A `<think>` block is a
+preamble. The instruction is not a control.
+
+**Why this compounds rather than merely wastes space.** The stored text is fed back as
+`PRIOR_SUMMARY_LABEL` on the next run, so the model reasons about its own previous reasoning. It
+also counts against `MAXIMUM_SUMMARY_BYTES` and the target-token budget, so the *actual* summary is
+squeezed by the reasoning that precedes it.
+
+**Moira has already decided that reasoning is not output — it just cannot enforce it here.**
+`text_from_choice` (`src/orchestration/runtime_factory.rs`) drops `AssistantContent::Reasoning` in
+its `_ => None` arm, and the streaming path filters `StreamedAssistantContent::Reasoning` and
+`ReasoningDelta` by name. That intent is implemented for the case where the **server** separates
+reasoning. vLLM without `--reasoning-parser` does not: the block arrives as ordinary `Text`, and
+Moira cannot tell it apart.
+
+**Not reachable through extraction**, which sends `extraction_output_schema()` — guided decoding
+suppressed the block entirely in test 2 below. **Summarization is the exposed path** precisely
+because F29's parse is gated on a schema summarization never sends.
+
+**Severity is deployment-shaped:** invisible on OpenAI/Anthropic, unavoidable on a self-hosted
+reasoning model — which is exactly what `OpenAiCompatible`/`Local` exists to serve, and what F39
+deliberately left admitted as undecidable.
+
+**Open question, deliberately not decided here:** strip, or refuse. Stripping is a heuristic on
+prose, and `memory_extraction.rs` documents a deliberate refusal to hunt JSON inside prose — the
+same shape. Refusing costs reasoning-model deployments their summaries entirely. **The one thing
+that is not defensible is the current behaviour: storing it silently.**
+
+#### The same session settled two other questions by measurement
+
+- **F39's undecidable half is decidable for this backend: vLLM complies.** `json_schema` +
+  `strict: true` returned exactly `{"name":"Dr. Elara Voss","age":42}` — clean, and with the
+  `<think>` block suppressed by guided decoding. Leaving `Local` admitted was right.
+- **F46 is confirmed on a real provider, not just by reading Rig's source.** Sending the exact shape
+  Moira's `json_object` compiled to — `{"type":"object"}` sanitised to `properties: {}`,
+  `additionalProperties: false`, `required: []`, `strict: true` — the model returned literally
+  `{}`. The refusal shipped in `a8937f4` is now backed by a measurement, not an inference.
+- Tool calling works on this endpoint (`finish_reason: tool_calls`), so **F48 becomes live-testable**
+  the day `build_completion_request` stops hardcoding `tools: Vec::new()`.
+
 ### F55 — a failed summarization leaves no operator-facing record at all
 
 Raised while closing F54, whose remedy assumed a "summarization run equivalent" of
