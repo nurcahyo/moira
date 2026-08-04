@@ -1161,15 +1161,10 @@ mod tests {
 
     #[tokio::test]
     async fn migrated_database_supports_the_identity_reads() {
-        let Ok(database_url) = std::env::var("MOIRA_TEST_DATABASE_URL") else {
-            eprintln!(
-                "skipping admin identity repository integration: set MOIRA_TEST_DATABASE_URL"
-            );
+        let Some(database) = crate::test_support::test_database().await else {
             return;
         };
-        let pool = PgPool::connect(&database_url).await.expect("connect");
-        crate::infra::db::migrate(&pool).await.expect("migrate");
-        let repo = PgAdminIdentityRepository::new(pool);
+        let repo = PgAdminIdentityRepository::new(database.pool().clone());
 
         // The singleton row is seeded by `0012`, so this resolves rather than defaulting.
         repo.setup_claimed().await.expect("setup state reads");

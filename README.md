@@ -209,12 +209,37 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-Validate database migrations against the local pgvector Postgres container when database behavior changes:
+### The test database
+
+`cargo test` needs PostgreSQL. `MOIRA_TEST_DATABASE_URL` names the **cluster** the test
+harnesses work on, and its role needs `CREATEDB`:
 
 ```bash
 export MOIRA_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/moira
+```
+
+Nothing is written to the database that URL names. Every integration fixture clones a
+private database from a migrated template and drops it again, and the library's own
+`#[cfg(test)]` modules create one private database per test process
+(`src/test_support.rs`). That isolation is why an unmerged migration in one checkout no
+longer breaks every other checkout's tests.
+
+**A missing database is a failure, not a skip.** Database-backed suites used to return
+early and report `ok`, so a whole gate run could pass having proven nothing. They now
+panic with an explanation. If you genuinely want to run without one — knowing it removes
+almost all of Moira's coverage — set `MOIRA_TEST_ALLOW_NO_DATABASE=1`; it is ignored when
+`CI=true`, and the skip line it prints still reds `scripts/gates.sh`.
+
+Validate database migrations against the local pgvector Postgres container when database behavior changes:
+
+```bash
 cargo test security_foundation_migration_creates_contract_tables_when_configured
 ```
+
+That suite creates and drops a database of its own. On a runner whose role cannot create
+databases, provision one **empty, disposable** database out of band and point
+`MOIRA_TEST_MIGRATION_DATABASE_URL` at it instead — the suite then migrates and mutates
+that database in place, over the same code path, and refuses to start if it is not empty.
 
 Mutation-test the code a change touches — a passing test proves it ran, not that it would have failed had the code been wrong:
 

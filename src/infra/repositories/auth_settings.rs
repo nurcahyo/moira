@@ -918,13 +918,10 @@ mod tests {
 
     #[tokio::test]
     async fn migrated_database_supports_the_auth_settings_reads() {
-        let Ok(database_url) = std::env::var("MOIRA_TEST_DATABASE_URL") else {
-            eprintln!("skipping auth provider settings integration: set MOIRA_TEST_DATABASE_URL");
+        let Some(database) = crate::test_support::test_database().await else {
             return;
         };
-        let pool = PgPool::connect(&database_url).await.expect("connect");
-        crate::infra::db::migrate(&pool).await.expect("migrate");
-        let repo = PgAuthProviderSettingsRepository::new(pool);
+        let repo = PgAuthProviderSettingsRepository::new(database.pool().clone());
 
         repo.list(None, 10).await.expect("list runs");
         repo.list_enabled_public()
@@ -953,15 +950,18 @@ mod tests {
     /// (`migrations/0013_auth_provider_settings.sql:67-69`) indexes
     /// `(method, coalesce(issuer, ''))`, so an issuer-less `generic_oidc` row occupies the
     /// single slot `('generic_oidc', '')` for the whole database — not a `Uuid`-keyed one
-    /// like every other row this suite writes. On the shared `MOIRA_TEST_DATABASE_URL`
-    /// database that makes the slot a global resource, and two test processes inserting
-    /// into it collide on a unique violation.
+    /// like every other row this suite writes. That makes the slot a global resource, and
+    /// two tests inserting into it collide on a unique violation.
+    ///
+    /// **The scope of that collision shrank with issue #77 and the lock still earns its
+    /// keep.** These tests now run against a database private to the test *process*
+    /// (`crate::test_support`), so a neighbouring worktree can no longer contend for the
+    /// slot — but `cargo test` runs this binary's tests on several threads against that
+    /// one database, and advisory locks are database-scoped, so the guard is unchanged and
+    /// still necessary. It is *cheaper* now: contention is bounded by this process.
     ///
     /// Same idiom, and for the same reason, as `SetupStateLock` in
     /// `src/application/identity.rs` — a different global resource, so a different key.
-    /// The two are deliberately not shared: `src/` has no test-support module, and adding
-    /// one to the library crate to host twenty lines of test scaffolding would be a
-    /// structural change for a test-only concern.
     const ISSUERLESS_GENERIC_OIDC_LOCK_KEY: i64 = i64::from_be_bytes(*b"moiraoid");
 
     /// Exclusive ownership of the `('generic_oidc', '')` slot for one test.
@@ -1045,15 +1045,13 @@ mod tests {
     /// slot.
     #[tokio::test]
     async fn a_shadowing_unbound_row_cannot_outrank_the_bound_provider() {
-        let Ok(database_url) = std::env::var("MOIRA_TEST_DATABASE_URL") else {
-            eprintln!("skipping auth provider settings integration: set MOIRA_TEST_DATABASE_URL");
+        let Some(database) = crate::test_support::test_database().await else {
             return;
         };
-        let pool = PgPool::connect(&database_url).await.expect("connect");
-        crate::infra::db::migrate(&pool).await.expect("migrate");
+        let pool = database.pool().clone();
         // Bound for the whole test, never as a bare `_`: dropping it early puts the slot
         // back up for grabs while this test is still using it.
-        let _slot_lock = IssuerlessSlotLock::acquire(&database_url, &pool).await;
+        let _slot_lock = IssuerlessSlotLock::acquire(database.url(), &pool).await;
 
         // The console's issuer — the string `$1` carries on every claim and redemption.
         let console_issuer = format!("https://console-{}.invalid/idp", Uuid::now_v7().simple());
