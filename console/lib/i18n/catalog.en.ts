@@ -1175,6 +1175,559 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "console's own issuer on every row, so under two providers minting one issuer the holder " +
       "of that grant may be somebody else entirely.",
   },
+
+  /* ------------------------------------------------------------------------ */
+  /* The /settings/llm screen (issue #74)                                     */
+  /* ------------------------------------------------------------------------ */
+  [K.llm_page_title]: {
+    key: K.llm_page_title,
+    message: "Language model providers",
+    description:
+      "Heading of `/settings/llm`, the screen where an operator registers the endpoints " +
+      "Moira sends prompts to.",
+  },
+  [K.llm_page_intro]: {
+    key: K.llm_page_intro,
+    message:
+      "A provider needs four things before a prompt can reach it: the provider itself, at " +
+      "least one model, a credential row, and routing pointed at it. Each one is listed " +
+      "below with whatever is still missing.",
+    description:
+      "Rendered under the page heading. It states the chain because both of its failure " +
+      "modes are reported by the backend in terms that name none of these four rows.",
+  },
+  [K.llm_load_failed]: {
+    key: K.llm_load_failed,
+    message: "The console could not read the provider configuration from the backend.",
+    description:
+      "Rendered instead of the whole screen when the server-side read throws. The page " +
+      "still answers with a 2xx, because the accessibility walker asserts every route " +
+      "answers below 400 and a backend outage must not take that gate red.",
+  },
+  [K.llm_request_failed]: {
+    key: K.llm_request_failed,
+    message: "That request did not complete. Nothing was changed.",
+    description:
+      "The browser-side fallback when a call to one of this screen's own route handlers " +
+      "produced no readable keyed refusal - an offline browser, or a proxy that answered " +
+      "with something that is not JSON.",
+  },
+  [K.llm_request_body_invalid]: {
+    key: K.llm_request_body_invalid,
+    message:
+      "The console sent a request it could not build correctly. This is a fault in the " +
+      "console, not in what you typed.",
+    description:
+      "A route handler could not read its own request body, or read one with no usable " +
+      "fields. It is reachable only through a console bug or a hand-made request, so the " +
+      "copy says so rather than asking the operator to correct an input.",
+  },
+  [K.llm_action_unknown]: {
+    key: K.llm_action_unknown,
+    message: "That is not an action this screen offers.",
+    description:
+      "The shortcut endpoint received a stage discriminator it does not implement. Distinct " +
+      "from a malformed body: the body was readable and named something real-looking.",
+  },
+  [K.llm_general_route_missing]: {
+    key: K.llm_general_route_missing,
+    message:
+      "This deployment has no default route, so routing cannot be pointed anywhere. Re-run " +
+      "the database migrations and reload this page.",
+    description:
+      "The seeded default route could not be found. The console deliberately does not " +
+      "create one: the create operation documents no conflict for a duplicate route key, so " +
+      "a second one would leave routing with two candidates and no documented rule for " +
+      "choosing.",
+  },
+  [K.llm_list_truncated]: {
+    key: K.llm_list_truncated,
+    message:
+      "There are more rows than one page can show, so the console cannot tell whether this " +
+      "already exists. Remove some rows before trying again.",
+    description:
+      "A reuse-first lookup ran out of page before it found a match. Refusing is " +
+      "deliberate: creating the row anyway is how a duplicate provider or a second eligible " +
+      "routing policy gets made.",
+  },
+  [K.llm_providers_heading]: {
+    key: K.llm_providers_heading,
+    message: "Configured providers",
+    description:
+      "Heading of the section listing every provider row, with its models, credential rows " +
+      "and routing.",
+  },
+  [K.llm_providers_empty]: {
+    key: K.llm_providers_empty,
+    message: "No provider is configured yet.",
+    description:
+      "The empty state for the provider list. Rendered on a freshly migrated deployment, " +
+      "where it is the expected state rather than a problem.",
+  },
+  [K.llm_status_active]: {
+    key: K.llm_status_active,
+    message: "Enabled",
+    description:
+      "Badge text for a row the backend reports as active. Paired with a tone, never colour " +
+      "alone.",
+  },
+  [K.llm_status_disabled]: {
+    key: K.llm_status_disabled,
+    message: "Disabled",
+    description:
+      "Badge text for any row that is not active. Covers disabled and deleted alike, " +
+      "because the difference does not change what an operator can do next from this " +
+      "screen.",
+  },
+  [K.llm_models_heading]: {
+    key: K.llm_models_heading,
+    message: "Models",
+    description: "Sub-heading above the models registered against one provider.",
+  },
+  [K.llm_models_empty]: {
+    key: K.llm_models_empty,
+    message: "No model is registered for this provider.",
+    description:
+      "Empty state for one provider's model list. A provider with no model is never " +
+      "selected by routing, and nothing reports that at request time.",
+  },
+  [K.llm_key_rows_heading]: {
+    key: K.llm_key_rows_heading,
+    message: "Credential rows",
+    description:
+      "Sub-heading above the credential rows attached to one provider. Rows, not keys: no " +
+      "key value is ever sent to the browser.",
+  },
+  [K.llm_key_row_present]: {
+    key: K.llm_key_row_present,
+    message: "A stored credential",
+    description:
+      "Label for one credential row. It deliberately describes the row and not its contents " +
+      "- the value, its mask and its fingerprint are all withheld by the server.",
+  },
+  [K.llm_key_row_missing]: {
+    key: K.llm_key_row_missing,
+    message:
+      "No credential row exists. A prompt is refused before it reaches the endpoint, even " +
+      "when the endpoint needs no key.",
+    description:
+      "Both the empty state for one provider's credential rows and the missing-step line in " +
+      "the readiness list. It states the surprising half of the rule, because the backend " +
+      "reports this as a missing-credential error that reads as though a key were wrong.",
+  },
+  [K.llm_routing_heading]: {
+    key: K.llm_routing_heading,
+    message: "Routing entries",
+    description: "Sub-heading above the routing policies pointing at one provider.",
+  },
+  [K.llm_policy_present]: {
+    key: K.llm_policy_present,
+    message: "Bound to a route",
+    description:
+      "Fallback label for a routing policy whose route key the console could not resolve - " +
+      "the policy exists and points somewhere, and saying so beats rendering an opaque " +
+      "identifier.",
+  },
+  [K.llm_policy_missing]: {
+    key: K.llm_policy_missing,
+    message: "Routing does not point at this provider yet.",
+    description:
+      "Both the empty state for one provider's routing policies and the missing-step line " +
+      "in the readiness list. A provider with no policy is simply never selected, with no " +
+      "error at all until a completion picks something else.",
+  },
+  [K.llm_disable_provider]: {
+    key: K.llm_disable_provider,
+    message: "Disable this provider",
+    description:
+      "The undo for having created a provider. It disables rather than deletes: nothing on " +
+      "this surface is destroyed, and a disabled row stays readable.",
+  },
+  [K.llm_disable_model]: {
+    key: K.llm_disable_model,
+    message: "Disable this model",
+    description: "The undo for having registered a model.",
+  },
+  [K.llm_disable_key_row]: {
+    key: K.llm_disable_key_row,
+    message: "Disable this credential",
+    description:
+      "The undo for having created a credential row. Disabling it makes the provider " +
+      "ineligible again, which is the same state as never having created it.",
+  },
+  [K.llm_disable_policy]: {
+    key: K.llm_disable_policy,
+    message: "Stop routing here",
+    description:
+      "The undo for having pointed routing at this provider. It is the step that moves live " +
+      "traffic, so its label says what stops rather than which row is edited.",
+  },
+  [K.llm_add_provider_heading]: {
+    key: K.llm_add_provider_heading,
+    message: "Add a provider by hand",
+    description:
+      "Heading of the manual provider form - the long way round the shortcut, for an " +
+      "endpoint that is not reachable from this deployment right now.",
+  },
+  [K.llm_provider_name_label]: {
+    key: K.llm_provider_name_label,
+    message: "Display name",
+    description: "Label of the provider's name field.",
+  },
+  [K.llm_provider_name_hint]: {
+    key: K.llm_provider_name_hint,
+    message: "How this provider is named on this screen. It is never sent to the endpoint.",
+    description:
+      "Hint under the name field, so the operator does not try to make it match something " +
+      "the endpoint expects.",
+  },
+  [K.llm_provider_base_url_label]: {
+    key: K.llm_provider_base_url_label,
+    message: "Endpoint address",
+    description:
+      "Label of the field holding the OpenAI-compatible base address of a provider.",
+  },
+  [K.llm_provider_base_url_hint]: {
+    key: K.llm_provider_base_url_hint,
+    message:
+      "The base address of an OpenAI-compatible server. The version segment is added for " +
+      "you when it is missing.",
+    description:
+      "Hint under every endpoint field on this screen. It states the canonicalisation, " +
+      "because a provider row created from a bare origin fails much later, at request time, " +
+      "with a message that names none of this.",
+  },
+  [K.llm_add_provider_submit]: {
+    key: K.llm_add_provider_submit,
+    message: "Add provider",
+    description: "Submit control of the manual provider form.",
+  },
+  [K.llm_provider_created]: {
+    key: K.llm_provider_created,
+    message: "Provider added. Finish the remaining steps below.",
+    description:
+      "Confirmation after the manual form succeeded. It points at the rest of the chain, " +
+      "because creating the provider alone leaves the deployment no closer to running a " +
+      "prompt.",
+  },
+  [K.llm_display_name_required]: {
+    key: K.llm_display_name_required,
+    message: "Enter a display name.",
+    description:
+      "The console refused a provider create or patch with a blank name, before any request " +
+      "left.",
+  },
+  [K.llm_base_url_required]: {
+    key: K.llm_base_url_required,
+    message: "Enter the address of the endpoint.",
+    description: "The console refused an endpoint field that was empty.",
+  },
+  [K.llm_base_url_invalid]: {
+    key: K.llm_base_url_invalid,
+    message: "That is not an address the console can read.",
+    description: "The endpoint field did not parse as an address at all.",
+  },
+  [K.llm_base_url_scheme_unsupported]: {
+    key: K.llm_base_url_scheme_unsupported,
+    message: "Only web addresses are accepted here.",
+    description:
+      "The endpoint address parsed but named a scheme this console will not fetch. The " +
+      "console makes this call itself, so the set of schemes it will follow is narrowed " +
+      "deliberately.",
+  },
+  [K.llm_base_url_userinfo_rejected]: {
+    key: K.llm_base_url_userinfo_rejected,
+    message:
+      "Remove the sign-in details from the address, and store a key as a credential " +
+      "instead.",
+    description:
+      "The endpoint address carried a user name or password. Accepting it would write a " +
+      "secret into a provider row, and from there into every list response this screen " +
+      "renders.",
+  },
+  [K.llm_chain_heading]: {
+    key: K.llm_chain_heading,
+    message: "Finish setting this provider up",
+    description:
+      "Heading of the panel holding the three steps that come after a provider row exists.",
+  },
+  [K.llm_chain_complete]: {
+    key: K.llm_chain_complete,
+    message: "Ready: a prompt can reach this provider.",
+    description:
+      "Rendered when all four parts of the chain are present and active. It is derived from " +
+      "the server-rendered data rather than from what the panel believes it just did.",
+  },
+  [K.llm_chain_incomplete]: {
+    key: K.llm_chain_incomplete,
+    message: "Not ready yet.",
+    description:
+      "Rendered when any part of the chain is missing. The missing parts are listed under " +
+      "it.",
+  },
+  [K.llm_step_model_missing]: {
+    key: K.llm_step_model_missing,
+    message: "Register at least one model.",
+    description: "Readiness line for a provider with no model row.",
+  },
+  [K.llm_step_enable_missing]: {
+    key: K.llm_step_enable_missing,
+    message: "Enable the provider.",
+    description:
+      "Readiness line for a provider row that is not active. Reachable after an operator " +
+      "disables one and then wants it back.",
+  },
+  [K.llm_add_model_label]: {
+    key: K.llm_add_model_label,
+    message: "Model identifier",
+    description:
+      "Label of the field holding the identifier the endpoint itself uses for a model.",
+  },
+  [K.llm_add_model_hint]: {
+    key: K.llm_add_model_hint,
+    message: "Exactly as the endpoint reports it. This is the value sent on every request.",
+    description:
+      "Hint under the model field. A near-miss here is answered by the endpoint rather than " +
+      "by the backend, which makes it hard to attribute.",
+  },
+  [K.llm_add_model_submit]: {
+    key: K.llm_add_model_submit,
+    message: "Add model",
+    description: "Submit control of the add-model field.",
+  },
+  [K.llm_model_key_required]: {
+    key: K.llm_model_key_required,
+    message: "Enter the identifier the endpoint uses for this model.",
+    description:
+      "The console refused a model create with a blank identifier, before any request left.",
+  },
+  [K.llm_model_required]: {
+    key: K.llm_model_required,
+    message: "Select at least one model.",
+    description:
+      "The shortcut was asked to register a provider with no model selected. A provider " +
+      "with no model is never selected by routing.",
+  },
+  [K.llm_model_not_found]: {
+    key: K.llm_model_not_found,
+    message: "That model does not belong to this provider.",
+    description:
+      "The console refused to act on a model identifier that does not appear among the " +
+      "named provider's models. The backend's own disable operation takes no provider, so " +
+      "this check exists only here.",
+  },
+  [K.llm_key_label]: {
+    key: K.llm_key_label,
+    message: "Key",
+    description:
+      "Label of the write-only field holding a provider key. Nothing populates it and " +
+      "nothing reads it back.",
+  },
+  [K.llm_add_key_row_hint]: {
+    key: K.llm_add_key_row_hint,
+    message:
+      "Leave this blank for an endpoint that needs no key. The row itself is what the " +
+      "backend requires, not its contents.",
+    description:
+      "Hint under the key field. Blank is the ordinary case for an endpoint on the " +
+      "operator's own network, and the console generates the stored placeholder itself.",
+  },
+  [K.llm_add_key_row_submit]: {
+    key: K.llm_add_key_row_submit,
+    message: "Create credential row",
+    description: "Submit control of the credential form.",
+  },
+  [K.llm_key_row_not_found]: {
+    key: K.llm_key_row_not_found,
+    message: "That credential does not belong to this provider.",
+    description:
+      "The console refused to act on a credential identifier that does not appear among the " +
+      "named provider's rows.",
+  },
+  [K.llm_bind_routing_model_label]: {
+    key: K.llm_bind_routing_model_label,
+    message: "Model to route to",
+    description:
+      "Label of the selector choosing which of a provider's models the default route should " +
+      "send prompts to.",
+  },
+  [K.llm_bind_routing_no_model]: {
+    key: K.llm_bind_routing_no_model,
+    message: "Choose a model",
+    description:
+      "The unselected option of that selector. Chosen over a blank entry so the control " +
+      "announces what it is for.",
+  },
+  [K.llm_bind_routing_submit]: {
+    key: K.llm_bind_routing_submit,
+    message: "Point routing here",
+    description:
+      "Submit control that binds the default route to the selected provider and model.",
+  },
+  [K.llm_policy_not_found]: {
+    key: K.llm_policy_not_found,
+    message: "That routing entry does not belong to this provider.",
+    description:
+      "The console refused to act on a routing identifier that does not point at the named " +
+      "provider.",
+  },
+  [K.llm_connect_heading]: {
+    key: K.llm_connect_heading,
+    message: "Connect a local endpoint",
+    description:
+      "Heading of the shortcut panel, which asks an endpoint what it serves and then " +
+      "registers everything a prompt needs.",
+  },
+  [K.llm_connect_intro]: {
+    key: K.llm_connect_intro,
+    message:
+      "Ask the endpoint what it serves, then register it in one step. The console makes " +
+      "that call itself; your browser never contacts the endpoint.",
+    description:
+      "Rendered under the shortcut heading. It states where the outbound call is made from, " +
+      "because that is a deliberate boundary and not an implementation detail: the endpoint " +
+      "is on the operator's own network.",
+  },
+  [K.llm_connect_endpoint_label]: {
+    key: K.llm_connect_endpoint_label,
+    message: "Local endpoint address",
+    description:
+      "Label of the shortcut's address field, pre-filled with this deployment's usual local " +
+      "endpoint. The address itself is a constant in the code, never catalogue copy.",
+  },
+  [K.llm_connect_discover_submit]: {
+    key: K.llm_connect_discover_submit,
+    message: "Ask the endpoint",
+    description:
+      "The first of the shortcut's two controls. It writes nothing - a mistyped address " +
+      "must not leave a provider row behind.",
+  },
+  [K.llm_connect_discovered_heading]: {
+    key: K.llm_connect_discovered_heading,
+    message: "Models this endpoint reports",
+    description:
+      "Legend above the list of model identifiers the endpoint returned, offered for " +
+      "selection so nobody has to type one.",
+  },
+  [K.llm_connect_submit]: {
+    key: K.llm_connect_submit,
+    message: "Register the selected models",
+    description: "The second of the shortcut's two controls. This is the one that writes.",
+  },
+  [K.llm_connect_pending]: {
+    key: K.llm_connect_pending,
+    message: "Working...",
+    description: "Announced politely while either of the shortcut's two calls is in flight.",
+  },
+  [K.llm_connect_done]: {
+    key: K.llm_connect_done,
+    message: "Done. The provider, its models, a credential row and routing all exist.",
+    description:
+      "Announced after the whole chain completed. It names all four rows, because that " +
+      "conjunction is the thing the operator came to this screen to achieve.",
+  },
+  [K.llm_connect_step_failed]: {
+    key: K.llm_connect_step_failed,
+    message:
+      "Registration stopped part-way. What was already created is listed below, and trying " +
+      "again continues from there rather than duplicating it.",
+    description:
+      "The chain failed at a step. Everything written up to that point is reported with it: " +
+      "a retry made blind is how a second eligible routing policy gets created, since none " +
+      "of these operations reports a conflict for a duplicate.",
+  },
+  [K.llm_discovery_unreachable]: {
+    key: K.llm_discovery_unreachable,
+    message:
+      "The console could not reach that endpoint. Check that it is running, and that this " +
+      "deployment can route to it.",
+    description:
+      "The outbound probe never produced a response - name resolution, a refused " +
+      "connection, a certificate, or the timeout. Ordinary rather than exceptional: a " +
+      "laptop with its tunnel down reaches this every time.",
+  },
+  [K.llm_discovery_refused]: {
+    key: K.llm_discovery_refused,
+    message: "The endpoint answered, but would not list its models.",
+    description:
+      "The probe got an HTTP response with a failure status. Distinct from unreachable, " +
+      "because the remedy is different: something is listening and it said no.",
+  },
+  [K.llm_discovery_response_too_large]: {
+    key: K.llm_discovery_response_too_large,
+    message: "The endpoint's answer was too large for the console to read.",
+    description:
+      "The probe's read cap was passed. The read is bounded so that a hostile or hung " +
+      "endpoint cannot hold a request handler open.",
+  },
+  [K.llm_discovery_invalid_response]: {
+    key: K.llm_discovery_invalid_response,
+    message: "The endpoint's answer was not a model listing the console recognises.",
+    description:
+      "The probe's response parsed but did not match the shape a model listing must have. " +
+      "Nothing from an unvalidated response is rendered.",
+  },
+  [K.llm_trace_heading]: {
+    key: K.llm_trace_heading,
+    message: "What was written",
+    description:
+      "Heading of the per-step record the shortcut returns, shown after a success and after " +
+      "a partial failure alike.",
+  },
+  [K.llm_step_provider]: {
+    key: K.llm_step_provider,
+    message: "Provider",
+    description: "Names the first step of the registration chain in the trace.",
+  },
+  [K.llm_step_provider_model]: {
+    key: K.llm_step_provider_model,
+    message: "Model",
+    description: "Names the second step of the registration chain in the trace.",
+  },
+  [K.llm_step_provider_credential]: {
+    key: K.llm_step_provider_credential,
+    message: "Credential row",
+    description:
+      "Names the third step of the registration chain in the trace - the one a keyless " +
+      "endpoint still needs.",
+  },
+  [K.llm_step_provider_enable]: {
+    key: K.llm_step_provider_enable,
+    message: "Enable",
+    description:
+      "Names the fourth step of the registration chain in the trace. It is skipped when the " +
+      "provider is already active, which is the ordinary case.",
+  },
+  [K.llm_step_routing_policy]: {
+    key: K.llm_step_routing_policy,
+    message: "Routing",
+    description: "Names the last step of the registration chain in the trace.",
+  },
+  [K.llm_step_unknown]: {
+    key: K.llm_step_unknown,
+    message: "Step",
+    description:
+      "Fallback name for a trace step the console does not have a label for, so an added " +
+      "step degrades to something readable instead of rendering its own identifier.",
+  },
+  [K.llm_outcome_created]: {
+    key: K.llm_outcome_created,
+    message: "created",
+    description: "Trace outcome for a row this run wrote.",
+  },
+  [K.llm_outcome_reused]: {
+    key: K.llm_outcome_reused,
+    message: "reused",
+    description:
+      "Trace outcome for a row that already existed and was matched rather than duplicated.",
+  },
+  [K.llm_outcome_skipped]: {
+    key: K.llm_outcome_skipped,
+    message: "already done",
+    description:
+      "Trace outcome for a step that had nothing to do - in practice, enabling a provider " +
+      "that was already active.",
+  },
 };
 
 /** Every entry, as a plain array. */

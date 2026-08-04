@@ -45,6 +45,7 @@
 //   console.expiry.*  invitation lifetimes (the ExpiryPicker molecule)
 //   console.admins.*  the /admins screen — grants, invitations, ownership
 //   console.invite.*  the public /invite/[token] redemption page
+//   console.llm.*     the /settings/llm screen — providers, models, routing
 
 /* -------------------------------------------------------------------------- */
 /* The table                                                                  */
@@ -234,6 +235,103 @@ export const CONSOLE_MESSAGE_KEYS = {
   secret_dismiss: "console.secret.dismiss",
   secret_already_shown: "console.secret.already_shown",
   secret_expires_at: "console.secret.expires_at",
+
+  /* --- the /settings/llm screen (issue #74) ------------------------------- */
+  //
+  // A NAMESPACE OF ITS OWN. `console.setup.*` belongs to the first-run wizard and
+  // is being rewritten on another branch; LLM configuration is ordinary
+  // administration that happens long after setup, so it takes `console.llm.*`
+  // and the two catalogs never touch the same lines.
+
+  /* --- the page itself --------------------------------------------------- */
+  llm_page_title: "console.llm.page_title",
+  llm_page_intro: "console.llm.page_intro",
+  llm_load_failed: "console.llm.load_failed",
+  llm_request_failed: "console.llm.request_failed",
+  llm_request_body_invalid: "console.llm.request_body_invalid",
+  llm_action_unknown: "console.llm.action_unknown",
+  llm_general_route_missing: "console.llm.general_route_missing",
+  llm_list_truncated: "console.llm.list_truncated",
+
+  /* --- the provider list ------------------------------------------------- */
+  llm_providers_heading: "console.llm.providers_heading",
+  llm_providers_empty: "console.llm.providers_empty",
+  llm_status_active: "console.llm.status_active",
+  llm_status_disabled: "console.llm.status_disabled",
+  llm_models_heading: "console.llm.models_heading",
+  llm_models_empty: "console.llm.models_empty",
+  llm_key_rows_heading: "console.llm.key_rows_heading",
+  llm_key_row_present: "console.llm.key_row_present",
+  llm_key_row_missing: "console.llm.key_row_missing",
+  llm_routing_heading: "console.llm.routing_heading",
+  llm_policy_present: "console.llm.policy_present",
+  llm_policy_missing: "console.llm.policy_missing",
+  llm_disable_provider: "console.llm.disable_provider",
+  llm_disable_model: "console.llm.disable_model",
+  llm_disable_key_row: "console.llm.disable_key_row",
+  llm_disable_policy: "console.llm.disable_policy",
+
+  /* --- adding a provider by hand ----------------------------------------- */
+  llm_add_provider_heading: "console.llm.add_provider_heading",
+  llm_provider_name_label: "console.llm.provider_name_label",
+  llm_provider_name_hint: "console.llm.provider_name_hint",
+  llm_provider_base_url_label: "console.llm.provider_base_url_label",
+  llm_provider_base_url_hint: "console.llm.provider_base_url_hint",
+  llm_add_provider_submit: "console.llm.add_provider_submit",
+  llm_provider_created: "console.llm.provider_created",
+  llm_display_name_required: "console.llm.display_name_required",
+  llm_base_url_required: "console.llm.base_url_required",
+  llm_base_url_invalid: "console.llm.base_url_invalid",
+  llm_base_url_scheme_unsupported: "console.llm.base_url_scheme_unsupported",
+  llm_base_url_userinfo_rejected: "console.llm.base_url_userinfo_rejected",
+
+  /* --- finishing the chain: model, credential row, routing --------------- */
+  llm_chain_heading: "console.llm.chain_heading",
+  llm_chain_complete: "console.llm.chain_complete",
+  llm_chain_incomplete: "console.llm.chain_incomplete",
+  llm_step_model_missing: "console.llm.step_model_missing",
+  llm_step_enable_missing: "console.llm.step_enable_missing",
+  llm_add_model_label: "console.llm.add_model_label",
+  llm_add_model_hint: "console.llm.add_model_hint",
+  llm_add_model_submit: "console.llm.add_model_submit",
+  llm_model_key_required: "console.llm.model_key_required",
+  llm_model_required: "console.llm.model_required",
+  llm_model_not_found: "console.llm.model_not_found",
+  llm_key_label: "console.llm.key_label",
+  llm_add_key_row_hint: "console.llm.add_key_row_hint",
+  llm_add_key_row_submit: "console.llm.add_key_row_submit",
+  llm_key_row_not_found: "console.llm.key_row_not_found",
+  llm_bind_routing_model_label: "console.llm.bind_routing_model_label",
+  llm_bind_routing_no_model: "console.llm.bind_routing_no_model",
+  llm_bind_routing_submit: "console.llm.bind_routing_submit",
+  llm_policy_not_found: "console.llm.policy_not_found",
+
+  /* --- the Connect-local-endpoint shortcut ------------------------------- */
+  llm_connect_heading: "console.llm.connect_heading",
+  llm_connect_intro: "console.llm.connect_intro",
+  llm_connect_endpoint_label: "console.llm.connect_endpoint_label",
+  llm_connect_discover_submit: "console.llm.connect_discover_submit",
+  llm_connect_discovered_heading: "console.llm.connect_discovered_heading",
+  llm_connect_submit: "console.llm.connect_submit",
+  llm_connect_pending: "console.llm.connect_pending",
+  llm_connect_done: "console.llm.connect_done",
+  llm_connect_step_failed: "console.llm.connect_step_failed",
+  llm_discovery_unreachable: "console.llm.discovery_unreachable",
+  llm_discovery_refused: "console.llm.discovery_refused",
+  llm_discovery_response_too_large: "console.llm.discovery_response_too_large",
+  llm_discovery_invalid_response: "console.llm.discovery_invalid_response",
+
+  /* --- the chain trace --------------------------------------------------- */
+  llm_trace_heading: "console.llm.trace_heading",
+  llm_step_provider: "console.llm.step_provider",
+  llm_step_provider_model: "console.llm.step_provider_model",
+  llm_step_provider_credential: "console.llm.step_provider_credential",
+  llm_step_provider_enable: "console.llm.step_provider_enable",
+  llm_step_routing_policy: "console.llm.step_routing_policy",
+  llm_step_unknown: "console.llm.step_unknown",
+  llm_outcome_created: "console.llm.outcome_created",
+  llm_outcome_reused: "console.llm.outcome_reused",
+  llm_outcome_skipped: "console.llm.outcome_skipped",
 } as const;
 
 /** Every console-originated key, as a union of string literals. */
