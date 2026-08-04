@@ -76,6 +76,35 @@
 // refused (`409 setup_resume_state_conflict`) instead of resolved in the
 // caller's favour, because a disagreement is either a stale browser or a
 // caller naming a row that is not this console's, and neither should write.
+//
+// ============================================================================
+// `body.slug`: WHAT IT MAY STILL CHOOSE, AND WHAT IT MAY NOT
+// ============================================================================
+//
+// The slug is the one caller-supplied selector left, and it selects the CONSOLE
+// ISSUER NAMESPACE (`consoleIssuerForSlug`) rather than a row. The two actions
+// treat it differently, on purpose:
+//
+//   claim      the namespace is CHECKED against the provider the session was
+//              actually established through (`SessionCheck.consoleIssuer`).
+//              Without that check, signing in through provider A and posting
+//              provider B's slug wrote an `admin_identities` grant in B's
+//              namespace for an identity that never authenticated against B —
+//              and B's allow-list was never applied to it either. Refused 403,
+//              nothing written.
+//
+//   provision  the namespace stays caller-chosen, and that is the feature: an
+//              additional provider is registered under an operator-chosen
+//              stable slug (see `consoleIssuerForSlug`'s note on why the slug
+//              and not the row UUID). What the slug CANNOT do is choose a row:
+//              `deriveProvisioningState` reads the trusted issuer for that
+//              namespace and then only the provider BOUND to it, so a slug this
+//              console does not already own can only ever create, never rewrite
+//              — and `findProviderBoundTo` filters on exactly that binding. The
+//              blast radius of a well-formed slug nobody asked for is therefore
+//              a new, disabled-then-enabled provider row under a namespace with
+//              no admins, inside a window that is already gated on holding the
+//              bootstrap system key.
 
 import { consoleProviderIdFor, isInteractiveMethod, isProviderSlug } from "@/lib/auth-config";
 import { readJsonBody } from "@/lib/console-api";
@@ -532,6 +561,28 @@ async function claim(
     context.env.jwksUrl,
     slugResult.slug,
   ).issuer;
+
+  // ...and the slug is CHECKED against the provider the session was actually
+  // established through, which is the half that was missing.
+  //
+  // Deriving the issuer from the slug bounds the STRING (PROVIDER_SLUG_PATTERN)
+  // but not the AUTHORITY: `consoleIssuerForSlug` is total over well-formed
+  // slugs, so an operator signed in through provider A could post provider B's
+  // slug and be granted `moira:admin` in B's namespace. The allow-list
+  // `checkSession` applied a few lines above is A's — that is the list of the
+  // configuration that resolved the cookie — so nothing had yet compared the
+  // namespace being written to against the provider that authenticated.
+  //
+  // `session.consoleIssuer` comes from the `ResolvedAuthConfig` that resolved
+  // this session (`lib/auth.ts`'s `consoleSessionCheck`), never from the body,
+  // so this compares a derived value against a derived value.
+  if (session.consoleIssuer !== consoleIssuer) {
+    return setupError(
+      403,
+      "setup_claim_issuer_mismatch",
+      CONSOLE_MESSAGE_KEYS.setup_claim_issuer_mismatch,
+    );
+  }
 
   // The provisioning state is DERIVED HERE, never read off the request body.
   // The browser's copy does not survive the OAuth round trip (sign-in is a full

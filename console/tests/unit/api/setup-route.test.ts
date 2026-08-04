@@ -232,6 +232,11 @@ function handlers(overrides: Record<string, StubHandler> = {}): Record<string, S
 const SIGNED_IN: SessionCheck = {
   ok: true,
   identity: { email: "ops@example.com", emailVerified: true, idpSubject: "sub-abc" },
+  // The console issuer of the configuration that AUTHENTICATED this session.
+  // Required from issue #71: `claim` compares the namespace its `slug` resolves
+  // to against this, so a session fixture without it would be a session that
+  // could claim in any namespace.
+  consoleIssuer: CONSOLE_ISSUER,
 };
 
 let stub: MoiraStub;
@@ -1108,6 +1113,36 @@ describe("POST claim derives the provisioning state SERVER-SIDE", () => {
     expect((await json(response))["identity"]).toMatchObject({ email: "ops@example.com" });
   });
 
+  test("a slug naming a namespace the session did not authenticate against is refused", async () => {
+    // ========================================================================
+    // THE CLAIM NAMESPACE IS BOUND TO THE PROVIDER THAT AUTHENTICATED (#71)
+    // ========================================================================
+    //
+    // `slug` selects the console-issuer namespace the `admin_identities` grant
+    // is written into. It is bounded by `PROVIDER_SLUG_PATTERN` and therefore
+    // well-formed — and well-formed was all it had to be: the session below is
+    // a REAL, allow-listed, verified session, established through the incumbent
+    // provider (`consoleIssuer === CONSOLE_ISSUER`), and it used to be able to
+    // claim under `.../idp/other` simply by naming it. That namespace's own
+    // allow-list was never applied to this identity, because the allow-list
+    // `checkSession` ran is the AUTHENTICATING configuration's.
+    //
+    // Now the two derived issuers are compared and the request is refused with
+    // nothing written — asserted by the absence of `CLAIM_ROUTE` below.
+    installProvisioned();
+    const response = await POST(post({ action: "claim", slug: "other" }));
+
+    expect(response.status).toBe(403);
+    const error = errorOf(await json(response));
+    expect(error["code"]).toBe("setup_claim_issuer_mismatch");
+    expect(error["message_key"]).toBe(CONSOLE_MESSAGE_KEYS.setup_claim_issuer_mismatch);
+    expect(
+      stub.routes(),
+      "the claim reached Moira despite naming a namespace this session never authenticated " +
+        "against",
+    ).not.toContain(CLAIM_ROUTE);
+  });
+
   test("AC4 — an unverified address is refused BEFORE the request leaves", async () => {
     // `SetupOrderingError` from `claimAdminIdentity`, which is the defence in
     // depth in front of Moira's own `admin_claim_email_not_verified`. The
@@ -1118,6 +1153,7 @@ describe("POST claim derives the provisioning state SERVER-SIDE", () => {
       session: {
         ok: true,
         identity: { email: "ops@example.com", emailVerified: false, idpSubject: "sub-abc" },
+        consoleIssuer: CONSOLE_ISSUER,
       },
     });
     const response = await POST(post({ action: "claim" }));

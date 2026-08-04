@@ -72,7 +72,23 @@ export const SESSION_REJECTION_MESSAGE_KEYS: Readonly<Record<SessionRejection, s
 };
 
 export type SessionCheck =
-  | { readonly ok: true; readonly identity: ConsoleSessionIdentity }
+  | {
+      readonly ok: true;
+      readonly identity: ConsoleSessionIdentity;
+      /**
+       * The CONSOLE ISSUER of the provider this session was established
+       * through — `ResolvedAuthConfig.consoleIssuer`, never a caller's string.
+       *
+       * Carried on the verdict because a caller that wants to act in an
+       * `admin_identities` NAMESPACE has to be able to prove the session
+       * belongs to it, and only the resolution knows which one that is. The
+       * setup window's claim step is the first such caller: its namespace comes
+       * from a request-body slug, and without this it had nothing to check that
+       * slug against — signing in through provider A and posting provider B's
+       * slug would have granted admin in B's namespace.
+       */
+      readonly consoleIssuer: string;
+    }
   | { readonly ok: false; readonly rejection: SessionRejection; readonly messageKey: string };
 
 function reject(rejection: SessionRejection): SessionCheck {
@@ -105,7 +121,7 @@ export function rejectedSession(rejection: SessionRejection): SessionCheck {
  */
 export function checkSession(
   session: Partial<ConsoleSessionIdentity> | null | undefined,
-  config: Pick<ResolvedAuthConfig, "allowedEmailDomains">,
+  config: Pick<ResolvedAuthConfig, "allowedEmailDomains" | "consoleIssuer">,
 ): SessionCheck {
   if (session === null || session === undefined) return reject("no_session");
   const { email, emailVerified, idpSubject } = session;
@@ -115,7 +131,13 @@ export function checkSession(
     return reject("email_domain_not_allowed");
   }
   if (typeof idpSubject !== "string" || idpSubject === "") return reject("idp_subject_missing");
-  return { ok: true, identity: { email, emailVerified: true, idpSubject } };
+  return {
+    ok: true,
+    identity: { email, emailVerified: true, idpSubject },
+    // Taken from the configuration that AUTHENTICATED this session, never from
+    // anything the caller sent — see the field's own note on `SessionCheck`.
+    consoleIssuer: config.consoleIssuer,
+  };
 }
 
 /**
@@ -174,7 +196,7 @@ export class SessionNotAdmissibleError extends Error {
  */
 export function assertAdmissibleSession(
   session: Partial<ConsoleSessionIdentity> | null | undefined,
-  config: Pick<ResolvedAuthConfig, "allowedEmailDomains">,
+  config: Pick<ResolvedAuthConfig, "allowedEmailDomains" | "consoleIssuer">,
 ): ConsoleSessionIdentity {
   const check = checkSession(session, config);
   if (!check.ok) throw new SessionNotAdmissibleError(check.rejection, check.messageKey);

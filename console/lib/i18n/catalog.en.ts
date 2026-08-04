@@ -464,6 +464,18 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "domain is named — Moira's own envelope does not carry it, and this is the last screen on " +
       "which the allow-list can still be changed.",
   },
+  [K.setup_claim_issuer_mismatch]: {
+    key: K.setup_claim_issuer_mismatch,
+    message:
+      "This claim names a different sign-in provider from the one you signed in through. Sign in " +
+      "through that provider first.",
+    description:
+      "The claim body's `slug` resolved to a console issuer that is not the one the session was " +
+      "established through (`SessionCheck.consoleIssuer`). The slug selects the " +
+      "`admin_identities` namespace the grant is written into, so accepting a mismatch would " +
+      "grant admin in a namespace this identity never authenticated against. Refused 403 with " +
+      "nothing written.",
+  },
 
   /* --- accessibility ------------------------------------------------------ */
   //

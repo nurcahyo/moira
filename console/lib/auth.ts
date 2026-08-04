@@ -823,7 +823,12 @@ export async function consoleSessionCheck(
     }
     throw error;
   }
-  if (session === null || session === undefined) return checkSession(null, { allowedEmailDomains: [] });
+  // `rejectedSession`, not `checkSession(null, …)`: with no session there is no
+  // authenticating configuration to answer from, and passing an invented one
+  // just to satisfy the parameter would be inventing the very field
+  // `SessionCheck.consoleIssuer` exists to make trustworthy. The verdict is the
+  // same one `checkSession` returns for a null session.
+  if (session === null || session === undefined) return rejectedSession("no_session");
 
   let config: ResolvedAuthConfig;
   try {

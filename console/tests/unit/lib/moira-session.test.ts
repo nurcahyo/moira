@@ -27,7 +27,18 @@ function envWith(overrides: Record<string, string> = {}): ConsoleEnv {
   });
 }
 
-const ALLOW = { allowedEmailDomains: ["example.com"] };
+/**
+ * The authenticating configuration, reduced to what `checkSession` reads.
+ *
+ * `consoleIssuer` joined it when the setup window's claim step needed to check
+ * a caller-supplied namespace against the provider the session was actually
+ * established through (issue #71): the verdict now carries the issuer of the
+ * configuration that produced it, so it has to be supplied here.
+ */
+const ALLOW = {
+  allowedEmailDomains: ["example.com"],
+  consoleIssuer: "https://console.example",
+};
 
 describe("checkSession", () => {
   test("accepts a verified, allow-listed identity with a subject", () => {

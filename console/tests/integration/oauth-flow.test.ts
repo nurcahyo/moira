@@ -318,13 +318,21 @@ describe("OAuth sign-in against a real mock IdP", () => {
   test("the session passes the console's own allow-list check", async () => {
     const check = checkSession(
       { email: OPERATOR.email, emailVerified: true, idpSubject: OPERATOR.sub },
-      { allowedEmailDomains: ["example.com"] },
+      // `consoleIssuer` is required from issue #71: the verdict carries the
+      // issuer of the configuration that authenticated the session, so the
+      // setup window's claim step can check a caller-supplied namespace
+      // against it.
+      { allowedEmailDomains: ["example.com"], consoleIssuer: "https://console.example" },
     );
     expect(check.ok).toBe(true);
 
     const outsider = checkSession(
       { email: "someone@evilexample.com", emailVerified: true, idpSubject: "x" },
-      { allowedEmailDomains: ["example.com"] },
+      // `consoleIssuer` is required from issue #71: the verdict carries the
+      // issuer of the configuration that authenticated the session, so the
+      // setup window's claim step can check a caller-supplied namespace
+      // against it.
+      { allowedEmailDomains: ["example.com"], consoleIssuer: "https://console.example" },
     );
     expect(outsider.ok).toBe(false);
   });

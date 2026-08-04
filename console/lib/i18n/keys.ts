@@ -109,6 +109,7 @@ export const CONSOLE_MESSAGE_KEYS = {
   setup_claim_step_unreachable: "console.error.setup_claim_step_unreachable",
   setup_email_not_verified: "console.error.setup_email_not_verified",
   setup_claim_domain_not_allowed: "console.error.setup_claim_domain_not_allowed",
+  setup_claim_issuer_mismatch: "console.error.setup_claim_issuer_mismatch",
 
   /* --- accessibility ------------------------------------------------------ */
   a11y_loading: "console.a11y.loading",
