@@ -152,6 +152,51 @@ reading that digest may conclude a symbol is absent when it is present, or miss 
 call sites. **Wrap `grep`/`tail` in a script file whenever the exact output matters**, the same way
 `cargo` already must be. The immunity rule is unchanged: the hook only sees the outer command.
 
+### 2.2d THE HOST CAN STOP BEING ABLE TO RUN *ANY* FRESHLY COMPILED BINARY — 2026-08-04
+
+**A cargo build that hangs forever with every process at `0:00.00` CPU is not a slow build and not
+a lock. It is macOS refusing to exec.** Found on F57, after 12 minutes of a cold `cargo check`
+sitting on eight build scripts that had accumulated **zero** CPU time between them, with **no
+`rustc` running at all**.
+
+The cause is not cargo. `/usr/libexec/syspolicyd` — Gatekeeper — was pegged at ~99 % CPU because a
+`chrome_crashpad_handler` was in a `FATAL` crash-loop, respawning roughly **once per second**; every
+spawn is a code-signing assessment, and the queue never drains. Binaries whose signature is already
+cached keep working, which is why the machine looks completely healthy: your shell, git, `psql` and
+`gh` are all fine. Only *newly written* executables block, which is precisely every build artefact.
+
+**The one-command diagnosis, and it takes five seconds:**
+
+```bash
+printf 'int main(void){return 7;}\n' > /tmp/t.c && cc -o /tmp/t_bin /tmp/t.c
+timeout 20 /tmp/t_bin; echo $?      # 7 = healthy, 124 = the host cannot exec new binaries
+```
+
+Do this **before** concluding anything about a hung build. Two corroborations, both root-free:
+`launchctl print system/com.apple.MobileFileIntegrity` (it read `state = not running`), and
+`ps -Ao pid,stat,%cpu,time,comm -r | head` (syspolicyd at the top with hundreds of CPU-minutes).
+
+**The fix needs root and is therefore the user's:** stop the crash-looping app, or
+`sudo launchctl kickstart -k system/com.apple.MobileFileIntegrity`, or reboot. `amfid` respawning
+on its own is **not** sufficient — it came back during F57 and exec still hung, because the wedge
+was one layer up in `syspolicyd`.
+
+**Two things still work, and they are the difference between a lost cycle and a delivered one:**
+
+- **`cargo fmt --check` runs.** rustfmt is a pre-existing toolchain binary and compiles nothing, so
+  the formatting gate is honestly runnable even in this state. Do not skip it because "cargo is
+  broken" — it is not, only *exec of new artefacts* is.
+- **A Linux container does not consult macOS code signing.** `rust:1.97-trixie` with the worktree
+  bind-mounted, `CARGO_TARGET_DIR` on a named volume, and
+  `MOIRA_TEST_DATABASE_URL=postgres://postgres:postgres@host.docker.internal:5432/moira` plus
+  `--add-host=host.docker.internal:host-gateway` reaches the host's Postgres unchanged — it already
+  listens on `*`. This is the escape hatch; it is slower over the bind mount but it is real.
+
+**Record which runner produced a gate result.** A container run is not `scripts/gates.sh`, so its
+log-completeness assertion and its skipped-DB-suite check did **not** run. Say so rather than
+letting `ALL GATES PASSED` be inferred — that marker means something specific and a container run
+does not emit it.
+
 ### 2.2b `scripts/gates.sh` CANNOT run concurrently with another gates run
 
 Found 2026-08-01, after two runs sat **wedged for 40+ minutes**.
@@ -389,6 +434,7 @@ once. Current state of everything above F28:
 | ~~**F44**~~ | ~~`RuntimeModelHandle::stream` / `RuntimeStreamOutput` are dead `pub` API~~ | **CLOSED** same branch. Premise held exactly; **103 lines deleted**. Not in the finding: that cluster was the sole reason `runtime_factory.rs` imported the runtime-event vocabulary, so deleting it restored the Rig/application boundary |
 | ~~**F54**~~ | ~~A failed extraction cannot be correlated to its execution except through an unenforced `request_id` string convention (`"memory-extraction-{run_id}"`)~~ | **CLOSED** `fix/f54-extraction-correlation`, migration `0025`. **Premise partly REFUTED as it was later summarised:** the failure class is *not* lost from `memory_extraction_runs` — that column has existed since `0007` — so the "persist the failure class" candidate was already shipped, and `response_id` is already a real FK that is already taken (it names the *triggering turn's* response). The real gap was the missing `execution_id`, now a bare indexed uuid **matching `context_plans` and `retrieval_runs`, which solve the identical problem in the same migration**; a FK is impossible because `execution_id` is no table's primary key. Written when the run row is **opened**, not at completion, so the `'running'` row a mid-call death leaves behind keeps its correlation. The barrier is the type: `MemoryExtractionRunInsert.execution_id` is a required `Uuid`. Four mutations; the guard **joins** `execution_attempts` rather than checking the column is populated, because the weakened `is_some()` version was verified **green** against a fresh-uuid mint. Raised **F55** |
 | **F55** | **A failed summarization leaves no operator-facing record at all** — `conversation_summaries` is a table of successful outputs with no `status`, no `failure_class` and no run row; the only trace of a failure is an aggregate metric counter. F54's remedy assumed a "summarization run equivalent" and there is none | **raised, deliberately not fixed.** It is a new table rather than a column, and whether a failed summarization should be durable at all is a design question with a real cost on the response path. Remedy shape in the ledger |
+| ~~**F56**~~ | ~~A reasoning model's chain-of-thought is stored as the conversation summary~~ | **REPRODUCED then CLOSED as F57** `fix/f57-reasoning-in-summaries`. Re-measured on a second machine two days later: **1 298 of 2 419 bytes, 53.7 %** (F56 said 63 % — the share is transcript-dependent; what reproduces is that most of the stored summary is not the summary). **Resolved by announcing, not removing**, and removal was rejected on a *measurement*: a transcript that merely discusses reasoning tags returned one `<think>` and **ten** `</think>`, real terminator fifth — cutting at the first leaves 985 B of CoT, cutting at the last destroys 2 173 B of summary. A `max_tokens` truncation returns an **unterminated** block (100 % CoT), which a well-formed-block rule cannot touch at all. Anchored detection at offset 0 was correct on all five replies: **the condition is decidable, its extent is not.** Refusing was rejected by reasoning already at `parse_summary` — a refused summary never advances `covers_through_sequence`, so a *permanent* model property would re-trigger a provider call every turn forever; that option reopens with **F55**. `message.reasoning` is `null` on the wire while `content` carries the block, so the operator fix (`--reasoning-parser`) is named in the `warn!` and the metric |
 | **F35, F37, F34, F29, F39, F46** | — | CLOSED |
 | **F36, F41** | — | REFUTED / wrong as recorded |
 
