@@ -12083,7 +12083,7 @@
         ]
       },
       "put": {
-        "description": "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.",
+        "description": "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is implemented: once `summarization_enabled` is on, a new immutable summary version is produced automatically after an assistant turn crosses the configured thresholds, or on demand through POST /api/v1/conversations/{id}/summarize, and the active summary is injected as history unless `history_strategy` is `recent_messages`. See docs/conversation-memory-rag-api.md.",
         "operationId": "put_conversation_policy",
         "parameters": [
           {
@@ -12296,7 +12296,7 @@
         ]
       },
       "put": {
-        "description": "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.",
+        "description": "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is implemented: once `summarization_enabled` is on, a new immutable summary version is produced automatically after an assistant turn crosses the configured thresholds, or on demand through POST /api/v1/conversations/{id}/summarize, and the active summary is injected as history unless `history_strategy` is `recent_messages`. See docs/conversation-memory-rag-api.md.",
         "operationId": "put_embedding_policy",
         "parameters": [
           {
@@ -12509,7 +12509,7 @@
         ]
       },
       "put": {
-        "description": "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.",
+        "description": "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is implemented: once `summarization_enabled` is on, a new immutable summary version is produced automatically after an assistant turn crosses the configured thresholds, or on demand through POST /api/v1/conversations/{id}/summarize, and the active summary is injected as history unless `history_strategy` is `recent_messages`. See docs/conversation-memory-rag-api.md.",
         "operationId": "put_memory_policy",
         "parameters": [
           {
@@ -12722,7 +12722,7 @@
         ]
       },
       "put": {
-        "description": "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.",
+        "description": "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is implemented: once `summarization_enabled` is on, a new immutable summary version is produced automatically after an assistant turn crosses the configured thresholds, or on demand through POST /api/v1/conversations/{id}/summarize, and the active summary is injected as history unless `history_strategy` is `recent_messages`. See docs/conversation-memory-rag-api.md.",
         "operationId": "put_retrieval_policy",
         "parameters": [
           {
@@ -25916,7 +25916,7 @@
         ]
       },
       "post": {
-        "description": "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.",
+        "description": "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is implemented: once `summarization_enabled` is on, a new immutable summary version is produced automatically after an assistant turn crosses the configured thresholds, or on demand through POST /api/v1/conversations/{id}/summarize, and the active summary is injected as history unless `history_strategy` is `recent_messages`. See docs/conversation-memory-rag-api.md.",
         "operationId": "create_conversation",
         "parameters": [
           {
@@ -26530,7 +26530,7 @@
         ]
       },
       "post": {
-        "description": "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.",
+        "description": "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is implemented: once `summarization_enabled` is on, a new immutable summary version is produced automatically after an assistant turn crosses the configured thresholds, or on demand through POST /api/v1/conversations/{id}/summarize, and the active summary is injected as history unless `history_strategy` is `recent_messages`. See docs/conversation-memory-rag-api.md.",
         "operationId": "create_message",
         "parameters": [
           {
@@ -27267,7 +27267,7 @@
         ]
       },
       "post": {
-        "description": "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.",
+        "description": "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is implemented: once `summarization_enabled` is on, a new immutable summary version is produced automatically after an assistant turn crosses the configured thresholds, or on demand through POST /api/v1/conversations/{id}/summarize, and the active summary is injected as history unless `history_strategy` is `recent_messages`. See docs/conversation-memory-rag-api.md.",
         "operationId": "create_memory",
         "parameters": [
           {

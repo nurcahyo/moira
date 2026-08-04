@@ -4340,6 +4340,64 @@ description, expect F42's emitter guard to go **red** (that red is the interlock
 the disposition with three emitters in view, and replace the two `tests/structured_output.rs` cases
 that pin the current behaviour on both run paths.
 
+## F58 CLOSED — `fix/openapi-summarization-claim-94`, 2026-08-05 (issue #94)
+
+### F58 — the spec told seven operations that summarization does not exist, one hour after it shipped
+
+`POST /api/v1/conversations/{id}/summarize` landed in `dac7468` (plan 11 Sub-Phase E) on
+2026-08-02 at 05:21. `270df5e` — **F31, the fix whose entire subject was "stop the spec telling
+callers that retrieval is unwired"** — landed at 06:19 the same morning and wrote
+
+> Conversation summarization is not implemented yet.
+
+into the shared operation description carried by seven operations: `POST /api/v1/conversations`,
+`POST /api/v1/conversations/{id}/messages`, `POST /api/v1/memories`, and the four
+`/api/v1/admin/applications/{application_id}/*-policy` PUTs. F31 replaced one false claim with a
+narrower one. The four policy PUTs are again the sharp end: `summarization_enabled`,
+`summary_trigger_tokens`, `minimum_messages_since_summary`, `summary_target_tokens` and
+`history_strategy` are all written through the conversation-policy PUT whose own description said
+the feature they configure does not exist.
+
+**Checked for the nuance that would have made it true, and there is none.** The endpoint exists and
+is registered on the caller plane; `summarize_conversation` writes an immutable version behind a
+per-conversation advisory lock; `maybe_summarize_after_turn` runs the automatic path after the
+assistant message is persisted; `assemble_context` injects the active summary for every
+`history_strategy` except `recent_messages`, and the column's default is `summary_plus_recent`.
+`tests/conversation_summarization.rs` (1 605 lines) covers both entry points end to end. The only
+true part of the neighbourhood is that `summarization_enabled` defaults to `false` — a default, not
+an absence, and the corrected sentence says so.
+
+**Fixed** by replacing the sentence in all seven `#[utoipa::path]` descriptions with what the
+feature actually does, including the gate and the injection condition, and by regenerating
+`docs/openapi.json`. **No operation was added or removed and the operation count did not move**;
+the snapshot diff is seven description strings.
+
+**The regression guard is the test that used to hold the falsehood in place.**
+`conversation_memory_rag_operations_document_where_stored_content_is_used` already pins the
+sentence verbatim on all eleven operations and already carries `INERT_PRIMITIVE_CLAIMS`, the
+forbidden-phrase family from the same defect one sub-phase earlier. `"summarization is not
+implemented"` is now the seventh member, so the sentence cannot return by any wording that contains
+it.
+
+**Siblings checked and deliberately left alone** (every hedging description in the generated
+document was read against the code):
+
+| Claim | Verdict |
+|---|---|
+| `ClaimAdminIdentityRequest.setup_token` — "deferred … refused with a clear, keyed error" | **still true** — `setup_token_not_supported` is raised in both `src/application/identity.rs` and `src/http/identity.rs` |
+| `DELETE /api/v1/admin/admin-identities/{id}` — "plan 07's explicitly deferred revoke endpoint" | **still true and honest** — it describes shipped soft-revoke behaviour |
+| The four RAG-write `Idempotency-Key` descriptions | **already fixed by 02b** — real replay, and two tests forbid "not implemented" there |
+| `POST /v1/responses` — "`json_object` is refused", "`verbosity` is refused rather than ignored" | **still true** (F35) |
+| `SENTENCE_A_RAG_WRITE` on the four RAG writes | **still true** — chunking, embedding, indexing and citations all run |
+| "retrieval stays off until those policies enable it" | **still true** — the three retrieval flags default `false`; kept verbatim |
+
+The prose docs the descriptions point at carried the same lie and were corrected with them:
+`docs/conversation-memory-rag-api.md` had a section titled *"The one thing that still does not
+run"* asserting `conversation_summaries` has no writer. `docs/public-api.md` was already correct,
+which is the clearest evidence that this was a stale sentence rather than a disagreement about
+behaviour.
+
+
 ### F54 — a failed extraction cannot be correlated to its execution
 
 Found while discharging F29's third precondition. `memory_extraction_runs` has **no

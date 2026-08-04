@@ -29,18 +29,20 @@ exactly as it did before plan 11.
 
 | Route group | Does today | Does not do today |
 | --- | --- | --- |
-| `/api/v1/conversations`, `/api/v1/conversations/{id}/messages` | Store conversation and message rows; attach a conversation to a response; replay bounded history into the prompt | Summarize a conversation past its budget |
+| `/api/v1/conversations`, `/api/v1/conversations/{id}/messages` | Store conversation and message rows; attach a conversation to a response; replay bounded history into the prompt; summarize the conversation on demand via `POST /api/v1/conversations/{id}/summarize` | — |
 | `/api/v1/memories` | Store explicit memory records; embed them; retrieve and inject them under policy; cite them | — |
-| Conversation and memory policy endpoints | Store policy configuration and gate history replay, memory retrieval, and automatic memory extraction with it | Enforce summarization, which does not exist yet |
+| Conversation and memory policy endpoints | Store policy configuration **and gate live behavior**: history replay, memory retrieval, automatic memory extraction, and summarization (`summarization_enabled`, the trigger thresholds, and `history_strategy`, which decides whether the active summary is injected) | — |
 | Retrieval and embedding policy endpoints | Store policy configuration **and gate live behavior**: `enabled` switches retrieval on for the application, and the embedding policy selects the model that embeds both the corpus and the query | — |
 | `/api/v1/admin/rag-collections`, `/api/v1/admin/rag-documents` (create/ingest/reindex) | Store and version document content; chunk, embed, and index it; report real progress in `ingestion_status`; replay `Idempotency-Key` | — |
 
-## The one thing that still does not run
+## Summarization
 
-Conversation summarization (plan 11 Sub-Phase E). `conversation_summaries` has no writer,
-so a conversation past its configured budget is truncated rather than summarized. The
-context planner already reads a summary when one exists, so this is a missing producer, not
-a missing consumer.
+Plan 11 Sub-Phase E gave `conversation_summaries` its writer. Summarization is off by default
+(`summarization_enabled` defaults to `false`); with it on, a new immutable summary version is
+produced automatically after an assistant turn crosses both configured thresholds, or on demand
+through `POST /api/v1/conversations/{id}/summarize`. The context planner injects the active summary
+unless `history_strategy` is `recent_messages`. See
+[`docs/conversation-summarization.md`](./conversation-summarization.md).
 
 Idempotency behavior for these routes is documented in
 [`docs/idempotency.md`](./idempotency.md).

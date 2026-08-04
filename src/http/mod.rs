@@ -1485,7 +1485,7 @@ mod tests {
     ];
 
     const SENTENCE_A_RAG_WRITE: &str = "Ingested content is chunked, embedded, and indexed for retrieval; ingestion_status reports that pipeline's real progress rather than storage. Indexed chunks reach the prompt on POST /api/v1/responses for applications whose retrieval policy enables RAG, and appear in that response's citations. See docs/conversation-memory-rag-api.md.";
-    const SENTENCE_A_SHORT: &str = "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is not implemented yet. See docs/conversation-memory-rag-api.md.";
+    const SENTENCE_A_SHORT: &str = "Conversation history, memories, and RAG chunks are retrieved and injected into the prompt on POST /api/v1/responses, gated by this application's conversation, memory, retrieval, and embedding policies; retrieval stays off until those policies enable it. Conversation summarization is implemented: once `summarization_enabled` is on, a new immutable summary version is produced automatically after an assistant turn crosses the configured thresholds, or on demand through POST /api/v1/conversations/{id}/summarize, and the active summary is injected as history unless `history_strategy` is `recent_messages`. See docs/conversation-memory-rag-api.md.";
 
     /// Restatements of the pre-plan-11 "these routes store but do nothing" claim.
     ///
@@ -1494,13 +1494,19 @@ mod tests {
     /// citations (G). Four of them are the *policy* routes that switch retrieval on, so the
     /// spec was telling operators that the setting they were writing "does not affect any
     /// behavior at all".
-    const INERT_PRIMITIVE_CLAIMS: [&str; 6] = [
+    ///
+    /// The last entry is the same defect one sub-phase later: F31 wrote "conversation
+    /// summarization is not implemented yet" onto seven operations one hour *after* Sub-Phase E
+    /// (`dac7468`) shipped the writer, the endpoint and the automatic trigger. It is listed here
+    /// so the sentence cannot come back.
+    const INERT_PRIMITIVE_CLAIMS: [&str; 7] = [
         "not yet used to influence model responses",
         "is not used to influence model responses",
         "no retrieval, chunking, or embedding pipeline runs",
         "persistence primitive",
         "persistence/configuration primitive",
         "does not affect any behavior",
+        "summarization is not implemented",
     ];
     const SENTENCE_B_INTERIM_IDEMPOTENCY: &str = "Idempotency-Key is accepted but replay is not implemented yet; retrying can duplicate side effects.";
     /// The truthful `Idempotency-Key` parameter description 02b installs on all four
