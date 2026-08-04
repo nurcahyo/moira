@@ -65,8 +65,17 @@ function methodSummary(value: unknown): SetupMethodSummary | null {
   };
 }
 
-async function loadViewModel(): Promise<SetupViewModel> {
-  const response = await readSetupWindow();
+async function loadViewModel(slug: string | null): Promise<SetupViewModel> {
+  // The in-process call still carries the query, because `?slug=` is what
+  // scopes the whole view model to a namespace — and the OAuth callback and
+  // every reload arrive here as a plain GET with nothing else to go on.
+  const response = await readSetupWindow(
+    new Request(
+      slug === null
+        ? "http://setup.local/api/setup"
+        : `http://setup.local/api/setup?slug=${encodeURIComponent(slug)}`,
+    ),
+  );
   let payload: Record<string, unknown> | null = null;
   try {
     payload = asRecord(await response.json());
@@ -82,10 +91,15 @@ async function loadViewModel(): Promise<SetupViewModel> {
           .filter((summary): summary is SetupMethodSummary => summary !== null)
       : [];
     const providerId = payload["provider_id"];
+    const echoedSlug = payload["slug"];
     return {
       kind: "ready",
       claimed: payload["claimed"] === true,
       methods,
+      // The BFF's echo, never the raw query: it has been through `readSlug`, so
+      // what reaches the wizard is a slug the console can actually derive an
+      // issuer from.
+      slug: typeof echoedSlug === "string" && echoedSlug !== "" ? echoedSlug : null,
       // The BFF's derived state: what has ALREADY been provisioned. An absent
       // or unreadable field degrades to "nothing confirmed yet", never to a
       // crash — the wizard then simply starts from the auth-settings step.
@@ -116,8 +130,14 @@ async function loadViewModel(): Promise<SetupViewModel> {
   };
 }
 
-export default async function SetupPage() {
-  const view = await loadViewModel();
+export default async function SetupPage({
+  searchParams,
+}: {
+  readonly searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
+  const raw = (await searchParams)["slug"];
+  const slug = typeof raw === "string" && raw.trim() !== "" ? raw.trim() : null;
+  const view = await loadViewModel(slug);
 
   return (
     <main className={styles.main}>

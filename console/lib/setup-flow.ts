@@ -436,28 +436,40 @@ export function assertProviderIsBoundToTrustedIssuer(
  *   * the row exists and is NOT enabled — PATCH, unguarded. A disabled row
  *     authenticates nobody, so rewriting it escalates nothing; it is a partial
  *     setup attempt being completed.
- *   * the row exists and IS enabled — PATCH only for a caller carrying a valid
- *     console session established through that row.
+ *   * the row exists and IS enabled — PATCH only for a caller who authenticated
+ *     through that row.
  *
  * That last case is exactly the legitimate remedy the PATCH path exists for.
  * The domain-refusal correction happens AFTER a successful sign-in: the
  * operator signs in, tries to claim, Moira answers `403
  * admin_claim_domain_not_allowed`, and they come back to widen the allow-list.
- * They hold a session through this very provider at that moment, so the
+ * They authenticated through this very provider at that moment, so the
  * instruction stays followable.
  *
- * THE COST, STATED. An operator who enables a provider they then cannot sign in
- * through (a mistyped client secret, say) can no longer correct it here — they
- * hold no session, and no session can be obtained through a broken provider.
- * They are not stuck: the create path is still open under a different provider
- * slug, and they hold the bootstrap system key, which is the credential Moira's
- * own admin API takes. What the console refuses to be is an unauthenticated
- * proxy for that write.
+ * "Authenticated through", not "holds an admissible session": the console's own
+ * `checkSession` applies the same allow-list, so that operator's session is
+ * itself refused on the list they are here to widen. Deciding which refusals
+ * still prove operatorship is the ROUTE's job (`operatorSessionFor` in
+ * `app/api/setup/route.ts`, which admits exactly that one shape); by the time a
+ * value reaches this function the question is already settled and this compares
+ * ids.
  *
- * `sessionProviderId` is the row the CALLER's session was established through
- * (`SessionCheck.moiraProviderId`), or `null` for no session. Never a string
- * off a request body: it is resolved by `consoleSessionCheck` from the
- * configuration that actually resolved the cookie.
+ * THE COST, STATED. An operator who enables a provider they then cannot sign in
+ * through at all (a mistyped client secret, say) can no longer correct that row
+ * here — no session can be obtained through a broken provider, so there is
+ * nothing to prove operatorship with. They are not stuck: the wizard's
+ * auth-settings form carries a PROVIDER SLUG field, and a new slug is a new
+ * console issuer with its own trusted issuer and its own row, so the create
+ * path is still open from the console itself. Failing that they hold the
+ * bootstrap system key, which is the credential Moira's own admin API takes.
+ * What the console refuses to be is an unauthenticated proxy for a write
+ * against a live authenticator.
+ *
+ * `sessionProviderId` is the row the CALLER authenticated through
+ * (`SessionCheck.moiraProviderId`, or `resolvedProviderId` on an allow-list
+ * refusal), or `null` for no session. Never a string off a request body: it is
+ * resolved by `consoleSessionCheck` from the configuration that actually
+ * resolved the cookie.
  */
 export function assertEnabledProviderMayBeReSaved(
   provider: AuthProviderSettingsRecord,

@@ -34,7 +34,17 @@ export type SetupViewModel =
        * state is gone after both, and this field is where it comes back from.
        */
       readonly provisioning: SetupProvisioningState;
-      /** Better Auth's provider id for the incumbent issuer. An identifier. */
+      /**
+       * The console-issuer namespace this view model describes — `?slug=` as
+       * the BFF echoed it, `null` for the incumbent.
+       *
+       * Not decoration: it is what the wizard puts back on the provision body,
+       * the claim body and the OAuth callback URL, so a run started under a
+       * replacement slug stays in that namespace across the sign-in navigation
+       * and any reload.
+       */
+      readonly slug: string | null;
+      /** Better Auth's provider id for that namespace. An identifier. */
       readonly oauthProviderId: string | null;
     }
   | { readonly kind: "claimed" }

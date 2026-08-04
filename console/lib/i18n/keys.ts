@@ -253,6 +253,8 @@ export const CONSOLE_MESSAGE_KEYS = {
   setup_auth_method_label: "console.setup.auth_method_label",
   setup_auth_method_google: "console.setup.auth_method_google",
   setup_auth_method_generic: "console.setup.auth_method_generic",
+  setup_auth_slug_label: "console.setup.auth_slug_label",
+  setup_auth_slug_hint: "console.setup.auth_slug_hint",
   setup_auth_display_name_label: "console.setup.auth_display_name_label",
   setup_auth_client_id_label: "console.setup.auth_client_id_label",
   setup_auth_client_secret_label: "console.setup.auth_client_secret_label",

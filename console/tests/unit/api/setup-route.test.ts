@@ -24,7 +24,7 @@ import { readConsoleEnv, type ConsoleEnv, type EnvSource } from "@/lib/env";
 import { CONSOLE_CATALOG, t } from "@/lib/i18n";
 import { CONSOLE_MESSAGE_KEYS } from "@/lib/i18n/keys";
 import { MoiraClient } from "@/lib/moira-client";
-import type { SessionCheck } from "@/lib/moira-session";
+import { checkSession, type SessionCheck } from "@/lib/moira-session";
 import type { SealedClientSecret, ConsoleSecretStore } from "@/lib/console-secrets";
 import { setSetupWindowDependenciesForTests } from "@/lib/setup-window";
 import {
@@ -229,35 +229,91 @@ function handlers(overrides: Record<string, StubHandler> = {}): Record<string, S
   };
 }
 
-const SIGNED_IN: SessionCheck = {
-  ok: true,
-  identity: { email: "ops@example.com", emailVerified: true, idpSubject: "sub-abc" },
-  // The console issuer of the configuration that AUTHENTICATED this session.
-  // Required from issue #71: `claim` compares the namespace its `slug` resolves
-  // to against this, so a session fixture without it would be a session that
-  // could claim in any namespace.
-  consoleIssuer: CONSOLE_ISSUER,
-  // ...and the Moira ROW that configuration was resolved from. `provision`
-  // compares the derived row against this before it re-saves an ENABLED
-  // provider, so a fixture without it would be a session that could re-point
-  // any live sign-in provider.
-  moiraProviderId: PROVIDER_ID,
-};
+/* -------------------------------------------------------------------------- */
+/* Sessions: HAND-BUILT VERDICTS ARE NOT ALLOWED HERE                         */
+/* -------------------------------------------------------------------------- */
+//
+// `install` substitutes `readSession` wholesale, so no test in this file
+// exercises the real session resolution. That is deliberate — the route's job is
+// what it DOES with a verdict — but it is only safe while the verdicts handed in
+// are ones the real decider can actually produce.
+//
+// A hand-written literal is not that. The refusal an operator whose domain is
+// missing from the allow-list really holds is `email_domain_not_allowed` WITH
+// the row that resolved them named on it, and a literal that omitted the row
+// would let the route's remedy path pass a test no operator can reproduce. So
+// every fixture below is built by calling `checkSession` — the same function
+// `consoleSessionCheck` calls on the shipped path — against the configuration
+// that would have resolved it. If `checkSession` stops naming the row, or
+// changes which conditions it refuses, these fixtures change with it and the
+// route tests fail rather than drifting.
+
+/** The configuration a session resolves against, as `checkSession` reads it. */
+function authConfig(overrides: {
+  readonly moiraProviderId?: string;
+  readonly consoleIssuer?: string;
+  readonly allowedEmailDomains?: readonly string[];
+} = {}) {
+  return {
+    allowedEmailDomains: overrides.allowedEmailDomains ?? ["example.com"],
+    // The console issuer of the configuration that AUTHENTICATES the session.
+    // Required from issue #71: `claim` compares the namespace its `slug`
+    // resolves to against this, so a session without it could claim in any
+    // namespace.
+    consoleIssuer: overrides.consoleIssuer ?? CONSOLE_ISSUER,
+    // ...and the Moira ROW that configuration was resolved from. `provision`
+    // compares the derived row against this before it re-saves an ENABLED
+    // provider, so a session without it could re-point any live sign-in
+    // provider.
+    moiraProviderId: overrides.moiraProviderId ?? PROVIDER_ID,
+  };
+}
+
+const OTHER_PROVIDER_ID = "44444444-4444-4444-8444-444444444444";
+
+const SIGNED_IN: SessionCheck = checkSession(
+  { email: "ops@example.com", emailVerified: true, idpSubject: "sub-abc" },
+  authConfig(),
+);
 
 /** No session at all — the true state of an anonymous caller in the window. */
-const NO_SESSION: SessionCheck = {
-  ok: false,
-  rejection: "no_session",
-  messageKey: CONSOLE_MESSAGE_KEYS.session_required,
-};
+const NO_SESSION: SessionCheck = checkSession(null, authConfig());
 
 /** A real, allow-listed session established through a DIFFERENT provider row. */
-const SIGNED_IN_ELSEWHERE: SessionCheck = {
-  ok: true,
-  identity: { email: "ops@example.com", emailVerified: true, idpSubject: "sub-other" },
-  consoleIssuer: "https://console.example.com/idp/other",
-  moiraProviderId: "44444444-4444-4444-8444-444444444444",
-};
+const SIGNED_IN_ELSEWHERE: SessionCheck = checkSession(
+  { email: "ops@other.example", emailVerified: true, idpSubject: "sub-other" },
+  authConfig({
+    moiraProviderId: OTHER_PROVIDER_ID,
+    consoleIssuer: "https://console.example.com/idp/other",
+    allowedEmailDomains: ["other.example"],
+  }),
+);
+
+/**
+ * THE OPERATOR THE PATCH PATH EXISTS FOR.
+ *
+ * Signed in through the deployment's own provider row, and refused by the
+ * console's copy of the very allow-list they have come back to widen. Not a
+ * contrived shape: it is what `checkSession` returns for the exact sequence the
+ * wizard walks an operator through — sign in, claim, `403
+ * admin_claim_domain_not_allowed`, "Edit auth settings".
+ */
+const OPERATOR_OUTSIDE_THE_ALLOW_LIST: SessionCheck = checkSession(
+  { email: "ops@newdomain.example", emailVerified: true, idpSubject: "sub-abc" },
+  authConfig(),
+);
+
+/** The same refusal, but resolved through a row that is NOT the derived one. */
+const OUTSIDER_ELSEWHERE: SessionCheck = checkSession(
+  { email: "ops@newdomain.example", emailVerified: true, idpSubject: "sub-other" },
+  authConfig({ moiraProviderId: OTHER_PROVIDER_ID }),
+);
+
+/** Authenticated through the derived row, but the IdP never verified them. */
+const UNVERIFIED_HERE: SessionCheck = checkSession(
+  { email: "ops@example.com", emailVerified: false, idpSubject: "sub-abc" },
+  authConfig(),
+);
 
 let stub: MoiraStub;
 let store: RecordingSecretStore;
@@ -479,6 +535,49 @@ describe("GET aggregates server-side and publishes a narrowed view", () => {
     expect(serialised).not.toContain("allowed_email_domains");
     expect(serialised).not.toContain("googleapis.com");
     expect(serialised).not.toContain(CLIENT_ID);
+  });
+
+  test("`?slug=` scopes the rehydration to THAT namespace, and is echoed back", async () => {
+    // The escape hatch's other half. An operator whose enabled provider is
+    // broken provisions a replacement under a new slug; the OAuth round trip and
+    // every reload come back through this handler as a plain GET, and the query
+    // is the only thing that survives them. A rehydration that always answered
+    // for the incumbent would land them on the broken row's state with the wrong
+    // `provider_id` behind the sign-in button.
+    installProvisioned();
+    const body = await json(await GET(new Request("http://console.local/api/setup?slug=recovery")));
+
+    // The echo is what the wizard puts back on the provision body, on the claim
+    // body and on the callback URL.
+    expect(body["slug"]).toBe("recovery");
+    // Nothing is provisioned under `recovery` yet — the fixture's row is bound
+    // to the INCUMBENT issuer — so the derivation for this namespace is empty.
+    // That is the point: this deployment's incumbent row must not be handed to a
+    // wizard run that is deliberately not addressing it.
+    expect(body["state"]).toMatchObject({ providerId: null, trustedJwtIssuerId: null });
+  });
+
+  test("an absent or empty `?slug=` is the incumbent, not a refusal", async () => {
+    installProvisioned();
+    for (const url of ["http://console.local/api/setup", "http://console.local/api/setup?slug="]) {
+      const body = await json(await GET(new Request(url)));
+      expect(body["slug"]).toBeNull();
+      expect(body["state"]).toMatchObject({ providerId: PROVIDER_ID });
+    }
+  });
+
+  test("a malformed `?slug=` is the same keyed 400 the provision body gets", async () => {
+    // One spelling of the rule: the slug becomes a URL path segment and part of
+    // the issuer string Moira pins tokens to, and `consoleIssuerForSlug` throws a
+    // developer diagnostic on a bad one. Caught here rather than surfacing as a
+    // 500.
+    const response = await GET(new Request("http://console.local/api/setup?slug=Not%20A%20Slug"));
+    expect(response.status).toBe(400);
+    expect(errorOf(await json(response))["message_key"]).toBe(
+      CONSOLE_MESSAGE_KEYS.setup_provider_slug_invalid,
+    );
+    // Refused before the guard spent anything on Moira.
+    expect(stub.routes()).toEqual([]);
   });
 });
 
@@ -1137,27 +1236,78 @@ describe("an ENABLED provider is not re-pointed by a caller who cannot prove the
     expectNothingWasWritten();
   });
 
-  test("a session refused for another reason is a 403, not a 401", async () => {
+  test("a session refused for a reason signing in cannot fix keeps ITS OWN key", async () => {
     // The two statuses are not decoration: 401 says "there is nobody here",
     // 403 says "you are here and may not". Only the first is fixed by signing
     // in, and the wizard renders the difference.
-    installEnabledRow({
-      ok: false,
-      rejection: "email_domain_not_allowed",
-      messageKey: CONSOLE_MESSAGE_KEYS.email_domain_not_allowed,
-    });
+    //
+    // ...and the KEY is not decoration either. This session authenticated
+    // through the derived row; what disqualifies it is an address the IdP never
+    // verified. Answering that with `setup_enabled_provider_requires_session`
+    // ("Sign in through it first, then save your changes") would send them to
+    // repeat the one action that cannot change the answer.
+    installEnabledRow(UNVERIFIED_HERE);
     const response = await POST(post(RE_POINT_BODY));
     expect(response.status).toBe(403);
-    expect(errorOf(await json(response))["code"]).toBe("setup_enabled_provider_requires_session");
+    const error = errorOf(await json(response));
+    expect(error["code"]).toBe("email_not_verified");
+    expect(error["message_key"]).toBe(CONSOLE_MESSAGE_KEYS.email_not_verified);
     expectNothingWasWritten();
   });
 
-  test("THE REMEDY still works: the operator signed in through THAT provider re-saves it", async () => {
+  test("THE REMEDY: the operator the ALLOW-LIST refused re-saves the row that refused them", async () => {
     // The legitimate path this PATCH exists for, and the reason the gate is a
-    // session rather than a blanket refusal: the operator signs in, tries to
-    // claim, Moira answers 403 admin_claim_domain_not_allowed, and they come
-    // back to widen the allow-list — holding, at that moment, a session through
-    // this very provider.
+    // session rather than a blanket refusal.
+    //
+    // WAS A REGRESSION, and this test used to pin it. The operator arrives here
+    // by the route the wizard itself walks them down: sign in, claim, Moira
+    // answers `403 admin_claim_domain_not_allowed`, take the "Edit auth
+    // settings" way back, widen the allow-list, save. At that moment the
+    // console's OWN `checkSession` has already refused their session on the
+    // same list — `email_domain_not_allowed`, which is what
+    // `OPERATOR_OUTSIDE_THE_ALLOW_LIST` is, built by `checkSession` itself
+    // rather than asserted. A gate that demanded `SessionCheck.ok` therefore
+    // refused the one caller it exists to serve, and the widen-and-retry
+    // instruction was unfollowable.
+    //
+    // The proof that it is the ROW and not the mere refusal that admits them is
+    // the next test.
+    installEnabledRowPatchable(OPERATOR_OUTSIDE_THE_ALLOW_LIST);
+    const response = await POST(
+      post({
+        ...PROVISION_BODY,
+        client_secret: "",
+        allowed_email_domains: ["example.com", "newdomain.example"],
+      }),
+    );
+
+    expect(response.status).toBe(201);
+    expect(stub.routes()).toContain(PROVIDER_PATCH_ROUTE);
+    const patched = stub.bodyOf(PROVIDER_PATCH_ROUTE) as Record<string, unknown>;
+    expect(patched["allowed_email_domains"]).toEqual(["example.com", "newdomain.example"]);
+  });
+
+  test("THE LIMIT: the same allow-list refusal from ANOTHER row is still refused", async () => {
+    // Without this, "refused on the allow-list" alone would be enough, and on an
+    // unclaimed multi-provider deployment ANY enabled provider can mint a
+    // session — so a stranger who can authenticate anywhere could re-point the
+    // row here. What admits the caller above is that the row which resolved
+    // their cookie IS the row being written; this is the same rejection with
+    // that one fact removed.
+    installEnabledRow(OUTSIDER_ELSEWHERE);
+    const response = await POST(post(RE_POINT_BODY));
+
+    expect(response.status).toBe(403);
+    expect(errorOf(await json(response))["code"]).toBe("email_domain_not_allowed");
+    expect(stub.routes()).toEqual([CLAIM_STATUS_ROUTE, ISSUER_LIST_ROUTE, PROVIDER_LIST_ROUTE]);
+    expectNothingWasWritten();
+  });
+
+  test("THE REMEDY still works for an allow-listed operator too", async () => {
+    // The other half of the same remedy: an operator whose address WAS on the
+    // list all along (they are fixing a URL, not a domain) holds an ordinary
+    // `ok` session, and admitting the refused one must not have cost them
+    // anything.
     installEnabledRowPatchable(SIGNED_IN);
     const response = await POST(
       post({
@@ -1172,6 +1322,52 @@ describe("an ENABLED provider is not re-pointed by a caller who cannot prove the
     const patched = stub.bodyOf(PROVIDER_PATCH_ROUTE) as Record<string, unknown>;
     expect(patched["allowed_email_domains"]).toEqual(["example.com", "gmail.com"]);
     expect((await json(response))["state"]).toMatchObject({ allowedEmailDomainCount: 2 });
+  });
+
+  test("the row handed to the IN-MODULE lock is the CALLER's, not the derived one", async () => {
+    // The pre-check and the in-module lock look redundant while the derivation
+    // and the fresh read agree. They do not agree in exactly one case — the row
+    // was DISABLED when derived and is ENABLED by the time it is read back — and
+    // that case is the only place the two possible sources for
+    // `sessionProviderId` differ:
+    //
+    //   operator.sessionProviderId   null (the pre-check never asked: the
+    //                                derived row was disabled)
+    //   derived.providerId           the row id — which the lock would then
+    //                                compare against ITSELF and pass
+    //
+    // Substituting the second for the first leaves every other test in this
+    // file green while reopening the hole the lock exists to close. This is
+    // what fails when someone does.
+    install({
+      handlers: handlers({
+        [ISSUER_LIST_ROUTE]: populatedIssuerList,
+        // The derivation sees a disabled row, so the pre-check stands down...
+        [PROVIDER_LIST_ROUTE]: () => ({
+          status: 200,
+          body: {
+            data: [providerRecord({ enabled: false })],
+            pagination: { has_more: false, next_cursor: null },
+          },
+        }),
+        // ...and the fresh read the PATCH is preconditioned on sees it enabled.
+        [PROVIDER_GET_ROUTE]: () => ({
+          status: 200,
+          body: providerRecord({ enabled: true, version: 2 }),
+        }),
+        [PROVIDER_PATCH_ROUTE]: () => {
+          throw new Error("a row that became enabled mid-flight was PATCHed anonymously");
+        },
+      }),
+      session: NO_SESSION,
+    });
+    store.sealedIds.add(PROVIDER_ID);
+
+    const response = await POST(post(RE_POINT_BODY));
+    expect(response.status).toBe(403);
+    expect(errorOf(await json(response))["code"]).toBe("setup_enabled_provider_requires_session");
+    expect(stub.routes()).not.toContain(PROVIDER_PATCH_ROUTE);
+    expect(store.puts).toEqual([]);
   });
 
   test("CONTROL: an UNPROVISIONED deployment still provisions with no session", async () => {
@@ -1503,9 +1699,7 @@ describe("POST claim derives the provisioning state SERVER-SIDE", () => {
   });
 
   test("no session is a 401 carrying the session check's own key", async () => {
-    install({
-      session: { ok: false, rejection: "no_session", messageKey: "console.error.session_required" },
-    });
+    install({ session: NO_SESSION });
     const response = await POST(post({ action: "claim" }));
     expect(response.status).toBe(401);
     const error = errorOf(await json(response));
@@ -1516,13 +1710,13 @@ describe("POST claim derives the provisioning state SERVER-SIDE", () => {
   });
 
   test("a session that may not act is a 403, not a 401", async () => {
-    install({
-      session: {
-        ok: false,
-        rejection: "email_domain_not_allowed",
-        messageKey: CONSOLE_MESSAGE_KEYS.email_domain_not_allowed,
-      },
-    });
+    // The CLAIM path is unchanged by the provisioning gate's allow-list
+    // admission: a claim by an identity outside the allow-list is exactly what
+    // Moira would refuse, so the console refuses it here rather than spending a
+    // round trip on it. The provisioning path admits the same session, because
+    // there the allow-list is the thing being edited — see the enabled-provider
+    // describe block below.
+    install({ session: OPERATOR_OUTSIDE_THE_ALLOW_LIST });
     expect((await POST(post({ action: "claim" }))).status).toBe(403);
   });
 

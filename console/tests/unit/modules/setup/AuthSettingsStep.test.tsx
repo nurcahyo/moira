@@ -115,6 +115,7 @@ describe("the client secret is write-only", () => {
         methods={[EXISTING_METHOD]}
         provisioning={EMPTY_PROVISIONING_STATE}
         refusedDomain={null}
+        slug={null}
         onProvisioned={() => {}}
         fetchImpl={makeFetch([]).fetchImpl}
       />,
@@ -133,6 +134,7 @@ describe("the client secret is write-only", () => {
         methods={[EXISTING_METHOD]}
         provisioning={EMPTY_PROVISIONING_STATE}
         refusedDomain={null}
+        slug={null}
         onProvisioned={() => {}}
         fetchImpl={makeFetch([]).fetchImpl}
       />,
@@ -149,6 +151,7 @@ describe("the client secret is write-only", () => {
         methods={[{ ...EXISTING_METHOD, clientIdConfigured: false }]}
         provisioning={EMPTY_PROVISIONING_STATE}
         refusedDomain={null}
+        slug={null}
         onProvisioned={() => {}}
         fetchImpl={makeFetch([]).fetchImpl}
       />,
@@ -165,6 +168,7 @@ describe("an empty submission is blocked, not sent", () => {
         methods={[]}
         provisioning={EMPTY_PROVISIONING_STATE}
         refusedDomain={null}
+        slug={null}
         onProvisioned={() => {}}
         fetchImpl={fetchImpl}
       />,
@@ -185,6 +189,7 @@ describe("an empty submission is blocked, not sent", () => {
         methods={[]}
         provisioning={EMPTY_PROVISIONING_STATE}
         refusedDomain={null}
+        slug={null}
         onProvisioned={() => {}}
         fetchImpl={fetchImpl}
       />,
@@ -235,6 +240,7 @@ describe("the step is not complete until all four conditions are confirmed", () 
           methods={[]}
           provisioning={EMPTY_PROVISIONING_STATE}
         refusedDomain={null}
+        slug={null}
           onProvisioned={(state) => reported.push(state)}
           fetchImpl={fetchImpl}
         />,
@@ -263,6 +269,7 @@ describe("the step is not complete until all four conditions are confirmed", () 
         methods={[]}
         provisioning={EMPTY_PROVISIONING_STATE}
         refusedDomain={null}
+        slug={null}
         onProvisioned={(state) => reported.push(state)}
         fetchImpl={fetchImpl}
       />,
@@ -304,6 +311,7 @@ describe("a forced secret-write failure is incomplete, with Retry AND Discard", 
         methods={[]}
         provisioning={EMPTY_PROVISIONING_STATE}
         refusedDomain={null}
+        slug={null}
         onProvisioned={(state) => reported.push(state)}
         fetchImpl={fetchImpl}
       />,
@@ -348,6 +356,7 @@ describe("a forced secret-write failure is incomplete, with Retry AND Discard", 
         methods={[]}
         provisioning={EMPTY_PROVISIONING_STATE}
         refusedDomain={null}
+        slug={null}
         onProvisioned={() => {}}
         fetchImpl={fetchImpl}
       />,
@@ -379,6 +388,7 @@ describe("the secret reaches the BFF and nothing else", () => {
         methods={[]}
         provisioning={EMPTY_PROVISIONING_STATE}
         refusedDomain={null}
+        slug={null}
         onProvisioned={() => {}}
         fetchImpl={fetchImpl}
       />,
@@ -422,6 +432,7 @@ describe("a re-save of an already-provisioned provider — the domain-refusal re
         methods={[]}
         provisioning={COMPLETE_STATE}
         refusedDomain="gmail.com"
+        slug={null}
         onProvisioned={(state) => reported.push(state)}
         fetchImpl={fetchImpl}
       />,
@@ -449,6 +460,7 @@ describe("a re-save of an already-provisioned provider — the domain-refusal re
         methods={[]}
         provisioning={EMPTY_PROVISIONING_STATE}
         refusedDomain={null}
+        slug={null}
         onProvisioned={() => {}}
         fetchImpl={fetchImpl}
       />,
@@ -486,6 +498,7 @@ describe("a re-save of an already-provisioned provider — the domain-refusal re
         methods={[]}
         provisioning={COMPLETE_STATE}
         refusedDomain="gmail.com"
+        slug={null}
         onProvisioned={(state) => reported.push(state)}
         fetchImpl={fetchImpl}
       />,
@@ -507,6 +520,7 @@ describe("a claim-time domain refusal focuses the allow-list with the instructio
         methods={[]}
         provisioning={EMPTY_PROVISIONING_STATE}
         refusedDomain={null}
+        slug={null}
         onProvisioned={() => {}}
         fetchImpl={makeFetch([]).fetchImpl}
       />,
@@ -518,6 +532,7 @@ describe("a claim-time domain refusal focuses the allow-list with the instructio
         methods={[]}
         provisioning={EMPTY_PROVISIONING_STATE}
         refusedDomain="gmail.com"
+        slug={null}
         onProvisioned={() => {}}
         fetchImpl={makeFetch([]).fetchImpl}
       />,
@@ -531,5 +546,166 @@ describe("a claim-time domain refusal focuses the allow-list with the instructio
     await waitFor(() =>
       expect(document.activeElement).toBe(field(K.setup_auth_allowed_domains_label)),
     );
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* THE ESCAPE HATCH: a provider slug, in the UI rather than only in the BFF    */
+/* -------------------------------------------------------------------------- */
+//
+// An ENABLED provider row may only be re-saved by somebody who authenticated
+// through it. A row enabled with a mistyped client secret authenticates nobody,
+// so it cannot be corrected — and `docs/console-architecture.md` names the way
+// out: "provision again under a different provider slug".
+//
+// That instruction was unfollowable. The form had no slug field and never sent
+// one, so every wizard provision resolved to the incumbent console issuer and
+// derived the same enabled row; the only remaining paths were a hand-crafted
+// POST or Moira's admin API. The tests below are what stops the documented
+// remedy from silently becoming a dead end again.
+
+describe("the wizard can provision under a different provider slug", () => {
+  test("a typed slug reaches the BFF on the provision body", async () => {
+    const { calls, fetchImpl } = makeFetch([
+      { status: 201, body: { state: COMPLETE_STATE, provider_id: "moira-console-idp-recovery" } },
+    ]);
+    render(
+      <AuthSettingsStep
+        methods={[EXISTING_METHOD]}
+        provisioning={EMPTY_PROVISIONING_STATE}
+        refusedDomain={null}
+        slug={null}
+        onProvisioned={() => {}}
+        fetchImpl={fetchImpl}
+      />,
+    );
+
+    await userEvent.type(field(K.setup_auth_slug_label), "recovery");
+    await fillEverything();
+    await submit();
+
+    await waitFor(() => expect(calls).toHaveLength(1));
+    expect(calls[0]!.body["slug"]).toBe("recovery");
+  });
+
+  test("an empty slug is OMITTED, not sent as an empty string", async () => {
+    // `readSlug` treats an absent slug as "the incumbent" and refuses `""` with
+    // `setup_provider_slug_invalid`, so sending the empty field verbatim would
+    // turn every ordinary first run into a keyed 400.
+    const { calls, fetchImpl } = makeFetch([{ status: 201, body: { state: COMPLETE_STATE } }]);
+    render(
+      <AuthSettingsStep
+        methods={[]}
+        provisioning={EMPTY_PROVISIONING_STATE}
+        refusedDomain={null}
+        slug={null}
+        onProvisioned={() => {}}
+        fetchImpl={fetchImpl}
+      />,
+    );
+
+    await fillEverything();
+    await submit();
+
+    await waitFor(() => expect(calls).toHaveLength(1));
+    expect(Object.keys(calls[0]!.body)).not.toContain("slug");
+  });
+
+  test("the field is SEEDED from the run's namespace, so a reload stays in it", () => {
+    // The OAuth round trip and every reload go through the server, and the
+    // server's echo of `?slug=` is the only thing that survives them. A field
+    // that always started empty would quietly re-point the next save at the
+    // incumbent issuer.
+    render(
+      <AuthSettingsStep
+        methods={[]}
+        provisioning={EMPTY_PROVISIONING_STATE}
+        refusedDomain={null}
+        slug="recovery"
+        onProvisioned={() => {}}
+        fetchImpl={makeFetch([]).fetchImpl}
+      />,
+    );
+    expect(field(K.setup_auth_slug_label).value).toBe("recovery");
+  });
+
+  test("changing the slug drops the resume state — a new namespace is a CREATE", async () => {
+    // The escape hatch's whole point is a NEW row. `resume` names a provider the
+    // BFF derived for the OLD console issuer, and replaying it under a new slug
+    // is the disagreement answered `409 setup_resume_state_conflict` — which
+    // would leave the operator exactly as stuck as before.
+    const { calls, fetchImpl } = makeFetch([{ status: 201, body: { state: COMPLETE_STATE } }]);
+    render(
+      <AuthSettingsStep
+        methods={[EXISTING_METHOD]}
+        // A revisit: the wizard holds a complete state for the incumbent row.
+        provisioning={COMPLETE_STATE}
+        refusedDomain={null}
+        slug={null}
+        onProvisioned={() => {}}
+        fetchImpl={fetchImpl}
+      />,
+    );
+
+    await userEvent.type(field(K.setup_auth_slug_label), "recovery");
+    await fillEverything();
+    await submit();
+
+    await waitFor(() => expect(calls).toHaveLength(1));
+    expect(calls[0]!.body["slug"]).toBe("recovery");
+    expect(Object.keys(calls[0]!.body)).not.toContain("resume");
+  });
+
+  test("an UNCHANGED slug still resumes against the row the wizard holds", async () => {
+    // The control for the test above: dropping `resume` whenever a slug field
+    // exists would break the domain-refusal re-save, which depends on resuming
+    // against the derived row (and on `consoleSecretStored`, which is what lets
+    // the operator save without re-typing a secret the console holds).
+    const { calls, fetchImpl } = makeFetch([{ status: 201, body: { state: COMPLETE_STATE } }]);
+    render(
+      <AuthSettingsStep
+        methods={[EXISTING_METHOD]}
+        provisioning={COMPLETE_STATE}
+        refusedDomain="gmail.com"
+        slug="recovery"
+        onProvisioned={() => {}}
+        fetchImpl={fetchImpl}
+      />,
+    );
+
+    await fillEverything();
+    await submit();
+
+    await waitFor(() => expect(calls).toHaveLength(1));
+    expect(calls[0]!.body["slug"]).toBe("recovery");
+    expect(calls[0]!.body["resume"]).toEqual(
+      COMPLETE_STATE as unknown as Record<string, unknown>,
+    );
+  });
+
+  test("the slug provisioned under is reported upward with the state", async () => {
+    // Everything after this step — the OAuth callback URL and the claim's
+    // `admin_identities` namespace — has to stay in the namespace that was
+    // actually written. This is the only place that fact exists.
+    const reported: Array<string | null> = [];
+    const { fetchImpl } = makeFetch([
+      { status: 201, body: { state: COMPLETE_STATE, provider_id: "moira-console-idp-recovery" } },
+    ]);
+    render(
+      <AuthSettingsStep
+        methods={[]}
+        provisioning={EMPTY_PROVISIONING_STATE}
+        refusedDomain={null}
+        slug={null}
+        onProvisioned={(_state, _providerId, provisionedSlug) => reported.push(provisionedSlug)}
+        fetchImpl={fetchImpl}
+      />,
+    );
+
+    await userEvent.type(field(K.setup_auth_slug_label), "recovery");
+    await fillEverything();
+    await submit();
+
+    await waitFor(() => expect(reported).toEqual(["recovery"]));
   });
 });

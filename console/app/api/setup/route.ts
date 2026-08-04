@@ -100,25 +100,27 @@
 //                (`docs/console-architecture.md`) rather than silently assumed.
 //   disabled     PATCH, ungated. A disabled row authenticates nobody, so
 //                rewriting it escalates nothing.
-//   enabled      PATCH only for a caller carrying a valid console session whose
-//                authenticating provider IS that row.
+//   enabled      PATCH only for a caller who AUTHENTICATED THROUGH that row.
 //
 // The session is resolved by the same function the claim step uses —
-// `context.readSession` -> `consoleSessionCheck` — and compared on
-// `SessionCheck.moiraProviderId`, the Moira row the resolved configuration came
-// from. Derived value against derived value, one resolution, no second spelling.
+// `context.readSession` -> `consoleSessionCheck` — and compared on the Moira row
+// the resolved configuration came from: `SessionCheck.moiraProviderId` when the
+// session was admitted, `SessionCheck.resolvedProviderId` when it was refused
+// only on the allow-list. Derived value against derived value, one resolution,
+// no second spelling.
+//
+// "AUTHENTICATED THROUGH", not "holds an admissible session", and the
+// difference is the whole remedy. `checkSession` also applies the row's own
+// `allowed_email_domains`, so the operator who is here to WIDEN that list
+// arrives refused by it. `operatorSessionFor` admits that one shape — refused
+// on the allow-list, resolved through the row being written — and nothing else.
+// Its own note states what that widens.
 //
 // It is resolved LAZILY, only once the derived row turns out to be enabled.
 // Resolving it costs a Moira read of the auth configuration, and on the fresh
 // deployment that provisioning normally runs against there is no enabled
 // provider to resolve — the honest answer there is "no session" and the request
 // does not need to pay for it.
-//
-// This is exactly the shape of the legitimate remedy: the domain-refusal
-// correction happens AFTER a successful sign-in (sign in, claim, `403
-// admin_claim_domain_not_allowed`, come back and widen the allow-list), so the
-// operator holds a session through this very provider at the moment they need
-// to re-save it.
 //
 // ============================================================================
 // `body.slug`: WHAT IT MAY STILL CHOOSE, AND WHAT IT MAY NOT
@@ -227,15 +229,52 @@ async function hasSealedSecret(store: ConsoleSecretStore, providerId: string): P
   return (await store.read(providerId)) !== null;
 }
 
-export async function GET(): Promise<Response> {
+/**
+ * The `?slug=` this read is scoped to, or a keyed refusal.
+ *
+ * An ABSENT or EMPTY parameter means the incumbent issuer, which is what every
+ * ordinary first run reads. Empty is folded onto absent here (and not in
+ * `readSlug`, whose caller is a JSON body where `""` is a distinct thing a
+ * client chose to send): `?slug=` is a URL an operator can produce by hand or by
+ * deleting a value, and answering it with "that is not a usable slug" would be
+ * pedantry about a query string that named nothing.
+ */
+function readSlugQuery(request: Request | undefined): { readonly slug: string | null } | Response {
+  if (request === undefined) return { slug: null };
+  const raw = new URL(request.url).searchParams.get("slug");
+  if (raw === null || raw.trim() === "") return { slug: null };
+  return readSlug(raw);
+}
+
+/**
+ * The wizard's view model, for one console-issuer namespace.
+ *
+ * `request` is optional because this handler is also called IN PROCESS by
+ * `app/setup/page.tsx`; Next supplies one on the HTTP route. Absent means the
+ * incumbent issuer, the same thing an absent `?slug=` means.
+ */
+export async function GET(request?: Request): Promise<Response> {
+  const slugResult = readSlugQuery(request);
+  if (slugResult instanceof Response) return slugResult;
+
   return withSetupWindow(async (context) => {
     const methods = await context.client.getSetupAuthMethods();
-    // Rehydrate what has ALREADY been provisioned for the incumbent issuer, so
+    // Rehydrate what has ALREADY been provisioned for the requested issuer, so
     // the wizard survives the OAuth round trip (sign-in is a full navigation
     // away from /setup and back) and any revisit of a provisioned-but-unclaimed
     // deployment. The state is display-safe by construction: ids, versions,
     // booleans and a domain COUNT — never the allow-list itself (D4).
-    const consoleConfig = consoleIssuerConfigFor(context.env, context.env.jwksUrl, null);
+    //
+    // Scoped to the SLUG rather than always to the incumbent: an operator whose
+    // enabled provider is broken provisions a replacement under a new slug, and
+    // if this always answered for the incumbent, their reload — and the OAuth
+    // round trip, which IS a reload — would land them back on the broken row's
+    // state with the wrong `provider_id` behind the sign-in button.
+    const consoleConfig = consoleIssuerConfigFor(
+      context.env,
+      context.env.jwksUrl,
+      slugResult.slug,
+    );
     const state = await deriveProvisioningState(
       context.client,
       (providerId) => hasSealedSecret(context.store, providerId),
@@ -251,7 +290,11 @@ export async function GET(): Promise<Response> {
       audience: context.env.adminApiAudience,
       methods: methods.methods.map(methodView),
       state,
-      // Better Auth's providerId for the incumbent issuer — an identifier the
+      // Which namespace this view model describes, echoed so the wizard can put
+      // it back on the provision body, on the claim body and on the OAuth
+      // callback URL. `null` is the incumbent.
+      slug: slugResult.slug,
+      // Better Auth's providerId for the requested issuer — an identifier the
       // sign-in step posts, not a credential. Derived by the one server
       // function that owns the derivation.
       provider_id: consoleProviderIdFor(context.env.bffIssuerUrl, consoleConfig.issuer),
@@ -366,6 +409,32 @@ function readSlug(value: unknown): { readonly slug: string | null } | Response {
  * keyed refusal otherwise. Only an ENABLED derived row asks the question at
  * all — see the header note on why the answer is lazily resolved and why the
  * other two states are ungated.
+ *
+ * # An allow-list refusal is not an absent operator
+ *
+ * The question this gate asks is "did you authenticate through the row you are
+ * asking me to rewrite", and `SessionCheck.ok` is a stricter question than
+ * that: `readSession` runs `checkSession`, which also applies the provider
+ * row's own `allowed_email_domains` (the same exact-match rule Moira's
+ * `evaluate_claim_policy` applies). So the ONE operator this PATCH path exists
+ * to serve — the one whose own domain is missing from the list they are here to
+ * widen — arrives holding `ok:false / email_domain_not_allowed`.
+ *
+ * Refusing that caller makes the documented remedy ("add the domain and save
+ * again") unfollowable: the wizard sends them back to the auth-settings form
+ * after a refused claim, and the save they are sent back to make would be
+ * refused with "sign in through it first" — to somebody already signed in
+ * through that very row. So the gate admits exactly that shape, and only when
+ * the row that authenticated them is the row being written.
+ *
+ * What that widens, stated: inside the setup window, anybody the deployment's
+ * IdP will authenticate — not only an allow-listed address — can re-save the
+ * enabled row. It does NOT admit an anonymous caller (the hole closed by the
+ * commit this gate came from), a session through another row, an unverified
+ * address, or a session whose provider could not be resolved at all. Those keep
+ * their refusals, and now keep them under their OWN keys: the
+ * `setup_enabled_provider_requires_session` copy says "sign in through it
+ * first", which is the wrong instruction for an address the IdP never verified.
  */
 async function operatorSessionFor(
   context: SetupWindowContext,
@@ -378,14 +447,31 @@ async function operatorSessionFor(
 
   const session = await context.readSession(request.headers);
   if (!session.ok) {
-    // 401 when there is nothing to identify the caller at all, 403 when there
-    // is a session and it may not act. The same split the claim step makes, and
-    // for the same reason: only one of the two is fixable by signing in.
-    return setupError(
-      session.rejection === "no_session" ? 401 : 403,
-      "setup_enabled_provider_requires_session",
-      CONSOLE_MESSAGE_KEYS.setup_enabled_provider_requires_session,
-    );
+    if (
+      session.rejection === "email_domain_not_allowed" &&
+      session.resolvedProviderId === derived.providerId
+    ) {
+      // Refused ONLY on the list this request is here to change, by the row this
+      // request is here to write. That is the operator, and `resolvedProviderId`
+      // comes from the configuration that resolved the cookie, never from the
+      // body — see its note on `SessionCheck`.
+      return { sessionProviderId: session.resolvedProviderId };
+    }
+    if (session.rejection === "no_session") {
+      // Nothing identifies the caller at all: a 401, because signing in is the
+      // one thing that fixes it.
+      return setupError(
+        401,
+        "setup_enabled_provider_requires_session",
+        CONSOLE_MESSAGE_KEYS.setup_enabled_provider_requires_session,
+      );
+    }
+    // A session exists and may not act. Answered with the reason `checkSession`
+    // actually decided rather than re-keyed as "sign in through it first" —
+    // re-keying it would tell an operator with an unverified address, or one
+    // whose session predates the provider column, to repeat the one action that
+    // cannot change the answer.
+    return setupError(403, session.rejection, session.messageKey);
   }
   if (session.moiraProviderId !== derived.providerId) {
     // A real session, through a DIFFERENT provider. On a multi-provider
@@ -486,12 +572,19 @@ async function provision(
 
   // ---- and who may spend that authority --------------------------------
   //
-  // FIRST, before any other refusal: which row may be written is settled above,
-  // but an ENABLED row is a live authenticator and rewriting it re-points
-  // sign-in. That takes an operator, and inside this window a session
-  // established through that same row is the only available proof of one.
-  // Ordered ahead of the body checks so an unauthorised caller learns nothing
-  // about the deployment's shape from which refusal they get.
+  // Which row may be written is settled above, but an ENABLED row is a live
+  // authenticator and rewriting it re-points sign-in. That takes an operator,
+  // and inside this window a session established through that same row is the
+  // only available proof of one.
+  //
+  // WHERE THIS SITS, honestly: it is the first check that consults the
+  // DEPLOYMENT, not the first check in the handler. Seven pure-SHAPE refusals
+  // run ahead of it — slug, method, display name, client id, resume shape,
+  // endpoints, allow-list — because they are decided from the request body
+  // alone and disclose nothing about what exists. What DOES matter for
+  // disclosure is that this runs before every check that reads the derived
+  // state (the empty-secret rule and the resume-conflict rule below), and
+  // before any write.
   const operator = await operatorSessionFor(context, request, derived);
   if (operator instanceof Response) return operator;
 

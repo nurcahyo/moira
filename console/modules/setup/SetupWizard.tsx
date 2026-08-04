@@ -108,6 +108,12 @@ export function SetupWizard({ view, fetchImpl, navigate }: SetupWizardProps) {
   const [oauthProviderId, setOauthProviderId] = useState<string | null>(
     view.kind === "ready" ? view.oauthProviderId : null,
   );
+  // The console-issuer namespace this run is in. Seeded from the SERVER echo of
+  // `?slug=` for the same reason the provisioning state is: the sign-in step is
+  // a full navigation away and back, and only the server's answer survives it.
+  // Updated when a provision confirms a different one, so the claim that
+  // follows names the namespace that was actually written.
+  const [slug, setSlug] = useState<string | null>(view.kind === "ready" ? view.slug : null);
   const [signedInEmail, setSignedInEmail] = useState<string | null>(null);
   const [claimSucceeded, setClaimSucceeded] = useState(false);
   const [claimedEmail, setClaimedEmail] = useState<string | null>(null);
@@ -171,9 +177,14 @@ export function SetupWizard({ view, fetchImpl, navigate }: SetupWizardProps) {
 
   const methods = view.kind === "ready" ? view.methods : [];
 
-  function onProvisioned(state: SetupProvisioningState, providerId: string | null): void {
+  function onProvisioned(
+    state: SetupProvisioningState,
+    providerId: string | null,
+    provisionedSlug: string | null,
+  ): void {
     setProvisioning(state);
     if (providerId !== null) setOauthProviderId(providerId);
+    setSlug(provisionedSlug);
     setRefusedDomain(null);
     if (isProvisioningComplete(state)) setCursor("sign_in");
   }
@@ -216,6 +227,7 @@ export function SetupWizard({ view, fetchImpl, navigate }: SetupWizardProps) {
           methods={methods}
           provisioning={provisioning}
           refusedDomain={refusedDomain}
+          slug={slug}
           onProvisioned={onProvisioned}
           {...(fetchImpl === undefined ? {} : { fetchImpl })}
         />
@@ -229,6 +241,10 @@ export function SetupWizard({ view, fetchImpl, navigate }: SetupWizardProps) {
           // Moira's row id for the provider that was actually provisioned, so
           // the one sign-in button can be labelled with that row's name.
           providerRowId={provisioning.providerId}
+          // The namespace the claim writes into and the callback returns to.
+          // Never re-derived down there: the provision that created this run's
+          // provider is the only thing that knows it.
+          slug={slug}
           signedInEmail={signedInEmail}
           onClaimed={onClaimed}
           onDomainRefused={onDomainRefused}

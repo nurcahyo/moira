@@ -69,8 +69,23 @@ export interface AuthSettingsStepProps {
   readonly provisioning: SetupProvisioningState;
   /** A claim was refused for this domain; focus the allow-list and instruct. */
   readonly refusedDomain: string | null;
-  /** Reports the state Moira confirmed. Never carries the secret. */
-  readonly onProvisioned: (state: SetupProvisioningState, providerId: string | null) => void;
+  /**
+   * The console-issuer namespace this wizard run is scoped to, as the BFF
+   * echoed it — `null` for the incumbent. Seeds the slug field, so a reload or
+   * an OAuth round trip comes back to the same namespace rather than silently
+   * to the default one.
+   */
+  readonly slug: string | null;
+  /**
+   * Reports the state Moira confirmed, and the SLUG it was confirmed under so
+   * the coordinator can keep the rest of the run in that namespace. Never
+   * carries the secret.
+   */
+  readonly onProvisioned: (
+    state: SetupProvisioningState,
+    providerId: string | null,
+    slug: string | null,
+  ) => void;
   /** Injected by the unit test. Shipped call sites use the global. */
   readonly fetchImpl?: typeof fetch;
 }
@@ -78,6 +93,17 @@ export interface AuthSettingsStepProps {
 /** The whole form, held as ONE envelope inside this organism. */
 interface FormEnvelope {
   readonly method: "google_oauth" | "generic_oidc";
+  /**
+   * The console-issuer namespace to provision under. Empty means the incumbent.
+   *
+   * This is the ONE field on this form that chooses a different provider row
+   * rather than rewriting the derived one — which is what makes it the escape
+   * hatch from a provider that was enabled with credentials nobody can sign in
+   * with. An enabled row may only be re-saved by somebody who authenticated
+   * through it, and a broken row authenticates nobody; a new slug is a new
+   * trusted issuer and a new row, so the create path stays open.
+   */
+  readonly slug: string;
   readonly displayName: string;
   readonly clientId: string;
   readonly clientSecret: string;
@@ -90,6 +116,7 @@ interface FormEnvelope {
 
 const EMPTY_FORM: FormEnvelope = {
   method: "google_oauth",
+  slug: "",
   displayName: "",
   clientId: "",
   clientSecret: "",
@@ -134,10 +161,11 @@ export function AuthSettingsStep({
   methods,
   provisioning,
   refusedDomain,
+  slug,
   onProvisioned,
   fetchImpl,
 }: AuthSettingsStepProps) {
-  const [form, setForm] = useState<FormEnvelope>(EMPTY_FORM);
+  const [form, setForm] = useState<FormEnvelope>({ ...EMPTY_FORM, slug: slug ?? "" });
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
   const [fieldErrors, setFieldErrors] = useState<readonly FieldName[]>([]);
   const [blocked, setBlocked] = useState(false);
@@ -150,6 +178,7 @@ export function AuthSettingsStep({
 
   const methodSelectId = useId();
   const domainsFieldId = useId();
+  const slugFieldId = useId();
 
   useEffect(() => {
     if (refusedDomain !== null) domainsInputRef.current?.focus();
@@ -159,13 +188,46 @@ export function AuthSettingsStep({
     setForm((previous) => ({ ...previous, [name]: value }));
   }
 
+  /** The slug this submission names, normalised. `null` is the incumbent. */
+  function currentSlug(): string | null {
+    const trimmed = form.slug.trim();
+    return trimmed === "" ? null : trimmed;
+  }
+
+  /** Is the form still pointed at the namespace `provisioning` describes? */
+  function slugIsUnchanged(): boolean {
+    return currentSlug() === slug;
+  }
+
+  /**
+   * Editing the slug abandons the recorded attempt AND the submission id.
+   *
+   * Both belong to the namespace they were recorded in: `resume` names a
+   * provider row the BFF derived for the OLD issuer, so replaying it under a new
+   * slug is exactly the disagreement `resumeHintDisagrees` answers `409
+   * setup_resume_state_conflict`; and replaying a submission id against a
+   * changed body is `409 idempotency_conflict`, permanently.
+   */
+  function setSlug(value: string): void {
+    if (value.trim() !== form.slug.trim()) {
+      resumeRef.current = null;
+      submissionRef.current = null;
+    }
+    set("slug", value);
+  }
+
   /**
    * The state a save resumes against: the recorded partial state of a failed
    * attempt first, otherwise the wizard's provisioning state when it already
    * names a provider row — the domain-refusal re-save, or any save after a
    * reload/OAuth round trip. `null` means a genuinely fresh create.
+   *
+   * A slug that no longer matches the wizard's namespace forces `null`: that
+   * state was derived for a DIFFERENT console issuer, and the whole point of
+   * typing a new slug is to create rather than to resume.
    */
   function effectiveResume(): SetupProvisioningState | null {
+    if (!slugIsUnchanged()) return null;
     if (resumeRef.current !== null) return resumeRef.current;
     return provisioning.providerId !== null ? provisioning : null;
   }
@@ -208,10 +270,14 @@ export function AuthSettingsStep({
 
     submissionRef.current ??= crypto.randomUUID();
     const resume = effectiveResume();
+    const submittedSlug = currentSlug();
     const optional = (value: string): string | null => (value.trim() === "" ? null : value.trim());
     const body: Record<string, unknown> = {
       action: "provision",
       method: form.method,
+      // Omitted entirely for the incumbent, because the BFF's `readSlug` treats
+      // an absent slug and a `null` one as the same thing but refuses `""`.
+      ...(submittedSlug === null ? {} : { slug: submittedSlug }),
       display_name: form.displayName.trim(),
       client_id: form.clientId.trim(),
       client_secret: form.clientSecret,
@@ -252,7 +318,10 @@ export function AuthSettingsStep({
         return;
       }
       const providerId = payload?.["provider_id"];
-      onProvisioned(state, typeof providerId === "string" ? providerId : null);
+      // The slug goes up with the state: everything after this step — the
+      // sign-in callback URL and the claim's namespace — has to stay in the
+      // namespace this save actually wrote to.
+      onProvisioned(state, typeof providerId === "string" ? providerId : null, submittedSlug);
       if (isProvisioningComplete(state)) {
         // Done. The secret has been sealed console-side; nothing here needs it
         // any longer, so the envelope drops it. The SUBMISSION id is dropped
@@ -285,7 +354,7 @@ export function AuthSettingsStep({
         // already-complete provider carries the untouched complete state, and
         // reporting it would both be redundant and advance the cursor away
         // from the failure the operator is looking at.
-        if (!isProvisioningComplete(state)) onProvisioned(state, null);
+        if (!isProvisioningComplete(state)) onProvisioned(state, null, submittedSlug);
       }
       setPhase({
         kind: "failed",
@@ -380,6 +449,27 @@ export function AuthSettingsStep({
             <option value="google_oauth">{t(CONSOLE_MESSAGE_KEYS.setup_auth_method_google)}</option>
             <option value="generic_oidc">{t(CONSOLE_MESSAGE_KEYS.setup_auth_method_generic)}</option>
           </select>
+        </div>
+
+        {/*
+          The escape hatch, rendered as an ordinary field rather than hidden
+          behind a disclosure: an operator who reaches this form from the
+          sign-in step's way back is often here BECAUSE the enabled provider is
+          broken, and that repair is only possible under a new slug. Empty is
+          the normal answer and the whole first run never touches it.
+        */}
+        <div className={styles.field}>
+          <Label htmlFor={slugFieldId}>{t(CONSOLE_MESSAGE_KEYS.setup_auth_slug_label)}</Label>
+          <Input
+            id={slugFieldId}
+            name="slug"
+            value={form.slug}
+            aria-describedby={`${slugFieldId}-note`}
+            onChange={(event) => setSlug(event.currentTarget.value)}
+          />
+          <p id={`${slugFieldId}-note`} className={styles.hint}>
+            {t(CONSOLE_MESSAGE_KEYS.setup_auth_slug_hint)}
+          </p>
         </div>
 
         <FormField

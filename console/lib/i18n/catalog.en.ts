@@ -762,6 +762,27 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
     message: "Generic OpenID Connect",
     description: "Option label for `AuthMethod.generic_oidc`.",
   },
+  [K.setup_auth_slug_label]: {
+    key: K.setup_auth_slug_label,
+    message: "Provider slug",
+    description:
+      "Label of the provider-slug field. The slug picks the console-issuer namespace this " +
+      "provider is registered under, and a new slug means a new trusted issuer and a new " +
+      "provider row rather than a rewrite of the incumbent.",
+  },
+  [K.setup_auth_slug_hint]: {
+    key: K.setup_auth_slug_hint,
+    message:
+      "Leave empty for the default provider. Enter a short name — lower-case letters, digits and " +
+      "hyphens — to register a SEPARATE provider instead: the way out when the enabled one was " +
+      "saved with credentials nobody can sign in with. It becomes part of the sign-in URL and " +
+      "cannot be changed afterwards.",
+    description:
+      "Hint under the provider-slug field. States both what the slug is for (the documented " +
+      "escape hatch from a provider enabled with a mistyped client secret, which cannot be " +
+      "re-saved because that needs a session through it) and that it is permanent — it is a URL " +
+      "path segment and part of the issuer string Moira pins tokens to.",
+  },
   [K.setup_auth_display_name_label]: {
     key: K.setup_auth_display_name_label,
     message: "Provider display name",

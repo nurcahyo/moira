@@ -42,6 +42,7 @@ const COMPLETE_STATE: SetupProvisioningState = {
 const READY: SetupViewModel = {
   kind: "ready",
   claimed: false,
+  slug: null,
   methods: [],
   provisioning: EMPTY_PROVISIONING_STATE,
   oauthProviderId: null,
@@ -51,6 +52,7 @@ const READY: SetupViewModel = {
 const READY_PROVISIONED: SetupViewModel = {
   kind: "ready",
   claimed: false,
+  slug: null,
   methods: [
     {
       id: PROVIDER_ID,
@@ -115,9 +117,10 @@ function field(labelKey: string): HTMLInputElement {
 const claimButton = () => screen.queryByRole("button", { name: copy(K.setup_claim_button) });
 
 /** Walk the wizard from welcome through a submitted provision form. */
-async function provisionThroughForm(): Promise<void> {
+async function provisionThroughForm(slug?: string): Promise<void> {
   const user = userEvent.setup();
   await user.click(screen.getByRole("button", { name: copy(K.setup_welcome_continue) }));
+  if (slug !== undefined) await user.type(field(K.setup_auth_slug_label), slug);
   await user.type(field(K.setup_auth_display_name_label), "Google Workspace");
   await user.type(field(K.setup_auth_client_id_label), "client-123.apps.example");
   await user.type(field(K.setup_auth_client_secret_label), "unit-secret-3f81b2");
@@ -214,6 +217,7 @@ describe("the claim step is unreachable until the gate conditions are CONFIRMED"
         view={{
           kind: "ready",
           claimed: false,
+          slug: null,
           methods: [
             {
               id: PROVIDER_ID,
@@ -629,5 +633,125 @@ describe("the terminal states", () => {
     expect(screen.getByText(copy(K.setup_unavailable_heading))).toBeInTheDocument();
     expect(screen.getByRole("alert")).toHaveTextContent(copy(K.setup_system_key_absent));
     expect(screen.queryAllByRole("button")).toEqual([]);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* A RUN UNDER A REPLACEMENT SLUG STAYS IN ITS OWN NAMESPACE                  */
+/* -------------------------------------------------------------------------- */
+//
+// Provisioning under a new slug is the console's only in-UI way out of a
+// provider that was enabled with credentials nobody can sign in with: an enabled
+// row may only be re-saved by somebody who authenticated through it, and a
+// broken row authenticates nobody.
+//
+// Creating the row is not enough. The two steps AFTER it each carry a namespace,
+// and neither can re-derive it: the sign-in callback returns through a full
+// navigation, and the claim names an `admin_identities` namespace the BFF checks
+// against the provider the session was actually established through. Drop the
+// slug at either point and the operator lands back on the incumbent — the very
+// row they are escaping — with a claim that is refused or, worse, granted in the
+// wrong namespace.
+
+describe("the namespace a provision wrote to survives the rest of the run", () => {
+  test("the OAuth callback returns to /setup SCOPED to the slug", async () => {
+    const redirects: string[] = [];
+    const { calls, fetchImpl } = makeFetch({
+      provision: {
+        status: 201,
+        body: { state: COMPLETE_STATE, provider_id: "moira-console-idp-recovery" },
+      },
+      signIn: { status: 200, body: { url: "https://accounts.google.com/o/oauth2/v2/auth?x=1" } },
+      session: { status: 200, body: null },
+    });
+    render(
+      <SetupWizard view={READY} fetchImpl={fetchImpl} navigate={(url) => redirects.push(url)} />,
+    );
+
+    await provisionThroughForm("recovery");
+    await screen.findByText(copy(K.setup_sign_in_intro));
+    await userEvent.click(
+      screen.getByRole("button", { name: copy(K.sign_in_button_generic) }),
+    );
+
+    await waitFor(() =>
+      expect(calls.some((call) => call.url === "/api/auth/sign-in/oauth2")).toBe(true),
+    );
+    const signIn = calls.find((call) => call.url === "/api/auth/sign-in/oauth2")!;
+    // The provider id is the one the BFF derived for THIS namespace...
+    expect(signIn.body?.["providerId"]).toBe("moira-console-idp-recovery");
+    // ...and the return trip carries the slug, because a full navigation is the
+    // one thing no client-side state survives.
+    expect(signIn.body?.["callbackURL"]).toBe("/setup?slug=recovery");
+    await waitFor(() => expect(redirects).toHaveLength(1));
+  });
+
+  test("the claim names the slug's namespace, not the incumbent's", async () => {
+    const { calls, fetchImpl } = makeFetch({
+      provision: {
+        status: 201,
+        body: { state: COMPLETE_STATE, provider_id: "moira-console-idp-recovery" },
+      },
+      session: { status: 200, body: { user: { email: "ops@example.com" } } },
+      claim: { status: 201, body: { identity: { email: "ops@example.com" } } },
+    });
+    render(<SetupWizard view={READY} fetchImpl={fetchImpl} navigate={() => {}} />);
+
+    await provisionThroughForm("recovery");
+    await userEvent.click(await screen.findByRole("button", { name: copy(K.setup_claim_button) }));
+
+    await waitFor(() =>
+      expect(calls.some((call) => call.body?.["action"] === "claim")).toBe(true),
+    );
+    const claim = calls.find((call) => call.body?.["action"] === "claim")!;
+    expect(claim.body?.["slug"]).toBe("recovery");
+  });
+
+  test("an ordinary run names no slug at all — absent is the incumbent", async () => {
+    // The control. `readSlug` refuses `""`, so a wizard that always sent the
+    // field would turn every first run into a keyed 400.
+    const { calls, fetchImpl } = makeFetch({
+      provision: { status: 201, body: { state: COMPLETE_STATE, provider_id: "moira-console-idp" } },
+      session: { status: 200, body: { user: { email: "ops@example.com" } } },
+      claim: { status: 201, body: { identity: { email: "ops@example.com" } } },
+    });
+    render(<SetupWizard view={READY} fetchImpl={fetchImpl} navigate={() => {}} />);
+
+    await provisionThroughForm();
+    await userEvent.click(await screen.findByRole("button", { name: copy(K.setup_claim_button) }));
+
+    await waitFor(() =>
+      expect(calls.some((call) => call.body?.["action"] === "claim")).toBe(true),
+    );
+    for (const call of calls.filter((entry) => entry.url === "/api/setup")) {
+      expect(Object.keys(call.body ?? {})).not.toContain("slug");
+    }
+  });
+
+  test("a rehydrated run keeps the SERVER's namespace across the round trip", async () => {
+    // The revisit, which is what the OAuth callback actually is: the browser's
+    // memory is gone and the server's echo of `?slug=` is all there is. A wizard
+    // that seeded `null` here would claim in the incumbent's namespace with a
+    // session established through the replacement provider — refused by the BFF's
+    // issuer check, and unfixable from the UI.
+    const { calls, fetchImpl } = makeFetch({
+      session: { status: 200, body: { user: { email: "ops@example.com" } } },
+      claim: { status: 201, body: { identity: { email: "ops@example.com" } } },
+    });
+    render(
+      <SetupWizard
+        view={{ ...READY_PROVISIONED, slug: "recovery" }}
+        fetchImpl={fetchImpl}
+        navigate={() => {}}
+      />,
+    );
+
+    await userEvent.click(await screen.findByRole("button", { name: copy(K.setup_claim_button) }));
+    await waitFor(() =>
+      expect(calls.some((call) => call.body?.["action"] === "claim")).toBe(true),
+    );
+    expect(calls.find((call) => call.body?.["action"] === "claim")!.body?.["slug"]).toBe(
+      "recovery",
+    );
   });
 });

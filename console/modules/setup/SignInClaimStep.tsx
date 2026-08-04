@@ -12,7 +12,9 @@
 // `/api/auth/sign-in/oauth2` handler with a `providerId` the SERVER derived
 // (the provision response's `provider_id`; the derivation is server-only in
 // `lib/auth-config.ts` and is not re-implemented here). The callback returns to
-// `/setup`, where the wizard's session probe picks the identity up.
+// `/setup` — carrying `?slug=` when this run provisioned under one, because the
+// round trip is a full navigation and the query is the only thing that survives
+// it — where the wizard's session probe picks the identity up.
 //
 // ============================================================================
 // ONE PROVIDER PER WIZARD RUN, THEREFORE ONE BUTTON
@@ -81,6 +83,17 @@ export interface SignInClaimStepProps {
    * a selector: the request posts `oauthProviderId`, not this.
    */
   readonly providerRowId: string | null;
+  /**
+   * The console-issuer namespace this run provisioned under — `null` for the
+   * incumbent.
+   *
+   * Two jobs, both of which fail silently without it: the claim's
+   * `admin_identities` namespace (the BFF derives the issuer from this slug and
+   * checks it against the provider the session was actually established
+   * through), and the OAuth callback URL, so the round trip returns to the
+   * wizard scoped to this namespace instead of to the default one.
+   */
+  readonly slug: string | null;
   /** The probed console session's email, when one exists. */
   readonly signedInEmail: string | null;
   readonly onClaimed: (email: string | null) => void;
@@ -109,6 +122,7 @@ export function SignInClaimStep({
   methods,
   oauthProviderId,
   providerRowId,
+  slug,
   signedInEmail,
   onClaimed,
   onDomainRefused,
@@ -117,6 +131,12 @@ export function SignInClaimStep({
   navigate,
 }: SignInClaimStepProps) {
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
+
+  // Relative, and the slug is encoded rather than interpolated raw: it has been
+  // through the BFF's `readSlug`, but a callback URL is not the place to rely on
+  // a validation performed somewhere else.
+  const callbackPath =
+    slug === null ? CALLBACK_PATH : `${CALLBACK_PATH}?slug=${encodeURIComponent(slug)}`;
 
   const send = fetchImpl ?? globalThis.fetch;
   const go = navigate ?? ((url: string) => globalThis.location.assign(url));
@@ -140,7 +160,7 @@ export function SignInClaimStep({
       response = await send(SIGN_IN_ENDPOINT, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ providerId: oauthProviderId, callbackURL: CALLBACK_PATH }),
+        body: JSON.stringify({ providerId: oauthProviderId, callbackURL: callbackPath }),
       });
     } catch {
       setPhase({ kind: "failed", messageKey: CONSOLE_MESSAGE_KEYS.sign_in_request_failed });
@@ -178,7 +198,13 @@ export function SignInClaimStep({
         // No state: the BFF re-derives the provisioning state from Moira and
         // the console's secret store, so nothing here depends on what this
         // document happens to remember.
-        body: JSON.stringify({ action: "claim" }),
+        //
+        // The SLUG is the exception, and it is not state: it names the
+        // `admin_identities` namespace, and the BFF checks the issuer it
+        // resolves to against the provider the session was actually established
+        // through — so posting the wrong one is refused rather than obeyed.
+        // Omitted for the incumbent, because `readSlug` refuses `""`.
+        body: JSON.stringify({ action: "claim", ...(slug === null ? {} : { slug }) }),
       });
     } catch {
       setPhase({ kind: "failed", messageKey: CONSOLE_MESSAGE_KEYS.setup_request_unreachable });

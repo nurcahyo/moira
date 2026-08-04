@@ -88,6 +88,46 @@ describe("checkSession", () => {
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.rejection).toBe("email_domain_not_allowed");
+    // ...and the refusal NAMES the row that authenticated them. That is the
+    // whole difference between "there is nobody here" and "somebody the
+    // deployment's own IdP admitted, whom this list then turned away", and the
+    // setup window's provisioning gate is the caller that cannot function
+    // without it: the operator here is the one who has come back to widen this
+    // very list, so a refusal that dropped the row would make the console's own
+    // widen-and-retry instruction unfollowable.
+    expect(result.resolvedProviderId).toBe(ALLOW.moiraProviderId);
+  });
+
+  test("a refusal decided BEFORE any row resolved names no row", () => {
+    // The other side of the same rule. No cookie resolved, so no provider
+    // authenticated anybody — whatever configuration happened to be passed in.
+    // A caller must read `null` as "no proof", and it must never be able to
+    // read it as "some row", so this pins that the config's id does NOT leak
+    // onto a verdict it did not decide.
+    for (const session of [null, undefined, { emailVerified: true, idpSubject: "sub-1" }]) {
+      const result = checkSession(session, ALLOW);
+      expect(result.ok).toBe(false);
+      if (result.ok) continue;
+      expect(result.rejection).toBe("no_session");
+      expect(result.resolvedProviderId).toBeNull();
+    }
+  });
+
+  test("the other post-resolution refusals name the row too", () => {
+    for (const session of [
+      { email: "operator@example.com", emailVerified: false, idpSubject: "sub-1" },
+      { email: "operator@example.com", emailVerified: true },
+    ]) {
+      const result = checkSession(session, ALLOW);
+      expect(result.ok).toBe(false);
+      if (result.ok) continue;
+      // Named, but NOT thereby admitted anywhere: naming the row answers
+      // "which authenticator turned this person away", and it is the route's
+      // gate that decides which of these refusals still proves operatorship.
+      // It admits only `email_domain_not_allowed` — see
+      // `tests/unit/api/setup-route.test.ts`.
+      expect(result.resolvedProviderId).toBe(ALLOW.moiraProviderId);
+    }
   });
 
   test("a session with no IdP subject is refused", () => {

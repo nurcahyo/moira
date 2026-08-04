@@ -152,12 +152,23 @@ remove it.
   Moira's own records — this console's trusted issuer, then the provider row
   bound to it — and is never named by the caller. A request that names a
   different row is refused with nothing written.
-- **An enabled provider cannot be re-pointed without a session established
+- **An enabled provider cannot be re-pointed by anyone who did not authenticate
   through it.** An enabled row is a live authenticator, so rewriting its client
   id or its issuer/discovery/token/userinfo/JWKS URLs would repoint sign-in at
-  another identity provider. Re-saving one requires a valid console session whose
-  authenticating provider is that same row; otherwise the request is refused and
+  another identity provider. Re-saving one requires a console session that Better
+  Auth resolved against that same row; otherwise the request is refused and
   nothing is written.
+
+  "Authenticated through it", not "holds an admissible session", and the
+  difference is what keeps the domain-refusal remedy below followable. The
+  console's own session check also applies the row's `allowed_email_domains`, so
+  the operator who is here to *widen* that list arrives holding a session the
+  check has already refused. That one shape — refused on the allow-list, resolved
+  through the row being written — is admitted; a caller with no session at all, a
+  session through another row, an address the IdP never verified, or a session
+  whose provider cannot be resolved is not. The cost is stated plainly: inside
+  the setup window, anybody the deployment's IdP will authenticate can re-save
+  the enabled row, not only an allow-listed address.
 - **A disabled row may still be completed without a session**, deliberately: it
   authenticates nobody, and requiring a session would make an interrupted first
   run unresumable.
@@ -177,16 +188,30 @@ remove it.
 
 ### The one consequence operators meet
 
-Because an enabled provider needs a session to be re-saved, a provider that was
-enabled with a credential nobody can actually sign in with (a mistyped client
-secret, say) cannot be corrected from the wizard: there is no session to be had
-through a broken provider. Two ways out, both intended:
+A domain refusal is *not* one of them: the operator whose own domain is missing
+from the allow-list still authenticated through the row, so the wizard's
+"Edit auth settings" way back, widen the list, save again is a path the console
+accepts end to end.
 
-- provision again under a different provider slug — the create path is still
-  open, and each slug gets its own trusted issuer; or
-- correct the row directly against Moira's admin API with the bootstrap system
-  key you already hold. The console declines to be an unauthenticated proxy for
-  that write; it does not deny you the write.
+What remains is the provider enabled with a credential **nobody at all** can sign
+in with — a mistyped client id or client secret, or a discovery URL pointing at
+the wrong IdP. That row cannot be corrected: no session can be obtained through
+it, so there is nothing to prove operatorship with. Two ways out, both intended,
+and the first is in the wizard itself:
+
+- **Provision again under a different provider slug.** The auth-settings form has
+  a *Provider slug* field; leave it empty for the default provider, or enter a
+  short name to register a separate one. A new slug is a new console issuer with
+  its own trusted issuer and its own provider row, so the create path is still
+  open and the broken row is left untouched. The rest of the run stays in that
+  namespace — the sign-in callback returns to `/setup?slug=…` and the claim names
+  the same namespace — so a replacement provider can be provisioned, signed in
+  through, and claimed without leaving the console. The slug becomes part of the
+  OAuth redirect path and of the issuer string Moira pins tokens to, so it cannot
+  be changed afterwards.
+- **Correct the row directly against Moira's admin API** with the bootstrap
+  system key you already hold. The console declines to be an unauthenticated
+  proxy for that write; it does not deny you the write.
 
 ## Routes, layouts, and where the auth boundary sits
 
