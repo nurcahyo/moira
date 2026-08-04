@@ -1,0 +1,49 @@
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  align-items: flex-start;
+  border-top: 1px solid rgba(0, 0, 0, 0.1);
+  padding-top: 0.75rem;
+  width: 100%;
+}
+
+.heading {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.ready {
+  margin: 0;
+  color: #1c5c2a;
+}
+
+.notReady {
+  margin: 0;
+  color: #6b4a06;
+}
+
+.missing {
+  margin: 0;
+  padding-left: 1.1rem;
+}
+
+.selectRow {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.selectLabel {
+  font-weight: 600;
+}
+
+.select {
+  min-width: 16rem;
+  padding: 0.35rem;
+}
+
+.problem {
+  margin: 0;
+  color: #8a1c1c;
+}

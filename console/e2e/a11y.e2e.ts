@@ -85,7 +85,15 @@ const SIGN_IN_PATH = "/login";
  * gated routes EXACTLY, so adding a gated screen without touching this file
  * fails, and so does leaving an entry here after the route stops being gated.
  */
-const ROUTES_NOT_AUDITED_PENDING_AUTHENTICATED_E2E: readonly string[] = ["/", "/admins"];
+const ROUTES_NOT_AUDITED_PENDING_AUTHENTICATED_E2E: readonly string[] = [
+  "/",
+  "/admins",
+  // Issue #74. Inside `(console)`, so the walker below asserts it redirects to
+  // `/login` and does NOT audit it. Listed rather than silently uncovered: the
+  // bidirectional assertion means adding a gated screen without touching this
+  // file fails, which is the only thing keeping the gap a reviewed fact.
+  "/settings/llm",
+];
 
 /** The pathname a route's fixture URL resolves to. */
 function expectedPathname(route: DiscoveredRoute): string {
