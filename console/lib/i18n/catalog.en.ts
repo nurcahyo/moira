@@ -305,6 +305,144 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "operation declares no `Idempotency-Key`.",
   },
 
+  /* --- the BFF setup door (lib/setup-window.ts, app/api/setup/route.ts) ----
+   *
+   * Every entry here is a refusal the CONSOLE decided. None of them is a Moira
+   * error passed through: those already carry their own `message_key`, and
+   * `lib/errors.ts` maps them to a remedy. The one apparent exception,
+   * `setup_claim_domain_not_allowed`, is deliberately the console's own key —
+   * Moira's envelope for that code does not name the offending domain, and this
+   * is the one screen on which the operator can still change it. */
+  [K.setup_system_key_absent]: {
+    key: K.setup_system_key_absent,
+    message:
+      "First-run setup is not available on this deployment: it holds no bootstrap credential.",
+    description:
+      "`withSetupWindow` refused with 404 because the console has no bootstrap system key. Either " +
+      "it was never configured, or the operator removed it after finishing setup — which is what " +
+      "they are told to do, so this is the normal steady state rather than a fault.",
+  },
+  [K.setup_already_claimed]: {
+    key: K.setup_already_claimed,
+    message: "Setup is already complete for this deployment. Sign in instead.",
+    description:
+      "`withSetupWindow` refused with 409: Moira's claim-status says an admin identity already " +
+      "exists. Read from Moira on every request, never cached — retrying will not change it.",
+  },
+  [K.setup_request_body_invalid]: {
+    key: K.setup_request_body_invalid,
+    message: "The setup request could not be read. Send it again.",
+    description:
+      "`POST /api/setup` received a body that was absent, not JSON, or not a JSON object. Kept " +
+      "distinct from a rejected FIELD so the wizard can tell a transport problem from a " +
+      "validation one.",
+  },
+  [K.setup_action_unknown]: {
+    key: K.setup_action_unknown,
+    message: "That setup step is not one this console performs.",
+    description:
+      "`POST /api/setup` was sent an `action` other than `provision` or `claim`. Reachable only " +
+      "from a client this console did not ship, so it is refused rather than guessed at.",
+  },
+  [K.setup_method_unsupported]: {
+    key: K.setup_method_unsupported,
+    message: "Choose a sign-in method the console can offer a button for.",
+    description:
+      "The submitted `method` is absent, unknown, or non-interactive (`jwks` is a bearer-token " +
+      "trust method with no OAuth client). Provisioning one would create a provider row that can " +
+      "never be offered at sign-in.",
+  },
+  [K.setup_display_name_required]: {
+    key: K.setup_display_name_required,
+    message: "Give the sign-in provider a name to show on the sign-in button.",
+    description:
+      "`display_name` was empty. Schema-required by Moira — omitting it is a 400 there — and it " +
+      "is the string operators actually see, so it is refused here before any write.",
+  },
+  [K.setup_client_id_required]: {
+    key: K.setup_client_id_required,
+    message: "Enter the OAuth client ID issued by your identity provider.",
+    description:
+      "`client_id` was empty. Without it there is nothing for the console to seal its client " +
+      "secret against: the encryption binds `(provider id, client id)` as additional data.",
+  },
+  [K.setup_client_secret_required]: {
+    key: K.setup_client_secret_required,
+    message: "Enter the OAuth client secret issued by your identity provider.",
+    description:
+      "`client_secret` was empty. The console stores it encrypted in its own database and never " +
+      "sends it to Moira, so an empty value is a sign-in that cannot complete its code exchange.",
+  },
+  [K.setup_issuer_or_discovery_required]: {
+    key: K.setup_issuer_or_discovery_required,
+    message:
+      "Supply a discovery document, or the issuer with its authorization and token endpoints.",
+    description:
+      "Neither a discovery URL nor a complete manual endpoint set was submitted. Moira refuses the " +
+      "same shape as `auth_provider_method_config_incomplete` one write later; refusing here leaves " +
+      "no orphan trusted-issuer row behind.",
+  },
+  [K.setup_allowed_email_domains_required]: {
+    key: K.setup_allowed_email_domains_required,
+    message: "List at least one email domain that may become an administrator.",
+    description:
+      "`allowed_email_domains` was empty. The policy is deny-by-default with no first-claim " +
+      "exemption, so an empty list would refuse every claim — including the operator's own, on the " +
+      "very next step.",
+  },
+  [K.setup_provider_slug_invalid]: {
+    key: K.setup_provider_slug_invalid,
+    message:
+      "Use a short lower-case name, letters and digits separated by hyphens, for this provider.",
+    description:
+      "The submitted `slug` is not a usable provider slug. It becomes a URL path segment in the " +
+      "OAuth redirect and part of the issuer string Moira pins tokens to, neither of which can be " +
+      "changed after the first sign-in.",
+  },
+  [K.setup_resume_state_invalid]: {
+    key: K.setup_resume_state_invalid,
+    message:
+      "The console could not read what the previous attempt completed. Start this step again.",
+    description:
+      "A `resume`/`state` payload did not narrow back to a provisioning state. Refused rather than " +
+      "treated as a fresh start: restarting re-registers the trusted JWT issuer and hits a unique " +
+      "index Moira reports as an opaque server error.",
+  },
+  [K.setup_ordering_violated]: {
+    key: K.setup_ordering_violated,
+    message:
+      "This deployment's identity configuration must be corrected before setup can continue.",
+    description:
+      "`SetupOrderingError` escaped provisioning — a trusted issuer that asserts scopes, a deleted " +
+      "one being reused, or a provider row that came back without its issuer binding. A retry " +
+      "cannot differ until the configuration changes.",
+  },
+  [K.setup_claim_step_unreachable]: {
+    key: K.setup_claim_step_unreachable,
+    message: "Finish configuring the sign-in provider before claiming administrator access.",
+    description:
+      "`assertClaimStepIsReachable` refused: the provisioning gate is not complete, so the claim " +
+      "would be a request Moira is guaranteed to deny. Navigation state, not advice.",
+  },
+  [K.setup_email_not_verified]: {
+    key: K.setup_email_not_verified,
+    message:
+      "Your identity provider has not verified this address. Sign in with a verified account.",
+    description:
+      "`claimAdminIdentity` refused before the request left the process because the session " +
+      "reported an unverified address. Moira refuses the same claim with " +
+      "`admin_claim_email_not_verified`; this is the defence in depth in front of it.",
+  },
+  [K.setup_claim_domain_not_allowed]: {
+    key: K.setup_claim_domain_not_allowed,
+    message:
+      "Moira refused this claim: the domain {domain} is not on this deployment's allow-list.",
+    description:
+      "Moira answered `403 admin_claim_domain_not_allowed`. Re-keyed by the console so the offending " +
+      "domain is named — Moira's own envelope does not carry it, and this is the last screen on " +
+      "which the allow-list can still be changed.",
+  },
+
   /* --- accessibility ------------------------------------------------------ */
   //
   // These two are pinned CHARACTER FOR CHARACTER by shipped tests:
@@ -1037,7 +1175,6 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "console's own issuer on every row, so under two providers minting one issuer the holder " +
       "of that grant may be somebody else entirely.",
   },
-
 };
 
 /** Every entry, as a plain array. */

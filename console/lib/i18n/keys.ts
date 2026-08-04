@@ -87,6 +87,26 @@ export const CONSOLE_MESSAGE_KEYS = {
   auth_provider_secret_write_failed: "console.error.auth_provider_secret_write_failed",
   auth_provider_enable_failed: "console.error.auth_provider_enable_failed",
 
+  /* --- lib/setup-window.ts + app/api/setup/route.ts (the BFF setup door) ---
+         Refusals the CONSOLE decided, before or instead of a Moira request.
+         Wizard UI copy is NOT here — it belongs to the setup-wizard-ui item. */
+  setup_system_key_absent: "console.error.setup_system_key_absent",
+  setup_already_claimed: "console.error.setup_already_claimed",
+  setup_request_body_invalid: "console.error.setup_request_body_invalid",
+  setup_action_unknown: "console.error.setup_action_unknown",
+  setup_method_unsupported: "console.error.setup_method_unsupported",
+  setup_display_name_required: "console.error.setup_display_name_required",
+  setup_client_id_required: "console.error.setup_client_id_required",
+  setup_client_secret_required: "console.error.setup_client_secret_required",
+  setup_issuer_or_discovery_required: "console.error.setup_issuer_or_discovery_required",
+  setup_allowed_email_domains_required: "console.error.setup_allowed_email_domains_required",
+  setup_provider_slug_invalid: "console.error.setup_provider_slug_invalid",
+  setup_resume_state_invalid: "console.error.setup_resume_state_invalid",
+  setup_ordering_violated: "console.error.setup_ordering_violated",
+  setup_claim_step_unreachable: "console.error.setup_claim_step_unreachable",
+  setup_email_not_verified: "console.error.setup_email_not_verified",
+  setup_claim_domain_not_allowed: "console.error.setup_claim_domain_not_allowed",
+
   /* --- accessibility ------------------------------------------------------ */
   a11y_loading: "console.a11y.loading",
   a11y_required: "console.a11y.required",
