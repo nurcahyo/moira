@@ -4510,11 +4510,41 @@ HANDOFF §2.2d, which is the durable half of this entry.
 else ran inside `rust:1.97-trixie` against the same Postgres over `host.docker.internal`. **That is
 not `scripts/gates.sh`**, so its log-completeness assertion and its skipped-DB-suite check did not
 run, and no `ALL GATES PASSED` marker exists for this branch. Said plainly rather than left to be
-inferred.
+inferred — the completeness check was instead done by hand: **all 47 files in `tests/` appear as a
+`Running tests/…` line**, none dropped.
 
-One flake was observed and is the one HANDOFF §2.2a already names:
-`a_concurrent_summarization_is_answered_with_202_and_retry_after` returned 502 instead of 200 on the
-M1 run and passed on every subsequent run. It is timing-sensitive and unrelated to this change.
+**All six gates ran and are green**, in three passes because the VM's 32 GB disk could not hold the
+debug and release trees at once:
+
+| gate | result |
+|---|---|
+| `fmt --check` | **PASS** (host *and* container) |
+| `clippy --workspace --all-targets --all-features -- -D warnings` | **PASS** |
+| `test --workspace --all-features --no-fail-fast` | **1111 passed, 1 failed** — 50 result lines over 47 suites; the one failure is the flake below |
+| `build --release --locked` | **PASS** — `Finished \`release\` profile [optimized] in 15m 05s`, rc 0 |
+| `deny check` | **PASS** — `advisories ok, bans ok, licenses ok, sources ok` |
+| `audit` | **PASS** — `warning: 1 allowed warning found`, RUSTSEC-2026-0221, the expected one |
+
+**A form-1 trap was walked into while running the supply-chain pair, and the content marker is what
+caught it.** The script ended each gate with `cargo … | tail -20; echo "EXIT=$?"`, which reports
+**`tail`'s** status — both printed `EXIT=0` while `cargo audit` had in fact printed
+`error: no such command: audit`, having never installed. Exactly §2.2's first form, in a script
+written by someone who had just read §2.2. The only reason it was not recorded as a pass is that
+`deny`'s own `advisories ok, bans ok, licenses ok, sources ok` line is a *content* marker and
+`audit` had no such line. It was then installed properly and run **unpiped**, so `AUDIT_RC=0` is its
+own status. **The argument for content markers over exit codes, earned again.**
+
+Two flakes were observed, both timing-sensitive, both unrelated to this change, and both verified by
+re-running in isolation:
+
+- `a_concurrent_summarization_is_answered_with_202_and_retry_after` — the one HANDOFF §2.2a already
+  names. 502 instead of 200 on two runs; **3/3 green** when re-run alone.
+- `context_planner_boundary`'s two `responses request timed out` failures under the parallel run;
+  **6/6 green** when that suite is run alone. Timeouts, not assertions, in a suite this change does
+  not touch.
+
+Both are the container's bind-mount latency on a host whose spare core is being eaten by the
+`syspolicyd` spin described above.
 
 ### F55 — a failed summarization leaves no operator-facing record at all
 
