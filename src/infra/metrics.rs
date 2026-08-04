@@ -149,6 +149,18 @@ const MEMORY_EXTRACTION_REJECTED_TOTAL: &str = "moira_memory_extraction_rejected
 // otherwise be invisible until a conversation's context quietly stopped carrying a summary.
 const SUMMARIZATION_RUNS_TOTAL: &str = "moira_summarization_runs_total";
 
+// Finding F57 — summaries stored with a reasoning model's chain of thought inlined.
+//
+// A separate label-free family rather than a third `outcome` value on the one above, because the
+// run genuinely *succeeded*: folding it into that domain would make "how many summaries were
+// produced" a sum of two series, and would break the binary `succeeded` argument that keeps the
+// two outcomes from drifting apart. It is a property of the reply, not an outcome of the run.
+//
+// No `conversation_id` and no sample of the text, for the reasons the header gives: the first is
+// unbounded, and the second is the conversation's content on a scrape path. The per-conversation
+// answer is the `inline_reasoning` field on the `conversation.summary.created` audit row.
+const SUMMARIZATION_INLINE_REASONING_TOTAL: &str = "moira_summarization_inline_reasoning_total";
+
 // Plan 09 wave 2 — the admin-invitation surface, which grants full `moira:admin` on
 // redemption and had no operational signal at all before this.
 //
@@ -451,6 +463,15 @@ impl MetricsRegistry {
                  conversation_summaries row itself."
             );
             describe_counter!(
+                SUMMARIZATION_INLINE_REASONING_TOTAL,
+                "Successful summarization runs whose reply opened with an inline reasoning \
+                 block, which is stored verbatim as the summary. A non-zero rate means the \
+                 backend is a reasoning model serving its chain of thought as ordinary text: \
+                 start vLLM with --reasoning-parser so the block arrives in its own field, \
+                 which Moira already discards. Every run counted here is also counted as a \
+                 succeeded run on moira_summarization_runs_total."
+            );
+            describe_counter!(
                 ADMIN_INVITE_OUTCOMES_TOTAL,
                 "Admin-invitation outcomes, by a bounded outcome/denial-reason label. Carries \
                  no invitee email, domain, invite id or issuer: those are unbounded \
@@ -487,6 +508,7 @@ impl MetricsRegistry {
             counter!(RAG_EMBEDDINGS_WRITTEN_TOTAL).increment(0);
             counter!(MEMORY_EXTRACTION_WRITTEN_TOTAL).increment(0);
             counter!(MEMORY_EXTRACTION_REJECTED_TOTAL).increment(0);
+            counter!(SUMMARIZATION_INLINE_REASONING_TOTAL).increment(0);
             for outcome in RAG_INGESTION_OUTCOMES {
                 counter!(RAG_INGESTION_RUNS_TOTAL, "outcome" => *outcome).increment(0);
                 counter!(RETRIEVAL_RUNS_TOTAL, "outcome" => *outcome).increment(0);
@@ -671,6 +693,18 @@ impl MetricsRegistry {
         let outcome = if succeeded { "succeeded" } else { "failed" };
         with_local_recorder(&self.inner.recorder, || {
             counter!(SUMMARIZATION_RUNS_TOTAL, "outcome" => outcome).increment(1);
+        });
+    }
+
+    /// Records one stored summary that opened with an inline reasoning block — finding F57.
+    ///
+    /// Called *in addition to* [`Self::record_summarization_run`] with `succeeded = true`, never
+    /// instead of it. The run produced a row; what this counts is that the row's text is mostly
+    /// the model's scratchpad. An operator reading only the run family would see a healthy
+    /// summarizer, which is exactly the silence F57 is about.
+    pub fn record_summarization_inline_reasoning(&self) {
+        with_local_recorder(&self.inner.recorder, || {
+            counter!(SUMMARIZATION_INLINE_REASONING_TOTAL).increment(1);
         });
     }
 
@@ -1607,6 +1641,7 @@ mod tests {
             MEMORY_EXTRACTION_WRITTEN_TOTAL,
             MEMORY_EXTRACTION_REJECTED_TOTAL,
             SUMMARIZATION_RUNS_TOTAL,
+            SUMMARIZATION_INLINE_REASONING_TOTAL,
         ] {
             assert!(
                 rendered.contains(family),
@@ -1630,6 +1665,10 @@ mod tests {
         for family in [
             MEMORY_EXTRACTION_WRITTEN_TOTAL,
             MEMORY_EXTRACTION_REJECTED_TOTAL,
+            // F57. The alert is "this deployment is storing chain-of-thought as summaries", and a
+            // deployment on OpenAI never emits it — so without the seed the series is absent and
+            // the alert reads "no data" on precisely the healthy case it exists to distinguish.
+            SUMMARIZATION_INLINE_REASONING_TOTAL,
         ] {
             assert!(
                 rendered.contains(&format!("{family}{{service=\"moira-test\"}} 0")),
@@ -1698,6 +1737,38 @@ mod tests {
         assert!(
             rendered.contains(&format!("{} 1", series("failed"))),
             "{rendered}"
+        );
+    }
+
+    /// The inline-reasoning family is emitted, and it does **not** displace a run — finding F57.
+    ///
+    /// The seeding test proves the series exists; this proves the recorder reaches it. The second
+    /// half is the one worth writing down: the two families count different things, and the
+    /// tempting simplification is to treat "the reply carried reasoning" as a third *outcome*. It
+    /// is not — the run succeeded and wrote a row. So this asserts the inline count and the
+    /// `succeeded` count are **both** 2 off the same two observations, which no re-labelling
+    /// arrangement can satisfy.
+    #[test]
+    fn inline_reasoning_is_counted_alongside_the_run_not_instead_of_it() {
+        let metrics = registry();
+        metrics.record_summarization_run(true);
+        metrics.record_summarization_inline_reasoning();
+        metrics.record_summarization_run(true);
+        metrics.record_summarization_inline_reasoning();
+        metrics.record_summarization_run(true);
+        let rendered = metrics.render_prometheus("moira-test", false, false);
+
+        assert!(
+            rendered.contains(&format!(
+                "{SUMMARIZATION_INLINE_REASONING_TOTAL}{{service=\"moira-test\"}} 2"
+            )),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "{SUMMARIZATION_RUNS_TOTAL}{{service=\"moira-test\",outcome=\"succeeded\"}} 3"
+            )),
+            "an inline-reasoning run is still a successful run:\n{rendered}"
         );
     }
 

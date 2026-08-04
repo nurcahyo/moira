@@ -4335,6 +4335,217 @@ that is not defensible is the current behaviour: storing it silently.**
 - Tool calling works on this endpoint (`finish_reason: tool_calls`), so **F48 becomes live-testable**
   the day `build_completion_request` stops hardcoding `tools: Vec::new()`.
 
+## F56 REPRODUCED · CLOSED as F57 — `fix/f57-reasoning-in-summaries`, 2026-08-04
+
+**F56 reproduced against the live endpoint before anything was built on it**, on a second machine
+two days later, with a different transcript. Same shape, different magnitude: **1 298 of 2 419
+bytes — 53.7 %** of the stored summary was chain-of-thought, against F56's 63 %. The share is
+transcript-dependent and should not be quoted as a constant; what reproduces is that *the majority
+of the stored summary is not the summary*.
+
+Three things the wire showed that reading the code could not:
+
+1. **The `reasoning` field is present on the response and is `null`.** vLLM without
+   `--reasoning-parser` emits `message.reasoning: null` while `content` carries the block. So
+   Moira's existing intent — `text_from_choice` dropping `AssistantContent::Reasoning`, the
+   streaming path filtering `ReasoningDelta` — is not merely unenforced, it is *addressed to a
+   field the server left empty*. That makes the operator-side fix exact and nameable rather than
+   speculative, and it is why the warning names `--reasoning-parser`.
+2. **The endpoint sits behind a WAF that 403s on `User-Agent: Python-urllib/*`** while accepting
+   an empty or absent UA. Nothing to do with Moira — but it cost the first measurement attempt, and
+   a future agent probing this endpoint should know that a 403 there is not an auth failure.
+3. `chat_template_kwargs: {"enable_thinking": false}` **works** — 830 bytes, zero tags. It is a
+   real fix living on the request, and it is rejected below for a stated reason rather than
+   overlooked.
+
+### The decision: announce it, store it unchanged. Removal was rejected on a measurement
+
+`parse_summary` now returns `ValidatedSummary { text, inline_reasoning }`, where
+`inline_reasoning` is `text.starts_with("<think>")` — anchored at offset 0, no search, no
+terminator, **and `text` is byte-identical either way**. The condition is announced three ways with
+three consumers, the split `announce_dangling_agent_profile` established for F50: a `warn!` naming
+`--reasoning-parser`, the new label-free counter
+`moira_summarization_inline_reasoning_total`, and an `inline_reasoning` boolean on the existing
+`conversation.summary.created` audit row.
+
+**Stripping the block (option a) was not rejected on principle. It was rejected because the
+terminator is not identifiable, and the live model demonstrated that on the first attempt.** A
+transcript that merely *discusses* reasoning tags — a support conversation about this very defect,
+which is the population most likely to be running a reasoning model — returned one `<think>` and
+**ten** `</think>`: the model quoted the tag while reasoning, and again in the summary because the
+user had asked for the markers verbatim. The real terminator was the **fifth of ten**.
+
+| removal rule | result on that reply |
+|---|---|
+| cut at the first `</think>` | **985 bytes of chain-of-thought left in the stored summary** |
+| cut at the last `</think>` | **2 173 bytes of legitimate summary destroyed**, 220 left |
+| cut only a *well-formed* leading block | correct here, and **inert** on the truncation case below |
+
+And the worst case has no terminator at all. At `max_tokens: 120` the reply came back
+`finish_reason: length`, 613 bytes, one `<think>` and **zero** `</think>` — 100 % reasoning, 0 %
+summary. A rule that strips only a well-formed block does nothing precisely where the damage is
+total, and truncation is reachable: `AgentProfileRecord::max_tokens` reaches this path (F49).
+
+Detection had the opposite result over the same five replies — anchored at offset 0 it was correct
+on **all five**, including the truncated one and the `enable_thinking: false` control. **The
+condition is decidable; its extent is not.** That asymmetry is the entire decision, and it is why
+the fix stores a `bool` rather than a shorter string.
+
+### Every option rejected, with why
+
+- **(b) refuse with a new `FAILURE_SUMMARY_*` class** — rejected **by reasoning already in the
+  tree**, which is why it is worth stating rather than re-deriving. `parse_summary`'s own doc
+  comment explains that a refused summary writes no row, so `covers_through_sequence` does not
+  advance, so the backlog that triggered the run re-triggers it **every turn, forever**. That
+  argument was written about a conversation containing the word `bearer `; here it is strictly
+  worse, because "the model emits inline reasoning" is a **permanent property of the deployment**,
+  not an incident. Refusing would convert a fat summary into an unbounded per-turn provider bill on
+  exactly the deployments the feature is meant to serve. **Its reversal condition is already
+  written at that function and is F55** — a `conversation_summarization_runs` table that can record
+  a refusal and back it off. F55 has **not** landed; the brief for this work assumed it had.
+- **(d) per-provider or per-model configuration** — rejected because it buys nothing. The action a
+  declaration would authorise is still *removal*, and removal is undecidable regardless of how
+  confident the operator is that their model reasons. Configuration that cannot change what the
+  code does is sprawl.
+- **(e) send `chat_template_kwargs: {"enable_thinking": false}`** — measured to work, and still
+  rejected. It is a vLLM transport extension carrying a *Qwen chat-template* kwarg; OpenAI rejects
+  unknown body fields, and `OpenAiCompatible`/`Local` is by construction the arm where Moira cannot
+  know what is behind it — the same undecidability F39 recorded and deliberately left admitted.
+  Moira would be guessing the backend in order to avoid guessing the prose. It is the **operator's**
+  knob, so it is named in the metric description instead.
+- **A well-argued no-change** was available and was not taken, because the measurement moved the
+  question. F56 recorded the one thing not defensible as *storing it silently*; the silence is
+  removable without any heuristic, and that is all that shipped.
+
+### What is deliberately unchanged
+
+The stored summary is still 53 % scratchpad, and it still counts against `MAXIMUM_SUMMARY_BYTES`,
+`budget_tokens` and the target-token budget. **Compounding was measured and the brief's account of
+it needs one correction:** feeding run 1's contaminated summary back as `PRIOR_SUMMARY_LABEL`
+raised the prompt from 347 to 894 tokens and produced a 3 617-byte reply — but run 2's *output* did
+not quote run 1's reasoning. It read it as material and rewrote it. So the compounding is in
+**bytes and tokens**, not in semantic contamination of the summary text. That is still a real cost
+and still not fixed here; it is fixed by `--reasoning-parser`, which is now discoverable.
+
+### Reversal condition
+
+**Remove the block instead of reporting it only if a *non-positional* separation becomes
+available** — the provider separating it into its own field, or a declared response contract that
+makes the boundary explicit. **A better search over the prose is not that**, and any proposed
+search must first be run against the ten-terminator reply, which is committed as
+`REASONING_SUMMARY_BODY` in `tests/conversation_summarization.rs` for exactly that purpose.
+
+Separately, **the refusal option reopens the day `conversation_summarization_runs` exists** (F55).
+At that point a refused summary can be recorded and backed off, the retry loop stops being the cost
+of refusing, and "refuse a reply that is mostly scratchpad" becomes a live choice rather than a
+foreclosed one.
+
+### Guards, and the mutations run against them
+
+Six cases: four pure (`src/application/summarization.rs`), two DB-backed
+(`tests/conversation_summarization.rs`), plus a metrics unit test and an **opt-in, skipped-by-default**
+live suite (`tests/live_reasoning_model.rs`, gated on `MOIRA_LIVE_REASONING_BASE_URL`; CI has no
+route to the endpoint and a gate that depends on someone's LAN is a gate that lies).
+
+**Watched failing first.** With `begins_with_inline_reasoning` returning a constant `false` — which
+*is* the shipped defect, expressed compilably — the suite reported
+`FAILED. 25 passed; 3 failed` and `FAILED. 18 passed; 2 failed`, the three positive unit cases and
+the integration case reding on `inline_reasoning: false` / `left: 0.0, right: 1.0`. **Both negative
+cases stayed green**, which is what makes it the defect rather than an inverted build. Restoring the
+one-line body gave `28 passed; 0 failed`, `25 passed; 0 failed` (metrics) and `20 passed; 0 failed`.
+
+Four mutations run, and **the interesting result is that no single case catches more than two of
+them** — which is the point of splitting detection from storage:
+
+| mutation | measured result |
+|---|---|
+| M1 `begins_with_inline_reasoning` → `false` (**the shipped defect**) | 3 unit + 1 integration red; both controls green |
+| M2 `starts_with` → `contains` | `27 passed; 1 failed` — **only** `a_summary_that_merely_discusses_reasoning_tags_is_not_flagged` |
+| M3 cut the text at the terminator (**option (a), implemented**) | `26 passed; 2 failed` — only the byte-identity assertions |
+| M4 delete the `record_summarization_inline_reasoning()` call | `28 passed` in the lib, **`19 passed; 1 failed`** in the integration suite |
+
+**M3's green case is the argument, sitting in the suite.** Implementing option (a) reds the two
+cases whose replies *have* a terminator and leaves `an_unterminated_reasoning_block_is_flagged_too`
+**passing** — because a well-formed-block strip does nothing to a block that never closes. The
+measurement that ruled stripping out is therefore not only recorded in prose; the test suite
+demonstrates the blind spot on every run.
+
+**M4 is HANDOFF §3.4's thirteenth-entry shape in miniature:** all 28 pure tests stay green because
+the pure layer cannot see whether anything is wired to it. Only the DB-backed case names the
+counter, and it is the only thing standing between this fix and the "seeded but never emitted"
+failure this repository has shipped five times.
+
+The `contains` mutation is the one worth naming. It is invisible in review, leaves every other case
+green, and would fire on any conversation *about* reasoning models — so its false positives land on
+precisely the population whose true positives matter. It is caught by a case whose input is the
+live model's own reply, not by an invented one.
+
+The `contains` mutation is the one worth naming. It is invisible in review, leaves every other case
+green, and would fire on any conversation *about* reasoning models — so its false positives land on
+precisely the population whose true positives matter. It is caught by a case whose input is the
+live model's own reply, not by an invented one.
+
+The control (`an_ordinary_summary_announces_nothing`) is not padding: without it,
+`inline_reasoning: true` unconditionally is a passing implementation of the entire feature. That is
+F45's lesson from HANDOFF §3.4, applied before it was needed rather than after.
+
+**One assertion was written wrong and caught before it could lie.** The integration case first
+walked the *whole* `audit_logs` table asserting the phrase `"invoicing rewrite in March"` was
+absent — and `USER_TURN` in that same fixture is
+`"we agreed to ship the invoicing rewrite in March"`. It would have failed for a reason having
+nothing to do with F57, or worse, passed only because nothing happened to log the turn. It is now
+scoped to the summary row and to markers unique to the reply, and the general property is left to
+`no_summary_or_transcript_text_reaches_the_audit_log`, which already owns it — HANDOFF §3.4's
+"a guard that duplicates another guard is not a second guard".
+
+### Gate runner — NOT `scripts/gates.sh`, and why
+
+This host could not execute **any** freshly compiled binary while this work was done: a
+`chrome_crashpad_handler` in a FATAL crash-loop had `syspolicyd` pegged at ~99 % CPU, so every
+code-signing assessment queued forever. A 16 KB hello-world hung; cargo sat on eight build scripts
+with `0:00.00` CPU each and no `rustc` at all. Diagnosis and escape hatch are written up in
+HANDOFF §2.2d, which is the durable half of this entry.
+
+`cargo fmt --check` was run on the host (rustfmt compiles nothing, so it is unaffected). Everything
+else ran inside `rust:1.97-trixie` against the same Postgres over `host.docker.internal`. **That is
+not `scripts/gates.sh`**, so its log-completeness assertion and its skipped-DB-suite check did not
+run, and no `ALL GATES PASSED` marker exists for this branch. Said plainly rather than left to be
+inferred — the completeness check was instead done by hand: **all 47 files in `tests/` appear as a
+`Running tests/…` line**, none dropped.
+
+**All six gates ran and are green**, in three passes because the VM's 32 GB disk could not hold the
+debug and release trees at once:
+
+| gate | result |
+|---|---|
+| `fmt --check` | **PASS** (host *and* container) |
+| `clippy --workspace --all-targets --all-features -- -D warnings` | **PASS** |
+| `test --workspace --all-features --no-fail-fast` | **1111 passed, 1 failed** — 50 result lines over 47 suites; the one failure is the flake below |
+| `build --release --locked` | **PASS** — `Finished \`release\` profile [optimized] in 15m 05s`, rc 0 |
+| `deny check` | **PASS** — `advisories ok, bans ok, licenses ok, sources ok` |
+| `audit` | **PASS** — `warning: 1 allowed warning found`, RUSTSEC-2026-0221, the expected one |
+
+**A form-1 trap was walked into while running the supply-chain pair, and the content marker is what
+caught it.** The script ended each gate with `cargo … | tail -20; echo "EXIT=$?"`, which reports
+**`tail`'s** status — both printed `EXIT=0` while `cargo audit` had in fact printed
+`error: no such command: audit`, having never installed. Exactly §2.2's first form, in a script
+written by someone who had just read §2.2. The only reason it was not recorded as a pass is that
+`deny`'s own `advisories ok, bans ok, licenses ok, sources ok` line is a *content* marker and
+`audit` had no such line. It was then installed properly and run **unpiped**, so `AUDIT_RC=0` is its
+own status. **The argument for content markers over exit codes, earned again.**
+
+Two flakes were observed, both timing-sensitive, both unrelated to this change, and both verified by
+re-running in isolation:
+
+- `a_concurrent_summarization_is_answered_with_202_and_retry_after` — the one HANDOFF §2.2a already
+  names. 502 instead of 200 on two runs; **3/3 green** when re-run alone.
+- `context_planner_boundary`'s two `responses request timed out` failures under the parallel run;
+  **6/6 green** when that suite is run alone. Timeouts, not assertions, in a suite this change does
+  not touch.
+
+Both are the container's bind-mount latency on a host whose spare core is being eaten by the
+`syspolicyd` spin described above.
+
 ### F55 — a failed summarization leaves no operator-facing record at all
 
 Raised while closing F54, whose remedy assumed a "summarization run equivalent" of
