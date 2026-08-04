@@ -1,0 +1,89 @@
+# Performance hint ONLY. This file can never affect coverage.
+# Coverage is derived from `ls tests/*.rs` at run time and from nothing else.
+# A target missing from this table still runs — it gets DEFAULT_COST, which is
+# deliberately HIGH (25s) so an unmeasured new target is assumed expensive and
+# lands on a light shard. A stale row naming a deleted target is ignored.
+# This quarantine is deliberate: HANDOFF §3.4's `every_triggered_table_has_a_scope`
+# was a guard pinned against a hand-retyped copy of the list it checked (21 entries
+# vs 24 in the schema). A guard that pins X against a hand-written list of X is not
+# a guard, it is a duplicate. This table is therefore kept OFF the correctness path.
+#
+# Two columns, tab-separated: target name (no `tests/` prefix, no `.rs`) and the
+# measured seconds of its `test result: … finished in Ns` line.
+#
+# SOURCE: GitHub Actions run 30889929026 (job `rust`, 2026-08-04), captured log.
+# Reconciled by TEST NAME, not by log order: that log interleaves cargo's stderr
+# `Running tests/X.rs` line into the *previous* binary's stdout block for a handful
+# of targets, so positional pairing silently swaps costs between neighbours. The
+# naive pairing gave `secret_leak_snapshots` 0.34s and `runtime_notify_inventory`
+# 52.85s — exactly backwards, and exactly the row two independent readings of that
+# log disagreed on. The values below are the by-name attribution.
+#
+# NOT MEASURED, deliberately left out: `conversation_content_persistence`, which was
+# added on 2026-08-05 (commit 85e9528), after the measurement run. It therefore rides
+# DEFAULT_COST today. That is the quarantine working as designed, not an omission to
+# fix in a hurry: it costs balance, never coverage.
+#
+# TO REFRESH: the `rust` aggregator prints a predicted-vs-actual table in the job
+# summary. It WARNS and never fails — putting drift on the correctness path would
+# put this hand-maintained list back on it too.
+actor_fingerprint_unification	3.55
+admin_audit_atomicity	1.33
+admin_idempotency	5.86
+admin_invite_lifecycle	21.99
+admin_query_contract	0.58
+agent_profile_wire	2.49
+auth_provider_settings	23.24
+cluster_admission	2.12
+cluster_coordination	1.00
+content_leak_snapshots	24.64
+context_planner_boundary	4.63
+conversation_summarization	24.47
+coordination_default_path	0.60
+execution_lifecycle	8.17
+execution_policy_if_match	1.32
+http_error_contract	0.56
+http_middleware_contract	5.43
+idempotency_hash_migration	4.29
+identity_claim	14.56
+if_match_family_races	1.80
+if_match_toctou_harness	0.61
+jwks_hardening	2.94
+list_pagination	21.24
+live_reasoning_model	0.00
+memory_content_hash_rotation	0.66
+memory_extraction	29.32
+metrics_endpoint	2.41
+openai_compat_text_format	11.38
+openapi_drift	0.72
+policy_reads_do_not_write	1.08
+public_authorization	2.11
+rag_idempotency_replay	2.84
+rag_ingestion_honesty	2.91
+rag_retrieval_end_to_end	6.25
+response_output_honesty	3.30
+retention_worker	1.40
+retrieval_cross_tenant_isolation	2.07
+rig_boundary	0.04
+runtime_config_invalidation	2.16
+runtime_notify_inventory	0.34
+secret_leak_snapshots	52.85
+security_foundation	0.48
+structured_output	1.83
+supply_chain_policy	0.00
+test_database_isolation	0.03
+worker_leader_election	5.70
+worker_queue	1.57
+# Pseudo-units. These are targets `ls tests/*.rs` cannot see, and each one is a
+# target that would otherwise be covered by no shard and vanish with nothing red.
+#
+# `__lib__` is padded above its measured 6.16s to 26.16 to carry its share of the
+# per-shard link/startup cost: whichever shard holds it pays `--lib`'s link.
+# It holds `generated_openapi_covers_every_registered_route`, the whole-route-table
+# pin, and `committed_openapi_matches_the_generated_document`.
+__lib__	26.16
+__bins__	0.50
+# Measured 0.00s of run time, but `all doctests ran in 0.91s; merged doctests
+# compilation took 0.88s` — and it is a SEPARATE `cargo test --doc` invocation,
+# so it pays its own startup. Charged 3.00s.
+__doc__	3.00
