@@ -270,6 +270,9 @@ export const CONSOLE_MESSAGE_KEYS = {
   llm_disable_model: "console.llm.disable_model",
   llm_disable_key_row: "console.llm.disable_key_row",
   llm_disable_policy: "console.llm.disable_policy",
+  llm_enable_model: "console.llm.enable_model",
+  llm_enable_key_row: "console.llm.enable_key_row",
+  llm_enable_policy: "console.llm.enable_policy",
 
   /* --- adding a provider by hand ----------------------------------------- */
   llm_add_provider_heading: "console.llm.add_provider_heading",
@@ -331,6 +334,7 @@ export const CONSOLE_MESSAGE_KEYS = {
   llm_step_unknown: "console.llm.step_unknown",
   llm_outcome_created: "console.llm.outcome_created",
   llm_outcome_reused: "console.llm.outcome_reused",
+  llm_outcome_enabled: "console.llm.outcome_enabled",
   llm_outcome_skipped: "console.llm.outcome_skipped",
 } as const;
 

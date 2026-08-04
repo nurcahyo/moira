@@ -1362,6 +1362,28 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "The undo for having pointed routing at this provider. It is the step that moves live " +
       "traffic, so its label says what stops rather than which row is edited.",
   },
+  [K.llm_enable_model]: {
+    key: K.llm_enable_model,
+    message: "Enable this model",
+    description:
+      "Shown in place of the disable control on a model that is not active. Routing accepts " +
+      "only active models, and re-adding the same identifier collides with the row that is " +
+      "already there, so this is the only way back.",
+  },
+  [K.llm_enable_key_row]: {
+    key: K.llm_enable_key_row,
+    message: "Enable this credential",
+    description:
+      "Shown in place of the disable control on a credential row that is not active. A " +
+      "disabled row fails a completion with the same error a missing one does.",
+  },
+  [K.llm_enable_policy]: {
+    key: K.llm_enable_policy,
+    message: "Route here again",
+    description:
+      "Shown in place of the stop-routing control on a policy that is not active. It moves " +
+      "live traffic back, so its label says what resumes rather than which row is edited.",
+  },
   [K.llm_add_provider_heading]: {
     key: K.llm_add_provider_heading,
     message: "Add a provider by hand",
@@ -1467,8 +1489,12 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
   },
   [K.llm_step_model_missing]: {
     key: K.llm_step_model_missing,
-    message: "Register at least one model.",
-    description: "Readiness line for a provider with no model row.",
+    message: "Register a model, or enable one that is disabled.",
+    description:
+      "Readiness line for a provider with no model routing would accept. Names both causes " +
+      "because they are indistinguishable from the failure: routing joins on an active " +
+      "model, so a provider whose only model is disabled has none as far as a prompt is " +
+      "concerned.",
   },
   [K.llm_step_enable_missing]: {
     key: K.llm_step_enable_missing,
@@ -1720,6 +1746,15 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
     message: "reused",
     description:
       "Trace outcome for a row that already existed and was matched rather than duplicated.",
+  },
+  [K.llm_outcome_enabled]: {
+    key: K.llm_outcome_enabled,
+    message: "enabled",
+    description:
+      "Trace outcome for a row that already existed but was disabled, and was turned back " +
+      "on. Kept apart from 'reused' because routing accepts only active rows: a step that " +
+      "reported 'reused' for a disabled row would be announcing a working deployment no " +
+      "prompt could reach.",
   },
   [K.llm_outcome_skipped]: {
     key: K.llm_outcome_skipped,

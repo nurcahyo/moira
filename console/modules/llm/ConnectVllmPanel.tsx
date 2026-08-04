@@ -97,6 +97,8 @@ export function outcomeLabelKey(outcome: string): string {
       return CONSOLE_MESSAGE_KEYS.llm_outcome_created;
     case "reused":
       return CONSOLE_MESSAGE_KEYS.llm_outcome_reused;
+    case "enabled":
+      return CONSOLE_MESSAGE_KEYS.llm_outcome_enabled;
     default:
       return CONSOLE_MESSAGE_KEYS.llm_outcome_skipped;
   }

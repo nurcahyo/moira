@@ -29,6 +29,9 @@
 // that carries no session at all.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { resolve } from "node:path";
+
+import { exportedHandlersUnder } from "../../support/route-exports";
 
 import { POST as CONNECT } from "@/app/api/llm/connect-vllm/route";
 import { GET as PROVIDERS_GET, POST as PROVIDERS_POST } from "@/app/api/llm/providers/route";
@@ -37,11 +40,20 @@ import {
   PATCH as PROVIDER_PATCH,
 } from "@/app/api/llm/providers/[id]/route";
 import { POST as MODEL_POST } from "@/app/api/llm/providers/[id]/models/route";
-import { DELETE as MODEL_DELETE } from "@/app/api/llm/providers/[id]/models/[modelId]/route";
+import {
+  DELETE as MODEL_DELETE,
+  POST as MODEL_ENABLE_POST,
+} from "@/app/api/llm/providers/[id]/models/[modelId]/route";
 import { POST as CREDENTIAL_POST } from "@/app/api/llm/providers/[id]/credentials/route";
-import { DELETE as CREDENTIAL_DELETE } from "@/app/api/llm/providers/[id]/credentials/[credentialId]/route";
+import {
+  DELETE as CREDENTIAL_DELETE,
+  POST as CREDENTIAL_ENABLE_POST,
+} from "@/app/api/llm/providers/[id]/credentials/[credentialId]/route";
 import { POST as ROUTING_POST } from "@/app/api/llm/providers/[id]/routing/route";
-import { DELETE as ROUTING_DELETE } from "@/app/api/llm/providers/[id]/routing/[policyId]/route";
+import {
+  DELETE as ROUTING_DELETE,
+  POST as ROUTING_ENABLE_POST,
+} from "@/app/api/llm/providers/[id]/routing/[policyId]/route";
 
 import type { ResolvedAuthConfig } from "@/lib/auth-config";
 import type { ConsoleAuth } from "@/lib/auth";
@@ -310,57 +322,103 @@ function errorOf(body: Record<string, unknown>): Record<string, unknown> {
 /* AC3 — every handler is behind the gate                                     */
 /* -------------------------------------------------------------------------- */
 
-/** Every exported handler, with the arguments Next would give it. */
+/**
+ * Every exported handler, with the arguments Next would give it.
+ *
+ * `name` is `"METHOD app/api/llm/.../route.ts"` — the exact spelling the source
+ * scan produces — so the floor below can compare this list against the
+ * FILESYSTEM instead of against a number somebody typed. See that test.
+ */
 const EVERY_HANDLER: ReadonlyArray<{ name: string; call: () => Promise<Response> }> = [
-  { name: "GET /api/llm/providers", call: () => PROVIDERS_GET(request("GET")) },
   {
-    name: "POST /api/llm/providers",
+    name: "GET app/api/llm/providers/route.ts",
+    call: () => PROVIDERS_GET(request("GET")),
+  },
+  {
+    name: "POST app/api/llm/providers/route.ts",
     call: () => PROVIDERS_POST(request("POST", { display_name: "x", base_url: BASE_URL })),
   },
   {
-    name: "PATCH /api/llm/providers/[id]",
+    name: "PATCH app/api/llm/providers/[id]/route.ts",
     call: () => PROVIDER_PATCH(request("PATCH", { display_name: "x" }), params({ id: PROVIDER_ID })),
   },
   {
-    name: "DELETE /api/llm/providers/[id]",
+    name: "DELETE app/api/llm/providers/[id]/route.ts",
     call: () => PROVIDER_DELETE(request("DELETE"), params({ id: PROVIDER_ID })),
   },
   {
-    name: "POST /api/llm/providers/[id]/models",
+    name: "POST app/api/llm/providers/[id]/models/route.ts",
     call: () => MODEL_POST(request("POST", { model_key: MODEL_KEY }), params({ id: PROVIDER_ID })),
   },
   {
-    name: "DELETE /api/llm/providers/[id]/models/[modelId]",
+    name: "DELETE app/api/llm/providers/[id]/models/[modelId]/route.ts",
     call: () => MODEL_DELETE(request("DELETE"), params({ id: PROVIDER_ID, modelId: MODEL_ID })),
   },
   {
-    name: "POST /api/llm/providers/[id]/credentials",
+    name: "POST app/api/llm/providers/[id]/models/[modelId]/route.ts",
+    call: () =>
+      MODEL_ENABLE_POST(request("POST"), params({ id: PROVIDER_ID, modelId: MODEL_ID })),
+  },
+  {
+    name: "POST app/api/llm/providers/[id]/credentials/route.ts",
     call: () => CREDENTIAL_POST(request("POST", { api_key: "" }), params({ id: PROVIDER_ID })),
   },
   {
-    name: "DELETE /api/llm/providers/[id]/credentials/[credentialId]",
+    name: "DELETE app/api/llm/providers/[id]/credentials/[credentialId]/route.ts",
     call: () =>
       CREDENTIAL_DELETE(request("DELETE"), params({ id: PROVIDER_ID, credentialId: CREDENTIAL_ID })),
   },
   {
-    name: "POST /api/llm/providers/[id]/routing",
+    name: "POST app/api/llm/providers/[id]/credentials/[credentialId]/route.ts",
+    call: () =>
+      CREDENTIAL_ENABLE_POST(
+        request("POST"),
+        params({ id: PROVIDER_ID, credentialId: CREDENTIAL_ID }),
+      ),
+  },
+  {
+    name: "POST app/api/llm/providers/[id]/routing/route.ts",
     call: () =>
       ROUTING_POST(request("POST", { provider_model_id: MODEL_ID }), params({ id: PROVIDER_ID })),
   },
   {
-    name: "DELETE /api/llm/providers/[id]/routing/[policyId]",
+    name: "DELETE app/api/llm/providers/[id]/routing/[policyId]/route.ts",
     call: () =>
       ROUTING_DELETE(request("DELETE"), params({ id: PROVIDER_ID, policyId: POLICY_ID })),
   },
   {
-    name: "POST /api/llm/connect-vllm",
+    name: "POST app/api/llm/providers/[id]/routing/[policyId]/route.ts",
+    call: () =>
+      ROUTING_ENABLE_POST(request("POST"), params({ id: PROVIDER_ID, policyId: POLICY_ID })),
+  },
+  {
+    name: "POST app/api/llm/connect-vllm/route.ts",
     call: () => CONNECT(request("POST", { action: "discover", base_url: BASE_URL })),
   },
 ];
 
 describe("AC3 — nothing on this surface is reachable without a console session", () => {
-  test("the handler list is the whole surface, so the loop below is not scanning air", () => {
-    expect(EVERY_HANDLER.length, "eleven exported handlers under app/api/llm/**").toBe(11);
+  test("THE LIST IS DERIVED FROM THE FILESYSTEM, so a new handler cannot slip past", () => {
+    // This assertion used to be `expect(EVERY_HANDLER.length).toBe(11)` against
+    // a hand-written literal — a floor that can only ever count the handlers
+    // somebody already remembered. The twelfth walks straight through it: add an
+    // export, do not add a line here, and every "is it guarded" test below
+    // simply never runs for it. That is the same shape as the file-level scan
+    // `route-handler-session.test.ts`'s header records, one level up.
+    //
+    // So the surface is read from `app/api/llm/**` with the SAME extractor that
+    // suite uses, and compared as a SET rather than as a count: a name on one
+    // side and not the other fails, in both directions.
+    const onDisk = exportedHandlersUnder(
+      resolve(import.meta.dir, "../../../app/api/llm"),
+      resolve(import.meta.dir, "../../.."),
+    );
+    expect(onDisk.length, "no handlers found under app/api/llm/** — the loop is vacuous").
+      toBeGreaterThan(0);
+    expect(
+      EVERY_HANDLER.map((handler) => handler.name).sort(),
+      "every exported handler under app/api/llm/** must be driven by the loop below",
+    ).toEqual(onDisk);
   });
 
   for (const handler of EVERY_HANDLER) {
@@ -537,6 +595,116 @@ describe("a privileged write never lets the request choose its target", () => {
   });
 });
 
+/* -------------------------------------------------------------------------- */
+/* DISABLE IS ONLY REVERSIBLE IF SOMETHING REVERSES IT                        */
+/* -------------------------------------------------------------------------- */
+
+const MODEL_ENABLE = `POST /api/v1/admin/provider-models/${MODEL_ID}/enable`;
+const CREDENTIAL_ENABLE = `POST /api/v1/admin/provider-credentials/${CREDENTIAL_ID}/enable`;
+const POLICY_ENABLE = `POST /api/v1/admin/routing-policies/${POLICY_ID}/enable`;
+
+/** The three rows in their disabled state, plus the enable each needs. */
+function disabledRows(): Record<string, StubHandler> {
+  return {
+    [MODEL_LIST]: () => ({ status: 200, body: page([modelRecord({ status: "disabled" })]) }),
+    [MODEL_ENABLE]: () => ({ status: 200, body: modelRecord({ version: 4 }) }),
+    [CREDENTIAL_LIST]: () => ({
+      status: 200,
+      body: page([credentialRecord({ status: "disabled" })]),
+    }),
+    [CREDENTIAL_ENABLE]: () => ({ status: 200, body: credentialRecord({ version: 5 }) }),
+    [POLICY_LIST]: () => ({ status: 200, body: page([policyRecord({ status: "disabled" })]) }),
+    [POLICY_ENABLE]: () => ({ status: 200, body: policyRecord({ version: 6 }) }),
+  };
+}
+
+describe("every nested row this screen disables can be enabled again", () => {
+  const cases: ReadonlyArray<{
+    readonly what: string;
+    readonly call: () => Promise<Response>;
+    readonly enable: string;
+    readonly version: string;
+  }> = [
+    {
+      what: "a model",
+      call: () => MODEL_ENABLE_POST(request("POST"), params({ id: PROVIDER_ID, modelId: MODEL_ID })),
+      enable: MODEL_ENABLE,
+      version: "3",
+    },
+    {
+      what: "a credential row",
+      call: () =>
+        CREDENTIAL_ENABLE_POST(
+          request("POST"),
+          params({ id: PROVIDER_ID, credentialId: CREDENTIAL_ID }),
+        ),
+      enable: CREDENTIAL_ENABLE,
+      version: "4",
+    },
+    {
+      what: "a routing policy",
+      call: () =>
+        ROUTING_ENABLE_POST(request("POST"), params({ id: PROVIDER_ID, policyId: POLICY_ID })),
+      enable: POLICY_ENABLE,
+      version: "5",
+    },
+  ];
+
+  for (const scenario of cases) {
+    test(`${scenario.what} comes back, with the version the lookup read`, async () => {
+      // Moira's routing joins all three on `status = 'active'`. Before these
+      // handlers existed the client's `enableProviderModel`,
+      // `enableProviderCredential` and `enableRoutingPolicy` had NO caller
+      // anywhere, so "disable is reversible" — the stated justification for
+      // choosing disable over delete — was false for three of the four rows.
+      install({ handlers: handlers(disabledRows()) });
+      const response = await scenario.call();
+      expect(response.status).toBe(200);
+      expect(stub.routes()).toContain(scenario.enable);
+      expect(stub.requestsFor(scenario.enable)[0]?.headers["If-Match"]).toBe(scenario.version);
+    });
+  }
+
+  test("a row that is already active is left alone rather than re-enabled", async () => {
+    // The default fixture is active. Writing anyway would burn a version and
+    // turn a double-click into a lost `If-Match` race for whoever clicked next.
+    const response = await MODEL_ENABLE_POST(
+      request("POST"),
+      params({ id: PROVIDER_ID, modelId: MODEL_ID }),
+    );
+    expect(response.status).toBe(200);
+    expect(stub.routes()).not.toContain(MODEL_ENABLE);
+  });
+
+  test("ENABLE MAKES THE SAME OWNERSHIP CHECK DISABLE DOES", async () => {
+    // Moira's enable is as flat as its disable. A nested path that checked
+    // ownership on the way down and not on the way back up would be a hole in
+    // exactly the rule the nesting exists for.
+    install({ handlers: handlers(disabledRows()) });
+    const response = await ROUTING_ENABLE_POST(
+      request("POST"),
+      params({ id: PROVIDER_ID, policyId: "a-policy-of-someone-elses" }),
+    );
+    expect(response.status).toBe(404);
+    expect(errorOf(await json(response))["message_key"]).toBe(
+      CONSOLE_MESSAGE_KEYS.llm_policy_not_found,
+    );
+    expect(stub.routes()).not.toContain(POLICY_ENABLE);
+  });
+
+  test("no enable response says anything about a secret", async () => {
+    install({ handlers: handlers(disabledRows()) });
+    const response = await CREDENTIAL_ENABLE_POST(
+      request("POST"),
+      params({ id: PROVIDER_ID, credentialId: CREDENTIAL_ID }),
+    );
+    const body = JSON.stringify(await json(response));
+    expect(body).not.toContain("sha256:fingerprint-that-must-not-cross");
+    expect(body).not.toContain("sk-****mask");
+    expect(body).toBe(JSON.stringify({ id: CREDENTIAL_ID }));
+  });
+});
+
 describe("POST /api/llm/providers/[id]/routing", () => {
   test("the route is resolved from `route_key` and is never taken from the body", async () => {
     install({ handlers: handlers({ [POLICY_LIST]: () => ({ status: 200, body: EMPTY_PAGE }) }) });
@@ -563,6 +731,54 @@ describe("POST /api/llm/providers/[id]/routing", () => {
     );
     expect(response.status).toBe(200);
     expect((await json(response))["id"]).toBe(POLICY_ID);
+    expect(stub.routes()).not.toContain(POLICY_CREATE);
+  });
+
+  test("A DISABLED MATCH IS ENABLED, not answered 200 as though it were routing", async () => {
+    // The one-way door. The dedupe matches on the (route, provider, model)
+    // triple regardless of status, so a disabled policy blocked the create
+    // forever — this handler kept answering 200 with its id and writing nothing,
+    // while `runtime.rs` joins `routing_policies` on `rp.status = 'active'` and
+    // never selected it. An active policy for that triple could not be produced
+    // from this screen again.
+    install({
+      handlers: handlers({
+        [POLICY_LIST]: () => ({ status: 200, body: page([policyRecord({ status: "disabled" })]) }),
+        [POLICY_ENABLE]: () => ({ status: 200, body: policyRecord({ version: 6 }) }),
+      }),
+    });
+    const response = await ROUTING_POST(
+      request("POST", { provider_model_id: MODEL_ID }),
+      params({ id: PROVIDER_ID }),
+    );
+    expect(response.status).toBe(200);
+    expect((await json(response))["id"]).toBe(POLICY_ID);
+    expect(stub.routes()).toContain(POLICY_ENABLE);
+    // Still no duplicate: the triple already exists.
+    expect(stub.routes()).not.toContain(POLICY_CREATE);
+    expect(stub.requestsFor(POLICY_ENABLE)[0]?.headers["If-Match"]).toBe("5");
+  });
+
+  test("a truncated policy page is refused rather than read as `does not exist`", async () => {
+    // `find` over page one only. "Not on this page" is not "does not exist", and
+    // creating anyway lands the second eligible policy the dedupe exists to
+    // prevent — the same rule `findOnPage` applies inside the chain.
+    install({
+      handlers: handlers({
+        [POLICY_LIST]: () => ({
+          status: 200,
+          body: { data: [], pagination: { has_more: true, next_cursor: "more" } },
+        }),
+      }),
+    });
+    const response = await ROUTING_POST(
+      request("POST", { provider_model_id: MODEL_ID }),
+      params({ id: PROVIDER_ID }),
+    );
+    expect(response.status).toBe(400);
+    expect(errorOf(await json(response))["message_key"]).toBe(
+      CONSOLE_MESSAGE_KEYS.llm_list_truncated,
+    );
     expect(stub.routes()).not.toContain(POLICY_CREATE);
   });
 
@@ -662,7 +878,83 @@ describe("POST /api/llm/connect-vllm", () => {
     expect(response.status).toBe(200);
     expect(await json(response)).toEqual({ base_url: BASE_URL, models: [MODEL_KEY, "other"] });
     expect(seen).toEqual([`${BASE_URL}/models`]);
-    // Discovery writes nothing.
+    // Discovery WRITES nothing. The one Moira call it makes is the admin-grant
+    // read — a list, no body, no mutation — and it happens BEFORE the probe.
+    expect(stub.routes()).toEqual([PROVIDER_LIST]);
+    expect(stub.requestsFor(PROVIDER_LIST)[0]?.method).toBe("GET");
+  });
+
+  test("THE GRANT IS READ BEFORE THE BFF CONTACTS ANYTHING, and a refusal stops it", async () => {
+    // The one handler on this surface whose effect never reaches Moira, so the
+    // one whose authorization the session gate cannot supply. `checkSession`
+    // admits any verified address inside `allowed_email_domains`; it reads no
+    // `admin_identities` grant. Without this call, an employee with no grant —
+    // every Moira read on the page 403s for them — could aim the BFF's own
+    // `fetch` at any host and port reachable from inside the deployment and read
+    // the answer off the three refusal keys.
+    let probed = 0;
+    const probe = (async () => {
+      probed += 1;
+      return new Response(JSON.stringify({ data: [{ id: MODEL_KEY }] }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    install({
+      handlers: handlers({
+        [PROVIDER_LIST]: () => ({ status: 403, body: errorEnvelope("admin_grant_required") }),
+      }),
+    });
+    const response = await withDiscovery(probe, () =>
+      CONNECT(request("POST", { action: "discover", base_url: "http://10.0.0.7:6379" })),
+    );
+
+    expect(response.status).toBe(403);
+    // NOT A SINGLE OUTBOUND PACKET. Refusing after the probe would still have
+    // answered the question the probe was asked.
+    expect(probed, "the BFF reached the named host despite the refusal").toBe(0);
+    expect(stub.routes()).toEqual([PROVIDER_LIST]);
+  });
+
+  test("a stalled or broken response body is a keyed 502, never a 500 with a stack", async () => {
+    // `readBounded` used to be called with no deadline, no signal and no
+    // try/catch, so a body that failed after the headers rejected out of
+    // `discoverModels`, out of this handler, and past `withConsoleSession`'s
+    // catch — which rethrows anything that is not a MoiraRequestError. Next then
+    // rendered a 500. A half-open network on the operator's LAN is this screen's
+    // stated normal case.
+    const broken = (async () => {
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"data":['));
+          controller.error(new TypeError("terminated"));
+        },
+      });
+      return new Response(stream, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const response = await withDiscovery(broken, () =>
+      CONNECT(request("POST", { action: "discover", base_url: BASE_URL })),
+    );
+    expect(response.status).toBe(502);
+    const body = await json(response);
+    expect(errorOf(body)["message_key"]).toBe(CONSOLE_MESSAGE_KEYS.llm_discovery_unreachable);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+  });
+
+  test("a model id past discovery's own bounds is refused on the way back in", async () => {
+    // `model_keys` is a plain request body. Narrowing what discovery OFFERS
+    // while accepting anything on the return trip narrows nothing: the value
+    // travels into a provider row and onto the wire of every completion.
+    const response = await CONNECT(
+      request("POST", {
+        action: "connect",
+        base_url: BASE_URL,
+        model_keys: ["x".repeat(1024)],
+      }),
+    );
+    expect(response.status).toBe(400);
+    expect(errorOf(await json(response))["message_key"]).toBe(
+      CONSOLE_MESSAGE_KEYS.llm_model_required,
+    );
     expect(stub.routes()).toEqual([]);
   });
 

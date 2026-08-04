@@ -26,8 +26,21 @@
 // ============================================================================
 //
 // Two identical policies on one route are both stored and both eligible. The
-// existing set is listed first and a match is returned as-is, which makes a
+// existing set is listed first and a match is returned, which makes a
 // double-click a no-op instead of a second eligible row.
+//
+// A MATCH IS RETURNED **ACTIVE**, NOT AS FOUND. A disabled policy still blocks
+// the create — it is the same (route, provider, model) triple, and this handler
+// would keep answering 200 with its id forever while `runtime.rs`, which joins
+// `routing_policies` on `rp.status = 'active'`, kept refusing to select it. So
+// an active policy for that triple could never be produced from this screen
+// again, and the only undo the screen offers would be a one-way door. A disabled
+// match is enabled instead.
+//
+// The dedupe also REFUSES A TRUNCATED PAGE rather than reading "not on page one"
+// as "does not exist" — the same rule `findOnPage` applies inside the chain, for
+// the same reason: guessing wrong creates the duplicate the dedupe exists to
+// prevent.
 //
 // Re-checks the session itself — `app/api/**` is outside every route group.
 
@@ -35,6 +48,7 @@ import { badRequest, notFound, readJsonBody, withConsoleSession } from "@/lib/co
 import { CONSOLE_MESSAGE_KEYS } from "@/lib/i18n/keys";
 import { GENERAL_ROUTE_KEY } from "@/lib/llm-view";
 import { LIST_PAGE_LIMIT } from "@/lib/llm-settings";
+import { ifMatchFor } from "@/lib/moira-client";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -69,7 +83,16 @@ export async function POST(
         policy.status !== "deleted",
     );
     if (already !== undefined) {
-      return Response.json({ id: already.id }, { headers: { "cache-control": "no-store" } });
+      if (already.status === "active") {
+        return Response.json({ id: already.id }, { headers: { "cache-control": "no-store" } });
+      }
+      const revived = await client.enableRoutingPolicy(already.id, ifMatchFor(already));
+      return Response.json({ id: revived.id }, { headers: { "cache-control": "no-store" } });
+    }
+    if (existing.pagination.has_more) {
+      // "Not on this page" is not "does not exist". Creating anyway is how a
+      // second eligible policy for one triple gets landed.
+      return badRequest(CONSOLE_MESSAGE_KEYS.llm_list_truncated);
     }
 
     const record = await client.createRoutingPolicy(

@@ -266,9 +266,15 @@ describe("ConnectVllmPanel — the shortcut", () => {
       expect(copy(stepLabelKey(step)), step).not.toBe("");
     }
     expect(stepLabelKey("a-step-added-later")).toBe(CONSOLE_MESSAGE_KEYS.llm_step_unknown);
-    for (const outcome of ["created", "reused", "skipped"]) {
+    for (const outcome of ["created", "reused", "enabled", "skipped"]) {
       expect(copy(outcomeLabelKey(outcome)), outcome).not.toBe("");
     }
+    // `enabled` is its own label and NOT a synonym for `reused`. A step that
+    // found a disabled row and turned it back on did not reuse anything routing
+    // would have accepted, and reporting it as reuse is how the shortcut
+    // announced success on a deployment no prompt could reach.
+    expect(outcomeLabelKey("enabled")).not.toBe(outcomeLabelKey("reused"));
+    expect(copy(outcomeLabelKey("enabled"))).not.toBe(copy(outcomeLabelKey("reused")));
   });
 });
 
@@ -470,6 +476,53 @@ describe("ProviderChainPanel — what exists and what is still missing", () => {
       ).disabled,
     ).toBe(true);
   });
+
+  test("A PROVIDER WHOSE ONLY MODEL IS DISABLED IS NOT READY", () => {
+    // `chainReadiness` tested `status !== "deleted"`, and `provider_models.status`
+    // cannot BE "deleted" — migration 0003 constrains the column to
+    // ('active','disabled','deprecated') and disable writes 'disabled'. So the
+    // test degraded to "a row exists" while Moira's routing joins
+    // `pm.status = 'active'`. The screen said "Ready: a prompt can reach this
+    // provider" directly under the model's own Disabled badge, and the first
+    // prompt then failed with a routing error naming neither.
+    const halfDead = provider({
+      models: [model({ status: "disabled" })],
+      keyRows: [{ id: "cred-1", kind: "api_key", status: "active", version: 1 }],
+      policies: [
+        {
+          id: "policy-1",
+          routeId: "route-1",
+          routeKey: "general",
+          providerModelId: "model-1",
+          priority: 100,
+          weight: 1,
+          status: "active",
+          version: 1,
+        },
+      ],
+    });
+    render(<ProviderChainPanel provider={halfDead} />);
+    expect(screen.getByText(copy(CONSOLE_MESSAGE_KEYS.llm_chain_incomplete))).toBeDefined();
+    expect(screen.queryByText(copy(CONSOLE_MESSAGE_KEYS.llm_chain_complete))).toBeNull();
+    expect(missingStepKeys(halfDead)).toContain(CONSOLE_MESSAGE_KEYS.llm_step_model_missing);
+    // A 'deprecated' model, set outside this console, is the same answer.
+    expect(missingStepKeys(provider({ models: [model({ status: "deprecated" })] }))).toContain(
+      CONSOLE_MESSAGE_KEYS.llm_step_model_missing,
+    );
+  });
+
+  test("a disabled model is not offered for binding — that policy would never route", () => {
+    render(
+      <ProviderChainPanel
+        provider={provider({ models: [model({ status: "disabled" }), model({ id: "model-2", modelKey: "live" })] })}
+      />,
+    );
+    const select = field(CONSOLE_MESSAGE_KEYS.llm_bind_routing_model_label) as HTMLSelectElement;
+    const values = Array.from(select.options).map((option) => option.value);
+    // The placeholder plus the one active model, and not the disabled one:
+    // Moira stores a policy pointing at it and then never selects it.
+    expect(values).toEqual(["", "model-2"]);
+  });
 });
 
 /* -------------------------------------------------------------------------- */
@@ -535,6 +588,86 @@ describe("ProviderList — the inventory and its undo", () => {
     expect(screen.getAllByText(copy(CONSOLE_MESSAGE_KEYS.llm_status_disabled)).length).toBeGreaterThan(
       0,
     );
+  });
+
+  test("A DISABLED ROW OFFERS THE WAY BACK, and it is the same path POSTed", async () => {
+    // "Disable is reversible" is the stated justification for choosing disable
+    // over delete. It was false for three of the four row types: the client's
+    // `enableProviderModel`, `enableProviderCredential` and `enableRoutingPolicy`
+    // had no caller anywhere, so the only undo this screen offered had no undo
+    // of its own — and re-adding a model with the same identifier collides with
+    // the disabled row still holding the partial unique index.
+    const send = scriptedFetch([{ status: 200, body: { id: "model-1" } }]);
+    const changed: string[] = [];
+    render(
+      <ProviderList
+        providers={[provider({ models: [model({ status: "disabled" })] })]}
+        fetchImpl={send}
+        onChanged={() => changed.push("yes")}
+      />,
+    );
+
+    // One control, and it says what it will do. Not a disabled "Disable" beside
+    // an enabled "Enable".
+    expect(screen.queryByRole("button", { name: copy(CONSOLE_MESSAGE_KEYS.llm_disable_model) })).toBeNull();
+    await userEvent.click(
+      screen.getByRole("button", { name: copy(CONSOLE_MESSAGE_KEYS.llm_enable_model) }),
+    );
+
+    await waitFor(() => expect(send.calls.length).toBe(1));
+    expect(send.calls[0]).toMatchObject({
+      url: "/api/llm/providers/provider-1/models/model-1",
+      method: "POST",
+    });
+    expect(changed).toEqual(["yes"]);
+  });
+
+  test("an active row still offers only the disable control", () => {
+    render(<ProviderList providers={[provider({ models: [model()] })]} />);
+    expect(
+      screen.getByRole("button", { name: copy(CONSOLE_MESSAGE_KEYS.llm_disable_model) }),
+    ).toBeDefined();
+    expect(
+      screen.queryByRole("button", { name: copy(CONSOLE_MESSAGE_KEYS.llm_enable_model) }),
+    ).toBeNull();
+  });
+
+  test("the credential row and the routing policy get the same two-state control", async () => {
+    const send = scriptedFetch([{ status: 200, body: { id: "x" } }]);
+    render(
+      <ProviderList
+        providers={[
+          provider({
+            keyRows: [{ id: "cred-1", kind: "api_key", status: "disabled", version: 1 }],
+            policies: [
+              {
+                id: "policy-1",
+                routeId: "route-1",
+                routeKey: "general",
+                providerModelId: "model-1",
+                priority: 100,
+                weight: 1,
+                status: "disabled",
+                version: 1,
+              },
+            ],
+          }),
+        ]}
+        fetchImpl={send}
+      />,
+    );
+
+    expect(
+      screen.getByRole("button", { name: copy(CONSOLE_MESSAGE_KEYS.llm_enable_key_row) }),
+    ).toBeDefined();
+    await userEvent.click(
+      screen.getByRole("button", { name: copy(CONSOLE_MESSAGE_KEYS.llm_enable_policy) }),
+    );
+    await waitFor(() => expect(send.calls.length).toBe(1));
+    expect(send.calls[0]).toMatchObject({
+      url: "/api/llm/providers/provider-1/routing/policy-1",
+      method: "POST",
+    });
   });
 
   test("statusKey maps active and everything else to two distinct keys", () => {

@@ -77,14 +77,29 @@ const GUARDED_ENDPOINTS: ReadonlyArray<{
   { method: "DELETE", path: "/api/llm/providers/e2e-provider" },
   { method: "POST", path: "/api/llm/providers/e2e-provider/models", body: { model_key: "e2e" } },
   { method: "DELETE", path: "/api/llm/providers/e2e-provider/models/e2e-model" },
+  {
+    method: "POST",
+    path: "/api/llm/providers/e2e-provider/models/e2e-model",
+    stage: "enable",
+  },
   { method: "POST", path: "/api/llm/providers/e2e-provider/credentials", body: { api_key: "" } },
   { method: "DELETE", path: "/api/llm/providers/e2e-provider/credentials/e2e-credential" },
+  {
+    method: "POST",
+    path: "/api/llm/providers/e2e-provider/credentials/e2e-credential",
+    stage: "enable",
+  },
   {
     method: "POST",
     path: "/api/llm/providers/e2e-provider/routing",
     body: { provider_model_id: "e2e-model" },
   },
   { method: "DELETE", path: "/api/llm/providers/e2e-provider/routing/e2e-policy" },
+  {
+    method: "POST",
+    path: "/api/llm/providers/e2e-provider/routing/e2e-policy",
+    stage: "enable",
+  },
   {
     method: "POST",
     path: "/api/llm/connect-vllm",
@@ -99,7 +114,30 @@ const GUARDED_ENDPOINTS: ReadonlyArray<{
   },
 ];
 
-/** The three keyed refusals `withConsoleSession` may answer with. */
+/**
+ * The three keyed refusals `withConsoleSession` may answer with.
+ *
+ * ============================================================================
+ * 503 IS ON THIS LIST, AND THAT MAKES THE LOOP WEAKER THAN IT READS
+ * ============================================================================
+ *
+ * In THIS environment 503 is what every request produces regardless of the
+ * session: `MOIRA_API_URL` is `https://moira.invalid`, so `consoleRuntime()`
+ * cannot resolve a configuration and `withConsoleSession` returns before the
+ * session check runs at all. So the loop below proves "no 2xx and no Moira call
+ * reached", which is real and worth having, and does NOT prove "the session
+ * check refused" — nothing a browser can do here proves that, because there is
+ * no IdP inside the e2e environment to sign in against.
+ *
+ * The assertion that a SESSION is what separates a refusal from a success lives
+ * in `tests/integration/llm-connect-flow.test.ts`, which signs in for real
+ * against the mock IdP and makes the same call twice, once with the cookie and
+ * once without. Stated here rather than left implied, so nobody reads this loop
+ * as the gate's proof.
+ *
+ * REVERSAL CONDITION: when an authenticated Playwright project exists,
+ * `MOIRA_API_URL` points at something resolvable and 503 can leave this set.
+ */
 const REFUSAL_STATUSES = new Set([401, 403, 503]);
 
 test.describe("the LLM settings surface is gated", () => {
@@ -161,8 +199,10 @@ test.describe("the LLM settings surface is gated", () => {
 
   test("the guarded list covers every handler this item added", () => {
     // Named rather than counted, so adding a handler without adding it here is
-    // visible. Eleven exported handlers across nine route modules; the shortcut
-    // appears twice because its two stages are worth refusing separately.
+    // visible. Fourteen exported handlers across nine route modules: the three
+    // nested rows each carry a DELETE and the POST that reverses it, and the
+    // shortcut appears twice because its two stages are worth refusing
+    // separately.
     const paths = new Set(GUARDED_ENDPOINTS.map((endpoint) => endpoint.path));
     for (const path of [
       "/api/llm/providers",

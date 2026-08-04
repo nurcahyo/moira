@@ -22,8 +22,11 @@ import {
   isLlmProvisioningError,
   loadLlmSettings,
   modelKeysFromDiscoveryBody,
+  narrowModelKeys,
   runConnectChain,
+  DISCOVERY_MAX_BYTES,
   DISCOVERY_MAX_MODEL_KEY_LENGTH,
+  DISCOVERY_MAX_MODELS,
 } from "@/lib/llm-settings";
 import { MoiraClient } from "@/lib/moira-client";
 import {
@@ -334,6 +337,84 @@ describe("every step is reuse-first", () => {
     expect(retry.routes()).toContain(POLICY_CREATE);
   });
 
+  test("A DISABLED ROW IS REUSED **AND ENABLED**, not reported as if it worked", async () => {
+    // The state an operator reaches with this page's own buttons: connect, then
+    // disable a model, a credential row and a policy. Every reuse-first match
+    // accepted a disabled row and traced it as "reused", so the shortcut
+    // answered 201 announcing that everything exists — while `runtime.rs` joins
+    // all three on `status = 'active'` and no prompt could route. Narrowing the
+    // match instead would not do: a disabled model still occupies the partial
+    // unique index on `model_key`, so creating a second one is a unique
+    // violation Moira has no mapping for, i.e. an opaque 500.
+    const MODEL_ENABLE = `POST /api/v1/admin/provider-models/${MODEL_ID}/enable`;
+    const CREDENTIAL_ENABLE = `POST /api/v1/admin/provider-credentials/${CREDENTIAL_ID}/enable`;
+    const POLICY_ENABLE = `POST /api/v1/admin/routing-policies/${POLICY_ID}/enable`;
+
+    const stub = createMoiraStub(
+      handlers({
+        [PROVIDER_LIST]: () => ({ status: 200, body: page([providerRecord()]) }),
+        [MODEL_LIST]: () => ({
+          status: 200,
+          body: page([modelRecord({ status: "disabled", version: 4 })]),
+        }),
+        [MODEL_ENABLE]: () => ({ status: 200, body: modelRecord({ version: 5 }) }),
+        [CREDENTIAL_LIST]: () => ({
+          status: 200,
+          body: page([credentialRecord({ status: "disabled", version: 6 })]),
+        }),
+        [CREDENTIAL_ENABLE]: () => ({ status: 200, body: credentialRecord({ version: 7 }) }),
+        [POLICY_LIST]: () => ({
+          status: 200,
+          body: page([policyRecord({ status: "disabled", version: 8 })]),
+        }),
+        [POLICY_ENABLE]: () => ({ status: 200, body: policyRecord({ version: 9 }) }),
+      }),
+    );
+    const result = await connect(stub);
+
+    expect(stub.routes()).toEqual([
+      PROVIDER_LIST,
+      MODEL_LIST,
+      MODEL_ENABLE,
+      CREDENTIAL_LIST,
+      CREDENTIAL_ENABLE,
+      ROUTE_LIST,
+      POLICY_LIST,
+      POLICY_ENABLE,
+    ]);
+    // Nothing was duplicated on the way.
+    for (const write of [MODEL_CREATE, CREDENTIAL_CREATE, POLICY_CREATE]) {
+      expect(stub.routes(), `${write} duplicated a row that already existed`).not.toContain(write);
+    }
+    // Each `If-Match` is the version that was READ, never fabricated.
+    expect(stub.requestsFor(MODEL_ENABLE)[0]?.headers["If-Match"]).toBe("4");
+    expect(stub.requestsFor(CREDENTIAL_ENABLE)[0]?.headers["If-Match"]).toBe("6");
+    expect(stub.requestsFor(POLICY_ENABLE)[0]?.headers["If-Match"]).toBe("8");
+
+    // AND THE REPORT SAYS SO. "reused" here would be the console telling the
+    // operator a deployment works when it does not.
+    const outcomes = Object.fromEntries(result.trace.map((entry) => [entry.step, entry.outcome]));
+    expect(outcomes["provider_model"]).toBe("enabled");
+    expect(outcomes["provider_credential"]).toBe("enabled");
+    expect(outcomes["routing_policy"]).toBe("enabled");
+  });
+
+  test("an ACTIVE row is still merely reused — no version is burned on a no-op", async () => {
+    // The negative control for the test above. Enabling what is already enabled
+    // would move the version under a concurrent editor for no reason.
+    const stub = createMoiraStub(
+      handlers({
+        [PROVIDER_LIST]: () => ({ status: 200, body: page([providerRecord()]) }),
+        [MODEL_LIST]: () => ({ status: 200, body: page([modelRecord()]) }),
+        [CREDENTIAL_LIST]: () => ({ status: 200, body: page([credentialRecord()]) }),
+        [POLICY_LIST]: () => ({ status: 200, body: page([policyRecord()]) }),
+      }),
+    );
+    const result = await connect(stub);
+    expect(stub.routes().filter((route) => route.endsWith("/enable"))).toEqual([]);
+    expect(result.trace.every((entry) => entry.outcome !== "enabled")).toBe(true);
+  });
+
   test("a truncated list is refused rather than guessed", async () => {
     // `scripts/seed-local.sh`'s `find_by`: "not on this page" is not "does not
     // exist", and creating the row anyway makes the duplicate the dedupe existed
@@ -354,6 +435,38 @@ describe("every step is reuse-first", () => {
       CONSOLE_MESSAGE_KEYS.llm_list_truncated,
     );
     expect(stub.routes()).not.toContain(PROVIDER_CREATE);
+  });
+
+  test("a truncation at step five still reports the four steps that succeeded", async () => {
+    // `findOnPage` threw with `state: emptyConnectState()` and `trace: []`,
+    // which discards exactly what `LlmProvisioningError` exists to carry: the
+    // operator is told a provider, a model and a credential row exist, or the
+    // second click is made blind.
+    const stub = createMoiraStub(
+      handlers({ [POLICY_LIST]: () => ({ status: 200, body: page([], true) }) }),
+    );
+    let caught: unknown;
+    try {
+      await connect(stub);
+    } catch (error) {
+      caught = error;
+    }
+    expect(isLlmProvisioningError(caught)).toBe(true);
+    const failure = caught as {
+      step: string;
+      state: { providerId: string | null; providerModelIds: readonly string[] };
+      trace: readonly { step: string }[];
+    };
+    expect(failure.step).toBe("routing_policy");
+    expect(failure.state.providerId).toBe(PROVIDER_ID);
+    expect(failure.state.providerModelIds).toEqual([MODEL_ID]);
+    expect(failure.trace.map((entry) => entry.step)).toEqual([
+      "provider",
+      "provider_model",
+      "provider_credential",
+      "provider_enable",
+    ]);
+    expect(stub.routes()).not.toContain(POLICY_CREATE);
   });
 
   test("a missing `general` route is an actionable keyed error, not a crash", async () => {
@@ -454,7 +567,15 @@ describe("modelKeysFromDiscoveryBody — the validation, on its own", () => {
     { what: "an entry with no `id`", body: { data: [{ name: "a" }] } },
     { what: "a numeric `id`", body: { data: [{ id: 7 }] } },
     { what: "a blank `id`", body: { data: [{ id: "   " }] } },
-    { what: "an `id` carrying a control character", body: { data: [{ id: "a b" }] } },
+    {
+      // Written as an ESCAPE, not as a raw 0x00 byte. The implementation states the
+      // convention in as many words ("Written as escapes rather than as raw bytes so
+      // the range stays readable in a diff"), and a literal NUL in the source is
+      // invisible in a review, survives a copy-paste as nothing at all, and makes the
+      // test file itself the counter-example to the rule it is asserting.
+      what: "an `id` carrying a control character",
+      body: { data: [{ id: "a\u0000b" }] },
+    },
     {
       what: "an unboundedly long `id`",
       body: { data: [{ id: "x".repeat(DISCOVERY_MAX_MODEL_KEY_LENGTH + 1) }] },
@@ -553,6 +674,206 @@ describe("discoverModels", () => {
       ok: false,
       messageKey: CONSOLE_MESSAGE_KEYS.llm_discovery_invalid_response,
     });
+  });
+
+  test("the probe refuses to follow a redirect to a host the operator never named", async () => {
+    // `redirect: "error"` had no test at all, so deleting the option — or
+    // setting it to `"follow"` — was invisible: no fake inspects `init`, and the
+    // integration fixture answers 200 directly. An endpoint that 302s moves the
+    // request, and the credential-free GET, to somewhere nobody typed.
+    let seen: RequestInit | undefined;
+    const spy = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+      seen = init;
+      return new Response(JSON.stringify({ data: [{ id: MODEL_KEY }] }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    await discoverModels(BASE_URL, { fetchImpl: spy });
+    expect(seen?.redirect).toBe("error");
+    // And no credential of any kind travels with it.
+    expect(JSON.stringify(seen?.headers ?? {}).toLowerCase()).not.toContain("authorization");
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The two bounds that only exist once the HEADERS have arrived               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A `fetch` whose RESPONSE HEADERS arrive at once and whose BODY then behaves
+ * badly.
+ *
+ * ============================================================================
+ * WHY EVERY EXISTING DISCOVERY FAKE WAS BLIND TO THIS
+ * ============================================================================
+ *
+ * They all return a fully-buffered `Response`, or a promise that never settles.
+ * Both are pre-header shapes: `fetch` resolves when the headers land, so a
+ * deadline armed only around the fetch call covers exactly the hang those fakes
+ * produce, and nothing after it. The one test named "a hung endpoint is
+ * abandoned at the timeout" hangs the fetch PROMISE — which is the one hang the
+ * old timer already handled — so it stayed green through a defect that let a
+ * trickling endpoint hold a Node request handler open indefinitely.
+ *
+ * This builds the missing shape: 200, headers immediately, then a body that
+ * stalls, errors, or never stops. `cancelled()` reports whether the console
+ * closed the stream, which is what closes the socket.
+ */
+function bodyAfterHeaders(build: (controller: ReadableStreamDefaultController<Uint8Array>) => void): {
+  readonly impl: typeof fetch;
+  readonly cancelled: () => boolean;
+} {
+  let cancelled = false;
+  const impl = (async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        build(controller);
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    return new Response(stream, {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as unknown as typeof fetch;
+  return { impl, cancelled: () => cancelled };
+}
+
+const encode = (text: string): Uint8Array => new TextEncoder().encode(text);
+
+/** Let a cancellation that was started synchronously actually run. */
+async function settle(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+describe("the discovery deadline covers the BODY, not merely the headers", () => {
+  test("A BODY THAT STALLS AFTER THE HEADERS IS ABANDONED, and the stream is closed", async () => {
+    // THE MUTATION THIS BUYS: move `clearTimeout(timer)` back into the fetch's
+    // own `finally`, or drop the signal from `readBounded`, and this test never
+    // finishes — which is precisely the production behaviour it describes. A
+    // signed-in caller can point `action: "discover"` at a host that answers 200
+    // in ten milliseconds and then writes one byte every thirty seconds; the
+    // byte cap is never reached, `done` never arrives, and the handler is pinned
+    // for as long as that host chooses. undici's `bodyTimeout` is a 300 s
+    // INACTIVITY timer and resets on every byte, so it is not a backstop.
+    const trickle = bodyAfterHeaders((controller) => {
+      controller.enqueue(encode('{"data":['));
+      // ... and nothing more, ever.
+    });
+
+    expect(await discoverModels(BASE_URL, { fetchImpl: trickle.impl, timeoutMs: 25 })).toEqual({
+      ok: false,
+      messageKey: CONSOLE_MESSAGE_KEYS.llm_discovery_unreachable,
+    });
+    await settle();
+    expect(trickle.cancelled(), "the stalled body was left holding the socket").toBe(true);
+  });
+
+  test("A BODY THAT FAILS MID-STREAM IS A KEYED REFUSAL, NOT A THROW", async () => {
+    // `discoverModels`'s own header promises no path throws. It promised that
+    // only as far as the headers: `readBounded` was called bare, so a reset, a
+    // TLS shutdown or a premature close rejected out of here, out of the route
+    // handler, past `withConsoleSession`'s catch — which rethrows anything that
+    // is not a MoiraRequestError — and rendered as a Next 500 with a stack.
+    // A half-open network on the operator's own LAN is this screen's stated
+    // normal case.
+    const broken = bodyAfterHeaders((controller) => {
+      controller.enqueue(encode('{"data":['));
+      controller.error(new TypeError("terminated"));
+    });
+
+    let thrown: unknown = null;
+    let outcome: unknown = null;
+    try {
+      outcome = await discoverModels(BASE_URL, { fetchImpl: broken.impl });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown, "discoverModels threw instead of returning a keyed outcome").toBeNull();
+    expect(outcome).toEqual({
+      ok: false,
+      messageKey: CONSOLE_MESSAGE_KEYS.llm_discovery_unreachable,
+    });
+  });
+
+  test("the 256 KiB cap is enforced on a STREAM, not only on `content-length`", async () => {
+    // The only oversize test declares a 64 MiB `content-length` on a tiny body,
+    // so it exercises the pre-check and never the loop. An endpoint that simply
+    // omits the header — trivially, and every chunked response does — walked
+    // straight past it.
+    const chunk = new Uint8Array(64 * 1024);
+    let queued = 0;
+    const flood = bodyAfterHeaders((controller) => {
+      while (queued <= DISCOVERY_MAX_BYTES + chunk.byteLength) {
+        controller.enqueue(chunk);
+        queued += chunk.byteLength;
+      }
+    });
+
+    expect(await discoverModels(BASE_URL, { fetchImpl: flood.impl })).toEqual({
+      ok: false,
+      messageKey: CONSOLE_MESSAGE_KEYS.llm_discovery_response_too_large,
+    });
+    await settle();
+    expect(flood.cancelled(), "the oversized body was read but never cancelled").toBe(true);
+  });
+
+  test("a body that arrives in pieces and then ENDS is read normally", async () => {
+    // The negative control for all three above: chunking on its own is ordinary,
+    // and a bound that refused it would be a bound that broke the feature.
+    const chunked = bodyAfterHeaders((controller) => {
+      controller.enqueue(encode('{"data":[{"id":"'));
+      controller.enqueue(encode(MODEL_KEY));
+      controller.enqueue(encode('"}]}'));
+      controller.close();
+    });
+    expect(await discoverModels(BASE_URL, { fetchImpl: chunked.impl })).toEqual({
+      ok: true,
+      baseUrl: BASE_URL,
+      models: [MODEL_KEY],
+    });
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The other door a model id comes in through                                 */
+/* -------------------------------------------------------------------------- */
+
+describe("narrowModelKeys — the `connect` stage gets discovery's bounds too", () => {
+  test("a plain list is trimmed and de-duplicated", () => {
+    expect(narrowModelKeys([" a ", "b", "a"])).toEqual(["a", "b"]);
+  });
+
+  const rejected: ReadonlyArray<{ what: string; input: unknown }> = [
+    { what: "not an array", input: "a" },
+    { what: "an empty selection", input: [] },
+    { what: "a non-string entry", input: ["a", 7] },
+    { what: "a blank entry", input: ["a", "   "] },
+    {
+      what: "an id past the length cap",
+      input: ["x".repeat(DISCOVERY_MAX_MODEL_KEY_LENGTH + 1)],
+    },
+    { what: "an id carrying a control character", input: ["a\u0000b"] },
+    {
+      what: "more ids than the ceiling",
+      input: Array.from({ length: DISCOVERY_MAX_MODELS + 5 }, (_, index) => `m${index}`),
+    },
+  ];
+
+  for (const scenario of rejected) {
+    test(`${scenario.what} is refused`, () => {
+      expect(narrowModelKeys(scenario.input)).toBeNull();
+    });
+  }
+
+  test("the two doors agree, which is the whole point", () => {
+    // A body posted to `action: "connect"` is not obliged to carry what
+    // discovery offered, so a cap applied to one of them is a cap applied to
+    // neither.
+    const hostile = "a".repeat(DISCOVERY_MAX_MODEL_KEY_LENGTH + 1);
+    expect(modelKeysFromDiscoveryBody({ data: [{ id: hostile }] })).toBeNull();
+    expect(narrowModelKeys([hostile])).toBeNull();
   });
 });
 

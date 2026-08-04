@@ -42,9 +42,7 @@ import { CONSOLE_MESSAGE_KEYS, t } from "@/lib/i18n";
 import { loadLlmSettings } from "@/lib/llm-settings";
 import { LOCAL_VLLM_BASE_URL, type LlmSettingsView } from "@/lib/llm-view";
 import { moiraClientForSession } from "@/lib/moira-session";
-import { ConnectVllmPanel } from "@/modules/llm/ConnectVllmPanel";
-import { ProviderForm } from "@/modules/llm/ProviderForm";
-import { ProviderList } from "@/modules/llm/ProviderList";
+import { LlmSettingsPanels } from "@/modules/llm/LlmSettingsPanels";
 import { headers } from "next/headers";
 
 import styles from "./page.module.css";
@@ -86,9 +84,15 @@ export default async function LlmSettingsPage() {
               {t(CONSOLE_MESSAGE_KEYS.llm_general_route_missing)}
             </p>
           )}
-          <ConnectVllmPanel defaultBaseUrl={LOCAL_VLLM_BASE_URL} />
-          <ProviderForm />
-          <ProviderList providers={data.providers} />
+          {/* The three organisms, wired to re-read this page after any of them
+              changes something. A server component cannot call `refresh()`, and
+              a screen that renders a server-read view while a client organism
+              mutates behind it goes stale the moment anything succeeds — see
+              `LlmSettingsPanels`. */}
+          <LlmSettingsPanels
+            defaultBaseUrl={LOCAL_VLLM_BASE_URL}
+            providers={data.providers}
+          />
         </>
       )}
     </main>

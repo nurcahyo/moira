@@ -54,6 +54,7 @@ import { restoreDomWhatwgGlobals, useNativeWhatwgGlobals } from "../support/nati
 import { startMockIdp, type MockIdp } from "../support/mock-idp";
 import {
   createMoiraStub,
+  errorEnvelope,
   MOIRA_STUB_BASE_URL,
   type MoiraStub,
   type StubHandler,
@@ -344,6 +345,29 @@ describe("the shortcut, driven with a session the console itself minted", () => 
     expect(await json(admitted)).toEqual({ base_url: vllmBaseUrl, models: [MODEL_KEY] });
   });
 
+  test("AND A SESSION WITHOUT AN ADMIN GRANT IS REFUSED BEFORE THE PROBE LEAVES", async () => {
+    // The same cookie, minted by the same real sign-in — this is not a session
+    // problem. `checkSession` admits any verified address inside
+    // `allowed_email_domains`, and it reads no `admin_identities` grant, so for
+    // this one handler the session gate was the entire authorization: its whole
+    // effect is an outbound GET from inside the deployment's network to a host
+    // named in the request body, and no Moira call was ever made to be refused.
+    // Moira answering 403 to the grant read is what has to stop it, and it must
+    // stop it BEFORE the socket opens.
+    install(
+      moiraHandlers({
+        [PROVIDER_LIST]: () => ({ status: 403, body: errorEnvelope("admin_grant_required") }),
+      }),
+    );
+    vllmRequests = [];
+
+    const response = await CONNECT(
+      request({ action: "discover", base_url: vllmBaseUrl }, signedInCookie),
+    );
+    expect(response.status).toBe(403);
+    expect(vllmRequests, "the BFF probed the named host for a caller with no grant").toEqual([]);
+  });
+
   test("DISCOVERY GOES OUT FROM THE BFF, and the browser never touches the endpoint", async () => {
     install();
     vllmRequests = [];
@@ -354,8 +378,9 @@ describe("the shortcut, driven with a session the console itself minted", () => 
     // The version segment was appended, and the probe reached the real server.
     expect(vllmRequests).toEqual(["GET /v1/models"]);
     expect((await json(response))["base_url"]).toBe(vllmBaseUrl);
-    // Nothing was written by a probe.
-    expect(stub.routes()).toEqual([]);
+    // Nothing was WRITTEN by a probe. The single Moira call is the admin-grant
+    // read that authorizes it — a list, and it comes first.
+    expect(stub.routes()).toEqual([PROVIDER_LIST]);
   });
 
   test("the whole chain runs in the seed script's order and ends routable", async () => {

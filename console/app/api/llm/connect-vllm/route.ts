@@ -26,12 +26,32 @@
 // contact out of this process.
 //
 // It is bounded on all three axes that can hang a request handler — a 5 s
-// timeout, a 256 KiB read cap, and a cap on how many model ids may be offered —
-// and its response is VALIDATED before any of it is rendered. See
-// `discoverModels` and `modelKeysFromDiscoveryBody`.
+// deadline that covers the RESPONSE BODY and not merely the headers, a 256 KiB
+// read cap, and a cap on how many model ids may be offered — and its response is
+// VALIDATED before any of it is rendered. See `discoverModels`, `readBounded`
+// and `modelKeysFromDiscoveryBody`.
 //
 // An unreachable endpoint is an ordinary keyed message. A laptop with the tunnel
 // down must still get a usable page.
+//
+// ============================================================================
+// AND IT IS THE ONE HANDLER HERE WHOSE EFFECT NEVER REACHES MOIRA
+// ============================================================================
+//
+// The other ten handlers on this surface are authorized by Moira, because every
+// one of their effects IS a Moira admin call: a signed-in employee with no
+// `admin_identities` grant gets a 403 from Moira and nothing happens. The
+// `discover` stage has no such backstop — its whole effect is an outbound GET
+// from inside the deployment's network to a host named in the request body, and
+// it used to return before touching `client` at all, which made
+// `withConsoleSession` its entire authorization. That check is a session check,
+// not an admin check (`lib/console-api.ts` says so itself), so the stage was a
+// host and port oracle for anyone inside `allowed_email_domains`.
+//
+// `requireAdminGrant` runs FIRST, before the URL is even canonicalised. It is an
+// admin-plane read, so Moira's `authenticate_admin` applies the grant union and
+// answers 403 to a caller who holds none — and that 403 travels as a
+// `MoiraRequestError`, which `withConsoleSession` already renders keyed.
 //
 // ============================================================================
 // A PARTIAL CHAIN COMES BACK AS STATE, NOT AS A BARE FAILURE
@@ -51,6 +71,8 @@ import {
   canonicalOpenAiBaseUrl,
   discoverModels,
   isLlmProvisioningError,
+  narrowModelKeys,
+  requireAdminGrant,
   runConnectChain,
 } from "@/lib/llm-settings";
 
@@ -58,19 +80,6 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const NO_STORE = { "cache-control": "no-store" } as const;
-
-/** Model ids the operator selected, narrowed before they reach a provider row. */
-function readModelKeys(value: unknown): readonly string[] | null {
-  if (!Array.isArray(value) || value.length === 0) return null;
-  const keys: string[] = [];
-  for (const entry of value) {
-    if (typeof entry !== "string") return null;
-    const trimmed = entry.trim();
-    if (trimmed === "") return null;
-    if (!keys.includes(trimmed)) keys.push(trimmed);
-  }
-  return keys;
-}
 
 export async function POST(request: Request): Promise<Response> {
   return withConsoleSession(request, async ({ client }) => {
@@ -80,6 +89,10 @@ export async function POST(request: Request): Promise<Response> {
     const action = body["action"];
 
     if (action === "discover") {
+      // BEFORE the outbound fetch, and before the address is even parsed: this
+      // stage's whole effect happens outside Moira, so the grant has to be read
+      // rather than assumed. See this file's header.
+      await requireAdminGrant(client);
       const outcome = await discoverModels(body["base_url"]);
       if (!outcome.ok) {
         return Response.json(
@@ -97,7 +110,10 @@ export async function POST(request: Request): Promise<Response> {
       const resolved = canonicalOpenAiBaseUrl(body["base_url"]);
       if (!resolved.ok) return badRequest(resolved.messageKey);
 
-      const modelKeys = readModelKeys(body["model_keys"]);
+      // The SAME narrowing discovery applies — a 256-character cap, a 200-entry
+      // ceiling and a control-character refusal. `model_keys` is a plain request
+      // body and nothing obliges it to carry what discovery offered.
+      const modelKeys = narrowModelKeys(body["model_keys"]);
       if (modelKeys === null) return badRequest(CONSOLE_MESSAGE_KEYS.llm_model_required);
 
       const displayName =

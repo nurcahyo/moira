@@ -38,6 +38,7 @@ import { CONSOLE_MESSAGE_KEYS, t } from "@/lib/i18n";
 import {
   chainReadiness,
   isChainComplete,
+  isRoutable,
   providerEndpoint,
   type LlmProviderView,
 } from "@/lib/llm-view";
@@ -78,6 +79,12 @@ export function ProviderChainPanel({ provider, fetchImpl, onChanged }: ProviderC
   const pending = phase.kind === "pending";
   const missing = missingStepKeys(provider);
   const complete = isChainComplete(chainReadiness(provider));
+  // ONLY MODELS ROUTING WOULD ACCEPT. Binding a policy to a disabled model
+  // succeeds — Moira's `POST /routing-policies` takes the id and stores it — and
+  // then the policy is never selected, because routing joins `provider_models`
+  // on `pm.status = 'active'`. Offering the choice at all is offering a step
+  // that reports success and changes nothing.
+  const bindable = provider.models.filter((model) => isRoutable(model.status));
 
   // The return type is deliberately inferred rather than written. `Promise<void>`
   // after a parameter list containing `() => void` reads to the hardcoded-copy
@@ -169,11 +176,11 @@ export function ProviderChainPanel({ provider, fetchImpl, onChanged }: ProviderC
         <select
           className={styles.select}
           value={routedModelId}
-          disabled={pending || provider.models.length === 0}
+          disabled={pending || bindable.length === 0}
           onChange={(event) => setRoutedModelId(event.target.value)}
         >
           <option value="">{t(CONSOLE_MESSAGE_KEYS.llm_bind_routing_no_model)}</option>
-          {provider.models.map((model) => (
+          {bindable.map((model) => (
             <option key={model.id} value={model.id}>
               {model.modelKey}
             </option>

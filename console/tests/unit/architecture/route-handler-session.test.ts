@@ -52,9 +52,17 @@
 // checked on its own. Re-mutated afterwards: deleting the guard from `DELETE`
 // alone now fails, naming the method.
 
+// The EXTRACTOR ITSELF NOW LIVES IN `tests/support/route-exports.ts`. It grew a
+// second caller — `tests/unit/api/llm-routes.test.ts`, which needs the same
+// answer to decide whether its own handler list is the whole surface — and a
+// second transcription of a brace matcher this fiddly is how the two suites
+// start disagreeing about what a handler is. The controls below still run here,
+// against the shared implementation.
+
 import { describe, expect, test } from "bun:test";
-import { readdirSync, readFileSync, statSync } from "node:fs";
-import { extname, join, relative, resolve } from "node:path";
+import { join, resolve } from "node:path";
+
+import { exportedHandlers, routeModules, stripComments } from "../../support/route-exports";
 
 const CONSOLE_ROOT = resolve(import.meta.dir, "../../..");
 const API_ROOT = join(CONSOLE_ROOT, "app", "api");
@@ -100,136 +108,12 @@ const EXEMPT: ReadonlyArray<{ readonly path: string; readonly why: string }> = [
 
 const EXEMPT_PATHS = EXEMPT.map((entry) => entry.path);
 
-interface Handler {
-  readonly path: string;
-  readonly source: string;
-}
-
-function routeHandlers(): Handler[] {
-  const found: Handler[] = [];
-  const walk = (absolute: string): void => {
-    let entries: string[];
-    try {
-      entries = readdirSync(absolute);
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      const full = join(absolute, entry);
-      if (statSync(full).isDirectory()) {
-        walk(full);
-        continue;
-      }
-      if (extname(entry) !== ".ts" && extname(entry) !== ".tsx") continue;
-      if (!/^route\.tsx?$/.test(entry)) continue;
-      found.push({
-        path: relative(CONSOLE_ROOT, full).split("/").join("/"),
-        source: readFileSync(full, "utf8"),
-      });
-    }
-  };
-  walk(API_ROOT);
-  return found.sort((a, b) => a.path.localeCompare(b.path));
-}
-
-/** Comments stripped: a mention of the guard in prose is not a call. */
 function callsGuard(source: string): boolean {
   const code = stripComments(source);
   return new RegExp(`\\b${SESSION_GUARD}\\s*\\(`).test(code);
 }
 
-function stripComments(source: string): string {
-  return source.replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "");
-}
-
-/** The HTTP verbs Next.js routes to an exported function of the same name. */
-const HTTP_EXPORTS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] as const;
-
-export interface ExportedHandler {
-  readonly file: string;
-  readonly method: string;
-  readonly body: string;
-}
-
-/**
- * Every exported HTTP handler in a route module, with its own body.
- *
- * Brace-matched rather than split on the next `export`, so a nested function or
- * an object literal inside the handler does not truncate it. Both the
- * `export async function POST(...)` form and
- * `export const POST = async (...) => {...}` are matched, because Next accepts
- * either and a guard that only saw one would be silent about the other.
- */
-/**
- * Index of the `{` that opens a handler's BODY, skipping its parameter list.
- *
- * Returns -1 when the declaration is an alias (`= handle;`) with no body.
- */
-function openingBraceOfBody(source: string, from: number): number {
-  const paren = source.indexOf("(", from);
-  const semicolon = source.indexOf(";", from);
-  if (paren === -1 || (semicolon !== -1 && semicolon < paren)) return -1;
-  let depth = 0;
-  let index = paren;
-  for (; index < source.length; index += 1) {
-    const character = source[index];
-    if (character === "(") depth += 1;
-    else if (character === ")") {
-      depth -= 1;
-      if (depth === 0) break;
-    }
-  }
-  const brace = source.indexOf("{", index);
-  const end = source.indexOf(";", index);
-  if (brace === -1 || (end !== -1 && end < brace)) return -1;
-  return brace;
-}
-
-export function exportedHandlers(file: string, rawSource: string): ExportedHandler[] {
-  const source = stripComments(rawSource);
-  const found: ExportedHandler[] = [];
-  const declaration = new RegExp(
-    `export\\s+(?:async\\s+)?(?:function\\s+(${HTTP_EXPORTS.join("|")})\\b|const\\s+(${HTTP_EXPORTS.join("|")})\\s*=)`,
-    "g",
-  );
-  for (const match of source.matchAll(declaration)) {
-    const method = match[1] ?? match[2] ?? "";
-    const after = (match.index ?? 0) + match[0].length;
-    // THE PARAMETER LIST HAS TO BE SKIPPED FIRST, and getting this wrong is how
-    // the extractor silently reported a guarded handler as unguarded: Next's own
-    // signature is
-    //   export async function POST(request: Request, context: { params: … })
-    // so the first `{` after the function name is inside the SECOND PARAMETER's
-    // type annotation, and brace-matching from there ends the "body" before the
-    // real one begins. Caught by re-running the mutation, not by reading the
-    // regex.
-    const bodyStart = openingBraceOfBody(source, after);
-    // `export const GET = handle;` — an ALIAS to a function defined elsewhere,
-    // with no body of its own. Recorded with an EMPTY body so it reads as
-    // unguarded, which is the safe direction: a handler whose implementation
-    // this extractor cannot see is one it cannot vouch for. Skipping it instead
-    // would make the alias form a way through the rule.
-    if (bodyStart === -1) {
-      found.push({ file, method, body: "" });
-      continue;
-    }
-    const open = bodyStart;
-    let depth = 0;
-    let index = open;
-    for (; index < source.length; index += 1) {
-      const character = source[index];
-      if (character === "{") depth += 1;
-      else if (character === "}") {
-        depth -= 1;
-        if (depth === 0) break;
-      }
-    }
-    found.push({ file, method, body: source.slice(open, index + 1) });
-  }
-  return found;
-}
-
-const handlers = routeHandlers();
+const handlers = routeModules(API_ROOT, CONSOLE_ROOT);
 
 describe("the scan is alive", () => {
   test("route handlers were found at all", () => {

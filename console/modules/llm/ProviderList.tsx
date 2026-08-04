@@ -22,23 +22,35 @@
 // `lib/llm-view.ts`.
 //
 // ============================================================================
-// DISABLE, NOT DELETE
+// DISABLE, NOT DELETE — AND THE UNDO HAS AN UNDO
 // ============================================================================
 //
 // A wrong endpoint is the most likely first mistake on this screen, so every
 // created thing has an undo. None of them destroys anything: Moira's LLM surface
 // has no delete operation in this console's registry, and a disabled row stays
 // readable, which is what makes "what did I do wrong" answerable afterwards.
+//
+// "Reversible" is the stated justification for choosing disable over delete, so
+// each of the three nested rows renders ONE control that swaps with its status:
+// disable while it is active, enable while it is not. Without the second half
+// the claim was false — routing accepts only active rows, re-adding a model with
+// the same identifier collides with the disabled row still holding the unique
+// index, and the operator's only route back was a SQL prompt.
+//
+// The provider's own control does not swap, and that asymmetry is deliberate: a
+// disabled provider is brought back by the "Connect local vLLM" shortcut, which
+// re-runs the whole chain and repairs every part of it at once, rather than by a
+// button that fixes one of four things and leaves the other three.
 
 import { useState } from "react";
 
 import { Badge } from "@/components/atoms/Badge";
 import { Button } from "@/components/atoms/Button";
 import { CONSOLE_MESSAGE_KEYS, t } from "@/lib/i18n";
-import { providerEndpoint, type LlmProviderView } from "@/lib/llm-view";
+import { isRoutable, providerEndpoint, type LlmProviderView } from "@/lib/llm-view";
 
 import { ProviderChainPanel } from "./ProviderChainPanel";
-import { sendDelete, type LlmFailure } from "./request";
+import { postJson, sendDelete, type LlmFailure } from "./request";
 import styles from "./ProviderList.module.css";
 
 export interface ProviderListProps {
@@ -72,6 +84,47 @@ export function ProviderList({ providers, fetchImpl, onChanged }: ProviderListPr
     onChanged?.();
   }
 
+  /** The same path, POSTed: the handler beside the disable one. */
+  async function enable(id: string, url: string): Promise<void> {
+    setBusyId(id);
+    setFailure(null);
+    const result = await postJson<{ id: string }>(url, {}, fetchImpl);
+    setBusyId(null);
+    if (!result.ok) {
+      setFailure(result.failure);
+      return;
+    }
+    onChanged?.();
+  }
+
+  /**
+   * The one control a nested row gets, chosen by its status.
+   *
+   * Not two buttons with one disabled: a disabled "Enable" beside an enabled
+   * "Disable" reads as two independent things, and a screen reader announces
+   * both. One control that says what it will do is the honest rendering of a
+   * two-state row.
+   */
+  function toggle(row: { id: string; status: string }, url: string, keys: {
+    readonly disable: string;
+    readonly enable: string;
+  }) {
+    const active = isRoutable(row.status);
+    return (
+      <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        loading={busyId === row.id}
+        onClick={() => {
+          void (active ? disable(row.id, url) : enable(row.id, url));
+        }}
+      >
+        {t(active ? keys.disable : keys.enable)}
+      </Button>
+    );
+  }
+
   return (
     <section className={styles.panel} aria-label={t(CONSOLE_MESSAGE_KEYS.llm_providers_heading)}>
       <h2 className={styles.heading}>{t(CONSOLE_MESSAGE_KEYS.llm_providers_heading)}</h2>
@@ -101,20 +154,14 @@ export function ProviderList({ providers, fetchImpl, onChanged }: ProviderListPr
                     <Badge tone={model.status === "active" ? "success" : "neutral"}>
                       {t(statusKey(model.status))}
                     </Badge>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      loading={busyId === model.id}
-                      onClick={() => {
-                        void disable(
-                          model.id,
-                          providerEndpoint(provider.id, `/models/${encodeURIComponent(model.id)}`),
-                        );
-                      }}
-                    >
-                      {t(CONSOLE_MESSAGE_KEYS.llm_disable_model)}
-                    </Button>
+                    {toggle(
+                      model,
+                      providerEndpoint(provider.id, `/models/${encodeURIComponent(model.id)}`),
+                      {
+                        disable: CONSOLE_MESSAGE_KEYS.llm_disable_model,
+                        enable: CONSOLE_MESSAGE_KEYS.llm_enable_model,
+                      },
+                    )}
                   </li>
                 ))}
               </ul>
@@ -131,20 +178,14 @@ export function ProviderList({ providers, fetchImpl, onChanged }: ProviderListPr
                     <Badge tone={row.status === "active" ? "success" : "neutral"}>
                       {t(statusKey(row.status))}
                     </Badge>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      loading={busyId === row.id}
-                      onClick={() => {
-                        void disable(
-                          row.id,
-                          providerEndpoint(provider.id, `/credentials/${encodeURIComponent(row.id)}`),
-                        );
-                      }}
-                    >
-                      {t(CONSOLE_MESSAGE_KEYS.llm_disable_key_row)}
-                    </Button>
+                    {toggle(
+                      row,
+                      providerEndpoint(provider.id, `/credentials/${encodeURIComponent(row.id)}`),
+                      {
+                        disable: CONSOLE_MESSAGE_KEYS.llm_disable_key_row,
+                        enable: CONSOLE_MESSAGE_KEYS.llm_enable_key_row,
+                      },
+                    )}
                   </li>
                 ))}
               </ul>
@@ -163,23 +204,14 @@ export function ProviderList({ providers, fetchImpl, onChanged }: ProviderListPr
                     <Badge tone={policy.status === "active" ? "success" : "neutral"}>
                       {t(statusKey(policy.status))}
                     </Badge>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      loading={busyId === policy.id}
-                      onClick={() => {
-                        void disable(
-                          policy.id,
-                          providerEndpoint(
-                            provider.id,
-                            `/routing/${encodeURIComponent(policy.id)}`,
-                          ),
-                        );
-                      }}
-                    >
-                      {t(CONSOLE_MESSAGE_KEYS.llm_disable_policy)}
-                    </Button>
+                    {toggle(
+                      policy,
+                      providerEndpoint(provider.id, `/routing/${encodeURIComponent(policy.id)}`),
+                      {
+                        disable: CONSOLE_MESSAGE_KEYS.llm_disable_policy,
+                        enable: CONSOLE_MESSAGE_KEYS.llm_enable_policy,
+                      },
+                    )}
                   </li>
                 ))}
               </ul>

@@ -51,6 +51,31 @@
 // when the list is truncated and no match was found, exactly as the seed
 // script's `find_by` does, because guessing wrong creates the duplicate the
 // dedupe existed to prevent.
+//
+// ============================================================================
+// REUSE-FIRST MEANS REUSE **AND REPAIR** — 'active' IS THE ONLY STATUS ROUTING
+// ACCEPTS
+// ============================================================================
+//
+// A match is looked up as "not deleted" and then brought to `active` if it is
+// not there already. Both halves are load-bearing and for opposite reasons:
+//
+//   THE WIDE MATCH is what stops the chain creating a duplicate. Disable writes
+//   `status = 'disabled'` and leaves `deleted_at` null, so a disabled model row
+//   still occupies `provider_models_provider_model_key_active_unique` — a
+//   partial index on `deleted_at is null`. A narrow match would try to create a
+//   second one, and the unique violation has no mapping for that table, so the
+//   operator gets an opaque 500.
+//
+//   THE REPAIR is what makes the report true. `runtime.rs` joins
+//   `provider_models`, `routing_policies` and `provider_credentials` on
+//   `status = 'active'`, so a chain that "reused" three disabled rows and
+//   announced "the provider, its models, a credential row and routing all
+//   exist" would be describing a deployment no prompt can reach. A repaired step
+//   reports the outcome `enabled`, which is neither `created` nor `reused`.
+//
+// This is also what makes the DELETE-means-disable decision honest: disable is
+// only reversible if something reverses it.
 
 import "server-only";
 
@@ -198,20 +223,97 @@ export type DiscoveryOutcome =
   | { readonly ok: false; readonly messageKey: string };
 
 /**
- * Read at most `limit` bytes of a response body.
+ * The deadline elapsed, or the connection failed, while the body was arriving.
+ *
+ * A distinct type so `discoverModels` can say WHY it is answering
+ * `llm_discovery_unreachable` in one place instead of inferring it from a bare
+ * `catch`.
+ */
+export class DiscoveryBodyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DiscoveryBodyError";
+  }
+}
+
+/**
+ * `work`, but abandoned the moment `signal` aborts.
+ *
+ * ============================================================================
+ * THE SIGNAL HAS TO BE OBSERVED HERE, NOT ONLY HANDED TO `fetch`
+ * ============================================================================
+ *
+ * Passing `signal` to `fetch` aborts the body stream on a real runtime — but
+ * only on a real runtime. Every fake `fetch` in the test suite hands back a
+ * `Response` it constructed itself, whose body stream has no relationship to the
+ * controller at all, so a deadline that existed only inside `fetch` would be
+ * untestable: the one hang a test could write is the one hang it already
+ * covers. Racing each `read()` against the signal makes the bound a property of
+ * THIS function, observable with an ordinary stalled `ReadableStream`.
+ */
+function untilAborted<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (signal === undefined) return work;
+  if (signal.aborted) {
+    return Promise.reject(new DiscoveryBodyError("the discovery deadline had already elapsed"));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => {
+      reject(new DiscoveryBodyError("the discovery deadline elapsed while the body was arriving"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    // `then` before `finally` so the settled work always has a handler attached:
+    // once the race has been lost these rejections are ignored rather than
+    // becoming unhandled ones.
+    void work.then(resolve, reject).finally(() => {
+      signal.removeEventListener("abort", onAbort);
+    });
+  });
+}
+
+/** Close a body this console will not read, without waiting on the peer. */
+function discardBody(response: Response): void {
+  void response.body?.cancel().catch(() => undefined);
+}
+
+/**
+ * Read at most `limit` bytes of a response body, for at most as long as `signal`
+ * stays unaborted.
+ *
+ * ============================================================================
+ * BOTH BOUNDS, OR NEITHER IS A BOUND
+ * ============================================================================
  *
  * Streamed rather than `await response.text()`, because `text()` is unbounded:
  * an endpoint that answers with an endless body would be read until the process
  * ran out of memory. The reader is cancelled as soon as the cap is passed, which
  * also closes the socket.
+ *
+ * The SIZE cap alone is not enough, and that is the defect this parameter
+ * exists for. `fetch` resolves when the RESPONSE HEADERS arrive, so a probe
+ * whose only deadline is around the fetch is bounded on connect-and-headers and
+ * on nothing else. An endpoint that answers `200` in ten milliseconds and then
+ * writes one byte every thirty seconds never reaches the byte cap, never
+ * reports `done`, and holds a request handler and a socket open for as long as
+ * it likes — undici's `bodyTimeout` is a 300 s INACTIVITY timer, which such a
+ * trickle resets forever. So the deadline is passed in and observed on every
+ * read.
+ *
+ * Exported so both bounds can be exercised without a socket.
  */
-async function readBounded(response: Response, limit: number): Promise<string | null> {
+export async function readBounded(
+  response: Response,
+  limit: number,
+  signal?: AbortSignal,
+): Promise<string | null> {
   const declared = response.headers.get("content-length");
-  if (declared !== null && Number(declared) > limit) return null;
+  if (declared !== null && Number(declared) > limit) {
+    discardBody(response);
+    return null;
+  }
 
   const body = response.body;
   if (body === null) {
-    const text = await response.text();
+    const text = await untilAborted(response.text(), signal);
     return text.length > limit ? null : text;
   }
 
@@ -220,16 +322,22 @@ async function readBounded(response: Response, limit: number): Promise<string | 
   let total = 0;
   try {
     for (;;) {
-      const { done, value } = await reader.read();
+      const { done, value } = await untilAborted(reader.read(), signal);
       if (done) break;
       if (value === undefined) continue;
       total += value.byteLength;
       if (total > limit) {
-        await reader.cancel();
+        await untilAborted(reader.cancel(), signal).catch(() => undefined);
         return null;
       }
       chunks.push(value);
     }
+  } catch (error) {
+    // A stalled or broken body must not be left holding the socket. Not awaited:
+    // waiting on a peer that has already stopped answering is the state being
+    // escaped from.
+    void reader.cancel().catch(() => undefined);
+    throw error;
   } finally {
     reader.releaseLock();
   }
@@ -264,19 +372,119 @@ export function modelKeysFromDiscoveryBody(body: unknown): readonly string[] | n
   const keys: string[] = [];
   for (const entry of data) {
     if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return null;
-    const id = (entry as { id?: unknown }).id;
-    if (typeof id !== "string") return null;
-    const trimmed = id.trim();
-    if (trimmed === "") return null;
-    if (trimmed.length > DISCOVERY_MAX_MODEL_KEY_LENGTH) return null;
+    const key = narrowModelKey((entry as { id?: unknown }).id);
+    if (key === null) return null;
+    if (!keys.includes(key)) keys.push(key);
+    if (keys.length > DISCOVERY_MAX_MODELS) return null;
+  }
+  return keys;
+}
+
+/**
+ * One model id, narrowed to what may become a `provider_models.model_key`.
+ *
+ * ============================================================================
+ * THE SAME BOUNDS ON BOTH WAYS IN, BECAUSE THEY REACH THE SAME COLUMN
+ * ============================================================================
+ *
+ * A model id enters a provider row by two doors: the discovery listing an
+ * endpoint advertised, and the `model_keys` array the browser posts back with
+ * `action: "connect"`. Narrowing only the first is narrowing neither — the
+ * second is a plain request body and nothing obliges it to carry what discovery
+ * offered. Whatever a caller puts there travels into a provider row, into every
+ * list response, into a rendered table, and onto the wire of every completion
+ * built from that row.
+ *
+ * So the cap and the control-character refusal live here, once, and both doors
+ * call it.
+ */
+export function narrowModelKey(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (trimmed === "") return null;
+  if (trimmed.length > DISCOVERY_MAX_MODEL_KEY_LENGTH) return null;
     // A control character in a model id would travel into a provider row, a URL
     // and a rendered table. There is no legitimate one. Written as escapes
     // rather than as raw bytes so the range stays readable in a diff.
     if (/[\u0000-\u001f\u007f]/.test(trimmed)) return null;
-    if (!keys.includes(trimmed)) keys.push(trimmed);
+  return trimmed;
+}
+
+/**
+ * A non-empty list of model ids from an untrusted array, or `null`.
+ *
+ * [`narrowModelKey`] applied to the `connect` stage's `model_keys`, with the
+ * same de-duplication and the same 200-entry ceiling discovery applies. Empty is
+ * `null` rather than `[]`: a chain asked to register a provider with no model
+ * produces one routing never selects, which is `llm_model_required` and not a
+ * silent success.
+ */
+export function narrowModelKeys(value: unknown): readonly string[] | null {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const keys: string[] = [];
+  for (const entry of value) {
+    const key = narrowModelKey(entry);
+    if (key === null) return null;
+    if (!keys.includes(key)) keys.push(key);
     if (keys.length > DISCOVERY_MAX_MODELS) return null;
   }
   return keys;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Authorization for the one effect that never reaches Moira                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Refuse the discovery probe unless the operator holds an `admin_identities`
+ * grant.
+ *
+ * ============================================================================
+ * THE CONSOLE SESSION GATE IS NOT AN ADMIN CHECK, AND THIS IS THE ONE HANDLER
+ * THAT NEEDED IT TO BE
+ * ============================================================================
+ *
+ * `withConsoleSession` runs `checkSession`, which admits any session with a
+ * verified address inside `allowed_email_domains` and an IdP subject. It reads
+ * no grant, and `lib/console-api.ts` says so in as many words: *"It is not the
+ * security control. Moira is."* That reasoning is sound for every other handler
+ * on this surface, because every one of their effects IS a Moira admin call that
+ * Moira authorizes itself — a signed-in employee with no grant gets a 403 from
+ * Moira and nothing happens.
+ *
+ * `POST /api/llm/connect-vllm {action: "discover"}` is the exception. Its whole
+ * effect is an outbound GET issued from inside the deployment's network to a
+ * host named in the request body, and it returns before touching `client` at
+ * all — so no Moira authorization is ever consulted, and the session gate is the
+ * entire authorization. That makes it a host and port oracle over the internal
+ * network for anyone whose IdP address happens to be in the allow-list: the
+ * three refusal keys separate the outcomes cleanly (`unreachable` = nothing
+ * there, `refused` = something is listening and speaks HTTP, `invalid_response`
+ * = it speaks HTTP and answers 2xx), and up to 200 bounded ids of the response
+ * come back reflected as `models`.
+ *
+ * ============================================================================
+ * WHY A READ, AND WHY THIS READ
+ * ============================================================================
+ *
+ * Every path under `/api/v1/admin/*` goes through `authenticate_admin`, which is
+ * the ONLY authenticator that applies the `admin_identities` grant union
+ * (`src/security/auth.rs`). So any admin-plane call proves the grant, and the
+ * cheapest honest one is the list this operator is about to act on: it reads a
+ * single page-one row, writes nothing, and needs no authority the `connect`
+ * stage would not need a moment later.
+ *
+ * It THROWS rather than returning a verdict, deliberately. Moira's own 403
+ * travels as a `MoiraRequestError` and `withConsoleSession` already renders that
+ * as the keyed, client-safe union with a remedy — re-deriving the refusal here
+ * would be a second spelling of a rule Moira owns.
+ *
+ * Narrowing the URL is not a substitute for this and never was: reaching the
+ * operator's own LAN is the feature, so there is no private-address denylist to
+ * hide behind. The question is only who may ask.
+ */
+export async function requireAdminGrant(client: MoiraClient): Promise<void> {
+  await client.listProviders({ limit: 1 });
 }
 
 /**
@@ -301,6 +509,23 @@ export function modelKeysFromDiscoveryBody(body: unknown): readonly string[] | n
  * failure below — DNS, TLS, timeout, an HTML error page from a proxy, a body too
  * large to read, a shape that is not `{data: [{id}]}` — comes back as
  * `{ ok: false, messageKey }` and the page still renders.
+ *
+ * NO PATH THROWS, AND THE BODY IS PART OF "NO PATH". The first version of this
+ * function wrapped the fetch and left `readBounded` bare, which was a promise it
+ * only kept until the headers: a reset, a TLS shutdown or a premature close
+ * mid-body rejected out of here, out of the handler callback, past
+ * `withConsoleSession`'s catch — which rethrows anything that is not a
+ * `MoiraRequestError` — and rendered as a Next 500 with a stack. A half-open
+ * network on the operator's own LAN is the stated normal case for this screen;
+ * it must not be a console error page.
+ *
+ * ============================================================================
+ * THE DEADLINE COVERS THE WHOLE EXCHANGE, NOT THE HEADERS
+ * ============================================================================
+ *
+ * The abort stays armed until the body has been read, and `clearTimeout` is in
+ * the outer `finally` for that reason alone. Clearing it in the fetch's own
+ * `finally` disarmed the only bound the body ever had — see `readBounded`.
  */
 export async function discoverModels(
   rawBaseUrl: unknown,
@@ -314,44 +539,55 @@ export async function discoverModels(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-  let response: Response;
   try {
-    response = await send(`${resolved.baseUrl}/models`, {
-      method: "GET",
-      headers: { accept: "application/json" },
-      signal: controller.signal,
-      // No credential of any kind. This console has none for the operator's own
-      // endpoint, and `redirect: "error"` keeps a redirect from moving the
-      // request to a host the operator never named.
-      redirect: "error",
-    });
-  } catch {
-    return { ok: false, messageKey: CONSOLE_MESSAGE_KEYS.llm_discovery_unreachable };
+    let response: Response;
+    try {
+      response = await send(`${resolved.baseUrl}/models`, {
+        method: "GET",
+        headers: { accept: "application/json" },
+        signal: controller.signal,
+        // No credential of any kind. This console has none for the operator's own
+        // endpoint, and `redirect: "error"` keeps a redirect from moving the
+        // request to a host the operator never named.
+        redirect: "error",
+      });
+    } catch {
+      return { ok: false, messageKey: CONSOLE_MESSAGE_KEYS.llm_discovery_unreachable };
+    }
+
+    if (!response.ok) {
+      discardBody(response);
+      return { ok: false, messageKey: CONSOLE_MESSAGE_KEYS.llm_discovery_refused };
+    }
+
+    let text: string | null;
+    try {
+      text = await readBounded(response, DISCOVERY_MAX_BYTES, controller.signal);
+    } catch {
+      // The deadline elapsed mid-body, or the connection failed after the
+      // headers. Both are "the endpoint did not answer", which is the same thing
+      // a refused connection means, so they carry the same key.
+      return { ok: false, messageKey: CONSOLE_MESSAGE_KEYS.llm_discovery_unreachable };
+    }
+    if (text === null) {
+      return { ok: false, messageKey: CONSOLE_MESSAGE_KEYS.llm_discovery_response_too_large };
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      return { ok: false, messageKey: CONSOLE_MESSAGE_KEYS.llm_discovery_invalid_response };
+    }
+
+    const models = modelKeysFromDiscoveryBody(parsed);
+    if (models === null || models.length === 0) {
+      return { ok: false, messageKey: CONSOLE_MESSAGE_KEYS.llm_discovery_invalid_response };
+    }
+    return { ok: true, baseUrl: resolved.baseUrl, models };
   } finally {
     clearTimeout(timer);
   }
-
-  if (!response.ok) {
-    return { ok: false, messageKey: CONSOLE_MESSAGE_KEYS.llm_discovery_refused };
-  }
-
-  const text = await readBounded(response, DISCOVERY_MAX_BYTES);
-  if (text === null) {
-    return { ok: false, messageKey: CONSOLE_MESSAGE_KEYS.llm_discovery_response_too_large };
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return { ok: false, messageKey: CONSOLE_MESSAGE_KEYS.llm_discovery_invalid_response };
-  }
-
-  const models = modelKeysFromDiscoveryBody(parsed);
-  if (models === null || models.length === 0) {
-    return { ok: false, messageKey: CONSOLE_MESSAGE_KEYS.llm_discovery_invalid_response };
-  }
-  return { ok: true, baseUrl: resolved.baseUrl, models };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -365,11 +601,22 @@ export async function discoverModels(
  * create it", and that reading is only sound when the whole list was seen. If it
  * was not, this throws rather than creating a duplicate that routing then has to
  * choose between with no rule for choosing.
+ *
+ * IT CARRIES THE PROGRESS IT INTERRUPTED. `LlmProvisioningError` exists to tell
+ * the operator what already exists — that is the whole reason it is not a bare
+ * `Error` — and a refusal raised at step five with `state: emptyConnectState()`
+ * throws away exactly the fact the report was built to carry. The caller passes
+ * what it has written so far; only a call site with nothing written yet takes
+ * the default.
  */
 export function findOnPage<T>(
   page: ListResponse<T>,
   match: (row: T) => boolean,
   step: ConnectStepName,
+  progress: {
+    readonly state: ConnectState;
+    readonly trace: readonly LlmConnectStepView[];
+  } = { state: emptyConnectState(), trace: [] },
 ): T | null {
   const hit = page.data.find(match);
   if (hit !== undefined) return hit;
@@ -377,8 +624,8 @@ export function findOnPage<T>(
     throw new LlmProvisioningError({
       step,
       messageKey: CONSOLE_MESSAGE_KEYS.llm_list_truncated,
-      state: emptyConnectState(),
-      trace: [],
+      state: progress.state,
+      trace: [...progress.trace],
     });
   }
   return null;
@@ -603,10 +850,25 @@ export async function runConnectChain(
         page,
         (row) => row.model_key === modelKey && row.status !== "deleted",
         "provider_model",
+        { state: { ...state, providerModelIds: [...modelIds] }, trace },
       );
       if (existing !== null) {
-        modelIds.push(existing.id);
-        trace.push({ step: "provider_model", outcome: "reused", detail: modelKey });
+        // REUSED **AND REPAIRED**. A disabled row still occupies
+        // `provider_models_provider_model_key_active_unique` — the partial index
+        // is on `deleted_at is null`, which disable leaves null — so creating a
+        // second one is a unique violation Moira has no mapping for, and an
+        // opaque 500 for the operator. Matching it and turning it back on is
+        // both the only way through and the undo this screen otherwise lacks.
+        const repaired =
+          existing.status === "active"
+            ? existing
+            : await client.enableProviderModel(existing.id, ifMatchFor(existing));
+        modelIds.push(repaired.id);
+        trace.push({
+          step: "provider_model",
+          outcome: existing.status === "active" ? "reused" : "enabled",
+          detail: modelKey,
+        });
         continue;
       }
       const created = await client.createProviderModel(
@@ -641,10 +903,23 @@ export async function runConnectChain(
       page,
       (row) => row.provider_id === provider.id && row.status !== "deleted",
       "provider_credential",
+      { state, trace },
     );
     if (existing !== null) {
-      state = { ...state, keyRowId: existing.id };
-      trace.push({ step: "provider_credential", outcome: "reused", detail: existing.id });
+      // Repaired for the same reason the model row is: routing resolves a
+      // credential whose status is `active` (`runtime.rs`), so a disabled row
+      // answers `credential_not_found` exactly as a missing one does — and this
+      // step exists because that error names neither.
+      const repaired =
+        existing.status === "active"
+          ? existing
+          : await client.enableProviderCredential(existing.id, ifMatchFor(existing));
+      state = { ...state, keyRowId: repaired.id };
+      trace.push({
+        step: "provider_credential",
+        outcome: existing.status === "active" ? "reused" : "enabled",
+        detail: repaired.id,
+      });
     } else {
       const created = await client.createProviderCredential(
         {
@@ -704,10 +979,22 @@ export async function runConnectChain(
           row.provider_model_id === providerModelId &&
           row.status !== "deleted",
         "routing_policy",
+        { state: { ...state, routingPolicyIds: [...policyIds] }, trace },
       );
       if (existing !== null) {
-        policyIds.push(existing.id);
-        trace.push({ step: "routing_policy", outcome: "reused", detail: existing.id });
+        // The last of the three. `runtime.rs` joins `routing_policies` on
+        // `rp.status = 'active'`, so a disabled policy is a policy that cannot
+        // be created again for the same triple and cannot be selected either.
+        const repaired =
+          existing.status === "active"
+            ? existing
+            : await client.enableRoutingPolicy(existing.id, ifMatchFor(existing));
+        policyIds.push(repaired.id);
+        trace.push({
+          step: "routing_policy",
+          outcome: existing.status === "active" ? "reused" : "enabled",
+          detail: repaired.id,
+        });
         continue;
       }
       const created = await client.createRoutingPolicy(

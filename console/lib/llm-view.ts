@@ -60,21 +60,27 @@ export const LOCAL_VLLM_BASE_URL = "https://local-llm.motrait.com";
  */
 export const GENERAL_ROUTE_KEY = "general";
 
-/** The console's own BFF paths. Never Moira's. */
+/**
+ * The console's own BFF paths. Never Moira's.
+ *
+ * THERE IS NO TOP-LEVEL `/api/llm/routing`. An earlier draft of this constant
+ * carried one, together with a `routingEndpoint()` helper that built
+ * `/api/llm/routing/{id}` — a path no route module under `app/api/llm/**`
+ * implements, and which Next answers with its 404 page rather than with a keyed
+ * refusal. Routing lives NESTED under the provider that owns it
+ * (`/api/llm/providers/{id}/routing[/{policyId}]`) because the ownership check
+ * that stops a request body choosing which policy a privileged call touches is
+ * only possible when the provider is in the path. Both the dead constant and the
+ * dead helper are gone; `providerEndpoint` builds every path on this surface.
+ */
 export const LLM_ENDPOINTS = {
   providers: "/api/llm/providers",
-  routing: "/api/llm/routing",
   connectVllm: "/api/llm/connect-vllm",
 } as const;
 
 /** `/api/llm/providers/{id}` and the collections nested under it. */
 export function providerEndpoint(providerId: string, suffix = ""): string {
   return `${LLM_ENDPOINTS.providers}/${encodeURIComponent(providerId)}${suffix}`;
-}
-
-/** `/api/llm/routing/{id}`. */
-export function routingEndpoint(policyId: string): string {
-  return `${LLM_ENDPOINTS.routing}/${encodeURIComponent(policyId)}`;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -157,12 +163,37 @@ export interface LlmChainReadiness {
   readonly hasPolicy: boolean;
 }
 
+/**
+ * A row routing will actually consider.
+ *
+ * ============================================================================
+ * `active`, NOT "not deleted" — MOIRA'S JOIN IS THE SPECIFICATION
+ * ============================================================================
+ *
+ * `provider_models.status` cannot be `deleted` at all: migration
+ * `0003_security_foundation.sql` constrains it to
+ * `('active','disabled','deprecated')`, and disable writes `'disabled'` with
+ * `deleted_at` left null. So a `status !== "deleted"` test degrades to "a row
+ * exists" and admits both of the states routing refuses.
+ *
+ * Routing's own predicate is the one this has to agree with:
+ * `src/infra/repositories/runtime.rs` joins `provider_models` on
+ * `pm.status = 'active'`, `routing_policies` on `rp.status = 'active'` and
+ * resolves a credential the same way. A screen that called a provider READY on a
+ * disabled model would render "a prompt can reach this provider" directly under
+ * a "Disabled" badge, and the first prompt would then fail with a routing error
+ * naming neither the model nor its status.
+ */
+export function isRoutable(status: string): boolean {
+  return status === "active";
+}
+
 export function chainReadiness(provider: LlmProviderView): LlmChainReadiness {
   return {
-    hasModel: provider.models.some((model) => model.status !== "deleted"),
-    hasKeyRow: provider.keyRows.some((row) => row.status === "active"),
-    isEnabled: provider.status === "active",
-    hasPolicy: provider.policies.some((policy) => policy.status === "active"),
+    hasModel: provider.models.some((model) => isRoutable(model.status)),
+    hasKeyRow: provider.keyRows.some((row) => isRoutable(row.status)),
+    isEnabled: isRoutable(provider.status),
+    hasPolicy: provider.policies.some((policy) => isRoutable(policy.status)),
   };
 }
 
@@ -189,10 +220,22 @@ export interface LlmDiscoveryView {
   readonly models: readonly string[];
 }
 
+/**
+ * What one step of the chain did.
+ *
+ * `enabled` is its own outcome and not a flavour of `reused`. A step that found
+ * a DISABLED row and turned it back on did not reuse anything routing would have
+ * accepted — the deployment was unroutable a moment earlier and the operator has
+ * to be able to tell the two apart, because "reused" on a disabled row is
+ * exactly the report that made the shortcut announce success on a deployment no
+ * prompt could reach.
+ */
+export type LlmConnectOutcome = "created" | "reused" | "enabled" | "skipped";
+
 /** One step of the connect chain, as reported back to the browser. */
 export interface LlmConnectStepView {
   readonly step: string;
-  readonly outcome: "created" | "reused" | "skipped";
+  readonly outcome: LlmConnectOutcome;
   readonly detail: string | null;
 }
 
