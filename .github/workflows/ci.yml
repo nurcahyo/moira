@@ -5,6 +5,17 @@ on:
   push:
     branches:
       - main
+      # `develop` is where this repository actually does its work; `main` is the
+      # promotion branch it is merged into later. Until this line existed, EVERY merge
+      # into develop ran no CI at all — the push filter matched only `main`, and a
+      # topic-branch PR's run tests the PR's merge commit, not what develop looks like
+      # afterwards. Three separate agents worked around it by hand with
+      # `gh workflow run ci.yml --ref develop`, and one of them recorded that the
+      # automatic run this workflow's instructions assumed "does not exist
+      # structurally". A branch that is merged into daily and never automatically
+      # tested is the loudest available version of "a gate you did not run is not a
+      # gate that passed".
+      - develop
   # Manual trigger against an arbitrary ref. Added 2026-07-31 because GitHub stopped
   # producing runs for `pull_request` events on this repository while `push` runs kept
   # working — PR #39 sat with zero check-runs across a synchronize, a close/reopen and a
@@ -13,8 +24,31 @@ on:
   # "a gate you did not run is not a gate that passed" trap.
   workflow_dispatch:
 
-# Sharding multiplies the cost of a superseded run by the shard count. `main` is
-# excluded so a merge push is never cancelled by the next merge.
+# THE workflow-level concurrency block. There is exactly one and there must stay
+# exactly one — a second `concurrency:` at job level would serialise the shards against
+# each other rather than dedupe runs, which is the opposite of what this is for.
+#
+# Sharding multiplies the cost of a superseded run by the shard count, so a fresh push
+# to a ref cancels that ref's in-flight run. `main` is excluded: cancelling a run on the
+# promotion branch destroys the evidence that a release commit was green. `develop` is
+# deliberately NOT excluded — a superseded develop run is merely stale, and the run for
+# the newer commit supersedes it with strictly better information.
+#
+# On whether adding `develop` to the push trigger above double-runs anything: for the
+# ordinary flow, no. The group key is `github.ref`, which is already distinct per event
+# (`refs/pull/N/merge` for `pull_request`, `refs/heads/X` for `push`), but the two
+# events do not both fire in the first place — a topic-branch → develop PR fires
+# `pull_request` only, because the topic branch does not match the push filter, and the
+# merge into develop fires `push` only, because no PR has develop as its head.
+#
+# One overlap is real and is accepted on purpose: while a develop → main promotion PR is
+# open, a push to develop fires both `push` (refs/heads/develop) and `pull_request`
+# synchronize (refs/pull/N/merge). Those are different refs AND different commits — the
+# branch head versus GitHub's merge commit against main — so both runs are genuine
+# evidence about different trees, and the promotion PR is rare. They could only be
+# collapsed by re-keying this group on commit SHA, which would destroy supersession for
+# the far more common case of pushing twice to one branch. Ten shards occasionally beats
+# never cancelling a superseded run.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
@@ -261,6 +295,160 @@ jobs:
       - run: cargo audit
       - run: cargo deny check
 
+  # ── Supply-chain scanning, issue #98 ─────────────────────────────────────────────
+  #
+  # Two NEW jobs, plus an SBOM step inside each image build (see `container-and-helm`
+  # and `console-container-and-helm` below). They are jobs rather than steps appended
+  # to `supply-chain` for the reason `console-container-and-helm` already documents:
+  # they share no inputs with `cargo audit`/`cargo deny`, they name their own failure
+  # instead of collapsing three causes into one red check, and they run BESIDE the five
+  # Rust shards rather than behind them. Neither is near the critical path, which is set
+  # by `container-and-helm` (~5m55s).
+  #
+  # `cargo audit`/`cargo deny` above are SCA — known CVEs in declared dependencies.
+  # `sast` is a different question (patterns in code we wrote), and `secret-scan` a
+  # third (credentials in the history). None of the three subsumes another, and none of
+  # them duplicates the Trivy image scans further down.
+  #
+  # NOTE for branch protection: these are NOT wired into the `rust` aggregator's
+  # `needs`. That job is the Rust union-completeness gate and adding unrelated jobs
+  # would blur what a red `rust` means. Require `secret-scan` and `sast` as their own
+  # checks — both names are stable and neither is a matrix job.
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # HISTORY, not the working tree. Secret scanning earns its keep in exactly the
+          # case where a credential was committed and then deleted: the default shallow
+          # clone (fetch-depth 1) sees only the deletion, reports clean, and misses the
+          # single thing this job exists to catch. Scoped to THIS job — the Rust shards
+          # gain nothing from a full clone and it is not free.
+          fetch-depth: 0
+      # BLOCKS. This repository is PUBLIC, so a credential that reaches a branch here is
+      # already disclosed the moment it is pushed; "reported, merged anyway, rotate
+      # later" is not a coherent outcome for it. This is the one scanner in this file
+      # where a warning would be strictly worse than nothing, because it would create a
+      # record that everyone had been told and nobody had to act.
+      #
+      # Installed as a released binary rather than through `gitleaks/gitleaks-action`,
+      # following the kubeconform precedent below: it removes a wrapper action from the
+      # pinning surface, and gitleaks-action additionally demands a GITLEAKS_LICENSE for
+      # organization accounts, which is a licence check standing in front of a security
+      # gate.
+      #
+      # `--redact` is NOT cosmetic. Workflow logs on a public repository are public, so
+      # printing the matched value on failure would widen the very disclosure the job
+      # detected. The redacted fingerprint plus the file and line is enough to triage.
+      - name: Scan the full git history for secrets
+        run: |
+          set -euo pipefail
+          version=8.30.1
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/bin" gitleaks
+          # `git` (not `dir`) is the history-walking subcommand; `dir` would scan the
+          # checked-out tree and reintroduce the blind spot fetch-depth: 0 just paid for.
+          # `.gitleaksignore` at the repo root is picked up automatically and holds the
+          # triaged baseline — 13 test fixtures, each read and justified in that file.
+          "$RUNNER_TEMP/bin/gitleaks" git . \
+            --redact \
+            --no-banner \
+            --no-color \
+            --exit-code 1 \
+            --report-format sarif \
+            --report-path "$RUNNER_TEMP/gitleaks.sarif"
+      - name: Upload gitleaks report
+        # `failure()`: the report is only interesting when something was found, and it is
+        # redacted, so it is safe to keep as an artifact for triage.
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: ${{ runner.temp }}/gitleaks.sarif
+          retention-days: 7
+          if-no-files-found: ignore
+
+  sast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      # Semgrep rather than CodeQL, for one reason: `github/codeql-action/analyze` does
+      # not fail a run on findings — it writes them to the Security tab and exits 0.
+      # That is a dashboard, not a gate, and this file already has a standing rule
+      # against guards that cannot go red. Semgrep exits non-zero under `--error`.
+      #
+      # `pipx` is preinstalled on the ubuntu-24.04 runner image (1.16.0) and installs
+      # into its own virtualenv, so this does not fight Ubuntu's PEP 668
+      # externally-managed Python the way `pip install --user` would.
+      - name: Install semgrep
+        run: pipx install semgrep==1.172.0
+      # BLOCKS, and covers EVERY p/rust rule at EVERY severity — not just ERROR.
+      #
+      # The reason this is its own step, rather than another `--config=p/rust` folded into
+      # the step below, is that `--severity=ERROR` filters p/rust down to NOTHING. Measured
+      # on this tree with semgrep 1.172.0: the ERROR-severity run over all five rulesets
+      # reports `ts 24 / yaml 7 / dockerfile 4 / js 22` rules and has no `rust` row at all,
+      # 34 rules over 119 targets. p/rust's 11 rules are all WARNING or INFO. A
+      # `--config=p/rust` sitting next to `--severity=ERROR` is inert, and a Rust
+      # repository whose blocking SAST step reads no Rust is exactly the toothless shape
+      # this file keeps cataloguing.
+      #
+      # So Rust is gated on its own terms: all 11 rules, no severity filter. The triaged
+      # baseline that makes this green is two `nosemgrep: rust.lang.security.args.args`
+      # comments in src/main.rs, each with the reasoning written next to the code. That is
+      # the whole residue — 11 rules over 94 Rust files produced 2 findings, both argv
+      # parsing in the operator CLI. There is no `.semgrepignore`, because suppressing by
+      # path would hide future findings in the same files.
+      - name: Semgrep — blocking gate for Rust (all p/rust rules, every severity)
+        run: |
+          semgrep scan --error --metrics=off \
+            --config=p/rust
+      # BLOCKS, at ERROR severity, for everything that is not Rust. ERROR in the registry
+      # rulesets means "this is a bug with a security consequence", which is the band worth
+      # stopping a merge for. `--metrics=off` because a security job should not phone home
+      # about the code it just read.
+      #
+      # p/rust is deliberately absent: it contributes zero rules at this severity, and
+      # listing it here would advertise Rust coverage that the step does not have. Rust is
+      # gated by the step above.
+      - name: Semgrep — blocking gate (ERROR severity, non-Rust rulesets)
+        run: |
+          semgrep scan --error --metrics=off --severity=ERROR \
+            --config=p/typescript \
+            --config=p/javascript \
+            --config=p/github-actions \
+            --config=p/dockerfile
+      # REPORTS ONLY, deliberately, and this is the honest version of that choice: there
+      # is no triaged WARNING/INFO baseline for these four rulesets yet, and turning
+      # unreviewed style-adjacent findings into a merge blocker on the day they first run
+      # teaches everyone to bypass the check. Measured on this tree: 33 findings, of which
+      # 31 are `github-actions-mutable-action-tag` against this very file. Note there is no
+      # `--error` and no `continue-on-error:` here — findings exit 0, but a semgrep CRASH
+      # still exits 2 and reds the job, because "the scanner did not run" must never read
+      # as "the scanner found nothing".
+      #
+      # p/rust is absent here too: it is fully blocking above, so repeating it would only
+      # print findings that already failed the run.
+      #
+      # TO PROMOTE: triage this step's output — pinning the action refs to commit SHAs
+      # clears 31 of the 33 — then move `--severity=WARNING` up into the step above.
+      - name: Semgrep — reporting only (WARNING and INFO, non-Rust rulesets)
+        run: |
+          semgrep scan --metrics=off --severity=WARNING --severity=INFO \
+            --config=p/typescript \
+            --config=p/javascript \
+            --config=p/github-actions \
+            --config=p/dockerfile
+
   container-and-helm:
     runs-on: ubuntu-latest
     permissions:
@@ -280,6 +468,30 @@ jobs:
       # If a deploy smoke test is wanted later, add it deliberately along with the steps that
       # exercise it, rather than restoring a cluster that no step consumes.
       - run: docker build -t moira:ci .
+      # SBOM of the IMAGE, not of the source tree, and therefore necessarily HERE: this
+      # job is the only place the image exists, and a source-tree SBOM would omit the
+      # base layer and every OS package — which is most of what the Trivy step below is
+      # finding. Generating it in a separate job would mean building the image twice.
+      #
+      # Placed BEFORE Trivy on purpose. Trivy exits 1 on CRITICAL/HIGH, and if the SBOM
+      # came after it, the run that most needs a dependency inventory would be exactly
+      # the run that never produced one.
+      #
+      # REPORTS ONLY, and that is not a weak choice: an SBOM is an inventory and has no
+      # pass/fail semantics to weaken. The gate that turns this inventory into a red
+      # build is the Trivy step immediately below. A non-zero exit here means syft
+      # itself failed, and that already fails the job.
+      - name: Generate CycloneDX SBOM for the Moira image
+        uses: anchore/sbom-action@v0.24.0
+        with:
+          image: moira:ci
+          format: cyclonedx-json
+          artifact-name: moira-image-sbom.cyclonedx.json
+          output-file: moira-image-sbom.cyclonedx.json
+          upload-artifact: true
+          # This workflow has no `release` trigger, so this would never fire; set
+          # explicitly rather than relying on that staying true.
+          upload-release-assets: false
       # `0.28.0` did not resolve: this action's tags are v-prefixed (`v0.36.0`, `v0.35.0`, …),
       # so the unprefixed ref matched nothing and the job died before running a single step.
       - uses: aquasecurity/trivy-action@v0.36.0
@@ -302,6 +514,31 @@ jobs:
             "https://github.com/yannh/kubeconform/releases/download/${version}/kubeconform-linux-amd64.tar.gz" \
             | tar -xz -C "$RUNNER_TEMP/bin" kubeconform
           "$RUNNER_TEMP/bin/kubeconform" -ignore-missing-schemas -summary /tmp/moira-rendered.yaml
+      # Issue #98 acceptance criterion (5). The step above validates NOTHING about the
+      # ServiceMonitor, twice over: `serviceMonitor.enabled` defaults to false so the
+      # template never renders, and `-ignore-missing-schemas` would wave the CRD through
+      # unvalidated even if it did. A rule that skips the only object it was named for is
+      # the toothless shape this file keeps cataloguing.
+      #
+      # So: render it explicitly, and validate it against the real CRD schema with
+      # `-ignore-missing-schemas` REMOVED. If the schema cannot be fetched, this step
+      # fails rather than passing silently — an unreachable schema and a valid manifest
+      # must not produce the same green tick.
+      #
+      # The `grep -q` is the guard on the guard. Without it, renaming or removing the
+      # `serviceMonitor.enabled` value would make `helm template` emit nothing, and
+      # kubeconform validates an empty document happily.
+      - name: Render and validate the ServiceMonitor against its CRD schema
+        run: |
+          set -euo pipefail
+          helm template moira charts/moira \
+            --set serviceMonitor.enabled=true \
+            > /tmp/moira-rendered-servicemonitor.yaml
+          grep -q '^kind: ServiceMonitor$' /tmp/moira-rendered-servicemonitor.yaml
+          "$RUNNER_TEMP/bin/kubeconform" -summary \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            /tmp/moira-rendered-servicemonitor.yaml
 
   # Frontend gate for the Next.js admin console. Everything here is scoped to
   # `console/` and shares nothing with the Rust jobs, so it runs in parallel with
@@ -424,6 +661,19 @@ jobs:
       - uses: azure/setup-helm@v4
       # Build context is `console/`, matching the COPY paths in its Dockerfile.
       - run: docker build -t moira-console:ci console
+      # Same reasoning as the Moira image's SBOM: before the scanner, inventory only,
+      # generated where the image exists. The console is the internet-facing half, so
+      # if anything it is the image whose contents most need to be enumerable after the
+      # fact.
+      - name: Generate CycloneDX SBOM for the console image
+        uses: anchore/sbom-action@v0.24.0
+        with:
+          image: moira-console:ci
+          format: cyclonedx-json
+          artifact-name: moira-console-image-sbom.cyclonedx.json
+          output-file: moira-console-image-sbom.cyclonedx.json
+          upload-artifact: true
+          upload-release-assets: false
       # Same action version, same exit-code and same severity floor as the Moira
       # image. No `--ignore-unfixed` and no `.trivyignore`: the console is the
       # internet-facing half, so it is the last place to start accepting a
