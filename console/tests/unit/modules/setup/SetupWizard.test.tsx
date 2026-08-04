@@ -79,6 +79,8 @@ interface ScriptedRoutes {
   claim?: { status: number; body: unknown };
   /** Response for `GET /api/auth/get-session`. */
   session?: { status: number; body: unknown };
+  /** Response for `POST /api/auth/sign-in/oauth2`. */
+  signIn?: { status: number; body: unknown };
 }
 
 function makeFetch(routes: ScriptedRoutes) {
@@ -91,6 +93,8 @@ function makeFetch(routes: ScriptedRoutes) {
     let scripted: { status: number; body: unknown } | undefined;
     if (url === "/api/auth/get-session") {
       scripted = routes.session ?? { status: 200, body: null };
+    } else if (url === "/api/auth/sign-in/oauth2") {
+      scripted = routes.signIn;
     } else if (url === "/api/setup" && body?.["action"] === "provision") {
       scripted = routes.provision;
     } else if (url === "/api/setup" && body?.["action"] === "claim") {
@@ -232,6 +236,69 @@ describe("the claim step is unreachable until the gate conditions are CONFIRMED"
 
     expect(await screen.findByText(copy(K.setup_sign_in_intro))).toBeInTheDocument();
     expect(claimButton()).toBeNull();
+    // The stage is not a dead end: the provider row's sign-in button exists.
+    expect(
+      screen.getByRole("button", {
+        name: copy(K.sign_in_button).replaceAll("{provider}", "Google Workspace"),
+      }),
+    ).toBeInTheDocument();
+  });
+});
+
+describe("a FRESH deployment's sign-in stage is never a dead end", () => {
+  // The server-rendered view of a fresh deployment carries NO method rows —
+  // `GET /api/setup` ran before anything was provisioned, and nothing
+  // re-fetches it after the in-session provision. The stage must still offer a
+  // working control, or the operator is stranded on a heading with no buttons.
+
+  test("after provisioning with an empty method list, one generic sign-in button drives the new provider", async () => {
+    const { calls, fetchImpl } = makeFetch({
+      provision: {
+        status: 201,
+        body: { state: COMPLETE_STATE, provider_id: "moira-console-idp" },
+      },
+      session: { status: 200, body: null },
+      signIn: { status: 200, body: { url: "https://idp.example/authorize?state=abc" } },
+    });
+    const navigated: string[] = [];
+    render(
+      <SetupWizard view={READY} fetchImpl={fetchImpl} navigate={(url) => navigated.push(url)} />,
+    );
+    await provisionThroughForm();
+
+    // The sign-in stage renders WITH a control, not just the intro copy.
+    expect(await screen.findByText(copy(K.setup_sign_in_intro))).toBeInTheDocument();
+    const button = screen.getByRole("button", { name: copy(K.sign_in_button_generic) });
+
+    // The button drives the SAME Better Auth flow as /login, with the provider
+    // id the provision response returned, and follows the redirect it gets.
+    await userEvent.click(button);
+    await waitFor(() => expect(navigated).toEqual(["https://idp.example/authorize?state=abc"]));
+    const signIn = calls.find((call) => call.url === "/api/auth/sign-in/oauth2");
+    expect(signIn).toBeDefined();
+    expect(signIn!.method).toBe("POST");
+    expect(signIn!.body).toEqual({ providerId: "moira-console-idp", callbackURL: "/setup" });
+  });
+
+  test("without an in-session provider id, the fallback button escapes to /login instead", async () => {
+    // Defence in depth: even if the provision response carried no provider id,
+    // the operator still gets a control — /login resolves the provider
+    // server-side and offers the working buttons.
+    const { calls, fetchImpl } = makeFetch({
+      provision: { status: 201, body: { state: COMPLETE_STATE } },
+      session: { status: 200, body: null },
+    });
+    const navigated: string[] = [];
+    render(
+      <SetupWizard view={READY} fetchImpl={fetchImpl} navigate={(url) => navigated.push(url)} />,
+    );
+    await provisionThroughForm();
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: copy(K.sign_in_button_generic) }),
+    );
+    expect(navigated).toEqual(["/login"]);
+    expect(calls.filter((call) => call.url === "/api/auth/sign-in/oauth2")).toHaveLength(0);
   });
 });
 

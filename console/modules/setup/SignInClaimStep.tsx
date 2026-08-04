@@ -46,7 +46,13 @@ const LOGIN_PATH = "/login";
 export interface SignInClaimStepProps {
   /** Which sub-surface is active, per `reachableSetupStep`. */
   readonly stage: "sign_in" | "claim";
-  /** Interactive provider rows, for the sign-in buttons' labels. */
+  /**
+   * Interactive provider rows, for the sign-in buttons' labels. On a FRESH
+   * deployment this is empty — the rows come from the server render of
+   * `GET /api/setup`, which ran before anything was provisioned — so an empty
+   * list must still render a working control: one generic sign-in button
+   * driving the just-provisioned `oauthProviderId`.
+   */
   readonly methods: readonly SetupMethodSummary[];
   /** Better Auth's provider id, from the provision response. Null on revisit. */
   readonly oauthProviderId: string | null;
@@ -221,9 +227,12 @@ export function SignInClaimStep({
         <>
           <p className={styles.body}>{t(CONSOLE_MESSAGE_KEYS.setup_sign_in_intro)}</p>
           <div className={styles.actions}>
-            {interactive.map((method) => (
+            {interactive.length === 0 ? (
+              // Fresh deployment: the server-rendered method list predates the
+              // provision that just completed, so no row exists to label a
+              // button — but `oauthProviderId` from the provision response
+              // does, and the flow works. One generic button, never zero.
               <Button
-                key={method.id}
                 type="button"
                 variant="primary"
                 loading={phase.kind === "signing_in"}
@@ -232,9 +241,24 @@ export function SignInClaimStep({
                   void signIn();
                 }}
               >
-                {buttonLabel(method, interactive.length)}
+                {t(CONSOLE_MESSAGE_KEYS.sign_in_button_generic)}
               </Button>
-            ))}
+            ) : (
+              interactive.map((method) => (
+                <Button
+                  key={method.id}
+                  type="button"
+                  variant="primary"
+                  loading={phase.kind === "signing_in"}
+                  disabled={busy}
+                  onClick={() => {
+                    void signIn();
+                  }}
+                >
+                  {buttonLabel(method, interactive.length)}
+                </Button>
+              ))
+            )}
           </div>
           {phase.kind === "signing_in" && <Spinner label={t(CONSOLE_MESSAGE_KEYS.sign_in_pending)} />}
         </>
