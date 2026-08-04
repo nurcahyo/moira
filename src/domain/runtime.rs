@@ -602,6 +602,23 @@ pub enum RuntimeEventType {
     ExecutionStarted,
     RoutingStarted,
     RouteSelected,
+    /// F50 — the selected route names an agent profile that no longer resolves.
+    ///
+    /// Emitted when `route_definitions.agent_profile_id` is `Some` and
+    /// `get_active_agent_profile` returns `None`, which happens whenever the profile has
+    /// been disabled or soft-deleted: neither operation clears the route's reference (the
+    /// FK is `on delete set null` and `soft_delete_agent_profile` never issues a `DELETE`),
+    /// so the route keeps pointing at a row the runtime will not use.
+    ///
+    /// **It is not emitted for a route that simply has no profile.** That is the normal
+    /// case and stays silent; the two are distinguishable at the call site because
+    /// `agent_profile_id` is `None` in the first and `Some(id)` in the second.
+    ///
+    /// The execution continues — see `src/application/execution.rs` for why observability
+    /// shipped ahead of the fail-closed/fail-open decision — so this event is the operator's
+    /// only structured notice that every request on the route is running without the
+    /// profile's `preamble`, `temperature` and `max_tokens`.
+    AgentProfileUnavailable,
     ModelSelected,
     ProviderAttemptStarted,
     OutputTextDelta,

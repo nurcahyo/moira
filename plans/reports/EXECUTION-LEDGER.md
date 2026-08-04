@@ -386,6 +386,96 @@ what the property actually is — a held connection cannot be idle), or poll the
 because it is a different file from F2's change and gate runs are serialised; fixing it inside F2's
 branch would have cost another full gate cycle to prove.
 
+#### **CLOSED** 2026-08-02, `fix/shared-db-flakes` — and neither the diagnosis nor the suggested fix above was right
+
+*(This is the metrics-gauge F28. `F28` also names an unrelated finding earlier in this file —
+inline memory extraction delaying the terminal SSE event. They share only a number.)*
+
+**`num_idle()` is not approximate.** The paragraph above is wrong on the mechanism, and the wrong
+mechanism pointed at the wrong fix. `sqlx-core-0.8.6/src/pool/inner.rs` reads:
+
+```rust
+pub(super) fn num_idle(&self) -> usize {
+    // We don't use `self.idle_conns.len()` as it waits for the internal
+    // head and tail pointers to stop changing for a moment before calculating the length…
+    // By maintaining our own atomic count, we avoid that issue entirely.
+    self.num_idle.load(Ordering::Acquire)
+}
+```
+
+A dedicated `AtomicUsize` since 0.6, and `size()` is another. Both are exact reads. There is also no
+pool maintenance task to "transiently disagree" with them: `spawn_maintenance_tasks` returns
+immediately unless `max_lifetime`, `idle_timeout` or `min_connections` is set, and the fixture pool
+sets none of them.
+
+**What is actually asynchronous is the return.** `Drop for PoolConnection` *spawns* a task, and
+`Floating::return_to_pool` issues `self.raw.ping().await` — a full round-trip to PostgreSQL — before
+it re-queues the connection and increments `num_idle`. So between a `drop` and the counter moving
+there is a database RTT during which the pool is genuinely still settling, and a scrape landing
+inside it reads a low `idle`. That is the failure exactly: the baseline scrape sampled `idle = 1`
+while a second connection's return was in flight, the return landed, and the "busy" scrape read
+`idle = 1` again instead of `0` — `left: 1.0, right: 0.0`.
+
+**Reproduced deterministically before anything was changed.** Replaying the test's shape back to
+back, so that each iteration's `drop` is the only thing between it and the next baseline scrape,
+failed **8 times in 10**; the delay that made the committed test pass was incidental — fixture setup
+and the first scrape happened to give the in-flight return time to land. Instrumented output, one
+failing iteration: `pre(size=2,idle=1) base(total=2,idle=1) post_idle=2 held_idle=1
+busy(total=2,idle=1) expected_busy_idle=0`. Note `pre_idle=1` against `post_idle=2`: the return
+landed *during* the scrape it was supposed to precede.
+
+**Neither a bound nor a poll was needed.** Two properties of the pool make the numbers exactly
+knowable:
+
+* **`acquire` is a barrier.** A connection whose return is still in flight has not yet released its
+  semaphore permit, so taking *every* permit cannot return until every pending return has completed.
+* **`PoolConnection::return_to_pool().await`** runs that same return eagerly instead of spawning it.
+
+Between them the pool reaches a state with nothing in flight. Measured 20/20 and 15/15 before being
+written up. `idle` is now asserted at **`capacity`**, **`capacity - 1`** and **`0`** — three exact
+values, no tolerance, no timing — which is *stronger* than the exact assertion it replaced, not
+weaker. The suggested `idle <= baseline_idle - 1` bound would have been satisfied by a gauge frozen
+at zero.
+
+**Two false claims in the test's own doc comment, both load-bearing** (the F22 pattern — the
+investigation found them, they were not reported):
+
+1. *"Nothing else touches this pool."* sqlx does, per above.
+2. *"`LifecycleFixture` serialises the suite."* It does not, and has not since fixtures were given
+   private databases. `tests/support/mod.rs` says so in as many words at `CONCURRENT_FIXTURES`:
+   *"This is **not** an isolation device — the database is."* Four fixtures run concurrently.
+
+A third claim — *"neither `/metrics` nor `/health/live` opens a connection"* — is **true**, is now
+load-bearing rather than incidental, and is proven in passing: the test scrapes successfully while
+holding all eight permits, which it could not do if the handler needed one.
+
+**Teeth, by injection.** Four mutations of `render_prometheus`, each reverted:
+
+| Mutation | Result |
+|---|---|
+| `record_db_pool_utilization(8, 8)` — both constant | RED at `capacity - 1`: *"the idle gauge did not follow the live pool"* |
+| `(pool.size(), pool.size())` — idle wired to total | RED, `left: 8.0, right: 7.0` |
+| sampling deleted, gauges frozen at their `0.0` init | RED at the settled scrape, `left: 0.0, right: 8.0` |
+| `total` from `options().get_max_connections()` | **GREEN — a survivor.** See below |
+
+**The fourth is the one worth reading.** Driving the pool to saturation is what bought determinism,
+and it also made `pool.size()` and `max_connections` the same number in every observation the test
+made — so a `total` gauge sourced from the configured ceiling passed. Verified by running the
+committed test against the mutation: `test result: ok`. Fixed by one scrape taken **before** the
+pool is touched, where the fixture has used it but not exhausted it. Only `total` is asserted there,
+because `size` is precisely the quantity an in-flight return does *not* move.
+
+*Reversal condition:* reopens if the pre-saturation scrape is deleted, or if these gauges are
+asserted anywhere against a pool not first brought to a known state.
+
+*Left open, deliberately:* `render_prometheus` does `u32::try_from(pool.num_idle()).unwrap_or(u32::MAX)`.
+sqlx's `release()` pushes to the idle queue and releases the permit **before** `num_idle.fetch_add`,
+so on a multi-threaded runtime a waiter can `fetch_sub` first and wrap the `AtomicUsize` to
+`usize::MAX` — published as `4294967295`. `#[tokio::test]` is current-thread, so no test here can
+observe it; **production is multi-threaded**. The one-line guard is to clamp the gauge to `size()`.
+Recorded rather than fixed: it is a `src/` behaviour change, and this branch is a test-hygiene
+branch.
+
 ### F3 — the skill files still describe deleted code, and agents are briefed from them
 
 Module 9 deleted `resolver.rs`, `executor.rs` and `src/http/chat.rs`. Several skill files still
@@ -1103,6 +1193,7 @@ where a test fails *forever* until someone deletes a row by hand.
    century-backdated rows with no cleanup path, so a failure leaks rows that sort ahead of the next
    run's under `order by expires_at` — self-poisoning. Deliberately left alone: changing retention
    test semantics is a larger, riskier change than belonged in a regression fix on the plan 07 branch.
+   — **CLOSED** 2026-08-02 `fix/shared-db-flakes`; see the sub-entry below.
 
 2. **`tests/http_middleware_contract.rs:469`** — creates a `system_api_keys` row per run and never
    deletes it. Minor; no current assertion depends on the count. — **CLOSED with F26**
@@ -1115,13 +1206,79 @@ where a test fails *forever* until someone deletes a row by hand.
    leaking to the shared database; a private clone would scope `retention::run_once` to one database
    and dissolve both its global advisory lock and its exact-equality hazard at once.
 
+#### Item 1 — **CLOSED** 2026-08-02, `fix/shared-db-flakes`. The self-poisoning was measured, not argued
+
+**The leak, reproduced.** A `panic!` injected into `retention_run_respects_the_configured_batch_size`
+after its 43 rows are seeded and before any cleanup, against the pre-fix suite:
+
+```
+$ psql moira -c "select count(*), min(expires_at)::date from idempotency_records"
+ 43 | 1926-08-27
+```
+
+**The poisoning, reproduced.** The *unmodified* pre-fix suite was then run against that database and
+failed on its own:
+
+```
+assertion `left == right` failed: the remainder of the backlog must be left for the next tick
+  left: 43
+ right: 23
+```
+
+All 43 of its own rows survived, because the 43 leaked 1926-dated rows sorted ahead under
+`order by expires_at` and absorbed the entire 20-row per-tick cap. And it **escalates**: each failed
+run leaks 23 more, measured at **43 → 66 → 89** across three consecutive runs, with no code path
+anywhere that would ever clean them up. That is the finding's "permanently red suite" demonstrated
+end to end rather than predicted.
+
+**The fix, verified the same way.** The suite now uses `support::TestDatabase`. The identical
+injected failure leaves **0 rows in the shared database and 0 leftover fixture databases** — the
+whole database is discarded in `Drop`, on a dedicated thread with its own runtime, so it runs while
+the test unwinds.
+
+**Isolation does not invalidate the suite, and the allowlist's stated reason for keeping it was
+wrong.** `SHARED_DATABASE_ALLOWLIST` recorded that `run_once` is "a cluster-wide sweep" and that a
+private clone would therefore change retention test semantics. A PostgreSQL connection is scoped to
+one database: the sweep is **database**-wide, and it is database-wide on a clone over the identical
+code path. No test in the file asserted that a sweep reaches rows it did not itself seed — the
+module comment said the *opposite*, that every assertion is scoped by id. What isolation removed was
+other suites' rows, which were never the subject. The entry has been deleted, which
+`every_allowlist_entry_is_still_load_bearing` forced rather than merely permitted.
+
+**What isolation bought, beyond the leak.** Every `>=` became `==`; whole-table counts were added,
+which catch a sweep deleting *more* than it was asked to and which no number of by-id existence
+checks can; the cluster-wide advisory lock serialising every retention sweep in every test binary
+and every worktree on the machine is gone, and the suite went from serialised to **2.86 s** for
+eight tests; and the century backdating — the thing that made a leak permanent — is gone with it.
+
+**Teeth, by injection.** Each mutation reverted after observing the failure:
+
+| Mutation | Guard that fired |
+|---|---|
+| `RetentionPlan::next_batch_size` ignores the per-tick cap | `retention_run_respects_the_configured_batch_size` — *"a backlog larger than the per-tick cap must be reported as capped, got RetentionOutcome { idempotency_records_deleted: 43, batches_run: 45, hit_per_tick_cap: false }"* |
+| `TestDatabase`'s pool pointed at the shared database | `the_fixture_owns_a_disposable_database` — *"the retention suite is sweeping the shared test database `moira`"* |
+| stale `retention_worker.rs` entry re-added to the allowlist | `every_allowlist_entry_is_still_load_bearing` — *"is on SHARED_DATABASE_ALLOWLIST but no longer resolves var(…). Delete the entry"* |
+
+**One incidental gap closed.** The suite's own skip message was `skipping retention worker tests:
+MOIRA_TEST_DATABASE_URL is not set`, which matches **neither** pattern in `scripts/gates.sh`'s
+skip assertion (`skipping database` / `set MOIRA_TEST_DATABASE_URL`). A silent skip here was
+invisible to the gate built to catch silent skips. `TestDatabase` prints `skipping database-backed
+tests: …`, which matches.
+
+*Reversal condition:* reopens if any suite outside `SHARED_DATABASE_ALLOWLIST` resolves
+`MOIRA_TEST_DATABASE_URL`, or if `the_fixture_owns_a_disposable_database` is deleted from any of the
+three suites that carry it. *Known limit, unchanged from F27:* the scan is **per-file and textual**,
+so the cheapest remaining bypass is a helper added to the allowlisted `support/mod.rs` that hands
+out a shared-database pool. Nothing would notice.
+
 **The general lesson.** `migrated_pool()`-style helpers hand every `#[cfg(test)]` module in `src/` the
 *same* database, and `cargo test --workspace` runs binaries concurrently against it. Any test writing
 a singleton, a globally-unique slot, or a cluster-wide counter is sharing mutable state with every
 other test in the tree. The integration suites avoid this with `support::LifecycleFixture`'s cloned
 databases; the lib tests have no equivalent, so they need an explicit advisory lock. **A test that
 leaks a row on the panic path is worse than a flaky one** — it converts one bad run into a permanently
-red suite.
+red suite. **No integration suite writes to the shared database any more**; the `src/**/tests` unit
+tests still do, and are the reason the `moira` database must keep existing.
 
 ### F7 — the "no `rig_core` under `src/domain/`" rule has no automated gate — **CLOSED** `d7580a6`
 
@@ -1338,7 +1495,9 @@ nobody had noticed), the wave-2 leftovers, and `cargo-mutants` adoption. CI-veri
 merge commit: five jobs, steps executed (`rust` 13, `console` 16, `console-container-and-helm` 14,
 `container-and-helm` 13, `supply-chain` 10).
 
-**Migrations: `main` is now at `0019`. Next free is `0020`.** `0016` is a permanent gap.
+**Migrations: the tree is now at `0024` (F53). Next free is `0025`.** `0016` is a permanent gap.
+This line said `0019`/`0020` for four migrations' worth of drift — **derive it with
+`ls migrations/ | tail -1` rather than trusting it.**
 
 ## ✅ ALL PLAN WORK IS COMPLETE — plan 09 finished 2026-07-31. Only T11 remains, and it is the user's.
 
@@ -1353,8 +1512,10 @@ merge commit: five jobs, steps executed (`rust` 13, `console` 16, `console-conta
 | **#43** | wave 5 — invitations and ownership UI | `820a5a8` |
 
 **The forced plan order `02b → 03 → 04 → 05 → 06 → 07 → {08 ∥ 10} → 11 → 09` is now fully executed.**
-Migrations end at `0020`; `0016` is a permanent gap. OpenAPI is stable at **151 operations / 99
-paths / 178 schemas**.
+~~Migrations end at `0020`~~ — **stale; see "STATE AT A GLANCE" above and derive it from
+`migrations/`.** `0016` is a permanent gap. ~~OpenAPI is stable at **151 / 99 / 178**~~ — also
+stale; it is **152 operations / 100 paths / 183 schemas**, and F50 added one `RuntimeEventType`
+enum member without changing any of the three counts.
 
 **The one piece of plan 09 the loop could not do is T11**, removing the console's
 `ambiguous_enabled_providers` guard. It is gated on stage 4A being **deployed**, not merged, and
@@ -2191,7 +2352,14 @@ because the preference never fires.
 Not Sub-Phase F's to close, and recorded rather than fixed in passing: it changes what every caller
 of the execution API receives, which deserves its own change and its own tests.
 
-### F30 — there are TWO memory-consent columns, and nothing makes them agree
+**The fail-hard variant F29 chose *not* to adopt has its own three preconditions, and all three now
+hold** — F39 landed; `StructuredOutputInvalid` has a recorded, guarded disposition (in none of
+`is_retryable`, `is_fallback_eligible`, `is_circuit_failure`); and `run_extraction` reads
+`execution.status`. The last two landed on `fix/f30-consent-columns` (2026-08-03). **The flip is
+still deliberately unshipped**; see "F30 CLOSED (partly refuted) · F29's last two preconditions
+LANDED" below and the doc comment on `structured_output_from_text`.
+
+### F30 — there are TWO memory-consent columns, and nothing makes them agree — **CLOSED, premise partly REFUTED**, see "F30 CLOSED (partly refuted)" below
 
 `application_memory_policies.consent_mode` and
 `application_conversation_policies.memory_consent_mode` are **independent**, both default
@@ -2412,17 +2580,23 @@ question being investigated. That clause has now out-produced the questions them
 
 | # | Finding | Severity |
 |---|---|---|
-| ~~**F35**~~ | ~~**The OpenAI-compat endpoint silently discards `text.format`.**~~ **CLOSED** `fix/f35-compat-text-format` — `json_schema` is honoured, `json_object` is refused (it would have reached the provider as an empty-object schema — now **F46**), every other `text` key is refused by a typed DTO. Finding verified correct in every particular; two things it did not mention made the fix sharper. See the F35 section below. | **HIGH** |
+| ~~**F35**~~ | ~~**The OpenAI-compat endpoint silently discards `text.format`.**~~ **CLOSED** `fix/f35-compat-text-format` — `json_schema` is honoured, `json_object` is refused (it would have reached the provider as an empty-object schema — that was **F46**, now **CLOSED** `a8937f4`: the native path refuses it too, so the two endpoints agree and F35's original reversal condition is superseded), every other `text` key is refused by a typed DTO. Finding verified correct in every particular; two things it did not mention made the fix sharper. See the F35 section below. | **HIGH** |
 | **F36** | **`SummarizationLock` pins a Postgres session advisory lock across a full provider round-trip**, on a per-turn path, over a `pool.acquire().await?.detach()`ed backend. A hung provider holds one backend and one conversation lock for the whole attempt timeout. The lock's own doc comment names this reversal condition — and it has already been met. | **MED-HIGH** |
 | **F37** | **Four wasted DB reads per conversation-linked turn when summarization is disabled**, inside the caller's request, between the last SSE delta and the terminal event. Six round-trips, four of them dead, on the default configuration. | **MEDIUM** |
-| **F38** | **The terminal-persistence-deadline arm throws away a successful provider result.** `execution.rs:658` returns `failed_outcome` with `output_text: None` and a default `UsageSummary` while `output.text` and `output.usage` are in hand and `"output_committed": true` is written into both the audit entry and the `ExecutionFailed` event. On streaming the client has already received every delta. Usage is preserved at attempt level and zeroed at outcome level — **the asymmetry is the tell**. Billing and reporting divergence. Found independently by both skeptics. **Still open after `fix/f29-structured-output`**, which added `structured_output` as a third dropped value and left an explicit comment naming all three rather than fixing the divergence — see the F29 closure entry for why a billing decision was kept out of a parsing change. | **MEDIUM** |
-| **F39** | **The structured-output capability gate cannot see Rig's per-provider reality.** The gate checks a config JSON bool; DeepSeek sets `SUPPORTS_RESPONSE_FORMAT = false` and drops the schema with a `warn!`, and `OpenAiCompatible`/`Local` ship `response_format.json_schema` to arbitrary self-hosted backends with no warning at all. Config says supported, wire says otherwise, caller gets prose and a `succeeded`. **Blocks the fail-hard variant of F29.** | **MEDIUM** |
-| **F40** | **`GET /v1/responses/{id}` returns an empty `output` array for a completed, persisted response.** Falls through both branches to `Vec::new()`. The `OutputUnavailable { reason: "metadata_only_persistence" }` variant exists to explain the *other* case, which makes the silent empty array read as an oversight rather than a decision. Needs a product call. | **LOW-MED** |
+| ~~**F38**~~ | ~~**The terminal-persistence-deadline arm throws away a successful provider result.**~~ **CLOSED** `fix/f38-deadline-usage`. Finding verified correct in every particular. **Decision: the outcome carries all three values (`output_text`, `structured_output`, `usage`) and `status` stays `Failed`**; the never-retry/never-fallback clamp is untouched. Two things the finding did not know sharpened it: `UsageSummary::default()` is all-`None` ("unknown"), not zero, so retention replaces an absence rather than overwriting a claim of no spend; and `terminal_update_from_outcome` runs on the `Failed` branch too, so the zeroing was also writing "no tokens, zero bytes, no hash" onto the `responses` row. **`"output_committed": true` was inaccurate** — a hardcoded literal, false in both available senses on the non-streaming path; now derived. Reversal conditions in the closure section below. | **CLOSED** |
+| ~~**F39**~~ | ~~**The structured-output capability gate cannot see Rig's per-provider reality.**~~ **CLOSED** `fix/f39-structured-output-capability`. Both divergences verified true. Resolved **asymmetrically**, because they are not the same problem: DeepSeek is decidable and is now reconciled out of routing by reading Rig's own `SUPPORTS_RESPONSE_FORMAT`; `OpenAiCompatible`/`Local` is **not decidable at admission** and was deliberately left admitted. See the F39 closure section below. | **CLOSED** |
+| ~~**F40**~~ | ~~**`GET /v1/responses/{id}` returns an empty `output` array for a completed, persisted response.**~~ **PREMISE REFUTED; two adjacent defects found and CLOSED** on `fix/f40-f47-response-output-and-policy-reads`. No persistence configuration reaches the empty array on a completed response, because **`output_persisted` is never `true`** — all three `ResponseTerminalUpdate` constructors hardcode `false`, the column defaults `false`, nothing in `src/` writes `true`. So `Completed` always took the `OutputUnavailable` branch and `Vec::new()` was reached only by `Queued`/`InProgress`/`Failed`/`Cancelled`, where it is correct. What was wrong: the **reason was a lie for three of the four persistence modes**, and `Completed && output_persisted` fell to `[]` — the inversion that produces F40's exact symptom the day content persistence lands. See the F40 closure section below. | **CLOSED** |
 | ~~**F41**~~ | ~~**Skill-tree drift on exactly the guidance F29's implementer needs.**~~ **STRUCK — the inference was wrong.** The `.claude/` copy is a nine-line **pointer file** that says to read the `.agents/` one; all eight `.claude/skills/` entries have that shape. See "F41 is WRONG as recorded" below. | **struck** |
-| **F42** | **i18n overclaim.** `moira.error.structured_output_invalid` asserts "or the model's output does not conform to it". No such path exists. Its description even narrates a prior widening. Becomes true only if the fail-hard variant ships. | **LOW** |
-| **F43** | **`ConcurrencyController::acquire` is dead `pub` API on the concurrency-safety path** — every caller is inside `#[cfg(test)]`. It hardcodes `is_stream: false`, so a future caller reaching for the obvious-looking name on a streaming path silently takes a *request* permit. | **LOW** |
-| **F44** | **`RuntimeModelHandle::stream` / `RuntimeStreamOutput` are dead `pub` API** — ~65 lines duplicating `execute_rig_stream`, kept alive only by a re-export. Divergence hazard: someone fixing streaming will fix one of the two. | **LOW** |
-| **F45** | **`PublicResponseFormat::JsonSchema { name, strict }` — both accepted, both dropped.** Public in `docs/openapi.json`; every destructure site uses `{ schema, .. }`. Rig hardcodes `strict: true` and renames from the schema's `title`. A caller sending `strict: false` gets strict mode, unreported. | **LOW** |
+| ~~**F42**~~ | ~~**i18n overclaim.** `moira.error.structured_output_invalid` asserts "or the model's output does not conform to it".~~ **CLOSED** `fix/f42-f45-declared-vs-true` `871889f`, `4551ba3`. **Premise held.** Enumerated: the code has exactly **two** emitters and both reject the *caller's schema* — `validate_response_format` (over `maximum_schema_bytes`) and `build_completion_request` (not a readable `schemars::Schema`, the only construction site of the class). `classify_completion_error` never produces it, so there is no third route in from the Rig boundary. **The near-miss the finding did not mention, and the reason the sentence was plausible enough to survive:** `memory_extraction::FAILURE_STRUCTURED_OUTPUT_INVALID` is the same string for exactly the missing case, but its own doc says it is never returned to a caller — it lands on `memory_extraction_runs.failure_class` and never renders an i18n message. Description corrected and the fail-hard variant deliberately **not** shipped (F29 needs three preconditions; only F39 has landed). `default_message` was wrong in the same direction and is now *"The structured output schema is invalid."* Two guards added, both from asking §3.4's question of the fix. | **closed** |
+| ~~**F43**~~ | ~~**`ConcurrencyController::acquire` is dead `pub` API** — every caller is inside `#[cfg(test)]`.~~ **CLOSED** `fix/f42-f45-declared-vs-true` `8729068`. **Half right, and the actionable half was wrong.** 29 call sites, every one test code — but **9 are in `tests/cluster_coordination.rs` and `tests/coordination_default_path.rs`, which are separate crates**, so `pub(crate)` and deletion were never available. "Dead `pub` API" in a `publish = false` service crate means "visible to integration tests", not an external contract. **The hazard was the real finding.** Resolved by removing the *choice* rather than the code: the wrapper is gone, `acquire_scoped` is now `pub` and named `acquire`, and there is exactly one admission function which cannot be called without stating `is_stream`. | **closed** |
+| ~~**F44**~~ | ~~**`RuntimeModelHandle::stream` / `RuntimeStreamOutput` are dead `pub` API.**~~ **CLOSED** `fix/f42-f45-declared-vs-true` `f83437c`. **Premise held in every particular**, verified by enumeration: `.stream(` occurs **exactly once** outside `target/` and that occurrence is Rig's own `CompletionModel::stream`; `RuntimeStreamOutput` occurred four times, all of them the method's own definition, return type, construction and re-export. `RuntimeEventSeed` and `next_event` existed only to serve it. 103 lines deleted. **What the finding did not know:** that cluster was the *sole* reason `runtime_factory.rs` imported `RuntimeEventEnvelope`, `RuntimeEventType` and `serde_json::json`; deleting it restored the Rig/runtime-event module boundary. | **closed** |
+| ~~**F45**~~ | ~~**`PublicResponseFormat::JsonSchema { name, strict }` — both accepted, both dropped.**~~ **CLOSED** `fix/f42-f45-declared-vs-true` `b516c4e`. **Premise held.** Neither is expressible in `rig-core` 0.40 on any provider. **Resolved asymmetrically, because the two fields are not the same problem: `strict` is refused, `name` is documented.** `strict` became `Option<bool>` and an explicit `false` is now `422 unsupported_request_option` on both endpoints — a stated **public contract change**. `name` cannot be refused (a required field of the variant) and is not smuggled through the schema's `title`. OpenAPI counts verified by hand and unchanged at **152 / 100 / 183**. | **closed** |
+| **F48** | **A third `output_schema` drop path, latent, and it is silent even on OpenAI.** `should_apply_response_format` (`openai/completion/mod.rs`) is `output_schema.is_some() && supports_response_format && (tools.is_empty() \|\| history_has_tool_result)`. The third clause drops the schema on **turn 1 of any tool-calling conversation, for every OpenAI-family provider**, and unlike the DeepSeek path it emits **no `warn!` at all** — the warning at the same site fires only when `supports_response_format` is false. Cannot bite today: `build_completion_request` hardcodes `tools: Vec::new()`, so `tools.is_empty()` is always true. It becomes live the moment tool calling is enabled, which `.agents/skills/moira-rig-tools/SKILL.md` contemplates. **The F39 fix does not cover it** — F39 reconciles by provider type, and this drop is per-request. Rig documents the caveat itself: *"a turn-1 answer with no tool call is therefore not schema-constrained; `Native` is 'guaranteed' only once tools have run"* (issue #1928). **GUARDED, still latent and still not fixed** (`fix/f38-deadline-usage`). Premise re-verified: `execution.rs:1907` is the tree's **only** `CompletionRequest` construction and still hardcodes `tools: Vec::new()`, and `public.rs` refuses caller-declared tools outright (`unsupported_tool`, *"client-defined tools are not registered in this phase"*), so tools cannot reach the constructor from any direction. The drop behaviour is Rig's and is deliberately unchanged; the guard is `moiras_request_still_carries_its_schema_onto_rigs_openai_wire_body` in `src/application/execution.rs`, which hands Moira's real request to Rig's real encoder and reds the moment `tools` stops being empty. See F49 for why the obvious-looking integration coverage does not substitute for it. | **MEDIUM, latent — guarded** |
+| ~~**F49**~~ | ~~**No integration test in the tree ever builds a request from an agent profile.**~~ **CLOSED** `fix/f49-agent-profile-coverage`. **Premise held, with one correction: the column is `route_definitions.agent_profile_id`, not `routing_policies.agent_profile_id` — `RoutingPolicyRecord` has no such field.** Verified exhaustively: all six typed `RouteDefinitionCreateRequest` sites in `tests/` pass `agent_profile_id: None`, the raw-SQL insert at `tests/public_authorization.rs:693` omits the column, and the seeded `general` route at `migrations/0005_provider_runtime.sql:295` omits it too — so `agent_profile` really was `None` on every end-to-end path. `tests/agent_profile_wire.rs` (6 cases) now attaches a real profile to the fixture's route and asserts on the body that reached the scripted mock. **The branch is correct at the wire**: `preamble` arrives as the leading `system` message, `temperature` and `max_tokens` arrive top-level, caller options win over profile values, and the streaming arm carries the same three. Eight mutations run, each reverted: `preamble: None` (3 red), dropping the `temperature` `or_else` (2 red), dropping the `max_tokens` `or_else` (2 red), inverting both `or_else` orders (**only** the precedence case red — the exact indistinguishability HANDOFF §3.4's seventh entry warns about, and why that case exists), never loading the profile (3 red), **hardcoding the profile's three values into `build_completion_request`** (the no-profile control red — this is the cheapest edit that leaves the primary case green, and the control is the only thing that sees it), a streaming-arm-only rebuild without the profile (**only** the streaming case red, so it is not redundant), and F48's own mutation. **Under F48's mutation only the new `tool_policy` case goes red; the preamble/temperature/max_tokens cases stay green** — they observe a different property, and `tests/structured_output.rs` was re-run under it and stayed green through all seven cases again. **F48's guard is not superseded** and its doc comment now says why. Raised **F50**. | **closed** |
+| ~~**F51**~~ | ~~**The runtime-config invalidation channel is wired to per-request data tables, and `apply_invalidation` ignores its own scope for three of the four things it clears.**~~ **CLOSED** `fix/f51-f52-invalidation-scope` `f97d4f1`. **Premise held in full, and every count in it was right** — 24 tables when counted by trigger *function* (`auth_provider_settings`'s trigger really is named `auth_provider_settings_notify`, so a name-based query returns 23), `conversations` and `memory_records` really do fire on every `INSERT`/`UPDATE`/`DELETE`, and the three `invalidate_all()` calls really were unconditional while only the breaker reset was scoped. **Both candidate fixes taken, because they are independent barriers and the brief was right that they are not exclusive.** (1) `invalidation_plan` now returns an `InvalidationPlan { caches, circuits }` from one parse, and `RUNTIME_DATA_RESOURCE_TYPES` names the resource types that clear no cache; the narrowing is one-way, so an unparseable payload, a non-uuid id or an unrecognised `resource_type` still clears everything and resets every breaker. (2) Migration `0022` drops the trigger from both data tables. **Nothing depends on those two tables notifying**, established three ways: `docs/runtime-cache-invalidation.md` enumerates the invalidation-producing resources and lists neither — the schema drifted from the documented design in `0007`, not the other way round; **no cache in the process is keyed by a conversation or a memory record** (there is no `ConversationCache`/`MemoryCache` anywhere in `src/`), and the three the listener clears hold provider configuration, built provider clients and the enabled auth methods; and `src/infra/db.rs` is the **only** listener on the channel, so there is no other subscriber whose behaviour could change. **The most expensive consequence was under-stated by the original entry's own framing**: the standing justification in `apply_invalidation`'s doc comment was that the caches "rebuild on the next read, so re-reading them costs a query" — true of `RuntimeConfigCache` and `AuthProviderSettingsCache`, **false of `ProviderRuntimeCache`**, which holds built Rig clients with their connection pools and is keyed by a tuple that already contains every version number, so the config-write case it was defending never needed the wipe either. **Five mutations, each reverted.** Reverting the scoping reds the integration guard; **honouring the plan for `cache` but not `runtime_handles`/`auth_settings` — the cheapest edit that preserves the defect — reds it on the handles assertion specifically**, which is why the guard seeds a real `RuntimeModelHandle` and observes all three caches rather than the one that is easy to observe; leaving the trigger attached reds the trigger guard (and showed all three of INSERT/UPDATE/DELETE firing, which is why the test does all three); eating the fail-safe on the unknown arm reds the unit guard. **Under mutation 1 the unit guard stayed green and only the integration guard fired** — the correct-predicate/wrong-wiring split of F16's shape, and the reason both exist. *Reversal condition:* re-attaching either trigger requires deleting that table from `RUNTIME_DATA_RESOURCE_TYPES` in the same change, because a table that has become configuration must not stay classified as data — `every_triggered_table_has_a_scope` asserts `plan.caches` for every triggered table and reds if it is. | **closed** |
+| ~~**F52**~~ | ~~**Three triggered tables are unclassified … and the guard that exists to prevent exactly this is a retyped list that has already drifted.**~~ **CLOSED** `fix/f51-f52-invalidation-scope` `9f243a6`. **Premise held in full and every specific was verified against the live catalogue**: `pg_trigger` returns exactly 24 tables for `notify_moira_runtime_config_change`, the three `legacy_*` tables are among them, their triggers still carry their *pre-rename* names (`legacy_providers`'s trigger is `providers_runtime_config_notify`) — so a name-based query mis-attributes them as well as missing `auth_provider_settings` — and the test's array really did hold 21 hand-typed names. **The fix is the shape the entry named**: `TRIGGERED_RESOURCE_TYPES` is now a real constant and `tests/runtime_notify_inventory.rs` pins it against `pg_trigger` **in both directions**, counted by trigger *function* and excluding `tgisinternal`, with a `MINIMUM_TRIGGERED_TABLES` floor against the empty-set failure a derived list is most exposed to. **The three legacy tables lose their triggers** (migration `0023`) rather than being classified: the finding's claim that nothing in `src/` reads or writes them is **correct and stronger than stated** — the only references anywhere in the tree are inside `0003_security_foundation.sql` itself, as a one-time backfill source guarded by `to_regclass(…) is not null`. The tables themselves are kept; they are an operator's record of the pre-0003 world and dropping them is irreversible. `legacy_applications` is renamed by the same migration and correctly absent — `0002` only ever attached the trigger to three tables. **Four mutations, each reverted, and the two halves interlock.** Leaving one legacy trigger attached reds both new tests — *the exact original defect, where the old guard was green*. **Attaching the trigger to a brand-new table (`responses`) reds the inventory test — the forward drift the retyped list could never detect, which is the whole property.** Then the cheapest edit: **"fix" that red by adding `responses` to `TRIGGERED_RESOURCE_TYPES` and nothing else — the inventory test goes green and the unit guard goes red**, because it iterates the constant and asserts the scope; and classifying it as `RUNTIME_DATA_RESOURCE_TYPES` instead leaves the scope assertion satisfied and reds the new `plan.caches` assertion. There is no way to satisfy one half without the other. *Reversal condition:* it re-opens if the inventory is ever satisfied by editing the constant alone — i.e. if `every_triggered_table_has_a_scope` stops iterating `TRIGGERED_RESOURCE_TYPES`, or if `tests/runtime_notify_inventory.rs` stops reading `pg_trigger`. | **closed** |
+| ~~**F53**~~ | ~~**The same defect class F51 closed, one table over and at admin rate rather than request rate: `rag_documents` and `rag_collections` are content, not configuration, and every write to one wipes every replica's cache.**~~ **CLOSED** `fix/f53-f50-silent-degradation` `31a23a2`. **Premise held in full**, and the gating question it was recorded with has one answer for both tables — reached, as instructed, before choosing the fix. **Neither table's configuration is read through any cache the listener clears, and for `rag_collections` the reason is stronger than the entry expected: it carries no runtime configuration at all.** Its columns are `collection_key`, `display_name`, `description`, `status`, `visibility`, `metadata` and the lifecycle fields; the embedding model, dimension, batch size and timeout the entry guessed might live there live in `application_embedding_policies`, keyed by `application_id`, and `find_document_ingestion_context`/`find_collection_ingestion_context` join the collection **only** to reach `application_id`. That policy table is configuration, keeps its trigger and keeps `caches: true`. The three caches make the answer type-level rather than argumentative: `RuntimeConfigCache` is `HashMap<Uuid, ProviderConfig>`, `AuthProviderSettingsCache` is one `Vec<PublicAuthMethod>`, `ProviderRuntimeCache` is keyed by `RuntimeCacheKey` (provider/model/credential/runtime-policy ids and versions) — none can hold either row, and no `RuntimeCacheKey` field derives from either table. Every read of both, including the `visibility`/`status` predicates that carry tenant isolation, goes to PostgreSQL on the spot, so dropping the trigger cannot make an authorization decision stale either. **So both lose the trigger, and both barriers are taken as under F51**: migration `0024` drops them, and `RUNTIME_DATA_RESOURCE_TYPES` gains both names while `TRIGGERED_RESOURCE_TYPES` loses them. **Five mutations, each reverted.** Honouring the plan for `runtime_cache` only and still wiping `runtime_handles`/`auth_settings` reds the new integration guard **on the handles assertion**, which is why it seeds a real `RuntimeModelHandle`. Reverting the classifier for `rag_documents` alone, and separately for `rag_collections` alone, each red only its own leg — **and every unit test stayed green through both**, so the integration guard is the only thing that sees them. Re-attaching the `rag_documents` trigger reds the trigger guard (showing all three of INSERT/UPDATE/DELETE) *and* the `pg_trigger` inventory; then "fixing" the inventory the lazy way — adding the name back to `TRIGGERED_RESOURCE_TYPES` — turns the inventory green and reds `every_triggered_table_has_a_scope` on its `caches` half, so F52's interlock holds for these tables too. **Two corrections to the entry.** Its claim that `docs/runtime-cache-invalidation.md` "does not list either table" was true when written and **false by the time it was committed**: the F51/F52 commit added *"and the RAG collection and document tables"* to that paragraph while making it match `TRIGGERED_RESOURCE_TYPES`. And "its embedding model, its dimensions" describes columns `rag_collections` does not have. *Reversal condition:* if a collection ever acquires configuration a cache holds, re-create its trigger and delete its name from `RUNTIME_DATA_RESOURCE_TYPES` in the same change. | **closed** |
+| **F50** | **A disabled or soft-deleted agent profile silently degrades every execution on its route.** `execution.rs:191` resolves the profile with `get_active_agent_profile`, which filters `status = 'active' and deleted_at is null`. Neither operation clears the route's reference: the FK is `on delete set null` and `soft_delete_agent_profile` only writes `status='deleted', deleted_at=now()`, never a `DELETE`. The lookup returns `Ok(None)` and the match arm treats it identically to "this route has no profile" — **no failure, no `warn!`, no runtime event, no audit row.** Every subsequent request loses its `preamble`, `temperature` and `max_tokens` and reports `succeeded`. A preamble is where guardrails live, so the failure mode is an unguarded model answering production traffic. The agent profile is the **only** runtime reference on this path whose disappearance is silent — an unresolvable route is a `RouteNotFound` failure. **Recorded, not fixed: the fix is a product decision.** Fail-closed is safer but breaks any deployment that disables a profile expecting its routes to keep serving; observable fail-open (`warn!` + runtime event) is cheaper but still serves the unguarded request. **Reversal condition:** decide fail-closed vs observable fail-open; on either decision `documents_current_behaviour_a_disabled_agent_profile_is_silently_ignored` in `tests/agent_profile_wire.rs` is wrong and must be rewritten — it is named `documents_` and not `guards_` because it pins current behaviour and would otherwise hold the defect in place (HANDOFF §3.4). Found by F49's new coverage. **ID allocated against `origin/main` at `779104d`, whose highest was F49.** **→ THE SILENCE IS FIXED; THE PRODUCT DECISION IS STILL OPEN.** See the F50 section below (`fix/f53-f50-silent-degradation` `da8a936`). | **OBSERVABLE — product decision open** |
 
 ### F35 — CLOSED: `text.format` is now honoured for `json_schema`, refused for the rest
 
@@ -2488,10 +2662,16 @@ endpoint is opt-in (`openai_responses_compat_enabled`, default `false`), which b
 radius to deployments that chose OpenAI compatibility — the deployments most likely to be sending
 `text.format` in the first place.
 
-*Reversal condition:* the `json_object` refusal reverts to a translation the moment the native path
-stops encoding `response_format: {"type":"json_object"}` as an empty-object schema — that is, when
-`documents_native_json_object_reaching_the_provider_as_an_empty_object_schema` goes red, which it
-will do on any fix to F46. The `json_schema` honouring reverts only if `PublicResponseFormat` stops
+*Reversal condition — **SUPERSEDED by F46's closure, 2026-08-02**.* As written it said the
+`json_object` refusal reverts to a translation the moment the native path stops encoding
+`{"type":"json_object"}` as an empty-object schema, i.e. when
+`documents_native_json_object_reaching_the_provider_as_an_empty_object_schema` goes red. That test
+is now deleted and the native path **also refuses** — so the trigger fired and the correct response
+was *not* to revert. Reading the original condition literally would un-refuse the compat path into
+a native 422 one layer later. **The live condition is now F46's:** both refusals revert together,
+and only when `rig-core` gains a schema-free structured-output mode on a typed `CompletionRequest`
+seam for every `ProviderType` Moira routes to. The `json_schema` honouring reverts only if
+`PublicResponseFormat` stops
 being the native representation of a caller-supplied schema; it does **not** revert on an F45 fix,
 which would simply make it more faithful.
 
@@ -2505,10 +2685,12 @@ F35 itself, reproduced on the wire; blinding the `json_object` refusal produced 
 `"text":"must-not-be-reached"`; removing `deny_unknown_fields` produced a 200 for
 `text: {"verbosity": "low"}`.
 
-### F46 — `response_format: {"type":"json_object"}` constrains the model to the empty object
+### F46 — `response_format: {"type":"json_object"}` constrains the model to the empty object — **CLOSED** `a8937f4`
 
 Confirmed while deciding F35, on the provider socket rather than by reading. **Native path,
 `POST /api/v1/responses`** — not the compat endpoint, which now refuses this shape.
+
+*As originally recorded, below; the closure and the one clause it got wrong follow it.*
 
 `PublicResponseFormat::JsonObject` maps to the output schema `{"type":"object"}` in
 `prepare_execution`. `rig-core` 0.40's `sanitize_schema` completes any object schema with
@@ -2518,22 +2700,450 @@ key list, and the encoder wraps the result with `strict: true`. What reaches the
 only by `{}`. OpenAI's own `json_object` mode means *free-form* JSON, so a caller asking for it gets
 the exact opposite of what the name promises, with a 200 and a `succeeded` status.
 
-**Not fixed here, because it cannot be fixed at Moira's layer.** Free-form JSON is a different
-`response_format` type, not a schema, and `rig-core`'s `output_schema` seam cannot express it —
-`json_utils::merge` lets the encoder's own `response_format` win over anything Moira puts in
-`additional_params`. The options are a rig-core change, or removing `JsonObject` from
-`PublicResponseFormat`, which is a public contract break. Both need a product call.
-
-Pinned by `tests/openai_compat_text_format.rs::documents_native_json_object_reaching_the_provider_as_an_empty_object_schema`,
-which asserts the exact schema bytes and `strict: true`. It documents current behaviour and says so
-in its name (HANDOFF §3.4).
-
-*Reversal condition:* none — this is a defect, not a decision. It closes when a caller sending
-`{"type":"json_object"}` either receives free-form JSON or is refused.
-
 *ID allocation:* `origin/main`'s ledger topped out at **F45** immediately before this was written
 (HANDOFF §3.2). Three concurrent finding branches were live; if F46 collides, this is the
 `json_object` one.
+### F39 — **CLOSED** `fix/f39-structured-output-capability`. Reconciled at candidate selection by reading Rig's own constant — 2026-08-02
+
+**Both divergences survived verification.** `providers/deepseek.rs` sets
+`SUPPORTS_RESPONSE_FORMAT = false`, and `providers/openai/completion/mod.rs` discards
+`output_schema` with only a `tracing::warn!` when it is false. `ProviderType::OpenAi`,
+`OpenAiCompatible` and `Local` really do share one `build_completion_model` arm, so all three send
+`response_format.json_schema` to whatever backend the base URL names.
+
+**The question was "can Moira know at admission time whether a schema will reach the provider?" and
+the answer is different for the two halves. That asymmetry is the whole decision.**
+
+- **DeepSeek is decidable.** Rig encodes the answer as a public associated const on a public trait,
+  so it is a *compile-time fact* Moira can read.
+- **`OpenAiCompatible` / `Local` is not decidable, ever.** Rig does send the schema; whether the
+  backend honours it is a property of a binary Moira has never seen. Any admission-time verdict
+  there would be a guess presented as a guarantee — which is the disease F39 names, relocated
+  rather than cured.
+
+**What changed.** One function, at the one site that already answered "does this candidate have
+capability X":
+
+```rust
+fn provider_emits_output_schema(provider_type: ProviderType) -> bool {
+    use rig_core::providers::openai::OpenAICompatibleProvider;
+    match provider_type {
+        ProviderType::OpenAi | ProviderType::OpenAiCompatible | ProviderType::Local =>
+            <openai::OpenAICompletionsExt as OpenAICompatibleProvider>::SUPPORTS_RESPONSE_FORMAT,
+        ProviderType::AzureOpenAi =>
+            <azure::AzureExt as OpenAICompatibleProvider>::SUPPORTS_RESPONSE_FORMAT,
+        ProviderType::DeepSeek =>
+            <deepseek::DeepSeekExt as OpenAICompatibleProvider>::SUPPORTS_RESPONSE_FORMAT,
+        ProviderType::Anthropic | ProviderType::Gemini => true,
+        ProviderType::Custom => false,
+    }
+}
+```
+
+`capabilities_match` takes `candidate.provider_type` (already on `ModelCandidate`) and returns
+false for `structured_output` when that is false. **It only ever subtracts** — a row declaring
+`structured_output: false` stays unusable even where Rig would honour it, because that is also an
+operator decision.
+
+**Why this is not the "hardcoded table that rots" the brief warned about.** For the four
+OpenAI-family provider types nothing is restated: Moira reads Rig's constant, so a `rig-core` bump
+that changes a provider's behaviour changes Moira's admission decision **with no edit here**. The
+divergence F39 describes is not *representable* for those four, which is strictly stronger than a
+table plus a test that notices it rotted. Only `Anthropic` and `Gemini` are restated, because they
+do not implement `OpenAICompatibleProvider` and expose no constant — they map `output_schema`
+natively (`anthropic/completion.rs` `output_config`, `gemini/completion.rs` `generation_config`).
+
+Rot in the *other* direction — Rig gaining DeepSeek support, silently un-applying the fix — is
+caught by `rig_0_40_still_drops_the_schema_for_deepseek_and_sends_it_for_everyone_else`, which
+states rig 0.40.0's truth table literally. **A red there is not a defect; it means Rig changed**,
+and it says so in the assertion message.
+
+**No contract change, and that is deliberate.** A disqualified candidate falls out of routing and,
+if nothing else matches, yields the pre-existing `no_eligible_model` (404). That is **exactly** what
+a row honestly declaring `structured_output: false` already produces — so the fix makes a lying row
+behave identically to a truthful one. No new failure class, no OpenAPI drift, no catalog entry.
+
+**Options rejected.**
+
+| Rejected | Why |
+|---|---|
+| Hardcoded `ProviderType → bool` table | Duplicates Rig and rots silently on a bump. Replaced by reading Rig's const, which cannot diverge. |
+| Refuse `OpenAiCompatible`/`Local` too | Rig *does* send the schema. Refusing breaks every conforming self-hosted backend (vLLM, llama.cpp, TGI) to guard against a non-conforming one Moira cannot identify. Symmetric treatment would be the wrong fix for the half that is unknowable. |
+| Observe Rig's `warn!` at runtime | Requires a subscriber layer string-matching a dependency's log text, and fires *after* admission. F16 already shows Rig's tracing carries tenant data; adding a scraper there is the wrong direction. |
+| A dedicated failure class / 422 | More precise-looking, but it special-cases `structured_output` against every other capability — `vision` already yields `no_eligible_model` on the same path. Consistency beat precision. |
+| Validate the capability JSON on write | **Deferred, not rejected — see below.** Right idea, wrong blast radius for this change. |
+
+**The deferred half, and why it is deferred rather than done.** Refusing `structured_output: true`
+on a DeepSeek row *at write time* would stop the lie being stored at all, and gives the operator
+feedback at the only moment they can act on it. It is not done here because it would 422 a
+previously-accepted admin request and break any IaC that sets it — the **exact** shape of F32,
+which is complete, gated, and deliberately left unmerged as PR #57 pending human sight
+(HANDOFF §3.3 item 4). Landing a second one autonomously would be inconsistent with that
+precedent. The routing fix covers already-stored rows, which the write-time check would not.
+
+**Reversal condition.** This reverses if any of:
+1. `rig-core` gives DeepSeek `SUPPORTS_RESPONSE_FORMAT = true` — the fix un-applies itself
+   correctly, and the pinning test reds to force the re-read.
+2. Moira gains a way to *verify* a backend honours `json_schema` (a probe, a declared conformance
+   field on the provider row, a capability handshake). Then `OpenAiCompatible`/`Local` becomes
+   decidable and the asymmetry above is no longer justified.
+3. `capabilities_match` stops being the single site answering candidate capability — the
+   reconciliation is only sound while there is exactly one such site.
+
+**Three things found that the finding did not mention.**
+
+1. **A third drop path, recorded as F48.** `should_apply_response_format` also requires
+   `tools.is_empty() || history_has_tool_result`, so the schema is dropped on turn 1 of any
+   tool-calling conversation **on every OpenAI-family provider, with no warning at all**. Latent
+   only because `build_completion_request` hardcodes `tools: Vec::new()`. F39's provider-type
+   reconciliation does **not** cover it — that drop is per-request.
+2. **Anthropic and Gemini are fine, and had to be checked.** Neither goes through the OpenAI arm;
+   both map `output_schema` onto their own request shapes. Had either dropped it, the finding's
+   scope would have been twice what it claimed.
+3. **Moira's OpenAI mock could not serve a DeepSeek provider, and failed misleadingly.** rig's
+   DeepSeek response type declares `prompt_cache_hit_tokens` and `prompt_cache_miss_tokens` with
+   **no `#[serde(default)]`**. Omitting them makes a perfectly good 200 fail to deserialize, and it
+   surfaces as `provider_upstream_error` with the message **"provider request failed with HTTP
+   200"** — which reads as an upstream fault rather than a mock gap. Two keys added to
+   `tests/support/mock_openai.rs`; no rig `Usage` sets `deny_unknown_fields`, so nothing else moved.
+   Anyone writing the next DeepSeek test would have lost the same hour.
+
+**Guards, and the mutation that killed each — every one run, not read.**
+
+| Guard | Mutation | Result |
+|---|---|---|
+| `a_deepseek_row_claiming_structured_output_is_not_routed_a_structured_request` | remove the reconciliation | red: `left: String("succeeded")`, `right: "failed"` — **the defect verbatim** |
+| `a_structured_request_routes_past_deepseek_to_a_provider_that_sends_the_schema` | remove the reconciliation | red: `left: Null`, `right: Object {"a": 1}` |
+| `a_deepseek_candidate_cannot_satisfy_structured_output_however_it_is_configured` | `DeepSeek => true` (hardcode instead of reading the const) | red |
+| `rig_0_40_still_drops_the_schema_for_deepseek_and_sends_it_for_everyone_else` | same | red: *"rig-core changed: DeepSeek now sends response_format"* |
+| `the_reconciliation_subtracts_only_and_touches_no_other_capability` | reconcile **upward** (`return provider_emits_output_schema(..)`) | red: *"an operator's explicit false must survive the reconciliation"* — **and nothing else red**, so the guards discriminate |
+| `rig_drops_the_schema_before_the_wire_on_deepseek` | *(none — premise guard)* | green **before and after** the fix, by design |
+
+That last row is the one worth reading twice. It drives a real DeepSeek `CompletionModel` against
+the mock with `required_capabilities` deliberately **empty**, so the candidate filter never runs and
+the request still reaches the wire — which is the only way the premise stays *observable* after the
+fix starts excluding DeepSeek from routing. A guard that could only be checked before its own fix
+landed would have been a guard nobody could ever re-run.
+
+**Does this unblock the strict variant of F29? Partly — one of three, and F29's own entry says so.**
+Its reversal condition names **all three** of: F39 landed; `StructuredOutputInvalid` given an
+explicit retry/fallback disposition (today it is in *neither* `is_retryable` nor
+`is_fallback_eligible` nor `is_circuit_failure`); and `run_extraction` reading `execution.status`
+rather than inferring failure from `output_text` being `None`. **Item 1 is now true. Items 2 and 3
+are untouched, so the lenient parse must stay**, and **F42** — the i18n string that already claims a
+non-conformance path exists — becomes true on the same day as those two, not this one.
+
+
+
+#### F46 — **CLOSED** `fix/f46-json-object-format` `a8937f4`. Refused, not translated — 2026-08-02
+
+**The mechanism as recorded was correct except for one clause, and that clause was the one that
+said it could not be fixed.** Verified against the vendored crate rather than assumed:
+`sanitize_schema` (`providers/openai/mod.rs:39`) does complete an object schema with
+`properties: {}` and `additionalProperties: false` and then set `required` to the empty property
+key list, and `strict: true` is hardcoded at `providers/openai/completion/mod.rs:1839`.
+
+**What the entry got wrong:** it said `json_utils::merge` lets the encoder's `response_format` win
+over `additional_params`. `merge(a, b)` does let `b` win — but it is only reached inside
+`if let Some(schema) = output_schema && should_apply_response_format` (line 1823), and
+`should_apply_response_format` requires `output_schema.is_some()` (line 1818). With **no**
+`output_schema`, `additional_params` passes through untouched and lands flattened on the wire
+(`#[serde(flatten)]`, line 1582). So a hand-built `additional_params.response_format` *would* have
+reached an OpenAI-family provider. The claim "cannot be fixed at Moira's layer" was false; it was
+refused for different reasons, below.
+
+**The decision: refuse it. `422 unsupported_request_option`, on the native path, streaming and
+non-streaming — following F35, consciously, not departing from it.** The asymmetry the brief
+warned about is now gone: both endpoints refuse the same shape for the same reason.
+
+**Why not honour it as free-form JSON**, the option the name argues for:
+
+1. **`rig-core` 0.40 has no representation of free-form JSON.** The string `"json_object"` occurs
+   **zero** times in the crate. `CompletionRequest::output_schema` is the only structured-output
+   seam and every encoder reads it as a *constraint* — OpenAI family via `sanitize_schema` +
+   `strict: true`; Anthropic via `output_config.format = json_schema` (`completion.rs:2363`);
+   Gemini only sets `generation_config.response_mime_type` when a schema is present
+   (`completion.rs:234`).
+2. **It is not expressible for every provider Moira routes to.** Anthropic's Messages API has no
+   free-form JSON mode at all. Honouring `json_object` would therefore make the same request
+   succeed or fail by *routing outcome* — a worse public contract than a consistent refusal, and
+   it would need a new `required_capabilities` entry to hide the difference.
+3. **It requires the boundary violation this tree has already refused once.** Doing it means Moira
+   hand-building `additional_params.response_format` per provider and bypassing `output_schema` —
+   named as the thing `moira-rig-integration` exists to prevent, in this ledger, in the F35 entry,
+   about F45. Applying the opposite reasoning here would be the drift the brief warned about.
+4. **The "open schema" variant was checked and rejected on evidence.** `sanitize_schema` inserts
+   `additionalProperties: false` only when the key is **absent**, so `{"type":"object",
+   "additionalProperties":true}` survives as `{"type":"object","properties":{},
+   "additionalProperties":true,"required":[]}` — semantically free-form. But `strict: true` is
+   hardcoded and OpenAI's strict mode *requires* `additionalProperties: false`, so this trades a
+   silent wrong answer for a provider 400 on the flagship provider, and would behave differently
+   on self-hosted backends. Rejected.
+
+**Why "it removes a shipped capability" does not apply.** It removes a shipped *defect*. Every
+caller who has ever sent `json_object` received a schema satisfied only by `{}`; there is no
+working behaviour to preserve and nobody can be depending on one. Nothing in-tree used it either —
+memory extraction and summarization pass explicit schemas or none.
+
+**The variant stays in `PublicResponseFormat`.** Removing it would be the actual contract break:
+requests would fail deserialization with an uncoded 400 instead of a coded, documented 422 that
+names the field and points at `json_schema`. Same shape F35 chose for `OpenAiCompatTextFormat`.
+
+**Two layers, deliberately redundant.** `validate_request` raises the coded 422 (placed *before*
+the `structured_output_enabled` check, so the caller is not told to enable a policy that would
+never help); `prepare_execution`'s match arm — where the empty-object schema was born — refuses
+again and falls back to `None`, never to a schema. `prepare_execution` calls `validate_request`
+itself, so there is no entry point that reaches one without the other.
+
+*Reversal condition:* this refusal becomes a translation when `rig-core` gains a **schema-free**
+structured-output mode reachable through a typed `CompletionRequest` seam — not through
+`additional_params` — for every variant of `ProviderType` Moira routes to. A rig-core release in
+which `"json_object"` appears in the OpenAI encoder *and* Anthropic/Gemini gain an equivalent is
+the concrete trigger. Partial support is not enough: routing-dependent semantics on a public API
+is the failure mode this refusal exists to avoid.
+
+*Verification.* Four mutations run, none read:
+
+| Mutation | Result |
+|---|---|
+| **M1** — restore both layers to pre-fix (`Some(json!({"type":"object"}))` + delete the refusal) | **RED**, and it is F46 verbatim: `got 200 OK: {…"status":"completed"…"output_text":"{}"…}`. The streaming twin returned `200` with the full SSE sequence, confirming a late refusal there becomes a 200, not a 422 |
+| **M4** — the *plausible alternative fix*: map `JsonObject` → `None`, delete the refusal | **RED**. This is the one that matters: no bad schema reaches the provider under M4, so a guard asserting "the empty-object schema is absent from the wire" would have passed while the caller still got a `200` for a request Moira cannot honour. Asserting on the **refusal** rather than on the absence of the bad schema is what gives the guard teeth |
+| **M2** — restore the `prepare_execution` translation only | **GREEN**, property held — `validate_request` still refuses |
+| **M3** — delete the `validate_request` refusal only | **GREEN**, property held — `prepare_execution` still refuses |
+
+M2/M3 green is the intended relationship, not a toothless guard: neither single edit reintroduces
+the defect, and the guard asserts the property, not the implementation.
+
+**Cheapest edit that breaks the property while leaving the guard green — none found inside the
+public request path.** The two layers are individually sufficient and `prepare_execution` funnels
+through `validate_request`, so no third entry point exists. The guard was also built against the
+two ways this repository's guards have gone toothless before: it asserts the **error code**, not
+just `422`, because a routing failure raises `422` with `call_count() == 0` for the wrong reason;
+and it carries a `json_schema` **control on the same fixture** proving the provider *is* reachable,
+so the zero is attributable to the refusal rather than to a broken fixture. The nearest surviving
+route to an empty-object schema is **outside** this property and belongs to F45: `POST
+/api/v1/admin/runtime/diagnose` takes `ExecutionOptions.output_schema` verbatim, so an admin
+sending the literal schema `{"type":"object"}` still gets it closed and `strict`-ed on the wire.
+That is rig's strict-mode rewrite of a caller-supplied schema, not a `json_object` mistranslation,
+and the endpoint is admin-gated and `false` by default.
+
+*On the provider socket, now:* `json_object` → `calls=0 status=422`. The `json_schema` control on
+the same fixture → `calls=1 status=200` carrying
+`"response_format":{"type":"json_schema","json_schema":{"name":"caller_title","strict":true,
+"schema":{"type":"object","title":"caller_title","properties":{"answer":{"type":"string"}},
+"required":["answer"],"additionalProperties":false}}}` — F45 still visible in `name` coming from
+the schema's `title` and `strict` being hardcoded, unchanged and out of scope here.
+
+*Guards:* `tests/openai_compat_text_format.rs::native_json_object_is_refused_and_never_reaches_the_provider`
+and `::native_json_object_is_refused_before_the_stream_begins` (wiring), plus
+`src/application/public.rs::tests::native_json_object_is_refused_and_the_other_two_formats_are_not`
+(predicate — it also asserts `Text` and `JsonSchema` still pass, so refusing everything is not a
+cheap way to make it green). The F35-era documentation test
+`documents_native_json_object_reaching_the_provider_as_an_empty_object_schema` is **deleted**; its
+own doc comment predicted exactly this.
+
+*OpenAPI:* regenerated; **counts unchanged**. The brief's frozen figures (151 operations / 99 paths
+/ 178 schemas) were **stale** — the tree is at **152 operations / 100 paths / 183 schemas**, which
+is also what `src/http/mod.rs:777` asserts. One line added to `docs/openapi.json`: the
+`PublicResponseFormat` schema description.
+### F42, F43, F44, F45 — **CLOSED** `fix/f42-f45-declared-vs-true` — 2026-08-02
+
+Four LOW findings sharing one shape: *the API declares something it does not do.* Independent
+commits. **All four premises survived verification; one had a wrong conclusion (F43).**
+
+#### F45 — `strict` refused, `name` documented. The public contract changed, deliberately. `b516c4e`
+
+**Can Rig express either? No — established against the vendored crate before deciding.**
+
+| Field | Provider | Verdict |
+|---|---|---|
+| `strict` | OpenAI family | `"strict": true` **hardcoded**, `providers/openai/completion/mod.rs:1838`. Not reachable via `additional_params`: with an `output_schema` present the encoder's object is the `b` argument to `json_utils::merge` and wins |
+| `strict` | Anthropic | `OutputConfig { format: JsonSchema { schema } }` — no strictness field exists |
+| `strict` | Gemini | `response_mime_type` + `response_json_schema` — no strictness field exists |
+| `strict` | DeepSeek | schema dropped before the wire entirely (`SUPPORTS_RESPONSE_FORMAT = false`, F39) |
+| `name` | OpenAI family | derived from the **schema's `title`**, falling back to `"response_schema"` (line 1826) |
+| `name` | Anthropic, Gemini | no name field of any kind |
+
+**The two fields got different answers, and that asymmetry is the decision.**
+
+**`strict` is refused**, following F46. The silent upgrade is not harmless over-delivery:
+`sanitize_schema` promotes **every declared property to `required`**, so a caller's optional
+fields come back mandatory, and OpenAI's strict mode rejects schemas outside its supported
+subset, so a caller who asked for best-effort can receive a provider error. That is measured, not
+argued — `rig_0_40_still_hardcodes_strict_true_and_promotes_optional_properties_to_required`
+sends a schema whose `note` property is optional and reads `required: ["answer","note"]` back off
+the socket.
+
+**PUBLIC CONTRACT CHANGE, weighed as F32 and F46 were.** `strict` is now `Option<bool>`; omitted
+(`null`) and `true` are accepted exactly as before, an explicit `false` is `422
+unsupported_request_option` on the native path and the compat path, streaming and non-streaming.
+**F35 considered this refusal and rejected it** — *"OpenAI's own default for `strict` is falsy, so
+it would refuse the common case"* — and F35 was **right about the field as it then stood**:
+`#[serde(default)] strict: bool` made an omitted `strict` and an explicit `false` the same value.
+Making the field nullable is what makes refusing available, and it is a **restoration rather than
+an invention**: `OpenAiCompatTextFormat` already carried `Option<bool>`, and
+`strict.unwrap_or(false)` in `compat_response_format` was destroying the distinction at the one
+boundary that still had it. It removes a shipped *defect*, not a capability: nobody can depend on
+`strict: false` working, because it never did.
+
+**`name` is documented, not refused, and not honoured.** Refusing is impossible — it is a
+*required* field of the variant, so refusing it refuses every request. Honouring means writing it
+into the schema's `title`, which is the only thing `rig-core` reads: that mutates caller-supplied
+data to pass a value through a field meaning something else — a subtler form of the boundary
+violation F46 refused, abusing the typed field rather than bypassing it — and it works on one
+provider family only, making the contract's truthfulness depend on routing, **which is F46's
+objection #2 verbatim**. Unlike `strict`, `name` has no observable effect on the answer. The
+documentation now points callers at the lever that does work: put it in the schema's `title`.
+
+*Out of scope, and stated so it is not mistaken for an oversight:* `POST
+/api/v1/admin/runtime/diagnose` takes `ExecutionOptions.output_schema` verbatim and never
+constructs a `PublicResponseFormat`, so neither refusal applies there. There is no `strict` field
+on that path to drop — an admin supplying a schema directly is not making a claim Moira is
+ignoring.
+
+*Reversal conditions.* The `strict` refusal becomes an honouring when `rig-core` exposes
+strictness on a typed `CompletionRequest` seam — not `additional_params` — for **every**
+`ProviderType` Moira routes to; a release in which the OpenAI encoder reads a strictness input
+instead of hardcoding `true` *and* Anthropic and Gemini gain an equivalent is the concrete
+trigger. `name` becomes honourable on the same all-providers condition, for a response-format
+name. Partial support is not enough for either: routing-dependent semantics on a public API is
+the failure mode both refusals exist to avoid. **Both triggers are mechanical**, not a diary
+note: `rig_0_40_still_hardcodes_strict_true_and_promotes_optional_properties_to_required` reds
+when either fact changes, and its message says so.
+
+*OpenAPI:* regenerated. Counts **verified by hand from the committed document** and unchanged —
+**152 operations / 100 paths / 183 schemas**, which is what `src/http/mod.rs:777` asserts. The
+only drift was `PublicResponseFormat`'s description, two new property descriptions, and
+`strict`'s type becoming `["boolean","null"]` and leaving `required`.
+
+*Six mutations, each reverted, each run:*
+
+| Mutation | Result |
+|---|---|
+| **M1** — blind both refusal layers | **RED**, F45 verbatim: `got 200 OK` … `"status":"completed"` on a `strict: false` request. All three wiring cases |
+| **M2** — remove the `prepare_execution` layer only | **GREEN**, property held — `validate_request` still refuses |
+| **M3** — remove the `validate_request` layer only | **GREEN**, property held — `prepare_execution` still refuses |
+| **M4** — the *plausible alternative fix*: map `strict: Some(false)` to `output_schema: None` instead of refusing | **RED.** No bad schema reaches the provider under M4, so a guard asserting "the wrong schema is absent from the wire" would have passed while the caller still got a 200 for a request Moira cannot honour. Asserting on the **refusal** is what gives it teeth — F46's lesson, re-earned |
+| **M5** — the cheapest edit: `strict.or(Some(false))` at the compat translation, restoring the old collapse of omitted-into-false | **RED, and only the omitted-`strict` CONTROL reds.** Every primary refusal assertion stays green. This is why the controls exist |
+| **M6** — refuse the whole `json_schema` variant (the classic cheap green) | **RED** in 5 wiring cases *and* the predicate, which reports `an omitted strict must stay honoured — it is the common case` |
+
+M2/M3 green is the intended relationship, not a toothless guard: neither single edit reintroduces
+the defect, and the guards assert the property rather than the implementation.
+
+#### F42 — the string described a path that does not exist; corrected, not widened. `871889f`, `4551ba3`
+
+**Premise held.** Two emitters, both rejecting the *caller's schema*:
+`validate_response_format` (over `maximum_schema_bytes`) and `build_completion_request` (not a
+readable `schemars::Schema`) — the latter being the **only** construction site of
+`ExecutionFailureClass::StructuredOutputInvalid`. `classify_completion_error` never produces the
+class, so nothing arrives from the Rig boundary either.
+
+**The near-miss the finding did not mention.** `memory_extraction::FAILURE_STRUCTURED_OUTPUT_INVALID`
+is the identical string for exactly the case the description claimed — a model reply that does
+not parse. It is *not* a counter-example, because its own doc comment says it is never returned
+to a caller: it lands on `memory_extraction_runs.failure_class` and never renders an i18n
+message. The corrected description says this explicitly, so the next reader does not "fix" the
+wording back by pointing at it.
+
+**The fail-hard variant was deliberately not shipped.** F29's reversal condition needs all three
+of: F39 landed (true), `StructuredOutputInvalid` given a retry/fallback disposition (still
+false — the mutation output confirms `retryable: false, fallback_eligible: false`), and
+`run_extraction` reading `execution.status` (still false).
+
+`default_message` was wrong in the same direction and was changed too: *"The structured output is
+invalid."* points at the model on a path that only ever rejects the caller's schema. It is now
+*"The structured output schema is invalid."*
+
+*Guards, and the two gaps that asking §3.4's question found:*
+
+1. **The corrected description is a claim about the code, and nothing observed it.**
+   `docs_mirror_matches_rust_catalog` proves only that the Rust catalog and the JSON mirror
+   agree — they can be wrong together, and were. So a **third emitter** added anywhere (a
+   tool-argument validator raising the same code for a non-conforming *reply* is the obvious
+   one) falsifies the description with every test green.
+   `structured_output_invalid_has_only_the_two_emitters_its_catalog_entry_describes` derives the
+   emitter set by walking `src/` and **parsing calls** — not matching mentions, which would
+   harvest doc comments — in both spellings the code reaches a client. It is honest about its
+   limit: it cannot prove prose true, it makes prose unable to rot silently.
+2. **The suite's own header argues that `execute_rig_stream` is a separate path, then does not
+   apply that argument to the non-conforming reply.** Adding the fail-hard variant to the
+   **streaming arm only** left all seven existing cases green — case 2 sends conforming JSON and
+   never reaches the branch, case 4 never streams. Verified by running it.
+   `a_stream_whose_reply_is_not_json_leaves_the_field_null_and_still_succeeds` is the missing
+   twin, and under that mutation it is the **only** case that reds.
+
+*Mutations:* reverting the mirror description reds `docs_mirror_matches_rust_catalog` naming the
+field; renaming the `AppError` code in `public.rs` and adding a third emitter in
+`runtime_factory.rs` each red the new inventory test in the correct direction; the fail-hard
+variant reds the completion case, and the streaming-only fail-hard reds the new stream case
+alone. Both behavioural reds print a message naming **both** catalog files.
+
+*Reversal condition:* the description is widened when the fail-hard variant ships, i.e. when all
+three of F29's preconditions hold. The two behavioural guards are the trigger — they red on that
+change and their failure messages say which files to edit.
+
+#### F43 — the finding's conclusion was wrong; the hazard it named was real. `8729068`
+
+**"Every caller is inside `#[cfg(test)]`" is true only if `tests/` counts as `#[cfg(test)]`.**
+Enumerated: 29 call sites, all test code — 20 in `controls.rs`'s two `#[cfg(test)]` modules and
+**9 in `tests/cluster_coordination.rs` and `tests/coordination_default_path.rs`, which are
+separate crates and genuinely require a `pub` entry point.** So the implied remedies — make it
+private, delete it — were never available. It is also worth stating once for the next
+dead-`pub`-API finding: this crate is `publish = false` and is the only crate in the workspace,
+so `pub` here means "visible to integration tests", not an external contract.
+
+**The hazard was real and is what got fixed.** `acquire` supplied `is_stream: false` and
+`provider_stream_limit = provider_limit` itself, and it was the shorter, more obvious name than
+`acquire_scoped` — the one a future streaming caller reaches for, silently taking a *request*
+permit and leaving `max_concurrent_streams` unenforced. **The fix removes the choice, not the
+code:** `acquire_scoped` is now `pub` and named `acquire`, the wrapper is gone, and there is one
+admission function that cannot be called without stating which ceiling is wanted.
+`CapacityExhaustion`/`CapacityScope` became `pub` because that entry point returns the type that
+*names* the ceiling — strictly more information than the wrapper's `ExecutionFailure`, which had
+already discarded it. Production behaviour is unchanged: `execute_attempt` already called
+`acquire_scoped` with the real `command.options.stream`.
+
+*The guard already existed and has teeth.* `stream_capacity_is_independent_from_request_capacity`
+in `tests/execution_lifecycle.rs` runs `max_concurrent_requests: 2` against
+`max_concurrent_streams: 1` — two **distinct** numbers, so the ceilings stay distinguishable,
+which is not true of the three other fixtures in that file that set both to 1 and therefore could
+never have seen this. **Mutation: pass `false` instead of `command.options.stream` at the one
+production call site. It is the only test in the suite that reds**, with `left: Succeeded, right:
+Failed` — a second stream admitted against a ceiling of 1, F43's hazard exactly.
+
+*What stops it coming back:* **nothing mechanical, and that is stated in the code.** No lint
+catches a new four-argument convenience wrapper — it would have test callers immediately, which
+is precisely how the old one survived. What changed is that the obvious name is now taken by the
+function that demands the answer, and the wiring is guarded.
+
+#### F44 — deleted; the hazard was divergence, and it is gone by construction. `f83437c`
+
+**Premise held in every particular, verified by enumeration over the whole tree.** `.stream(`
+occurs **exactly once** outside `target/`, at `runtime_factory.rs:347`, and that occurrence is
+Rig's own `CompletionModel::stream` inside `start_stream_with_model` —
+`RuntimeModelHandle::stream` had **zero** callers. `RuntimeStreamOutput` occurred four times: its
+definition, its use as that method's return type, its construction inside it, and the re-export.
+`RuntimeEventSeed` and `next_event` existed only to serve it. Nothing in `tests/`, `docs/` or the
+skills references any of them, and nothing outside the crate can. **103 lines removed.**
+
+**What the finding did not know, and it sharpens the case:** that cluster was the *sole* reason
+`runtime_factory.rs` imported `RuntimeEventEnvelope`, `RuntimeEventType` and `serde_json::json`.
+With it gone the file compiles without the runtime-event vocabulary at all — Rig primitives in
+the factory, runtime events in the application layer, which is the boundary
+`moira-rig-integration` describes.
+
+*Which one to keep was not a coin flip, and it was measured.* Deleting all 103 lines left the
+build and every suite green — nothing linked to them. A one-line mutation to the **surviving**
+`execute_rig_stream` (dropping `text.push_str(&delta)`) reds two integration tests immediately.
+The surviving loop is also the one carrying idle timeouts, backpressure, cancellation, TTFT
+metrics and `mark_output_committed`; the duplicate had none of them, which is the divergence
+hazard stated concretely.
+
+*What stops it coming back:* **nothing mechanical, stated as such in the surviving function's doc
+comment.** `dead_code` cannot see it — `pub` items in a library crate are exempt from that lint
+whether or not anything calls them, which is exactly how ~95 lines survived. A source-scan
+pretending otherwise would be a guard written to have a guard, which is what §3.4 is a list of.
+
 ### F29 — **CLOSED** `fix/f29-structured-output`. Gated parse in `execution.rs`, not at the Rig boundary — 2026-08-02
 
 **One parse site, `structured_output_from_text` in `src/application/execution.rs`, called from both
@@ -2607,6 +3217,13 @@ was implemented first, the case was watched going red, and the gate was added af
 it is pretty-printed on purpose — a compact JSON reply round-trips through `to_string()` identically
 and the guard would pass against the defect.
 
+**[SUPERSEDED 2026-08-02 — F38 is now CLOSED on `fix/f38-deadline-usage`; see the F38 closure
+section above. The reasoning below is preserved because it is what deferred the decision, and two
+of its premises turned out to be weaker than they read: `UsageSummary::default()` is `None`
+("unknown"), not a zero that retention would overwrite, and `terminal_update_from_outcome` already
+runs on the `Failed` branch, so the outcome was *already* the source of the response row's usage
+and output hash.]**
+
 **F38 is NOT fixed and stays open.** `execution.rs`'s terminal-persistence-deadline arm calls
 `failed_outcome` from inside `match result { Ok(Ok(output)) => … }`, where `output` is live. F29
 turns its `structured_output: None` into a third silent drop alongside `output.text` and
@@ -2616,6 +3233,113 @@ Not fixed here because the arm's own condition is that terminal persistence did 
 so promoting the usage onto the outcome asserts a billing fact whose row may be absent, and
 promoting `output_text` onto a non-`Succeeded` status changes what every consumer of a failed
 execution receives. That is a billing decision; burying it inside a parsing change would hide it.
+
+### F38 — **CLOSED** `fix/f38-deadline-usage`. The outcome keeps what the provider produced — 2026-08-02
+
+**The finding was right, and two facts it did not have made the decision easier than it looked.**
+
+**Decision: `output_text`, `structured_output` and `usage` are all retained on the outcome;
+`status` stays `Failed`; the retry/fallback clamp is untouched.** One arm changed, in
+`src/application/execution.rs` — the `Err(_)` branch of the terminal-persistence timeout, the only
+`failed_outcome` call site reachable from `Ok(Ok(output))`.
+
+**Why the "this asserts a billing fact whose row may be absent" objection does not survive
+contact.** Three things, each checked against the tree rather than reasoned about:
+
+1. **`UsageSummary::default()` is all-`None`, not zero.** Every field is `Option<u64>`. The old
+   outcome did not claim the execution was free — it claimed the token count was *unknown*, while
+   the `attempts` array **in the same serialised document** carried the exact numbers. Retention
+   replaces an absence of information with information. The mutation run confirmed the shape:
+   `left: None, right: Some(2)`.
+2. **The outcome is already the write path for the response row.**
+   `terminal_update_from_outcome` in `application/public.rs` runs on the `Failed` branch as well
+   as the `Succeeded` one, and copies `usage`, `output_text.len()` and the output hash straight
+   onto `responses`. The zeroing was writing *"no tokens, zero bytes, no hash"* for a call the
+   provider answered and will invoice. Nothing new is asserted; a wrong assertion is corrected.
+3. **No `usage_records` row is created, so nothing is double-counted.** Billing reads
+   `usage_records`, which on this arm is empty — the integration test asserts `count(*) = 0`. So
+   invoicing still under-counts this execution. The difference is that `responses.usage`
+   populated while `usage_records` has no row is now the **detectable signature** of exactly this
+   condition, which was previously invisible in every surface at once.
+
+**What it costs.** The deployment still eats the provider cost — this change does not bill anyone
+for anything. It buys the ability to *find out*, and to reconcile against the provider invoice.
+
+**Reversal condition — usage.** Re-zero it the day `ExecutionOutcome.usage` or `responses.usage`
+becomes an input to customer invoicing rather than a reporting surface. Today the only readers are
+`terminal_update_from_outcome` and the runtime diagnostic endpoint, both reporting. Once a billing
+job sums the response rows, a `Failed` response carrying usage charges a caller who received an
+HTTP error, and the deployment must decide explicitly whether this arm is chargeable instead of
+inheriting the answer from a struct literal. **The trigger is concrete: any new reader of
+`responses.usage` that is not a reporting or reconciliation surface.**
+
+**Reversal condition — text.** `ConversationService::run_extraction` and `summarize_conversation`
+infer "the model answered" from `output_text`/`structured_output` being `Some`, never from
+`status`. Retaining the text lets both proceed on a reply that genuinely exists, which is the
+correct answer to the question they are asking — the model *did* answer; only Moira's own
+bookkeeping failed. If a **delivery** path (rather than an interpretation path) ever treats
+`output_text.is_some()` as "show this to the end user" without checking `status`, this arm must
+stop carrying text and those two sites must read `status` — which is also the third precondition of
+F29's own reversal condition. The public plane is not such a path today: both `create_response` and
+the streaming terminal branch dispatch on `outcome.status` first, and the `Failed` arm never
+*delivers* the text — it returns `Err(AppError::coded(…))` / a `terminal_failure` SSE, and it does
+not call `record_conversation_assistant`, so no conversation message is written from it. It does
+**read** `output_text` on that arm, through `terminal_update_from_outcome`, but only to record
+`output_text_bytes` and `output_hash` — which is the improvement, not the risk.
+
+**`"output_committed": true` was inaccurate, and the audit entry was the wrong one — not the
+outcome.** The brief asked which of the two is wrong. Neither, exactly: the value was a **hardcoded
+literal**, never derived from anything, and the module uses the word in two incompatible senses.
+
+- `EventCollector::output_committed` — the module's own definition — flips on the first chunk
+  *accepted by the consumer*. On the non-streaming path nothing reaches the caller, so it is
+  `false`.
+- The `tracing::error!` line two statements above the audit call always said output *may* already
+  be committed. It was the honest one.
+- The existing integration test asserted `usage_records` count `= 0` in the same body, so the
+  write group had not landed either.
+
+So on a non-streaming execution the literal was false in **both** available senses, and the test
+shipped in the tree **pinned it** — an instance of HANDOFF §3.4's "a test's own content literal,
+not code". It is now read from `EventCollector::output_committed`, and a second key
+`terminal_state_persisted: false` records what the arm actually knows.
+
+**The clamp keeps its unconditional `true`, for a third and different reason, now documented.**
+`terminal_persistence_deadline_failure()` passes `output_committed = true` into
+`attempt_timeout_failure` to force `retryable = false` / `fallback_eligible = false`. That is not a
+claim about delivery — it is the fact that *the provider's tokens are already spent*, so a retry
+buys a second answer at a second cost whether or not a byte reached the caller. Making that
+argument conditional would let a non-streaming execution be retried against a provider that has
+already billed for the answer. **`ExecutionFailure` classification is otherwise unchanged**, as the
+brief scoped it: nothing here required it, and the three preconditions for strict structured-output
+failure still have only one landed.
+
+**Guards, and the mutation that killed each.** Every one was run, not read.
+
+| Guard | Mutation | Result |
+|---|---|---|
+| `a_terminal_persistence_breach_clamps_retry_and_keeps_the_result_it_could_not_persist` | restore `failed_outcome(...)` | RED — `left: None, right: Some("committed-output")` |
+| `a_streamed_terminal_persistence_breach_reports_the_output_the_caller_already_received` | restore `failed_outcome(...)` | RED — `left: None, right: Some("firstsecond")` |
+| both | retain the text, re-zero **only** `usage` | RED both — `left: None, right: Some(2)`. The billing half is independently pinned; the text assertion is not shadowing it |
+| non-streamed case | restore the hardcoded `"output_committed": true` | RED — `left: Bool(true), right: false` |
+| streamed case | *same mutation* | **GREEN, correctly** — the caller really did receive the deltas there. The pair is what proves the value is derived rather than constant; one case asserting `false` everywhere would have been the toothless version |
+
+**Renamed test.** `terminal_persistence_timeout_is_recorded_as_output_committed_not_as_a_plain_failure`
+→ `a_terminal_persistence_breach_clamps_retry_and_keeps_the_result_it_could_not_persist`. The old
+name asserted the thing F38 found to be false. It is cited in
+`plans/04-durability-correctness.md:359`, which is now stale on the name only.
+
+**Cheapest edit that breaks the property while leaving the guards green.** Populate the outcome
+from a *different* successful-attempt source than `output` — e.g. re-reading the attempt row —
+which would produce the right numbers here and diverge whenever the row did not commit. The
+`outcome.usage == attempt.usage` conjunction is asserted as one fact for that reason. The residual
+gap is the `responses` row: neither case drives `PublicService`, so
+`terminal_update_from_outcome`'s handling of a `Failed` outcome carrying usage is reasoned about
+above but not pinned by a test. A public-plane case that forces a terminal-persistence breach would
+close it.
+
+**Gates:** `ALL GATES PASSED` — fmt, clippy, **test (1049 passed, 42/42 integration targets logged,
+zero DB-skip lines)**, release, deny, audit (the one expected allowed warning, RUSTSEC-2026-0221).
 
 ### F41 is WRONG as recorded — there is no skill-tree drift
 
@@ -2828,6 +3552,191 @@ and it touches every `get_or_create_*_policy` family rather than the two on this
 about policy reads, not about summarization. *Reversal condition:* it closes when the read path
 stops writing.
 
+### F47 — **CLOSED** `fix/f40-f47-response-output-and-policy-reads`. The read path stops writing, and the consequence was three times larger than recorded — 2026-08-02
+
+**The finding was right and understated.** It named dead-tuple churn and a row lock. Measured
+against the live schema, those are two of **four** things one `get_or_create_*_policy` call did,
+and the two it missed are the expensive ones. Every measurement below was taken with `psql`
+against the real tables, not argued from the SQL:
+
+| what a "read" did | evidence |
+|---|---|
+| wrote a new heap tuple + WAL record | `xmin` `1067657 → 1067658 → 1067659 → 1067660` and `ctid` `(0,1) → (0,2) → (0,3) → (0,4)` over three calls |
+| **bumped `version`** — the `ETag` served on `GET …/policy` and demanded back on `If-Match` | `version 1 → 2 → 3 → 4` over the same three calls, via the `<table>_bump_version` trigger; `updated_at` moved each time too |
+| **fired `pg_notify('moira_runtime_config', …)`** | `LISTEN` on the channel received **exactly three** notifications from three `do update` calls and **zero** from three `do nothing` calls |
+| took a row-level lock | as recorded |
+
+The third is the one that matters. `apply_invalidation` (`src/infra/db.rs`) calls
+`cache.invalidate_all()`, `runtime_handles.invalidate_all()` and `auth_settings.invalidate_all()`
+on **every** notification, so a conversation-linked turn — three policy reads — wiped every
+replica's runtime-config cache and every cached provider client handle **three times per turn**.
+The second means an operator's `If-Match` on a policy `PUT` could be invalidated by unrelated
+traffic on the same application.
+
+**The family is FIVE, not two, and the count in the finding's own fix sketch was the trap.** Four
+live on `PgConversationRepository` (conversation, memory, retrieval, embedding) and all four had
+the `do update` spelling. The fifth is
+`PgPublicRepository::get_or_create_application_execution_policy`, and it is the interesting one:
+it **already read first**, so it never had any of the write amplification above — and its insert
+carried **no `on conflict` clause at all**. Two concurrent first requests for a new application
+therefore raced, and the loser got
+`duplicate key value violates unique constraint "application_execution_policies_pkey"`.
+Reproduced directly in Postgres, then reproduced through the repository under a barrier. It sits
+on the hot path of every `POST /v1/responses`.
+
+That inverts the brief's warning. It said the row lock being removed "is currently what makes
+[the race] impossible" — true for the four writers, and **false for the fifth, which never had
+the lock and already had the bug.** Done properly the fix *removes* a correctness bug rather than
+trading one for throughput.
+
+**The race is closed by a fresh snapshot, not by a retry.** All five now share
+`src/infra/repositories/policy_row.rs`: `select` → `insert … on conflict do nothing returning` →
+`select`. Each statement runs on its own pooled connection at `READ COMMITTED`, so the second
+`select` takes a **new** snapshot and sees a row a concurrent inserter committed while the
+`do nothing` was waiting on its speculative insertion. Verified in Postgres: the losing session
+returns `INSERT 0 0` and the following `select` returns the row. Steady state is now **one
+`SELECT`** — cheaper than what it replaced as well as silent. The bounded `ATTEMPTS` loop exists
+only so a row deleted underneath the caller ends in a coded error rather than a spin.
+
+**Guard: `tests/policy_reads_do_not_write.rs`, five cases, and it asserts on the write.** A guard
+that checked "the policy comes back" passes in both arrangements — the returned value was never
+wrong. So the assertions are `xmin`, `version`, and the **absence of a runtime-config
+notification**, the last one closed with a sentinel `pg_notify` rather than a timeout so it is an
+acknowledgement gate and not a delay. The silence is checked against a control on the same
+listener — a genuine `put_*_policy` must still be announced — because an assertion that nothing
+arrived is worthless if nothing *can* arrive, which is F16's shape.
+
+**Six mutations run, each reverted:**
+
+| mutation | result |
+|---|---|
+| conversation policy back to `do update` | red — three notifications, naming that table |
+| **memory** policy back to `do update`, conversation left fixed | red — three notifications, naming *that* table. Per-member coverage is real, and reverting one member is the cheapest edit |
+| execution policy back to `select` + bare `insert` | red — `a concurrent first touch of application_execution_policies failed: database error` |
+| delete the insert entirely, select only | red ×3, loudly |
+| `ATTEMPTS = 1` — no re-select after a conflicting insert | **red on the concurrency case only.** This is the "cannot return `None` for a row that exists" mutation, and it proves the second select is load-bearing |
+| `select … for update` | **`a_policy_read_is_not_a_write` stayed GREEN** |
+
+The last one is the §3.4 answer and the reason there are five cases and not three. `for update`
+restores the serialisation half of F47 while writing nothing — no tuple version, no `version`
+bump, no notification — so every write assertion held. That is the cheapest edit that breaks the
+property and satisfies the guard, and it now has its own case:
+`a_policy_read_does_not_wait_for_a_row_lock` holds an exclusive lock in an uncommitted
+transaction and requires the read not to wait. **Found by asking the question and then running
+the answer**, which is the only step that has ever worked here.
+
+**The known state that collapsed two variables, and the case that separates them.** Pinning every
+row to "already exists" makes the signatures exactly comparable — and makes *read-then-insert*
+and *select-only* indistinguishable, because no policy is ever missing.
+`a_first_touch_creates_the_row_and_says_so` separates them, and
+`concurrent_first_touches_all_succeed` separates both from the bare-insert spelling that actually
+shipped. A fifth case pins `POLICY_TABLES` against `information_schema`, because every other
+assertion iterates a hardcoded list of five and a sixth `application_*_policies` table would be
+watched by nothing.
+
+*Reversal condition:* F47 reopens if any `get_or_create_*_policy` performs a heap write, takes a
+row lock, or emits a `moira_runtime_config` notification on the path where the row already
+exists — all three of which `tests/policy_reads_do_not_write.rs` now observes directly. It also
+reopens if a new `application_*_policies` table is added without being added to `POLICY_TABLES`,
+which the schema-pinned fifth case reds on.
+
+**Raised F51** while measuring the notification half: the channel is attached to `conversations`
+and `memory_records` as well as the configuration tables, and `apply_invalidation` ignores
+`circuit_reset_scope` for three of the four things it clears. F47's fix does not touch that.
+
+### F40 — **CLOSED** `fix/f40-f47-response-output-and-policy-reads`. Premise refuted; the reason it gave was the real defect — 2026-08-02
+
+**The premise does not hold, and establishing that was most of the work.** F40 says
+`GET /v1/responses/{id}` returns an empty `output` array "for a completed, persisted response".
+That state is unreachable. `output_persisted` is written by exactly three constructors —
+`terminal_update_from_outcome`, `failure_update`, and the stream-start failure arm — and **all
+three hardcode `false`**; the column defaults `false`; nothing anywhere in `src/` writes `true`.
+`docs/response-persistence.md` already said so. The old condition was
+`Completed && !output_persisted`, so `Completed` *always* produced `OutputUnavailable`, and
+`Vec::new()` was reached only by `Queued`, `InProgress`, `Failed` and `Cancelled`.
+
+**Is `[]` right for those four?** Yes, and it is left alone. They have genuinely produced no
+output, `status` already says which, and converting them would be a public-shape change with
+nothing behind it. `only_completed_responses_carry_an_explanation` pins that, so the fix cannot
+drift into "always explain".
+
+**Is the output retrievable anywhere?** No — and this is the question the product call turned on.
+There is **no column that stores response output text**. `responses.output_summary` holds
+`{persistence_mode, output_text_bytes, output_hash}` — a length and a *peppered* hash, not the
+text. The one surviving copy is `conversation_messages.content_plain`, written by
+`record_assistant_response`, and only for conversation-linked responses. **Serving it from
+`get_response` was considered and rejected**: that endpoint authorises `moira:responses:read`,
+while conversation content is governed by `moira:conversations:read` plus the conversation
+policy's `conversation_content_persistence` (which F32 shows is enforced by nothing, on a fix
+still unmerged in PR #57). Widening an authorisation boundary to improve an explanatory string is
+the wrong trade, and it is the same reasoning `citations_from_link` already gives for not
+re-resolving `context_plans` on this path.
+
+**So: not retrievable ⟹ say so, and say it accurately. Two defects, both real, both fixed.**
+
+1. **The reason was a lie for three of the four persistence modes.**
+   `reason: "metadata_only_persistence"` was a literal, emitted whatever the application had
+   configured. It is correct for the default and false for `none`, `plain_content` and
+   `encrypted_content` — worse than no explanation, because it names a cause the operator did not
+   choose and sends them to change a setting that is not the reason. Now derived from the
+   `persistence_mode` recorded in `output_summary` **at completion time**: `none` →
+   `persistence_disabled`, `plain_content`/`encrypted_content` →
+   `content_persistence_not_implemented` (nothing in the tree honours either; see also F33's five
+   unwritten encryption columns), everything else → the previous literal.
+2. **`Completed && output_persisted` fell through to `[]`** — the more the row claimed to have
+   persisted, the less the endpoint returned. Unreachable today and now named
+   `persisted_output_not_loaded` rather than left silent, so whoever implements content
+   persistence meets a string that says what happened instead of the empty array F40 reported.
+   This is the F48 shape: latent, made loud, behaviour on every reachable path unchanged.
+
+**The invariant is now stateable: a completed response never carries an empty `output`.** Either
+the text, or a reason. That matters because a completed response *can* legitimately have no
+content — a model returning an empty string — and it is served as `OutputText { text: "" }`,
+never as `[]` and never as `output_unavailable`. Pinned by
+`an_empty_model_reply_is_output_text_not_output_unavailable`, because if `Succeeded` could arrive
+with `output_text: None` the whole distinction would collapse.
+
+**Public shape: unchanged. Value: changed, narrowly, and deliberately.** `reason` is
+`{"type": "string"}` with no `enum` in `docs/openapi.json`, so no schema moved — the committed
+snapshot is byte-identical and the counts hold at **152 operations / 100 paths / 183 schemas**
+(re-derived from the document, not copied from a brief). The *value* changes only for
+applications not on the default `metadata_only`, which are exactly the ones being told something
+false today. **This is a much weaker break than F32 or F46** — F32 refused a previously-accepted
+input value with a 422 and was held for human sight; F46 refused a previously-accepted request
+shape. This changes an explanatory string on a field documented as unconstrained, and the default
+deployment sees no change at all. Recorded in the PR body; not held.
+
+**Guards, at two levels, deliberately.** Five unit cases in `src/application/public.rs` pin the
+whole mapping matrix — all four modes with a distinctness assertion, the `output_persisted` case,
+every non-completed status, the empty-completion case, and the unreadable-mode fallback. Three
+integration cases in `tests/response_output_honesty.rs` drive a real `POST` against a scripted
+mock and read the real `GET` body.
+
+**Why both, and the mutation that proves it was not redundant.** This is F49's lesson applied
+before the fact: *"it asserts on the real wire" is not "it reaches the code you changed"*, and
+its converse. The fix reads `output_summary.persistence_mode`; the unit cases build that field
+themselves, so they cannot tell whether `terminal_update_from_outcome` writes it or whether
+`find_response_authorized` selects it. Mutation **M10** removed `persistence_mode` from the
+terminal update — **all 21 unit cases stayed green while two integration cases went red.** Unit
+coverage alone would have been exactly the F49 trap.
+
+**Four mutations run, each reverted:**
+
+| mutation | result |
+|---|---|
+| re-hardcode the reason to `"metadata_only_persistence"` | red at both levels; the integration failure prints the whole response body |
+| restore `&& !record.output_persisted` | red at both levels — the integration case reports `got []`, F40's exact symptom |
+| explain every status, not only `Completed` | red — `Queued must return an empty output array` |
+| **drop `persistence_mode` from the terminal update** | **unit green ×21, integration red ×2** — the wiring is genuinely under test |
+
+*Reversal condition:* F40 reopens the moment anything writes `output_persisted = true`. At that
+point `persisted_output_not_loaded` stops being a latent-state marker and becomes a real bug
+report about `get_response`, which must then load and return the stored body —
+`a_row_claiming_persisted_output_is_not_served_as_an_empty_array` is the case to rewrite, and it
+flips the column by hand precisely so it is already sitting on that state. It also reopens if a
+fifth `ResponsePersistenceMode` variant is added without an arm in `output_unavailable_reason`,
+which falls back to the default answer silently.
+
 ## USER DECISIONS — 2026-07-31, taken interactively
 
 1. **Findings before waves 4–5.** F20, F13, F17 and the Wave 2 leftovers first. F20 is the reason:
@@ -2897,6 +3806,1128 @@ If any of those is false, **make it true first** — that is cheap, and re-deriv
 The "State at a glance" block above exists precisely so a compacted context can resume from one read.
 
 ## Cycle log
+
+### Cycle 17 — 2026-08-03 — F54 closed; the queue is empty; a marker-carrying commit shipped and was caught
+
+`main` at `027af93`. **Eleven PRs merged across cycles 14–17.** Nothing actionable remains.
+
+**F54 closed on a corrected premise — and the correction came from my own summary, not the finding.**
+The cycle-16 paragraph said the extraction failure class was *"lost from `memory_extraction_runs`"*.
+It was not: that column has existed since `0007` and has carried the class since F29's third
+precondition. **F54's own entry said so; my one-line summary of it said the opposite, in the same
+commit** — and the summary is what the next brief inherited, which made its first proposed fix
+already-shipped work. Corrected in `b1bb9af`.
+
+The real gap was *correlation*, closed by `0025`'s `execution_id` column. Not a FK, deliberately —
+`execution_id` is no table's primary key, and a FK to `responses` would fail on exactly the
+deployments that persist least. The argument against the cheapest option was not "documenting is
+bad": **the schema had already answered this twice in the same migration** (`context_plans` and
+`retrieval_runs` both carry bare indexed `execution_id`), so documenting the string convention would
+have made `memory_extraction_runs` the only run table correlating differently.
+
+**The `stricter_of` gap recorded as "bounded, not fixed" turned out closable** — `permissiveness()`
+maps two consent modes to the same value deliberately, so a tying pair exists.
+
+#### ⚠️ A thirteenth form of "exit codes lie", committed by this loop
+
+**A conflict-resolution script failed its assertion, and `git add; git commit` — chained with `;`
+rather than `&&` — staged, committed and pushed the file with `<<<<<<<` still in it.** The commit
+output looked entirely normal.
+
+Form 3's shape applied to a merge: *a failed step followed by a succeeding one reads as success.*
+Caught by grepping the pushed branch, fixed in `8ab8cac`, recorded as HANDOFF §2.2 form 13.
+**Two habits close it:** chain with `&&`, and make the resolver assert *zero markers remain* **before
+it writes** — a wrong line number must not be able to produce a half-resolved file.
+
+#### Two more corrections to briefs I wrote
+
+- **"the shared DB is at `0024`"** — true and misleading. `moira` is only the *origin*; each test
+  clones a migrated **template** which was at 25. `select max(version)` against `moira` reads 24 and
+  is **not** evidence a migration failed to apply. Nearly caused a real green to be read as a lie.
+- **"summarization has the same shape"** (in F54's own entry) — false. `conversation_summaries` has
+  no `status`, no `failure_class` and no run row; a failed summarization writes nothing but a metric
+  counter. Raised as **F55**, deliberately unfixed: a new table and a design question, not a column.
+
+#### The record across this run
+
+**Four findings were refuted where they aimed and real somewhere else** — F40, F43, F30, F53 — and
+F53's evidence had been destroyed by the commit that raised it. **Thirteen guards** have now been
+found that could not fire, several already shipped and trusted. The question that found nearly all of
+them: *what is the cheapest edit that breaks the property while leaving the guard green?*
+
+
+### Cycle 17 — 2026-08-03 — F54 closed on a corrected premise; F30's recorded gap closed
+
+Branch `fix/f54-extraction-correlation`, three commits, one gate run — **ALL GATES PASSED**, 1102
+tests, the one expected allowed `RUSTSEC-2026-0221`.
+
+| item | verdict |
+|---|---|
+| **F54** | **CLOSED, premise partly REFUTED.** Migration `0025` adds `memory_extraction_runs.execution_id` |
+| **F30's recorded `stricter_of` gap** | **CLOSED — it was closable, not unclosable.** The tying pair exists in the enum |
+
+#### F54's brief was wrong in the same direction twice, and the ledger's own entry was righter
+
+The cycle-16 summary above says *"the extraction failure class is lost from
+`memory_extraction_runs`"*, and the brief that carried it repeated that. **It is not lost.**
+`memory_extraction_runs.failure_class` has existed since `0007…:312` and has carried the
+*execution's own* class since F29's third precondition — which the F54 entry two sections down
+states correctly (*"The run row now records the execution's failure class"*). The one-line summary
+drifted from the entry it was summarising, in the direction of restating the finding it had just
+narrowed.
+
+**The consequence is that the brief's first candidate fix — "persist the failure class on
+`memory_extraction_runs`" — was already shipped**, and had it been taken it would have duplicated
+a column onto itself. The second candidate ("persist the execution/response id as a real column,
+making the correlation a foreign key") was also wrong in its detail: `response_id` is **already**
+a real FK on that table and is **already taken** — it references the *triggering turn's* response,
+which is a different execution from the extraction's own. *Read the entry, not the summary of the
+entry; and check whether a proposed column already exists before costing it.*
+
+#### What the fix is, and why the cheapest option was not right
+
+`execution_id uuid` plus an index, written when the run row is **opened**.
+
+**Not a foreign key, and this is not a compromise.** There is nothing to reference: `execution_id`
+is not the primary key of any table — it is `unique` on `responses` and a plain indexed column on
+`execution_attempts`. A FK to `responses(execution_id)` would additionally fail *exactly* on the
+deployments that persist least, since a `responses` row exists only when `persistence_mode` says
+so while `execution_attempts` and `audit_logs` are written regardless.
+
+**The argument that beat "document the convention" is not that documenting is cheap-and-bad; it is
+that the schema had already answered this question twice, in the same migration.**
+`context_plans.execution_id` and `retrieval_runs.execution_id` (`0007…:448`, `0007…:467`) are both
+bare indexed uuids on run tables solving this exact problem. Extraction was the odd one out.
+Documenting the string convention would have made `memory_extraction_runs` the only run table in
+the schema that correlates differently — and the convention is a `varchar(128)` with no format
+constraint, so the documented join would still have been `like 'memory-extraction-%'` with a uuid
+parsed out of it. There was also a **fourth** option the brief did not list and which is genuinely
+the cheapest: put the id in the existing `metadata` jsonb and skip the migration entirely. It
+loses the index and the type, on a column whose only consumer is an operator writing SQL.
+
+**Written at open, not at completion.** `insert_memory_extraction_run`'s doc comment celebrates
+that a run dying mid-call leaves a `'running'` row rather than no row. That row is the one an
+operator most needs to correlate, and it never reaches `complete_memory_extraction_run` — so
+recording the id at completion would have left it null precisely there.
+
+**The barrier is the type.** `MemoryExtractionRunInsert.execution_id` is a required `Uuid`, not an
+`Option`, so no writer can open a run row without naming the execution it is about to run. The
+column is nullable only for rows predating `0025`.
+
+**Reversal condition:** if executions ever get a table of their own with `execution_id` as its
+primary key, this column becomes a real foreign key to it in the same change. Until then the type
+on the insert struct is what holds the invariant, and it must not be relaxed to `Option` to make a
+new call site compile.
+
+#### The correlation guard, and the naive version that would have shipped green
+
+`a_failed_extraction_run_names_the_execution_that_failed`. It does **not** assert the column is
+populated; it resolves it against `execution_attempts`, which the *execution kernel* wrote.
+
+| mutation | observed |
+|---|---|
+| `run_extraction` mints its own id again, ignoring the one the run row was opened with | **red** — *"the run row must name the execution that failed, not a uuid minted somewhere else"*. The column is non-null and indexed and names nothing |
+| the same mutation, against a guard weakened to `assert!(execution_id.is_some())` | **GREEN.** Run deliberately, and it is the whole reason the guard joins |
+| `insert_memory_extraction_run` binds `None` | **red** — *"a run row must name the execution it ran, even when that execution failed"*. Only this test reds; the other 22 stay green, so nothing else in the tree covered this |
+| the run row records the **caller's** execution id (the realistic confusion, since `response_id` on the same row points at that turn) | **red** on the same `assert_eq!` — and see below |
+
+**The fixture always produces two executions** — the caller's turn and the extraction — so an id
+that merely resolves to *some* attempt row proves nothing. The caller's succeeded and the
+extraction failed, which is what makes them tellable apart.
+
+**What running the fourth mutation found, and it is about the guard rather than the code.** The
+guard also carried an explicit `assert_ne!(run_execution_id, callers.execution_id)`. That
+assertion **can never be the one that fires**: with the two ids already asserted distinct, it is
+implied by the `assert_eq!` above it. It was removed in its own commit. *An arm no test can
+execute is a promise, not a guard* — §3.4's rule, applied to a guard written by an author who had
+just read it, which is the third time that sequence has happened here.
+
+**Cheapest edit that breaks the property while leaving the guard green:** none found. Writing the
+id at completion instead of at open is not cheap — it requires moving the field from the insert
+struct to the outcome struct, because the insert takes a non-optional `Uuid` and the outcome has
+no such field. That is a redesign, not an edit.
+
+#### F30's recorded gap — CLOSABLE, and now closed
+
+The gap was *"swapping `stricter_of`'s arguments at the `memory_behavior` call site survives its
+guard"*. The brief asked whether a pair of **different** values that **tie** exists in the enum,
+and said that if none did the gap would be unclosable by construction and should be left recorded.
+
+**Such a pair exists.** `permissiveness()` maps `ApplicationManaged` and
+`AutomaticWithUserControls` both to `2` — deliberately, and documented as such: they *"differ in
+who asserted consent, not in how much is permitted"*. So the gap is closable, and
+`the_reported_memory_behavior_resolves_the_consent_tie_toward_the_memory_policy` closes it with
+both argument orders of that pair.
+
+| mutation | observed |
+|---|---|
+| `stricter_of(memory, conversation)` at `effective_memory_behavior` — **the recorded gap verbatim** | **red**, and **only** the new test — *"conversation=AutomaticWithUserControls memory=ApplicationManaged: … left: "automatic_with_user_controls", right: "application_managed""*. 23 other cases green, which confirms this was genuinely the surviving edit |
+| `effective_memory_behavior` reports the memory column alone (F30's shipped defect) | **red**, and **only the sibling** `…_is_the_stricter_of_the_two_consent_columns`. The new tie test stays **green** |
+
+**The two cases are exact complements, verified in both directions rather than asserted.** The tie
+test is *blind* to a memory-column-only read — because on a tie the memory column **is** the
+answer — and the sibling is blind to the swap. Neither is a superset of the other, and the doc
+comment on the new case says so explicitly so that neither gets retired for the other later.
+
+**The value is bounded and the test states the bound in its own doc:** both tied modes permit the
+same thing, so this can only change *which of two equally-permissive labels is reported*, never a
+consent outcome. It is worth pinning because resolving the tie the other way would silently change
+the value reported to deployments where nothing is wrong.
+
+*Swapping the arguments at the **other** call site (`effective_extraction_status`) remains inert
+and is not a gap: both tied modes map to the same `MemoryStatus`, which
+`the_combined_consent_decision_is_symmetric` already pins.*
+
+#### A correction to the F54 entry's own remedy
+
+It said *"add `execution_id` … (and the summarization run equivalent)"*. **There is no
+summarization run equivalent.** `conversation_summaries` has no `status`, no `failure_class` and
+no run row at all — a summarization that fails writes **nothing** to the database beyond a metric.
+That is a different and larger gap than F54's, and it was not expanded into here. Recorded as
+**F55** rather than silently folded in.
+
+#### What remains
+
+Unchanged by this cycle, and none of it autonomous: **F50**'s fail-closed product decision, the
+**structured-output fail-hard flip**, **F33**'s envelope-encryption scoping, **PR #57** (F32), the
+**rig-core issue** in `docs/upstream/`, and the **T11 deploy**. Newly raised and also not
+autonomous: **F55**.
+
+### Cycle 16 — 2026-08-03 — the queue is empty; what is left needs a human
+
+**Ten PRs merged across cycles 15–16.** `main` at `cddb2a5`. **Every finding that an autonomous loop
+can honestly close is closed.**
+
+| PR | Findings | Merge |
+|---|---|---|
+| #66 | F53, F50 made observable | `8d983aa` |
+| #67 | F30 (partly refuted), both structured-output preconditions, F54 raised | `cddb2a5` |
+
+#### Two more findings were refuted where they aimed and real somewhere else
+
+- **F53's own evidence was destroyed by the commit that raised it.** It argued
+  `docs/runtime-cache-invalidation.md` "lists neither table" — true when drafted, **false when
+  committed**, because `e16cb0c` added the RAG tables to that paragraph. *A finding that cites a
+  document its own commit edits cannot be re-verified later by reading that document.* It also named
+  columns (`embedding model`, `dimensions`) that `rag_collections` does not have.
+- **F30 is refuted as an extraction defect** — "takes the stricter" *is* implemented. But **its own
+  predicted third reader had already arrived**: `conversation_select` reads the memory column alone,
+  in SQL, so `GET /api/v1/conversations` reported `application_managed` while extraction refused
+  under a conversation policy of `disabled`.
+
+#### The rules earned this cycle
+
+1. **A single point of truth is only a barrier if it is reachable from every layer that needs the
+   answer, in the type that layer needs.** F30's rule was already in one place — an application-layer
+   function over `Option<MemoryStatus>` that a SQL query could neither call nor use.
+2. **A guard that iterates a constant cannot see a name being *removed* from it.** Set-membership
+   guards are one-directional by construction; deleting `rag_documents` from the derived inventory
+   left every unit test green.
+3. **An arm no test can execute is a promise, not a guard.** Why `run_extraction` records the
+   execution's own failure class rather than special-casing an unreachable variant.
+4. **Checking a claim can change the fix.** Precondition 3's "the only signal" was overstated — the
+   class survives in `audit_logs` and `execution_attempts`. The narrower truth (lost from the
+   operator-facing `memory_extraction_runs`) is now **F54**.
+
+#### Decisions taken, each with what would reverse it
+
+- **F50: observability shipped, product decision untouched.** Silence is a defect under *either*
+  answer; fail-closed and observable fail-open differ only in whether the request is *also* refused.
+  **Recommendation if the decision is taken: a per-route opt-in, not a global mode** — a disabled
+  profile is a configuration state an operator chose, and refusing turns one admin toggle into a
+  route-wide outage. Fail-closed is defensible only if the preamble is a *security control* rather
+  than a behaviour default, and nothing in the tree frames it that way.
+- **`StructuredOutputInvalid` stays out of all three dispositions**, now recorded and guarded rather
+  than true by omission. Fallback was **nearly yes** and flipped to no because **F39 already removed
+  the real case at routing time**, and because a class carries one disposition while this class has
+  two emitters — admitting it lets one malformed caller schema walk the whole fallback chain.
+- **The fail-hard flip is NOT shipped.** Its reversal condition now holds in full, so it is a choice
+  rather than a wait — but it turns a silent `None` into a terminal 422 for every caller whose model
+  returns prose, and it *must* turn F42's emitter guard red (that red is the interlock working).
+  Landing it inside enabling work would have meant a reviewer approving a blast-radius decision they
+  did not come for. What it must do is written at `structured_output_from_text`.
+
+
+> **CORRECTION (cycle 17).** This paragraph originally described F54 as *"the extraction failure
+> class is lost from `memory_extraction_runs`"*. **That was wrong, and it contradicted F54's own
+> entry in the same commit.** `memory_extraction_runs.failure_class` has existed since `0007` and has
+> carried the execution's class since F29's third precondition. The real gap was *correlation* — the
+> run could not be tied to its execution except through an unenforced `request_id` string convention.
+> Closed by `0025`'s `execution_id` column.
+>
+> **A one-line summary of a finding can contradict the finding, in the same commit, and the summary
+> is what the next brief inherits.** The implementing agent caught it by reading the entry rather than
+> the summary — the same failure mode as F53, whose evidence its own commit had destroyed.
+
+#### What remains, and none of it is autonomous work
+
+~~**F54** (a failed extraction cannot be correlated to its execution except through an unenforced
+`request_id` string convention) and one **bounded,
+recorded gap** — swapping `stricter_of`'s arguments survives its guard, and can only change which of
+two equally-permissive labels is *reported*, never a consent outcome.~~
+
+**Both closed on `fix/f54-extraction-correlation` (2026-08-03) — and the first clause of that
+sentence was wrong when written.** The failure class is **not** lost from `memory_extraction_runs`;
+that column has existed since `0007` and this cycle's own F54 entry says so. What F54 is actually
+about is the missing **`execution_id`**, which migration `0025` adds. The `stricter_of` gap turned
+out to be **closable** — `ApplicationManaged` and `AutomaticWithUserControls` are two distinct
+values that tie — so it is closed rather than still recorded. See cycle 17.
+
+**Needing a human:** PR **#57** (F32's 422 breaks IaC setting `encrypted_content`); **F33**'s
+encryption scoping; the **rig-core issue** drafted in `docs/upstream/`; the **T11 deploy**; **F50**'s
+fail-closed call; and the **fail-hard flip**.
+
+
+### Cycle 15 — 2026-08-02/03 — the findings queue emptied: eight PRs, three refutations
+
+**Every finding on the inherited queue is closed.** `main` moved `eb9b988 → 20efdfa`.
+
+| PR | Findings | Merge |
+|---|---|---|
+| #59 | F39 — structured-output capability | `655494a` — **the stopped peer's**, adopted |
+| #58 | F46 — refuse `json_object` | `c938d5c` |
+| #60 | F28, F10 item 1 | `71b7dba` — **my stopped agent's**, recovered and re-gated |
+| #61 | F38, F48 guard, F49 raised | `779104d` |
+| #62 | F49, F50 raised | `324d1b4` |
+| #63 | F47 confirmed, **F40 refuted**, F51/F52 raised | `d295f9e` |
+| #64 | F51, F52, F53 raised | `e16cb0c` |
+| #65 | F42, F43 **refuted**, F44, F45 | `20efdfa` |
+
+**Three findings were refuted rather than fixed, and each refutation was worth more than a fix
+would have been:**
+
+- **F40** — no configuration reaches the empty array at all; `output_persisted` is never `true`
+  anywhere, so `Completed` *always* took the `OutputUnavailable` branch. Going to check turned up two
+  real defects next door: a hardcoded reason literal that was false for three of four modes, and a
+  fall-through to `[]` where the row claimed *more* persistence.
+- **F43** — "every caller is inside `#[cfg(test)]`" is true only if `tests/` counts. **9 of 29 callers
+  are in a separate crate**, so private/deleted were never available. **`pub` in this
+  `publish = false` single-crate workspace means "visible to integration tests", not "external
+  contract"** — that reframes every dead-`pub` finding.
+- **F41, F36** were refuted in the prior cycle; the pattern is now established enough to expect it.
+
+**Two findings were understated by their own entries:**
+
+- **F47** — the family is **five**, not two, and the cost was not dead tuples. Each "read" fired
+  `pg_notify`, so a conversation-linked turn wiped every replica's caches **three times**. Measured:
+  3 notifications from 3 `do update` calls, 0 from 3 `do nothing`.
+- **F51** — its standing defence was that caches "rebuild on the next read." True of two of three;
+  **false of `ProviderRuntimeCache`, which holds built Rig clients with their connection pools** —
+  and it is keyed by a tuple already containing every version number, so even the config-write case
+  that defence was written for never needed the wipe.
+
+#### The rules earned this cycle
+
+1. **A derived inventory is only a guard if something else consumes it.** (F52) Deriving a list from
+   `pg_trigger` stops it drifting from the schema; it does not stop someone editing the list to make
+   the test pass. Closed only because a second guard consumes the same constant.
+2. **A barrier must be inert with respect to the property it brackets.** `drain_listener` emits a
+   `provider_models` payload — configuration — so it cleared the very caches under observation.
+3. **Observe the most expensive thing a fix protects, not the easiest to construct.**
+4. **Two CI runs can exist on one commit.** A `workflow_dispatch` alongside the automatic
+   `pull_request` event makes `check-runs` report a job as *both* `completed/success` and
+   `in_progress`. Form 12 warns about the previous *commit*; this is its sibling on the *same* commit.
+   **Select the run by `event == "pull_request"`, and do not fire a redundant dispatch.**
+5. **`pgrep` for a live build is too coarse to gate a reclaim on.** The build that blocked one was the
+   Moira **server** (`cargo run` in the main checkout on `./target`), unrelated to every
+   `~/.cargo-targets/*`. Resolve with `lsof -a -p <pid> -d cwd -Fn` and the process's
+   `CARGO_TARGET_DIR` before acting.
+
+#### On recovering stopped work
+
+Two sessions stopped mid-flight this cycle and both left work worth finishing. The recovered branch
+carried five commits *including its own ledger closures*, which reads like completion — **but no gates
+log existed anywhere.** Gates were re-run from scratch before it was PR'd. *"It committed, so gates
+must have passed"* is exactly the inference §2.2 exists to prevent.
+
+#### What remains, and it is short
+
+~~**F50** and **F53** are open and both deliberately unfixed~~ — **both were taken on
+`fix/f53-f50-silent-degradation` (2026-08-03).** F53 is **CLOSED**: the question it was gated on was
+answered first and neither RAG table's configuration is read through any cache, so both lose the
+trigger. F50's **silence is fixed** — `warn!`, runtime event, audit row — while the fail-closed vs
+fail-open **product decision is deliberately still open**, because observability is the part both
+answers share rather than half of one of them. ~~The two remaining strict-structured-output
+preconditions are unshipped by design.~~ — **both landed on `fix/f30-consent-columns`
+(2026-08-03); the flip itself is still deliberately unshipped, and its reversal condition now
+holds.** **F30** closed on the same branch, its premise partly refuted. **PR #57 (F32) is still
+held for human sight.**
+
+**The things still needing a human on the findings queue are therefore F50's product decision** and
+**the structured-output fail-hard flip** — now unblocked rather than blocked, which makes it a
+choice about blast radius rather than a wait — plus the pre-existing F33 (envelope encryption
+scoping), the newly raised F54 (extraction runs carry no `execution_id`), and F32's held PR.
+
+
+### Cycle 15 — 2026-08-02 — `fix/f40-f47-response-output-and-policy-reads`: one refutation, one understatement, two new findings
+
+Two independent findings closed on one branch, separate commits, one gate run.
+
+| finding | verdict |
+|---|---|
+| **F40** | **premise REFUTED** — the state it described is unreachable. Two adjacent defects in the same function were real and are fixed |
+| **F47** | **confirmed and understated by a factor of two** — it named two consequences and there were four, including a cluster-wide cache wipe |
+| **F51** | raised — the invalidation channel is attached to per-request data tables and `apply_invalidation` ignores its own scope for three of four targets |
+| **F52** | raised — three triggered tables are unclassified, and the shipped guard that exists to catch that retypes its inventory instead of deriving it |
+
+## F30 CLOSED (partly refuted) · F29's last two preconditions LANDED — `fix/f30-consent-columns`, 2026-08-03
+
+Two independent pieces, separate commits (`673f9c0`, `4824838`, `ff7f5e2`), one gate run.
+
+| finding | verdict |
+|---|---|
+| **F30** | **premise partly REFUTED, and confirmed at a site it did not name.** "No code path reconciles them" was true when written and false by the time it was read: `effective_extraction_status` has taken the stricter of the two since Sub-Phase F, tested with the columns disagreeing in both directions. **But the reader F30 predicted had already arrived** — `ConversationRecord.memory_behavior` was one of the two columns, computed in SQL |
+| **F29 preconditions** | both remaining ones **landed**. The fail-hard flip is deliberately **not** taken; the reversal condition now holds and the flip is a separate, reviewable change |
+| **F54** | raised — a failed extraction cannot be correlated to its execution except through an unenforced `request_id` string convention. **CLOSED on `fix/f54-extraction-correlation` (2026-08-03)** by migration `0025`'s `memory_extraction_runs.execution_id`; the "failure class is lost" half of how it was later summarised is **refuted** — that column has existed since `0007` |
+
+### F30 — the finding was right about the shape and wrong about the site
+
+The entry said *"no constraint or code path reconciles them"*. **One does**, and has since plan 11
+Sub-Phase F: `effective_extraction_status` takes the stricter of the two, and
+`explicit_only_on_the_conversation_policy_alone_still_withholds_the_memory` and
+`disabled_consent_calls_no_extractor_and_writes_no_run_row` already drove the columns *apart* in
+both directions. As an extraction defect F30 is **refuted**.
+
+**Its own predicted failure mode had happened anyway.** `conversation_select` emitted
+`coalesce(mp.consent_mode, 'explicit_only') as memory_behavior`, and that value is returned to
+every caller of `GET /api/v1/conversations` and `GET /api/v1/conversations/{id}`. An application
+with `memory_consent_mode = 'disabled'` on the conversation policy and
+`consent_mode = 'application_managed'` on the memory policy was **told `application_managed`
+while extraction was refusing**. Exactly the shape the entry named — two columns that agree in
+every default deployment and disagree only where an operator deliberately tightened one — and
+every test in the tree set them to the same value, which is why it shipped.
+
+**The reason it happened in SQL is the whole lesson, and it is a sharpening of "reconcile in one
+place".** The combining rule *was* in one place: an application-layer function over
+`Option<MemoryStatus>`. A query cannot call an application-layer function, and the value
+`memory_behavior` needed was a *mode*, not a status — so the second reader could not reuse the
+rule even if its author had wanted to, and wrote its own in six words. **"One place in code" is
+only a barrier if it is reachable from every layer that needs the answer, in the type that layer
+needs.** The rule now lives on `MemoryConsentMode` as `stricter_of`, which is why
+`src/infra/pg_rows.rs` can apply it and `conversation_select` can go back to selecting two raw
+columns and deciding nothing.
+
+Three barriers, in decreasing strength:
+
+1. **There is no consent decision in SQL any more.** The query hands both columns up.
+2. **`status_for_consent_mode` is private and no longer re-exported.** It turned *one* column into
+   a decision, which made it the autocomplete answer for anyone holding one. The only exported
+   entry point takes both.
+3. **Two guards on the data layer**, because 1 and 2 constrain the code that exists and F30 is
+   about the code that does not yet.
+
+`create_memory` still reads the memory column alone. That is deliberate — a manual memory is
+`user_application`-scoped and carries no conversation id, so the conversation policy is not
+describing it — and it is now labelled as a decision in code and in `docs/memory-consent.md`
+rather than sitting there looking like the defect.
+
+**The mutation that mattered**, and it is the one the brief named: a guard that sets both columns
+to the same value cannot see a reader consulting one of them.
+
+| mutation | observed |
+|---|---|
+| `effective_memory_behavior` reports the memory column alone (the shipped defect, restored) | `the_reported_memory_behavior_is_the_stricter_of_the_two_consent_columns` **red** — *"conversation=Disabled memory=ApplicationManaged: the value reported to callers must be the one enforced; left: "application_managed", right: "disabled""*. Every other consent test in the file stayed green, which is precisely how this shipped |
+| a new single-column read added to `conversation_select` (a fourth reader appearing) | both data-layer guards **red**; the count guard named the file and the direction — `("src/infra/repositories/conversation.rs", 8, 7)` against an expected `(7, 7)` |
+| the conversation-policy read **removed** from `conversation_select` | both **red**; the count guard went `(6, 6)` against `(7, 7)`. This is the direction a membership guard cannot see — §3.4's thirteenth shape — and is why the table is compared as a whole rather than asserted upward |
+| `stricter_of` ignores its conversation argument (the rule neutered, SQL untouched) | four unit guards **red**, including `the_combined_consent_decision_is_symmetric`, which was already in the tree and is the one no single-column implementation can pass. The two data-layer guards stayed **green**, correctly — they guard the shape of the query, not the rule |
+
+**Cheapest edit that breaks the property while leaving the guards green** — one found, bounded and
+recorded rather than fixed: **swapping `stricter_of`'s arguments** at the `memory_behavior` call
+site. The function is symmetric except on the tie between the two equally-permissive modes, and the
+integration case that exercises a tie uses two *agreeing* values, so nothing goes red. The blast
+radius is which of `application_managed` / `automatic_with_user_controls` is reported when the two
+columns hold one each — a label difference between two modes that permit the same thing, never a
+consent difference. ~~Closing it would need a tie case with the columns disagreeing, which is worth
+adding the next time this file is opened.~~
+
+**CLOSED on `fix/f54-extraction-correlation` (2026-08-03).** The tie case with the columns
+disagreeing exists, because `ApplicationManaged` and `AutomaticWithUserControls` are two *distinct*
+values that both rank `2`.
+`the_reported_memory_behavior_resolves_the_consent_tie_toward_the_memory_policy` drives both
+argument orders of that pair; the swap reds it and **only** it, with 23 other cases green. It is
+deliberately **not** a superset of `…_is_the_stricter_of_the_two_consent_columns` — on a tie the
+memory column *is* the answer, so the new case is blind to the single-column read F30 was about,
+and the sibling is blind to the swap. Verified in both directions by running both mutations.
+
+### F29's preconditions — the disposition question had a different answer than expected
+
+Precondition 1 asked for a retry/fallback disposition for `StructuredOutputInvalid`. The answer is
+**stay out of all three sets** — the same *behaviour* it had by omission, now a recorded decision —
+but the reasoning is not the same in the three directions, and one of them nearly went the other
+way.
+
+- **Retry: no.** The two live emitters reject the *caller's schema* before the model is called, and
+  an unreadable schema is unreadable on the second attempt. For the reply case the flip would add,
+  Moira pins `temperature: Some(0.0)` on its own schema-carrying calls, so a resample is
+  bit-identical; and a retry budget spent on a chatty model is an attempt not available to the
+  transport failure retries exist for.
+- **Fallback: nearly yes.** The real argument was DeepSeek — a provider that *structurally cannot*
+  send a schema will never comply, and the next one might. **F39 answered that at routing time**, so
+  a model that cannot carry a schema is no longer selected for a schema-carrying request. What is
+  left is a caller schema that fails everywhere, or a model declining, which is a quality question
+  the fallback chain is not scoped for.
+- **The decisive constraint, and it is worth stating on its own: a class carries exactly one
+  disposition, and this class has two emitters.** `is_fallback_eligible` cannot tell "the model
+  replied badly" from "the caller sent a 2 MB schema". Admitting it would let one malformed schema
+  walk the entire fallback chain on every request — caller-triggered amplification against every
+  provider the route lists.
+- **Circuit: no, and least arguable.** Breaker entries are per `(provider, model)` and refuse
+  traffic for *every* caller. A request-shaped failure that can open one is a denial of service
+  wearing a health check's clothes.
+
+**The claim in precondition 3 was overstated, and checking it changed the fix.** The doc comment
+said reclassifying would lose *"the only signal"* distinguishing "the model did not comply" from
+"the call did not happen". It is not the only one: `audit_execution` writes an `audit_logs` row with
+`metadata.failure_class`, and `complete_failed_attempt` writes `execution_attempts.failure_class`.
+What is true is narrower and still bad — the signal is lost from `memory_extraction_runs`, the
+operator-facing record for extraction, and recovering it needs an undocumented string-format join
+(**F54**).
+
+**The fix is deliberately general rather than one arm for `StructuredOutputInvalid`.** A special
+case for that class would be **unreachable by any test in this tree**: extraction builds its own
+always-readable schema and never crosses `validate_response_format`, so neither live emitter is on
+that path. An arm no test can execute is a promise, not a guard. `run_extraction` now records the
+execution's own failure class, which *is* reachable — and the proof is that
+`a_failed_extraction_call_leaves_the_response_untouched` went red on a real provider 500 and now
+asserts `provider_unavailable` where it asserted `extraction_call_failed`.
+
+**The consequence worth keeping:** a non-conforming reply is recorded as `structured_output_invalid`
+**before and after the flip** — today by `parse_candidates` refusing prose, afterwards by the
+execution. The signal precondition 3 was protecting survives the flip instead of being traded for it.
+
+**Mutations.**
+
+| mutation | observed |
+|---|---|
+| `StructuredOutputInvalid` added to `is_fallback_eligible` | both disposition guards **red**; the table one printed *"StructuredOutputInvalid: (retryable, fallback_eligible, circuit_failure) changed … left: (false, true, false), right: (false, false, false)"* |
+| `ProviderTimeout` **removed** from `is_retryable` | the single-variant guard **green**, the table guard **red** — §3.4's thirteenth shape, demonstrated on the guard written to survive it |
+| the `run_extraction` call site reverted to the constant, leaving the helper and its unit tests intact | unit guards **green**, integration guard **red**. This is F49's lesson in one line, and it is *why* the general form was chosen: had the fix special-cased `StructuredOutputInvalid`, this mutation would have had no red at all |
+
+**Cheapest edit that breaks the property while leaving the guards green:** for the disposition,
+adding a **third emitter** of `StructuredOutputInvalid` on a model-output path without revisiting
+the decision. Not a new gap — F42's
+`structured_output_invalid_has_only_the_two_emitters_its_catalog_entry_describes` is the interlock,
+and the disposition guard's body now points at it so a red there is read as "re-open this decision"
+rather than "fix the count".
+
+### Why the flip is still not shipped
+
+The reversal condition holds in full: F39 landed, the disposition is recorded and guarded, and
+`run_extraction` reads `execution.status`. **It is still not taken here, and that is the point.**
+The flip turns a silent `None` into a terminal 422 for every caller whose model returns prose, on a
+class that by design neither retries nor falls back — a blast-radius decision that deserves its own
+diff and its own review rather than arriving inside the work that unblocked it.
+
+What it must still do is written down at `structured_output_from_text`: widen the catalog
+description, expect F42's emitter guard to go **red** (that red is the interlock working), re-read
+the disposition with three emitters in view, and replace the two `tests/structured_output.rs` cases
+that pin the current behaviour on both run paths.
+
+### F54 — a failed extraction cannot be correlated to its execution
+
+Found while discharging F29's third precondition. `memory_extraction_runs` has **no
+`execution_id` column**. The run row now records the execution's failure class, which is the
+question an operator asks first — but the follow-up ("show me that execution: which provider,
+which model, which attempts, what the sanitised provider message was") has no join key.
+
+The only correlation that exists is a **string convention**: `run_extraction` sets
+`request_id = format!("memory-extraction-{run_id}")`, and `audit_execution` writes that into
+`audit_logs.request_id`. Nothing enforces the format, no test asserts it, and no doc names it, so
+an operator can only find the execution by knowing to `like 'memory-extraction-%'` and parsing a
+uuid out of a string. `summarization` has the same shape.
+
+**Not fixed here**: it is a migration plus a writer plus an admin-surface question about whether
+the id is exposed, in a change whose subject was consent columns and failure labels. **Remedy in
+one change:** add `execution_id uuid` to `memory_extraction_runs` (and the summarization run
+equivalent), write it from the `ExecutionCommand` that is already in scope, and pin the
+correlation with a test that reads the execution back through it — at which point the `request_id`
+convention becomes a convenience rather than the only route.
+
+**CLOSED on `fix/f54-extraction-correlation` (2026-08-03), migration `0025`.** Three corrections
+to the remedy as written above, all found while taking it:
+
+1. **The admin-surface question does not arise.** `memory_extraction_runs` is exposed on no route
+   and appears nowhere in `docs/openapi.json`; it is a SQL-only operator record. So there is no
+   DTO and no contract change — but it does mean the column has to be *queryable*, which rules
+   out the genuinely cheapest option of stuffing the id into the existing `metadata` jsonb.
+2. **Write it from the run-row insert, not "from the `ExecutionCommand` that is already in
+   scope".** The command is built *after* the row is opened, so taking the id from it means
+   recording at completion — and the row that never completes is the one
+   `insert_memory_extraction_run` exists to leave behind. The id is now minted in
+   `extract_memories` and handed *to* the command instead.
+3. **There is no summarization run equivalent** — see F55.
+
+### F56 — a reasoning model's chain-of-thought is stored as the conversation summary
+
+**Measured against a real provider, not inferred.** The user's vLLM moved to
+`https://local-llm.motrait.com` (`Qwen/Qwen3-4B`, OpenAI-compatible, no key) on 2026-08-04, which
+made this testable for the first time. Every number below came off that wire.
+
+Moira's **actual** summarization call — `SUMMARIZATION_INSTRUCTION`, the real transcript shape, **no
+`output_schema`**, temperature 0 — returned:
+
+```
+<think>
+Okay, let's see. The user wants to ship the invoicing rewrite before the March board meeting…
+</think>
+
+The user aims to complete the invoicing rewrite ahead of the March board meeting but faces…
+```
+
+**808 of 1282 bytes — 63% — is chain-of-thought**, and `parse_summary` stores all of it.
+`parse_summary` trims, strips a **code fence**, then checks empty and size. There were **zero** code
+fences. Nothing in `src/` handles a reasoning block; `grep -rn "think" src/` returns nothing.
+
+**The prompt already tries to prevent this and fails.** `SUMMARIZATION_INSTRUCTION` says *"Return
+only the summary text — no preamble, no headings, no JSON, no code fences."* A `<think>` block is a
+preamble. The instruction is not a control.
+
+**Why this compounds rather than merely wastes space.** The stored text is fed back as
+`PRIOR_SUMMARY_LABEL` on the next run, so the model reasons about its own previous reasoning. It
+also counts against `MAXIMUM_SUMMARY_BYTES` and the target-token budget, so the *actual* summary is
+squeezed by the reasoning that precedes it.
+
+**Moira has already decided that reasoning is not output — it just cannot enforce it here.**
+`text_from_choice` (`src/orchestration/runtime_factory.rs`) drops `AssistantContent::Reasoning` in
+its `_ => None` arm, and the streaming path filters `StreamedAssistantContent::Reasoning` and
+`ReasoningDelta` by name. That intent is implemented for the case where the **server** separates
+reasoning. vLLM without `--reasoning-parser` does not: the block arrives as ordinary `Text`, and
+Moira cannot tell it apart.
+
+**Not reachable through extraction**, which sends `extraction_output_schema()` — guided decoding
+suppressed the block entirely in test 2 below. **Summarization is the exposed path** precisely
+because F29's parse is gated on a schema summarization never sends.
+
+**Severity is deployment-shaped:** invisible on OpenAI/Anthropic, unavoidable on a self-hosted
+reasoning model — which is exactly what `OpenAiCompatible`/`Local` exists to serve, and what F39
+deliberately left admitted as undecidable.
+
+**Open question, deliberately not decided here:** strip, or refuse. Stripping is a heuristic on
+prose, and `memory_extraction.rs` documents a deliberate refusal to hunt JSON inside prose — the
+same shape. Refusing costs reasoning-model deployments their summaries entirely. **The one thing
+that is not defensible is the current behaviour: storing it silently.**
+
+#### The same session settled two other questions by measurement
+
+- **F39's undecidable half is decidable for this backend: vLLM complies.** `json_schema` +
+  `strict: true` returned exactly `{"name":"Dr. Elara Voss","age":42}` — clean, and with the
+  `<think>` block suppressed by guided decoding. Leaving `Local` admitted was right.
+- **F46 is confirmed on a real provider, not just by reading Rig's source.** Sending the exact shape
+  Moira's `json_object` compiled to — `{"type":"object"}` sanitised to `properties: {}`,
+  `additionalProperties: false`, `required: []`, `strict: true` — the model returned literally
+  `{}`. The refusal shipped in `a8937f4` is now backed by a measurement, not an inference.
+- Tool calling works on this endpoint (`finish_reason: tool_calls`), so **F48 becomes live-testable**
+  the day `build_completion_request` stops hardcoding `tools: Vec::new()`.
+
+## F56 REPRODUCED · CLOSED as F57 — `fix/f57-reasoning-in-summaries`, 2026-08-04
+
+**F56 reproduced against the live endpoint before anything was built on it**, on a second machine
+two days later, with a different transcript. Same shape, different magnitude: **1 298 of 2 419
+bytes — 53.7 %** of the stored summary was chain-of-thought, against F56's 63 %. The share is
+transcript-dependent and should not be quoted as a constant; what reproduces is that *the majority
+of the stored summary is not the summary*.
+
+Three things the wire showed that reading the code could not:
+
+1. **The `reasoning` field is present on the response and is `null`.** vLLM without
+   `--reasoning-parser` emits `message.reasoning: null` while `content` carries the block. So
+   Moira's existing intent — `text_from_choice` dropping `AssistantContent::Reasoning`, the
+   streaming path filtering `ReasoningDelta` — is not merely unenforced, it is *addressed to a
+   field the server left empty*. That makes the operator-side fix exact and nameable rather than
+   speculative, and it is why the warning names `--reasoning-parser`.
+2. **The endpoint sits behind a WAF that 403s on `User-Agent: Python-urllib/*`** while accepting
+   an empty or absent UA. Nothing to do with Moira — but it cost the first measurement attempt, and
+   a future agent probing this endpoint should know that a 403 there is not an auth failure.
+3. `chat_template_kwargs: {"enable_thinking": false}` **works** — 830 bytes, zero tags. It is a
+   real fix living on the request, and it is rejected below for a stated reason rather than
+   overlooked.
+
+### The decision: announce it, store it unchanged. Removal was rejected on a measurement
+
+`parse_summary` now returns `ValidatedSummary { text, inline_reasoning }`, where
+`inline_reasoning` is `text.starts_with("<think>")` — anchored at offset 0, no search, no
+terminator, **and `text` is byte-identical either way**. The condition is announced three ways with
+three consumers, the split `announce_dangling_agent_profile` established for F50: a `warn!` naming
+`--reasoning-parser`, the new label-free counter
+`moira_summarization_inline_reasoning_total`, and an `inline_reasoning` boolean on the existing
+`conversation.summary.created` audit row.
+
+**Stripping the block (option a) was not rejected on principle. It was rejected because the
+terminator is not identifiable, and the live model demonstrated that on the first attempt.** A
+transcript that merely *discusses* reasoning tags — a support conversation about this very defect,
+which is the population most likely to be running a reasoning model — returned one `<think>` and
+**ten** `</think>`: the model quoted the tag while reasoning, and again in the summary because the
+user had asked for the markers verbatim. The real terminator was the **fifth of ten**.
+
+| removal rule | result on that reply |
+|---|---|
+| cut at the first `</think>` | **985 bytes of chain-of-thought left in the stored summary** |
+| cut at the last `</think>` | **2 173 bytes of legitimate summary destroyed**, 220 left |
+| cut only a *well-formed* leading block | correct here, and **inert** on the truncation case below |
+
+And the worst case has no terminator at all. At `max_tokens: 120` the reply came back
+`finish_reason: length`, 613 bytes, one `<think>` and **zero** `</think>` — 100 % reasoning, 0 %
+summary. A rule that strips only a well-formed block does nothing precisely where the damage is
+total, and truncation is reachable: `AgentProfileRecord::max_tokens` reaches this path (F49).
+
+Detection had the opposite result over the same five replies — anchored at offset 0 it was correct
+on **all five**, including the truncated one and the `enable_thinking: false` control. **The
+condition is decidable; its extent is not.** That asymmetry is the entire decision, and it is why
+the fix stores a `bool` rather than a shorter string.
+
+### Every option rejected, with why
+
+- **(b) refuse with a new `FAILURE_SUMMARY_*` class** — rejected **by reasoning already in the
+  tree**, which is why it is worth stating rather than re-deriving. `parse_summary`'s own doc
+  comment explains that a refused summary writes no row, so `covers_through_sequence` does not
+  advance, so the backlog that triggered the run re-triggers it **every turn, forever**. That
+  argument was written about a conversation containing the word `bearer `; here it is strictly
+  worse, because "the model emits inline reasoning" is a **permanent property of the deployment**,
+  not an incident. Refusing would convert a fat summary into an unbounded per-turn provider bill on
+  exactly the deployments the feature is meant to serve. **Its reversal condition is already
+  written at that function and is F55** — a `conversation_summarization_runs` table that can record
+  a refusal and back it off. F55 has **not** landed; the brief for this work assumed it had.
+- **(d) per-provider or per-model configuration** — rejected because it buys nothing. The action a
+  declaration would authorise is still *removal*, and removal is undecidable regardless of how
+  confident the operator is that their model reasons. Configuration that cannot change what the
+  code does is sprawl.
+- **(e) send `chat_template_kwargs: {"enable_thinking": false}`** — measured to work, and still
+  rejected. It is a vLLM transport extension carrying a *Qwen chat-template* kwarg; OpenAI rejects
+  unknown body fields, and `OpenAiCompatible`/`Local` is by construction the arm where Moira cannot
+  know what is behind it — the same undecidability F39 recorded and deliberately left admitted.
+  Moira would be guessing the backend in order to avoid guessing the prose. It is the **operator's**
+  knob, so it is named in the metric description instead.
+- **A well-argued no-change** was available and was not taken, because the measurement moved the
+  question. F56 recorded the one thing not defensible as *storing it silently*; the silence is
+  removable without any heuristic, and that is all that shipped.
+
+### What is deliberately unchanged
+
+The stored summary is still 53 % scratchpad, and it still counts against `MAXIMUM_SUMMARY_BYTES`,
+`budget_tokens` and the target-token budget. **Compounding was measured and the brief's account of
+it needs one correction:** feeding run 1's contaminated summary back as `PRIOR_SUMMARY_LABEL`
+raised the prompt from 347 to 894 tokens and produced a 3 617-byte reply — but run 2's *output* did
+not quote run 1's reasoning. It read it as material and rewrote it. So the compounding is in
+**bytes and tokens**, not in semantic contamination of the summary text. That is still a real cost
+and still not fixed here; it is fixed by `--reasoning-parser`, which is now discoverable.
+
+### Reversal condition
+
+**Remove the block instead of reporting it only if a *non-positional* separation becomes
+available** — the provider separating it into its own field, or a declared response contract that
+makes the boundary explicit. **A better search over the prose is not that**, and any proposed
+search must first be run against the ten-terminator reply, which is committed as
+`REASONING_SUMMARY_BODY` in `tests/conversation_summarization.rs` for exactly that purpose.
+
+Separately, **the refusal option reopens the day `conversation_summarization_runs` exists** (F55).
+At that point a refused summary can be recorded and backed off, the retry loop stops being the cost
+of refusing, and "refuse a reply that is mostly scratchpad" becomes a live choice rather than a
+foreclosed one.
+
+### Guards, and the mutations run against them
+
+Six cases: four pure (`src/application/summarization.rs`), two DB-backed
+(`tests/conversation_summarization.rs`), plus a metrics unit test and an **opt-in, skipped-by-default**
+live suite (`tests/live_reasoning_model.rs`, gated on `MOIRA_LIVE_REASONING_BASE_URL`; CI has no
+route to the endpoint and a gate that depends on someone's LAN is a gate that lies).
+
+**Watched failing first.** With `begins_with_inline_reasoning` returning a constant `false` — which
+*is* the shipped defect, expressed compilably — the suite reported
+`FAILED. 25 passed; 3 failed` and `FAILED. 18 passed; 2 failed`, the three positive unit cases and
+the integration case reding on `inline_reasoning: false` / `left: 0.0, right: 1.0`. **Both negative
+cases stayed green**, which is what makes it the defect rather than an inverted build. Restoring the
+one-line body gave `28 passed; 0 failed`, `25 passed; 0 failed` (metrics) and `20 passed; 0 failed`.
+
+Four mutations run, and **the interesting result is that no single case catches more than two of
+them** — which is the point of splitting detection from storage:
+
+| mutation | measured result |
+|---|---|
+| M1 `begins_with_inline_reasoning` → `false` (**the shipped defect**) | 3 unit + 1 integration red; both controls green |
+| M2 `starts_with` → `contains` | `27 passed; 1 failed` — **only** `a_summary_that_merely_discusses_reasoning_tags_is_not_flagged` |
+| M3 cut the text at the terminator (**option (a), implemented**) | `26 passed; 2 failed` — only the byte-identity assertions |
+| M4 delete the `record_summarization_inline_reasoning()` call | `28 passed` in the lib, **`19 passed; 1 failed`** in the integration suite |
+
+**M3's green case is the argument, sitting in the suite.** Implementing option (a) reds the two
+cases whose replies *have* a terminator and leaves `an_unterminated_reasoning_block_is_flagged_too`
+**passing** — because a well-formed-block strip does nothing to a block that never closes. The
+measurement that ruled stripping out is therefore not only recorded in prose; the test suite
+demonstrates the blind spot on every run.
+
+**M4 is HANDOFF §3.4's thirteenth-entry shape in miniature:** all 28 pure tests stay green because
+the pure layer cannot see whether anything is wired to it. Only the DB-backed case names the
+counter, and it is the only thing standing between this fix and the "seeded but never emitted"
+failure this repository has shipped five times.
+
+The `contains` mutation is the one worth naming. It is invisible in review, leaves every other case
+green, and would fire on any conversation *about* reasoning models — so its false positives land on
+precisely the population whose true positives matter. It is caught by a case whose input is the
+live model's own reply, not by an invented one.
+
+The `contains` mutation is the one worth naming. It is invisible in review, leaves every other case
+green, and would fire on any conversation *about* reasoning models — so its false positives land on
+precisely the population whose true positives matter. It is caught by a case whose input is the
+live model's own reply, not by an invented one.
+
+The control (`an_ordinary_summary_announces_nothing`) is not padding: without it,
+`inline_reasoning: true` unconditionally is a passing implementation of the entire feature. That is
+F45's lesson from HANDOFF §3.4, applied before it was needed rather than after.
+
+**One assertion was written wrong and caught before it could lie.** The integration case first
+walked the *whole* `audit_logs` table asserting the phrase `"invoicing rewrite in March"` was
+absent — and `USER_TURN` in that same fixture is
+`"we agreed to ship the invoicing rewrite in March"`. It would have failed for a reason having
+nothing to do with F57, or worse, passed only because nothing happened to log the turn. It is now
+scoped to the summary row and to markers unique to the reply, and the general property is left to
+`no_summary_or_transcript_text_reaches_the_audit_log`, which already owns it — HANDOFF §3.4's
+"a guard that duplicates another guard is not a second guard".
+
+### Gate runner — NOT `scripts/gates.sh`, and why
+
+This host could not execute **any** freshly compiled binary while this work was done: a
+`chrome_crashpad_handler` in a FATAL crash-loop had `syspolicyd` pegged at ~99 % CPU, so every
+code-signing assessment queued forever. A 16 KB hello-world hung; cargo sat on eight build scripts
+with `0:00.00` CPU each and no `rustc` at all. Diagnosis and escape hatch are written up in
+HANDOFF §2.2d, which is the durable half of this entry.
+
+`cargo fmt --check` was run on the host (rustfmt compiles nothing, so it is unaffected). Everything
+else ran inside `rust:1.97-trixie` against the same Postgres over `host.docker.internal`. **That is
+not `scripts/gates.sh`**, so its log-completeness assertion and its skipped-DB-suite check did not
+run, and no `ALL GATES PASSED` marker exists for this branch. Said plainly rather than left to be
+inferred — the completeness check was instead done by hand: **all 47 files in `tests/` appear as a
+`Running tests/…` line**, none dropped.
+
+**All six gates ran and are green**, in three passes because the VM's 32 GB disk could not hold the
+debug and release trees at once:
+
+| gate | result |
+|---|---|
+| `fmt --check` | **PASS** (host *and* container) |
+| `clippy --workspace --all-targets --all-features -- -D warnings` | **PASS** |
+| `test --workspace --all-features --no-fail-fast` | **1111 passed, 1 failed** — 50 result lines over 47 suites; the one failure is the flake below |
+| `build --release --locked` | **PASS** — `Finished \`release\` profile [optimized] in 15m 05s`, rc 0 |
+| `deny check` | **PASS** — `advisories ok, bans ok, licenses ok, sources ok` |
+| `audit` | **PASS** — `warning: 1 allowed warning found`, RUSTSEC-2026-0221, the expected one |
+
+**A form-1 trap was walked into while running the supply-chain pair, and the content marker is what
+caught it.** The script ended each gate with `cargo … | tail -20; echo "EXIT=$?"`, which reports
+**`tail`'s** status — both printed `EXIT=0` while `cargo audit` had in fact printed
+`error: no such command: audit`, having never installed. Exactly §2.2's first form, in a script
+written by someone who had just read §2.2. The only reason it was not recorded as a pass is that
+`deny`'s own `advisories ok, bans ok, licenses ok, sources ok` line is a *content* marker and
+`audit` had no such line. It was then installed properly and run **unpiped**, so `AUDIT_RC=0` is its
+own status. **The argument for content markers over exit codes, earned again.**
+
+Two flakes were observed, both timing-sensitive, both unrelated to this change, and both verified by
+re-running in isolation:
+
+- `a_concurrent_summarization_is_answered_with_202_and_retry_after` — the one HANDOFF §2.2a already
+  names. 502 instead of 200 on two runs; **3/3 green** when re-run alone.
+- `context_planner_boundary`'s two `responses request timed out` failures under the parallel run;
+  **6/6 green** when that suite is run alone. Timeouts, not assertions, in a suite this change does
+  not touch.
+
+Both are the container's bind-mount latency on a host whose spare core is being eaten by the
+`syspolicyd` spin described above.
+
+### F55 — a failed summarization leaves no operator-facing record at all
+
+Raised while closing F54, whose remedy assumed a "summarization run equivalent" of
+`memory_extraction_runs` and whose entry says *"`summarization` has the same shape"*. **It does
+not, and its shape is worse.**
+
+Extraction has a run table: opened before the call, carrying `status`, `failure_class`,
+`started_at`/`completed_at`, counts, and now `execution_id`. Summarization has
+`conversation_summaries`, which is a table of **successful outputs** — no `status`, no
+`failure_class`, no `started_at`. `run_summarization` returns a `Result`; on the automatic path
+(`maybe_summarize_after_turn`) the error is swallowed so it cannot become the caller's problem,
+exactly as extraction's is. The difference is that extraction writes the reason to a row and
+summarization writes **nothing**. The only trace a failed summarization leaves anywhere is the
+`record_summarization_run(false)` metric counter — an aggregate with no conversation id, no
+failure class, and no execution to chase.
+
+So the operator question F54 was about — *"this conversation's summary is stale; why?"* — is not
+merely hard to answer here, it is unanswerable from the database. And the F54 fix does not reach
+it: there is no row to add a column to.
+
+**Not fixed here** deliberately. It is a new table, not a column, and "should a failed
+summarization be durable at all" is a design question with a real cost on the response path —
+summarization already makes a second provider call per triggering turn, and adding an
+insert-before-call plus an update-after doubles its database writes. That is a different
+conversation from F54's, which was a one-column correlation fix on a table that already existed.
+
+**Remedy if taken:** mirror extraction exactly — a `conversation_summarization_runs` table opened
+in `'running'` before the completion call, carrying `conversation_id`, `execution_id`,
+`failure_class` and the covered-sequence boundary, completed on both paths. The shape is already
+proven one module over, which is most of the argument for doing it that way rather than inventing
+a second one.
+
+## F53 CLOSED · F50 OBSERVABLE — `fix/f53-f50-silent-degradation`, 2026-08-03
+
+Two findings, separate commits (`31a23a2`, `da8a936`), one gate run.
+
+| finding | verdict |
+|---|---|
+| **F53** | **confirmed in full.** The gating question — is a RAG collection's own configuration read through any cache the listener clears? — has the **same answer for both tables, and it is no.** Both lose the trigger, exactly as `conversations` and `memory_records` did |
+| **F50** | **confirmed in full.** The silence is fixed — `warn!`, runtime event, audit row. **The fail-closed/fail-open decision is deliberately NOT taken and is still open** |
+
+### F53 — the question decided the fix, and the answer was stronger than "no"
+
+The entry's own hypothesis was that `rag_collections` might carry an embedding model and a
+dimension, which a cached read could then serve stale. **It carries neither. It carries no
+runtime configuration at all** — `collection_key`, `display_name`, `description`, `status`,
+`visibility`, `metadata` and lifecycle columns, and nothing else. Every embedding value is in
+`application_embedding_policies`, keyed by `application_id`; `find_collection_ingestion_context`
+and `find_document_ingestion_context` join the collection **only** to obtain that id. So the
+table that looked like the plausible configuration candidate turned out to be the clearer of
+the two.
+
+**The general answer is type-level rather than argumentative,** which is why it is worth
+writing down once: `apply_invalidation` clears exactly three caches, and all three are closed
+types. `RuntimeConfigCache` is `HashMap<Uuid, ProviderConfig>`. `AuthProviderSettingsCache` is
+one `Vec<PublicAuthMethod>`. `ProviderRuntimeCache` is keyed by `RuntimeCacheKey`, whose seven
+fields are provider, model, credential and runtime-policy ids and versions. **No RAG row can be
+in any of them and no key field derives from either table**, so the question "is it read through
+a cache?" cannot be answered yes for anything outside those three shapes. That argument is
+reusable for the next table anyone asks about.
+
+A second reason the answer is safe: the collection's `visibility` and `status` carry the
+tenant-isolation predicate, and they are evaluated in the retrieval SQL on every query rather
+than read from anywhere cached — so removing the notification cannot leave an authorization
+decision stale, which was the only way "content" could have been the wrong classification.
+
+**Corrections to the F53 entry, both worth recording because briefs here inherit each other's
+errors:**
+
+1. *"`docs/runtime-cache-invalidation.md` does not list either table as an invalidation-producing
+   resource, exactly as it did not list the two F51 removed."* **True when written, false by the
+   time it was committed.** The F51/F52 commit (`e16cb0c`) rewrote that paragraph to match
+   `TRIGGERED_RESOURCE_TYPES` and in doing so *added* "and the RAG collection and document
+   tables". The finding's supporting evidence was destroyed by the commit that raised it. Checked
+   with `git show e16cb0c^:docs/…` rather than trusting either version.
+2. *"its embedding model, its dimensions"* — columns that do not exist on that table.
+
+**Five mutations, each reverted.**
+
+| mutation | result |
+|---|---|
+| honour `plan.caches` for `runtime_cache` only; always clear `runtime_handles` and `auth_settings` | **red** on the handles assertion in both the F51 and F53 integration guards — *"dropped every built provider client handle, connection pools included"*. This is why the guard seeds a real `RuntimeModelHandle` rather than the trivially-seedable config sentinel |
+| move `rag_documents` back to `CIRCUIT_UNAFFECTED_RESOURCE_TYPES` | **red** on the `rag_documents` leg only — **and all eight `infra::db` unit tests stayed green**, because they iterate the constant the name was removed from. The integration guard is the only thing that sees this |
+| the same for `rag_collections` | **red** on the `rag_collections` leg only. The two legs are independent, which is the point of asserting per resource type |
+| re-attach the `rag_documents` trigger (a scratch `0025`) | **red** on the trigger guard, showing all three of INSERT/UPDATE/DELETE, **and** red on `the_notify_trigger_inventory_is_exactly_the_classified_set` naming the table |
+| then the **lazy repair**: add `rag_documents` back to `TRIGGERED_RESOURCE_TYPES` and stop | inventory test **green**, `every_triggered_table_has_a_scope` **red** on its `caches` half. F52's interlock holds for these tables without any new machinery |
+
+**What the second mutation adds to §3.4, and it is a sharpening rather than a new rule.** F52's
+lesson is *a derived inventory is only a guard if something else consumes it*. The corollary
+this run produced: **a guard that iterates a constant cannot see a name being removed from that
+constant.** `only_configuration_changes_invalidate_the_configuration_caches` is a real guard and
+it went green under the edit that reintroduced half the defect, because the edit deleted the
+name it would have iterated. Set-membership guards are one-directional by construction; the
+behavioural guard that names the table literally is what closes the other direction, and both
+are needed.
+
+### F50 — the silence is fixed; the product decision is untouched and still open
+
+**The coordinator's decision, implemented as given: observability only.** A `warn!`, a
+`RuntimeEventType::AgentProfileUnavailable` runtime event and an `agent_profile.unavailable`
+audit row. **The request's behaviour is byte-for-byte what it was** — `succeeded`, no failure,
+no preamble, no temperature, no max_tokens.
+
+**The rationale, recorded with its reversal condition.** Silence is a defect under *either*
+product answer. Fail-closed and observable fail-open both require the operator to be told; they
+differ only in whether the request is *also* refused. Shipping observability is therefore not a
+partial implementation of one option — it is the part both options share. **Reversal condition:**
+when the fail-closed/fail-open decision is taken, this changes from "observe and proceed" to
+"observe and refuse" *or* stays as it is. **The observability itself is not revisited.**
+
+**"No profile" and "the profile vanished" are cleanly distinguishable, and the distinction is
+free.** `route.agent_profile_id` is read *before* the lookup: `None` is "this route never had
+one" — the normal case, and what every other fixture in the tree produces — and only
+`Some(id)` with an unresolved lookup announces. No inference from the lookup's own result is
+needed. The one way the two could have collapsed is a **hard** delete, which the FK's
+`on delete set null` would turn into `None`; `soft_delete_agent_profile` writes
+`status = 'deleted', deleted_at = now()` and never issues a `DELETE`, so it cannot happen, and
+`guards_a_soft_deleted_agent_profile_is_announced_too` asserts the reference survives before it
+asserts anything else.
+
+**The event is deliberately not on the public SSE contract.** `map_runtime_event` returns `None`
+for it. Its payload names a route id, a route key and an agent profile id — admin-plane shape a
+caller can do nothing with — and the operator's channels are the diagnostic endpoint (which
+returns every envelope verbatim), the log and the audit row. `docs/openapi.json` gains exactly
+one enum member and nothing else; 152 / 100 / 183 unchanged.
+
+**`documents_current_behaviour_a_disabled_agent_profile_is_silently_ignored` is gone**, because
+its name stopped being true: the condition *is* observed now, it is simply not refused. It is
+replaced by four cases that keep the `documents_`/`guards_` line honest — three guards that
+survive the product decision, and one `documents_` case that the decision makes wrong. **Merging
+them would have made the observability guard go red on a fail-closed fix**, which is precisely
+the pinned-defect shape §3.4 records twice.
+
+**Six mutations, each reverted.**
+
+| mutation | result |
+|---|---|
+| drop the audit row, keep the event and the `warn!` | **red** on the disable and soft-delete guards |
+| drop the runtime event, keep the audit row and the `warn!` | **red** on all three announcement guards |
+| announce whenever `agent_profile_id` is `Some`, rather than when the lookup fails | **red** on the *within-test* active-profile control only — **`guards_a_route_with_no_agent_profile_announces_nothing` stayed green**, because that route never enters the arm. This is the edit that justifies having both controls |
+| empty payload (`json!({})`) | **red** on `agent_profile_id`; the ids are asserted, not just the event's presence |
+| `AuditResult::Success` instead of `Failed` | **red** — the disable guard asserts the row's `result`, not only its action |
+| map the event onto the public SSE contract | **red** on the new unit guard, which carries its own liveness control (`route_selected` must still map) |
+
+**The one gap, chosen rather than missed: nothing asserts the `warn!`.** That is deliberate —
+a log assertion is weak, and capturing `tracing` output requires a process-global subscriber that
+would fight every other test in the binary. Deleting the `warn!` alone leaves every guard green.
+The two signals that *are* guarded are the structured one and the durable one, which is the right
+two of the three.
+
+**A hole closed that nothing asked for, from §3.4's twelfth entry.** `tests/agent_profile_wire.rs`
+justifies its streaming case with *"both arms share the one call today, but they are separate
+arms"*. That justification applies to **every** property the suite tests, and F50's observability
+had no streaming twin. `get_active_agent_profile` has exactly one call site in `src/`, so the
+case cannot fail today for a reason the disable case would not also catch — it exists so the cell
+is filled before something moves the lookup. Adding it is the whole cost of not repeating F49.
+
+## F51 CLOSED · F52 CLOSED — `fix/f51-f52-invalidation-scope`, 2026-08-02
+
+Two defects in one channel, separate commits (`f97d4f1`, `9f243a6`), one gate run.
+
+| finding | verdict |
+|---|---|
+| **F51** | **confirmed in full — every count in the brief was right**, including the 24-vs-23 trigger count and which table's trigger is named differently. Both candidate fixes taken; they are independent barriers and neither is load-bearing |
+| **F52** | **confirmed in full, and the fix shape the entry named was the right one.** The three legacy tables lose their triggers rather than being classified — nothing outside `0003` itself has ever named them |
+| **F53** | raised — `rag_documents`/`rag_collections` are the same class as F51 at admin rate, deliberately left |
+
+**What this pair adds to §3.4, and it is a new shape: a fix can be *sound* and still leave the
+guard for it toothless, because the guard observes the cheapest-to-observe consequence rather
+than the most expensive one.** F51 clears three caches. Two rebuild from a query;
+`ProviderRuntimeCache` holds built Rig clients with their connection pools and is the reason the
+finding was worth fixing. A guard that watched `runtime_cache` — the one with a trivially
+seedable sentinel already sitting in the test file — passes against an edit that honours the
+plan for that cache and keeps wiping the other two. **Verified by running it.** The rule:
+*when a fix protects several things, seed and observe the one that is most expensive to lose,
+not the one that is easiest to construct.*
+
+**A second, smaller lesson, and it cost twenty minutes: the barrier a test uses can be the thing
+that breaks it.** `drain_listener` in `tests/runtime_config_invalidation.rs` establishes ordering
+by emitting a `provider_models` notification — which is *configuration*, so it clears the very
+caches a cache-survival assertion is about. The first version of the guard failed for that
+reason and not because the fix was wrong. It now brackets on the `moira_runtime_invalidations_total`
+counter, which `apply_invalidation` increments **after** doing its work and on every notification
+including the ones that now clear nothing. *A barrier must be inert with respect to the property
+under test, and an ordering barrier borrowed from a neighbouring test usually is not.*
+
+**F52's own verification is the part worth copying.** The question "what is the cheapest edit
+that breaks the property while leaving my guard green?" had an answer here that a reading would
+not have produced: attach the trigger to a new table, watch the inventory test red, then *fix
+that red the lazy way* — add the name to `TRIGGERED_RESOURCE_TYPES` and stop. The inventory test
+goes green. The unit guard reds, because it iterates that same constant and asserts the scope.
+**Two halves that can only be satisfied together is the property a derived inventory needs**, and
+it is not automatic: a derived list that nothing else consumes is just a different list.
+
+**The pattern across both closures: the finding was right about the system and wrong about the
+mechanism, in opposite directions.** F40 described a symptom that cannot occur and missed the two
+defects sitting in the branch it pointed at. F47 described a mechanism correctly and
+under-counted its effects. Neither could have been implemented from its one-liner — which is the
+third and fourth occurrence of the shape already named in "WHAT THE FINDINGS-SWEEP BRIEF GOT
+WRONG".
+
+**Everything load-bearing was measured, not argued.** `xmin`/`ctid` advance, `version` advance,
+`LISTEN` receiving exactly three notifications from three `do update` reads and zero from three
+`do nothing` reads, and the duplicate-key error from two racing first-touches — all taken with
+`psql` against the live schema before a line of Rust changed. The two claims that would have been
+easiest to get wrong by reasoning (does `on conflict do nothing` still write? does the follow-up
+`select` see a concurrently committed row?) are exactly the two that were checked directly.
+
+**Corrections to the brief this cycle worked from**, recorded because briefs here inherit each
+other's errors:
+
+1. **"The row-level lock you are removing is currently what makes [the insert/select race]
+   impossible."** True of the four `do update` members, and **inverted** for the fifth:
+   `get_or_create_application_execution_policy` never had that lock and already had the race.
+   Done properly the fix *removes* a correctness bug.
+2. **"Count the family members rather than assuming there are two."** Good instruction, and the
+   answer is five — but the interesting part is not the count, it is that the fifth member had a
+   *different* bug, so "apply the same fix to all of them" would have been wrong if the fix had
+   been "read-then-insert" as the finding suggested. That spelling is what the fifth already did.
+3. The OpenAPI counts in the brief (**152 / 100 / 183**) were **correct** — re-derived from
+   `docs/openapi.json` and unchanged by this branch. `plans/reports/HANDOFF.md` still said
+   151/99/178 and has been corrected.
+
+**One guard of my own failed before merge, and it is now HANDOFF §3.4's tenth.** F47's first
+guard asserted on the write three separate ways and stayed green under `select … for update` —
+because `do update` was removing *two* coupled things and all three assertions observed only one
+of them. Found by running the answer to "what is the cheapest edit that breaks the property while
+leaving my guard green", after having already asked it and judged the guard sound. Same sequence
+as the seventh.
+
+### Cycle 14 — 2026-08-02 — recovery cycle: three merges, two of them other people's work
+
+**A peer session and one of my own agents both stopped mid-flight. Neither left the tree broken, and
+both left work worth finishing rather than redoing.**
+
+| PR | What | Merge | Provenance |
+|---|---|---|---|
+| **#59** | F39 — structured-output capability reconciled against what Rig will actually send | `655494a` | **the stopped peer's**, adopted and finished |
+| **#58** | F46 — refuse `json_object` rather than send a schema only `{}` satisfies | `c938d5c` | mine |
+| **#60** | F28 + F10 item 1 — bound the pool-gauge assertion; retention suite off the shared DB | `71b7dba` | **my stopped agent's**, recovered and re-verified |
+
+**`SHARED_DATABASE_ALLOWLIST` is down to two entries** — `support/mod.rs` (owns the mechanism) and
+`security_foundation.rs` (must apply migrations to a real database to assert the migration contract).
+**Cross-run coupling through the shared test database is gone.**
+
+#### The recovered agent had committed but never gated — and the distinction mattered
+
+`fix/shared-db-flakes` carried five commits including its own ledger closures, which reads like
+finished work. **There was no gates log anywhere in the scratchpad.** "It committed, so gates must
+have passed" is precisely the inference §2.2 exists to prevent, so gates were re-run from scratch:
+`ALL GATES PASSED`, 1046 tests. Only then was it PR'd.
+
+#### A hazard one level below form 12: TWO runs on the SAME commit
+
+Form 12 warns that `statusCheckRollup` can report the *previous commit's* verdict. This cycle
+produced its sibling. A `workflow_dispatch` I triggered and the automatic `pull_request` event both
+ran on the **same head SHA**, so `check-runs` returned `rust: completed/success` **and**
+`rust: in_progress` simultaneously — both true, for different runs.
+
+Keying on the head SHA is **not sufficient**. Select the run by `event == "pull_request"` (the one
+that actually gates the PR) and read *its* jobs:
+
+```bash
+gh api "repos/{owner}/{repo}/actions/runs?per_page=15" \
+  --jq --arg s "$SHA" '[.workflow_runs[] | select(.head_sha==$s and .event=="pull_request")][0].id'
+```
+
+**Corollary: do not fire a redundant `workflow_dispatch` when the `pull_request` event will run
+anyway.** It buys nothing and creates an ambiguous signal at the moment you are deciding to merge.
+
+#### `pgrep` for a live build is too coarse to gate a reclaim on
+
+Disk hit 40 GB and `pgrep -f 'cargo|rustc'` said a build was live — which would normally abort any
+reclaim, per the rule against deleting a target directory you did not create.
+
+**It was the Moira server itself**, `cargo run` from the main checkout using `./target`, unrelated to
+every `~/.cargo-targets/*` directory. Resolve the ambiguity before acting on it:
+
+```bash
+lsof -a -p <pid> -d cwd -Fn      # which tree is it in?
+ps -Eww -p <pid> | tr ' ' '\n' | grep CARGO_TARGET_DIR   # which target dir?
+```
+
+22 GB reclaimed from two finished target dirs (one the stopped peer's, whose PR had merged), and a
+further 13 GB later — 40 GB → 63 GB — with `./target` and the running server untouched.
+
+#### Corrections to the briefing this cycle worked from
+
+- **F46 was listed as a user-only item needing "a rig-core change or a public contract break".** It
+  was already fixed and open as #58 — and the approach taken *was* the contract break, a 422 chosen
+  to match F35's precedent, with a reversal condition.
+- **The OpenAPI counts in circulation were stale**: the tree asserts **152 operations / 100 paths /
+  183 schemas**, not 151/99/178.
+- **F46's own recorded mechanism contained a false clause — the one implying it could not be fixed.**
+  `json_utils::merge` is only reached inside a branch requiring `output_schema.is_some()`, so with no
+  schema `additional_params` passes through untouched and *would* have reached an OpenAI-family
+  provider. It was refused on principle, not impossibility.
+
 
 ### Cycle 11 — 2026-07-31 — findings sweep (`fix/findings-sweep`, `a6d2984`)
 

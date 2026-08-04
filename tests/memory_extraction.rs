@@ -186,6 +186,31 @@ impl Case {
         )
     }
 
+    /// `memory_behavior` as a caller of `GET /api/v1/conversations` is told it.
+    ///
+    /// Read over HTTP rather than from the row mapper, because the whole of F30's second reader
+    /// lived between the two: the value was computed in SQL, and asserting on the Rust helper
+    /// would have proved the helper works while the query kept answering on its own.
+    async fn reported_memory_behavior(&self) -> String {
+        let response = tokio::time::timeout(
+            WAIT,
+            self.client
+                .get(format!("{}/api/v1/conversations", self.moira.base_url))
+                .header("x-consumer-key", &self.consumer_key)
+                .send(),
+        )
+        .await
+        .expect("conversations list timed out")
+        .expect("conversations list");
+        let status = response.status();
+        let body: Value = response.json().await.expect("conversations body");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["data"][0]["memory_behavior"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no memory_behavior on the listed conversation: {body}"))
+            .to_string()
+    }
+
     /// Every memory row this fixture's application holds, newest last.
     async fn memories(&self) -> Vec<MemoryRow> {
         sqlx::query_as::<_, MemoryRow>(
@@ -203,12 +228,28 @@ impl Case {
     async fn runs(&self) -> Vec<RunRow> {
         sqlx::query_as::<_, RunRow>(
             "select id, status, candidate_count, accepted_count, rejected_count, failure_class, \
-                    metadata, (completed_at is not null) as completed \
+                    metadata, execution_id, (completed_at is not null) as completed \
              from memory_extraction_runs order by started_at asc",
         )
         .fetch_all(&self.fixture.pool)
         .await
         .expect("read memory_extraction_runs")
+    }
+
+    /// Every provider attempt this fixture made, oldest first.
+    ///
+    /// Both executions land here — the caller's own turn and the extraction's — which is what
+    /// makes this table the right thing to join against in
+    /// `a_failed_extraction_run_names_the_execution_that_failed`: an `execution_id` that
+    /// resolves to *some* row proves nothing, because there is always more than one row.
+    async fn attempts(&self) -> Vec<AttemptRow> {
+        sqlx::query_as::<_, AttemptRow>(
+            "select execution_id, status, failure_class \
+             from execution_attempts order by started_at asc",
+        )
+        .fetch_all(&self.fixture.pool)
+        .await
+        .expect("read execution_attempts")
     }
 
     async fn memory_embedding_count(&self) -> i64 {
@@ -253,7 +294,15 @@ struct RunRow {
     rejected_count: i32,
     failure_class: Option<String>,
     metadata: Value,
+    execution_id: Option<Uuid>,
     completed: bool,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct AttemptRow {
+    execution_id: Uuid,
+    status: String,
+    failure_class: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -418,6 +467,148 @@ async fn explicit_only_on_the_conversation_policy_alone_still_withholds_the_memo
         "the conversation policy's consent column must bind as hard as the memory policy's"
     );
     case.shutdown().await;
+}
+
+/// F30 — what a caller is *told* about memory must be what is *enforced*, from both columns.
+///
+/// `ConversationRecord.memory_behavior` was `coalesce(mp.consent_mode, 'explicit_only')`,
+/// computed in `conversation_select`. It therefore reported the memory policy alone while
+/// extraction had, since Sub-Phase F, obeyed the stricter of the two columns — so an operator who
+/// tightened `application_conversation_policies.memory_consent_mode` was told the looser value.
+///
+/// **The columns are made to disagree, in both directions, which is the entire finding.** Every
+/// other consent case in this file that fixes both columns to the same value is blind to a reader
+/// that consults one of them; so was every test in the tree, which is why this shipped. The
+/// agreeing pair is kept as the control: it is the value the field has always reported, and it
+/// must not move.
+#[tokio::test]
+async fn the_reported_memory_behavior_is_the_stricter_of_the_two_consent_columns() {
+    for (conversation_mode, memory_mode, expected) in [
+        // The defect. Before the fix this reported "application_managed" while extraction refused.
+        (
+            MemoryConsentMode::Disabled,
+            MemoryConsentMode::ApplicationManaged,
+            "disabled",
+        ),
+        // The mirror. This one was already right, because it *is* the memory column.
+        (
+            MemoryConsentMode::ApplicationManaged,
+            MemoryConsentMode::Disabled,
+            "disabled",
+        ),
+        // Stricter-but-not-refusing on the conversation side: the second direction of the defect,
+        // and the one a `disabled`-only fix would miss.
+        (
+            MemoryConsentMode::ExplicitOnly,
+            MemoryConsentMode::ApplicationManaged,
+            "explicit_only",
+        ),
+        // The control: two agreeing columns still report what they agree on.
+        (
+            MemoryConsentMode::ApplicationManaged,
+            MemoryConsentMode::ApplicationManaged,
+            "application_managed",
+        ),
+    ] {
+        let Some(case) = Case::new(
+            conversation_mode,
+            memory_mode,
+            MemoryPolicyPutRequest::default(),
+            vec![
+                ProviderScript::Completion {
+                    text: ASSISTANT_REPLY.to_string(),
+                },
+                extraction_reply(json!([memory("preference", MEMORY_BODY, 0.95, "normal")])),
+            ],
+        )
+        .await
+        else {
+            return;
+        };
+        let (status, body) = case.respond(USER_TURN).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            case.reported_memory_behavior().await,
+            expected,
+            "conversation={conversation_mode:?} memory={memory_mode:?}: the value reported to \
+             callers must be the one enforced"
+        );
+        case.shutdown().await;
+    }
+}
+
+/// F30's recorded gap — the tie is resolved the same way at the call site as it is in the rule.
+///
+/// # What this closes
+///
+/// F30's fix left one edit that survived every guard it shipped: **swapping `stricter_of`'s
+/// arguments** in `effective_memory_behavior` (`src/infra/pg_rows.rs`). The function is symmetric
+/// except on the tie between the two equally-permissive modes, and every case that made the
+/// columns disagree used a pair with *different* permissiveness — where swapping changes nothing.
+///
+/// `ApplicationManaged` and `AutomaticWithUserControls` are two distinct values that both rank 2,
+/// so a pair that ties while disagreeing does exist, and the gap is closable. The tie resolves to
+/// the **memory** column, so the expected value below is always the memory policy's — which means
+/// swapping the arguments flips both rows here and reds them.
+///
+/// # What this is worth, stated exactly
+///
+/// Narrow, and deliberately so. Both tied modes permit the same thing, so this can only change
+/// **which of two equally-permissive labels is reported**, never a consent outcome — nothing here
+/// can widen or narrow what extraction does. `the_combined_consent_decision_is_symmetric` covers
+/// the decision; this covers the label. The reason the label is worth pinning is stated at
+/// `the_two_equally_permissive_modes_tie_toward_the_memory_policy`: resolving the tie the other
+/// way would silently change the value reported to deployments where nothing is wrong.
+///
+/// # What this does NOT cover, so nobody retires the sibling case for it
+///
+/// It is blind to a reader that consults the **memory** column alone — the exact defect F30 was
+/// about — because on a tie the memory column *is* the answer. Only
+/// `the_reported_memory_behavior_is_the_stricter_of_the_two_consent_columns`, whose pairs differ
+/// in permissiveness, can see that. The two cases are complements, not a superset and a subset.
+///
+/// The unit test on `stricter_of` cannot close this either: it calls the function directly, and
+/// the surviving edit was at the *call site*, in the order the two columns are handed to it.
+#[tokio::test]
+async fn the_reported_memory_behavior_resolves_the_consent_tie_toward_the_memory_policy() {
+    for (conversation_mode, memory_mode, expected) in [
+        (
+            MemoryConsentMode::AutomaticWithUserControls,
+            MemoryConsentMode::ApplicationManaged,
+            "application_managed",
+        ),
+        (
+            MemoryConsentMode::ApplicationManaged,
+            MemoryConsentMode::AutomaticWithUserControls,
+            "automatic_with_user_controls",
+        ),
+    ] {
+        let Some(case) = Case::new(
+            conversation_mode,
+            memory_mode,
+            MemoryPolicyPutRequest::default(),
+            vec![
+                ProviderScript::Completion {
+                    text: ASSISTANT_REPLY.to_string(),
+                },
+                extraction_reply(json!([memory("preference", MEMORY_BODY, 0.95, "normal")])),
+            ],
+        )
+        .await
+        else {
+            return;
+        };
+        let (status, body) = case.respond(USER_TURN).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            case.reported_memory_behavior().await,
+            expected,
+            "conversation={conversation_mode:?} memory={memory_mode:?}: the two modes are equally \
+             permissive, so the reported label must come from the memory column — reporting the \
+             conversation column's would change the value for deployments where nothing is wrong"
+        );
+        case.shutdown().await;
+    }
 }
 
 /// `disabled` on either consent column stops extraction before the model is ever called.
@@ -629,7 +820,16 @@ async fn an_unparseable_extraction_reply_fails_the_run_and_writes_no_memory() {
     case.shutdown().await;
 }
 
-/// The extractor being unreachable must not disturb the caller's response.
+/// The extractor being unreachable must not disturb the caller's response — **and the run row
+/// must say what actually went wrong**.
+///
+/// The second half is F29's third precondition, on the real wire. `run_extraction` used to write
+/// the constant `extraction_call_failed` for every execution that came back without a reply, so a
+/// provider returning 500, a route that resolves to nothing and (under the structured-output
+/// fail-hard variant) a model that did not comply were all recorded identically — on the one row
+/// whose job is to tell them apart. It now records `execution.failure.class`, and this case is
+/// what proves the read is reached rather than merely written: the assertion below is
+/// `provider_unavailable`, and it was `extraction_call_failed` before the change.
 #[tokio::test]
 async fn a_failed_extraction_call_leaves_the_response_untouched() {
     let Some(case) = Case::consenting(vec![
@@ -659,7 +859,99 @@ async fn a_failed_extraction_call_leaves_the_response_untouched() {
     assert_eq!(runs[0].status, "failed");
     assert_eq!(
         runs[0].failure_class.as_deref(),
-        Some("extraction_call_failed")
+        Some("provider_unavailable"),
+        "the run row must carry the execution's own failure class; `extraction_call_failed` here \
+         would mean run_extraction had gone back to ignoring execution.status"
+    );
+    case.shutdown().await;
+}
+
+/// F54 — a failed run names the execution it failed in, by a key an operator can join on.
+///
+/// `failure_class` on the run row answers *why*. This is the follow-up it could not answer:
+/// **which** execution, so that `execution_attempts`, `responses` and `audit_logs` can be read
+/// for the provider, the model, the attempt count and the sanitised provider message. Until
+/// migration `0025` the only route was `request_id like 'memory-extraction-%'` with a uuid
+/// parsed out of a varchar — a convention nothing enforced, nothing tested and no document
+/// named.
+///
+/// # Why this joins rather than checking the column is populated
+///
+/// Asserting `execution_id is not null` would stay green against the cheapest way to break
+/// this: let `run_extraction` mint its own id again instead of using the one the run row was
+/// opened with. The column would be non-null, indexed, and name an execution that never ran.
+/// So the assertion has to resolve the id against a table the *execution kernel* wrote.
+///
+/// And resolving it is not enough either, because this fixture always produces **two**
+/// executions — the caller's turn and the extraction — so an id that merely matches some
+/// attempt row proves nothing. The caller's turn succeeded and the extraction failed, which is
+/// what makes them tellable apart: the run row must point at the failed one, and must not point
+/// at the caller's.
+#[tokio::test]
+async fn a_failed_extraction_run_names_the_execution_that_failed() {
+    let Some(case) = Case::consenting(vec![
+        ProviderScript::Completion {
+            text: ASSISTANT_REPLY.to_string(),
+        },
+        ProviderScript::HttpError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: "extractor is down".to_string(),
+        },
+    ])
+    .await
+    else {
+        return;
+    };
+    let (status, body) = case.respond(USER_TURN).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let runs = case.runs().await;
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0].status, "failed");
+    let run_execution_id = runs[0]
+        .execution_id
+        .expect("a run row must name the execution it ran, even when that execution failed");
+
+    // The premise: there really are two executions here, so "it resolved" below is a choice
+    // between them rather than the only row available.
+    let attempts = case.attempts().await;
+    assert_eq!(
+        attempts.len(),
+        2,
+        "expected the caller's turn and the extraction: {attempts:?}"
+    );
+    let callers = attempts
+        .iter()
+        .find(|attempt| attempt.status == "succeeded")
+        .expect("the caller's own turn succeeded: {attempts:?}");
+    let extraction = attempts
+        .iter()
+        .find(|attempt| attempt.status == "failed")
+        .expect("the extraction's attempt failed: {attempts:?}");
+    assert_ne!(
+        callers.execution_id, extraction.execution_id,
+        "two executions, two ids: {attempts:?}"
+    );
+
+    // With the two ids known to differ, this one assertion says both of the things that matter:
+    // the run row names the extraction's execution, and therefore does *not* name the caller's.
+    // An explicit `assert_ne!` against `callers` was here and has been removed — it could never
+    // be the assertion that fired, which makes it a promise rather than a guard. Verified by
+    // running the mutation that writes the caller's id onto the run row: this line reds first.
+    assert_eq!(
+        run_execution_id, extraction.execution_id,
+        "the run row must name the execution that failed, not a uuid minted somewhere else"
+    );
+    // The join an operator actually performs: run row -> the provider-level record of why.
+    assert_eq!(
+        extraction.failure_class.as_deref(),
+        runs[0].failure_class.as_deref(),
+        "the class on the run row and the class on the execution it names must be the same \
+         failure, or the correlation is pointing at the wrong execution"
+    );
+    assert_eq!(
+        extraction.failure_class.as_deref(),
+        Some("provider_unavailable")
     );
     case.shutdown().await;
 }

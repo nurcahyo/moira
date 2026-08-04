@@ -5,7 +5,8 @@ work resumes. Read it, then read `plans/reports/EXECUTION-LEDGER.md` — the led
 truth for state; this file is the source of truth for *how to work here*.
 
 Written 2026-07-31. **All plan work is complete** — the forced order `02b → … → 09` is fully
-executed. What remains is a short findings queue and three things only the user can do, both in §3.
+executed. What remains is a short findings queue and **four** things only the user can do, both in §3.
+Updated 2026-08-02: F29, F31, F35 and F37 closed; F36 and F41 **refuted rather than fixed**.
 
 ---
 
@@ -40,7 +41,7 @@ landing an agent's commit on the wrong branch — that happened twice.
 **Any agent that will commit gets its own `git worktree`.** The coordinator must never run
 `git checkout` in a tree an agent is using.
 
-### 2.2 Exit codes lie here, in TEN observed forms — and form 4's cause is now known
+### 2.2 Exit codes lie here, in THIRTEEN observed forms — and form 4's cause is now known
 
 1. `cmd | tail` reports `tail`'s status — hid a genuinely failed `docker build`
 2. `grep -c` returns 1 on **zero** matches — made a fully green gate run look failed
@@ -94,6 +95,16 @@ landing an agent's commit on the wrong branch — that happened twice.
     **not** substitute for an empty string — queued checks carry `""`, not `null`, so a
     `grep -q pending` loop exits immediately on the first poll.
 
+13. **A conflict-resolution script that fails, followed by `git add; git commit`, commits the
+    markers.** Done 2026-08-03: a resolve script hit an assertion, and because the next commands were
+    chained with `;` rather than `&&`, the unresolved file was staged, committed and **pushed** with
+    `<<<<<<<` still in it. The commit output looked entirely normal. This is form 3's shape applied to
+    a merge: *a failed step followed by a succeeding one reads as success.*
+    **Two habits close it:** chain with `&&`, and make the resolver itself assert
+    `zero markers remain` **before it writes**, so a wrong line number cannot silently produce a
+    half-resolved file. Verifying afterwards with `grep -c '^<<<<<<<'` costs one command — and note
+    it exits **1** on zero matches (form 2), so read the printed count, not `$?`.
+
 **Redirect to a file, capture `$?` immediately, then read the file — and run cargo from inside a
 script.** Use `scripts/gates.sh`, which handles all of this and asserts log completeness against
 `ls tests/*.rs`.
@@ -102,6 +113,89 @@ script.** Use `scripts/gates.sh`, which handles all of this and asserts log comp
 applied to the very tool built to defeat form 1). Redirect to a file instead. The content marker
 `ALL GATES PASSED` is emitted only when the failures array is empty, so it is a sounder signal than
 `$?` in every case where the two could disagree.
+
+### 2.2a You may not be the only Claude session on this repo
+
+**Discovered 2026-08-02 the expensive way.** A coordinator briefed its agent "you are the only agent
+running gates". That was false: a *second Claude Code session* was running its own agents on the same
+checkout. Load average peaked at **96**, and two gate runs failed on timing-sensitive concurrency
+tests (`a_concurrent_summarization…`, `concurrent_key_create…`) with no relationship to the change
+under test. A coordinator cannot see another session's agents in its own context — it can only see
+their artifacts.
+
+**Check for peers before claiming exclusivity, and before deleting anything:**
+
+```bash
+git worktree list                     # worktrees under a DIFFERENT session id are not yours
+pgrep -f 'scripts/gates\.sh'          # a live gate run, whoever owns it
+gh pr list --state open               # PRs you did not open
+uptime                                # load >20 means you are not alone
+```
+
+**Never delete a target directory you did not create.** `scripts/reclaim.sh` L1 walks
+`$TARGET_ROOT/*/debug/incremental` and would drop a *peer's* cache mid-build. Under contention,
+reclaim only your own, and prefer waiting.
+
+**`pgrep -fc 'cargo-targets/moira-<name>'` is a FALSE NEGATIVE.** `CARGO_TARGET_DIR` is an
+*environment variable* — it never appears in a cargo process's argv, so this reports "clear" while a
+peer's gate run is live. It is form 10's cousin: a peer check that always passes. Key on
+`pgrep -f 'scripts/gates\.sh$'` or on a recorded PID.
+
+### 2.2c Form 9 is broader than documented: the hook rewrites `grep` and `tail` too
+
+The `rtk` `PreToolUse` hook does not only rewrite `cargo`. Observed 2026-08-02: a `grep` over the
+ledger returned rtk's *summary* (`3496 matches in 589F`) instead of the matching lines, and a
+`tail -3` was rewritten into `/usr/bin/read`.
+
+So a search can silently return a digest of the answer rather than the answer — and a coordinator
+reading that digest may conclude a symbol is absent when it is present, or miss the second of two
+call sites. **Wrap `grep`/`tail` in a script file whenever the exact output matters**, the same way
+`cargo` already must be. The immunity rule is unchanged: the hook only sees the outer command.
+
+### 2.2d THE HOST CAN STOP BEING ABLE TO RUN *ANY* FRESHLY COMPILED BINARY — 2026-08-04
+
+**A cargo build that hangs forever with every process at `0:00.00` CPU is not a slow build and not
+a lock. It is macOS refusing to exec.** Found on F57, after 12 minutes of a cold `cargo check`
+sitting on eight build scripts that had accumulated **zero** CPU time between them, with **no
+`rustc` running at all**.
+
+The cause is not cargo. `/usr/libexec/syspolicyd` — Gatekeeper — was pegged at ~99 % CPU because a
+`chrome_crashpad_handler` was in a `FATAL` crash-loop, respawning roughly **once per second**; every
+spawn is a code-signing assessment, and the queue never drains. Binaries whose signature is already
+cached keep working, which is why the machine looks completely healthy: your shell, git, `psql` and
+`gh` are all fine. Only *newly written* executables block, which is precisely every build artefact.
+
+**The one-command diagnosis, and it takes five seconds:**
+
+```bash
+printf 'int main(void){return 7;}\n' > /tmp/t.c && cc -o /tmp/t_bin /tmp/t.c
+timeout 20 /tmp/t_bin; echo $?      # 7 = healthy, 124 = the host cannot exec new binaries
+```
+
+Do this **before** concluding anything about a hung build. Two corroborations, both root-free:
+`launchctl print system/com.apple.MobileFileIntegrity` (it read `state = not running`), and
+`ps -Ao pid,stat,%cpu,time,comm -r | head` (syspolicyd at the top with hundreds of CPU-minutes).
+
+**The fix needs root and is therefore the user's:** stop the crash-looping app, or
+`sudo launchctl kickstart -k system/com.apple.MobileFileIntegrity`, or reboot. `amfid` respawning
+on its own is **not** sufficient — it came back during F57 and exec still hung, because the wedge
+was one layer up in `syspolicyd`.
+
+**Two things still work, and they are the difference between a lost cycle and a delivered one:**
+
+- **`cargo fmt --check` runs.** rustfmt is a pre-existing toolchain binary and compiles nothing, so
+  the formatting gate is honestly runnable even in this state. Do not skip it because "cargo is
+  broken" — it is not, only *exec of new artefacts* is.
+- **A Linux container does not consult macOS code signing.** `rust:1.97-trixie` with the worktree
+  bind-mounted, `CARGO_TARGET_DIR` on a named volume, and
+  `MOIRA_TEST_DATABASE_URL=postgres://postgres:postgres@host.docker.internal:5432/moira` plus
+  `--add-host=host.docker.internal:host-gateway` reaches the host's Postgres unchanged — it already
+  listens on `*`. This is the escape hatch; it is slower over the bind mount but it is real.
+
+**Record which runner produced a gate result.** A container run is not `scripts/gates.sh`, so its
+log-completeness assertion and its skipped-DB-suite check did **not** run. Say so rather than
+letting `ALL GATES PASSED` be inferred — that marker means something specific and a container run
+does not emit it.
 
 ### 2.2b `scripts/gates.sh` CANNOT run concurrently with another gates run
 
@@ -113,6 +207,13 @@ own digest. Two runs with different migration sets therefore sweep each other in
 shared template locks for live fixtures blocks another's exclusive request, while its own next
 fixture queues behind that exclusive request. Clear it with `pg_terminate_backend` on the idle lock
 holders.
+
+**The memory signal to watch is SWAP, not `vm_stat` free.** Measured 2026-08-02 with three
+concurrent `cargo test --workspace` runs: `vm_stat` reported **13 MB free** while
+`memory_pressure` said **34% free** — the free page list is not the constraint on macOS. What was
+genuinely nearly exhausted was swap: **15.5 GB used of 16 GB, 903 MB left**. An earlier note here
+recorded "~56 MB free" as the OOM threshold; that used the misleading metric. Check
+`sysctl vm.swapusage` and `memory_pressure`, and treat swap above ~90% as the stop signal.
 
 **Consequence for the loop: serialise gate runs.** Parallel agents are fine while they are reading,
 designing, or editing — but only one may be in `scripts/gates.sh` at a time. Stagger them, or give an
@@ -233,7 +334,10 @@ merged in the final cycle, each CI-verified with every job running steps:
 | #44 | F6 — allow-list on the OTLP bridge | `f2c24a8` |
 
 Migrations end at **`0020`** (next free `0021`; `0016` is a permanent gap). OpenAPI is stable at
-**151 operations / 99 paths / 178 schemas**.
+**152 operations / 100 paths / 183 schemas** — corrected 2026-08-02, re-derived from
+`docs/openapi.json` itself. This line said 151/99/178 for two cycles after it stopped being true;
+the ledger's cycle-14 entry already carried the correction and this one did not, which is how the
+wrong numbers kept reaching briefs. **Derive them, do not copy them.**
 
 ### 3.2 Open findings
 
@@ -241,8 +345,8 @@ Migrations end at **`0020`** (next free `0021`; `0016` is a permanent gap). Open
 |---|---|---|
 | **F16** | `rig-core` logs the whole completion body, now carrying other tenants' retrieved documents. Mitigated below the `EnvFilter` — **and that mitigation's own wiring test was missing until `8bbda15`** | **proper fix is upstream; needs an issue filed by a human** |
 | ~~**F2**~~ | ~~Pre-auth query-field enumeration~~ **CLOSED** `fix/f2-query-rejection-envelope`. Two corrections to the finding: it was never `Query`-only (every extractor rejection had the shape — `Json`'s 400/415/422, `Path`'s 400, `Extension`'s 500), and it was not an "observable wire change" — `docs/openapi.json` already documented `4XX`/`5XX` on these operations as `ErrorResponse`, so the fix makes the implementation obey a contract that was already committed and the snapshot is byte-identical. Scoped by **inverting the rule**: any non-JSON 4xx/5xx is envelope-wrapped, because `AppError` is the only producer of an error body. Rejection stays pre-auth, decided and recorded | closed |
-| **F28** | `metrics_endpoint_exposes_db_pool_gauges_reflecting_the_live_pool` treats sqlx's *approximate* `num_idle()`/`size()` as exact and mutually consistent within one scrape. Failed once under CPU contention (`left: 1.0, right: 0.0`), passed 9/9 immediately after with nothing changed. Fix is a bounded assertion (`idle <= baseline_idle - 1`) or a polled scrape — **not** a sleep | open, flake |
-| **F10 item 1** | `tests/retention_worker.rs` asserts an **exact** delete count against a cluster-wide sweep, and seeds century-backdated rows with no cleanup path, so a failure leaks rows that sort ahead of the next run's — self-poisoning | open. **It is now the LAST suite on the shared database**, so it is also the only remaining source of cross-run coupling |
+| ~~**F28** (metrics gauge)~~ | ~~`metrics_endpoint_exposes_db_pool_gauges_reflecting_the_live_pool` treats sqlx's `num_idle()`/`size()` as exact and mutually consistent within one scrape~~ **CLOSED** `fix/shared-db-flakes`. **The diagnosis in the finding was wrong.** `num_idle()` is not approximate — since sqlx 0.6 it is a dedicated `AtomicUsize`, and 0.8.6's `size()` is another. What is asynchronous is the **return**: `Drop for PoolConnection` *spawns* a task, and that task issues a `ping()` round-trip **before** it re-queues the connection and increments `num_idle`. So a scrape landing in that window reads a pool that is still settling. Reproduced **8/10** by replaying the shape with the incidental delay removed. No bound and no poll were needed: `acquire` on every permit is a barrier (an in-flight return has not released its permit) and `PoolConnection::return_to_pool().await` runs the return eagerly, so `idle` is now pinned **exactly** at `capacity`, `capacity - 1` and `0` — strictly stronger than what it replaced. Also corrected two false claims in the test's own doc comment | closed |
+| ~~**F10 item 1**~~ | ~~`tests/retention_worker.rs` asserts an exact delete count against a cluster-wide sweep, and seeds century-backdated rows with no cleanup path~~ **CLOSED** `fix/shared-db-flakes`. Both halves measured rather than argued: an injected failure leaked **43** rows dated **1926-08-27**, after which the *unmodified* suite failed `left: 43, right: 23` and leaked 23 more per run — 43 → 66 → 89 across three runs, permanently. Now on `support::TestDatabase`; the same injected failure leaves **0 rows and 0 databases**. The sweep is **database**-wide, not cluster-wide, so isolation does not change what is tested — it made the counts exactly assertable, and `>=` became `==` throughout. `SHARED_DATABASE_ALLOWLIST` is down to two entries | closed |
 | ~~**F27**~~ | ~~Leaked `trusted_jwt_issuers` rows in the shared test DB~~ **CLOSED** `fix/test-row-leak`. **The recorded count was wrong**: it said ~986; the measurement was **160** — exactly ten rows (the ten `register_issuer` call sites in `tests/jwks_hardening.rs`) × sixteen runs, and it leaked them on the **happy** path, not only on a panic. `tests/http_middleware_contract.rs` was the same shape (F10 item 2) with **42** *active* `moira:admin` API keys. Both now use `support::TestDatabase`, whose `Drop` discards the whole database including while unwinding. Residue deleted by predicate; `audit_logs` residue (180 rows) left in place deliberately | hygiene |
 
 **A concurrent branch `fix/test-row-leak-2` exists on origin** — a *reclaim* approach to the same
@@ -250,11 +354,29 @@ finding (delete the rows), superseded by `cac20ff` because reclaiming leaves the
 shared database, so the next run leaks again. It was **left in place rather than deleted**: it is
 another writer's work, and this loop does not destroy branches it did not create.
 
-*Reversal condition for F27:* it reopens if any test source outside `SHARED_DATABASE_ALLOWLIST` in
-`tests/test_database_isolation.rs` resolves `MOIRA_TEST_DATABASE_URL` itself, or if either suite's
-`the_fixture_owns_a_disposable_database` is deleted or weakened. The three allowlisted files
-(`support/mod.rs`, `security_foundation.rs`, `retention_worker.rs`) are *not* covered — see F10 item 1,
-which a private clone would also fix and which remains open.
+*Reversal condition for F27 and F10 item 1:* they reopen if any test source outside
+`SHARED_DATABASE_ALLOWLIST` in `tests/test_database_isolation.rs` resolves
+`MOIRA_TEST_DATABASE_URL` itself, or if any of the **three** suites'
+`the_fixture_owns_a_disposable_database` tests is deleted or weakened. **No integration suite
+writes to the shared database any more.** The allowlist is down to two entries — `support/mod.rs`,
+which owns the mechanism, and `security_foundation.rs`, which must migrate a database built from
+nothing — and both are read-scoped or self-cleaning. The shared `moira` database is still created
+and migrated by the unit tests under `src/**/tests`, which is why it must keep existing.
+
+*Reversal condition for F28 (metrics gauge):* it reopens if the pool gauges are asserted anywhere
+against a value sampled from a pool that is not first brought to a known state, or if
+`metrics_endpoint_exposes_db_pool_gauges_reflecting_the_live_pool` loses its **pre-saturation**
+scrape. That scrape looks redundant and is not: every other observation saturates the pool, so
+`pool.size()` and `max_connections` are the same number in all of them, and sourcing the `total`
+gauge from the configured ceiling left the whole test green until it was added. **That survivor was
+found by running the mutation — the test read fine.**
+
+*Known limit, deliberately left:* `render_prometheus` does `u32::try_from(pool.num_idle())`, and
+sqlx's `release()` re-queues the connection and releases its permit **before** incrementing
+`num_idle`, so on a multi-threaded runtime a waiter can decrement first and wrap the `AtomicUsize`
+to `usize::MAX` — which the `unwrap_or(u32::MAX)` then publishes as `4294967295`. `#[tokio::test]`
+is current-thread, so no test here can observe it; production is multi-threaded. Not fixed, not
+forgotten: the one-line guard is to clamp the gauge to `size()`.
 
 **Finding IDs are being allocated concurrently and have collided three times.** `F22` names *two*
 unrelated findings (`api_keys.prefix_length`, and the second `main` flake); `F21` has two entries; and
@@ -285,7 +407,58 @@ rather than implied. F14 was Sub-Phase F's inherited obligation and is now **clo
 (`74262ad`) — `memory_records.content_hash` is a content address, so the dedupe F will write does
 not have to carry a rotation caveat. F's remaining work is unchanged otherwise.
 
-### 3.3 Three things only the user can do
+### 3.2b THE LEDGER IS AHEAD OF THIS TABLE — read it, not just §3.2 (2026-08-02)
+
+The table above was written when the highest finding was F28. **The ledger now runs to `F55`.**
+`plans/reports/EXECUTION-LEDGER.md` is authoritative; §3.2 is a summary that has already gone stale
+once. Current state of everything above F28:
+
+| | What | State |
+|---|---|---|
+| **F33** | Five encryption-at-rest columns exist in `migrations/0007` and **nothing in `src/` writes or reads any of them** | **ESCALATED, human-only.** Envelope encryption is key custody, key rotation and plan 11's open Decision 3 — a scoping question, not an implementation gap. **Do not "finish" it autonomously** |
+| **F32** | `conversation_content_persistence` protected nothing — `'none'` still stored full plaintext | fixed on `fix/f32-content-persistence`, **PR #57, deliberately NOT auto-merged**: the 422 on the previously-accepted `encrypted_content` breaks any IaC that sets it. Loudly, which is the point — but that deserves human sight |
+| ~~**F46**~~ | ~~`response_format: {"type":"json_object"}` reaches the provider as a schema satisfied only by `{}`~~ | **CLOSED** `c938d5c` (#58) — **refused** with `422 unsupported_request_option` on both endpoints, matching F35's precedent on the compat path. Its recorded mechanism contained a false clause: `json_utils::merge` is only reached inside a branch requiring `output_schema.is_some()`, so a hand-built `additional_params` payload *would* have reached an OpenAI-family provider. It was refused on principle, not impossibility |
+| ~~**F47**~~ | ~~`get_or_create_*_policy` are `insert … on conflict do update`, i.e. **reads that write**~~ | **CLOSED** `fix/f40-f47-response-output-and-policy-reads`. Finding right and **understated**: a "read" also **bumped `version`** (the `If-Match` ETag) and fired `pg_notify('moira_runtime_config')`, which makes every replica drop its runtime-config *and provider-handle* caches — three times per conversation-linked turn. Family is **five**, not two; the fifth (`get_or_create_application_execution_policy`) already read first and so had **no** write amplification — and no `on conflict` clause either, so it raced and returned a duplicate-key error on the hot path of every `POST /v1/responses`. The brief's warning that the row lock "makes that race impossible" was **inverted** for that member. Six mutations; the `select … for update` one left the first guard green and earned a fifth case. Raised **F51** |
+| **F40** | ~~`GET /v1/responses/{id}` returns an empty `output` for a completed, persisted response~~ | **PREMISE REFUTED, two adjacent defects CLOSED**, same branch. `output_persisted` is never `true` anywhere, so `Completed` always explained itself and `[]` was reached only by non-completed statuses, where it is right. Real defects: the reason was the literal `"metadata_only_persistence"` for **all four** persistence modes, and `Completed && output_persisted` fell to `[]`. Public shape unchanged (`reason` is an unconstrained string; snapshot byte-identical) |
+| ~~**F51**~~ | ~~The `moira_runtime_config` channel is attached to **`conversations` and `memory_records`**, and `apply_invalidation` calls three `invalidate_all()`s **unconditionally**~~ | **CLOSED** `fix/f51-f52-invalidation-scope`. **Premise held in full — every count in it was right**, including 24 triggers when counted by *function* and which table's trigger is named differently. **Both fixes taken**: `invalidation_plan` returns `{caches, circuits}` and narrows one-way (unknown payloads still clear everything), and migration `0022` drops both triggers. **Nothing depended on them notifying** — `docs/runtime-cache-invalidation.md` never listed them, no cache in the process is keyed by a conversation or memory record, and `db.rs` is the only listener. The doc comment's standing defence ("re-reading costs a query") was **true of two caches and false of the third**: `ProviderRuntimeCache` holds built Rig clients with connection pools. Five mutations; **the cheapest edit — honour the plan for `runtime_cache` only — reds only the handles assertion.** Raised **F53** |
+| ~~**F52**~~ | ~~**A shipped, trusted guard whose list is retyped rather than pinned, and it has already drifted.**~~ | **CLOSED** `fix/f51-f52-invalidation-scope`. Premise held in full; `pg_trigger` returns exactly 24 and the three `legacy_*` tables still carry their **pre-rename trigger names**, so a name-based query mis-attributes as well as misses. `TRIGGERED_RESOURCE_TYPES` is now pinned against `pg_trigger` **both directions**, counted by trigger function, floored by `MINIMUM_TRIGGERED_TABLES`. The three legacy tables **lose their triggers** (`0023`) rather than being classified — the only references in the whole tree are inside `0003` itself, as a backfill source. Four mutations; **attaching the trigger to a new table reds the inventory test — the forward drift the retyped list could never detect — and "fixing" that red by adding the name to the constant alone reds the unit guard instead.** |
+| ~~**F53**~~ | ~~**F51's class, one table over and at admin rate:** `rag_documents` and `rag_collections` are content, not configuration, both carry the notify trigger and both are `caches: true`~~ | **CLOSED** `fix/f53-f50-silent-degradation`. **The gating question was answered before the fix was chosen, and both tables have the same answer: no.** `rag_collections` carries no runtime configuration at all — the embedding model and dimension the entry guessed at live in `application_embedding_policies`, and the collection is joined only to reach `application_id`. The three caches are closed types (`HashMap<Uuid, ProviderConfig>`, one `Vec<PublicAuthMethod>`, and a map keyed by `RuntimeCacheKey`'s seven provider/model/credential/policy fields), so no RAG row can be in any of them. Both lose the trigger (`0024`) **and** move into `RUNTIME_DATA_RESOURCE_TYPES`. Five mutations; the two that matter — reverting the classifier for **one** table — red only the integration guard and **leave every unit test green**, because a guard that iterates a constant cannot see a name removed from it |
+| ~~**F30**~~ | ~~`application_memory_policies.consent_mode` and `application_conversation_policies.memory_consent_mode` are independent, both default `'explicit_only'`, and nothing reconciles them~~ | **CLOSED, premise partly REFUTED** `fix/f30-consent-columns`. *Extraction* has reconciled them since Sub-Phase F and is tested with the columns **disagreeing** in both directions — as an extraction defect this is refuted. **But the reader it predicted had already arrived:** `ConversationRecord.memory_behavior` was `coalesce(mp.consent_mode, …)` **in SQL**, so `GET /api/v1/conversations` reported `application_managed` while extraction refused under a conversation policy of `disabled`. The lesson is a sharpening of *reconcile in one place*: the rule was in one place, in the **application layer**, and a query could not call it — it now lives on `MemoryConsentMode::stricter_of` so `pg_rows` can, and `conversation_select` decides nothing. `status_for_consent_mode` is private so no single-column answer has a ready-made caller. Four mutations; the one that matters restores the shipped defect and reds **only** the guard whose columns disagree |
+| **F48** | **A third `output_schema` drop path, and it is silent even on OpenAI.** Rig also requires `tools.is_empty() \|\| history_has_tool_result`, so the schema is dropped on turn 1 of any tool-calling conversation with **no `warn!` at all** — the warning at that site fires only for the DeepSeek case. Latent only because `build_completion_request` hardcodes `tools: Vec::new()`; it goes live the day tool calling is enabled. **F39's fix does not cover it** — that reconciles per provider type, this drop is per request | **latent, now GUARDED, behaviour deliberately unchanged.** Premise re-verified: that constructor is the tree's only `CompletionRequest`, and `public.rs` refuses caller-declared tools outright. `moiras_request_still_carries_its_schema_onto_rigs_openai_wire_body` reds on the precondition |
+| **F49** | **No integration test ever built a request from an agent profile** — every fixture left `agent_profile_id` NULL, so `preamble`/`temperature`/`max_tokens`/`tool_policy` were unverified at the wire | **CLOSED** `fix/f49-agent-profile-coverage`. Premise held; the column is on `route_definitions`, not `routing_policies`. `tests/agent_profile_wire.rs` now builds from a real profile and reads the mock's body. **The branch is correct at the wire.** Eight mutations run. Under F48's mutation only the new `tool_policy` case reds — **F48's guard is not superseded.** Raised F50 |
+| **F50** | **A disabled or soft-deleted agent profile silently degrades every execution on its route** — `get_active_agent_profile` filters on `status='active'`, neither disable nor soft-delete clears the route's FK, and `Ok(None)` is treated as "no profile": preamble, temperature and max_tokens vanish, and the run reports `succeeded` | **OBSERVABLE; the product decision is STILL OPEN.** `fix/f53-f50-silent-degradation` ships a `warn!`, a `RuntimeEventType::AgentProfileUnavailable` runtime event and an `agent_profile.unavailable` audit row. **The request's behaviour is unchanged** — fail-closed vs fail-open is **not** decided here, because silence is a defect under either answer and the observability is the part they share, not half of one. "No profile" and "profile vanished" are distinguished at the call site by reading `route.agent_profile_id` *before* the lookup. *Reversal condition:* the decision makes this "observe and refuse" or leaves it as is; **the observability is not revisited.** The `documents_`-named case is now scoped to the fail-open behaviour alone, so the three observability guards survive either answer |
+| **F38** | Terminal-persistence-deadline arm discarded a successful provider result | **CLOSED** `fix/f38-deadline-usage` — all three values retained, `"output_committed"` was a hardcoded literal and is now derived. Reversal conditions in the ledger |
+| ~~**F45**~~ | ~~`PublicResponseFormat::JsonSchema { name, strict }` — both accepted, both dropped~~ | **CLOSED** `fix/f42-f45-declared-vs-true`. Premise held; **neither field is expressible in rig-core 0.40 on any provider** (`strict: true` hardcoded and unreachable via `additional_params`; `name` derived from the schema's `title`; Anthropic and Gemini have neither field). Resolved **asymmetrically**: `strict` **refused**, `name` **documented**. **PUBLIC CONTRACT CHANGE** — `strict` is now `Option<bool>` and an explicit `false` is `422` on both endpoints; omitted and `true` are unchanged. That is what makes refusing available at all, and F35 was right to decline it while the field was a defaulting `bool`. `name` cannot be refused (required field) and is not smuggled through `title`. OpenAPI counts **hand-verified, unchanged: 152 / 100 / 183** |
+| ~~**F42**~~ | ~~`moira.error.structured_output_invalid` asserts a model-output-non-conformance path that does not exist~~ | **CLOSED** same branch. Premise held: two emitters, both rejecting the *caller's schema*. The near-miss that made it plausible — `memory_extraction::FAILURE_STRUCTURED_OUTPUT_INVALID`, the same string for the missing case — is never returned to a caller, and the description now says so. Fail-hard variant deliberately **not** shipped; F29 still needs two of its three preconditions |
+| ~~**F43**~~ | ~~`ConcurrencyController::acquire` is dead `pub` API; every caller is inside `#[cfg(test)]`~~ | **CLOSED** same branch. **Conclusion refuted, hazard confirmed.** 9 of the 29 callers are in `tests/`, a separate crate, so private/deleted were never available — `pub` in this `publish = false` single-crate workspace means "visible to integration tests", not an external contract. Fixed by removing the *choice*: one `pub acquire`, `is_stream` mandatory, wrapper gone |
+| ~~**F44**~~ | ~~`RuntimeModelHandle::stream` / `RuntimeStreamOutput` are dead `pub` API~~ | **CLOSED** same branch. Premise held exactly; **103 lines deleted**. Not in the finding: that cluster was the sole reason `runtime_factory.rs` imported the runtime-event vocabulary, so deleting it restored the Rig/application boundary |
+| ~~**F54**~~ | ~~A failed extraction cannot be correlated to its execution except through an unenforced `request_id` string convention (`"memory-extraction-{run_id}"`)~~ | **CLOSED** `fix/f54-extraction-correlation`, migration `0025`. **Premise partly REFUTED as it was later summarised:** the failure class is *not* lost from `memory_extraction_runs` — that column has existed since `0007` — so the "persist the failure class" candidate was already shipped, and `response_id` is already a real FK that is already taken (it names the *triggering turn's* response). The real gap was the missing `execution_id`, now a bare indexed uuid **matching `context_plans` and `retrieval_runs`, which solve the identical problem in the same migration**; a FK is impossible because `execution_id` is no table's primary key. Written when the run row is **opened**, not at completion, so the `'running'` row a mid-call death leaves behind keeps its correlation. The barrier is the type: `MemoryExtractionRunInsert.execution_id` is a required `Uuid`. Four mutations; the guard **joins** `execution_attempts` rather than checking the column is populated, because the weakened `is_some()` version was verified **green** against a fresh-uuid mint. Raised **F55** |
+| **F55** | **A failed summarization leaves no operator-facing record at all** — `conversation_summaries` is a table of successful outputs with no `status`, no `failure_class` and no run row; the only trace of a failure is an aggregate metric counter. F54's remedy assumed a "summarization run equivalent" and there is none | **raised, deliberately not fixed.** It is a new table rather than a column, and whether a failed summarization should be durable at all is a design question with a real cost on the response path. Remedy shape in the ledger |
+| ~~**F56**~~ | ~~A reasoning model's chain-of-thought is stored as the conversation summary~~ | **REPRODUCED then CLOSED as F57** `fix/f57-reasoning-in-summaries`. Re-measured on a second machine two days later: **1 298 of 2 419 bytes, 53.7 %** (F56 said 63 % — the share is transcript-dependent; what reproduces is that most of the stored summary is not the summary). **Resolved by announcing, not removing**, and removal was rejected on a *measurement*: a transcript that merely discusses reasoning tags returned one `<think>` and **ten** `</think>`, real terminator fifth — cutting at the first leaves 985 B of CoT, cutting at the last destroys 2 173 B of summary. A `max_tokens` truncation returns an **unterminated** block (100 % CoT), which a well-formed-block rule cannot touch at all. Anchored detection at offset 0 was correct on all five replies: **the condition is decidable, its extent is not.** Refusing was rejected by reasoning already at `parse_summary` — a refused summary never advances `covers_through_sequence`, so a *permanent* model property would re-trigger a provider call every turn forever; that option reopens with **F55**. `message.reasoning` is `null` on the wire while `content` carries the block, so the operator fix (`--reasoning-parser`) is named in the `warn!` and the metric |
+| **F35, F37, F34, F29, F39, F46** | — | CLOSED |
+| **F36, F41** | — | REFUTED / wrong as recorded |
+
+**F39 closed 2026-08-02** (`fix/f39-structured-output-capability`). Both divergences verified true,
+and fixed **asymmetrically because they are not the same problem**: DeepSeek is decidable — Moira
+now reads Rig's own `SUPPORTS_RESPONSE_FORMAT` associated const rather than restating it, so a
+`rig-core` bump cannot silently rot the answer — while `OpenAiCompatible`/`Local` is **undecidable
+at admission** (Rig does send the schema; whether a self-hosted backend honours it is unknowable)
+and is deliberately still admitted. Unblocked **one of the three** preconditions F29's reversal
+condition names — see the ledger's F39 section. **The other two landed on
+`fix/f30-consent-columns` (2026-08-03), so the reversal condition now holds in full and the flip is
+a choice rather than a wait.** `StructuredOutputInvalid`'s disposition is *stay out of all three*
+sets, recorded at each function and guarded bidirectionally; `run_extraction` reads
+`execution.status` and records the execution's own failure class. **The lenient parse still stays**
+— the flip turns a silent `None` into a terminal 422 on a class that neither retries nor falls
+back, and that blast radius deserves its own diff. What it must do is written at
+`structured_output_from_text`.
+
+**Finding IDs are allocated concurrently and have collided three times.** `F22` and `F28` each name
+**two** unrelated findings; `F21` has two entries; F27 was written as F26 until #47 claimed it.
+**Read `origin/main`'s ledger for the highest ID immediately before writing one down — not at the
+start of your task.**
+
+### 3.3 Things only the user can do
 
 1. **Deploy the release containing `c98aeb7`, then land T11** — removing the console's
    `ambiguous_enabled_providers` guard. **Do not wave this through.** It is gated on stage 4A being
@@ -294,16 +467,24 @@ not have to carry a rotation caveat. F's remaining work is unchanged otherwise.
    lands the console before Moira reopens exactly the window 4A closed. Correct order is 4A in
    release N, T11 in release N+1.
 2. **File the rig-core issue** for F16. Draftable, but it should go under a human's name.
-3. **Supply a Google credential** if the OAuth mock/live seam ever needs closing. Everything is
+3. **Decide F33's scope** — the five encryption-at-rest columns. Nothing in the tree encrypts, and
+   envelope encryption is key custody plus key rotation plus plan 11's open Decision 3. Recorded so
+   the columns are not mistaken for a partially-built feature by whoever finds them next.
+4. **Review PR #57 (F32)** — it is complete and gated but deliberately unmerged, because refusing the
+   previously-accepted `encrypted_content` with a 422 will break any deployment setting it in IaC.
+5. **Supply a Google credential** if the OAuth mock/live seam ever needs closing. Everything is
    verified against a real TLS mock IdP with real signed JWTs — what cannot be proven without a
    credential is Google's own token claims, consent screen and key rotation. Recorded, not implied.
    The same now applies to **GitHub**, added in wave 4B and exercised only against a purpose-built
    mock (no discovery document, no `id_token`, `/user` + `/user/emails`).
 
-### 3.4 Six guards that failed — five toothless, one that pinned the defect
+### 3.4 Thirteen guards that failed — eleven toothless, two that pinned the defect
 
 **Read this before writing any guard.** Plan 09 produced **six**, every one found by *running the
-mutation* and none by reading the test. **Two were already shipped and trusted.**
+mutation* and none by reading the test. **Two were already shipped and trusted.** A seventh followed
+on 2026-08-02, in a *replacement* guard written by an agent who had read this section first. A
+**tenth** followed later the same day, in a *brand-new* guard written by an agent who had read this
+section first and had already asked its question — see the end of this section.
 
 | Guard | Why it could not fire |
 |---|---|
@@ -324,12 +505,255 @@ outage.
 property, **say so in its name**; and **never let a conjunction be asserted as two independent
 facts.**
 
+**A seventh, and it is the one to be least comfortable about: the fix for a toothless assertion was
+itself toothless, in a new place.** F28's replacement drives the connection pool to saturation to
+make its numbers exact. That works — and it means `pool.size()` and the configured
+`max_connections` are *the same number in every observation the test makes*. Sourcing the `total`
+gauge from `options().get_max_connections()` instead of the live size therefore left the whole test
+green; verified by running it. One scrape taken **before** the pool is saturated closes it.
+
+**The lesson is narrower than "test more".** The technique that bought determinism — pin the system
+to a known extreme — is the same technique that collapsed two distinct quantities into one. *Any
+time a guard reaches a known state to make an assertion exact, ask which variables that state has
+just made indistinguishable from each other.* Determinism and discrimination pull in opposite
+directions, and this one was noticed only because the mutation was run anyway.
+
+**An eighth and a ninth, from `fix/f38-deadline-usage` — both already shipped and trusted.** That
+brings the shipped-and-trusted count to **four**, and an eleventh below takes it to **five**.
+
+| Guard | Why it could not fire |
+|---|---|
+| all seven cases in `tests/structured_output.rs` | they read `response_format` off the body that actually reached a mock provider, which looks unassailable — but every fixture in the tree left `route_definitions.agent_profile_id` NULL (**not** `routing_policies`, which has no such column — the original wording of this row and of F48's doc comment were both wrong, corrected under F49). The realistic way to enable tool calling is to read `AgentProfileRecord::tool_policy`, and **that mutation left all seven green**. Recorded as **F49**: no end-to-end test had ever built a request from an agent profile, so `preamble`, `temperature` and `max_tokens` were equally unpinned. **F49 is now CLOSED** — `tests/agent_profile_wire.rs` builds from a real profile — and the seven cases here are *still* green under that mutation. Closing the fixture hole did not arm them, and was never going to: they send no `output_schema` on the profile-carrying path, so they cannot see the drop |
+| `terminal_persistence_timeout_is_recorded_as_output_committed_not_as_a_plain_failure` | **PINNED the defect**, the second of that kind. It asserted `"output_committed": true` in both the event and the audit row on a **non-streaming** execution — and asserted `usage_records` count `= 0` a few lines away, which is the proof nothing was committed in either sense. The literal in the *test* was the thing keeping the wrong literal in the *code* |
+
+The lesson from the first: **"it asserts on the real wire" is not the same as "it reaches the code
+you changed."** Before trusting an end-to-end guard, check that its fixture populates the input
+your edit reads. The lesson from the second is §3.4's existing one, now twice-earned: a content
+literal in a test is code, and it can pin a defect just as firmly as an assertion can guard one.
+
+**A tenth, from `fix/f40-f47-response-output-and-policy-reads` — caught before merge, and a shape
+not yet on this list: the fix removed two coupled things and the guard observed only one.**
+
+F47's `on conflict do update` was both **a write** and **a row lock**. The guard asserted on the
+write, three ways — `xmin`, `version`, and the absence of a `moira_runtime_config` notification —
+which felt exhaustive because those are three independent observations of the same event. They
+are three observations of *one* of the two things being removed. Adding `for update` to the
+replacement `select` restores the serialisation with **no** new tuple version, **no** `version`
+bump and **no** notification, and left every one of those assertions green. Verified by running
+it, after the question had already been asked and the guard judged sound — the same sequence as
+the seventh.
+
+**The rule this adds: when a fix removes a construct, enumerate everything that construct was
+doing, and check the guard covers each one separately.** Three assertions on one consequence are
+one assertion. `do update` was doing two jobs; the guard needed a case per job, and
+`a_policy_read_does_not_wait_for_a_row_lock` is the second.
+
+A corollary that also came out of that suite, and is cheap everywhere: **an assertion that
+nothing happened is worthless unless something *can* happen.** The no-notification case now
+performs a real write on the same listener immediately afterwards and requires *that* to be
+announced. Without it the assertion would have held equally against a database with the triggers
+dropped or a listener on the wrong channel — F16's shape, in a new place.
+
+**An eleventh, found the same day and the worst of the shipped-and-trusted set, because it is a
+guard whose entire job is drift detection and it had already drifted. Recorded as F52, and
+since FIXED on `fix/f51-f52-invalidation-scope` — see the end of this entry for what the fix
+had to prove, which is more than "derive the list".**
+
+`every_triggered_table_has_a_scope` in `src/infra/db.rs` proves every table wired to
+`moira_runtime_config` classifies to something other than `CircuitResetScope::All` — an
+unclassified table means a write to it discards every provider's earned breaker health on every
+replica. Its doc comment says: *"the list is pinned here against the trigger list in
+`migrations/`."*
+
+**It is not pinned. It is retyped** — 21 table names as a Rust array literal, checked against a
+schema that has **24**. The three it omits are `legacy_providers`, `legacy_routing_policies` and
+`legacy_provider_credentials`, created by migration `0003`'s
+`alter table providers rename to legacy_providers`, which **carries the trigger with it**. All
+three fall to the classifier's `other =>` arm. The guard passes, and has always passed, because
+it is comparing the classifier to a copy of the classifier.
+
+**The rule: a guard that pins X against a hand-written list of X is not a guard, it is a
+duplicate.** The inventory must come from an independent source — `pg_trigger`,
+`information_schema`, `read_dir`, the generated document — or the guard only proves the author
+typed the same thing twice. This project already gets it right in three places
+(`suites_opening_the_shared_database` scans the filesystem, `if_match_inventory` reads the
+generated OpenAPI, and `MINIMUM_SUITES_SCANNED` floors the scan against an empty set), and
+`tests/policy_reads_do_not_write.rs` was given the same treatment on this branch for exactly this
+reason — `POLICY_TABLES` is pinned against `information_schema`, so a sixth policy table reds it.
+
+Note the shape it shares with the seventh and tenth: **all three were sound at the moment they
+were written and were falsified by a later change elsewhere** — a migration that renamed a table,
+a fix that removed two coupled behaviours. Guards rot in the direction of passing.
+
+**What fixing it taught, and it is not "derive the list".** `TRIGGERED_RESOURCE_TYPES` is now
+pinned against `pg_trigger` in both directions. That alone is *still* not a guard, because there
+is an obvious lazy repair for the red it produces: someone attaches a trigger to a new table, the
+inventory test fails naming that table, and they add the name to the constant. Set equality is
+restored, the test is green, and **the table is still unclassified** — the original defect,
+reintroduced by the fix's own error message. What closes it is that a *second* guard iterates the
+same constant and asserts each name classifies: adding the name satisfies the first and reds the
+second, and classifying it wrongly (as per-request data, so `caches: false`) reds a third
+assertion. **A derived inventory is only a guard if something else consumes it.** Verified by
+running all three edits, and the lazy-repair one was not predicted — it was found by asking the
+§3.4 question of the finished fix.
+
+**Two other things worth carrying, both from F51 on the same branch.**
+
+*When a fix protects several things, seed and observe the most expensive one, not the easiest
+to construct.* `apply_invalidation` clears three caches. Two rebuild from a query; the third
+holds built provider clients and their connection pools, and is the reason the finding mattered.
+The test file already contained a ready-made sentinel for the cheap one — so the guard that
+wrote itself would have watched exactly the wrong cache, and stayed green against an edit that
+honoured the plan for it and kept wiping the other two. That edit was run; it reds only the
+handles assertion.
+
+*A barrier must be inert with respect to the property under test.* The ordering barrier already
+in `tests/runtime_config_invalidation.rs` establishes "the listener has caught up" by emitting a
+`provider_models` notification — which is configuration, and therefore clears the caches. Reusing
+it to bracket a cache-*survival* assertion made the guard fail for a reason that had nothing to do
+with the code. It now brackets on the invalidation counter, which moves on every notification
+including the ones that clear nothing.
+
+**A twelfth, from `fix/f42-f45-declared-vs-true`, and its shape is new to this list: the suite
+stated the right principle in its own header and then applied it to half its cases.**
+
+`tests/structured_output.rs` opens by arguing that `execute_rig_stream` is *"a genuinely separate
+code path, and a fix applied at the Rig boundary would cover only case 1"*. That argument is
+correct, and it produced case 2 — the streaming twin of the **conforming** reply. It was never
+applied to the **non-conforming** one. So the cheapest edit that falsifies F42's corrected catalog
+entry — add the fail-hard variant to the streaming arm only — left **all seven** existing cases
+green: case 2 sends conforming JSON and never reaches the branch, and case 4 never streams.
+Verified by running it; the new twin is then the only case that reds.
+
+**The rule this adds: when a suite justifies a case by "this is a separate path", that
+justification applies to every property the suite tests on the other path, not just the one that
+prompted it.** A per-path pairing is a matrix, and this one had a hole in it that the header's own
+reasoning would have filled. It is cheap to check — list the properties, list the paths, look for
+the empty cell — and nothing else in the suite could have found it.
+
+**A thirteenth, from `fix/f53-f50-silent-degradation`, and it is the sharpening F52 needed: a
+guard that iterates a constant cannot see a name being REMOVED from that constant.**
+
+F52's rule is *a derived inventory is only a guard if something else consumes it*, and the
+consumer it produced — `only_configuration_changes_invalidate_the_configuration_caches` — loops
+over `RUNTIME_DATA_RESOURCE_TYPES` asserting each name classifies to `caches: false`. That is a
+real guard against a name being *added* wrongly. It is **structurally blind** to a name being
+taken out: the cheapest edit that reintroduces half of F53 is to move `rag_documents` back to
+`CIRCUIT_UNAFFECTED_RESOURCE_TYPES`, and **all eight `infra::db` unit tests stayed green** through
+it, because the loop no longer had that name to iterate. Only the integration guard, which names
+the table literally, reds. Verified by running it, for each of the two tables separately.
+
+**The rule: set-membership guards are one-directional by construction.** If a constant's contents
+are the property, something must also assert the *behaviour* of each specific member by name —
+otherwise the guard covers additions and silently permits deletions, which is the direction a
+regression actually travels. This is the same shape as the tenth entry (one construct, two jobs,
+guard covers one) applied to a list rather than a statement.
+
+**A second thing from the same branch, about `documents_` versus `guards_` when a fix is
+deliberately partial.** F50's coordinator decision was "ship the observability, do not take the
+product decision". The existing case was named
+`documents_current_behaviour_a_disabled_agent_profile_is_silently_ignored`, and shipping made its
+name false without making it fail. The temptation is to widen it into one case asserting both
+"it is announced" and "it still succeeds". **Do not** — the first survives whichever way the
+product decision goes and the second does not, so a merged case would go red on a correct
+fail-closed fix. Split by *lifetime*: what the pending decision cannot change is a `guards_`, what
+it will change is a `documents_` with the reversal condition on it. A `documents_` case is a
+liability with an expiry date, and the expiry date belongs in its name's scope.
+
+*Two things from the same branch that are not new failures but are worth carrying.* The F43 fix
+was guarded by a test that **already existed and did have teeth** —
+`stream_capacity_is_independent_from_request_capacity` reds alone when the streaming flag stops
+being wired — and it works precisely because it sets `max_concurrent_requests: 2` against
+`max_concurrent_streams: 1`. **Three other fixtures in the same file set both to 1** and could
+never have distinguished the two ceilings: the seventh entry's lesson (a state reached for
+determinism can collapse two quantities into one) sitting in the tree in triplicate, with one
+counter-example that happens to be the one that matters. And for F45, the *only* thing that caught
+the cheapest edit — collapsing an omitted `strict` back into an explicit `false` at the compat
+translation — was a **control** case asserting that the omitted spelling still succeeds. Every
+primary refusal assertion stayed green through it. Controls are not padding.
+
+**A sharpening about *barriers*, from F30 — it is not a fourteenth guard, it is the thing guards
+are supposed to be protecting.** The standing advice for "two inputs that must be read together" is
+*reconcile in one place in code that every reader must go through*. F30 had that: the
+stricter-of-two-consent-columns rule lived in exactly one function. A second reader appeared anyway,
+in **SQL**, and got it wrong — because the one place was an application-layer function over a type
+(`Option<MemoryStatus>`) that the layer needing the answer could neither call nor use. **A single
+point of truth is only a barrier if it is reachable from every layer that needs the answer, in the
+type that layer needs.** Otherwise the next reader is not being disciplined; it is being locked out,
+and it will reimplement.
+
+Two corollaries, both cheap:
+
+- **Ask which layers need the answer before choosing where the rule lives.** F30's fix was to move
+  the rule *down* to the domain type, which let `src/infra` apply it and let the query go back to
+  selecting raw columns and deciding nothing. Moving it up would have had the same failure.
+- **Delete the convenient wrong answer.** `status_for_consent_mode` turned *one* of the two columns
+  into a decision and was `pub`. Making it private is not tidying — it is removing the autocomplete
+  that any future single-column reader would have reached for first.
+
+**F30's recorded gap is now CLOSED, and the way it closed is worth more than the fix.** The brief
+that took it asked the right question — *does a pair of different values that tie actually exist in
+this enum?* — and pre-authorised the answer **"unclosable by construction, left recorded"** as a
+good outcome. It was closable: `permissiveness()` maps `ApplicationManaged` and
+`AutomaticWithUserControls` both to `2`, deliberately and with the reason written at the function.
+**Ask that question before writing the test, not after** — it is the difference between a real
+closure and a fourteenth guard that cannot fire, and the enum's own doc comment answered it in one
+read.
+
+**A shape not on the list above, from `fix/f54-extraction-correlation`. Like F30's, it is not a
+fourteenth guard — no shipped guard failed here. It is a rule for writing one, and it is specific
+to identifier columns: asserting that a correlation key is *present* does not assert that it
+*correlates*.**
+
+The F54 guard could have read `assert!(run.execution_id.is_some())`. That version was written,
+run against the cheapest mutation — let the writer mint its own uuid again instead of using the
+one the row was opened with — and **passed**. The column was non-null, indexed, and named an
+execution that had never existed. What has teeth is resolving the id against a table some *other*
+component wrote (`execution_attempts`, written by the execution kernel), and doing it where more
+than one candidate row exists so that resolving is a *choice*: this fixture always produces two
+executions, the caller's turn and the extraction, and only the failed one is the right answer.
+
+**The rule: an id column is trivially satisfiable, so a guard on one must dereference it.** Any
+uuid satisfies "is not null"; only the right uuid satisfies a join. This is F16's shape — an
+assertion that cannot discriminate — narrowed to the case where the *type* of the thing being
+asserted is what makes it undiscriminating.
+
+**A corollary about redundant assertions, found by running a mutation on a guard that was already
+sound.** The same guard also carried an explicit `assert_ne!` against the caller's execution id.
+Running the "record the caller's id instead" mutation showed it reds on the `assert_eq!` above,
+never on the `assert_ne!` — which, with the two ids already asserted distinct, is implied and can
+**never** be the assertion that fires. It was deleted. *An arm no test can execute is a promise,
+not a guard* applies to assertions inside a working guard, not only to whole cases — and this is
+now the **third** time the §3.4 question found something in a guard whose author had just read
+§3.4 and judged it sound. Asking is still not enough; run it.
+
+**And a way to check a complementarity claim instead of asserting one.** The new F30 tie case is
+blind to a memory-column-only read, and the sibling case is blind to the argument swap. That is
+written in both doc comments — and it was *verified*, by running each mutation and observing that
+each reds exactly one of the two. **When a doc comment claims two cases are complements rather
+than one being a superset, run both mutations**, or the claim is the same kind of untested
+assertion the cases exist to prevent.
+
+**One thing not about guards at all: a one-line summary of a finding can drift from the finding.**
+F54's own ledger entry says the run row *"now records the execution's failure class"*. The
+cycle-summary bullet three sections above it says the class is *"lost from
+`memory_extraction_runs`"*, and the brief built on the summary. **The summary had drifted back
+toward the overstated claim the entry had just narrowed** — so the first of the fix's three
+candidate options was work that had already shipped. *Read the entry, not the summary of the
+entry, and check whether a column a brief proposes adding already exists before costing it.*
+
+---
+
+**The original six — five toothless, one that pinned the defect**
+
 **The common shape:** each was written against the *shape the author imagined the defect would take*
-— a direct import, one handler per file, a representable row, a changed subject, a correct predicate
-— rather than against the property.
+— a direct import, one handler per file, a representable row, a changed subject, a correct
+predicate, a saturated pool — rather than against the property.
 
 **Ask of every guard: what is the cheapest edit that breaks the property while leaving the guard
-green?** That question found all five; reading the tests found none.
+green?** That question found all six; reading the tests found none. **Asking it is not enough — the
+seventh was found by *running* the answer**, after the same author had already asked the question
+and judged the guard sound.
 
 Three corollaries earned the hard way:
 
@@ -351,7 +775,13 @@ Three corollaries earned the hard way:
   `main + N × ~2 GB` and grows with every agent. Below 60 GB free run `scripts/reclaim.sh`; below
   30 GB also delete finished agents' target dirs. **Delete them routinely, not only under pressure.**
   `debug = 1` took a full build from 20 GB to 2 GB and a cold rebuild to 2m21s.
-- **Migrations** are append-only; next free number is **`0020`**.
+- **Migrations** are append-only; next free number is **`0026`** (`0025` is F54's). This line said
+  `0020` while the tree was at `0023`, and `0025` after `0025` landed — **derive it
+  (`ls migrations/ | tail -1`) instead of trusting it**, exactly as the brief for F53 instructed.
+  `0016` is a permanent gap. Note the shared `moira` database is only the *origin*; each test
+  clones a migrated **template** (`moira_test_template_<hash>`), so `select max(version) from
+  _sqlx_migrations` against `moira` will lag your branch and is **not** evidence a migration
+  failed to apply.
 - **OpenAPI** is frozen: regenerate with
   `UPDATE_SNAPSHOTS=1 cargo test --lib http::tests::committed_openapi_matches_the_generated_document`.
   Two gates enforce it, plus a hardcoded route list *and an exact operation count* in

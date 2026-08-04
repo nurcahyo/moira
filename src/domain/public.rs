@@ -128,6 +128,61 @@ pub enum PublicContentPart {
     InputImage { image_url: String },
 }
 
+/// The native `response_format` discriminated union.
+///
+/// `json_object` is **declared but refused** with `422 unsupported_request_option`. `rig-core`
+/// 0.40 has no representation of free-form JSON, so Moira used to translate it into the output
+/// schema `{"type":"object"}`, which reaches the provider as
+/// `{"type":"object","properties":{},"additionalProperties":false,"required":[]}` under
+/// `strict: true` — a schema satisfied only by `{}`, the opposite of what the name promises,
+/// returned with a `200` and a `succeeded` status (F46). The variant is kept so the refusal can
+/// *name* it instead of failing as an unknown variant. Send `json_schema` with an explicit
+/// schema. See `application::public::refuse_json_object`.
+///
+/// # `json_schema.name` is a label Moira cannot put on the wire (F45)
+///
+/// `rig-core` 0.40 offers **no seam for a response-format name** on any provider.
+/// `CompletionRequest::output_schema` is the only structured-output field, and each encoder
+/// derives (or discards) the name itself: the OpenAI family reads `json_schema.name` from the
+/// *schema's* `title`, falling back to the literal `"response_schema"`
+/// (`providers/openai/completion/mod.rs:1826`); Anthropic's `OutputConfig` carries a schema and
+/// nothing else; Gemini sets `generation_config.response_json_schema` and nothing else.
+///
+/// `name` is therefore accepted and used only by Moira. It is **not** refused, because it is a
+/// required field of this variant and refusing it would refuse every request. It is not
+/// honoured by rewriting the schema's `title` either: that would mutate caller-supplied data to
+/// smuggle a value through a field meaning something else — a subtler form of the boundary
+/// violation F46 refused — and it would work on one provider family only, making the contract's
+/// truthfulness depend on routing, which is F46's second objection verbatim.
+///
+/// **If you want a name on the wire, put it in the schema's `title`.** That already works, on
+/// the providers where a name exists at all, and it is the mechanism `rig-core` reads.
+///
+/// *Reversal condition:* `name` becomes honourable when `rig-core` exposes a response-format
+/// name on a typed `CompletionRequest` seam — not through `additional_params` — for every
+/// variant of [`crate::domain::ProviderType`] Moira routes to.
+///
+/// # `json_schema.strict` may not be `false` (F45)
+///
+/// `strict: true` is **hardcoded** in the OpenAI encoder
+/// (`providers/openai/completion/mod.rs:1838`) and cannot be reached through
+/// `additional_params`: with an `output_schema` present the encoder's `response_format` wins the
+/// `json_utils::merge`. Anthropic and Gemini have no strict/non-strict distinction at all. So a
+/// non-strict structured-output request is not expressible anywhere, and accepting `false` meant
+/// silently delivering the opposite — which is not merely stricter, it is observably different:
+/// `sanitize_schema` promotes **every declared property to `required`**, and OpenAI's strict
+/// mode rejects schemas outside its supported subset, so a caller who asked for best-effort can
+/// receive a provider 400.
+///
+/// The field is `Option<bool>` rather than `bool` precisely so "I did not say" stays
+/// distinguishable from "I said no". Omitted (`None`) and `true` are accepted; an explicit
+/// `false` is refused with `422 unsupported_request_option`. Under the previous `#[serde(default)]
+/// bool` the two were the same value, which is why refusing was rejected as an option when F35
+/// looked at it — it would have refused the common case.
+///
+/// *Reversal condition:* the refusal becomes an honouring when `rig-core` exposes strictness on
+/// a typed `CompletionRequest` seam for every provider Moira routes to. See
+/// `application::public::refuse_non_strict_json_schema`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PublicResponseFormat {
@@ -135,10 +190,14 @@ pub enum PublicResponseFormat {
     Text,
     JsonObject,
     JsonSchema {
+        /// Names the format for the caller's own logs. Never reaches a provider — see the type
+        /// documentation; put it in the schema's `title` if you need it on the wire.
         name: String,
         schema: Value,
+        /// Omit it, or send `true`. An explicit `false` is refused: Moira cannot ask any
+        /// provider for non-strict structured output, and the effective mode is always strict.
         #[serde(default)]
-        strict: bool,
+        strict: Option<bool>,
     },
 }
 

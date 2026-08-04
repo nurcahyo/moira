@@ -89,33 +89,53 @@ impl RuntimeInvalidationTargets {
 
 /// Applies one invalidation, whichever channel delivered it.
 ///
-/// The three caches stay unconditional: they are keyed by version (or, for the
-/// auth-settings cache, are a single small list) and rebuild on the next read, so
-/// re-reading them costs a query. Breaker state is earned by observing real
-/// failures and cannot be rebuilt, which is why only it is scoped.
+/// # Every target is scoped, not just the breakers (F51, F53)
 ///
-/// The auth-settings cache joins them here rather than being invalidated only by
-/// its own resource type, and that is deliberate: unconditional invalidation is
-/// what satisfies CONVENTIONS §7.2 even if a future trigger, view or rename makes
-/// an auth-settings change arrive under a payload this function does not
-/// recognise. Over-invalidating a list of three rows is free; under-invalidating
-/// the identity configuration is not.
+/// The three caches were once cleared unconditionally, on the argument that they
+/// are keyed by version and rebuild on the next read "so re-reading them costs a
+/// query". That argument is sound for a *configuration* write and false for
+/// everything else: the channel was also attached to tables whose rows are
+/// per-request data (F51) and to the two that hold RAG *content* (F53), and
+/// `runtime_handles` does not hold query results — it holds built provider
+/// clients, connection pools included. One conversation row, or one ingested
+/// document, therefore dropped every replica's entire runtime-config cache and
+/// every cached provider client handle, on a write that cannot change any of them.
+///
+/// So [`invalidation_plan`] now decides all four targets from one parse of the
+/// payload, and the caches are skipped for the resource types that are declared
+/// not to be configuration. The narrowing is deliberately one-way: anything this
+/// function does not recognise still clears everything and resets every breaker,
+/// exactly as it did before scoping existed.
+///
+/// # Why the three caches share one flag
+///
+/// The only narrowing that can be justified from a payload is "the row that
+/// changed is not configuration at all". *Which* config table invalidates *which*
+/// cache is a finer question nobody has established, and guessing it is how the
+/// identity configuration goes stale — CONVENTIONS §7.2 wants an auth-settings
+/// change to invalidate even if a future trigger, view or rename makes it arrive
+/// under a payload this function does not recognise. Over-invalidating a list of
+/// three rows on a genuine config write is free; under-invalidating it is not.
 async fn apply_invalidation(
     targets: &RuntimeInvalidationTargets,
     payload: &str,
     source: InvalidationChannel,
 ) {
-    let scope = circuit_reset_scope(payload);
-    targets.cache.invalidate_all().await;
-    targets.runtime_handles.invalidate_all().await;
-    targets.auth_settings.invalidate_all().await;
+    let plan = invalidation_plan(payload);
+    let scope = plan.circuits;
+    if plan.caches {
+        targets.cache.invalidate_all().await;
+        targets.runtime_handles.invalidate_all().await;
+        targets.auth_settings.invalidate_all().await;
+    }
     targets.circuits.reset_for_resource(scope).await;
     targets.metrics.record_runtime_invalidation(source);
     info!(
         channel = source.label(),
         payload,
+        caches_invalidated = plan.caches,
         circuit_reset_scope = ?scope,
-        "runtime config cache invalidated"
+        "runtime config invalidation applied"
     );
 }
 
@@ -271,12 +291,105 @@ const CIRCUIT_UNAFFECTED_RESOURCE_TYPES: &[&str] = &[
     "applications",
     "auth_provider_settings",
     "consumer_api_keys",
-    "conversations",
-    "memory_records",
     "provider_credentials",
     "provider_runtime_policies",
+    "route_definitions",
+    "routing_policies",
+    "system_api_keys",
+    "trusted_jwt_issuers",
+];
+
+/// Resource types whose rows are **data or content rather than configuration** (F51, F53).
+///
+/// A write to one of these cannot change anything the three in-process caches hold —
+/// provider configuration, built provider client handles, or the enabled auth methods —
+/// so it must clear none of them, and it cannot change provider health either.
+///
+/// # Two arrival rates, one property
+///
+/// `conversations` and `memory_records` (F51) are *per-request* data: they are written on
+/// the public execution path, once per conversation created and once per extracted memory.
+/// `rag_collections` and `rag_documents` (F53) are *content*: admin-written, so
+/// operator-rate rather than request-rate, but a bulk import is still one full
+/// cross-replica cache wipe per document. The rate is why F53 was a smaller finding than
+/// F51; it is not why either belongs here. What puts a name here is that no cache the
+/// listener clears can hold the row.
+///
+/// # `rag_collections` was the one that had to be checked rather than assumed
+///
+/// It is the plausible candidate for real configuration — a collection could reasonably
+/// own an embedding model and a dimension, and if it did, a cached read of one would go
+/// stale here. It does not. The table carries `collection_key`, `display_name`,
+/// `description`, `status`, `visibility` and `metadata`; every embedding value lives in
+/// `application_embedding_policies`, keyed by `application_id`, which keeps its trigger
+/// and its `caches: true` classification. `find_collection_ingestion_context` in
+/// `src/infra/repositories/conversation.rs` joins the collection solely to reach
+/// `application_id` and reads the configuration from the policy row.
+///
+/// # This asks a different question from [`CIRCUIT_UNAFFECTED_RESOURCE_TYPES`]
+///
+/// That list answers *"can this row change whether a provider is answering?"*. This one
+/// answers *"can this row change any cached configuration?"*. They are not the same
+/// question and the difference is the whole point: `agent_profiles` cannot change
+/// provider health and so is circuit-unaffected, but it very much changes cached runtime
+/// configuration and must keep clearing the caches. Only a table that answers **no to
+/// both** belongs here.
+///
+/// A name here is therefore implicitly circuit-unaffected as well, which is why these
+/// names are *not* repeated in the list above — one table, one list, so the two cannot
+/// disagree about it.
+///
+/// # These tables no longer carry the trigger either
+///
+/// `migrations/0022_conversations_and_memory_are_not_runtime_config.sql` drops the NOTIFY
+/// trigger from the first two and `migrations/0024_rag_content_is_not_runtime_config.sql`
+/// from the second two, so on the Postgres path this arm is unreachable today. It is kept
+/// as the second of two independent barriers: the classifier still narrows correctly if
+/// the trigger is ever re-attached, and it covers the Redis publish path, which is not
+/// gated by any trigger at all. Either barrier alone closes F51 and F53; neither is
+/// load-bearing.
+const RUNTIME_DATA_RESOURCE_TYPES: &[&str] = &[
+    "conversations",
+    "memory_records",
     "rag_collections",
     "rag_documents",
+];
+
+/// Every table wired to the `moira_runtime_config` channel, as the classifier below must
+/// be able to handle it.
+///
+/// # This list is pinned, not retyped — and the distinction is F52
+///
+/// The predecessor of this constant lived inside a unit test whose doc comment claimed it
+/// was "pinned here against the trigger list in `migrations/`". It was not pinned; it was
+/// **retyped** — 21 names written by hand against a schema that had 24 — and the three it
+/// omitted were exactly the three that fell through to the `other =>` arm and reset every
+/// breaker on every replica. A guard that compares the classifier to a hand-written copy
+/// of the classifier cannot detect drift in either; it only proves someone typed the same
+/// thing twice.
+///
+/// So the inventory is now pinned against `pg_trigger`, which is an independent source,
+/// by `the_notify_trigger_inventory_is_exactly_the_classified_set` in
+/// `tests/runtime_notify_inventory.rs`. Attaching the trigger to a new table reds that
+/// test until the table is added here and classified below — which is the obligation
+/// `CIRCUIT_UNAFFECTED_RESOURCE_TYPES` already states in prose and, until now, nothing
+/// enforced.
+///
+/// Exported for that test, and for no other reason.
+pub const TRIGGERED_RESOURCE_TYPES: &[&str] = &[
+    "agent_profiles",
+    "application_conversation_policies",
+    "application_embedding_policies",
+    "application_execution_policies",
+    "application_memory_policies",
+    "application_retrieval_policies",
+    "applications",
+    "auth_provider_settings",
+    "consumer_api_keys",
+    "provider_credentials",
+    "provider_models",
+    "provider_runtime_policies",
+    "providers",
     "route_definitions",
     "routing_policies",
     "system_api_keys",
@@ -305,47 +418,81 @@ pub const PUBLISHABLE_RESOURCE_TYPES: &[&str] = &[
     RESOURCE_TYPE_PROVIDER_RUNTIME_POLICIES,
 ];
 
-/// Maps one notification payload onto the breaker entries it may clear.
+/// Everything one notification must clear, decided from a single parse of its payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InvalidationPlan {
+    /// Whether to clear the three in-process configuration caches. One flag for all
+    /// three, for the reason recorded on [`apply_invalidation`].
+    caches: bool,
+    /// Which breaker entries may be reset.
+    circuits: CircuitResetScope,
+}
+
+impl InvalidationPlan {
+    /// The fail-safe: clear every cache and reset every breaker.
+    ///
+    /// This is what a payload the classifier cannot understand has always done, and it
+    /// is what F51's narrowing must never quietly weaken. Narrowing a payload that was
+    /// *misread* is how a breaker goes stale with nothing to say so.
+    const EVERYTHING: Self = Self {
+        caches: true,
+        circuits: CircuitResetScope::All,
+    };
+}
+
+/// Maps one notification payload onto the caches and breaker entries it may clear.
 ///
 /// Fails safe in every direction it cannot understand: an unparseable payload, a
 /// `resource_id` that is not a UUID, or a `resource_type` this function has never heard
-/// of all yield [`CircuitResetScope::All`], which is exactly the behaviour that shipped
-/// before scoping existed. Narrowing must never turn a parse bug into a silently stale
-/// breaker.
-fn circuit_reset_scope(payload: &str) -> CircuitResetScope {
+/// of all yield [`InvalidationPlan::EVERYTHING`], which is exactly the behaviour that
+/// shipped before scoping existed. Narrowing must never turn a parse bug into a silently
+/// stale breaker or a silently stale cache.
+fn invalidation_plan(payload: &str) -> InvalidationPlan {
     let change = match serde_json::from_str::<RuntimeConfigChange>(payload) {
         Ok(change) => change,
         Err(err) => {
             warn!(
                 error = %err,
-                "runtime config notification payload did not parse; resetting every circuit"
+                "runtime config notification payload did not parse; invalidating everything"
             );
-            return CircuitResetScope::All;
+            return InvalidationPlan::EVERYTHING;
         }
     };
 
     let Ok(resource_id) = Uuid::parse_str(&change.resource_id) else {
         warn!(
             resource_type = change.resource_type,
-            "runtime config notification carried a non-uuid resource id; resetting every circuit"
+            "runtime config notification carried a non-uuid resource id; invalidating everything"
         );
-        return CircuitResetScope::All;
+        return InvalidationPlan::EVERYTHING;
     };
 
     match change.resource_type.as_str() {
         // `CircuitBreakerRegistry` keys on `(provider_id, model_id)`, so `providers`
         // rows scope by the first element and `provider_models` rows by the second.
-        "providers" => CircuitResetScope::Provider(resource_id),
-        "provider_models" => CircuitResetScope::Model(resource_id),
-        other if CIRCUIT_UNAFFECTED_RESOURCE_TYPES.contains(&other) => {
-            CircuitResetScope::Unaffected
-        }
+        "providers" => InvalidationPlan {
+            caches: true,
+            circuits: CircuitResetScope::Provider(resource_id),
+        },
+        "provider_models" => InvalidationPlan {
+            caches: true,
+            circuits: CircuitResetScope::Model(resource_id),
+        },
+        // Checked before the circuit list, and the only arm that clears no cache.
+        other if RUNTIME_DATA_RESOURCE_TYPES.contains(&other) => InvalidationPlan {
+            caches: false,
+            circuits: CircuitResetScope::Unaffected,
+        },
+        other if CIRCUIT_UNAFFECTED_RESOURCE_TYPES.contains(&other) => InvalidationPlan {
+            caches: true,
+            circuits: CircuitResetScope::Unaffected,
+        },
         other => {
             warn!(
                 resource_type = other,
-                "unrecognised runtime config resource type; resetting every circuit"
+                "unrecognised runtime config resource type; invalidating everything"
             );
-            CircuitResetScope::All
+            InvalidationPlan::EVERYTHING
         }
     }
 }
@@ -353,6 +500,101 @@ fn circuit_reset_scope(payload: &str) -> CircuitResetScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The breaker half of [`invalidation_plan`], which is all most of these tests ask
+    /// about. One line delegating to the real function, so it cannot drift from it —
+    /// unlike a second copy of the mapping, which is the mistake F52 records.
+    fn circuit_reset_scope(payload: &str) -> CircuitResetScope {
+        invalidation_plan(payload).circuits
+    }
+
+    fn payload(resource_type: &str, resource_id: Uuid) -> String {
+        format!(r#"{{"resource_type":"{resource_type}","resource_id":"{resource_id}"}}"#)
+    }
+
+    /// F51's property, stated as what gets invalidated rather than as what arrives.
+    ///
+    /// # Why this is not "a notification was classified"
+    ///
+    /// A guard that only counted notifications, or only checked the breaker scope, passes
+    /// identically whether or not the caches are cleared — and the caches were the whole
+    /// finding: three unconditional `invalidate_all()` calls, one of which drops built
+    /// provider clients and their connection pools. So the assertion is on the `caches`
+    /// flag, per resource type.
+    ///
+    /// # The three cases are one fact, not three
+    ///
+    /// A data table that clears nothing is only meaningful beside a config table that
+    /// clears everything — otherwise `caches: false` for *everything* would pass the
+    /// first assertion — and beside an unknown table that still clears everything, which
+    /// is the fail-safe F51's narrowing must not have eaten. Asserted together for the
+    /// reason §3.4 records about conjunctions.
+    #[test]
+    fn only_configuration_changes_invalidate_the_configuration_caches() {
+        let id = Uuid::now_v7();
+
+        // Data and content: the finding, twice over. Clears no cache and no breaker.
+        //
+        // Iterating the constant rather than naming the four tables is the point. F52's
+        // rule is that a derived list is only a guard if something else consumes it, and
+        // this is one of the two consumers: adding a name to RUNTIME_DATA_RESOURCE_TYPES
+        // is not free, because it has to satisfy this assertion and
+        // `no_resource_type_is_in_both_classification_lists` below.
+        for resource_type in RUNTIME_DATA_RESOURCE_TYPES {
+            let plan = invalidation_plan(&payload(resource_type, id));
+            assert_eq!(
+                plan,
+                InvalidationPlan {
+                    caches: false,
+                    circuits: CircuitResetScope::Unaffected,
+                },
+                "a {resource_type} write is data or content, not configuration; \
+                 invalidating the caches on it drops every replica's runtime config and \
+                 every built provider client, connection pools included"
+            );
+        }
+
+        // Configuration: unchanged. Every cache still cleared.
+        for resource_type in ["providers", "applications", "auth_provider_settings"] {
+            assert!(
+                invalidation_plan(&payload(resource_type, id)).caches,
+                "a {resource_type} write is configuration and must still clear the caches; \
+                 narrowing the data tables must not have narrowed these with them"
+            );
+        }
+
+        // Unknown: the fail-safe, still intact in both directions.
+        assert_eq!(
+            invalidation_plan(&payload("some_future_table", id)),
+            InvalidationPlan::EVERYTHING,
+            "an unrecognised resource type must still clear everything and reset every \
+             breaker; narrowing a payload that was misread is how a cache goes stale silently"
+        );
+        assert_eq!(
+            invalidation_plan("not json"),
+            InvalidationPlan::EVERYTHING,
+            "an unparseable payload must still clear everything"
+        );
+    }
+
+    /// The two lists answer different questions, so no name may appear in both.
+    ///
+    /// A table in [`RUNTIME_DATA_RESOURCE_TYPES`] is already implicitly circuit-unaffected
+    /// — its arm returns [`CircuitResetScope::Unaffected`] and is matched first — so
+    /// repeating it in [`CIRCUIT_UNAFFECTED_RESOURCE_TYPES`] would create a second place
+    /// to edit and a way for the two to disagree about one table. This is the duplicate-list
+    /// shape F52 is about, caught at the point it would be introduced.
+    #[test]
+    fn no_resource_type_is_in_both_classification_lists() {
+        for resource_type in RUNTIME_DATA_RESOURCE_TYPES {
+            assert!(
+                !CIRCUIT_UNAFFECTED_RESOURCE_TYPES.contains(resource_type),
+                "{resource_type} is in both classification lists; the runtime-data arm \
+                 already implies circuit-unaffected, so the second entry is dead and can \
+                 only drift"
+            );
+        }
+    }
 
     #[test]
     fn notify_payload_parses_resource_type_and_id() {
@@ -402,44 +644,55 @@ mod tests {
         );
     }
 
-    /// Every table wired to the `moira_runtime_config` channel must be classified.
-    /// A table this function has never heard of is treated as unknown and falls back
-    /// to a full reset, which is safe but silently undoes the narrowing — so the list
-    /// is pinned here against the trigger list in `migrations/`.
+    /// Every table wired to the `moira_runtime_config` channel must be fully classified.
+    ///
+    /// A table the classifier has never heard of falls to the `other =>` arm, which is
+    /// safe but silently undoes every bit of narrowing at once: a full breaker reset and
+    /// a full cache wipe, on every replica, per row.
+    ///
+    /// # What this test is and is not
+    ///
+    /// It proves every name in [`TRIGGERED_RESOURCE_TYPES`] classifies correctly. It does
+    /// **not** prove that constant matches the schema — it cannot, because it has no
+    /// database, and a version of this test that carried its own copy of the list is
+    /// exactly the F52 defect. The schema half is
+    /// `the_notify_trigger_inventory_is_exactly_the_classified_set` in
+    /// `tests/runtime_notify_inventory.rs`, which reads `pg_trigger`. Neither half is
+    /// sufficient alone and neither duplicates the other.
+    ///
+    /// # Both halves of the plan, not just the breaker scope
+    ///
+    /// The `caches` assertion is what stops a *configuration* table being quietly moved
+    /// into [`RUNTIME_DATA_RESOURCE_TYPES`]: that would leave its scope `Unaffected` and
+    /// so satisfy the breaker assertion, while stopping every replica from ever noticing
+    /// the config change. A table that genuinely is data or content loses its trigger in
+    /// the same change, which takes it out of this list and out of this test's reach.
+    ///
+    /// It is also the half that closes F52's lazy repair, and F53 is the case that
+    /// exercises it: attach the trigger to `rag_documents` again, watch
+    /// `the_notify_trigger_inventory_is_exactly_the_classified_set` red naming the table,
+    /// then "fix" it by adding the name back to [`TRIGGERED_RESOURCE_TYPES`]. Set equality
+    /// is restored and *this* test fails instead, because the name is still in
+    /// [`RUNTIME_DATA_RESOURCE_TYPES`] and so classifies `caches: false`. The two halves
+    /// can only be satisfied together, which is the whole property a derived inventory
+    /// needs.
     #[test]
     fn every_triggered_table_has_a_scope() {
-        let triggered = [
-            "agent_profiles",
-            "application_conversation_policies",
-            "application_embedding_policies",
-            "application_execution_policies",
-            "application_memory_policies",
-            "application_retrieval_policies",
-            "applications",
-            "auth_provider_settings",
-            "consumer_api_keys",
-            "conversations",
-            "memory_records",
-            "provider_credentials",
-            "provider_models",
-            "provider_runtime_policies",
-            "providers",
-            "rag_collections",
-            "rag_documents",
-            "route_definitions",
-            "routing_policies",
-            "system_api_keys",
-            "trusted_jwt_issuers",
-        ];
         let resource_id = Uuid::now_v7();
-        for table in triggered {
-            let scope = circuit_reset_scope(&format!(
+        for table in TRIGGERED_RESOURCE_TYPES {
+            let plan = invalidation_plan(&format!(
                 r#"{{"resource_type":"{table}","resource_id":"{resource_id}"}}"#
             ));
             assert_ne!(
-                scope,
+                plan.circuits,
                 CircuitResetScope::All,
                 "{table} is triggered but unclassified, so it still resets every circuit"
+            );
+            assert!(
+                plan.caches,
+                "{table} still carries the NOTIFY trigger but no longer invalidates the \
+                 caches, so a change to it never reaches another replica; a table that is \
+                 really data or content must lose its trigger in the same change"
             );
         }
     }

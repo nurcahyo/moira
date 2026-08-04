@@ -400,6 +400,45 @@ pub fn public_response_record_from_row(
     })
 }
 
+/// `ConversationRecord.memory_behavior` — the consent mode actually in force, from **both**
+/// columns.
+///
+/// # F30
+///
+/// The value used to be `coalesce(mp.consent_mode, 'explicit_only')`, computed in
+/// `conversation_select`. That reported the memory policy alone, so an application that had
+/// tightened `application_conversation_policies.memory_consent_mode` was told its memory behaviour
+/// was the looser of its two settings — while extraction obeyed the stricter one. The two agree in
+/// every default deployment and disagree exactly when an operator has deliberately tightened one,
+/// which is why nothing noticed.
+///
+/// `MemoryConsentMode::stricter_of` is the same rule `effective_extraction_status` applies, and it
+/// is now applied here rather than restated, so the reported value and the enforced value cannot
+/// drift.
+///
+/// **`policy_controlled` when either column is missing, never a half-answer.** The sentinel is the
+/// pre-existing behaviour for the single-row call sites that do not go through
+/// `conversation_select` (find/patch/insert … returning), and extending it to "one column present,
+/// one absent" is deliberate: reporting the one column we happen to have is exactly the defect
+/// this function exists to remove. Every row from `conversation_select` carries both.
+fn effective_memory_behavior(row: &sqlx::postgres::PgRow) -> String {
+    let mode = |column: &str| -> Option<MemoryConsentMode> {
+        row.try_get::<String, _>(column)
+            .ok()
+            .and_then(|value| memory_consent_mode_from_db(value).ok())
+    };
+    match (
+        mode("conversation_consent_mode"),
+        mode("memory_policy_consent_mode"),
+    ) {
+        (Some(conversation), Some(memory)) => {
+            memory_consent_mode_to_db(MemoryConsentMode::stricter_of(conversation, memory))
+                .to_string()
+        }
+        _ => "policy_controlled".to_string(),
+    }
+}
+
 pub fn conversation_record_from_row(
     row: &sqlx::postgres::PgRow,
 ) -> Result<ConversationRecord, AppError> {
@@ -414,9 +453,7 @@ pub fn conversation_record_from_row(
         message_count: row.try_get("message_count")?,
         last_message_at: row.try_get("last_message_at")?,
         summary_available: row.try_get("summary_available").unwrap_or(false),
-        memory_behavior: row
-            .try_get("memory_behavior")
-            .unwrap_or_else(|_| "policy_controlled".to_string()),
+        memory_behavior: effective_memory_behavior(row),
         retention_expires_at: row.try_get("retention_expires_at")?,
         metadata: row.try_get("metadata")?,
         created_at: row.try_get("created_at")?,

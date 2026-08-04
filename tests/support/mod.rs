@@ -245,6 +245,36 @@ impl LifecycleFixture {
         policy: RuntimePolicy,
         capabilities: Value,
     ) -> ProviderFixture {
+        self.add_typed_provider_with_capabilities(
+            ProviderType::OpenAiCompatible,
+            base_url,
+            priority,
+            policy,
+            capabilities,
+        )
+        .await
+    }
+
+    /// As [`Self::add_provider_with_capabilities`], with the **provider type** also under the
+    /// caller's control (finding F39).
+    ///
+    /// Provider type is not cosmetic: it selects the `build_completion_model` arm, and therefore
+    /// which Rig client encodes the request. `DeepSeek` in particular is
+    /// `GenericCompletionModel<DeepSeekExt, _>` — OpenAI-compatible on the wire, so it drives
+    /// [`mock_openai::MockOpenAiServer`] unchanged, while carrying
+    /// `SUPPORTS_RESPONSE_FORMAT = false`, which is the only way to observe Rig dropping a
+    /// schema without reaching a real provider.
+    ///
+    /// Every arm this is used with must accept `CredentialType::ApiKey`, which is what this
+    /// fixture creates.
+    pub async fn add_typed_provider_with_capabilities(
+        &self,
+        provider_type: ProviderType,
+        base_url: String,
+        priority: i32,
+        policy: RuntimePolicy,
+        capabilities: Value,
+    ) -> ProviderFixture {
         let suffix = Uuid::now_v7().simple().to_string();
         let admin = AdminService::new(&self.state).expect("admin service");
         let provider = admin
@@ -252,7 +282,7 @@ impl LifecycleFixture {
                 &self.actor,
                 &request_context(),
                 ProviderCreateRequest {
-                    provider_type: ProviderType::OpenAiCompatible,
+                    provider_type,
                     display_name: format!("Lifecycle provider {suffix}"),
                     base_url: Some(base_url),
                     metadata: json!({ "test_fixture": true }),
@@ -965,7 +995,7 @@ fn template_database() -> String {
 /// opened its own pool on it.
 ///
 /// Exposed so a suite can assert it is *not* connected to that database without resolving
-/// the variable itself. `tests/test_database_isolation.rs` permits exactly three files to
+/// the variable itself. `tests/test_database_isolation.rs` permits exactly two files to
 /// make that lookup, and this module is the one that owns the mechanism; a suite doing it
 /// inline would be a new entry on that allowlist for no reason beyond a diagnostic.
 pub fn shared_database_name() -> Option<String> {

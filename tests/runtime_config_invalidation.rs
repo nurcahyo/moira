@@ -59,13 +59,17 @@ use chrono::Utc;
 use moira::{
     application::RuntimeAdminService,
     domain::{
-        AgentProfileCreateRequest, AgentProfilePatchRequest, ExecutionFailureClass, ProviderConfig,
-        ProviderKind, ProviderRuntimePolicyPutRequest, ProviderRuntimePolicyRecord,
-        RouteDefinitionCreateRequest, RouteDefinitionPatchRequest, RouteSelectionStrategy,
-        RoutingPolicyCreateRequest, RoutingPolicyPatchRequest, RuntimePolicyStatus,
+        AgentProfileCreateRequest, AgentProfilePatchRequest, AuthMethod, ExecutionFailureClass,
+        ProviderConfig, ProviderKind, ProviderRuntimePolicyPutRequest, ProviderRuntimePolicyRecord,
+        PublicAuthMethod, RouteDefinitionCreateRequest, RouteDefinitionPatchRequest,
+        RouteSelectionStrategy, RoutingPolicyCreateRequest, RoutingPolicyPatchRequest,
+        RuntimePolicyStatus,
     },
-    orchestration::{CircuitBreakerRegistry, RuntimeConfigCache},
+    orchestration::{
+        CircuitBreakerRegistry, RuntimeCacheKey, RuntimeConfigCache, RuntimeModelHandle,
+    },
 };
+use rig_core::{client::CompletionClient, providers::openai};
 use serde_json::json;
 use sqlx::PgPool;
 use support::{LifecycleFixture, RuntimePolicy, request_context};
@@ -213,6 +217,121 @@ fn sentinel_provider() -> ProviderConfig {
     }
 }
 
+/// A provider-handle cache key nothing else in the tree can name.
+///
+/// Every version field is pinned to a value no fixture writes, so the entry can only be
+/// removed by something that clears the whole cache — which is the only thing this file
+/// is asking about.
+fn sentinel_cache_key() -> RuntimeCacheKey {
+    RuntimeCacheKey {
+        provider_id: Uuid::now_v7(),
+        provider_version: 1,
+        model_id: Uuid::now_v7(),
+        model_version: 1,
+        credential_id: Uuid::now_v7(),
+        credential_version: 1,
+        runtime_policy_version: 1,
+    }
+}
+
+/// A real [`RuntimeModelHandle`], built the way `RigRuntimeFactory` builds one.
+///
+/// Client construction in `rig-core` is network-free — no request is made until a
+/// completion is requested — so this costs nothing and needs no mock. It has to be a
+/// genuine handle rather than a stand-in because the cache stores the enum itself.
+fn sentinel_handle() -> RuntimeModelHandle {
+    let client = openai::Client::builder()
+        .api_key("f51-sentinel-not-a-real-key")
+        .build()
+        .expect("build an openai client")
+        .completions_api();
+    RuntimeModelHandle::OpenAi(client.completion_model("f51-sentinel"))
+}
+
+fn sentinel_auth_method() -> PublicAuthMethod {
+    PublicAuthMethod {
+        id: Uuid::now_v7(),
+        method: AuthMethod::GoogleOauth,
+        display_name: "F51 sentinel".to_string(),
+        issuer: Some("https://accounts.google.com".to_string()),
+        discovery_url: None,
+        authorization_url: None,
+        jwks_url: None,
+        client_id: Some("f51-sentinel".to_string()),
+        requested_scopes: vec!["openid".to_string()],
+        allowed_email_domains: Vec::new(),
+    }
+}
+
+/// How many invalidations this fixture's listener has applied, from its own metrics.
+///
+/// `record_runtime_invalidation` is the last thing `apply_invalidation` does and it runs
+/// on **every** notification, including the ones that now clear no cache. That is exactly
+/// what a barrier for this file needs and what `drain_listener` cannot be: that helper
+/// drives its probe with a `provider_models` payload, which is configuration, so using it
+/// to bracket a cache-survival assertion would clear the very caches under observation.
+///
+/// Each `LifecycleFixture` owns its own `MetricsRegistry` and its own database, so this
+/// counter cannot be moved by another test.
+fn invalidations_applied(fixture: &LifecycleFixture) -> u64 {
+    let rendered = fixture
+        .state
+        .metrics
+        .render_prometheus("moira-test", false, false);
+    rendered
+        .lines()
+        .find(|line| {
+            line.starts_with("moira_runtime_invalidations_total")
+                && line.contains(r#"channel="postgres""#)
+        })
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|value| value.parse::<u64>().ok())
+        .expect("the runtime invalidation counter is seeded at zero from process start")
+}
+
+/// Emits one notification and blocks until the listener has applied it, clearing nothing
+/// on the way.
+///
+/// The counter above is the acknowledgement: it is incremented after the caches and
+/// breakers have been dealt with, so observing it move proves the payload was fully
+/// handled and the assertions that follow read a settled state.
+async fn notify_and_await(fixture: &LifecycleFixture, payload: &str) {
+    let before = invalidations_applied(fixture);
+    notify(&fixture.pool, payload).await;
+    wait_until(
+        async || invalidations_applied(fixture) > before,
+        "the runtime config listener never applied the notification under test",
+    )
+    .await;
+}
+
+/// Emits `sentinel` on the channel and returns every payload that preceded it.
+///
+/// Postgres delivers notifications to one connection in commit order, so a sentinel that
+/// arrives first proves everything committed before it announced nothing. That is an
+/// acknowledgement gate rather than a delay, and unlike a timeout it cannot pass by
+/// giving up early. Borrowed from `tests/policy_reads_do_not_write.rs`.
+async fn drain_until_sentinel(
+    listener: &mut sqlx::postgres::PgListener,
+    pool: &PgPool,
+    sentinel: &str,
+) -> Vec<String> {
+    sqlx::query("select pg_notify('moira_runtime_config', $1)")
+        .bind(sentinel)
+        .execute(pool)
+        .await
+        .expect("emit the sentinel notification");
+    let mut seen = Vec::new();
+    loop {
+        let notification = listener.recv().await.expect("listener stayed connected");
+        let payload = notification.payload().to_string();
+        if payload == sentinel {
+            return seen;
+        }
+        seen.push(payload);
+    }
+}
+
 struct Listener {
     task: tokio::task::JoinHandle<()>,
 }
@@ -332,12 +451,21 @@ async fn unrelated_table_notify_leaves_all_circuits_intact() {
     );
 }
 
-/// Narrowing the breaker reset must not have narrowed the caches with it. They are
-/// keyed by row version and rebuild from a query, so invalidating them on every
-/// notification stays correct and cheap; breaker state is the only thing that cannot be
-/// rebuilt, which is why it is the only thing that was scoped.
+/// Narrowing must not have narrowed the caches on a **configuration** write. An
+/// `applications` row is not provider health — so it resets no breaker — but it very much
+/// is runtime configuration, so every cache must still be dropped.
+///
+/// # This test used to be called `…_on_every_notify`, and that name is now wrong
+///
+/// It was written when `apply_invalidation` cleared the three caches unconditionally, and
+/// its old name asserted that as the property. F51 is precisely that the unconditional
+/// clearing was wrong for the two tables on this channel that carry per-request data, so
+/// a test named for "every notify" would have pinned the defect in place — the shape
+/// HANDOFF §3.4 records twice, where a test's own literal or name is what keeps the wrong
+/// behaviour in the code. The property it actually guards, and always did, is the one in
+/// the new name: a *config* write still invalidates.
 #[tokio::test]
-async fn runtime_cache_still_invalidates_on_every_notify() {
+async fn runtime_cache_still_invalidates_on_every_config_notify() {
     let Some(fixture) = LifecycleFixture::new().await else {
         return;
     };
@@ -664,6 +792,413 @@ async fn every_runtime_admin_mutation_leaves_provider_circuits_intact() {
         .await
         .expect("delete route definition");
     assert_circuits_survived(&circuits, owned, unrelated, "delete_route_definition").await;
+}
+
+/// F51, the classifier half: a per-request data payload must clear **no** cache.
+///
+/// # Why this observes all three caches and not just the runtime config cache
+///
+/// The finding is three unconditional `invalidate_all()` calls. A guard that watched only
+/// `runtime_cache` would stay green against the cheapest edit that preserves the defect —
+/// honour the plan for that one cache and keep clearing the other two — and the most
+/// expensive of the three is `runtime_handles`, which holds *built provider clients* with
+/// their connection pools, not query results. So a real handle and a real auth-methods
+/// list are seeded alongside the provider config, and all three are asserted.
+///
+/// # Silence here is checked against a control that must speak
+///
+/// "The caches survived" proves nothing if nothing could have cleared them — the listener
+/// might not be attached, the seeds might have expired. So the same test then issues an
+/// `applications` payload on the same listener and requires all three to be cleared by
+/// *that*. Survival and liveness are one fact, per §3.4.
+///
+/// # It sends a hand-built payload rather than writing a conversation row
+///
+/// Deliberately. `migrations/0022` drops the trigger from those tables, so a real
+/// conversation write emits nothing at all and this test would pass without the
+/// classifier ever being consulted — the two barriers would be indistinguishable. This
+/// one bypasses the trigger and therefore tests only the classifier;
+/// [`writing_a_conversation_announces_no_runtime_config_change`] writes a real row and
+/// therefore tests only the trigger.
+#[tokio::test]
+async fn a_conversation_notification_invalidates_no_cache() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let cache = fixture.state.runtime_cache.clone();
+    let handles = fixture.state.runtime_handles.clone();
+    let auth_settings = fixture.state.auth_settings_cache.clone();
+    let _listener = Listener::start(&fixture).await;
+
+    // Seed all three caches. Each seed is checked, so a later disappearance cannot be
+    // read off something that was never there.
+    let sentinel = sentinel_provider();
+    cache.put_provider(sentinel.clone()).await;
+    let handle_key = sentinel_cache_key();
+    handles.insert(handle_key.clone(), sentinel_handle()).await;
+    auth_settings
+        .put_enabled_methods(vec![sentinel_auth_method()])
+        .await;
+
+    assert!(
+        cache.get_provider(sentinel.id).await.is_some(),
+        "runtime config cache was not seeded"
+    );
+    assert!(
+        handles.get(&handle_key).await.is_some(),
+        "provider runtime handle cache was not seeded"
+    );
+    assert!(
+        auth_settings.enabled_methods().await.is_some(),
+        "auth settings cache was not seeded"
+    );
+
+    // The finding: a conversation is per-request data, not configuration.
+    notify_and_await(&fixture, &change_payload("conversations", Uuid::now_v7())).await;
+
+    assert!(
+        cache.get_provider(sentinel.id).await.is_some(),
+        "a conversations notification dropped the runtime config cache; every replica now \
+         re-reads every provider it had cached"
+    );
+    assert!(
+        handles.get(&handle_key).await.is_some(),
+        "a conversations notification dropped every built provider client handle, \
+         connection pools included — this is F51's most expensive consequence"
+    );
+    assert!(
+        auth_settings.enabled_methods().await.is_some(),
+        "a conversations notification dropped the auth settings cache"
+    );
+
+    // The control, on the same listener and the same seeds: a configuration write must
+    // still clear all three. Without it every assertion above would hold just as well
+    // against a listener that was never attached.
+    notify_and_await(
+        &fixture,
+        &change_payload("applications", fixture.application_id),
+    )
+    .await;
+
+    assert!(
+        cache.get_provider(sentinel.id).await.is_none(),
+        "an applications notification left the runtime config cache in place, so the \
+         survival asserted above proves nothing about scoping"
+    );
+    assert!(
+        handles.get(&handle_key).await.is_none(),
+        "an applications notification left the provider handle cache in place, so the \
+         survival asserted above proves nothing about scoping"
+    );
+    assert!(
+        auth_settings.enabled_methods().await.is_none(),
+        "an applications notification left the auth settings cache in place, so the \
+         survival asserted above proves nothing about scoping"
+    );
+}
+
+/// F51, the trigger half: writing a conversation row announces nothing at all.
+///
+/// The classifier is one barrier; `migrations/0022` dropping the trigger is the other,
+/// and this is the one that observes it. A real row is written and the channel is checked
+/// for silence with the sentinel technique from `tests/policy_reads_do_not_write.rs`:
+/// Postgres delivers notifications on one connection in commit order, so if the test's
+/// own sentinel is the first thing received, the write announced nothing. No sleep, no
+/// timeout, and exact.
+///
+/// The liveness control is in the same test for the same reason as everywhere else — an
+/// assertion that nothing arrived is worthless unless something can arrive — and it is a
+/// write to `applications`, which still carries its trigger.
+#[tokio::test]
+async fn writing_a_conversation_announces_no_runtime_config_change() {
+    const SENTINEL: &str = "f51-sentinel";
+
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    // No `Listener` here: this test reads the raw channel itself rather than watching a
+    // cache, so a listener task consuming in parallel would only add noise.
+    let mut listener = sqlx::postgres::PgListener::connect_with(&fixture.pool)
+        .await
+        .expect("attach a listener");
+    listener
+        .listen("moira_runtime_config")
+        .await
+        .expect("listen");
+
+    let conversation_id = Uuid::now_v7();
+    sqlx::query(
+        "insert into conversations (id, public_id, application_id, title, metadata) \
+         values ($1, $2, $3, $4, $5)",
+    )
+    .bind(conversation_id)
+    .bind(format!("conv_{conversation_id}"))
+    .bind(fixture.application_id)
+    .bind("F51 conversation")
+    .bind(json!({ "test_fixture": true }))
+    .execute(&fixture.pool)
+    .await
+    .expect("insert a conversation");
+
+    // An UPDATE and a DELETE too: the trigger fired on all three operations, and dropping
+    // it for one is not dropping it.
+    sqlx::query("update conversations set title = $2 where id = $1")
+        .bind(conversation_id)
+        .bind("F51 conversation renamed")
+        .execute(&fixture.pool)
+        .await
+        .expect("update the conversation");
+    sqlx::query("delete from conversations where id = $1")
+        .bind(conversation_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("delete the conversation");
+
+    let announced = drain_until_sentinel(&mut listener, &fixture.pool, SENTINEL).await;
+    let conversation_notifications: Vec<&String> = announced
+        .iter()
+        .filter(|payload| payload.contains("conversations"))
+        .collect();
+    assert!(
+        conversation_notifications.is_empty(),
+        "a conversation write announced a runtime-config change, so every replica dropped \
+         its runtime config and provider-handle caches: {conversation_notifications:?}"
+    );
+
+    // The control: the channel is live and this listener is on it.
+    sqlx::query("update applications set display_name = $2 where id = $1")
+        .bind(fixture.application_id)
+        .bind("f51 liveness probe")
+        .execute(&fixture.pool)
+        .await
+        .expect("update the application");
+    let announced = drain_until_sentinel(&mut listener, &fixture.pool, SENTINEL).await;
+    assert!(
+        announced
+            .iter()
+            .any(|payload| payload.contains("applications")),
+        "the notification channel is not live, so the silence asserted above proves \
+         nothing; saw {announced:?}"
+    );
+}
+
+/// F53, the classifier half: a RAG **content** notification clears nothing either.
+///
+/// # Why this is a separate finding from F51 and not a separate property
+///
+/// `rag_collections` and `rag_documents` came from the same `0007` block as
+/// `conversations` and `memory_records` and had the same defect, at a different rate:
+/// these two are written from admin routes, so a bulk import of N documents is N
+/// cross-replica cache wipes rather than one per conversation turn. The rate is why it
+/// was recorded separately. The property is identical, so this test is deliberately the
+/// twin of [`a_conversation_notification_invalidates_no_cache`] — including seeding a
+/// real [`RuntimeModelHandle`], because `runtime_handles` holds built provider clients
+/// with their connection pools and is the expensive thing the fix protects. A guard that
+/// watched only `runtime_cache` stays green against an edit that honours the plan for
+/// that one cache and keeps wiping the other two.
+///
+/// # Both tables, not one
+///
+/// F53 required establishing whether a collection's own configuration is read through a
+/// cache before either could lose its trigger, precisely because the two might have had
+/// different answers. They did not — a collection carries no runtime configuration at all
+/// — so both are narrowed, and the cheapest edit that preserves half the defect is to
+/// revert half the classifier. Each resource type is therefore asserted on its own.
+///
+/// # Hand-built payloads, for the reason its twin gives
+///
+/// `migrations/0024` drops both triggers, so a real document write emits nothing and this
+/// test would pass without the classifier ever being consulted. This one bypasses the
+/// trigger and tests only the classifier;
+/// [`writing_rag_content_announces_no_runtime_config_change`] writes real rows and
+/// therefore tests only the trigger.
+#[tokio::test]
+async fn a_rag_content_notification_invalidates_no_cache() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let cache = fixture.state.runtime_cache.clone();
+    let handles = fixture.state.runtime_handles.clone();
+    let auth_settings = fixture.state.auth_settings_cache.clone();
+    let _listener = Listener::start(&fixture).await;
+
+    let sentinel = sentinel_provider();
+    cache.put_provider(sentinel.clone()).await;
+    let handle_key = sentinel_cache_key();
+    handles.insert(handle_key.clone(), sentinel_handle()).await;
+    auth_settings
+        .put_enabled_methods(vec![sentinel_auth_method()])
+        .await;
+
+    assert!(
+        cache.get_provider(sentinel.id).await.is_some(),
+        "runtime config cache was not seeded"
+    );
+    assert!(
+        handles.get(&handle_key).await.is_some(),
+        "provider runtime handle cache was not seeded"
+    );
+    assert!(
+        auth_settings.enabled_methods().await.is_some(),
+        "auth settings cache was not seeded"
+    );
+
+    for resource_type in ["rag_documents", "rag_collections"] {
+        notify_and_await(&fixture, &change_payload(resource_type, Uuid::now_v7())).await;
+
+        assert!(
+            cache.get_provider(sentinel.id).await.is_some(),
+            "a {resource_type} notification dropped the runtime config cache; a bulk \
+             import does this once per document, on every replica"
+        );
+        assert!(
+            handles.get(&handle_key).await.is_some(),
+            "a {resource_type} notification dropped every built provider client handle, \
+             connection pools included — this is F53's most expensive consequence and the \
+             reason the guard does not stop at the config cache"
+        );
+        assert!(
+            auth_settings.enabled_methods().await.is_some(),
+            "a {resource_type} notification dropped the auth settings cache"
+        );
+    }
+
+    // The control, on the same listener and the same seeds. Without it every assertion
+    // above would hold just as well against a listener that was never attached.
+    notify_and_await(
+        &fixture,
+        &change_payload("applications", fixture.application_id),
+    )
+    .await;
+
+    assert!(
+        cache.get_provider(sentinel.id).await.is_none(),
+        "an applications notification left the runtime config cache in place, so the \
+         survival asserted above proves nothing about scoping"
+    );
+    assert!(
+        handles.get(&handle_key).await.is_none(),
+        "an applications notification left the provider handle cache in place, so the \
+         survival asserted above proves nothing about scoping"
+    );
+    assert!(
+        auth_settings.enabled_methods().await.is_none(),
+        "an applications notification left the auth settings cache in place, so the \
+         survival asserted above proves nothing about scoping"
+    );
+}
+
+/// F53, the trigger half: writing a RAG collection or document announces nothing at all.
+///
+/// The twin of [`writing_a_conversation_announces_no_runtime_config_change`], and it
+/// observes the other barrier — `migrations/0024` — with the same sentinel technique:
+/// Postgres delivers notifications on one connection in commit order, so if this test's
+/// own sentinel is the first thing received, everything committed before it announced
+/// nothing. No sleep, no timeout, exact.
+///
+/// INSERT, UPDATE **and** DELETE on both tables, because the trigger fired on all three
+/// operations and dropping it for one is not dropping it. The document is written and
+/// removed before the collection, since `rag_documents.collection_id` is
+/// `on delete cascade` and a cascaded delete would fire the document trigger from the
+/// collection's own `delete` — which is exactly the shape that would otherwise leave one
+/// of the two tables' triggers untested.
+#[tokio::test]
+async fn writing_rag_content_announces_no_runtime_config_change() {
+    const SENTINEL: &str = "f53-sentinel";
+
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let mut listener = sqlx::postgres::PgListener::connect_with(&fixture.pool)
+        .await
+        .expect("attach a listener");
+    listener
+        .listen("moira_runtime_config")
+        .await
+        .expect("listen");
+
+    let collection_id = Uuid::now_v7();
+    sqlx::query(
+        "insert into rag_collections (id, public_id, application_id, collection_key, \
+         display_name, metadata) values ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(collection_id)
+    .bind(format!("collection_{collection_id}"))
+    .bind(fixture.application_id)
+    .bind(format!("f53_{}", Uuid::now_v7().simple()))
+    .bind("F53 collection")
+    .bind(json!({ "test_fixture": true }))
+    .execute(&fixture.pool)
+    .await
+    .expect("insert a rag collection");
+
+    let document_id = Uuid::now_v7();
+    sqlx::query(
+        "insert into rag_documents (id, public_id, collection_id, title, source_type, \
+         mime_type, metadata) values ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(document_id)
+    .bind(format!("doc_{document_id}"))
+    .bind(collection_id)
+    .bind("F53 document")
+    .bind("inline")
+    .bind("text/plain")
+    .bind(json!({ "test_fixture": true }))
+    .execute(&fixture.pool)
+    .await
+    .expect("insert a rag document");
+
+    sqlx::query("update rag_documents set title = $2 where id = $1")
+        .bind(document_id)
+        .bind("F53 document renamed")
+        .execute(&fixture.pool)
+        .await
+        .expect("update the rag document");
+    sqlx::query("delete from rag_documents where id = $1")
+        .bind(document_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("delete the rag document");
+
+    sqlx::query("update rag_collections set display_name = $2 where id = $1")
+        .bind(collection_id)
+        .bind("F53 collection renamed")
+        .execute(&fixture.pool)
+        .await
+        .expect("update the rag collection");
+    sqlx::query("delete from rag_collections where id = $1")
+        .bind(collection_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("delete the rag collection");
+
+    let announced = drain_until_sentinel(&mut listener, &fixture.pool, SENTINEL).await;
+    let rag_notifications: Vec<&String> = announced
+        .iter()
+        .filter(|payload| payload.contains("rag_collections") || payload.contains("rag_documents"))
+        .collect();
+    assert!(
+        rag_notifications.is_empty(),
+        "a RAG content write announced a runtime-config change, so every replica dropped \
+         its runtime config, auth settings and provider-handle caches — once per document \
+         in a bulk import: {rag_notifications:?}"
+    );
+
+    // The control: the channel is live and this listener is on it.
+    sqlx::query("update applications set display_name = $2 where id = $1")
+        .bind(fixture.application_id)
+        .bind("f53 liveness probe")
+        .execute(&fixture.pool)
+        .await
+        .expect("update the application");
+    let announced = drain_until_sentinel(&mut listener, &fixture.pool, SENTINEL).await;
+    assert!(
+        announced
+            .iter()
+            .any(|payload| payload.contains("applications")),
+        "the notification channel is not live, so the silence asserted above proves \
+         nothing; saw {announced:?}"
+    );
 }
 
 /// The fail-safe. A payload the listener cannot understand must behave exactly as the

@@ -916,11 +916,25 @@ impl PublicExecutionService {
         }
         let output_schema = match &request.response_format {
             PublicResponseFormat::Text => None,
+            // F46 — this arm is where the empty-object schema was born, so the refusal is
+            // repeated here rather than left to `validate_request` alone. `validate_request`
+            // gives the caller the coded 422; this makes the wrong schema unconstructible by
+            // any future entry point that reaches `prepare_execution` without it. The two are
+            // deliberately redundant: neither edit alone reintroduces the defect.
+            // The trailing `None` is not dead code with a purpose of its own: it is the
+            // fallback if someone ever weakens `refuse_json_object`. An unconstrained request
+            // is a degradation; `Some(json!({"type":"object"}))` was a wrong answer.
             PublicResponseFormat::JsonObject => {
-                required_capabilities.push("structured_output".to_string());
-                Some(json!({ "type": "object" }))
+                refuse_json_object(&request.response_format)?;
+                None
             }
+            // F45 — the second layer, deliberately redundant with `validate_request`, exactly as
+            // the `json_object` arm above is. This is the site that turns a caller's
+            // `response_format` into the `output_schema` rig will encode under a hardcoded
+            // `strict: true`, so it is the last point at which "the caller said false" is still
+            // knowable. Neither edit alone reintroduces the defect.
             PublicResponseFormat::JsonSchema { schema, .. } => {
+                refuse_non_strict_json_schema(&request.response_format)?;
                 required_capabilities.push("structured_output".to_string());
                 Some(schema.clone())
             }
@@ -1269,9 +1283,18 @@ fn validate_request(
             "vision inputs are disabled for this application",
         ));
     }
+    // F46 — refused *before* the `structured_output_enabled` check on purpose. Both refusals
+    // are honest, but `structured_output_unsupported` invites the caller to enable the policy,
+    // and enabling it would never make `json_object` work. The unconditional fact is the more
+    // actionable one, so it is the one reported.
+    refuse_json_object(&request.response_format)?;
+    // F45 — placed beside the `json_object` refusal and, for the same reason, *before* the
+    // `structured_output_enabled` check: enabling that policy would never make `strict: false`
+    // work, so the unconditional fact is the more actionable one to report.
+    refuse_non_strict_json_schema(&request.response_format)?;
     if matches!(
         request.response_format,
-        PublicResponseFormat::JsonObject | PublicResponseFormat::JsonSchema { .. }
+        PublicResponseFormat::JsonSchema { .. }
     ) && !policy.structured_output_enabled
     {
         return Err(AppError::unprocessable(
@@ -1556,15 +1579,11 @@ pub(crate) fn openai_compat_to_public_request(
 /// Maps OpenAI's `text.format` onto Moira's native [`PublicResponseFormat`], refusing what
 /// Moira will not honour instead of accepting it and doing something else.
 ///
-/// `json_object` is the one shape deliberately refused rather than translated.
-/// `PublicResponseFormat::JsonObject` becomes the output schema `{"type":"object"}`, which
-/// `rig-core`'s OpenAI encoder completes to
-/// `{"type":"object","properties":{},"additionalProperties":false,"required":[]}` and sends
-/// under `strict: true` — a schema satisfied only by `{}`. Translating `json_object` would
-/// therefore replace F35's silent wrong answer with a different one. That native-path
-/// behaviour is pinned on the wire by
-/// `tests/openai_compat_text_format.rs::documents_native_json_object_reaching_the_provider_as_an_empty_object_schema`
-/// so this refusal has a witness and cannot be quietly invalidated.
+/// `json_object` is the one shape deliberately refused rather than translated. It is refused
+/// because Moira cannot honour it *anywhere* — see [`refuse_json_object`] for the mechanism and
+/// the reversal condition. Since F46 the native path refuses it too, so translating it here
+/// would produce the same 422 one layer later; refusing at the translation keeps the error
+/// naming the field the caller actually sent.
 fn compat_response_format(
     text: Option<OpenAiCompatTextOptions>,
 ) -> Result<PublicResponseFormat, AppError> {
@@ -1574,18 +1593,131 @@ fn compat_response_format(
             name,
             schema,
             strict,
+            // F45 — `strict` is carried across as the `Option` it arrived as. It used to be
+            // `strict.unwrap_or(false)`, which collapsed "the caller omitted it" into "the caller
+            // asked for non-strict" at the only boundary where the two were still distinguishable,
+            // and then the native path dropped the result anyway. Both endpoints now refuse an
+            // explicit `false` and accept an omitted one.
         }) => Ok(PublicResponseFormat::JsonSchema {
             name,
             schema,
-            strict: strict.unwrap_or(false),
+            strict,
         }),
         Some(OpenAiCompatTextFormat::JsonObject) => Err(AppError::unprocessable(
             "unsupported_request_option",
-            "text.format type json_object is not supported: Moira would constrain the output \
-             to the empty object rather than to free-form JSON. Send \
-             text.format.type = json_schema with an explicit schema instead.",
+            "text.format type json_object is not supported: Moira has no way to ask a provider \
+             for free-form JSON, so it would constrain the output to the empty object instead. \
+             Send text.format.type = json_schema with an explicit schema instead.",
         )),
     }
+}
+
+/// F46 — `response_format: {"type":"json_object"}` is refused, on the native path as well as
+/// on the compat one, rather than translated into a schema that means the opposite.
+///
+/// `JsonObject` used to become the output schema `{"type":"object"}`. `rig-core` 0.40 has **no**
+/// representation of free-form JSON — the string `"json_object"` does not occur anywhere in the
+/// crate — so `CompletionRequest::output_schema` is the only structured-output seam, and every
+/// encoder reads it as a *constraint*:
+///
+/// - the OpenAI family (`OpenAi`, `AzureOpenAi`, `DeepSeek`, `OpenAiCompatible`, `Local`) runs
+///   `sanitize_schema`, which completes an object schema with `properties: {}` and
+///   `additionalProperties: false` and then sets `required` to the (empty) property key list,
+///   and sends the result under a hardcoded `strict: true`. The wire schema
+///   `{"type":"object","properties":{},"additionalProperties":false,"required":[]}` is satisfied
+///   by exactly one document, `{}`;
+/// - Anthropic maps it to `output_config.format = json_schema` and its API has no free-form JSON
+///   mode at all;
+/// - Gemini only sets `generation_config.response_mime_type` when a schema is present.
+///
+/// So a caller asking for free-form JSON was answered with the empty object, under a `200` and a
+/// `succeeded` status — the exact opposite of the request.
+///
+/// **Why refuse instead of honour.** Honouring it would mean Moira hand-building
+/// `additional_params.response_format` per provider and bypassing `output_schema` — the boundary
+/// violation `moira-rig-integration` exists to prevent, already invoked in this tree against the
+/// same temptation for F45. It is also not expressible for every provider Moira routes to
+/// (Anthropic has none), so the same request would succeed or fail by routing outcome. Opening
+/// the schema with `additionalProperties: true` survives `sanitize_schema` but is rejected by
+/// OpenAI's strict mode, which trades a silent wrong answer for a provider 400.
+///
+/// This follows F35, which already refuses this shape on `POST /v1/responses`. The two endpoints
+/// now agree.
+///
+/// *Reversal condition:* this refusal becomes a translation when `rig-core` gains a
+/// schema-free structured-output mode that Moira can set through a typed `CompletionRequest`
+/// seam — not through `additional_params` — for every provider in
+/// [`crate::domain::ProviderType`]. Until then the variant stays in the public contract so the
+/// refusal can *name* it rather than 400 on an unknown variant.
+fn refuse_json_object(format: &PublicResponseFormat) -> Result<(), AppError> {
+    if matches!(format, PublicResponseFormat::JsonObject) {
+        return Err(AppError::unprocessable(
+            "unsupported_request_option",
+            "response_format type json_object is not supported: Moira would constrain the \
+             output to the empty object rather than to free-form JSON. Send response_format \
+             {\"type\": \"json_schema\"} with an explicit schema instead.",
+        ));
+    }
+    Ok(())
+}
+
+/// F45 — `response_format.json_schema.strict = false` is refused rather than accepted and
+/// inverted.
+///
+/// **`strict` is not expressible anywhere.** Verified against the vendored `rig-core` 0.40, not
+/// assumed:
+///
+/// - the OpenAI family (`OpenAi`, `AzureOpenAi`, `OpenAiCompatible`, `Local`) hardcodes
+///   `"strict": true` in the `response_format` it builds (`providers/openai/completion/mod.rs:1838`).
+///   `additional_params` cannot override it: the encoder's object is the `b` argument to
+///   `json_utils::merge`, so it wins whenever an `output_schema` is present;
+/// - Anthropic builds `OutputConfig { format: JsonSchema { schema } }` — no strictness field;
+/// - Gemini sets `generation_config.response_mime_type` and `response_json_schema` — no
+///   strictness field;
+/// - DeepSeek drops the schema before the wire entirely (`SUPPORTS_RESPONSE_FORMAT = false`),
+///   which is why F39 reconciles it out of routing at admission.
+///
+/// **Why this is not a harmless over-delivery.** Strict mode is not "the same answer, checked
+/// harder". `sanitize_schema` sets `required` to the full property-key list, so every field the
+/// caller declared optional becomes mandatory and the model is forced to invent one; and
+/// OpenAI's strict mode rejects schemas outside its supported subset, so a caller who asked for
+/// best-effort validation of a schema using, say, `pattern` receives a provider error. The
+/// caller asked for one contract and silently got a different one that can fail.
+///
+/// **Why refusing is now available when F35 judged it unavailable.** F35 considered refusing
+/// `strict: false` and rejected it because "OpenAI's own default for `strict` is falsy, so it
+/// would refuse the common case". That was correct against the field as it stood — `#[serde(default)]
+/// strict: bool` made an omitted `strict` indistinguishable from an explicit `false`. The field
+/// is now `Option<bool>`, so only an explicit `false` is refused and the common case is
+/// untouched. The compat DTO `OpenAiCompatTextFormat` already carried `Option<bool>`; the
+/// information was being destroyed by `strict.unwrap_or(false)` at the translation, and that
+/// `unwrap_or` is gone.
+///
+/// **Both endpoints refuse the same shape**, which is the property F35 and F46 both insisted on.
+/// This is the third member of that family: `json_object` (F46) and non-strict `json_schema`
+/// (here) are both refused natively and on `/v1/responses`.
+///
+/// *Reversal condition:* this refusal becomes an honouring when `rig-core` exposes strictness on
+/// a typed `CompletionRequest` seam — not through `additional_params` — for every variant of
+/// [`crate::domain::ProviderType`] Moira routes to. A release in which the OpenAI encoder reads
+/// a strictness input instead of hardcoding `true`, *and* Anthropic and Gemini gain an
+/// equivalent, is the concrete trigger. Partial support is not enough: routing-dependent
+/// semantics on a public API is the failure mode this refusal exists to avoid.
+fn refuse_non_strict_json_schema(format: &PublicResponseFormat) -> Result<(), AppError> {
+    if let PublicResponseFormat::JsonSchema {
+        strict: Some(false),
+        ..
+    } = format
+    {
+        return Err(AppError::unprocessable(
+            "unsupported_request_option",
+            "response_format json_schema strict=false is not supported: Moira has no way to ask \
+             a provider for non-strict structured output, so the request would be answered in \
+             strict mode instead — which makes every declared property required and can be \
+             rejected outright by the provider. Omit strict, or send strict=true.",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_response_format(
@@ -1768,21 +1900,75 @@ fn citations_from_link(link: Option<&ConversationExecutionLink>) -> Vec<PublicCi
         .unwrap_or_default()
 }
 
+/// Why a **completed** response is being served without its output text — finding F40.
+///
+/// # This is never "the model returned nothing"
+///
+/// A completed response whose model produced an empty string still carries
+/// `OutputText { text: "" }`, because `ExecutionStatus::Succeeded` always arrives with
+/// `output_text: Some(_)`. So the caller can tell an empty answer from an absent one, which
+/// is the whole reason this variant exists and the reason a bare `[]` would be wrong here.
+///
+/// # The mode is read from the response row, not from today's policy
+///
+/// `output_summary.persistence_mode` is written by [`terminal_update_from_outcome`] at the
+/// moment the response completed. The application's policy may have changed since; the row is
+/// the historical fact and the row is what is reported.
+///
+/// The literal was previously `"metadata_only_persistence"` unconditionally, which is correct
+/// for the default configuration and **false** for the other three modes — it named a cause
+/// the operator had not configured, sending them to change a setting that was not the reason.
+/// `plain_content` and `encrypted_content` are honoured by nothing in the tree (see
+/// `docs/response-persistence.md`, and F33 for the five unused encryption-at-rest columns), so
+/// the honest answer for those is that content persistence is unimplemented, not that the
+/// application asked for metadata only.
+///
+/// An absent or unrecognised mode falls back to the previous literal: `output_summary` is
+/// always written on the completed path, so the fallback is unreachable, and if it ever became
+/// reachable the default deployment's answer is the right guess.
+fn output_unavailable_reason(record: &PublicResponseRecord) -> &'static str {
+    if record.output_persisted {
+        // Unreachable today: every `ResponseTerminalUpdate` in this file hardcodes
+        // `output_persisted: false` and the column defaults to false, so nothing sets it.
+        // It is spelled out rather than folded into the branch below because the previous
+        // shape sent exactly this state to a silent `[]` — the more the system persisted, the
+        // less it returned. Whoever implements content persistence will see this string
+        // instead of an empty array, and the string names the work left to do: this read path
+        // does not load the stored body.
+        return "persisted_output_not_loaded";
+    }
+    match record
+        .output_summary
+        .get("persistence_mode")
+        .and_then(Value::as_str)
+    {
+        Some("none") => "persistence_disabled",
+        Some("plain_content" | "encrypted_content") => "content_persistence_not_implemented",
+        _ => "metadata_only_persistence",
+    }
+}
+
 fn public_response_from_record(
     record: &PublicResponseRecord,
     output_text: Option<String>,
     citations: Vec<PublicCitation>,
 ) -> PublicResponse {
+    // The invariant: a **completed** response never carries an empty `output`. Either the
+    // text, or a reason it is absent — because `[]` on a completed response is
+    // indistinguishable from a model that returned nothing, and those are very different
+    // results. A response that is queued, in progress, failed or cancelled has genuinely
+    // produced no output, and `status` already says which; `[]` is the honest answer there
+    // and stays.
     let output = if let Some(text) = output_text {
         vec![PublicOutputItem::Message {
             role: "assistant".to_string(),
             content: vec![PublicOutputContentPart::OutputText { text }],
         }]
-    } else if record.status == PublicResponseStatus::Completed && !record.output_persisted {
+    } else if record.status == PublicResponseStatus::Completed {
         vec![PublicOutputItem::Message {
             role: "assistant".to_string(),
             content: vec![PublicOutputContentPart::OutputUnavailable {
-                reason: "metadata_only_persistence".to_string(),
+                reason: output_unavailable_reason(record).to_string(),
             }],
         }]
     } else {
@@ -1848,6 +2034,15 @@ fn map_runtime_event(
         | RuntimeEventType::ToolCallDelta
         | RuntimeEventType::ToolCallCompleted
         | RuntimeEventType::ToolResult => return None,
+        // F50 — deliberately not on the caller's stream.
+        //
+        // A dangling `agent_profile_id` is an operator fault in this deployment's
+        // configuration, and its payload names a route and a profile the caller has no
+        // relationship with. Putting it on the public SSE contract would leak the shape of
+        // the admin plane to every API consumer and would say nothing they could act on.
+        // The audiences that need it are the diagnostic endpoint (which returns every
+        // `RuntimeEventEnvelope` verbatim), the `warn!` and the audit row.
+        RuntimeEventType::AgentProfileUnavailable => return None,
     };
     Some(public_sse(
         response_id,
@@ -2171,6 +2366,7 @@ fn failure_code(class: ExecutionFailureClass) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::ResponsePersistenceMode;
 
     /// Parses whatever a caller would actually put on the wire, so the assertion covers the
     /// DTO's own shape rather than a hand-built struct that cannot go wrong.
@@ -2218,7 +2414,12 @@ mod tests {
             );
         };
         assert_eq!(name, "answer");
-        assert!(!strict, "strict defaults to false when the caller omits it");
+        assert_eq!(
+            strict, None,
+            "F45 — an omitted strict must stay None. Under the previous `#[serde(default)] bool` it
+             collapsed to `false`, which is the value that is now refused, so the distinction is
+             the whole fix"
+        );
         assert_eq!(schema["properties"]["answer"]["type"], "string");
     }
 
@@ -2241,15 +2442,79 @@ mod tests {
         let public = openai_compat_to_public_request(request).expect("strict schema should map");
         assert!(matches!(
             public.response_format,
-            PublicResponseFormat::JsonSchema { strict: true, .. }
+            PublicResponseFormat::JsonSchema {
+                strict: Some(true),
+                ..
+            }
         ));
     }
 
-    /// `json_object` is refused rather than translated. Translating it would reach the provider
-    /// as `{"type":"object","properties":{},"additionalProperties":false,"required":[]}` under
-    /// `strict: true` — a schema satisfied only by `{}`. See
-    /// `tests/openai_compat_text_format.rs::documents_native_json_object_reaching_the_provider_as_an_empty_object_schema`,
-    /// which pins that behaviour on the wire.
+    /// F46 — the predicate. `json_object` is refused on the **native** representation, which is
+    /// what `prepare_execution` reads and what the compat translation produces.
+    ///
+    /// This is the predicate half of the pair HANDOFF §3.4 insists on; the wiring half is
+    /// `tests/openai_compat_text_format.rs`, which proves the refusal survives routing and that
+    /// no provider call is made. Every laundering finding in this repository has had a correct
+    /// predicate, so this test alone would prove nothing about the endpoint.
+    ///
+    /// It also asserts the refusal is *only* about `json_object`: `Text` and `JsonSchema` must
+    /// pass, or the cheapest way to make this test green would be to refuse everything.
+    #[test]
+    fn native_json_object_is_refused_and_the_other_two_formats_are_not() {
+        let err = refuse_json_object(&PublicResponseFormat::JsonObject)
+            .expect_err("json_object must be refused on the native path");
+        assert_eq!(
+            compat_error(&err),
+            Some((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported_request_option"
+            )),
+            "got {err:?}"
+        );
+        refuse_json_object(&PublicResponseFormat::Text).expect("text must stay honoured");
+        refuse_json_object(&PublicResponseFormat::JsonSchema {
+            name: "answer".to_string(),
+            schema: json!({ "type": "object" }),
+            strict: Some(true),
+        })
+        .expect("json_schema must stay honoured");
+    }
+
+    /// F45 — the predicate. Only an **explicit** `strict: false` is refused.
+    ///
+    /// The three cases are the whole point and none is padding. `None` is the common case and
+    /// the reason F35 judged this refusal unavailable — under the previous `#[serde(default)]
+    /// bool` it was the same value as `Some(false)`, so refusing would have refused everyone.
+    /// `Some(true)` is the case that matches what rig actually sends. If either regressed to a
+    /// refusal the endpoint would be broken for every structured-output caller, and refusing
+    /// everything would otherwise be the cheapest way to make the first assertion green.
+    #[test]
+    fn native_strict_false_is_refused_and_an_omitted_or_true_strict_is_not() {
+        let refused = |strict: Option<bool>| {
+            refuse_non_strict_json_schema(&PublicResponseFormat::JsonSchema {
+                name: "answer".to_string(),
+                schema: json!({ "type": "object" }),
+                strict,
+            })
+        };
+
+        let err = refused(Some(false)).expect_err("strict=false must be refused");
+        assert_eq!(
+            compat_error(&err),
+            Some((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported_request_option"
+            )),
+            "got {err:?}"
+        );
+
+        refused(None).expect("an omitted strict must stay honoured — it is the common case");
+        refused(Some(true)).expect("strict=true must stay honoured — it is what rig sends");
+        refuse_non_strict_json_schema(&PublicResponseFormat::Text)
+            .expect("text carries no schema and must be untouched");
+    }
+
+    /// `json_object` is refused rather than translated, on the compat path's own field name.
     #[test]
     fn compat_text_format_json_object_is_refused_rather_than_silently_dropped() {
         let request = compat_request(json!({
@@ -2393,6 +2658,48 @@ mod tests {
             };
             assert!(map_runtime_event(response_id, &event, 1).is_none());
         }
+    }
+
+    /// F50 — the dangling-agent-profile signal stays on the operator side.
+    ///
+    /// `AgentProfileUnavailable` reports that *this deployment's* route points at a
+    /// disabled or deleted agent profile, and its payload names a route id, a route key and
+    /// a profile id. That is admin-plane shape, and a caller can do nothing with it, so it
+    /// must not appear on the public SSE contract even though the caller's own request is
+    /// the thing degraded by it. The operator reads it from
+    /// `POST /api/v1/admin/runtime/diagnose`, the `warn!` and the audit row instead.
+    ///
+    /// The control is in the same test and is load-bearing: without it this assertion holds
+    /// equally against a `map_runtime_event` that returns `None` for everything, which is
+    /// the F16 shape §3.4 records — an assertion that nothing happened is worthless unless
+    /// something can happen.
+    #[test]
+    fn the_agent_profile_unavailable_event_is_not_a_public_sse_event() {
+        let response_id = Uuid::now_v7();
+        let envelope = |event_type| RuntimeEventEnvelope {
+            request_id: "req-test".to_string(),
+            execution_id: Uuid::now_v7(),
+            sequence: 1,
+            timestamp: Utc::now(),
+            event_type,
+            payload: json!({ "route_key": "general" }),
+        };
+
+        assert!(
+            map_runtime_event(
+                response_id,
+                &envelope(RuntimeEventType::AgentProfileUnavailable),
+                1
+            )
+            .is_none(),
+            "F50's operator signal reached the caller's stream; its payload names an \
+             internal route and agent profile"
+        );
+        assert!(
+            map_runtime_event(response_id, &envelope(RuntimeEventType::RouteSelected), 1).is_some(),
+            "route_selected is a public event, so the exclusion asserted above proves \
+             nothing about this event in particular"
+        );
     }
 
     #[test]
@@ -2560,5 +2867,241 @@ mod tests {
             legacy_public_actor_fingerprint(&base, effective_application_id(&base)),
             legacy_public_actor_fingerprint(&other, effective_application_id(&other)),
         );
+    }
+
+    // ------------------------------------------------------------------
+    // F40 — what a completed response says when it has no output text.
+    //
+    // The finding reported an empty `output` array for a completed, persisted response.
+    // That state is unreachable: nothing in the tree ever writes `output_persisted = true`.
+    // What *is* reachable is a completed response whose text was never persisted, and the
+    // single hardcoded reason it used to give was correct for one persistence mode out of
+    // four. These cases pin the whole matrix, because the cheapest edit that restores the
+    // defect is to collapse the four answers back into one literal — and a test that only
+    // exercised the default mode would not notice.
+    // ------------------------------------------------------------------
+
+    fn completed_record(persistence_mode: &str) -> PublicResponseRecord {
+        PublicResponseRecord {
+            id: Uuid::now_v7(),
+            execution_id: Uuid::now_v7(),
+            request_id: "req-f40".to_string(),
+            application_id: Some(Uuid::now_v7()),
+            external_tenant_id: None,
+            external_user_id: None,
+            conversation_id: None,
+            conversation_public_id: None,
+            status: PublicResponseStatus::Completed,
+            route_id: None,
+            route_key: None,
+            provider_id: None,
+            provider_type: None,
+            provider_model_id: None,
+            model_key: None,
+            // Exactly the shape `terminal_update_from_outcome` writes, so these cases read
+            // the same field the production path populates rather than a convenient stand-in.
+            output_summary: json!({
+                "persistence_mode": persistence_mode,
+                "output_text_bytes": 11,
+                "output_hash": "hash",
+            }),
+            usage: PublicUsageSummary::default(),
+            metadata: json!({}),
+            failure_class: None,
+            failure_message: None,
+            output_persisted: false,
+            created_at: Utc::now(),
+            started_at: None,
+            completed_at: Some(Utc::now()),
+            failed_at: None,
+            cancelled_at: None,
+            expires_at: None,
+            version: 1,
+        }
+    }
+
+    fn only_content_part(response: &PublicResponse) -> &PublicOutputContentPart {
+        let [PublicOutputItem::Message { content, .. }] = response.output.as_slice() else {
+            panic!(
+                "a completed response must carry exactly one output item, got {:?}",
+                response.output
+            );
+        };
+        let [part] = content.as_slice() else {
+            panic!("expected exactly one content part, got {content:?}");
+        };
+        part
+    }
+
+    fn unavailable_reason(response: &PublicResponse) -> &str {
+        match only_content_part(response) {
+            PublicOutputContentPart::OutputUnavailable { reason } => reason,
+            other => panic!("expected an output_unavailable part, got {other:?}"),
+        }
+    }
+
+    /// Each persistence mode gets its own answer, and no two of them share one.
+    ///
+    /// The previous code answered `"metadata_only_persistence"` for all four, which is true
+    /// only for the default. The distinctness assertion is the load-bearing half: four
+    /// separate equality checks would all pass against an implementation that returned the
+    /// same string for two modes if the expectations were ever edited to match.
+    #[test]
+    fn every_persistence_mode_gets_its_own_reason() {
+        let cases = [
+            ("metadata_only", "metadata_only_persistence"),
+            ("none", "persistence_disabled"),
+            ("plain_content", "content_persistence_not_implemented"),
+            ("encrypted_content", "content_persistence_not_implemented"),
+        ];
+
+        for (mode, expected) in cases {
+            let response = public_response_from_record(&completed_record(mode), None, Vec::new());
+            assert_eq!(
+                unavailable_reason(&response),
+                expected,
+                "persistence_mode {mode} reported the wrong reason"
+            );
+        }
+
+        // `plain_content` and `encrypted_content` deliberately share an answer — content
+        // persistence is unimplemented for both — so the distinct set is three, not four.
+        let distinct: std::collections::BTreeSet<&str> =
+            cases.iter().map(|(_, reason)| *reason).collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "the four modes collapsed into fewer than three answers: {distinct:?}"
+        );
+    }
+
+    /// The latent inversion F40 actually describes: the more the row claims to have
+    /// persisted, the less the old code returned.
+    ///
+    /// Unreachable today, and named rather than left silent so the day content persistence
+    /// lands the symptom is a string that says what happened instead of an empty array that
+    /// looks like a model with nothing to say.
+    #[test]
+    fn a_completed_response_claiming_persisted_output_says_so_rather_than_returning_nothing() {
+        let mut record = completed_record("plain_content");
+        record.output_persisted = true;
+
+        let response = public_response_from_record(&record, None, Vec::new());
+        assert!(
+            !response.output.is_empty(),
+            "a completed response must never carry an empty output array"
+        );
+        assert_eq!(unavailable_reason(&response), "persisted_output_not_loaded");
+    }
+
+    /// The other side of the invariant, so the fix cannot quietly become
+    /// "always emit an explanation".
+    ///
+    /// A response that is queued, running, failed or cancelled has genuinely produced no
+    /// output and `status` already says which. `[]` is honest there, and turning it into an
+    /// `output_unavailable` part would be a public-shape change with nothing behind it.
+    #[test]
+    fn only_completed_responses_carry_an_explanation() {
+        for status in [
+            PublicResponseStatus::Queued,
+            PublicResponseStatus::InProgress,
+            PublicResponseStatus::Failed,
+            PublicResponseStatus::Cancelled,
+        ] {
+            let mut record = completed_record("metadata_only");
+            record.status = status;
+            let response = public_response_from_record(&record, None, Vec::new());
+            assert!(
+                response.output.is_empty(),
+                "{status:?} must return an empty output array, got {:?}",
+                response.output
+            );
+        }
+    }
+
+    /// An empty model reply is not the same fact as an unavailable one, and the caller can
+    /// tell them apart.
+    ///
+    /// This is the assumption the whole finding rests on: if a succeeded execution could
+    /// arrive with `output_text: None`, then `output_unavailable` would be ambiguous no
+    /// matter what reason it carried.
+    #[test]
+    fn an_empty_model_reply_is_output_text_not_output_unavailable() {
+        let response = public_response_from_record(
+            &completed_record("metadata_only"),
+            Some(String::new()),
+            Vec::new(),
+        );
+        match only_content_part(&response) {
+            PublicOutputContentPart::OutputText { text } => assert_eq!(text, ""),
+            other => panic!("an empty completion must stay output_text, got {other:?}"),
+        }
+    }
+
+    /// An unrecognised or missing mode falls back to the value the default deployment sees.
+    #[test]
+    fn an_unreadable_persistence_mode_falls_back_to_the_default_answer() {
+        let mut record = completed_record("metadata_only");
+        record.output_summary = json!({});
+        assert_eq!(
+            unavailable_reason(&public_response_from_record(&record, None, Vec::new())),
+            "metadata_only_persistence"
+        );
+
+        record.output_summary = json!({ "persistence_mode": "a_mode_that_does_not_exist" });
+        assert_eq!(
+            unavailable_reason(&public_response_from_record(&record, None, Vec::new())),
+            "metadata_only_persistence"
+        );
+    }
+
+    /// The same record, with the mode written the way production writes it.
+    ///
+    /// [`completed_record`] takes a string, which is convenient and hides a coupling: the
+    /// production path builds `output_summary` with `json!({ "persistence_mode": <enum> })`, so
+    /// the key's value comes from `ResponsePersistenceMode`'s **serde** representation. A test
+    /// that hardcodes `"plain_content"` keeps passing if someone changes the `rename_all` on the
+    /// enum, while the live endpoint starts falling through to the default answer. This helper
+    /// serialises the enum instead, so the two cannot drift apart unnoticed.
+    fn completed_record_for(mode: ResponsePersistenceMode) -> PublicResponseRecord {
+        let mut record = completed_record("metadata_only");
+        record.output_summary = json!({
+            "persistence_mode": mode,
+            "output_text_bytes": 11,
+            "output_hash": "hash",
+        });
+        record
+    }
+
+    /// A fifth persistence mode must not silently inherit the default answer.
+    ///
+    /// [`every_persistence_mode_gets_its_own_reason`] iterates mode *strings*, so a new enum
+    /// variant would fall through `output_unavailable_reason`'s `_` arm, be reported as
+    /// metadata-only, and red nothing — the cheapest edit that breaks this finding's property
+    /// while leaving every other case here green. The `match` below is **exhaustive over the
+    /// enum**, so adding a variant is a compile error in this file. A compiler error is the only
+    /// guard that cannot be outrun by a change made somewhere else.
+    #[test]
+    fn every_persistence_mode_variant_is_mapped_and_reaches_the_reason() {
+        for mode in [
+            ResponsePersistenceMode::None,
+            ResponsePersistenceMode::MetadataOnly,
+            ResponsePersistenceMode::EncryptedContent,
+            ResponsePersistenceMode::PlainContent,
+        ] {
+            let expected = match mode {
+                ResponsePersistenceMode::None => "persistence_disabled",
+                ResponsePersistenceMode::MetadataOnly => "metadata_only_persistence",
+                ResponsePersistenceMode::EncryptedContent
+                | ResponsePersistenceMode::PlainContent => "content_persistence_not_implemented",
+            };
+            let response =
+                public_response_from_record(&completed_record_for(mode), None, Vec::new());
+            assert_eq!(
+                unavailable_reason(&response),
+                expected,
+                "{mode:?} did not reach its reason through the serialised output_summary"
+            );
+        }
     }
 }

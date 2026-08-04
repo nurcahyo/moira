@@ -24,6 +24,15 @@
 //! a disposable clone. Adding a suite to that set is then a visible, reviewable diff rather
 //! than a silent one.
 //!
+//! The allowlist has since shrunk by one. `tests/retention_worker.rs` was on it because
+//! `retention::run_once` sweeps every expired row in the database it is connected to, so on
+//! a shared database its delete counts included other suites' rows. That entry described a
+//! real constraint and a wrong conclusion: the sweep is *database*-wide, never
+//! cluster-wide, and it is database-wide on a private clone over the identical code path.
+//! Moving the suite (finding F10 item 1) made its counts exactly assertable instead of
+//! weakening them, and this file's second test is what forced the entry to be deleted
+//! rather than left to rot.
+//!
 //! **What it does not.** It matches source text, not behaviour: a suite that reached the
 //! same URL indirectly — through a helper, a second environment variable, or a `var(` call
 //! rustfmt happened to split across lines — would pass. It also cannot tell whether an
@@ -47,14 +56,6 @@ const SHARED_DATABASE_ALLOWLIST: &[(&str, &str)] = &[
         "asserts the migration contract itself, so it must apply migrations to a database \
          built from nothing rather than to a clone of an already-migrated template; it \
          already creates and force-drops its own database per run",
-    ),
-    (
-        "retention_worker.rs",
-        "`retention::run_once` is a cluster-wide sweep whose delete counter this suite \
-         asserts exact equality on, serialised against every other process by a global \
-         advisory lock (finding F10 item 1). A private clone would scope the sweep to one \
-         database and make both the lock and the exact-equality hazard disappear — a change \
-         of retention test semantics deliberately left outside F27",
     ),
 ];
 

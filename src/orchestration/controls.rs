@@ -308,7 +308,7 @@ struct DynamicPermit {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CapacityScope {
+pub enum CapacityScope {
     Global,
     ProviderRequest,
     ProviderStream,
@@ -318,7 +318,7 @@ pub(crate) enum CapacityScope {
 }
 
 #[derive(Debug)]
-pub(crate) struct CapacityExhaustion {
+pub struct CapacityExhaustion {
     scope: CapacityScope,
 }
 
@@ -390,26 +390,39 @@ impl ConcurrencyController {
         self.cluster.is_some()
     }
 
+    /// The **only** admission entry point. `is_stream` is a required argument and has no
+    /// default, deliberately.
+    ///
+    /// F43 — there used to be a second, `pub` one called `acquire`, which took four arguments
+    /// and supplied `is_stream: false` and `provider_stream_limit = provider_limit` itself.
+    /// Every one of its 29 call sites was test code (20 in this file's `#[cfg(test)]` modules,
+    /// 9 across `tests/cluster_coordination.rs` and `tests/coordination_default_path.rs`), so
+    /// the hardcoded `false` was never wrong in practice — but it was the shorter name, the
+    /// obvious name, and the one a future streaming caller would reach for, and reaching for it
+    /// would silently take a **request** permit and leave `max_concurrent_streams` unenforced.
+    ///
+    /// The fix is not "delete the dead code": the 9 integration-test call sites are a separate
+    /// crate and genuinely need a `pub` entry, so deleting it was never available. What was
+    /// available was removing the *choice*. There is now one function, it cannot be called
+    /// without stating which ceiling the caller wants, and `CapacityExhaustion`/`CapacityScope`
+    /// are `pub` so a caller can tell the two apart.
+    ///
+    /// The one production call site is `ExecutionService::execute_attempt`, which passes
+    /// `command.options.stream`. That *wiring* — not this predicate — is the thing worth
+    /// guarding, because a correct predicate with wrong wiring is this repository's most
+    /// repeated defect shape, and it is already guarded:
+    /// `stream_capacity_is_independent_from_request_capacity` in `tests/execution_lifecycle.rs`
+    /// runs `max_concurrent_requests: 2` against `max_concurrent_streams: 1` — two *distinct*
+    /// numbers, so the two ceilings stay distinguishable — holds one stream open, proves a
+    /// non-streaming execution still passes, and then requires a second stream to be refused
+    /// with `CapacityExhausted` and `call_count` unchanged. Passing `false` here instead of
+    /// `command.options.stream` reds it. Verified by running that edit, not by reading.
+    ///
+    /// **What does not stop this coming back:** nothing prevents a new four-argument
+    /// convenience wrapper being added above. There is no dead-code lint that would catch one
+    /// (it would have callers in tests immediately, which is exactly how the old one survived).
+    /// What changed is that the obvious name is taken by the function that demands the answer.
     pub async fn acquire(
-        &self,
-        provider_id: Uuid,
-        provider_limit: usize,
-        application_id: Option<Uuid>,
-        external_user_id: Option<&str>,
-    ) -> Result<ExecutionPermits, ExecutionFailure> {
-        self.acquire_scoped(
-            provider_id,
-            provider_limit,
-            false,
-            provider_limit,
-            application_id,
-            external_user_id,
-        )
-        .await
-        .map_err(Into::into)
-    }
-
-    pub(crate) async fn acquire_scoped(
         &self,
         provider_id: Uuid,
         provider_request_limit: usize,
@@ -1029,6 +1042,35 @@ impl ExecutionFailure {
     }
 }
 
+/// Whether the same provider and model are worth trying again for this failure.
+///
+/// # `StructuredOutputInvalid` is deliberately absent — F29's first precondition
+///
+/// Membership here means "the next attempt has a materially different chance of succeeding
+/// *without changing anything about the request*". That is true of a timeout, a 429 and a
+/// connection reset; it is false of every structured-output failure, in both directions, and the
+/// reasons differ per direction so they are recorded separately:
+///
+/// **The emitters that exist today are caller errors.** Both of them reject the *caller's
+/// schema* before the model ever sees it — `validate_response_format` over
+/// `public_api.maximum_schema_bytes`, and `build_completion_request` over a schema that is not a
+/// readable `schemars::Schema`. F42 pins that emitter set at exactly two
+/// (`structured_output_invalid_has_only_the_two_emitters_its_catalog_entry_describes`). A schema
+/// that is too large or unreadable is exactly as large and unreadable on the second attempt, so
+/// a retry is a guaranteed-identical failure paid for in latency.
+///
+/// **The emitter the fail-hard variant would add is a model error, and the answer is still no.**
+/// A reply that did not satisfy the schema *might* satisfy it on a second sample — but Moira
+/// pins `temperature: Some(0.0)` on its own schema-carrying calls (memory extraction), where a
+/// second sample is bit-identical; and where a caller did choose a non-zero temperature, a retry
+/// is a coin flip charged to them. Worse, the retry budget is shared: spending an attempt on a
+/// chatty model leaves fewer for the transport failure that arrives later in the same execution,
+/// which is the failure retries exist for.
+///
+/// See [`is_fallback_eligible`] for why the *other* provider question gets the same answer for a
+/// different reason, and [`is_circuit_failure`] for why counting this against a breaker would be
+/// a caller-triggered denial of service. The disposition is pinned by
+/// `structured_output_invalid_is_in_none_of_the_three_dispositions`.
 pub fn is_retryable(class: ExecutionFailureClass) -> bool {
     matches!(
         class,
@@ -1042,6 +1084,34 @@ pub fn is_retryable(class: ExecutionFailureClass) -> bool {
     )
 }
 
+/// Whether a *different* provider is worth trying for this failure.
+///
+/// # `StructuredOutputInvalid` is deliberately absent — and this is the direction that had a real
+/// case for inclusion
+///
+/// "Retry the same provider" and "try another one" are genuinely different questions, and the
+/// argument for fallback here was the strongest one in the family: a provider that *structurally
+/// cannot* send a schema will never comply, while the next provider in the chain might. That was
+/// concretely true of DeepSeek, where `rig-core`'s `SUPPORTS_RESPONSE_FORMAT = false` dropped the
+/// schema before the wire.
+///
+/// **F39 answered that question at routing time instead, which is why the answer here is no.**
+/// A model row that cannot carry a schema is no longer *selected* for a schema-carrying request
+/// (`a_deepseek_row_claiming_structured_output_is_not_routed_a_structured_request` and
+/// `a_structured_request_routes_past_deepseek_to_a_provider_that_sends_the_schema`, both in
+/// `tests/structured_output.rs`). What remains after F39 is not a capability failure that another
+/// provider fixes — it is either the caller's schema being unusable, which is unusable everywhere,
+/// or a model declining to comply, which is a quality question. Moira's fallback chain is a
+/// reliability mechanism: it answers "this provider is unavailable", not "this model's prose was
+/// disappointing", and silently answering from a different model because the first was chatty
+/// changes who produced the answer with nothing on the wire to say so.
+///
+/// **The decisive constraint: a class carries exactly one disposition, and this class has two
+/// emitters.** `is_fallback_eligible` cannot distinguish "the model replied badly" from "the
+/// caller sent a 2 MB schema". Admitting the class would let one caller's malformed schema walk
+/// the entire fallback chain on every request — a caller-triggered amplification against every
+/// provider the route lists. Whatever the reply case deserves, the request case must not pay for
+/// it, and today they share a class.
 pub fn is_fallback_eligible(class: ExecutionFailureClass) -> bool {
     matches!(
         class,
@@ -1056,6 +1126,20 @@ pub fn is_fallback_eligible(class: ExecutionFailureClass) -> bool {
     )
 }
 
+/// Whether this failure is evidence that the provider itself is unhealthy.
+///
+/// # `StructuredOutputInvalid` is deliberately absent, and here the reason is blast radius
+///
+/// Every class in this set is a statement *about the provider*: it timed out, it refused the
+/// connection, it returned a body that is not a completion. A breaker entry is keyed on
+/// `(provider_id, model_id)` and, once open, refuses traffic for **every** caller on that pair.
+///
+/// A structured-output failure is a statement about the *request* — the caller's schema today,
+/// and a model's reply if the fail-hard variant ships. Admitting it would let a single tenant
+/// posting an unreadable schema in a loop trip `circuit_failure_threshold` and take a healthy
+/// provider offline for everyone routed through it. That is a caller-triggered denial of service
+/// wearing a health check's clothes, and it is the reason this exclusion is the least arguable of
+/// the three.
 fn is_circuit_failure(class: ExecutionFailureClass) -> bool {
     matches!(
         class,
@@ -1090,6 +1174,122 @@ mod tests {
     use crate::domain::RuntimePolicyStatus;
     use chrono::Utc;
 
+    /// The disposition every failure class is *supposed* to have, written out independently of
+    /// the three `matches!` blocks it guards.
+    ///
+    /// Hand-written rather than derived, for F52's reason: a table computed from the thing it
+    /// checks agrees with it by construction and proves nothing. The `match` is exhaustive, so a
+    /// new [`ExecutionFailureClass`] variant does not compile until someone has decided what it
+    /// means for retry, fallback and the breaker.
+    fn expected_disposition(class: ExecutionFailureClass) -> (bool, bool, bool) {
+        use ExecutionFailureClass as C;
+        // (retryable, fallback_eligible, circuit_failure)
+        match class {
+            // Caller and configuration errors: identical on the next attempt, identical on the
+            // next provider, and no evidence about provider health.
+            C::InvalidExecutionRequest
+            | C::ApplicationUnavailable
+            | C::RouteNotFound
+            | C::RouteForbidden
+            | C::ModelNotFound
+            | C::ModelForbidden
+            | C::ModelCapabilityMismatch
+            | C::NoEligibleModel
+            | C::CredentialForbidden
+            | C::CredentialExpired
+            | C::CredentialDisabled
+            | C::CredentialDecryptionFailed
+            | C::ProviderConfigurationInvalid
+            | C::RequestCancelled
+            | C::DeadlineExceeded
+            | C::ProviderAuthenticationFailed
+            | C::StreamBackpressureExceeded
+            | C::InternalError => (false, false, false),
+            // F29's first precondition. See the three `is_*` doc comments: no retry (the schema
+            // is the same schema; a zero-temperature resample is the same reply), no fallback
+            // (F39 moved the capability question to routing, and the class cannot tell a bad
+            // caller schema from a bad model reply), no breaker (a caller must not be able to
+            // take a healthy provider offline for everyone).
+            C::StructuredOutputInvalid => (false, false, false),
+            // This provider cannot serve the request but another may hold a usable credential.
+            C::CredentialNotFound => (false, true, false),
+            // Operational: worth another attempt, worth another provider.
+            C::ProviderTimeout
+            | C::ProviderConnectionFailed
+            | C::ProviderUnavailable
+            | C::ProviderRateLimited
+            | C::ProviderUpstreamError => (true, true, true),
+            // Retry and fallback, but the breaker is what raised it — feeding it back would keep
+            // it open on its own output.
+            C::CircuitOpen | C::CapacityExhausted => (true, true, false),
+            // A body that is not a completion is provider health evidence, but replaying the same
+            // request at the same provider is not expected to change it.
+            C::ProviderInvalidResponse => (false, false, true),
+        }
+    }
+
+    /// F29's first precondition, stated as the property rather than as a membership check.
+    ///
+    /// **Why the whole table and not three asserts about one variant.** HANDOFF §3.4's thirteenth
+    /// shape is that a guard which iterates a constant cannot see a name being *removed* from it;
+    /// membership guards are one-directional. Asserting the full `(retry, fallback, circuit)`
+    /// triple for every class is bidirectional by construction — an addition and a removal both
+    /// go red — and it makes the disposition of `StructuredOutputInvalid` a recorded decision
+    /// sitting next to every other class's, which is what "give it a disposition" has to mean if
+    /// it is to survive the next edit.
+    ///
+    /// **Honest about its limit.** The loop walks [`ExecutionFailureClass::ALL`], and that array
+    /// can rot — its own doc comment says so. The exhaustive `match` in [`expected_disposition`]
+    /// is the backstop: a variant missing from `ALL` is still a compile error here.
+    #[test]
+    fn every_failure_class_has_a_recorded_retry_fallback_and_circuit_disposition() {
+        for class in ExecutionFailureClass::ALL {
+            let actual = (
+                is_retryable(class),
+                is_fallback_eligible(class),
+                is_circuit_failure(class),
+            );
+            assert_eq!(
+                actual,
+                expected_disposition(class),
+                "{class:?}: (retryable, fallback_eligible, circuit_failure) changed. \
+                 This table is the record of the decision, not a mirror of the code — \
+                 if the new behaviour is intended, change the table and say why in the \
+                 is_retryable / is_fallback_eligible / is_circuit_failure doc comments."
+            );
+        }
+    }
+
+    /// The precondition itself, said out loud so a reader grepping for it finds a test.
+    ///
+    /// Redundant with the table above *by design*: the table is what catches a drive-by edit, and
+    /// this is what tells whoever caused the red which decision they walked into. Deleting the
+    /// table would leave this one-directional; deleting this would leave the reason implicit.
+    #[test]
+    fn structured_output_invalid_is_in_none_of_the_three_dispositions() {
+        let class = ExecutionFailureClass::StructuredOutputInvalid;
+        assert!(
+            !is_retryable(class),
+            "a schema that is unreadable is unreadable on the second attempt too, and a \
+             zero-temperature resample of a non-conforming reply is the same reply"
+        );
+        assert!(
+            !is_fallback_eligible(class),
+            "F39 moved the capability question to routing; what is left is a caller schema that \
+             fails everywhere, and this class cannot tell that apart from a model's reply — so \
+             admitting it lets one bad schema walk the whole fallback chain"
+        );
+        assert!(
+            !is_circuit_failure(class),
+            "breaker entries are per (provider, model) and refuse traffic for every caller; a \
+             request-shaped failure must never be able to open one"
+        );
+        // The disposition is only safe while the emitter set is what the catalog says it is.
+        // `structured_output_invalid_has_only_the_two_emitters_its_catalog_entry_describes`
+        // (src/i18n/catalog/mod.rs) is the interlock: a third emitter goes red there, which is
+        // the prompt to re-read this decision rather than inherit it.
+    }
+
     fn policy(threshold: i32) -> ProviderRuntimePolicyRecord {
         ProviderRuntimePolicyRecord {
             id: Uuid::now_v7(),
@@ -1114,14 +1314,28 @@ mod tests {
     async fn global_concurrency_rejects_when_full() {
         let controller = ConcurrencyController::new(1, 1, 1, 8);
         let provider = Uuid::now_v7();
-        let first = controller.acquire(provider, 1, None, None).await.unwrap();
+        let first = controller
+            .acquire(provider, 1, false, 1, None, None)
+            .await
+            .unwrap();
         let second = controller
-            .acquire(provider, 1, None, None)
+            .acquire(provider, 1, false, 1, None, None)
             .await
             .unwrap_err();
-        assert_eq!(second.class, ExecutionFailureClass::CapacityExhausted);
+        // F43 — the entry point now returns `CapacityExhaustion`, which names the ceiling that
+        // was hit; the old wrapper returned an `ExecutionFailure` that had already thrown that
+        // away. Both are asserted: the scope, because it is the discriminating fact, and the
+        // conversion, because it is what the execution path actually reports to a caller.
+        assert_eq!(second.scope(), CapacityScope::Global);
+        let failure: ExecutionFailure = second.into();
+        assert_eq!(failure.class, ExecutionFailureClass::CapacityExhausted);
         drop(first);
-        assert!(controller.acquire(provider, 1, None, None).await.is_ok());
+        assert!(
+            controller
+                .acquire(provider, 1, false, 1, None, None)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -1130,12 +1344,12 @@ mod tests {
         let first_provider = Uuid::now_v7();
         let second_provider = Uuid::now_v7();
         let first = controller
-            .acquire_scoped(first_provider, 1, false, 1, None, None)
+            .acquire(first_provider, 1, false, 1, None, None)
             .await
             .unwrap();
 
         let exhausted = controller
-            .acquire_scoped(second_provider, 1, false, 1, None, None)
+            .acquire(second_provider, 1, false, 1, None, None)
             .await
             .unwrap_err();
         assert_eq!(exhausted.scope(), CapacityScope::LimiterRegistry);
@@ -1150,7 +1364,7 @@ mod tests {
         drop(first);
         assert!(
             controller
-                .acquire_scoped(second_provider, 1, false, 1, None, None)
+                .acquire(second_provider, 1, false, 1, None, None)
                 .await
                 .is_ok()
         );
@@ -1164,36 +1378,36 @@ mod tests {
         let controller = ConcurrencyController::new(8, 1, 1, 8);
         let provider = Uuid::now_v7();
         let first = controller
-            .acquire_scoped(provider, 2, false, 1, None, None)
+            .acquire(provider, 2, false, 1, None, None)
             .await
             .unwrap();
         let second = controller
-            .acquire_scoped(provider, 2, false, 1, None, None)
+            .acquire(provider, 2, false, 1, None, None)
             .await
             .unwrap();
 
         let lowered = controller
-            .acquire_scoped(provider, 1, false, 1, None, None)
+            .acquire(provider, 1, false, 1, None, None)
             .await
             .unwrap_err();
         assert_eq!(lowered.scope(), CapacityScope::ProviderRequest);
 
         drop(first);
         let still_full = controller
-            .acquire_scoped(provider, 1, false, 1, None, None)
+            .acquire(provider, 1, false, 1, None, None)
             .await
             .unwrap_err();
         assert_eq!(still_full.scope(), CapacityScope::ProviderRequest);
 
         let raised = controller
-            .acquire_scoped(provider, 2, false, 1, None, None)
+            .acquire(provider, 2, false, 1, None, None)
             .await
             .unwrap();
         drop(second);
         drop(raised);
         assert!(
             controller
-                .acquire_scoped(provider, 1, false, 1, None, None)
+                .acquire(provider, 1, false, 1, None, None)
                 .await
                 .is_ok()
         );
@@ -1204,24 +1418,24 @@ mod tests {
         let controller = ConcurrencyController::new(8, 1, 1, 8);
         let provider = Uuid::now_v7();
         let stream = controller
-            .acquire_scoped(provider, 3, true, 1, None, None)
+            .acquire(provider, 3, true, 1, None, None)
             .await
             .unwrap();
 
         let second_stream = controller
-            .acquire_scoped(provider, 3, true, 1, None, None)
+            .acquire(provider, 3, true, 1, None, None)
             .await
             .unwrap_err();
         assert_eq!(second_stream.scope(), CapacityScope::ProviderStream);
 
         let request = controller
-            .acquire_scoped(provider, 3, false, 1, None, None)
+            .acquire(provider, 3, false, 1, None, None)
             .await
             .unwrap();
         drop(stream);
         assert!(
             controller
-                .acquire_scoped(provider, 3, true, 1, None, None)
+                .acquire(provider, 3, true, 1, None, None)
                 .await
                 .is_ok()
         );
@@ -1235,12 +1449,12 @@ mod tests {
 
         let global_controller = ConcurrencyController::new(1, 2, 2, 8);
         let _global = global_controller
-            .acquire_scoped(provider, 2, false, 1, None, None)
+            .acquire(provider, 2, false, 1, None, None)
             .await
             .unwrap();
         assert_eq!(
             global_controller
-                .acquire_scoped(provider, 2, false, 1, None, None)
+                .acquire(provider, 2, false, 1, None, None)
                 .await
                 .unwrap_err()
                 .scope(),
@@ -1249,12 +1463,12 @@ mod tests {
 
         let provider_controller = ConcurrencyController::new(4, 2, 2, 8);
         let _provider = provider_controller
-            .acquire_scoped(provider, 1, false, 1, None, None)
+            .acquire(provider, 1, false, 1, None, None)
             .await
             .unwrap();
         assert_eq!(
             provider_controller
-                .acquire_scoped(provider, 1, false, 1, None, None)
+                .acquire(provider, 1, false, 1, None, None)
                 .await
                 .unwrap_err()
                 .scope(),
@@ -1263,12 +1477,12 @@ mod tests {
 
         let application_controller = ConcurrencyController::new(4, 1, 2, 8);
         let _application = application_controller
-            .acquire_scoped(provider, 4, false, 1, Some(application), None)
+            .acquire(provider, 4, false, 1, Some(application), None)
             .await
             .unwrap();
         assert_eq!(
             application_controller
-                .acquire_scoped(provider, 4, false, 1, Some(application), None)
+                .acquire(provider, 4, false, 1, Some(application), None)
                 .await
                 .unwrap_err()
                 .scope(),
@@ -1277,12 +1491,12 @@ mod tests {
 
         let user_controller = ConcurrencyController::new(4, 2, 1, 8);
         let _user = user_controller
-            .acquire_scoped(provider, 4, false, 1, None, Some("user-1"))
+            .acquire(provider, 4, false, 1, None, Some("user-1"))
             .await
             .unwrap();
         assert_eq!(
             user_controller
-                .acquire_scoped(provider, 4, false, 1, None, Some("user-1"))
+                .acquire(provider, 4, false, 1, None, Some("user-1"))
                 .await
                 .unwrap_err()
                 .scope(),
@@ -1297,18 +1511,18 @@ mod tests {
         let blocked_application = Uuid::now_v7();
         let available_application = Uuid::now_v7();
         let held = controller
-            .acquire_scoped(provider, 2, false, 1, Some(blocked_application), None)
+            .acquire(provider, 2, false, 1, Some(blocked_application), None)
             .await
             .unwrap();
 
         let failure = controller
-            .acquire_scoped(provider, 2, false, 1, Some(blocked_application), None)
+            .acquire(provider, 2, false, 1, Some(blocked_application), None)
             .await
             .unwrap_err();
         assert_eq!(failure.scope(), CapacityScope::Application);
 
         let recovered = controller
-            .acquire_scoped(provider, 2, false, 1, Some(available_application), None)
+            .acquire(provider, 2, false, 1, Some(available_application), None)
             .await
             .unwrap();
         drop(held);
@@ -1316,7 +1530,7 @@ mod tests {
 
         assert!(
             controller
-                .acquire_scoped(provider, 1, false, 1, Some(blocked_application), None)
+                .acquire(provider, 1, false, 1, Some(blocked_application), None)
                 .await
                 .is_ok()
         );
@@ -1696,17 +1910,23 @@ mod cluster_tests {
         assert!(!controller.is_cluster_wide());
         let provider = Uuid::now_v7();
 
-        let first = controller.acquire(provider, 2, None, None).await;
-        let second = controller.acquire(provider, 2, None, None).await;
+        let first = controller.acquire(provider, 2, false, 2, None, None).await;
+        let second = controller.acquire(provider, 2, false, 2, None, None).await;
         assert!(first.is_ok() && second.is_ok());
         assert!(
-            controller.acquire(provider, 2, None, None).await.is_err(),
+            controller
+                .acquire(provider, 2, false, 2, None, None)
+                .await
+                .is_err(),
             "the third acquire exceeds the global limit of 2"
         );
 
         drop(first);
         assert!(
-            controller.acquire(provider, 2, None, None).await.is_ok(),
+            controller
+                .acquire(provider, 2, false, 2, None, None)
+                .await
+                .is_ok(),
             "a released permit must be reusable"
         );
     }
@@ -1724,15 +1944,23 @@ mod cluster_tests {
         let replica_b = controller(2).with_cluster(coordinator.clone(), ttl);
         let provider = Uuid::now_v7();
 
-        let a1 = replica_a.acquire(provider, 2, None, None).await;
-        let b1 = replica_b.acquire(provider, 2, None, None).await;
+        let a1 = replica_a.acquire(provider, 2, false, 2, None, None).await;
+        let b1 = replica_b.acquire(provider, 2, false, 2, None, None).await;
         assert!(a1.is_ok() && b1.is_ok());
 
         assert!(
-            replica_a.acquire(provider, 2, None, None).await.is_err(),
+            replica_a
+                .acquire(provider, 2, false, 2, None, None)
+                .await
+                .is_err(),
             "without the cluster layer this replica would still have a local slot free"
         );
-        assert!(replica_b.acquire(provider, 2, None, None).await.is_err());
+        assert!(
+            replica_b
+                .acquire(provider, 2, false, 2, None, None)
+                .await
+                .is_err()
+        );
     }
 
     /// The same scenario with **no** coordinator is the documented cost of the
@@ -1744,8 +1972,8 @@ mod cluster_tests {
         let replica_b = controller(1);
         let provider = Uuid::now_v7();
 
-        let a = replica_a.acquire(provider, 1, None, None).await;
-        let b = replica_b.acquire(provider, 1, None, None).await;
+        let a = replica_a.acquire(provider, 1, false, 1, None, None).await;
+        let b = replica_b.acquire(provider, 1, false, 1, None, None).await;
         assert!(
             a.is_ok() && b.is_ok(),
             "this is the per-replica multiplier §0.4b accepts, bounded by the \
@@ -1762,7 +1990,10 @@ mod cluster_tests {
         let provider = Uuid::now_v7();
         let key = format!("moira:permit:provider:{provider}");
 
-        let permit = controller.acquire(provider, 1, None, None).await.unwrap();
+        let permit = controller
+            .acquire(provider, 1, false, 1, None, None)
+            .await
+            .unwrap();
         assert_eq!(coordinator.value(&key), 1);
         drop(permit);
 
@@ -1794,7 +2025,7 @@ mod cluster_tests {
         let provider = Uuid::now_v7();
 
         let held = controller
-            .acquire(provider, 8, None, Some("user-a"))
+            .acquire(provider, 8, false, 8, None, Some("user-a"))
             .await
             .expect("the first acquire fits");
 
@@ -1802,7 +2033,7 @@ mod cluster_tests {
         // global and provider slots have already been taken.
         assert!(
             controller
-                .acquire(provider, 8, None, Some("user-a"))
+                .acquire(provider, 8, false, 8, None, Some("user-a"))
                 .await
                 .is_err()
         );
@@ -1828,7 +2059,7 @@ mod cluster_tests {
             controller(64).with_cluster(FakeCoordinator::failing(), Duration::from_secs(60));
         assert!(
             controller
-                .acquire(Uuid::now_v7(), 64, None, None)
+                .acquire(Uuid::now_v7(), 64, false, 64, None, None)
                 .await
                 .is_err(),
             "an unreachable coordinator must not admit unbounded concurrency"
@@ -1845,7 +2076,7 @@ mod cluster_tests {
         let user = "person@example.com";
 
         let _permit = controller
-            .acquire(Uuid::now_v7(), 4, None, Some(user))
+            .acquire(Uuid::now_v7(), 4, false, 4, None, Some(user))
             .await
             .unwrap();
 

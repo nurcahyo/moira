@@ -7,9 +7,11 @@
 //! the same way Sub-Phase D split [`crate::application::context_planner`] is what lets the two
 //! security-critical decisions here be tested exhaustively with no database and no provider:
 //!
-//! 1. **Consent branching.** [`status_for_consent_mode`] is the *only* place a `consent_mode`
-//!    becomes a [`MemoryStatus`]. There is no second mapping to drift, and `Disabled` returns
-//!    `None` — extraction is refused rather than downgraded.
+//! 1. **Consent branching.** [`effective_extraction_status`] is the *only* exported way a
+//!    consent mode becomes a [`MemoryStatus`], and it takes **both** consent columns because
+//!    there are two (finding F30, and [`MemoryConsentMode::stricter_of`]). The single-column
+//!    mapping behind it is private for that reason. There is no second mapping to drift, and
+//!    `Disabled` returns `None` — extraction is refused rather than downgraded.
 //! 2. **Policy validation.** [`classify_candidate`] is the *only* place a model-proposed
 //!    candidate becomes something writable. A type, a sensitivity or a confidence the policy
 //!    did not allow cannot reach the insert, because the insert takes an [`AcceptedCandidate`]
@@ -455,7 +457,20 @@ fn sensitivity_from_wire(value: &str) -> Option<MemorySensitivity> {
 /// `Candidate` rows are invisible to retrieval — `find_memory_candidates` requires
 /// `status = 'active'` — which is what makes `explicit_only` mean something rather than being a
 /// label on a row that is used anyway.
-pub fn status_for_consent_mode(mode: MemoryConsentMode) -> Option<MemoryStatus> {
+///
+/// # Private, and that is the F30 fix, not tidying
+///
+/// This used to be `pub` and re-exported from `crate::application`. It was therefore the ready-made
+/// way to turn **one** consent column into a decision — and there are two columns
+/// (`MemoryConsentMode::stricter_of`). A helper that answers the question from half the inputs is
+/// the affordance F30 is about: the cheapest way for a fourth reader to get consent wrong was to
+/// call this with whichever column it happened to be holding.
+///
+/// It is now reachable only from inside this module, and only from
+/// [`effective_extraction_status`], which cannot be called without both columns. Getting consent
+/// wrong now requires writing a new mapping by hand, which is a reviewable act rather than an
+/// autocomplete.
+fn status_for_consent_mode(mode: MemoryConsentMode) -> Option<MemoryStatus> {
     match mode {
         MemoryConsentMode::Disabled => None,
         MemoryConsentMode::ExplicitOnly => Some(MemoryStatus::Candidate),
@@ -482,27 +497,41 @@ pub fn status_for_consent_mode(mode: MemoryConsentMode) -> Option<MemoryStatus> 
 /// `plan_context` already applies to `memory_retrieval_enabled`.
 ///
 /// The lattice is `None` (refuse) < `Candidate` < `Active`, and this returns the minimum.
+///
+/// # F30 — the combining rule moved to [`MemoryConsentMode::stricter_of`]
+///
+/// This used to combine two `Option<MemoryStatus>` values here, which meant the "stricter of the
+/// two columns" rule existed only in this function, phrased in a type that had already thrown away
+/// which mode produced it. `memory_behavior` needed the same rule and needed a *mode* back, so it
+/// could not reuse this and reached for the memory column alone instead — in SQL.
+///
+/// The rule now lives on the domain type and this is one of its callers. The behaviour is
+/// unchanged, which is a claim rather than a hope:
+/// `taking_the_stricter_mode_first_is_the_same_decision_as_combining_statuses` asserts the old
+/// expression and the new one agree over all sixteen pairs.
 pub fn effective_extraction_status(
     conversation_mode: MemoryConsentMode,
     memory_mode: MemoryConsentMode,
 ) -> Option<MemoryStatus> {
-    match (
-        status_for_consent_mode(conversation_mode),
-        status_for_consent_mode(memory_mode),
-    ) {
-        // Either side refusing refuses the whole thing.
-        (None, _) | (_, None) => None,
-        // Either side asking for confirmation gets confirmation.
-        (Some(MemoryStatus::Candidate), _) | (_, Some(MemoryStatus::Candidate)) => {
-            Some(MemoryStatus::Candidate)
-        }
-        (Some(left), Some(_)) => Some(left),
-    }
+    status_for_consent_mode(MemoryConsentMode::stricter_of(
+        conversation_mode,
+        memory_mode,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every consent mode. Listed rather than derived, so a new variant is a decision here too;
+    /// the exhaustive `match` in `status_for_consent_mode` is what makes forgetting it a build
+    /// failure rather than a silent gap.
+    const ALL_CONSENT_MODES: [MemoryConsentMode; 4] = [
+        MemoryConsentMode::Disabled,
+        MemoryConsentMode::ExplicitOnly,
+        MemoryConsentMode::ApplicationManaged,
+        MemoryConsentMode::AutomaticWithUserControls,
+    ];
 
     fn permissive_policy() -> ExtractionPolicy {
         ExtractionPolicy {
@@ -571,12 +600,7 @@ mod tests {
         // The exhaustive match is the real guard — this asserts the *shape* of the answer so
         // that a variant mapped to the wrong side of the branch is still caught. Exactly one
         // mode may refuse extraction, and exactly one may produce an unconfirmed row.
-        let modes = [
-            MemoryConsentMode::Disabled,
-            MemoryConsentMode::ExplicitOnly,
-            MemoryConsentMode::ApplicationManaged,
-            MemoryConsentMode::AutomaticWithUserControls,
-        ];
+        let modes = ALL_CONSENT_MODES;
         let refusing = modes
             .iter()
             .filter(|mode| status_for_consent_mode(**mode).is_none())
@@ -673,6 +697,99 @@ mod tests {
                 MemoryConsentMode::ApplicationManaged
             )
         );
+    }
+
+    /// F30 — moving the rule onto `MemoryConsentMode` changed no extraction decision.
+    ///
+    /// The old body combined two `Option<MemoryStatus>` values; the new one takes the stricter
+    /// *mode* first and maps once. Those are only obviously the same if the mode ordering and the
+    /// status lattice agree, and they do not agree everywhere — the two consenting modes are tied
+    /// as modes and equal as statuses. This asserts the two expressions agree over all sixteen
+    /// pairs rather than reasoning that they must.
+    #[test]
+    fn taking_the_stricter_mode_first_is_the_same_decision_as_combining_statuses() {
+        // The expression this function used to be, kept verbatim as the reference.
+        fn combined_statuses(
+            conversation_mode: MemoryConsentMode,
+            memory_mode: MemoryConsentMode,
+        ) -> Option<MemoryStatus> {
+            match (
+                status_for_consent_mode(conversation_mode),
+                status_for_consent_mode(memory_mode),
+            ) {
+                (None, _) | (_, None) => None,
+                (Some(MemoryStatus::Candidate), _) | (_, Some(MemoryStatus::Candidate)) => {
+                    Some(MemoryStatus::Candidate)
+                }
+                (Some(left), Some(_)) => Some(left),
+            }
+        }
+
+        for conversation in ALL_CONSENT_MODES {
+            for memory in ALL_CONSENT_MODES {
+                assert_eq!(
+                    effective_extraction_status(conversation, memory),
+                    combined_statuses(conversation, memory),
+                    "{conversation:?}/{memory:?} changed meaning"
+                );
+            }
+        }
+    }
+
+    /// F30 — the tie between the two consenting modes resolves to the memory policy.
+    ///
+    /// Not a detail: `memory_behavior` reports `stricter_of`'s *mode*, and it has always reported
+    /// the memory policy's value. Resolving the tie the other way would change the reported value
+    /// for deployments where nothing is wrong, so this pins the direction. The extraction decision
+    /// is unaffected either way, which is what `the_combined_consent_decision_is_symmetric`
+    /// already covers.
+    #[test]
+    fn the_two_equally_permissive_modes_tie_toward_the_memory_policy() {
+        use MemoryConsentMode::{ApplicationManaged, AutomaticWithUserControls};
+        assert_eq!(
+            MemoryConsentMode::stricter_of(ApplicationManaged, AutomaticWithUserControls),
+            AutomaticWithUserControls
+        );
+        assert_eq!(
+            MemoryConsentMode::stricter_of(AutomaticWithUserControls, ApplicationManaged),
+            ApplicationManaged
+        );
+    }
+
+    /// F30 — `stricter_of` genuinely takes the stricter one, in both directions.
+    ///
+    /// Enumerated rather than sampled, because the shape F30 describes is two columns that agree
+    /// in every default deployment: a table of same-value pairs proves nothing about a reader that
+    /// consults one column. Every asymmetric pair below has a `disagree` assertion attached — if
+    /// `stricter_of` returned its first argument, or its second, half of these go red.
+    #[test]
+    fn stricter_of_returns_the_more_restrictive_column_whichever_side_it_is_on() {
+        use MemoryConsentMode::{
+            ApplicationManaged, AutomaticWithUserControls, Disabled, ExplicitOnly,
+        };
+        for (stricter, looser) in [
+            (Disabled, ExplicitOnly),
+            (Disabled, ApplicationManaged),
+            (Disabled, AutomaticWithUserControls),
+            (ExplicitOnly, ApplicationManaged),
+            (ExplicitOnly, AutomaticWithUserControls),
+        ] {
+            assert_eq!(
+                MemoryConsentMode::stricter_of(stricter, looser),
+                stricter,
+                "conversation={stricter:?} memory={looser:?}"
+            );
+            assert_eq!(
+                MemoryConsentMode::stricter_of(looser, stricter),
+                stricter,
+                "conversation={looser:?} memory={stricter:?}"
+            );
+        }
+        // A mode is its own stricter self, so two agreeing columns report what they agree on —
+        // the case that has to keep working, and the case that hides the defect.
+        for mode in ALL_CONSENT_MODES {
+            assert_eq!(MemoryConsentMode::stricter_of(mode, mode), mode);
+        }
     }
 
     // ---------------------------------------------------------------------------

@@ -107,6 +107,31 @@ pub const FAILURE_SUMMARY_EMPTY: &str = "summary_empty";
 /// The model returned more than [`MAXIMUM_SUMMARY_BYTES`].
 pub const FAILURE_SUMMARY_TOO_LARGE: &str = "summary_too_large";
 
+/// The marker a reasoning model emits when the **server** does not separate its chain of thought.
+///
+/// Qwen and DeepSeek-R1 both open an inline reasoning block with this literal. Other families
+/// differ, so this recognises one vendor convention and says so rather than pretending to a
+/// general rule — see [`begins_with_inline_reasoning`] for why recognising it is nonetheless
+/// sound while *removing* it is not.
+pub const INLINE_REASONING_OPEN_TAG: &str = "<think>";
+
+/// Whether a reply **opens with** an inline chain-of-thought block — finding F57.
+///
+/// # This is an anchored check, and the anchor is the whole point
+///
+/// It asks one question: is [`INLINE_REASONING_OPEN_TAG`] the first thing in the reply? It does
+/// **not** search, does not look for a terminator, and nothing downstream removes anything. That
+/// restraint was chosen against a measurement rather than on taste; see [`parse_summary`]'s
+/// "Why the block is reported and not removed".
+///
+/// A prose summary that legitimately *begins* with the literal `<think>` is not a case worth
+/// trading precision for: the instruction asks for plain prose, and a summary discussing the tag
+/// mentions it mid-sentence, where this check cannot see it. That asymmetry — detection anchored
+/// at offset 0, discussion anywhere else — is what makes the signal safe to act on.
+fn begins_with_inline_reasoning(text: &str) -> bool {
+    text.starts_with(INLINE_REASONING_OPEN_TAG)
+}
+
 /// Exactly the policy fields summarization reads.
 ///
 /// A narrow struct rather than the whole `ConversationPolicyRecord`, so the unit tests state
@@ -262,6 +287,12 @@ pub fn summarization_messages(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedSummary {
     pub text: String,
+    /// The reply opened with an inline chain-of-thought block — finding F57.
+    ///
+    /// An observation about `text`, never a modification of it: `text` is byte-identical whether
+    /// this is `true` or `false`. It exists so the caller can announce the condition, which is
+    /// the only thing that is decidable here.
+    pub inline_reasoning: bool,
 }
 
 /// Validates the model's reply into a storable summary.
@@ -301,6 +332,50 @@ pub struct ValidatedSummary {
 /// table (or an equivalent per-conversation failure marker) that can bound the retry — at that
 /// point a rejected summary can be recorded and backed off, and the loop above stops being the
 /// cost of refusing.
+///
+/// # Why the inline reasoning block is reported and not removed — finding F57
+///
+/// A reasoning model served by a backend that does not separate its chain of thought returns the
+/// block inline, as ordinary `Text`. Moira has already decided reasoning is not output —
+/// `text_from_choice` drops `AssistantContent::Reasoning` and the streaming path filters
+/// `ReasoningDelta` — but neither can act on a block the server never separated. Summarization is
+/// the exposed path because it sends no `output_schema`, so guided decoding does not suppress it
+/// the way it does for extraction.
+///
+/// [`begins_with_inline_reasoning`] therefore *reports* the condition and this function stores the
+/// reply unchanged. **Removing the block was rejected on a measurement, not on principle**, taken
+/// against the deployment's own vLLM (`Qwen/Qwen3-4B`, temperature 0, this module's real prompt):
+///
+/// * **The terminator is not identifiable.** A transcript that merely *discusses* reasoning tags —
+///   a support conversation about this very defect — produced one `<think>` and **ten** `</think>`,
+///   because the model quoted the tag while reasoning and again in the summary. The real
+///   terminator was the fifth: cutting at the first left 985 bytes of chain-of-thought in the
+///   stored summary, and cutting at the last destroyed 2 173 bytes of the actual summary. Neither
+///   failure is visible to anything downstream.
+/// * **The worst case has no terminator at all.** A reply truncated by `max_tokens`
+///   (`finish_reason: length`) is an *unterminated* block — 100 % reasoning, 0 % summary. A rule
+///   that only strips a well-formed block leaves exactly that case untouched, so the heuristic is
+///   absent precisely where the damage is total.
+///
+/// Detection had the opposite result over the same five replies: anchored at offset 0 it was
+/// correct on all five, including the truncated one and the clean control. **The condition is
+/// decidable; the extent of it is not.** That split is the entire decision, and it is why this
+/// stores a `bool` rather than a shorter string.
+///
+/// Refusing instead was rejected by the retry loop documented two sections above: a refused
+/// summary does not advance `covers_through_sequence`, and unlike a pasted `bearer ` this
+/// condition is a **permanent** property of the deployment's model, so every subsequent turn would
+/// re-trigger a provider call forever.
+///
+/// The operator-side fix is real and cheap, which is why announcing is worth more than guessing:
+/// starting vLLM with `--reasoning-parser` makes the server populate its own `reasoning` field —
+/// measured `null` on this backend while `content` carried the block — at which point Moira's
+/// existing `Reasoning` drop does the job with no heuristic anywhere.
+///
+/// **Reversal condition:** remove the block rather than report it only if a *non-positional*
+/// separation becomes available — the provider separating it, or a declared response contract that
+/// makes the boundary explicit. A better search over the prose is not that, and the ten-terminator
+/// measurement above is the case any proposed search must be run against first.
 pub fn parse_summary(raw: &str) -> Result<ValidatedSummary, &'static str> {
     let text = strip_code_fence(raw.trim()).trim();
     if text.is_empty() {
@@ -310,6 +385,7 @@ pub fn parse_summary(raw: &str) -> Result<ValidatedSummary, &'static str> {
         return Err(FAILURE_SUMMARY_TOO_LARGE);
     }
     Ok(ValidatedSummary {
+        inline_reasoning: begins_with_inline_reasoning(text),
         text: text.to_string(),
     })
 }
@@ -537,6 +613,97 @@ mod tests {
                 .text,
             "The user prefers dark mode."
         );
+    }
+
+    /// The reply a reasoning model actually sends is flagged, and **not one byte is removed**.
+    ///
+    /// # The two assertions are the decision, not a description of it
+    ///
+    /// F57's whole argument is that the condition is decidable and its extent is not, so the flag
+    /// and the byte-identity have to be asserted *together*. `text` is compared against the full
+    /// input rather than against a prefix of it: the cheapest way to "improve" this later is to
+    /// start cutting at a terminator, and every such edit reds here.
+    ///
+    /// The body is the shape measured off `Qwen/Qwen3-4B` — an opening `<think>`, prose, a close,
+    /// then the real summary.
+    #[test]
+    fn a_reply_opening_with_a_reasoning_block_is_flagged_and_stored_whole() {
+        let raw = "<think>\nOkay, the user wants a summary. Let me work through the transcript.\n\
+                   </think>\n\nThe user agreed to ship the invoicing rewrite in March.";
+        let parsed = parse_summary(raw).expect("accepted");
+        assert!(parsed.inline_reasoning, "{parsed:?}");
+        assert_eq!(
+            parsed.text, raw,
+            "the reply must be stored byte-identically; F57 reports, it never removes"
+        );
+    }
+
+    /// A reply truncated **inside** the reasoning block is still flagged.
+    ///
+    /// Measured on the live backend at `max_tokens: 120`: `finish_reason: length`, an opening
+    /// `<think>` and **zero** closing tags — 100 % chain-of-thought, 0 % summary. This is the case
+    /// a "strip a well-formed block" rule cannot touch at all, which is half of why there is no
+    /// such rule. An anchored check does not care that the block never ends.
+    #[test]
+    fn an_unterminated_reasoning_block_is_flagged_too() {
+        let raw = "<think>\nOkay, let me start by understanding what the user is asking for. \
+                   They said they need the invoicing rewrite before the March board";
+        let parsed = parse_summary(raw).expect("accepted");
+        assert!(parsed.inline_reasoning, "{parsed:?}");
+        assert_eq!(parsed.text, raw);
+    }
+
+    /// A summary that **discusses** reasoning tags is not flagged — the discrimination guard.
+    ///
+    /// # The cheapest edit this exists to red
+    ///
+    /// Spelling the check `contains` instead of `starts_with`. That edit is invisible in review,
+    /// leaves every other case in this module green, and turns an operator-facing signal into one
+    /// that fires on any conversation about reasoning models — the population most likely to be
+    /// *running* one, so the false positives would land exactly where the true positives do.
+    ///
+    /// The body is not hypothetical: it is the shape the live model returned when the transcript
+    /// itself discussed `<think>`. That reply carried **ten** `</think>` occurrences, which is the
+    /// measurement that removed stripping from the table.
+    #[test]
+    fn a_summary_that_merely_discusses_reasoning_tags_is_not_flagged() {
+        let raw = "The user is debugging why their deployment leaks its scratchpad: the raw \
+                   reply opens with <think> and closes with </think> before the answer. They \
+                   asked for both markers, <think> and </think>, to be recorded verbatim on the \
+                   ticket.";
+        let parsed = parse_summary(raw).expect("accepted");
+        assert!(
+            !parsed.inline_reasoning,
+            "a summary mentioning the tag mid-sentence is content, not a reasoning block: \
+             {parsed:?}"
+        );
+        assert_eq!(parsed.text, raw);
+    }
+
+    /// The control: an ordinary summary is not flagged.
+    ///
+    /// Without it, `inline_reasoning: true` unconditionally would satisfy both positive cases
+    /// above. HANDOFF §3.4's F45 lesson — the only thing that caught the cheapest edit there was a
+    /// control asserting the ordinary spelling still works.
+    #[test]
+    fn an_ordinary_summary_carries_no_reasoning_flag() {
+        let parsed = parse_summary("The user agreed to ship the invoicing rewrite in March.")
+            .expect("accepted");
+        assert!(!parsed.inline_reasoning, "{parsed:?}");
+    }
+
+    /// The flag is read **after** the fence strip, not before it.
+    ///
+    /// A model that both fences its reply and reasons inline puts the fence first, so a check run
+    /// against the raw string would see ```` ``` ```` and miss the block entirely. This pins the
+    /// ordering inside `parse_summary`, which is otherwise a one-line detail nothing would notice.
+    #[test]
+    fn a_fenced_reasoning_block_is_flagged_after_the_fence_is_removed() {
+        let parsed =
+            parse_summary("```\n<think>\nWorking through it.\n</think>\n\nThe summary.\n```")
+                .expect("accepted");
+        assert!(parsed.inline_reasoning, "{parsed:?}");
+        assert!(parsed.text.starts_with("<think>"), "{parsed:?}");
     }
 
     #[test]

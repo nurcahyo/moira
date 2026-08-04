@@ -50,6 +50,19 @@ const ASSISTANT_REPLY: &str = "Noted — March it is.";
 const SUMMARY_BODY: &str = "The user and assistant agreed to ship the invoicing rewrite in March.";
 const SECOND_SUMMARY_BODY: &str = "March ship date confirmed; scope now includes refunds.";
 
+/// A summarization reply in the shape a reasoning model actually returns — finding F57.
+///
+/// Not invented. This is the structure measured off the deployment's own vLLM
+/// (`Qwen/Qwen3-4B`, temperature 0, this module's real prompt): an inline `<think>` block, the
+/// summary after it, and — critically — a `</think>` occurrence **inside the summary body** as
+/// well as the real terminator. The live reply carried ten of them. It is reproduced here because
+/// it is the input any future "just strip the block" proposal has to be run against.
+const REASONING_SUMMARY_BODY: &str = "<think>\nOkay, the user wants a summary. The key points \
+    are the March deadline and the refund double-counting. I should mention </think> handling if \
+    it comes up. Keep it plain prose.\n</think>\n\nThe user and assistant agreed to ship the \
+    invoicing rewrite in March, and noted that replies wrapped in </think> markers were part of \
+    the diagnostic thread.";
+
 /// The scopes the manual summarize endpoint needs, plus what a turn needs.
 const SUMMARIZE_SCOPES: &[&str] = &[
     "moira:responses:create",
@@ -278,6 +291,29 @@ impl Case {
         body.lines()
             .filter(|line| line.starts_with("moira_summarization_runs_total{"))
             .filter(|line| line.contains(&needle))
+            .filter_map(|line| line.rsplit(' ').next())
+            .filter_map(|value| value.parse::<f64>().ok())
+            .next()
+            .unwrap_or(0.0)
+    }
+
+    /// The value of the label-free `moira_summarization_inline_reasoning_total` series — F57.
+    ///
+    /// Same "absent reads as zero" caveat as [`Self::summarization_runs`], and the same reason it
+    /// is safe: the family is zero-seeded at registry construction, so an absent series is a
+    /// seeding regression owned by `the_new_families_are_seeded_at_zero_before_any_observation`.
+    async fn summarization_inline_reasoning(&self) -> f64 {
+        let body = self
+            .client
+            .get(format!("{}/metrics", self.moira.base_url))
+            .send()
+            .await
+            .expect("scrape /metrics")
+            .text()
+            .await
+            .expect("read /metrics body");
+        body.lines()
+            .filter(|line| line.starts_with("moira_summarization_inline_reasoning_total{"))
             .filter_map(|line| line.rsplit(' ').next())
             .filter_map(|value| value.parse::<f64>().ok())
             .next()
@@ -1151,6 +1187,146 @@ async fn a_successful_automatic_summarization_counts_as_succeeded() {
         case.summarization_runs("failed").await,
         0.0,
         "nothing failed, so the failed series must still read zero"
+    );
+
+    case.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Finding F57 — a reasoning model's chain of thought is announced, never removed.
+// ---------------------------------------------------------------------------
+
+/// A reply carrying an inline reasoning block is **stored whole** and **announced**.
+///
+/// # Why both halves, and why the byte-identity is the load-bearing one
+///
+/// F57's decision is that the condition is decidable and its extent is not, so the fix announces
+/// and changes nothing. Two facts make that a shipped decision rather than a comment:
+///
+/// 1. `summary_text_plain` equals the model's reply **byte for byte**, including the `</think>`
+///    that appears inside the summary sentence. That second occurrence is the whole reason
+///    stripping was rejected: the live model emitted ten of them, and the real terminator was
+///    neither the first nor the last. Any edit that starts cutting at a terminator reds here, and
+///    a `rindex`-based one reds hardest — it would leave four words.
+/// 2. The operator is told, on the counter *and* on the durable audit row.
+///
+/// # Why it also asserts the run counted as *succeeded*
+///
+/// The neighbouring pair of cases pins that the run counter carries the real outcome. This case
+/// pins that F57 did not quietly become an outcome: the run wrote a row, so it is a success with
+/// a property, and the cheapest wrong fix — refusing the reply — moves it to `failed` and reds
+/// here rather than passing as "now it is reported".
+#[tokio::test]
+async fn an_inline_reasoning_block_is_announced_and_the_summary_is_stored_verbatim() {
+    let Some(case) = Case::enabled(vec![
+        completion(ASSISTANT_REPLY),
+        completion(REASONING_SUMMARY_BODY),
+    ])
+    .await
+    else {
+        return;
+    };
+
+    let (status, body) = case.respond(USER_TURN).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let summaries = case.summaries().await;
+    assert_eq!(
+        summaries.len(),
+        1,
+        "the fixture must summarise: {summaries:?}"
+    );
+    assert_eq!(
+        summaries[0].summary_text_plain.as_deref(),
+        Some(REASONING_SUMMARY_BODY),
+        "the reply must be stored byte-identically; F57 reports, it never removes"
+    );
+
+    assert_eq!(
+        case.summarization_inline_reasoning().await,
+        1.0,
+        "an inline reasoning block must reach its own counter"
+    );
+    assert_eq!(
+        case.summarization_runs("succeeded").await,
+        1.0,
+        "the run produced a row, so it is still a success — F57 is a property, not an outcome"
+    );
+    assert_eq!(
+        case.summarization_runs("failed").await,
+        0.0,
+        "F57 must not turn a stored summary into a failure"
+    );
+
+    // The durable half. `conversation.summary.created` is the row an operator queries per
+    // conversation, and until F55 lands it is the only per-conversation record summarization has.
+    let audit = case.audit_rows().await;
+    let created = audit
+        .iter()
+        .find(|(action, _)| action == "conversation.summary.created")
+        .expect("a conversation.summary.created audit row");
+    assert_eq!(
+        created.1["inline_reasoning"],
+        Value::Bool(true),
+        "the audit row must record the condition: {created:?}"
+    );
+
+    // …and it must record the condition without recording the block. Scoped to this row and to a
+    // marker unique to the reply: `no_summary_or_transcript_text_reaches_the_audit_log` already
+    // owns the general property, so restating it here would be a duplicate — what is new is that
+    // F57's field is a `bool` and did not become a place to put a sample of the text.
+    let serialised = serde_json::to_string(&created.1).expect("serialise audit metadata");
+    assert!(
+        !serialised.contains("<think>") && !serialised.contains("refund double-counting"),
+        "the reasoning block must not be sampled into the audit row: {serialised}"
+    );
+
+    case.shutdown().await;
+}
+
+/// The control: an ordinary summary leaves the counter and the audit flag alone.
+///
+/// # The cheapest edit this exists to red, and it is not hypothetical
+///
+/// Spelling the detector `contains` rather than `starts_with`. `SUMMARY_BODY` does not mention a
+/// reasoning tag, so this case alone would not catch that — what it catches is the coarser and
+/// likelier edit of announcing unconditionally, which satisfies the case above completely. Without
+/// a control, "always true" is a passing implementation of the whole feature.
+///
+/// The `contains`-versus-`starts_with` edit is red-ed by
+/// `a_summary_that_merely_discusses_reasoning_tags_is_not_flagged` in
+/// `src/application/summarization.rs`, which is the layer that can state that input in one line.
+/// Both edits are covered; neither case covers both.
+#[tokio::test]
+async fn an_ordinary_summary_announces_nothing() {
+    let Some(case) =
+        Case::enabled(vec![completion(ASSISTANT_REPLY), completion(SUMMARY_BODY)]).await
+    else {
+        return;
+    };
+
+    let (status, body) = case.respond(USER_TURN).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        case.summaries().await.len(),
+        1,
+        "the fixture must summarise"
+    );
+
+    assert_eq!(
+        case.summarization_inline_reasoning().await,
+        0.0,
+        "an ordinary summary must not be announced as carrying reasoning"
+    );
+    let audit = case.audit_rows().await;
+    let created = audit
+        .iter()
+        .find(|(action, _)| action == "conversation.summary.created")
+        .expect("a conversation.summary.created audit row");
+    assert_eq!(
+        created.1["inline_reasoning"],
+        Value::Bool(false),
+        "the flag must be present and false, not absent: {created:?}"
     );
 
     case.shutdown().await;

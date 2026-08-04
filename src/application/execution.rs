@@ -10,7 +10,7 @@ use tokio::{
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::Instrument;
+use tracing::{Instrument, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -189,7 +189,14 @@ impl MoiraExecutionService {
         .await?;
 
         let agent_profile = match route.agent_profile_id {
-            Some(id) => self.runtime_repo.get_active_agent_profile(id).await?,
+            Some(id) => {
+                let resolved = self.runtime_repo.get_active_agent_profile(id).await?;
+                if resolved.is_none() {
+                    self.announce_dangling_agent_profile(&command, &route, id, events)
+                        .await?;
+                }
+                resolved
+            }
             None => None,
         };
 
@@ -408,7 +415,7 @@ impl MoiraExecutionService {
                 let permits = match self
                     .state
                     .concurrency
-                    .acquire_scoped(
+                    .acquire(
                         candidate.provider_id,
                         candidate.runtime_policy.max_concurrent_requests.max(1) as usize,
                         command.options.stream,
@@ -600,6 +607,24 @@ impl MoiraExecutionService {
                             Ok(result) => result?,
                             Err(_) => {
                                 let failure = terminal_persistence_deadline_failure();
+                                // **What "committed" means here, and why it is read rather
+                                // than asserted (finding F38).**
+                                //
+                                // `EventCollector::output_committed` is this module's own
+                                // definition of the word: it flips on the first chunk that is
+                                // *accepted by the consumer*, so it is `true` on a streamed
+                                // answer the caller has already seen and `false` on every
+                                // non-streaming execution, where the caller receives nothing
+                                // but the outcome. It says nothing about the database — the
+                                // three terminal writes are precisely what timed out.
+                                //
+                                // This used to be the literal `true` in both the audit entry
+                                // and the `ExecutionFailed` event, which was wrong in both
+                                // available senses on the non-streaming path: nothing had
+                                // reached the caller, and the write group had not completed.
+                                // The `tracing` line below always said "may", and it was the
+                                // honest one.
+                                let delivered_to_caller = events.output_committed();
                                 tracing::error!(
                                     request_id = %command.request_id,
                                     execution_id = %command.execution_id,
@@ -607,6 +632,7 @@ impl MoiraExecutionService {
                                     provider_id = %candidate.provider_id,
                                     provider_model_id = %candidate.provider_model_id,
                                     latency_ms,
+                                    delivered_to_caller,
                                     "terminal persistence exceeded the execution deadline after a successful provider call; output may already be committed"
                                 );
                                 // The database is by definition slow at this point, so the
@@ -623,7 +649,8 @@ impl MoiraExecutionService {
                                         "provider_model_id": candidate.provider_model_id,
                                         "latency_ms": latency_ms,
                                         "failure_class": failure.class,
-                                        "output_committed": true
+                                        "output_committed": delivered_to_caller,
+                                        "terminal_state_persisted": false
                                     }),
                                 );
                                 match tokio::time::timeout(TERMINAL_PERSISTENCE_AUDIT_BUDGET, audit)
@@ -652,44 +679,87 @@ impl MoiraExecutionService {
                                     json!({
                                         "failure_class": failure.class,
                                         "phase": "terminal_persistence",
-                                        "output_committed": true
+                                        "output_committed": delivered_to_caller,
+                                        "terminal_state_persisted": false
                                     }),
                                 );
-                                // **`output` is live here, and `failed_outcome` discards it.**
+                                // **Finding F38 — the outcome keeps what the provider produced.**
                                 //
-                                // This is the one `failed_outcome` call site reached from
-                                // `Ok(Ok(output))`, so the outcome it builds drops three values
-                                // that are in hand and already reported elsewhere:
-                                // `output.text` (the client has received every delta of it on
-                                // the streaming path), `output.structured_output` (finding F29,
-                                // populated since this commit), and `output.usage` — which the
-                                // `attempt_summary` two statements above records in full while
-                                // the outcome carries `UsageSummary::default()`. That asymmetry
-                                // is finding **F38**, a billing and reporting divergence, and
-                                // both audit metadata and the `ExecutionFailed` event assert
-                                // `"output_committed": true` right beside it.
+                                // This is the one arm reached from `Ok(Ok(output))` that does
+                                // not return `Succeeded`, and it used to call `failed_outcome`,
+                                // which hardcodes `output_text: None`, `structured_output: None`
+                                // and `usage: UsageSummary::default()`. Three values that were
+                                // live in `output` were dropped, while the `attempt_summary`
+                                // pushed a few statements above recorded the usage in full. The
+                                // outcome and its own `attempts` array contradicted each other
+                                // inside a single serialised document; that asymmetry was the
+                                // whole finding.
                                 //
-                                // **Deliberately not fixed here, and F38 stays open.** The
-                                // condition this arm reports is that terminal persistence did
-                                // *not* complete: `update_attempt`, `insert_usage_record` and
-                                // `touch_credential_used` may each have failed to commit. So
-                                // promoting the usage onto the outcome would assert a billing
-                                // fact whose row may be absent, and promoting `output_text` onto
-                                // a non-`Succeeded` status changes what every consumer of a
-                                // failed execution receives. Deciding which of the two levels is
-                                // authoritative is F38's own change, with its own tests; making
-                                // it a side effect of F29 would bury a billing decision inside a
-                                // parsing one.
+                                // **Decision: report the provider's result, keep the failure.**
+                                // `status` stays `Failed` and the retry/fallback clamp is
+                                // untouched — terminal state genuinely did not persist and this
+                                // execution must never be re-run. But `output_text`,
+                                // `structured_output` and `usage` are facts about a provider
+                                // call that *succeeded*, and discarding them made the failure
+                                // report less true, not safer:
                                 //
-                                // What this comment buys: the drop is no longer silent. It was
-                                // inert only while `structured_output` was universally `None`.
-                                return Ok(failed_outcome(
-                                    command,
-                                    Some(route),
-                                    Some(model),
+                                // - `UsageSummary::default()` is all-`None`, i.e. "unknown",
+                                //   not "zero". Retaining the real counts replaces an absence
+                                //   of information with information; it does not overwrite a
+                                //   deliberate claim that nothing was spent.
+                                // - `terminal_update_from_outcome` in `application/public.rs`
+                                //   runs on the `Failed` branch too and copies `usage`,
+                                //   `output_text.len()` and the output hash straight onto the
+                                //   `responses` row. Dropping them wrote "no tokens, zero
+                                //   bytes, no hash" for a request the provider answered and
+                                //   will invoice. Retaining them makes that row faithful, and
+                                //   makes `responses.usage` populated while `usage_records` has
+                                //   no row the detectable signature of exactly this condition —
+                                //   which is otherwise invisible.
+                                // - On the streaming path the caller has already received every
+                                //   delta. An outcome reporting no output described something
+                                //   the caller could see had not happened.
+                                //
+                                // **What this deliberately does not do.** No `usage_records`
+                                // row is written, so nothing is double-counted; billing that
+                                // reads `usage_records` still under-counts this execution, and
+                                // that under-count is now *detectable* rather than silent.
+                                //
+                                // **Reversal condition.** Zero the usage again the day
+                                // `ExecutionOutcome.usage` (or `responses.usage`) becomes an
+                                // input to customer invoicing rather than a reporting surface.
+                                // Today its only readers are `terminal_update_from_outcome` and
+                                // the runtime diagnostic endpoint, both reporting; invoicing
+                                // reads `usage_records`. Once a billing job sums the response
+                                // rows, a `Failed` response carrying usage would charge a
+                                // caller who received an HTTP error, and the deployment must
+                                // then decide explicitly whether this arm is chargeable instead
+                                // of inheriting the answer from a struct literal.
+                                //
+                                // **Second reversal condition, for the text.** Two consumers —
+                                // `ConversationService::run_extraction` and
+                                // `summarize_conversation` — infer "the model answered" from
+                                // `output_text`/`structured_output` being `Some`, never from
+                                // `status`. Retaining the text therefore lets both proceed on a
+                                // reply that is genuinely present, which is the correct answer
+                                // to the question they are asking. If a *delivery* path (rather
+                                // than an interpretation path) ever starts treating
+                                // `output_text.is_some()` as "show this to the end user" without
+                                // checking `status`, this arm must stop carrying text and the
+                                // two inference sites must read `status` instead — which is also
+                                // the third precondition of F29's own reversal condition.
+                                return Ok(ExecutionOutcome {
+                                    request_id: command.request_id,
+                                    execution_id: command.execution_id,
+                                    status: execution_status_for_failure(failure.class),
+                                    output_text: Some(output.text),
+                                    structured_output: output.structured_output,
+                                    usage: output.usage,
+                                    route: Some(route),
+                                    model: Some(model),
                                     attempts,
-                                    failure,
-                                ));
+                                    failure: Some(failure),
+                                });
                             }
                         }
                         self.state
@@ -1154,6 +1224,79 @@ impl MoiraExecutionService {
             .await
     }
 
+    /// F50 — the route names an agent profile that no longer resolves.
+    ///
+    /// # What this does and, just as deliberately, what it does not
+    ///
+    /// `get_active_agent_profile` filters `status = 'active' and deleted_at is null`.
+    /// Disabling a profile or soft-deleting it leaves `route_definitions.agent_profile_id`
+    /// pointing at the row — the FK is `on delete set null` and `soft_delete_agent_profile`
+    /// only writes `status = 'deleted', deleted_at = now()`, never a `DELETE` — so the
+    /// lookup returns `Ok(None)` and the caller's request proceeds without the profile's
+    /// `preamble`, `temperature` and `max_tokens`, reporting `succeeded`. A preamble is
+    /// where guardrails live, so the failure mode is an unguarded model answering
+    /// production traffic.
+    ///
+    /// Until this function existed there was **no failure, no `warn!`, no runtime event and
+    /// no audit row** — the agent profile was the only runtime reference on this path whose
+    /// disappearance was silent, where an unresolvable *route* is a `RouteNotFound` failure.
+    ///
+    /// **The request's behaviour is unchanged.** Whether Moira should also *refuse* is a
+    /// product decision that has not been taken: fail-closed is safer but breaks any
+    /// deployment that disables a profile expecting its routes to keep serving, and
+    /// observable fail-open still serves the unguarded request. Silence, however, is a
+    /// defect under *either* answer — both require the operator to be told, and they differ
+    /// only in whether the request is also refused. So the observability is not half of one
+    /// option; it is the part both options share, and it ships first.
+    ///
+    /// *Reversal condition:* when that decision is taken this becomes "observe and refuse"
+    /// or stays as it is. The observability itself is not revisited.
+    ///
+    /// # It cannot fire for a route that has no profile
+    ///
+    /// Called only from the `Some(id)` arm above, so "this route was never given a profile"
+    /// — the normal case, and the one every fixture in the tree exercises — stays exactly as
+    /// silent as it was. The two are distinguishable because `route.agent_profile_id` is the
+    /// thing that differs, and it is read before the lookup rather than inferred from it.
+    ///
+    /// # Three signals, because they have three different consumers
+    ///
+    /// The `warn!` reaches whoever is tailing logs. The runtime event is structured, carries
+    /// the ids, and is returned verbatim by `POST /api/v1/admin/runtime/diagnose` — it is
+    /// deliberately *not* mapped onto the public SSE contract, see `map_runtime_event`. The
+    /// audit row is the durable one: it survives log rotation and is queryable by
+    /// `resource_id = execution_id` alongside `execution.started`.
+    async fn announce_dangling_agent_profile(
+        &self,
+        command: &ExecutionCommand,
+        route: &RouteDecision,
+        agent_profile_id: Uuid,
+        events: &mut EventCollector,
+    ) -> Result<(), AppError> {
+        warn!(
+            execution_id = %command.execution_id,
+            request_id = %command.request_id,
+            route_id = %route.route_id,
+            route_key = %route.route_key,
+            %agent_profile_id,
+            "route references an agent profile that is disabled or deleted; the execution \
+             proceeds without its preamble, temperature and max_tokens"
+        );
+        let detail = json!({
+            "agent_profile_id": agent_profile_id,
+            "route_id": route.route_id,
+            "route_key": route.route_key,
+        });
+        events.push(RuntimeEventType::AgentProfileUnavailable, detail.clone());
+        self.audit_runtime_event(
+            command,
+            "agent_profile.unavailable",
+            AuditResult::Failed,
+            detail,
+        )
+        .await
+    }
+
     async fn audit_runtime_event(
         &self,
         command: &ExecutionCommand,
@@ -1441,7 +1584,11 @@ impl ModelRouter for DefaultModelRouter<'_> {
                 && command
                     .model_hint
                     .is_none_or(|model_id| candidate.provider_model_id == model_id)
-                && capabilities_match(&candidate.capabilities, &policy.required_capabilities)
+                && capabilities_match(
+                    candidate.provider_type,
+                    &candidate.capabilities,
+                    &policy.required_capabilities,
+                )
         });
         if candidates.is_empty() {
             return Err(ExecutionFailure::new(
@@ -1662,24 +1809,59 @@ impl EventCollector {
 ///
 /// # Why a non-conforming reply is `None` rather than `StructuredOutputInvalid`
 ///
-/// Three reasons, each verified against the tree rather than assumed:
+/// Three reasons, each verified against the tree rather than assumed. **All three have since
+/// been discharged** — see "the reversal condition now holds" below. They are kept because they
+/// are the argument the flip has to answer, not a changelog.
 ///
-/// 1. `StructuredOutputInvalid` is in **neither** `is_retryable` nor `is_fallback_eligible` nor
-///    `is_circuit_failure`, so one non-conforming reply would end the execution with no retry
-///    and no fallback.
+/// 1. `StructuredOutputInvalid` was in **neither** `is_retryable` nor `is_fallback_eligible` nor
+///    `is_circuit_failure` — by omission, with nothing recording whether that was a decision — so
+///    one non-conforming reply would end the execution with no retry and no fallback.
 /// 2. On DeepSeek the schema never reaches the wire — Rig's `SUPPORTS_RESPONSE_FORMAT = false`
 ///    drops it — so *every* structured request on that route would hard-fail where it previously
 ///    returned 200. Failing loudly is the right end state; it must follow the capability fix
 ///    (finding F39), not precede it.
-/// 3. `ConversationService::run_extraction` detects failure by `output_text` being `None` and
-///    never inspects `execution.status`, so a hard failure would reclassify an unparseable
+/// 3. `ConversationService::run_extraction` detected failure by `output_text` being `None` and
+///    never inspected `execution.status`, so a hard failure would reclassify an unparseable
 ///    extraction reply from `structured_output_invalid` to `extraction_call_failed` — losing the
-///    only signal that distinguishes "the model did not comply" from "the call did not happen".
+///    signal that distinguishes "the model did not comply" from "the call did not happen".
 ///
-/// **Reversal condition:** adopt the fail-hard variant once F39 has landed *and*
-/// `StructuredOutputInvalid` has been given a retry/fallback disposition *and* `run_extraction`
-/// reads `execution.status`. Until all three hold, failing here trades a silent `None` for a
-/// loud outage on a provider that was never going to comply.
+/// # The reversal condition now holds, and the flip is still not taken here
+///
+/// All three preconditions are discharged:
+///
+/// 1. **Done.** The absence is now a recorded disposition rather than an omission:
+///    `is_retryable`, `is_fallback_eligible` and `is_circuit_failure` in
+///    `src/orchestration/controls.rs` each carry the reason `StructuredOutputInvalid` is excluded,
+///    and `every_failure_class_has_a_recorded_retry_fallback_and_circuit_disposition` fails on a
+///    change in either direction. The disposition is *stay out of all three*, and the load-bearing
+///    reason is that a class carries exactly one disposition while this class has two emitters —
+///    a caller's unusable schema and (under the flip) a model's non-conforming reply. Admitting it
+///    to `is_fallback_eligible` would let one 2 MB schema walk the whole fallback chain.
+/// 2. **Done.** F39 landed. A model that cannot carry a schema is no longer routed a
+///    schema-carrying request, so the failure the flip introduces is a model declining to comply,
+///    not a provider structurally unable to.
+/// 3. **Done.** `run_extraction` reads `execution.status` and labels the run row with the
+///    execution's own failure class (`extraction_failure_class` in
+///    `src/application/conversation.rs`). A non-conforming reply is recorded as
+///    `structured_output_invalid` **before and after** the flip: today `parse_candidates` writes
+///    it by refusing prose, afterwards the execution writes it. The signal reason 3 was protecting
+///    survives the flip rather than being traded for it.
+///
+/// **The flip is deliberately a separate change.** Landing the preconditions and flipping the
+/// behaviour together would bury a blast-radius decision inside enabling work: the flip turns a
+/// silent `None` into a terminal 422 for every caller whose model returns prose, on a class that
+/// by design neither retries nor falls back. What it needs is its own diff, its own tests, and its
+/// own review of that consequence.
+///
+/// **What the flip must still do**, none of which is done here:
+/// - Widen the `moira.error.structured_output_invalid` catalog description, which currently states
+///   as fact that the class is never raised for a model's reply, and update
+///   `structured_output_invalid_has_only_the_two_emitters_its_catalog_entry_describes`
+///   (`src/i18n/catalog/mod.rs`), which pins the emitter count at two and *will* go red — that red
+///   is the interlock working, not a broken test.
+/// - Re-read the disposition above with three emitters in view rather than two.
+/// - Replace `a_reply_that_is_not_json_leaves_the_field_null_and_still_succeeds` and its streaming
+///   twin in `tests/structured_output.rs`, which pin the current behaviour on both run paths.
 ///
 /// # Strict, and deliberately not a scavenger
 ///
@@ -1734,6 +1916,31 @@ fn record_first_token(recorded: &mut bool, stream_metrics: &StreamMetricsContext
     );
 }
 
+/// The **only** place a `RuntimeItemStream` is drained into runtime events.
+///
+/// F44 — there used to be a second one, `RuntimeModelHandle::stream` in
+/// `src/orchestration/runtime_factory.rs`: ~66 lines that drove `start_stream` through the same
+/// `RuntimeStreamItem` match and produced a `RuntimeStreamOutput { text, usage,
+/// provider_request_id, events }`. It had **zero callers** — `.stream(` occurred exactly once in
+/// the whole tree and that occurrence was Rig's own `CompletionModel::stream` inside
+/// `start_stream_with_model` — and it was kept compiling only by the re-export in
+/// `src/orchestration/mod.rs`. It is deleted, along with `RuntimeStreamOutput`,
+/// `RuntimeEventSeed` and `next_event`, which existed only to serve it.
+///
+/// The hazard was divergence, not the dead lines: this loop has since grown idle timeouts,
+/// backpressure, cancellation, TTFT metrics and `mark_output_committed`, and the duplicate had
+/// none of them. Anyone fixing streaming had a coin-flip chance of fixing the wrong one.
+///
+/// Deleting it also restored the module boundary. That cluster was the sole reason
+/// `runtime_factory.rs` imported `RuntimeEventEnvelope`, `RuntimeEventType` and `serde_json::json`
+/// at all; with it gone, the file compiles without the runtime-event vocabulary, which is what
+/// `moira-rig-integration` says the Rig seam should look like — Rig primitives there, runtime
+/// events here.
+///
+/// **Nothing mechanical prevents a second drain loop being written again.** `dead_code` cannot
+/// see it: the items were `pub` in a library crate, and `pub` items are exempt from that lint
+/// regardless of whether anything calls them, which is exactly how ~95 lines survived. Saying so
+/// is more useful than a brittle source-scan pretending otherwise.
 async fn execute_rig_stream(
     handle: Arc<RuntimeModelHandle>,
     request: CompletionRequest,
@@ -1980,8 +2187,77 @@ fn effective_runtime_policy(
     }
 }
 
-fn capabilities_match(capabilities: &Value, required: &[String]) -> bool {
+/// The one capability key whose configured value Rig is able to contradict (finding F39).
+///
+/// `application/public.rs` pushes this string for every non-`text` response format. It is
+/// duplicated there rather than shared because `public.rs` may not import `rig_core`
+/// (`.agents/skills/moira-rig-integration/SKILL.md`), and this module is where the
+/// reconciliation has to live.
+const STRUCTURED_OUTPUT_CAPABILITY: &str = "structured_output";
+
+/// Whether Rig 0.40 will actually put a request's `output_schema` on the wire for this provider.
+///
+/// **Read from Rig, not restated.** Every provider Moira builds through the OpenAI-compatible
+/// arm answers with Rig's own public associated const,
+/// `openai::completion::OpenAICompatibleProvider::SUPPORTS_RESPONSE_FORMAT`. A `rig-core` bump
+/// that flips one of those constants therefore flips Moira's admission decision with no edit
+/// here — for those four provider types the config/wire divergence F39 describes is not
+/// *representable*, which is strictly stronger than a table plus a test that notices it rotted.
+///
+/// This matters because the drop is otherwise invisible. When the const is false,
+/// `providers/openai/completion/mod.rs` discards `output_schema` with only a `tracing::warn!`
+/// and builds the request anyway, so nothing observable at Moira's layer distinguishes "the
+/// schema was sent and the model ignored it" from "the schema was never sent". The const is the
+/// only signal available *before* the request goes out.
+///
+/// `Anthropic` and `Gemini` do not implement `OpenAICompatibleProvider` — they map
+/// `output_schema` natively onto their own request shapes (`anthropic/completion.rs`
+/// `output_config`, `gemini/completion.rs` `generation_config`) and expose no constant to read.
+/// `true` is restated for those two and pinned by
+/// `the_two_native_providers_still_map_output_schema` below; that test is the thing that reds if
+/// a bump makes the restatement false.
+///
+/// `Custom` never constructs a model at all — `build_completion_model` returns
+/// `AppError::Config` — so no schema can reach any provider on that arm.
+fn provider_emits_output_schema(provider_type: ProviderType) -> bool {
+    use rig_core::providers::openai::OpenAICompatibleProvider;
+
+    match provider_type {
+        ProviderType::OpenAi | ProviderType::OpenAiCompatible | ProviderType::Local => {
+            <rig_core::providers::openai::OpenAICompletionsExt as OpenAICompatibleProvider>::SUPPORTS_RESPONSE_FORMAT
+        }
+        ProviderType::AzureOpenAi => {
+            <rig_core::providers::azure::AzureExt as OpenAICompatibleProvider>::SUPPORTS_RESPONSE_FORMAT
+        }
+        ProviderType::DeepSeek => {
+            <rig_core::providers::deepseek::DeepSeekExt as OpenAICompatibleProvider>::SUPPORTS_RESPONSE_FORMAT
+        }
+        ProviderType::Anthropic | ProviderType::Gemini => true,
+        ProviderType::Custom => false,
+    }
+}
+
+/// Whether a routing candidate can satisfy every capability the policy requires.
+///
+/// The configured capability JSON is necessary but **not sufficient** for `structured_output`:
+/// it is an operator's claim about a model, and for some provider types Rig will drop the schema
+/// regardless of what the row says. Reconciling here — at the one site that already answers
+/// "does this candidate have capability X" — keeps the answer single-sourced and lets an
+/// unqualified candidate fall out of routing rather than fail mid-flight.
+///
+/// The reconciliation only ever **subtracts**. A row that declares `structured_output: false`
+/// stays unusable for structured requests even on a provider Rig would honour, because that
+/// declaration is also an operator decision to disable it.
+fn capabilities_match(
+    provider_type: ProviderType,
+    capabilities: &Value,
+    required: &[String],
+) -> bool {
     required.iter().all(|required| {
+        if required == STRUCTURED_OUTPUT_CAPABILITY && !provider_emits_output_schema(provider_type)
+        {
+            return false;
+        }
         capabilities
             .get(required)
             .and_then(Value::as_bool)
@@ -2185,10 +2461,20 @@ fn terminal_persistence_budget(deadline: Instant) -> Duration {
 /// Failure raised when terminal persistence overruns the deadline.
 ///
 /// Built through `attempt_timeout_failure(bounded_by_total_deadline = true,
-/// output_committed = true)` so it inherits the existing "output is already committed,
-/// never retry and never fall back" clamp rather than introducing a parallel scheme. The
-/// message is specialised so the condition is distinguishable from a plain
-/// `deadline_failure()` in logs, audit metadata, and the outcome envelope.
+/// output_committed = true)` so it inherits the existing "never retry and never fall back"
+/// clamp rather than introducing a parallel scheme. The message is specialised so the
+/// condition is distinguishable from a plain `deadline_failure()` in logs, audit metadata,
+/// and the outcome envelope.
+///
+/// **The `true` here is not the same claim the audit entry makes** (finding F38). The clamp
+/// argument is unconditionally `true` because the *provider call already completed and its
+/// tokens are already spent*, so a retry or a fallback would buy a second answer at a second
+/// cost — that is true whether or not a single byte reached the caller. The
+/// `"output_committed"` key in the audit entry and the `ExecutionFailed` event answers the
+/// different question "has the caller seen this output", and is read from
+/// [`EventCollector::output_committed`] rather than asserted. Keep the two apart: making this
+/// argument conditional would let a non-streaming execution be retried against a provider
+/// that has already billed for the answer.
 fn terminal_persistence_deadline_failure() -> ExecutionFailure {
     let mut failure = attempt_timeout_failure(true, true);
     failure.message =
@@ -2265,6 +2551,279 @@ mod tests {
             attempt_status_for_failure(ExecutionFailureClass::ProviderUnavailable),
             AttemptStatus::Failed
         );
+    }
+
+    /// Finding F39. A `structured_output: true` capability row is an operator's claim; on
+    /// DeepSeek it is false whatever the row says, because Rig drops the schema before the wire.
+    ///
+    /// The cheapest edit that breaks the property is deleting the `STRUCTURED_OUTPUT_CAPABILITY`
+    /// early return in `capabilities_match` — that edit turns this case red.
+    #[test]
+    fn a_deepseek_candidate_cannot_satisfy_structured_output_however_it_is_configured() {
+        let required = vec![STRUCTURED_OUTPUT_CAPABILITY.to_string()];
+
+        // Both spellings the capability JSON supports — the bool key and the array form — so a
+        // fix that reconciled only one of them is caught.
+        for capabilities in [
+            json!({ "structured_output": true }),
+            json!({ "capabilities": ["structured_output"] }),
+        ] {
+            assert!(
+                !capabilities_match(ProviderType::DeepSeek, &capabilities, &required),
+                "a DeepSeek row must not satisfy structured_output: {capabilities}"
+            );
+        }
+    }
+
+    /// The other half of the same property: the reconciliation must not disqualify providers
+    /// whose schema Rig really does send, or every structured request would lose its routing.
+    #[test]
+    fn the_providers_rig_sends_a_schema_for_still_satisfy_structured_output() {
+        let required = vec![STRUCTURED_OUTPUT_CAPABILITY.to_string()];
+        let capabilities = json!({ "structured_output": true });
+
+        for provider_type in [
+            ProviderType::OpenAi,
+            ProviderType::OpenAiCompatible,
+            ProviderType::Local,
+            ProviderType::AzureOpenAi,
+            ProviderType::Anthropic,
+            ProviderType::Gemini,
+        ] {
+            assert!(
+                capabilities_match(provider_type, &capabilities, &required),
+                "{provider_type:?} sends the schema and must stay eligible"
+            );
+        }
+    }
+
+    /// The reconciliation only ever subtracts, and only for the one key it owns.
+    ///
+    /// Two ways a plausible implementation goes wrong: reconciling *upward* (letting the
+    /// provider type grant a capability the row denies), and applying the provider-type check to
+    /// every capability rather than to `structured_output` alone. `vision` is the witness for
+    /// the second — it is the only other key `public.rs` ever pushes.
+    #[test]
+    fn the_reconciliation_subtracts_only_and_touches_no_other_capability() {
+        // Declared false stays false even where Rig would send the schema.
+        assert!(
+            !capabilities_match(
+                ProviderType::OpenAi,
+                &json!({ "structured_output": false }),
+                &[STRUCTURED_OUTPUT_CAPABILITY.to_string()],
+            ),
+            "an operator's explicit false must survive the reconciliation"
+        );
+
+        // `vision` is unaffected on the provider whose structured output is dropped.
+        assert!(
+            capabilities_match(
+                ProviderType::DeepSeek,
+                &json!({ "vision": true }),
+                &["vision".to_string()],
+            ),
+            "the reconciliation must not spill onto other capabilities"
+        );
+
+        // A DeepSeek row keeps every capability except the reconciled one.
+        assert!(
+            !capabilities_match(
+                ProviderType::DeepSeek,
+                &json!({ "vision": true, "structured_output": true }),
+                &[
+                    "vision".to_string(),
+                    STRUCTURED_OUTPUT_CAPABILITY.to_string()
+                ],
+            ),
+            "one unsatisfiable capability must disqualify the candidate"
+        );
+    }
+
+    /// **Anti-rot tripwire for the `rig-core` pin.**
+    ///
+    /// `provider_emits_output_schema` reads Rig's own `SUPPORTS_RESPONSE_FORMAT` for every
+    /// OpenAI-compatible arm, so a bump that changes Rig's behaviour changes Moira's silently
+    /// and correctly. That is the right default, but "silently" also means nobody re-reads F39
+    /// or the deliberately lenient F29 parse that depends on it. This test states rig 0.40.0's
+    /// truth table literally, so a bump that moves any entry reds here and forces that read.
+    ///
+    /// A red in this test is **not** a defect: it means Rig changed. Verify the new constant in
+    /// the vendored crate, update the expectation, and revisit the F29 reversal condition in
+    /// `plans/reports/EXECUTION-LEDGER.md`.
+    #[test]
+    fn rig_0_40_still_drops_the_schema_for_deepseek_and_sends_it_for_everyone_else() {
+        assert!(
+            !provider_emits_output_schema(ProviderType::DeepSeek),
+            "rig-core changed: DeepSeek now sends response_format — re-read finding F39"
+        );
+        assert!(
+            !provider_emits_output_schema(ProviderType::Custom),
+            "custom providers never construct a model, so no schema can reach a wire"
+        );
+        for provider_type in [
+            ProviderType::OpenAi,
+            ProviderType::OpenAiCompatible,
+            ProviderType::Local,
+            ProviderType::AzureOpenAi,
+            ProviderType::Anthropic,
+            ProviderType::Gemini,
+        ] {
+            assert!(
+                provider_emits_output_schema(provider_type),
+                "rig-core changed: {provider_type:?} no longer sends the schema — re-read F39"
+            );
+        }
+    }
+
+    /// **Finding F48 — a guard on the precondition, not on the behaviour.**
+    ///
+    /// `rig-core` 0.40's OpenAI encoder computes
+    ///
+    /// ```text
+    /// should_apply_response_format =
+    ///     output_schema.is_some() && supports_response_format
+    ///     && (tools.is_empty() || history_has_tool_result)
+    /// ```
+    ///
+    /// (`providers/openai/completion/mod.rs`). The third clause discards `output_schema` on
+    /// **turn 1 of any tool-calling conversation, for every OpenAI-family provider**, and —
+    /// unlike the `supports_response_format == false` path a few lines above it — emits **no
+    /// `warn!` at all**. Rig documents the caveat itself (issue #1928) and Moira's own
+    /// `composes_native_output_with_tools` comment restates it. **That behaviour is Rig's and is
+    /// deliberately not changed here.**
+    ///
+    /// It cannot bite today: [`build_completion_request`] hardcodes `tools: Vec::new()`, and the
+    /// public plane refuses caller-declared tools outright — `application/public.rs` answers
+    /// `unsupported_tool` / *"client-defined tools are not registered in this phase"* before an
+    /// `ExecutionCommand` is ever built. So the drop is unreachable, which is exactly why it
+    /// would ship unnoticed.
+    ///
+    /// This case therefore guards the *precondition*. It hands the request Moira really builds
+    /// to Rig's real encoder and asserts the schema survived onto the wire body. The moment
+    /// `tools` stops being empty, Rig drops `response_format` and this reds — naming F48, so
+    /// whoever enables tool calling confronts the silent drop instead of discovering it in
+    /// production.
+    ///
+    /// **Three things this fixture does on purpose**, each answering "what is the cheapest edit
+    /// that breaks the property while leaving the guard green?":
+    ///
+    /// 1. **The profile carries a `tool_policy`.** `AgentProfileRecord::tool_policy` is the
+    ///    field a tool-calling implementation reads first, so the cheapest enabling edit is
+    ///    "populate `tools` from the profile". A fixture passing `agent_profile: None` would
+    ///    sail straight through it.
+    /// 2. **Both `stream` settings.** `build_completion_request` ignores `stream` today; an
+    ///    implementation that enabled tools on one path only would otherwise stay green.
+    /// 3. **Rig's encoder, not a restatement of Rig's predicate.** Re-implementing
+    ///    `should_apply_response_format` in the test module would be the F16 shape — a correct
+    ///    predicate, tested against itself. `CompletionRequest::try_from((model, request))` is
+    ///    Rig's own public conversion, configured (`supports_response_format: true`,
+    ///    `supports_tools: true`) exactly as the OpenAI family is.
+    ///
+    /// **Measured, not assumed: this case is the only coverage of the *drop* in point 1.** The
+    /// mutation above was run against the whole suite, and `tests/structured_output.rs` — which
+    /// reads `response_format.type` off the body that actually reached a mock provider, and which
+    /// looks like it should be the stronger guard — stayed **green** through it. At the time,
+    /// every fixture in the tree left `route_definitions.agent_profile_id` NULL, so
+    /// `agent_profile` was `None` on every integration path and no end-to-end test had ever
+    /// built a request from a profile at all. (The column is on `route_definitions`;
+    /// `RoutingPolicyRecord` has no such field, and F48's original wording said
+    /// `routing_policies`. Corrected under F49.)
+    ///
+    /// **`tests/agent_profile_wire.rs` (finding F49) now closes that fixture hole, and it still
+    /// does not replace this case.** Its
+    /// `an_agent_profiles_tool_policy_does_not_become_a_tool_list_on_the_wire` does go red under
+    /// the same mutation — but it reds saying *tools appeared on the wire*, which is not the
+    /// dangerous half. No case in that file sends an `output_schema`, so none of them can
+    /// observe `response_format` disappearing alongside the tools. This case is the only one
+    /// that names the silent drop. Do not delete it in favour of either suite.
+    ///
+    /// The one gap that remains: a tool list attached to the request *after*
+    /// `build_completion_request` returns, between the build and `handle.completion(request)`.
+    /// That the wire tests would catch, because it needs no profile.
+    #[test]
+    fn moiras_request_still_carries_its_schema_onto_rigs_openai_wire_body() {
+        use rig_core::providers::openai::completion::CompletionRequest as OpenAiWireRequest;
+
+        let profile = AgentProfileRecord {
+            id: Uuid::now_v7(),
+            profile_key: "f48-guard".to_string(),
+            display_name: "F48 guard".to_string(),
+            preamble: Some("you are a guard".to_string()),
+            temperature: Some(0.0),
+            max_tokens: Some(64),
+            // The field a tool-calling implementation reads first. See point 1 above.
+            tool_policy: json!({
+                "tools": [{
+                    "name": "lookup",
+                    "description": "look something up",
+                    "parameters": { "type": "object", "properties": {} }
+                }]
+            }),
+            context_policy: Value::Null,
+            memory_policy: Value::Null,
+            status: crate::domain::ResourceStatus::Active,
+            metadata: Value::Null,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            deleted_at: None,
+            version: 1,
+        };
+
+        for stream in [false, true] {
+            let command = ExecutionCommand {
+                request_id: "f48".to_string(),
+                execution_id: Uuid::now_v7(),
+                identity: CallerRuntimeIdentity {
+                    actor_type: format!("{:?}", ActorType::SystemKey),
+                    subject: None,
+                    external_user_id: None,
+                    external_tenant_id: None,
+                    application_id: None,
+                    scopes: vec!["moira:admin".to_string()],
+                },
+                application_id: None,
+                external_tenant_id: None,
+                external_user_id: None,
+                messages: vec![DomainMessage::user("hello")],
+                route_hint: None,
+                provider_hint: None,
+                model_hint: None,
+                credential_hint: None,
+                options: ExecutionOptions {
+                    stream,
+                    output_schema: Some(json!({
+                        "title": "Answer",
+                        "type": "object",
+                        "properties": { "a": { "type": "integer" } },
+                        "required": ["a"]
+                    })),
+                    ..ExecutionOptions::default()
+                },
+                // Non-null so `additional_params` is already `Some`, which forces Rig's
+                // *merge* branch rather than its plain-assignment branch.
+                metadata: json!({ "moira": { "purpose": "f48_guard" } }),
+            };
+
+            let request = build_completion_request(&command, Some(&profile))
+                .expect("the guard's own request must be buildable");
+            assert!(
+                request.output_schema.is_some(),
+                "the fixture must actually carry a schema, or this guard proves nothing"
+            );
+
+            let wire = OpenAiWireRequest::try_from(("gpt-4o".to_string(), request))
+                .expect("rig-core must encode a schema-carrying request");
+            let params = wire.additional_params.unwrap_or(Value::Null);
+            assert!(
+                params.get("response_format").is_some(),
+                "finding F48: rig-core dropped output_schema before the wire (stream={stream}). \
+                 `should_apply_response_format` also requires `tools.is_empty() || \
+                 history_has_tool_result`, so this is what a non-empty tool list looks like on \
+                 turn 1 — and rig emits no warning for it. Enabling tool calling means deciding \
+                 what happens to structured output on turn 1 first; see F48 in \
+                 plans/reports/EXECUTION-LEDGER.md. Encoded params: {params}"
+            );
+        }
     }
 
     #[test]

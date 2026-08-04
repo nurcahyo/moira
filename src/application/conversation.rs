@@ -1,5 +1,6 @@
 use serde::Serialize;
 use serde_json::{Value, json};
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
@@ -22,13 +23,14 @@ use crate::{
         ConversationPolicyPutRequest, ConversationPolicyRecord, ConversationQuery,
         ConversationRecord, ConversationStatus, ConversationSummaryRecord, CursorScope,
         DomainMessage, EmbeddingPolicyPutRequest, EmbeddingPolicyRecord, ExecutionCommand,
-        ExecutionOptions, HistoryStrategy, ListCursor, ListResponse, MemoryConsentMode,
-        MemoryCreateRequest, MemoryPatchRequest, MemoryPolicyPutRequest, MemoryPolicyRecord,
-        MemoryQuery, MemoryRecord, MemoryScope, MemoryStatus, Pagination, PublicCitation,
-        PublicContentPart, PublicInputMessage, RagCollectionCreateRequest,
-        RagCollectionPatchRequest, RagCollectionQuery, RagCollectionRecord, RagCollectionStatus,
-        RagDocumentCreateRequest, RagDocumentIngestRequest, RagDocumentRecord,
-        ResponseConversationInput, RetrievalPolicyPutRequest, RetrievalPolicyRecord, SeqCursor,
+        ExecutionOptions, ExecutionOutcome, ExecutionStatus, HistoryStrategy, ListCursor,
+        ListResponse, MemoryConsentMode, MemoryCreateRequest, MemoryPatchRequest,
+        MemoryPolicyPutRequest, MemoryPolicyRecord, MemoryQuery, MemoryRecord, MemoryScope,
+        MemoryStatus, Pagination, PublicCitation, PublicContentPart, PublicInputMessage,
+        RagCollectionCreateRequest, RagCollectionPatchRequest, RagCollectionQuery,
+        RagCollectionRecord, RagCollectionStatus, RagDocumentCreateRequest,
+        RagDocumentIngestRequest, RagDocumentRecord, ResponseConversationInput,
+        RetrievalPolicyPutRequest, RetrievalPolicyRecord, SeqCursor,
     },
     error::AppError,
     infra::repositories::{
@@ -213,6 +215,46 @@ fn failed_extraction(failure_class: &'static str) -> MemoryExtractionRunOutcome 
         status: "failed",
         failure_class: Some(failure_class),
         metadata: json!({}),
+    }
+}
+
+/// The label for an extraction run whose execution came back with nothing to parse.
+///
+/// # F29's third precondition — `run_extraction` now reads `execution.status`
+///
+/// `run_extraction` used to answer this question with the constant
+/// [`FAILURE_EXTRACTION_CALL_FAILED`], which made every failed execution look the same on
+/// `memory_extraction_runs.failure_class`: a route that resolves to nothing, a provider returning
+/// 500, and — once the structured-output fail-hard variant ships — a model that did not comply
+/// were all recorded as *"the call did not happen"*. Recording the execution's own class instead
+/// keeps the distinction the run row exists to make, and gives
+/// [`FAILURE_EXTRACTION_CALL_FAILED`] back its literal meaning: it is now written **only** when
+/// there was no execution to ask — no pool, no service, or `execute` itself returned `Err`.
+///
+/// **Why the general form rather than one arm for `StructuredOutputInvalid`.** A special case for
+/// that one class would be code no test in this tree can reach: extraction builds its own schema
+/// from [`extraction_output_schema`], which is always readable, and never crosses
+/// `validate_response_format`, so neither of the class's two live emitters is on this path. An
+/// arm that cannot be executed is not a guard, it is a promise. Recording whatever the execution
+/// reports is reachable today — `a_failed_extraction_call_leaves_the_response_untouched` drives a
+/// real provider 500 through it — and it produces the right answer for the fail-hard variant
+/// without a second edit.
+///
+/// **The consequence worth stating: the flip becomes invisible here.** A non-conforming reply is
+/// recorded as `structured_output_invalid` today, by `parse_candidates` refusing prose. Under the
+/// fail-hard variant the same string arrives from the execution instead. The run row says the
+/// same thing before and after, which is exactly what F29's doc comment was worried about losing.
+///
+/// # This does **not** re-open F38
+///
+/// The status is consulted only on the branch that has already decided to fail — the reply is
+/// missing, so the run is over either way, and the only open question is what to call it. The
+/// decision to *proceed* still comes from the fields, so a terminal-persistence-deadline failure
+/// that carries a real reply is still extracted from. See the call site.
+fn extraction_failure_class(execution: &ExecutionOutcome) -> &'static str {
+    match (execution.status, execution.failure.as_ref()) {
+        (ExecutionStatus::Succeeded, _) | (_, None) => FAILURE_EXTRACTION_CALL_FAILED,
+        (_, Some(failure)) => failure.class.code(),
     }
 }
 
@@ -1225,11 +1267,21 @@ impl ConversationService {
         let input_message_ids: Vec<Uuid> =
             history.iter().map(|message| message.message_uuid).collect();
 
+        // F54 — the run row names the execution before the execution happens.
+        //
+        // Minted here rather than inside `run_extraction` so the same uuid can be written on the
+        // opening insert *and* used as the `ExecutionCommand`'s id. Recording it at completion
+        // instead would leave it null on the one run an operator most needs to chase: the row
+        // that `insert_memory_extraction_run` exists to leave behind when the process dies
+        // mid-call, which never reaches `complete_memory_extraction_run` at all.
+        let execution_id = Uuid::now_v7();
+
         let run_id = match insert_memory_extraction_run(
             pool,
             &MemoryExtractionRunInsert {
                 conversation_uuid: Some(conversation_uuid),
                 response_id: Some(response_id),
+                execution_id,
                 input_message_ids,
                 provider_model_id: None,
             },
@@ -1247,6 +1299,7 @@ impl ConversationService {
                 conversation_uuid,
                 response_id,
                 run_id,
+                execution_id,
                 status,
                 &memory_policy,
                 &turns,
@@ -1295,6 +1348,7 @@ impl ConversationService {
         conversation_uuid: Uuid,
         response_id: Uuid,
         run_id: Uuid,
+        execution_id: Uuid,
         status: MemoryStatus,
         policy: &MemoryPolicyRecord,
         turns: &[(String, String)],
@@ -1304,8 +1358,15 @@ impl ConversationService {
             return failed_extraction(FAILURE_EXTRACTION_CALL_FAILED);
         };
         let command = ExecutionCommand {
+            // A convenience, no longer the correlation — finding F54. This format was the
+            // *only* way to get from a run row to its execution until `execution_id` became a
+            // column on `memory_extraction_runs`; nothing enforces it, so nothing should depend
+            // on it. Read `memory_extraction_runs.execution_id` and join
+            // `execution_attempts`/`responses`/`audit_logs.resource_id` on that instead.
             request_id: format!("memory-extraction-{run_id}"),
-            execution_id: Uuid::now_v7(),
+            // Passed in, never minted here: the run row was opened with this value, and the two
+            // must be the same uuid or the column on that row names an execution that never ran.
+            execution_id,
             identity: CallerRuntimeIdentity {
                 actor_type: format!("{:?}", actor.actor_type),
                 subject: actor.subject.clone(),
@@ -1339,10 +1400,25 @@ impl ConversationService {
         let Ok(execution) = service.execute(command).await else {
             return failed_extraction(FAILURE_EXTRACTION_CALL_FAILED);
         };
-        // `structured_output` is not populated by the execution kernel today — it is `None` on
-        // both the streaming and non-streaming paths — so the schema-constrained reply arrives
-        // as `output_text` and is parsed here. Preferring `structured_output` when it is
-        // present means this call site needs no edit the day the kernel starts filling it.
+        // `structured_output` is populated by the execution kernel since F29
+        // (`structured_output_from_text`, gated on the request carrying an `output_schema`),
+        // which this call does. It falls back to `output_text` for a reply that is not valid
+        // JSON, which F29 deliberately does not fail hard on.
+        //
+        // **Whether to proceed is still inferred from these two fields rather than from
+        // `execution.status`** (finding F38's second reversal condition; the other site is
+        // `summarize_conversation`). Since F38 a terminal-persistence-deadline failure carries
+        // the provider's real reply here instead of `None`, so an extraction whose only failure
+        // was Moira's own bookkeeping proceeds on a reply that genuinely exists — which is the
+        // correct answer to the question this site is asking, and F29's third precondition does
+        // not change it.
+        //
+        // What *did* change: the failure **label** on the branch where there is nothing to parse
+        // now comes from `execution.status` and `execution.failure` via
+        // `extraction_failure_class`, instead of being the constant `extraction_call_failed`. The
+        // status is read only after the reply has already been found missing, so it can rename a
+        // failure but never cause one.
+        let missing_reply_class = extraction_failure_class(&execution);
         let raw = match execution
             .structured_output
             .as_ref()
@@ -1350,7 +1426,7 @@ impl ConversationService {
             .or(execution.output_text)
         {
             Some(raw) => raw,
-            None => return failed_extraction(FAILURE_EXTRACTION_CALL_FAILED),
+            None => return failed_extraction(missing_reply_class),
         };
         let candidates = match parse_candidates(&raw) {
             Ok(candidates) => candidates,
@@ -1693,10 +1769,19 @@ impl ConversationService {
         lock.release().await;
 
         self.state.metrics.record_summarization_run(outcome.is_ok());
-        let row = outcome?;
+        let SummarizationRun {
+            row,
+            inline_reasoning,
+        } = outcome?;
         // Audited by shape, never by content: the version, the coverage boundary and the token
         // count. `audit_logs` records that a summary was produced and how far it reaches; the
         // summary body itself lives only in `conversation_summaries`.
+        //
+        // `inline_reasoning` (F57) is the durable, per-conversation half of that announcement and
+        // is a `bool` for the same reason — it says *that* the stored text opens with a reasoning
+        // block, never how much of it or what it said. It rides this existing row deliberately:
+        // F55 is the open question of whether a *failed* summarization deserves a table, and this
+        // is a successful run, so nothing here prejudges it.
         self.audit(
             actor,
             ctx,
@@ -1710,6 +1795,7 @@ impl ConversationService {
                 "token_count": row.token_count,
                 "message_count": plan.turns.len(),
                 "forced": force,
+                "inline_reasoning": inline_reasoning,
             }),
         )
         .await?;
@@ -1821,7 +1907,7 @@ impl ConversationService {
         conversation_uuid: Uuid,
         policy: &ConversationPolicyRecord,
         plan: &SummarizationPlan,
-    ) -> Result<ConversationSummaryRow, AppError> {
+    ) -> Result<SummarizationRun, AppError> {
         // The route the conversation's own turns went to. `route_hint: None` would land on
         // `get_default_route()`, which is decision D-F3's exact trap — a route the caller never
         // used, and `NoEligibleModel` on a deployment with no active default.
@@ -1867,10 +1953,15 @@ impl ConversationService {
             .execute(command)
             .await
             .map_err(|_| summarization_failed(FAILURE_SUMMARIZATION_CALL_FAILED))?;
-        // `structured_output` is not populated by the execution kernel today (finding F29) and
-        // summarization asks for prose anyway, so the reply arrives as `output_text`. Preferring
-        // `structured_output` when present costs nothing and means this call site needs no edit
-        // the day the kernel starts filling it.
+        // Summarization sends **no** `output_schema`, and F29's parse is gated on one, so
+        // `structured_output` is always `None` on this path however JSON-shaped the prose is —
+        // that gate is the whole reason `summary_hash` stays a content address of the bytes the
+        // model actually sent. The `structured_output` arm therefore never fires here; it is
+        // kept only so the two inference sites read identically.
+        //
+        // Like `run_extraction`, this infers "the model answered" from the fields rather than
+        // from `execution.status`, so since F38 a terminal-persistence-deadline failure supplies
+        // real prose here instead of `None`. See F38's second reversal condition.
         let raw = execution
             .structured_output
             .as_ref()
@@ -1878,6 +1969,30 @@ impl ConversationService {
             .or(execution.output_text)
             .ok_or_else(|| summarization_failed(FAILURE_SUMMARIZATION_CALL_FAILED))?;
         let summary = parse_summary(&raw).map_err(summarization_failed)?;
+
+        // **Finding F57 — announce an inline reasoning block; do not remove it.**
+        //
+        // Why this is only announced is argued at `parse_summary`, against a measurement: the
+        // condition is decidable at offset 0, the *extent* of it is not. So the reply is stored
+        // exactly as the model sent it and the operator is told, three ways with three consumers,
+        // the same split `announce_dangling_agent_profile` uses for F50.
+        //
+        // The `warn!` carries the conversation id and two byte counts and **no summary text**.
+        // That is not incidental tidiness: `tests/content_leak_snapshots.rs` asserts summary
+        // bodies reach neither the log stream nor `audit_logs` nor a metric label, and a reply
+        // that is 63 % chain-of-thought is still 37 % the conversation's content.
+        if summary.inline_reasoning {
+            warn!(
+                conversation_id = %conversation_uuid,
+                stored_bytes = summary.text.len(),
+                covers_through_sequence = plan.covers_through_sequence,
+                "summarization reply opened with an inline reasoning block and is stored \
+                 verbatim; the summary is mostly chain-of-thought and is re-injected into every \
+                 later turn. Serve the model with a reasoning parser (vLLM: --reasoning-parser) \
+                 so the block arrives in its own field, which Moira discards"
+            );
+            self.state.metrics.record_summarization_inline_reasoning();
+        }
 
         let summary_hash = request_hash(summary.text.as_bytes());
         let token_count = budget_tokens(&summary.text);
@@ -1901,7 +2016,7 @@ impl ConversationService {
             .conversation_content_persistence
             .persists_plaintext()
             .then_some(summary.text.as_str());
-        insert_conversation_summary(
+        let row = insert_conversation_summary(
             pool,
             &ConversationSummaryInsert {
                 conversation_uuid,
@@ -1912,7 +2027,11 @@ impl ConversationService {
                 provider_model_id: None,
             },
         )
-        .await
+        .await?;
+        Ok(SummarizationRun {
+            row,
+            inline_reasoning: summary.inline_reasoning,
+        })
     }
 
     /// Summarises after an assistant turn, if the policy says to — plan 11 Sub-Phase E.
@@ -1973,6 +2092,19 @@ impl ConversationService {
                 "manual memory is disabled for this application",
             ));
         }
+        // F30 — this reads **one** of the two consent columns, on purpose.
+        //
+        // There are two (`MemoryConsentMode::stricter_of`), and every other consent decision in
+        // the tree takes the stricter of them. This one does not, because a manual memory is not a
+        // conversation: `POST /api/v1/memories` writes at `MemoryScope::UserApplication` and takes
+        // no conversation id, so `application_conversation_policies` is not describing it. The
+        // memory policy's own `manual_memory_enabled` gate above is the switch that governs this
+        // path.
+        //
+        // Recorded rather than assumed: `docs/memory-consent.md` states the asymmetry, and this
+        // comment is here so the next reader knows it is a decision and not the defect F30 names.
+        // Changing it would change what `POST /api/v1/memories` accepts, which is a public
+        // behaviour change and belongs in its own commit.
         if matches!(policy.consent_mode, MemoryConsentMode::Disabled) {
             return Err(AppError::coded(
                 axum::http::StatusCode::FORBIDDEN,
@@ -3093,6 +3225,18 @@ fn required_application_id(actor: &Actor) -> Result<Uuid, AppError> {
 
 /// What one summarization run will feed the model, once the trigger has said yes.
 #[derive(Debug)]
+/// What one completed summarization run produced.
+///
+/// A struct rather than a bare [`ConversationSummaryRow`] so F57's observation survives the
+/// return: the flag is decided inside `run_summarization`, where the raw reply is, and consumed by
+/// `summarize_conversation_unscoped`, where the audit row is written. A tuple would have carried
+/// it equally well and named neither half.
+struct SummarizationRun {
+    row: ConversationSummaryRow,
+    /// The stored summary opens with an inline reasoning block. See `parse_summary`.
+    inline_reasoning: bool,
+}
+
 struct SummarizationPlan {
     /// The active summary's text, when there is one and it was persisted in plaintext.
     previous_summary: Option<String>,
@@ -3345,8 +3489,87 @@ fn contains_secret_like_text(content: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{application::FAILURE_STRUCTURED_OUTPUT_INVALID, domain::ExecutionFailureClass};
 
     const TEST_SCOPE: CursorScope = CursorScope::new("test.pagination");
+
+    fn outcome(
+        status: ExecutionStatus,
+        failure: Option<ExecutionFailureClass>,
+    ) -> crate::domain::ExecutionOutcome {
+        crate::domain::ExecutionOutcome {
+            request_id: "memory-extraction-test".to_string(),
+            execution_id: Uuid::nil(),
+            status,
+            output_text: None,
+            structured_output: None,
+            usage: crate::domain::UsageSummary::default(),
+            route: None,
+            model: None,
+            attempts: Vec::new(),
+            failure: failure
+                .map(|class| crate::domain::ExecutionFailure::new(class, "failure message")),
+        }
+    }
+
+    /// F29's third precondition: the run row keeps the execution's own failure class.
+    ///
+    /// The four cases are the whole decision. The `StructuredOutputInvalid` row is the one the
+    /// precondition is about, and it is deliberately *not* a special case in the code — see
+    /// [`extraction_failure_class`].
+    #[test]
+    fn a_failed_execution_is_labelled_with_its_own_class_not_extraction_call_failed() {
+        assert_eq!(
+            extraction_failure_class(&outcome(
+                ExecutionStatus::Failed,
+                Some(ExecutionFailureClass::StructuredOutputInvalid)
+            )),
+            FAILURE_STRUCTURED_OUTPUT_INVALID,
+            "the signal that distinguishes 'the model did not comply' from 'the call did not \
+             happen' must survive, and it must be the same string parse_candidates writes"
+        );
+        assert_eq!(
+            extraction_failure_class(&outcome(
+                ExecutionStatus::Failed,
+                Some(ExecutionFailureClass::ProviderUpstreamError)
+            )),
+            "provider_upstream_error"
+        );
+        assert_eq!(
+            extraction_failure_class(&outcome(
+                ExecutionStatus::Cancelled,
+                Some(ExecutionFailureClass::RequestCancelled)
+            )),
+            "request_cancelled"
+        );
+    }
+
+    /// `extraction_call_failed` now means only what it says.
+    ///
+    /// A succeeded execution that somehow carried no text, and a failed one with no failure
+    /// attached, are both "there is nothing here to name" — the constant is the honest answer,
+    /// and it is also what the three pre-execution guards (`pool`, service construction, `execute`
+    /// returning `Err`) still return.
+    #[test]
+    fn only_an_execution_with_nothing_to_report_is_called_extraction_call_failed() {
+        assert_eq!(
+            extraction_failure_class(&outcome(ExecutionStatus::Succeeded, None)),
+            FAILURE_EXTRACTION_CALL_FAILED
+        );
+        assert_eq!(
+            extraction_failure_class(&outcome(ExecutionStatus::Failed, None)),
+            FAILURE_EXTRACTION_CALL_FAILED
+        );
+        // A *succeeded* execution is never relabelled, even if a failure is somehow attached:
+        // reading `status` is the point of the precondition, not reading `failure` alone.
+        assert_eq!(
+            extraction_failure_class(&outcome(
+                ExecutionStatus::Succeeded,
+                Some(ExecutionFailureClass::StructuredOutputInvalid)
+            )),
+            FAILURE_EXTRACTION_CALL_FAILED
+        );
+    }
 
     fn list_keys(count: usize) -> Vec<(String, ListCursor)> {
         (0..count)

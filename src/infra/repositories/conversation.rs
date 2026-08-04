@@ -99,6 +99,8 @@ use crate::{
     },
 };
 
+use super::policy_row::get_or_create_policy_row;
+
 #[derive(Debug, Clone)]
 pub struct PgConversationRepository {
     pool: PgPool,
@@ -531,20 +533,18 @@ impl PgConversationRepository {
 
 #[async_trait]
 impl ConversationRepository for PgConversationRepository {
+    /// F47: a read, and no longer a write. See [`super::policy_row`] for what the previous
+    /// `on conflict … do update` spelling cost on every call.
     async fn get_or_create_conversation_policy(
         &self,
         application_id: Uuid,
     ) -> Result<ConversationPolicyRecord, AppError> {
-        let row = sqlx::query(
-            r#"
-            insert into application_conversation_policies (application_id)
-            values ($1)
-            on conflict (application_id) do update set application_id = excluded.application_id
-            returning *
-            "#,
+        let row = get_or_create_policy_row(
+            &self.pool,
+            "application_conversation_policies",
+            "*",
+            application_id,
         )
-        .bind(application_id)
-        .fetch_one(&self.pool)
         .await?;
         conversation_policy_record_from_row(&row)
     }
@@ -635,20 +635,17 @@ impl ConversationRepository for PgConversationRepository {
         conversation_policy_record_from_row(&row)
     }
 
+    /// F47: a read, and no longer a write. See [`super::policy_row`].
     async fn get_or_create_memory_policy(
         &self,
         application_id: Uuid,
     ) -> Result<MemoryPolicyRecord, AppError> {
-        let row = sqlx::query(
-            r#"
-            insert into application_memory_policies (application_id)
-            values ($1)
-            on conflict (application_id) do update set application_id = excluded.application_id
-            returning *
-            "#,
+        let row = get_or_create_policy_row(
+            &self.pool,
+            "application_memory_policies",
+            "*",
+            application_id,
         )
-        .bind(application_id)
-        .fetch_one(&self.pool)
         .await?;
         memory_policy_record_from_row(&row)
     }
@@ -742,20 +739,17 @@ impl ConversationRepository for PgConversationRepository {
         memory_policy_record_from_row(&row)
     }
 
+    /// F47: a read, and no longer a write. See [`super::policy_row`].
     async fn get_or_create_retrieval_policy(
         &self,
         application_id: Uuid,
     ) -> Result<RetrievalPolicyRecord, AppError> {
-        let row = sqlx::query(
-            r#"
-            insert into application_retrieval_policies (application_id)
-            values ($1)
-            on conflict (application_id) do update set application_id = excluded.application_id
-            returning *
-            "#,
+        let row = get_or_create_policy_row(
+            &self.pool,
+            "application_retrieval_policies",
+            "*",
+            application_id,
         )
-        .bind(application_id)
-        .fetch_one(&self.pool)
         .await?;
         retrieval_policy_record_from_row(&row)
     }
@@ -830,20 +824,17 @@ impl ConversationRepository for PgConversationRepository {
         retrieval_policy_record_from_row(&row)
     }
 
+    /// F47: a read, and no longer a write. See [`super::policy_row`].
     async fn get_or_create_embedding_policy(
         &self,
         application_id: Uuid,
     ) -> Result<EmbeddingPolicyRecord, AppError> {
-        let row = sqlx::query(
-            r#"
-            insert into application_embedding_policies (application_id)
-            values ($1)
-            on conflict (application_id) do update set application_id = excluded.application_id
-            returning *
-            "#,
+        let row = get_or_create_policy_row(
+            &self.pool,
+            "application_embedding_policies",
+            "*",
+            application_id,
         )
-        .bind(application_id)
-        .fetch_one(&self.pool)
         .await?;
         embedding_policy_record_from_row(&row)
     }
@@ -2321,7 +2312,24 @@ pub(crate) async fn insert_memory_embedding(
 #[derive(Debug, Clone)]
 pub struct MemoryExtractionRunInsert {
     pub conversation_uuid: Option<Uuid>,
+    /// The **triggering turn's** response — the conversation turn whose completion caused
+    /// extraction to run. Not the extraction's own execution; see [`Self::execution_id`].
     pub response_id: Option<Uuid>,
+    /// The id of the completion the extraction is about to issue — finding F54.
+    ///
+    /// Required, not `Option`. The column is nullable for rows written before migration `0025`,
+    /// but no *writer* may omit it: an operator reading a failed run asks "which provider, which
+    /// model, what did it say", and every one of those answers is keyed by `execution_id` on
+    /// `execution_attempts`, `responses` and `audit_logs.resource_id`. Making the field
+    /// non-optional is the barrier — a caller that has not decided on an execution id cannot
+    /// open a run row.
+    ///
+    /// The caller therefore mints the id *before* the run row exists and hands the same value to
+    /// the `ExecutionCommand`. Writing it here rather than on
+    /// [`complete_memory_extraction_run`] is deliberate and is the whole point: a run that dies
+    /// mid-call is exactly the run an operator most needs to correlate, and it never reaches
+    /// completion.
+    pub execution_id: Uuid,
     pub input_message_ids: Vec<Uuid>,
     pub provider_model_id: Option<Uuid>,
 }
@@ -2341,14 +2349,16 @@ pub(crate) async fn insert_memory_extraction_run(
     sqlx::query(
         r#"
             insert into memory_extraction_runs (
-                id, conversation_id, response_id, status, input_message_ids, provider_model_id
+                id, conversation_id, response_id, execution_id, status, input_message_ids,
+                provider_model_id
             )
-            values ($1, $2, $3, 'running', $4, $5)
+            values ($1, $2, $3, $4, 'running', $5, $6)
             "#,
     )
     .bind(id)
     .bind(insert.conversation_uuid)
     .bind(insert.response_id)
+    .bind(insert.execution_id)
     .bind(&insert.input_message_ids)
     .bind(insert.provider_model_id)
     .execute(pool)
@@ -3221,6 +3231,21 @@ pub(crate) async fn find_application_embedding_target(
 // Each helper restates the sort key of the *list* query that uses it. Single-row call sites
 // (find/patch/insert … returning) are unaffected by an `order by` over one row.
 
+/// F30 — this query selects **both** consent columns and decides nothing.
+///
+/// It used to emit `coalesce(mp.consent_mode, 'explicit_only') as memory_behavior`, which made it
+/// a consent reader that consulted one of the two consent columns
+/// (`MemoryConsentMode::stricter_of` documents why there are two). An application whose
+/// conversation policy said `disabled` while its memory policy said `application_managed` was
+/// reported to every caller of `GET /api/v1/conversations/{id}` as `application_managed`, while
+/// extraction — which has taken the stricter of the two since Sub-Phase F — was refusing.
+///
+/// **The reason it happened here and not in Rust is the reason the fix is shaped this way.** The
+/// combining rule was an application-layer function over `Option<MemoryStatus>`; SQL could not
+/// call it and did not have to, so the second reader wrote its own answer in six words. Selecting
+/// both columns raw and combining them in `conversation_record_from_row` leaves no consent
+/// decision in SQL at all, which is the only version of "every reader goes through one place" that
+/// a query cannot walk around.
 fn conversation_select(inner: &str) -> String {
     format!(
         r#"
@@ -3231,9 +3256,11 @@ fn conversation_select(inner: &str) -> String {
                    where s.conversation_id = conversation_rows.id
                      and s.superseded_at is null
                ) as summary_available,
-               coalesce(mp.consent_mode, 'explicit_only') as memory_behavior
+               coalesce(cp.memory_consent_mode, 'explicit_only') as conversation_consent_mode,
+               coalesce(mp.consent_mode, 'explicit_only') as memory_policy_consent_mode
         from conversation_rows
         left join application_memory_policies mp on mp.application_id = conversation_rows.application_id
+        left join application_conversation_policies cp on cp.application_id = conversation_rows.application_id
         order by conversation_rows.updated_at desc, conversation_rows.id desc
         "#
     )
@@ -3297,6 +3324,152 @@ mod tests {
         memory_by_key_sql, memory_candidates_sql, memory_select, nearest_memory_sql,
         rag_document_select,
     };
+
+    /// F30 — `conversation_select` hands both consent columns up and decides neither.
+    ///
+    /// The defect was one word of SQL: this query aliased the memory policy's consent column as
+    /// `memory_behavior` and shipped it to callers as the conversation's memory behaviour, while
+    /// extraction obeyed the stricter of the two columns. Asserting on the emitted SQL rather than
+    /// only on the served value is deliberate — the served value is also covered, over HTTP, by
+    /// `the_reported_memory_behavior_is_the_stricter_of_the_two_consent_columns` — because this is
+    /// the assertion that names the *shape*: two raw columns out, no alias that sounds like a
+    /// decision, and the conversation-policy join present at all.
+    #[test]
+    fn conversation_select_emits_both_consent_columns_and_decides_nothing() {
+        let sql = conversation_select("select 1");
+        let conversation_column = concat!("conversation_consent", "_mode");
+        let memory_column = concat!("memory_policy_consent", "_mode");
+        assert!(
+            sql.contains(conversation_column),
+            "the conversation policy's consent column is not selected; \
+             memory_behavior would be computed from one of two columns again: {sql}"
+        );
+        assert!(
+            sql.contains(memory_column),
+            "the memory policy's consent column is not selected: {sql}"
+        );
+        assert!(
+            sql.contains("application_conversation_policies cp"),
+            "the conversation-policy join is gone, so the column above resolves to nothing: {sql}"
+        );
+        assert!(
+            !sql.contains("memory_behavior"),
+            "memory_behavior must not be computed in SQL — that is where the F30 defect lived, \
+             and the point of the fix is that the combining rule (MemoryConsentMode::stricter_of) \
+             is somewhere a query cannot route around: {sql}"
+        );
+    }
+
+    /// F30 — the set of places `src/infra` touches a consent column, pinned.
+    ///
+    /// # Why a count, and what it is really for
+    ///
+    /// F30's failure mode is not the reader that exists; it is **the next one**. The defect above
+    /// was written in SQL, where no Rust helper could be in its way, and it read one of two
+    /// columns in six words. Making `MemoryConsentMode::stricter_of` the single combining rule
+    /// stops a *decision* being reimplemented, but nothing stops a new query from selecting one
+    /// column and calling it an answer. This is what notices.
+    ///
+    /// The expected table is hand-written and compared against a fresh walk of the tree, which is
+    /// F52's rule: an inventory derived from the thing it checks agrees with it by construction.
+    /// It is deliberately **bidirectional** — a mention appearing and a mention disappearing both
+    /// go red — because a guard that only counts upward cannot see a reader being deleted, which
+    /// is HANDOFF §3.4's thirteenth shape.
+    ///
+    /// # Honest about its limits
+    ///
+    /// It cannot tell a correct reader from an incorrect one; it can only say the set moved. A red
+    /// here means "someone touched consent in the data layer — go and check they took both
+    /// columns", and the message says so. It is scoped to `src/infra` because that is where SQL is
+    /// written; the application layer is covered structurally instead, by
+    /// `status_for_consent_mode` being private so that the single-column answer has no ready-made
+    /// caller.
+    #[test]
+    fn the_consent_columns_are_touched_only_where_this_test_says_they_are() {
+        // Split so this file's own source does not match the walk it performs.
+        let conversation_column = concat!("memory_consent", "_mode");
+        let memory_column = concat!("consent", "_mode");
+        // Helper names embed the conversation column's spelling and are not consent reads.
+        let helpers = [
+            concat!("memory_consent", "_mode_from_db"),
+            concat!("memory_consent", "_mode_to_db"),
+        ];
+
+        // (path relative to the crate root, memory-policy mentions, conversation-policy mentions)
+        let expected: &[(&str, usize, usize)] = &[
+            // 4: two column aliases read back in `effective_memory_behavior`, and the
+            //    `MemoryPolicyRecord` mapper's field plus its column name.
+            // 2: the `ConversationPolicyRecord` mapper's field plus its column name.
+            ("src/infra/pg_rows.rs", 4, 2),
+            // 7 / 7: the two policy upserts (column list, on-conflict merge, bind — each column
+            //        appearing twice in its own merge line), plus the two raw columns
+            //        `conversation_select` now emits, plus two test-fixture mentions.
+            ("src/infra/repositories/conversation.rs", 7, 7),
+        ];
+
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        rust_sources_under(&manifest.join("src").join("infra"), &mut files);
+        assert!(
+            files.len() > 3,
+            "the source walker found only {} files under src/infra — it is broken, \
+             and a broken walker asserts nothing",
+            files.len()
+        );
+
+        let mut actual: Vec<(String, usize, usize)> = Vec::new();
+        for file in &files {
+            let source = std::fs::read_to_string(file)
+                .unwrap_or_else(|error| panic!("read {}: {error}", file.display()));
+            let (mut memory, mut conversation) = (0usize, 0usize);
+            for line in source.lines() {
+                // A mention in prose is not a read. `///` is caught by the same split.
+                let mut code = line.split("//").next().unwrap_or("").to_string();
+                for helper in helpers {
+                    code = code.replace(helper, "");
+                }
+                let here = code.matches(conversation_column).count();
+                conversation += here;
+                memory += code.matches(memory_column).count() - here;
+            }
+            if memory > 0 || conversation > 0 {
+                let relative = file
+                    .strip_prefix(manifest)
+                    .unwrap_or(file)
+                    .display()
+                    .to_string();
+                actual.push((relative, memory, conversation));
+            }
+        }
+        actual.sort();
+
+        let expected: Vec<(String, usize, usize)> = expected
+            .iter()
+            .map(|(path, memory, conversation)| (path.to_string(), *memory, *conversation))
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "the places src/infra touches a consent column have changed. There are two consent \
+             columns and they must be read together (MemoryConsentMode::stricter_of); a query \
+             that selects one of them is finding F30 happening again. If the new site is correct, \
+             update the table above and say why."
+        );
+    }
+
+    /// Every `.rs` file under a directory, recursively.
+    fn rust_sources_under(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                rust_sources_under(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
 
     /// **F14's third clause, as a test.** Every `memory_records` read that compares content
     /// across rows must bind `application_id` in the same query.
