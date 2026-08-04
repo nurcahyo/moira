@@ -1,0 +1,256 @@
+# Prometheus alerting rules for Moira.
+#
+# Load with `rule_files:` in prometheus.yml, or as the `spec.groups` of a
+# PrometheusRule custom resource (see README.md).
+#
+# Every `expr` names a metric family declared in `src/infra/metrics.rs`. The one
+# exception is `up`, which Prometheus synthesises for each scrape target and is
+# the only way to distinguish "the process is gone" from "the process is idle".
+#
+# The `job=~"moira.*"` matcher assumes the scrape job is named `moira` (or
+# `moira-something`). Change it to match your own job naming; nothing else in
+# this file depends on it.
+#
+# Severity convention used here:
+#   critical - page a human now
+#   warning  - ticket / next business day
+---
+groups:
+  - name: moira-availability
+    interval: 30s
+    rules:
+      - alert: MoiraServiceDown
+        # `up` is Prometheus' own per-target scrape health, not a Moira metric.
+        # A Moira counter cannot express "the process stopped answering".
+        expr: up{job=~"moira.*"} == 0
+        for: 5m
+        labels:
+          severity: critical
+          service: moira
+        annotations:
+          summary: "Moira target {{ $labels.instance }} is not being scraped"
+          description: >-
+            Prometheus has failed to scrape {{ $labels.instance }} for 5 minutes.
+            Either the process is down, /metrics is unreachable, or
+            MOIRA_TELEMETRY__PROMETHEUS_ENABLED was turned off (the endpoint then
+            answers 404 and the scrape fails).
+
+      - alert: MoiraHighServerErrorRate
+        expr: >-
+          sum by (job, service) (rate(moira_http_response_status_class_total{status_class="5xx"}[5m]))
+            /
+          clamp_min(sum by (job, service) (rate(moira_http_response_status_class_total[5m])), 1e-9)
+            > 0.05
+        for: 10m
+        labels:
+          severity: critical
+          service: moira
+        annotations:
+          summary: "Moira is serving more than 5% 5xx ({{ $value | humanizePercentage }})"
+          description: >-
+            moira_http_response_status_class_total shows the 5xx share of all
+            responses above 5% for 10 minutes on job {{ $labels.job }}. Check the
+            provider-execution panels first: most Moira 5xx originate in an
+            upstream provider attempt rather than in Moira itself.
+
+      - alert: MoiraProviderFailureRateHigh
+        expr: >-
+          sum by (job, provider_type) (rate(moira_provider_outcome_total{outcome!~"succeeded|cancelled"}[5m]))
+            /
+          clamp_min(sum by (job, provider_type) (rate(moira_provider_outcome_total[5m])), 1e-9)
+            > 0.25
+        for: 10m
+        labels:
+          severity: critical
+          service: moira
+        annotations:
+          summary: "Provider {{ $labels.provider_type }} is failing {{ $value | humanizePercentage }} of attempts"
+          description: >-
+            moira_provider_outcome_total: more than a quarter of execution
+            attempts against provider type {{ $labels.provider_type }} ended in a
+            failure class rather than `succeeded` or `cancelled`, for 10 minutes.
+            Break it down by the `outcome` label to separate a provider outage
+            (provider_unavailable, provider_timeout, provider_upstream_error)
+            from a configuration fault (credential_*, provider_configuration_invalid).
+
+      - alert: MoiraProviderCircuitOpen
+        expr: sum by (job, provider_type, model_key) (rate(moira_provider_outcome_total{outcome="circuit_open"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+          service: moira
+        annotations:
+          summary: "Circuit breaker open for {{ $labels.provider_type }} / {{ $labels.model_key }}"
+          description: >-
+            moira_provider_outcome_total{outcome="circuit_open"} has been
+            incrementing for 5 minutes, so requests are being rejected before
+            they reach the provider. Traffic is being shed, not served.
+
+      - alert: MoiraProviderAuthFailing
+        expr: sum by (job, provider_type) (rate(moira_provider_outcome_total{outcome=~"provider_authentication_failed|credential_expired|credential_decryption_failed"}[10m])) > 0
+        for: 15m
+        labels:
+          severity: critical
+          service: moira
+        annotations:
+          summary: "Credential problem on provider {{ $labels.provider_type }}"
+          description: >-
+            moira_provider_outcome_total is recording
+            provider_authentication_failed, credential_expired or
+            credential_decryption_failed. This does not recover on its own — a
+            key has to be rotated or re-encrypted.
+
+  - name: moira-saturation
+    interval: 30s
+    rules:
+      - alert: MoiraDbPoolNearExhaustion
+        expr: >-
+          (
+            sum by (job, service) (moira_db_pool_connections{state="total"})
+              -
+            sum by (job, service) (moira_db_pool_connections{state="idle"})
+          )
+            /
+          clamp_min(sum by (job, service) (moira_db_pool_connections{state="total"}), 1)
+            > 0.9
+        for: 10m
+        labels:
+          severity: critical
+          service: moira
+        annotations:
+          summary: "PostgreSQL pool over 90% in use on {{ $labels.job }}"
+          description: >-
+            moira_db_pool_connections: fewer than 10% of pool slots have been idle
+            for 10 minutes. The gauges are sampled once per scrape, so a short
+            spike will not trip this; a sustained one means requests are queueing
+            for a connection.
+
+      - alert: MoiraWorkerQueueRejectingEnqueues
+        expr: sum by (job) (rate(moira_worker_queue_enqueue_rejected_total[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+          service: moira
+        annotations:
+          summary: "Worker queue is refusing new jobs on {{ $labels.job }}"
+          description: >-
+            moira_worker_queue_enqueue_rejected_total is incrementing, which means
+            the queue's pending-depth cap was reached and work is being dropped at
+            the door. Moira exports no queue-depth gauge, so this counter is the
+            saturation signal for the queue.
+
+      - alert: MoiraHttpLatencyP95High
+        expr: >-
+          histogram_quantile(
+            0.95,
+            sum by (job, le) (rate(moira_http_request_duration_seconds_bucket[5m]))
+          ) > 2
+        for: 15m
+        labels:
+          severity: warning
+          service: moira
+        annotations:
+          summary: "Moira p95 HTTP latency above 2s on {{ $labels.job }}"
+          description: >-
+            moira_http_request_duration_seconds: the 95th percentile has been over
+            two seconds for 15 minutes. Note the bucket set tops out at 10s, so a
+            value pinned at 10 means "at least 10s", not exactly 10.
+
+  - name: moira-background
+    interval: 1m
+    rules:
+      - alert: MoiraWorkerJobsDeadLettered
+        expr: sum by (job, job_name) (increase(moira_worker_jobs_dead_letter_total[15m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: moira
+        annotations:
+          summary: "Worker job {{ $labels.job_name }} exhausted its retries"
+          description: >-
+            moira_worker_jobs_dead_letter_total increased for job
+            {{ $labels.job_name }}: at least one job hit max_attempts and will not
+            be retried again. Nothing else will surface this.
+
+      - alert: MoiraRedisOperationsFailing
+        expr: sum by (job, operation) (rate(moira_redis_operation_failures_total[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+          service: moira
+        annotations:
+          summary: "Redis operation {{ $labels.operation }} is failing"
+          description: >-
+            moira_redis_operation_failures_total is incrementing for operation
+            {{ $labels.operation }}. Redis coordination is off by default, so this
+            family stays flat at zero unless the deployment enabled it; a non-zero
+            rate means an enabled coordination path is degraded.
+
+      - alert: MoiraRetrievalFailing
+        expr: >-
+          sum by (job) (rate(moira_retrieval_runs_total{outcome="failed"}[10m]))
+            /
+          clamp_min(sum by (job) (rate(moira_retrieval_runs_total[10m])), 1e-9)
+            > 0.1
+        for: 15m
+        labels:
+          severity: warning
+          service: moira
+        annotations:
+          summary: "Over 10% of retrieval passes are failing on {{ $labels.job }}"
+          description: >-
+            moira_retrieval_runs_total: under the default failure_behavior a failed
+            retrieval is invisible to the caller — the answer is simply produced
+            without its context. This counter and the retrieval_runs table are the
+            only places it shows up.
+
+      - alert: MoiraMemoryExtractionFailing
+        expr: >-
+          sum by (job) (rate(moira_memory_extraction_runs_total{outcome="failed"}[10m]))
+            /
+          clamp_min(sum by (job) (rate(moira_memory_extraction_runs_total[10m])), 1e-9)
+            > 0.25
+        for: 30m
+        labels:
+          severity: warning
+          service: moira
+        annotations:
+          summary: "Automatic memory extraction is failing on {{ $labels.job }}"
+          description: >-
+            moira_memory_extraction_runs_total: extraction never surfaces an error
+            to the caller, so a failing extractor is silent. Zero traffic on this
+            family is normal — automatic_extraction_enabled is off by default — and
+            the ratio is undefined rather than alerting when nothing runs.
+
+      - alert: MoiraSummarizationFailing
+        expr: >-
+          sum by (job) (rate(moira_summarization_runs_total{outcome="failed"}[10m]))
+            /
+          clamp_min(sum by (job) (rate(moira_summarization_runs_total[10m])), 1e-9)
+            > 0.25
+        for: 30m
+        labels:
+          severity: warning
+          service: moira
+        annotations:
+          summary: "Conversation summarization is failing on {{ $labels.job }}"
+          description: >-
+            moira_summarization_runs_total: the automatic summarization path does
+            not return its failure to the caller. A conversation's context quietly
+            stops carrying a summary instead.
+
+      - alert: MoiraSummariesStoringInlineReasoning
+        expr: sum by (job) (rate(moira_summarization_inline_reasoning_total[15m])) > 0
+        for: 30m
+        labels:
+          severity: warning
+          service: moira
+        annotations:
+          summary: "Stored summaries contain the model's chain of thought"
+          description: >-
+            moira_summarization_inline_reasoning_total is non-zero: the
+            summarization backend is a reasoning model serving its chain of thought
+            as ordinary text, and that text is being stored verbatim as the summary
+            (finding F57). Start the backend with a reasoning parser — for vLLM,
+            --reasoning-parser — so the block arrives in its own field, which Moira
+            already discards.
