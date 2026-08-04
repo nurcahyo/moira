@@ -50,7 +50,7 @@
 // endpoint URLs, and the browser is not offered a way to call auth-methods
 // itself.
 
-import { isInteractiveMethod, isProviderSlug } from "@/lib/auth-config";
+import { consoleProviderIdFor, isInteractiveMethod, isProviderSlug } from "@/lib/auth-config";
 import { readJsonBody } from "@/lib/console-api";
 import { isMoiraRequestError } from "@/lib/errors";
 import { CONSOLE_MESSAGE_KEYS } from "@/lib/i18n/keys";
@@ -295,6 +295,10 @@ async function provision(context: SetupWindowContext, body: SetupRequestBody): P
       {
         submission_id: submissionId,
         console_issuer: consoleConfig.issuer,
+        // Better Auth's providerId for this provider, derived by the ONE server
+        // function that owns the derivation. The wizard's sign-in step posts it
+        // to `/api/auth/sign-in/oauth2`; it is an identifier, not a credential.
+        provider_id: consoleProviderIdFor(context.env.bffIssuerUrl, consoleConfig.issuer),
         state: result.state,
         trace: result.trace,
       },
