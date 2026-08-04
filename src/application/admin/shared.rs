@@ -80,13 +80,16 @@ pub(crate) const TRUSTED_JWT_ISSUERS_CURSOR: CursorScope =
     CursorScope::new("admin.trusted_jwt_issuers");
 pub(crate) const AUDIT_LOGS_CURSOR: CursorScope = CursorScope::new("admin.audit_logs");
 
-/// What a paginated admin list needs from its caller: how many rows, and where to resume.
+/// What a paginated list needs from its caller: how many rows, and where to resume.
 ///
-/// # There is exactly one way to build one, deliberately
+/// # Every way to build one takes the cursor too, deliberately
 ///
-/// [`From<&PageQuery>`] is the only constructor. It carries both the `limit` *and* the
-/// `cursor` query parameter through to the service, so a handler cannot obtain a
-/// `PageRequest` without having decided what to do about the cursor.
+/// [`From<&PageQuery>`] covers the admin lists;
+/// [`Self::from_limit_and_cursor`] is what the public lists' own query types go through
+/// (`impl From<&ExecutionQuery>` and friends live in `crate::application::public`, next to
+/// the services that use them). Both carry the `limit` *and* the `cursor` through to the
+/// service, so a handler cannot obtain a `PageRequest` without having decided what to do
+/// about the cursor.
 ///
 /// An earlier revision also had a `From<i64>` bridge that hardcoded `cursor: None`, so a
 /// handler passing a bare `query.limit()` still type-checked while silently dropping the
@@ -103,6 +106,16 @@ pub struct PageRequest {
 }
 
 impl PageRequest {
+    /// The constructor the public list query types go through (issue #93).
+    ///
+    /// Both arguments are required, which is the whole guarantee: there is still no way to
+    /// name a page size without also naming what happens to the cursor. `limit` must already
+    /// be clamped by the query type it came from — this does not clamp, because the two
+    /// surfaces' clamps are theirs to define.
+    pub(crate) fn from_limit_and_cursor(limit: i64, cursor: Option<String>) -> Self {
+        Self { limit, cursor }
+    }
+
     /// Rows the caller asked for, clamped. The repository fetches one more than this.
     pub fn limit(&self) -> i64 {
         self.limit

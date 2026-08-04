@@ -3,7 +3,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
-use sqlx::{PgConnection, PgPool, Postgres, Row, Transaction, postgres::PgArguments, query::Query};
+use sqlx::{PgConnection, PgPool, Postgres, Row, Transaction};
 use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
@@ -25,6 +25,8 @@ use crate::{
     },
     security::EncryptedSecret,
 };
+
+use super::keyset::{KeysetTail, bind_cursor, over_fetch_limit};
 
 #[derive(Debug, Clone)]
 pub struct PgAdminRepository {
@@ -2444,92 +2446,6 @@ async fn insert_audit_with_connection(
     Ok(())
 }
 
-/// How many rows a list query actually asks Postgres for.
-///
-/// One more than the caller wants. That extra row is the existence proof for `has_more`:
-/// the application layer trims it off and reports `has_more = true` if it was there. It is
-/// what keeps `has_more` from costing a second `count(*)` over the whole table on every
-/// single page.
-fn over_fetch_limit(limit: i64) -> i64 {
-    limit.saturating_add(1)
-}
-
-/// The `order by` / `limit` tail shared by every admin list query, plus the optional
-/// keyset predicate that makes the advertised `cursor` parameter real.
-///
-/// Two things here are load-bearing:
-///
-/// * **Strictly less-than.** Every admin list is ordered descending, so "the page after
-///   this cursor" is the rows whose sort key is strictly *below* it. `<=` would re-emit
-///   the cursor row itself at the top of every page.
-/// * **The `id` tiebreaker.** The comparison is on the row constructor
-///   `(sort_column, id)`, not on `sort_column` alone. Without the `id` leg, rows sharing a
-///   timestamp come back in an unspecified order, and a page boundary landing inside such
-///   a group silently skips or repeats rows — the exact defect P1-4 describes. None of the
-///   nine admin lists had this tiebreaker before plan 04.
-///
-/// `sort_column` is always a literal chosen by the call sites in this file and is never
-/// caller input. The cursor's *values* never reach the SQL text at all: they are bound as
-/// parameters by [`bind_cursor`].
-struct KeysetTail {
-    /// The bare keyset condition, or `None` when the caller asked for the first page.
-    condition: Option<String>,
-    order_and_limit: String,
-}
-
-impl KeysetTail {
-    /// `first_param` is the next unused `$n` after the query's own fixed parameters, so
-    /// the numbering stays correct whether or not a cursor is present.
-    fn new(sort_column: &str, cursor: Option<&ListCursor>, first_param: usize) -> Self {
-        let (condition, limit_param) = match cursor {
-            Some(_) => (
-                Some(format!(
-                    "({sort_column}, id) < (${first_param}::timestamptz, ${}::uuid)",
-                    first_param + 1
-                )),
-                first_param + 2,
-            ),
-            None => (None, first_param),
-        };
-
-        Self {
-            condition,
-            order_and_limit: format!("order by {sort_column} desc, id desc limit ${limit_param}"),
-        }
-    }
-
-    /// The condition as an `and …` clause, for a query that already has a `where`.
-    fn and_clause(&self) -> String {
-        match &self.condition {
-            Some(condition) => format!("and {condition}"),
-            None => String::new(),
-        }
-    }
-
-    /// The condition as a `where …` clause, for a query that has none (`audit_logs`).
-    fn where_clause(&self) -> String {
-        match &self.condition {
-            Some(condition) => format!("where {condition}"),
-            None => String::new(),
-        }
-    }
-}
-
-/// Binds the cursor's two values, in the order [`KeysetTail`] numbered them.
-///
-/// This is the only place a cursor value meets a query, and it is a bind every time. A
-/// forged or malformed cursor has already been rejected by `ListCursor::decode`, and even
-/// a valid one is a typed `DateTime<Utc>` / `Uuid` that cannot reach the SQL text.
-fn bind_cursor<'q>(
-    query: Query<'q, Postgres, PgArguments>,
-    cursor: Option<&ListCursor>,
-) -> Query<'q, Postgres, PgArguments> {
-    match cursor {
-        Some(cursor) => query.bind(cursor.ts).bind(cursor.id),
-        None => query,
-    }
-}
-
 fn credential_select_sql(suffix: &str) -> String {
     format!(
         r#"
@@ -2714,139 +2630,4 @@ async fn lock_and_match_version(
         return Err(version_conflict());
     }
     Ok(current_version)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn cursor() -> ListCursor {
-        ListCursor::new(
-            DateTime::from_timestamp_micros(1_753_401_600_123_456).expect("in-range timestamp"),
-            Uuid::parse_str("018f3a7c-1c2d-7e4f-8a9b-0c1d2e3f4a5b").expect("valid uuid"),
-        )
-    }
-
-    #[test]
-    fn keyset_predicate_is_omitted_when_no_cursor_is_supplied() {
-        let tail = KeysetTail::new("created_at", None, 1);
-
-        assert_eq!(tail.and_clause(), "");
-        assert_eq!(tail.where_clause(), "");
-        // With no cursor, the limit takes the first free parameter slot.
-        assert_eq!(
-            tail.order_and_limit,
-            "order by created_at desc, id desc limit $1"
-        );
-    }
-
-    #[test]
-    fn keyset_predicate_uses_strict_less_than_for_descending_lists() {
-        let tail = KeysetTail::new("created_at", Some(&cursor()), 1);
-
-        assert_eq!(
-            tail.and_clause(),
-            "and (created_at, id) < ($1::timestamptz, $2::uuid)"
-        );
-        // `<=` would re-emit the cursor row at the top of every page.
-        assert!(!tail.and_clause().contains("<="));
-        assert!(!tail.and_clause().contains('>'));
-    }
-
-    #[test]
-    fn keyset_predicate_uses_the_occurred_at_column_for_audit_logs() {
-        // The one admin list whose sort key is not `created_at`, and the one that has to
-        // introduce its own `where`.
-        let tail = KeysetTail::new("occurred_at", Some(&cursor()), 1);
-
-        assert_eq!(
-            tail.where_clause(),
-            "where (occurred_at, id) < ($1::timestamptz, $2::uuid)"
-        );
-        assert_eq!(
-            tail.order_and_limit,
-            "order by occurred_at desc, id desc limit $3"
-        );
-        assert!(!tail.where_clause().contains("created_at"));
-    }
-
-    #[test]
-    fn every_keyset_ordering_carries_the_id_tiebreaker() {
-        // Without `id desc`, rows sharing a timestamp come back in an unspecified order and
-        // a page boundary inside such a group silently skips or repeats them. All nine
-        // admin lists lacked this before plan 04.
-        for column in ["created_at", "occurred_at"] {
-            for cursor in [None, Some(&cursor())] {
-                let tail = KeysetTail::new(column, cursor, 1);
-                assert!(
-                    tail.order_and_limit
-                        .starts_with(&format!("order by {column} desc, id desc limit $")),
-                    "missing id tiebreaker for {column}: {}",
-                    tail.order_and_limit
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn keyset_parameter_numbering_follows_the_querys_own_fixed_parameters() {
-        // `list_provider_models` and `list_user_credentials` each bind one fixed parameter
-        // before the cursor, so the cursor starts at `$2` and the limit lands at `$4`.
-        let tail = KeysetTail::new("created_at", Some(&cursor()), 2);
-        assert_eq!(
-            tail.and_clause(),
-            "and (created_at, id) < ($2::timestamptz, $3::uuid)"
-        );
-        assert_eq!(
-            tail.order_and_limit,
-            "order by created_at desc, id desc limit $4"
-        );
-
-        // …and without a cursor the limit moves up to the slot the cursor would have used.
-        let first_page = KeysetTail::new("created_at", None, 2);
-        assert_eq!(
-            first_page.order_and_limit,
-            "order by created_at desc, id desc limit $2"
-        );
-    }
-
-    #[test]
-    fn keyset_predicate_binds_parameters_and_never_interpolates_values() {
-        // The strongest form of this assertion: two cursors that share no bytes must
-        // produce byte-identical SQL. If any cursor-derived value ever reached the query
-        // text, these would differ.
-        let one = ListCursor::new(
-            DateTime::from_timestamp_micros(1).expect("in-range timestamp"),
-            Uuid::parse_str("ffffffff-ffff-4fff-bfff-ffffffffffff").expect("valid uuid"),
-        );
-        let two = cursor();
-
-        for column in ["created_at", "occurred_at"] {
-            let a = KeysetTail::new(column, Some(&one), 1);
-            let b = KeysetTail::new(column, Some(&two), 1);
-
-            assert_eq!(a.and_clause(), b.and_clause());
-            assert_eq!(a.where_clause(), b.where_clause());
-            assert_eq!(a.order_and_limit, b.order_and_limit);
-
-            // And nothing that looks like a value is present at all — only `$n` holes.
-            let fragment = format!("{} {}", a.where_clause(), a.order_and_limit);
-            for forbidden in ["ffffffff", "018f3a7c", "1753401600", "'", "1970"] {
-                assert!(
-                    !fragment.contains(forbidden),
-                    "cursor-derived literal {forbidden:?} leaked into SQL: {fragment}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn over_fetch_limit_is_limit_plus_one() {
-        assert_eq!(over_fetch_limit(1), 2);
-        assert_eq!(over_fetch_limit(50), 51);
-        assert_eq!(over_fetch_limit(200), 201);
-        // Never panics on a hostile value, and never wraps to a negative limit — Postgres
-        // rejects a negative `LIMIT`, so wrapping would turn a bad input into a 500.
-        assert_eq!(over_fetch_limit(i64::MAX), i64::MAX);
-    }
 }

@@ -12,19 +12,21 @@ use crate::{
     app::AppState,
     application::{
         ConversationExecutionLink, ConversationService, ExecutionService, RequestContext,
+        admin::{PageRequest, shared::paginate},
     },
     domain::{
         ApplicationExecutionPolicyPutRequest, ApplicationExecutionPolicyRecord, AuditLogInsert,
-        AuditResult, CallerRuntimeIdentity, DomainMessage, DomainMessageContent, DomainMessageRole,
-        ExecutionCommand, ExecutionFailure, ExecutionFailureClass, ExecutionOptions,
-        ExecutionOutcome, ExecutionQuery, ExecutionStatus, IdempotencyRecord, ListResponse,
-        OpenAiCompatTextFormat, OpenAiCompatTextOptions, OpenAiResponseCompatRequest,
-        PublicCapabilities, PublicCitation, PublicContentPart, PublicConversationRef,
-        PublicExecutionSummary, PublicInputMessage, PublicMessageRole, PublicModelRef,
-        PublicModelResource, PublicOutputContentPart, PublicOutputItem, PublicResponse,
-        PublicResponseFormat, PublicResponseRecord, PublicResponseRequest, PublicResponseStatus,
-        PublicRouteRef, PublicRouteResource, PublicSseEnvelope, PublicUsageRecord,
-        PublicUsageSummary, RuntimeEventEnvelope, RuntimeEventType, UsageQuery,
+        AuditResult, CallerRuntimeIdentity, CursorScope, DomainMessage, DomainMessageContent,
+        DomainMessageRole, ExecutionCommand, ExecutionFailure, ExecutionFailureClass,
+        ExecutionOptions, ExecutionOutcome, ExecutionQuery, ExecutionStatus, IdempotencyRecord,
+        Keyed, ListResponse, OpenAiCompatTextFormat, OpenAiCompatTextOptions,
+        OpenAiResponseCompatRequest, PublicCapabilities, PublicCitation, PublicContentPart,
+        PublicConversationRef, PublicExecutionSummary, PublicInputMessage, PublicListQuery,
+        PublicMessageRole, PublicModelRef, PublicModelResource, PublicOutputContentPart,
+        PublicOutputItem, PublicResponse, PublicResponseFormat, PublicResponseRecord,
+        PublicResponseRequest, PublicResponseStatus, PublicRouteRef, PublicRouteResource,
+        PublicSseEnvelope, PublicUsageRecord, PublicUsageSummary, RuntimeEventEnvelope,
+        RuntimeEventType, UsageQuery,
     },
     error::AppError,
     infra::repositories::{
@@ -34,6 +36,64 @@ use crate::{
     },
     security::{Actor, ActorType, IdempotencyHasher, secret_fingerprint},
 };
+
+/// Cursor scopes for the four public lists (issue #93).
+///
+/// Same contract as the admin scopes in `crate::application::admin::shared`: the label is
+/// mixed into the cursor's integrity tag but never stored inside it, so a cursor minted by
+/// one list fails closed with `400 invalid_cursor` on another instead of paging through an
+/// unrelated key space. `/v1/executions` and `/v1/usage` are the pair that most needs it —
+/// both are `(timestamp, uuid)` over rows keyed by the same execution, so nothing in the
+/// payload distinguishes them.
+const EXECUTIONS_CURSOR: CursorScope = CursorScope::new("public.executions");
+const USAGE_CURSOR: CursorScope = CursorScope::new("public.usage");
+const MODELS_CURSOR: CursorScope = CursorScope::new("public.models");
+const ROUTES_CURSOR: CursorScope = CursorScope::new("public.routes");
+
+/// The public list queries reach the shared [`PageRequest`] the same way `PageQuery` does:
+/// by a `From` that carries **both** the limit and the cursor.
+///
+/// That is the whole point of the conversion existing at all. `PageRequest` deliberately has
+/// no constructor taking a bare limit, because the nine admin lists once shipped exactly that
+/// — they compiled, they paginated, and they silently dropped every cursor a caller sent. The
+/// four public lists shipped the same defect for longer: they advertised a `cursor` parameter
+/// and bound it to no SQL whatsoever. Going through `PageRequest` means a handler cannot get
+/// a page size here without having also handed over the cursor.
+impl From<&ExecutionQuery> for PageRequest {
+    fn from(query: &ExecutionQuery) -> Self {
+        Self::from_limit_and_cursor(query.limit(), query.cursor.clone())
+    }
+}
+
+impl From<&UsageQuery> for PageRequest {
+    fn from(query: &UsageQuery) -> Self {
+        Self::from_limit_and_cursor(query.limit(), query.cursor.clone())
+    }
+}
+
+impl From<&PublicListQuery> for PageRequest {
+    fn from(query: &PublicListQuery) -> Self {
+        Self::from_limit_and_cursor(query.limit(), query.cursor.clone())
+    }
+}
+
+/// Assembles a public page from the repository's over-fetched, key-tagged rows.
+///
+/// This is `crate::application::admin::shared::paginate` with the [`Keyed`] wrapper peeled
+/// off afterwards — the trimming, the `has_more` arithmetic and the "encode the last row
+/// actually returned, never the over-fetched one" rule are that function's, not a second
+/// copy of them. The only thing done here is dropping the sort keys, which exist so the
+/// cursor can be minted and must not reach the wire.
+fn paginate_public<T>(
+    rows: Vec<Keyed<T>>,
+    page: &PageRequest,
+    scope: CursorScope,
+) -> ListResponse<T> {
+    let keyed = paginate(rows, page, scope, |row| row.key);
+    let mut response = ListResponse::new(keyed.data.into_iter().map(|row| row.row).collect());
+    response.pagination = keyed.pagination;
+    response
+}
 
 #[derive(Clone)]
 pub struct PublicExecutionService {
@@ -766,10 +826,16 @@ impl PublicExecutionService {
             actor,
             can_read_all(actor, "moira:executions:read", &self.state),
         )?;
-        self.public_repo
-            .list_executions_authorized(&access, query)
-            .await
-            .map(ListResponse::new)
+        // Decoded after the authorization check and before the query, exactly as the admin
+        // lists do it: an unauthorized caller learns nothing about cursor validity, and a
+        // bad cursor never reaches Postgres.
+        let page = PageRequest::from(query);
+        let cursor = page.decode(EXECUTIONS_CURSOR)?;
+        let rows = self
+            .public_repo
+            .list_executions_authorized(&access, cursor, page.limit())
+            .await?;
+        Ok(paginate_public(rows, &page, EXECUTIONS_CURSOR))
     }
 
     pub async fn list_usage(
@@ -780,44 +846,56 @@ impl PublicExecutionService {
     ) -> Result<ListResponse<PublicUsageRecord>, AppError> {
         self.state.authz.require(actor, "moira:usage:read")?;
         let access = public_access(actor, can_read_all(actor, "moira:usage:read", &self.state))?;
-        let records = self
+        let page = PageRequest::from(query);
+        let cursor = page.decode(USAGE_CURSOR)?;
+        let rows = self
             .public_repo
-            .list_usage_authorized(&access, query)
+            .list_usage_authorized(&access, query, cursor)
             .await?;
+        let response = paginate_public(rows, &page, USAGE_CURSOR);
+        // Counts the rows the caller actually receives, not the over-fetched probe row.
         self.audit(
             actor,
             ctx,
             "usage.read",
             AuditResult::Success,
             None,
-            json!({ "count": records.len() }),
+            json!({ "count": response.data.len() }),
         )
         .await?;
-        Ok(ListResponse::new(records))
+        Ok(response)
     }
 
     pub async fn list_models(
         &self,
         actor: &Actor,
+        query: &PublicListQuery,
     ) -> Result<ListResponse<PublicModelResource>, AppError> {
         self.state.authz.require(actor, "moira:models:read")?;
         let access = public_access(actor, false)?;
-        self.public_repo
-            .list_visible_models(&access, 200)
-            .await
-            .map(ListResponse::new)
+        let page = PageRequest::from(query);
+        let cursor = page.decode(MODELS_CURSOR)?;
+        let rows = self
+            .public_repo
+            .list_visible_models(&access, cursor, page.limit())
+            .await?;
+        Ok(paginate_public(rows, &page, MODELS_CURSOR))
     }
 
     pub async fn list_routes(
         &self,
         actor: &Actor,
+        query: &PublicListQuery,
     ) -> Result<ListResponse<PublicRouteResource>, AppError> {
         self.state.authz.require(actor, "moira:routes:read")?;
         let access = public_access(actor, false)?;
-        self.public_repo
-            .list_visible_routes(&access, 200)
-            .await
-            .map(ListResponse::new)
+        let page = PageRequest::from(query);
+        let cursor = page.decode(ROUTES_CURSOR)?;
+        let rows = self
+            .public_repo
+            .list_visible_routes(&access, cursor, page.limit())
+            .await?;
+        Ok(paginate_public(rows, &page, ROUTES_CURSOR))
     }
 
     pub async fn capabilities(&self, actor: &Actor) -> Result<PublicCapabilities, AppError> {

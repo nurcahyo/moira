@@ -235,6 +235,31 @@ impl ListCursor {
     }
 }
 
+/// A row paired with the keyset position it occupies (issue #93).
+///
+/// The nine admin lists need nothing like this: their record types are internal and already
+/// carry both halves of the sort key, so `paginate` extracts it with a closure. The four
+/// public lists do not. `PublicUsageRecord` has no `id`, and `PublicModelResource` and
+/// `PublicRouteResource` have no timestamp — these are wire shapes, and widening them so the
+/// pagination layer can read a sort key would put a column on the public API for an internal
+/// reason, permanently.
+///
+/// So the repository, which is reading the sort key anyway, hands it back alongside the row.
+/// The mechanism above it is unchanged: over-fetch by one, trim, mint `next_cursor` from the
+/// last row actually returned. `key` is dropped when the page is assembled and never reaches
+/// the wire — deliberately no `Serialize`, so it cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Keyed<T> {
+    pub key: ListCursor,
+    pub row: T,
+}
+
+impl<T> Keyed<T> {
+    pub fn new(key: ListCursor, row: T) -> Self {
+        Self { key, row }
+    }
+}
+
 /// Cursor for a list ordered by an ascending, unique `sequence_number`.
 ///
 /// Intentionally **not** `Serialize`/`Deserialize`, for the same reason as [`ListCursor`].

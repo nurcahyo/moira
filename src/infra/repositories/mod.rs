@@ -3,6 +3,11 @@ mod auth_settings;
 mod cluster;
 mod conversation;
 mod identity;
+// Issue #93. The keyset SQL builder plan 04 wrote for the nine admin lists, lifted out of
+// `admin` so the four public lists page on the same predicate rather than a second copy of
+// it. Correctness here rests on `<` versus `<=` and on the `id` tiebreaker; two copies is
+// two places for one of those to drift.
+mod keyset;
 // F47. The auto-provisioning read behind every `get_or_create_*_policy`, in one place
 // because the five members live in two repositories and had drifted into two different
 // wrong answers — four that wrote on every read, one that raced on first touch.

@@ -26865,6 +26865,7 @@
         "operationId": "list_executions",
         "parameters": [
           {
+            "description": "Opaque `pagination.next_cursor` from a previous response for this same list.\nRejected with `400 invalid_cursor` if malformed, tampered with, or minted by a\ndifferent list.",
             "in": "query",
             "name": "cursor",
             "required": false,
@@ -26873,6 +26874,7 @@
             }
           },
           {
+            "description": "Rows per page. Defaults to 50 and is clamped to 1..=200.",
             "in": "query",
             "name": "limit",
             "required": false,
@@ -27663,6 +27665,25 @@
         "operationId": "list_models",
         "parameters": [
           {
+            "description": "Opaque `pagination.next_cursor` from a previous response for this same list.\nRejected with `400 invalid_cursor` if malformed, tampered with, or minted by a\ndifferent list.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Rows per page. Defaults to 50 and is clamped to 1..=200.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
             "description": "Optional caller-provided correlation identifier; generated when absent",
             "in": "header",
             "name": "X-Request-Id",
@@ -27682,6 +27703,24 @@
               }
             },
             "description": "Models available to the caller",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid query or pagination cursor",
             "headers": {
               "X-Request-Id": {
                 "description": "Request correlation identifier",
@@ -28360,6 +28399,25 @@
         "operationId": "list_routes",
         "parameters": [
           {
+            "description": "Opaque `pagination.next_cursor` from a previous response for this same list.\nRejected with `400 invalid_cursor` if malformed, tampered with, or minted by a\ndifferent list.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Rows per page. Defaults to 50 and is clamped to 1..=200.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
             "description": "Optional caller-provided correlation identifier; generated when absent",
             "in": "header",
             "name": "X-Request-Id",
@@ -28379,6 +28437,24 @@
               }
             },
             "description": "Routes available to the caller",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid query or pagination cursor",
             "headers": {
               "X-Request-Id": {
                 "description": "Request correlation identifier",
@@ -28534,6 +28610,7 @@
             }
           },
           {
+            "description": "Opaque `pagination.next_cursor` from a previous response for this same list.\nRejected with `400 invalid_cursor` if malformed, tampered with, or minted by a\ndifferent list.",
             "in": "query",
             "name": "cursor",
             "required": false,
@@ -28542,6 +28619,7 @@
             }
           },
           {
+            "description": "Rows per page. Defaults to 50 and is clamped to 1..=200.",
             "in": "query",
             "name": "limit",
             "required": false,
