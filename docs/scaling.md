@@ -6,9 +6,14 @@ Primary shared bottlenecks:
 
 - PostgreSQL connection pool
 - provider concurrency limits
-- Redis locks and token buckets
 - streaming connection count
 - vector search indexes
+- Redis rate-limit windows and concurrency permits — **only if Redis is enabled**, which it is
+  not by default (see the next section). In the shipped configuration these two controllers are
+  per-process memory, so they are not a *shared* bottleneck at all; they become one when you turn
+  Redis on. "Redis locks" was the wrong name for them either way: `RedisClient` exposes
+  `check_rate_window` and `try_acquire_permit`/`release_permit`, and the locks Moira actually
+  relies on cluster-wide — idempotency claims, leader election — are Postgres advisory locks.
 
 Use HPA for CPU as a baseline, but production autoscaling should also consider request latency, active streams, queue depth, and provider saturation.
 
