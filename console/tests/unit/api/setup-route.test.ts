@@ -237,6 +237,26 @@ const SIGNED_IN: SessionCheck = {
   // to against this, so a session fixture without it would be a session that
   // could claim in any namespace.
   consoleIssuer: CONSOLE_ISSUER,
+  // ...and the Moira ROW that configuration was resolved from. `provision`
+  // compares the derived row against this before it re-saves an ENABLED
+  // provider, so a fixture without it would be a session that could re-point
+  // any live sign-in provider.
+  moiraProviderId: PROVIDER_ID,
+};
+
+/** No session at all — the true state of an anonymous caller in the window. */
+const NO_SESSION: SessionCheck = {
+  ok: false,
+  rejection: "no_session",
+  messageKey: CONSOLE_MESSAGE_KEYS.session_required,
+};
+
+/** A real, allow-listed session established through a DIFFERENT provider row. */
+const SIGNED_IN_ELSEWHERE: SessionCheck = {
+  ok: true,
+  identity: { email: "ops@example.com", emailVerified: true, idpSubject: "sub-other" },
+  consoleIssuer: "https://console.example.com/idp/other",
+  moiraProviderId: "44444444-4444-4444-8444-444444444444",
 };
 
 let stub: MoiraStub;
@@ -735,8 +755,17 @@ describe("a partial write comes back resumable, with the remedy for its step", (
 // refused, and that the legitimate remedies still work.
 
 describe("the re-save target is server-derived, and `resume` is only a hint", () => {
-  /** A deployment whose console issuer already owns an enabled bound provider. */
-  function installReSavable(): void {
+  /**
+   * A deployment whose console issuer already owns an ENABLED bound provider.
+   *
+   * The session is passed EXPLICITLY rather than left to `install`'s default,
+   * because from this wave on it is load-bearing here: an enabled row is a live
+   * authenticator and may only be re-saved by a caller signed in through it, so
+   * a test that got its session by accident would be a test that stopped
+   * describing why it passes. `SIGNED_IN.moiraProviderId === PROVIDER_ID` — the
+   * row these handlers serve.
+   */
+  function installReSavable(session: SessionCheck = SIGNED_IN): void {
     install({
       handlers: handlers({
         [ISSUER_LIST_ROUTE]: populatedIssuerList,
@@ -754,6 +783,7 @@ describe("the re-save target is server-derived, and `resume` is only a hint", ()
           }),
         }),
       }),
+      session,
     });
     store.sealedIds.add(PROVIDER_ID);
   }
@@ -816,6 +846,10 @@ describe("the re-save target is server-derived, and `resume` is only a hint", ()
     // document (a back-navigation after a reload, say) sends no `resume`, and
     // the console still finds the row it owns, still patches it, and still does
     // not ask for a secret it already holds.
+    //
+    // What it does NOT do is admit an ANONYMOUS caller by the same door — the
+    // row is enabled, so the operator's session is still required. That is the
+    // group below; here the operator has one.
     installReSavable();
     const response = await POST(post(RE_SAVE_BODY));
     expect(response.status).toBe(201);
@@ -967,6 +1001,267 @@ describe("the re-save target is server-derived, and `resume` is only a hint", ()
     );
     expect(stub.routes()).not.toContain(PROVIDER_PATCH_ROUTE);
     expect(store.puts).toEqual([]);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* THE RESIDUAL: an ENABLED provider may only be re-saved by its own operator  */
+/* -------------------------------------------------------------------------- */
+//
+// Deriving the row server-side settled WHICH row a privileged write may touch.
+// It did not settle WHO may ask for that write, and for one shape of row that
+// is the whole risk. The setup window is open whenever a system key is present
+// and nobody has claimed. Inside it, an ANONYMOUS caller needs no `resume` at
+// all: `deriveProvisioningState` finds the console's OWN provider row for them,
+// and the update path PATCHes it — client id, issuer, discovery, authorization,
+// token, userinfo and jwks URLs, and `allowed_email_domains`. When that row is
+// already ENABLED, the allow-list is the last thing between an unclaimed
+// deployment and an attacker: re-point the endpoints at an IdP they control,
+// widen the allow-list to a domain they own, sign in, claim admin.
+//
+// The rule now: an enabled row is re-savable only by a caller carrying a valid
+// session established THROUGH THAT ROW. Absent and disabled rows are untouched
+// by it — an absent row is the first-run create, and a disabled row
+// authenticates nobody — and both are asserted below as controls, because the
+// cheapest way to "fix" the attack tests is to require a session for every
+// provision, which would make first-run setup impossible.
+
+describe("an ENABLED provider is not re-pointed by a caller who cannot prove they are the operator", () => {
+  const RE_POINT_BODY = {
+    ...PROVISION_BODY,
+    // The whole point of the write: another IdP, and a domain the caller owns.
+    issuer: "https://idp.attacker.example",
+    discovery_url: "https://idp.attacker.example/.well-known/openid-configuration",
+    client_id: "attacker-client-id",
+    client_secret: "attacker-client-secret",
+    allowed_email_domains: ["attacker.example"],
+  };
+
+  /**
+   * The enabled-row deployment, with every write route booby-trapped.
+   *
+   * `PROVIDER_PATCH_ROUTE` throwing is not belt and braces: `stub.routes()`
+   * proves no PATCH was RECORDED, and this proves none was ATTEMPTED even by a
+   * path that swallowed its own failure.
+   */
+  function installEnabledRow(session: SessionCheck): void {
+    install({
+      handlers: handlers({
+        [ISSUER_LIST_ROUTE]: populatedIssuerList,
+        [PROVIDER_LIST_ROUTE]: enabledProviderList,
+        [PROVIDER_GET_ROUTE]: () => ({
+          status: 200,
+          body: providerRecord({ enabled: true, version: 2 }),
+        }),
+        [PROVIDER_PATCH_ROUTE]: () => {
+          throw new Error("an enabled provider was PATCHed without an operator session");
+        },
+        [PROVIDER_CREATE_ROUTE]: () => {
+          throw new Error("a refused re-save must not fall back to creating a second row");
+        },
+      }),
+      session,
+    });
+    store.sealedIds.add(PROVIDER_ID);
+  }
+
+  /** The same deployment, but with the PATCH allowed to succeed. */
+  function installEnabledRowPatchable(session: SessionCheck): void {
+    install({
+      handlers: handlers({
+        [ISSUER_LIST_ROUTE]: populatedIssuerList,
+        [PROVIDER_LIST_ROUTE]: enabledProviderList,
+        [PROVIDER_GET_ROUTE]: () => ({
+          status: 200,
+          body: providerRecord({ enabled: true, version: 2 }),
+        }),
+        [PROVIDER_PATCH_ROUTE]: () => ({
+          status: 200,
+          body: providerRecord({
+            enabled: true,
+            version: 3,
+            allowed_email_domains: ["example.com", "gmail.com"],
+          }),
+        }),
+      }),
+      session,
+    });
+    store.sealedIds.add(PROVIDER_ID);
+  }
+
+  /** Nothing was written, by any route, on any store. */
+  function expectNothingWasWritten(): void {
+    expect(stub.routes()).not.toContain(PROVIDER_PATCH_ROUTE);
+    expect(stub.routes()).not.toContain(PROVIDER_CREATE_ROUTE);
+    expect(stub.routes()).not.toContain(PROVIDER_ENABLE_ROUTE);
+    expect(stub.routes()).not.toContain(ISSUER_CREATE_ROUTE);
+    // Belt: no write verb reached the stub at all, whatever its path.
+    expect(stub.routes().filter((route) => !route.startsWith("GET "))).toEqual([]);
+    expect(store.puts).toEqual([]);
+  }
+
+  test("THE ATTACK: no session at all — refused, and no write left the console", async () => {
+    installEnabledRow(NO_SESSION);
+    const response = await POST(post(RE_POINT_BODY));
+
+    expect(response.status).toBe(401);
+    const error = errorOf(await json(response));
+    expect(error["code"]).toBe("setup_enabled_provider_requires_session");
+    expect(error["message_key"]).toBe(
+      CONSOLE_MESSAGE_KEYS.setup_enabled_provider_requires_session,
+    );
+
+    // The refusal is not merely a status: the stub records the whole wire, and
+    // the only calls on it are the guard's claim-status read and the derivation
+    // that answered "this row is enabled". Nothing was read from the row, and
+    // nothing at all was written.
+    expect(stub.routes()).toEqual([CLAIM_STATUS_ROUTE, ISSUER_LIST_ROUTE, PROVIDER_LIST_ROUTE]);
+    expectNothingWasWritten();
+  });
+
+  test("THE VARIANT: a valid session through a DIFFERENT provider — refused the same way", async () => {
+    // Not a stranger: an allow-listed, verified, real session. It simply was not
+    // established through the row being rewritten. Without this case the gate
+    // could be satisfied by "some session exists", and on an unclaimed
+    // deployment any enabled provider can mint one.
+    installEnabledRow(SIGNED_IN_ELSEWHERE);
+    const response = await POST(post(RE_POINT_BODY));
+
+    expect(response.status).toBe(403);
+    const error = errorOf(await json(response));
+    expect(error["code"]).toBe("setup_enabled_provider_session_mismatch");
+    expect(error["message_key"]).toBe(
+      CONSOLE_MESSAGE_KEYS.setup_enabled_provider_session_mismatch,
+    );
+    expect(stub.routes()).toEqual([CLAIM_STATUS_ROUTE, ISSUER_LIST_ROUTE, PROVIDER_LIST_ROUTE]);
+    expectNothingWasWritten();
+  });
+
+  test("a session refused for another reason is a 403, not a 401", async () => {
+    // The two statuses are not decoration: 401 says "there is nobody here",
+    // 403 says "you are here and may not". Only the first is fixed by signing
+    // in, and the wizard renders the difference.
+    installEnabledRow({
+      ok: false,
+      rejection: "email_domain_not_allowed",
+      messageKey: CONSOLE_MESSAGE_KEYS.email_domain_not_allowed,
+    });
+    const response = await POST(post(RE_POINT_BODY));
+    expect(response.status).toBe(403);
+    expect(errorOf(await json(response))["code"]).toBe("setup_enabled_provider_requires_session");
+    expectNothingWasWritten();
+  });
+
+  test("THE REMEDY still works: the operator signed in through THAT provider re-saves it", async () => {
+    // The legitimate path this PATCH exists for, and the reason the gate is a
+    // session rather than a blanket refusal: the operator signs in, tries to
+    // claim, Moira answers 403 admin_claim_domain_not_allowed, and they come
+    // back to widen the allow-list — holding, at that moment, a session through
+    // this very provider.
+    installEnabledRowPatchable(SIGNED_IN);
+    const response = await POST(
+      post({
+        ...PROVISION_BODY,
+        client_secret: "",
+        allowed_email_domains: ["example.com", "gmail.com"],
+      }),
+    );
+
+    expect(response.status).toBe(201);
+    expect(stub.routes()).toContain(PROVIDER_PATCH_ROUTE);
+    const patched = stub.bodyOf(PROVIDER_PATCH_ROUTE) as Record<string, unknown>;
+    expect(patched["allowed_email_domains"]).toEqual(["example.com", "gmail.com"]);
+    expect((await json(response))["state"]).toMatchObject({ allowedEmailDomainCount: 2 });
+  });
+
+  test("CONTROL: an UNPROVISIONED deployment still provisions with no session", async () => {
+    // The first run, which is the whole reason the setup window exists: there
+    // is no provider to sign in through, so demanding a session here would make
+    // the deployment unclaimable. Requiring one for every provision is the
+    // cheapest way to turn the two attack tests green, and this is what refuses
+    // it.
+    install({ session: NO_SESSION });
+    const response = await POST(post(PROVISION_BODY));
+
+    expect(response.status).toBe(201);
+    expect(stub.routes()).toEqual([
+      CLAIM_STATUS_ROUTE,
+      ISSUER_LIST_ROUTE,
+      ISSUER_LIST_ROUTE,
+      ISSUER_CREATE_ROUTE,
+      PROVIDER_CREATE_ROUTE,
+      PROVIDER_ENABLE_ROUTE,
+    ]);
+    expect(store.puts).toEqual([
+      { providerId: PROVIDER_ID, clientId: CLIENT_ID, plaintext: CLIENT_SECRET },
+    ]);
+  });
+
+  test("CONTROL: a DISABLED row is still re-saved and enabled with no session", async () => {
+    // The interrupted first run being finished. A disabled row authenticates
+    // nobody, so rewriting it escalates nothing — and the operator cannot have
+    // a session through it, because it cannot issue one. Gating this would make
+    // a partial setup unresumable.
+    install({
+      handlers: handlers({
+        [ISSUER_LIST_ROUTE]: populatedIssuerList,
+        [PROVIDER_LIST_ROUTE]: () => ({
+          status: 200,
+          body: {
+            data: [providerRecord({ enabled: false })],
+            pagination: { has_more: false, next_cursor: null },
+          },
+        }),
+        [PROVIDER_GET_ROUTE]: () => ({
+          status: 200,
+          body: providerRecord({ enabled: false, version: 2 }),
+        }),
+        [PROVIDER_PATCH_ROUTE]: () => ({
+          status: 200,
+          body: providerRecord({ enabled: false, version: 3 }),
+        }),
+      }),
+      session: NO_SESSION,
+    });
+
+    const response = await POST(post(PROVISION_BODY));
+    expect(response.status).toBe(201);
+    expect(stub.routes()).toEqual([
+      CLAIM_STATUS_ROUTE,
+      ISSUER_LIST_ROUTE,
+      PROVIDER_LIST_ROUTE,
+      ISSUER_LIST_ROUTE,
+      PROVIDER_GET_ROUTE,
+      PROVIDER_PATCH_ROUTE,
+      PROVIDER_ENABLE_ROUTE,
+    ]);
+    expect((await json(response))["state"]).toMatchObject({ providerEnabled: true });
+  });
+
+  test("the session is not resolved at all unless the derived row is enabled", async () => {
+    // Resolving a session costs a Moira read of the auth configuration, and on
+    // a fresh deployment there is no enabled provider to resolve it against —
+    // the answer would be "no session" after paying for it. So the read is
+    // lazy, and this pins that: a `readSession` that throws must never be
+    // reached on the create path.
+    stub = createMoiraStub(handlers());
+    store = new RecordingSecretStore();
+    const env = envWith();
+    setSetupWindowDependenciesForTests({
+      env,
+      client: new MoiraClient({
+        baseUrl: MOIRA_STUB_BASE_URL,
+        systemKey: env.moiraSystemKey,
+        fetch: stub.fetch,
+      }),
+      store,
+      storageMode: "ephemeral",
+      readSession: async () => {
+        throw new Error("provisioning resolved a session it did not need");
+      },
+    });
+
+    expect((await POST(post(PROVISION_BODY))).status).toBe(201);
   });
 });
 
@@ -1154,6 +1449,7 @@ describe("POST claim derives the provisioning state SERVER-SIDE", () => {
         ok: true,
         identity: { email: "ops@example.com", emailVerified: false, idpSubject: "sub-abc" },
         consoleIssuer: CONSOLE_ISSUER,
+        moiraProviderId: PROVIDER_ID,
       },
     });
     const response = await POST(post({ action: "claim" }));
@@ -1311,6 +1607,8 @@ describe("every key this route emits is real English", () => {
     CONSOLE_MESSAGE_KEYS.setup_claim_step_unreachable,
     CONSOLE_MESSAGE_KEYS.setup_email_not_verified,
     CONSOLE_MESSAGE_KEYS.setup_claim_domain_not_allowed,
+    CONSOLE_MESSAGE_KEYS.setup_enabled_provider_requires_session,
+    CONSOLE_MESSAGE_KEYS.setup_enabled_provider_session_mismatch,
   ] as const;
 
   test("each resolves to English rather than to its own name", () => {

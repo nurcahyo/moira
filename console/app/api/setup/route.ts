@@ -78,6 +78,49 @@
 // caller naming a row that is not this console's, and neither should write.
 //
 // ============================================================================
+// AN ENABLED PROVIDER MAY ONLY BE RE-SAVED BY SOMEBODY SIGNED IN THROUGH IT
+// ============================================================================
+//
+// Deriving the row server-side settles WHICH row a write may touch. It does not
+// settle WHO may ask for that write, and for one shape of row that second
+// question is the whole of the risk: an anonymous caller needs no `resume` at
+// all to reach the update path, because `deriveProvisioningState` finds the
+// console's own provider row for them. If that row is already ENABLED it is a
+// live authenticator, and PATCHing it re-points sign-in — client id, discovery,
+// authorization, token, userinfo and jwks URLs — at an IdP of the caller's
+// choosing, with `allowed_email_domains` widened to a domain they own. Sign in,
+// claim, done. The allow-list was the only thing in the way.
+//
+// So the three states of the derived row are treated differently, and the
+// difference is about escalation rather than about tidiness:
+//
+//   absent       CREATE, ungated. An unclaimed, unprovisioned deployment is
+//                claimable by whoever completes setup first. That is inherent
+//                to first-run bootstrap and is DOCUMENTED
+//                (`docs/console-architecture.md`) rather than silently assumed.
+//   disabled     PATCH, ungated. A disabled row authenticates nobody, so
+//                rewriting it escalates nothing.
+//   enabled      PATCH only for a caller carrying a valid console session whose
+//                authenticating provider IS that row.
+//
+// The session is resolved by the same function the claim step uses —
+// `context.readSession` -> `consoleSessionCheck` — and compared on
+// `SessionCheck.moiraProviderId`, the Moira row the resolved configuration came
+// from. Derived value against derived value, one resolution, no second spelling.
+//
+// It is resolved LAZILY, only once the derived row turns out to be enabled.
+// Resolving it costs a Moira read of the auth configuration, and on the fresh
+// deployment that provisioning normally runs against there is no enabled
+// provider to resolve — the honest answer there is "no session" and the request
+// does not need to pay for it.
+//
+// This is exactly the shape of the legitimate remedy: the domain-refusal
+// correction happens AFTER a successful sign-in (sign in, claim, `403
+// admin_claim_domain_not_allowed`, come back and widen the allow-list), so the
+// operator holds a session through this very provider at the moment they need
+// to re-save it.
+//
+// ============================================================================
 // `body.slug`: WHAT IT MAY STILL CHOOSE, AND WHAT IT MAY NOT
 // ============================================================================
 //
@@ -112,6 +155,7 @@ import { isMoiraRequestError } from "@/lib/errors";
 import { CONSOLE_MESSAGE_KEYS } from "@/lib/i18n/keys";
 import type { ConsoleSecretStore } from "@/lib/console-secrets";
 import {
+  SetupEnabledProviderSessionError,
   SetupOrderingError,
   SetupProvisioningError,
   claimAdminIdentity,
@@ -229,7 +273,9 @@ export async function POST(request: Request): Promise<Response> {
   }
 
   return withSetupWindow(async (context) =>
-    action === "provision" ? provision(context, body) : claim(context, request, body),
+    action === "provision"
+      ? provision(context, request, body)
+      : claim(context, request, body),
   );
 }
 
@@ -312,7 +358,55 @@ function readSlug(value: unknown): { readonly slug: string | null } | Response {
   return { slug };
 }
 
-async function provision(context: SetupWindowContext, body: SetupRequestBody): Promise<Response> {
+/**
+ * May this caller re-save the row the console derived, and which row is their
+ * session established through?
+ *
+ * Returns the caller's authenticating row id (or `null`) on success, and a
+ * keyed refusal otherwise. Only an ENABLED derived row asks the question at
+ * all — see the header note on why the answer is lazily resolved and why the
+ * other two states are ungated.
+ */
+async function operatorSessionFor(
+  context: SetupWindowContext,
+  request: Request,
+  derived: SetupProvisioningState,
+): Promise<{ readonly sessionProviderId: string | null } | Response> {
+  if (derived.providerId === null || !derived.providerEnabled) {
+    return { sessionProviderId: null };
+  }
+
+  const session = await context.readSession(request.headers);
+  if (!session.ok) {
+    // 401 when there is nothing to identify the caller at all, 403 when there
+    // is a session and it may not act. The same split the claim step makes, and
+    // for the same reason: only one of the two is fixable by signing in.
+    return setupError(
+      session.rejection === "no_session" ? 401 : 403,
+      "setup_enabled_provider_requires_session",
+      CONSOLE_MESSAGE_KEYS.setup_enabled_provider_requires_session,
+    );
+  }
+  if (session.moiraProviderId !== derived.providerId) {
+    // A real session, through a DIFFERENT provider. On a multi-provider
+    // deployment that is an operator who signed in through the wrong one; on an
+    // unclaimed one it is the same escalation with one extra step, since any
+    // enabled provider can mint a session. Either way the answer is the same,
+    // and nothing is written.
+    return setupError(
+      403,
+      "setup_enabled_provider_session_mismatch",
+      CONSOLE_MESSAGE_KEYS.setup_enabled_provider_session_mismatch,
+    );
+  }
+  return { sessionProviderId: session.moiraProviderId };
+}
+
+async function provision(
+  context: SetupWindowContext,
+  request: Request,
+  body: SetupRequestBody,
+): Promise<Response> {
   const slugResult = readSlug(body["slug"]);
   if (slugResult instanceof Response) return slugResult;
 
@@ -390,6 +484,17 @@ async function provision(context: SetupWindowContext, body: SetupRequestBody): P
     consoleConfig.issuer,
   );
 
+  // ---- and who may spend that authority --------------------------------
+  //
+  // FIRST, before any other refusal: which row may be written is settled above,
+  // but an ENABLED row is a live authenticator and rewriting it re-points
+  // sign-in. That takes an operator, and inside this window a session
+  // established through that same row is the only available proof of one.
+  // Ordered ahead of the body checks so an unauthorised caller learns nothing
+  // about the deployment's shape from which refusal they get.
+  const operator = await operatorSessionFor(context, request, derived);
+  if (operator instanceof Response) return operator;
+
   // An EMPTY secret is acceptable in exactly one shape: a re-save of a provider
   // whose secret the console has ACTUALLY sealed. The domain-refusal remedy
   // says "add the domain and save again", and demanding the operator re-type a
@@ -456,6 +561,12 @@ async function provision(context: SetupWindowContext, body: SetupRequestBody): P
       // way the row is this console's own, because that is the only kind
       // `deriveProvisioningState` can return.
       resume: derived,
+      // The second lock on the same rule, asserted inside the module that
+      // issues the write and against the row it reads back — so a row that
+      // became enabled between the derivation above and the PATCH is refused
+      // too, and so the property holds for every caller of
+      // `runSetupProvisioning` rather than for this one audited route.
+      sessionProviderId: operator.sessionProviderId,
     });
 
     return setupJson(
@@ -473,6 +584,24 @@ async function provision(context: SetupWindowContext, body: SetupRequestBody): P
     );
   } catch (error) {
     if (error instanceof SetupProvisioningError) return provisioningFailure(error, submissionId);
+    if (error instanceof SetupEnabledProviderSessionError) {
+      // The in-module lock fired where the pre-check did not: the row was
+      // reported disabled by the derivation and came back ENABLED on the fresh
+      // read. Answered with the same keyed refusal the pre-check gives, because
+      // the operator's next move is the same one — sign in through that
+      // provider, then save again. Caught BEFORE `SetupOrderingError`, whose
+      // subclass this is; the generic "correct the configuration" copy would
+      // send them looking for a misconfiguration that is not there.
+      return setupError(
+        403,
+        error.reason === "no_session"
+          ? "setup_enabled_provider_requires_session"
+          : "setup_enabled_provider_session_mismatch",
+        error.reason === "no_session"
+          ? CONSOLE_MESSAGE_KEYS.setup_enabled_provider_requires_session
+          : CONSOLE_MESSAGE_KEYS.setup_enabled_provider_session_mismatch,
+      );
+    }
     if (error instanceof SetupOrderingError) {
       // The B1 invariant, or an adopted trusted issuer that declares
       // `scopes_claim`. Both are configuration the operator must change before a

@@ -34,10 +34,17 @@ function envWith(overrides: Record<string, string> = {}): ConsoleEnv {
  * a caller-supplied namespace against the provider the session was actually
  * established through (issue #71): the verdict now carries the issuer of the
  * configuration that produced it, so it has to be supplied here.
+ *
+ * `moiraProviderId` joined it for the other half of the same question. The
+ * claim step asks "which namespace"; the provisioning step asks "which ROW",
+ * because an already-enabled provider may only be re-saved by somebody signed
+ * in through that row. Both are copied from the authenticating configuration,
+ * never from a caller.
  */
 const ALLOW = {
   allowedEmailDomains: ["example.com"],
   consoleIssuer: "https://console.example",
+  moiraProviderId: "22222222-2222-4222-8222-222222222222",
 };
 
 describe("checkSession", () => {
@@ -49,6 +56,11 @@ describe("checkSession", () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.identity.idpSubject).toBe("sub-1");
+    // The verdict carries WHO authenticated and WHERE — both copied from the
+    // authenticating configuration. A verdict that dropped either would let a
+    // caller supply it, which is the whole point of carrying it.
+    expect(result.consoleIssuer).toBe(ALLOW.consoleIssuer);
+    expect(result.moiraProviderId).toBe(ALLOW.moiraProviderId);
   });
 
   test("no session", () => {

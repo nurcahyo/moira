@@ -88,6 +88,22 @@ export type SessionCheck =
        * slug would have granted admin in B's namespace.
        */
       readonly consoleIssuer: string;
+      /**
+       * The `auth_provider_settings` ROW this session was established through —
+       * `ResolvedAuthConfig.moiraProviderId`, never a caller's string.
+       *
+       * `consoleIssuer` answers "which `admin_identities` namespace"; this
+       * answers "which provider row", and the two are not interchangeable when
+       * the question is whether a caller may REWRITE that row. The setup
+       * window's provisioning step is the caller that needs it: an already
+       * ENABLED provider is a live authenticator, so re-pointing its client id
+       * and endpoint URLs is equivalent to replacing the deployment's identity
+       * provider. It may therefore only be re-saved by somebody who has proved
+       * they are the operator, and the only proof available inside a window
+       * that runs on the bootstrap system key is a session established THROUGH
+       * THAT SAME ROW.
+       */
+      readonly moiraProviderId: string;
     }
   | { readonly ok: false; readonly rejection: SessionRejection; readonly messageKey: string };
 
@@ -121,7 +137,7 @@ export function rejectedSession(rejection: SessionRejection): SessionCheck {
  */
 export function checkSession(
   session: Partial<ConsoleSessionIdentity> | null | undefined,
-  config: Pick<ResolvedAuthConfig, "allowedEmailDomains" | "consoleIssuer">,
+  config: Pick<ResolvedAuthConfig, "allowedEmailDomains" | "consoleIssuer" | "moiraProviderId">,
 ): SessionCheck {
   if (session === null || session === undefined) return reject("no_session");
   const { email, emailVerified, idpSubject } = session;
@@ -134,9 +150,11 @@ export function checkSession(
   return {
     ok: true,
     identity: { email, emailVerified: true, idpSubject },
-    // Taken from the configuration that AUTHENTICATED this session, never from
-    // anything the caller sent — see the field's own note on `SessionCheck`.
+    // Both taken from the configuration that AUTHENTICATED this session, never
+    // from anything the caller sent — see the fields' own notes on
+    // `SessionCheck`.
     consoleIssuer: config.consoleIssuer,
+    moiraProviderId: config.moiraProviderId,
   };
 }
 
@@ -196,7 +214,7 @@ export class SessionNotAdmissibleError extends Error {
  */
 export function assertAdmissibleSession(
   session: Partial<ConsoleSessionIdentity> | null | undefined,
-  config: Pick<ResolvedAuthConfig, "allowedEmailDomains" | "consoleIssuer">,
+  config: Pick<ResolvedAuthConfig, "allowedEmailDomains" | "consoleIssuer" | "moiraProviderId">,
 ): ConsoleSessionIdentity {
   const check = checkSession(session, config);
   if (!check.ok) throw new SessionNotAdmissibleError(check.rejection, check.messageKey);

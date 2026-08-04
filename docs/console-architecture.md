@@ -127,6 +127,67 @@ There is no rotate-secret endpoint and there must never be one; rotation is a
 console `put()`. `tests/unit/architecture/server-only-guards.test.ts` scans the
 whole tree for that endpoint's name as a bare literal, comments included.
 
+## The setup window: do not expose an unclaimed console to an untrusted network
+
+**While a deployment is unclaimed, the setup window is open by design, and the
+first party to complete setup becomes its owner.** The console must therefore not
+be reachable from an untrusted network until the first admin has been claimed.
+Bind it to a private network, an operator VPN, or a bastion for that interval,
+and open it up afterwards.
+
+The window is open exactly while both of these hold, and both are re-read from
+Moira on every request rather than cached:
+
+1. the console holds a bootstrap system key (`MOIRA_SYSTEM_KEY`), and
+2. Moira answers `claimed: false` on `GET /api/v1/admin/setup/claim-status`.
+
+Removing the system key after setup closes the window permanently — `/api/setup`
+then answers `404`, and that is why the post-setup runbook tells operators to
+remove it.
+
+### What is protected inside the window
+
+- **A row bound to another console's trusted issuer cannot be touched at all.**
+  Which provider row a privileged write may target is derived server-side from
+  Moira's own records — this console's trusted issuer, then the provider row
+  bound to it — and is never named by the caller. A request that names a
+  different row is refused with nothing written.
+- **An enabled provider cannot be re-pointed without a session established
+  through it.** An enabled row is a live authenticator, so rewriting its client
+  id or its issuer/discovery/token/userinfo/JWKS URLs would repoint sign-in at
+  another identity provider. Re-saving one requires a valid console session whose
+  authenticating provider is that same row; otherwise the request is refused and
+  nothing is written.
+- **A disabled row may still be completed without a session**, deliberately: it
+  authenticates nobody, and requiring a session would make an interrupted first
+  run unresumable.
+- **The OAuth client secret never crosses to Moira**, and the setup responses
+  publish counts and presence rather than the allow-list or the endpoint URLs.
+
+### What is NOT protected, and cannot be
+
+- **An unprovisioned, unclaimed deployment is claimable by whoever finishes setup
+  first.** There is no admin yet to authorise the first admin, and no session to
+  require, so reachability is the only thing that decides it. This is inherent to
+  first-run bootstrap and is not something the console can close in code — it is
+  closed by not publishing the console until the claim is done.
+- **Anyone who can reach the window can read the setup view model** — whether the
+  deployment is claimed, which sign-in methods exist, how many domains are
+  allow-listed. It is narrowed, but it is not secret.
+
+### The one consequence operators meet
+
+Because an enabled provider needs a session to be re-saved, a provider that was
+enabled with a credential nobody can actually sign in with (a mistyped client
+secret, say) cannot be corrected from the wizard: there is no session to be had
+through a broken provider. Two ways out, both intended:
+
+- provision again under a different provider slug — the create path is still
+  open, and each slug gets its own trusted issuer; or
+- correct the row directly against Moira's admin API with the bootstrap system
+  key you already hold. The console declines to be an unauthenticated proxy for
+  that write; it does not deny you the write.
+
 ## Routes, layouts, and where the auth boundary sits
 
 ```

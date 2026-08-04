@@ -110,6 +110,8 @@ export const CONSOLE_MESSAGE_KEYS = {
   setup_email_not_verified: "console.error.setup_email_not_verified",
   setup_claim_domain_not_allowed: "console.error.setup_claim_domain_not_allowed",
   setup_claim_issuer_mismatch: "console.error.setup_claim_issuer_mismatch",
+  setup_enabled_provider_requires_session: "console.error.setup_enabled_provider_requires_session",
+  setup_enabled_provider_session_mismatch: "console.error.setup_enabled_provider_session_mismatch",
 
   /* --- accessibility ------------------------------------------------------ */
   a11y_loading: "console.a11y.loading",

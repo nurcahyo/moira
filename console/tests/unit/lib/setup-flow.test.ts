@@ -21,9 +21,11 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import { MoiraClient } from "@/lib/moira-client";
 import {
   EMPTY_PROVISIONING_STATE,
+  SetupEnabledProviderSessionError,
   SetupOrderingError,
   SetupProvisioningError,
   assertB1Invariant,
+  assertEnabledProviderMayBeReSaved,
   assertProviderIsBoundToTrustedIssuer,
   buildProviderCreateBody,
   buildProviderPatchBody,
@@ -166,6 +168,13 @@ function provisioningRequest(
       trustedJwtIssuer: "idem-issuer-0001",
       authProvider: "idem-provider-0001",
     },
+    // NO SESSION by default, because that is the true condition of the window
+    // this runs in: setup happens before the first admin exists and, on a fresh
+    // deployment, before any provider a human could sign in through. A default
+    // of "signed in as the operator" would quietly authorise every re-save
+    // below, which is precisely the fact under test — so the enabled-row cases
+    // pass `sessionProviderId` explicitly and visibly.
+    sessionProviderId: null,
     ...overrides,
   };
 }
@@ -521,6 +530,11 @@ describe("a server-derived resume that names a provider row is an update, never 
       provisioningRequest({
         provider: { ...providerConfig, allowedEmailDomains: ["example.com", "gmail.com"] },
         resume: resumedComplete,
+        // The row is ENABLED, so the re-save takes an operator: a session
+        // established through this very provider. That is exactly the state the
+        // remedy is reached from — the operator signed in, tried to claim, and
+        // Moira answered 403 admin_claim_domain_not_allowed.
+        sessionProviderId: PROVIDER_ID,
       }),
     );
 
@@ -564,10 +578,15 @@ describe("a server-derived resume that names a provider row is an update, never 
         }),
       }),
     );
+    // A CONTROL for the enabled-row gate below: no session is passed (the
+    // helper's default), and a DISABLED row must still be completable — it
+    // authenticates nobody, so rewriting it escalates nothing, and requiring a
+    // session here would make an interrupted first-run setup unresumable.
     const result = await runSetupProvisioning(
       clientFor(stub),
       provisioningRequest({
         resume: { ...resumedComplete, providerEnabled: false, consoleSecretStored: false },
+        sessionProviderId: null,
       }),
     );
 
@@ -591,7 +610,9 @@ describe("a server-derived resume that names a provider row is an update, never 
     );
     const error = (await runSetupProvisioning(
       clientFor(stub),
-      provisioningRequest({ resume: resumedComplete }),
+      // Enabled row, so the operator's session is what admits the attempt at
+      // all; this test is about what happens when Moira then refuses the PATCH.
+      provisioningRequest({ resume: resumedComplete, sessionProviderId: PROVIDER_ID }),
     ).catch((caught: unknown) => caught)) as SetupProvisioningError;
 
     expect(error).toBeInstanceOf(SetupProvisioningError);
@@ -621,9 +642,18 @@ describe("a server-derived resume that names a provider row is an update, never 
       }),
     );
 
-    await expect(
-      runSetupProvisioning(clientFor(stub), provisioningRequest({ resume: resumedComplete })),
-    ).rejects.toThrow(SetupOrderingError);
+    const error = (await runSetupProvisioning(
+      clientFor(stub),
+      // Signed in through this very row, so the session gate is satisfied and
+      // cannot be what refuses: the OWNERSHIP check is, and it runs first.
+      provisioningRequest({ resume: resumedComplete, sessionProviderId: PROVIDER_ID }),
+    ).catch((caught: unknown) => caught)) as Error;
+    expect(error).toBeInstanceOf(SetupOrderingError);
+    expect(
+      error,
+      "ownership must be decided before operatorship: a row this console does not own is refused " +
+        "whoever is signed in",
+    ).not.toBeInstanceOf(SetupEnabledProviderSessionError);
 
     // The read happened; the WRITE did not. Nothing about that row changed, and
     // no enable was attempted on it either.
@@ -664,6 +694,115 @@ describe("a server-derived resume that names a provider row is an update, never 
         ISSUER_ID,
       ),
     ).toThrow(SetupOrderingError);
+  });
+
+  /* ------------------------------------------------------------------------ */
+  /* An ENABLED row may only be re-saved by somebody signed in through it      */
+  /* ------------------------------------------------------------------------ */
+  //
+  // Ownership settles WHICH row; this settles WHO. The residual the group above
+  // does not close: an anonymous caller inside the open setup window needs no
+  // resume at all — the route derives the console's OWN row for them — and if
+  // that row is enabled, PATCHing it re-points sign-in (client id, discovery,
+  // authorization, token, userinfo, jwks) at an IdP they control and widens the
+  // allow-list to a domain they own. Sign in, claim, done.
+  //
+  // These run at the MODULE boundary deliberately: the route refuses earlier
+  // and more cheaply, but a property that only holds in the one caller that was
+  // audited is not a property.
+
+  test("an ENABLED row is NOT re-saved for a caller with no session", async () => {
+    const stub = createMoiraStub(updateHandlers());
+    const error = (await runSetupProvisioning(
+      clientFor(stub),
+      // `sessionProviderId: null` — the default, spelled out because it IS the
+      // scenario: the window is open, nobody is signed in, the row is live.
+      provisioningRequest({ resume: resumedComplete, sessionProviderId: null }),
+    ).catch((caught: unknown) => caught)) as SetupEnabledProviderSessionError;
+
+    expect(error).toBeInstanceOf(SetupEnabledProviderSessionError);
+    expect(error.reason).toBe("no_session");
+    expect(error.providerId).toBe(PROVIDER_ID);
+    // Refused BEFORE the write, not detected after it. The read is allowed —
+    // a GET is not a privileged write — but nothing else may have happened.
+    expect(stub.requestsFor(`PATCH /api/v1/admin/auth/providers/${PROVIDER_ID}`)).toHaveLength(0);
+    expect(stub.routes()).not.toContain(`POST /api/v1/admin/auth/providers/${PROVIDER_ID}/enable`);
+    expect(stub.requestsFor("POST /api/v1/admin/auth/providers")).toHaveLength(0);
+    expect(secretWrites).toEqual([]);
+  });
+
+  test("an ENABLED row is NOT re-saved for a session established through ANOTHER row", async () => {
+    // A real, valid, allow-listed session — through a different provider. On a
+    // multi-provider deployment that is the wrong tab; on an unclaimed one it
+    // is the same escalation with one extra step, because any enabled provider
+    // can mint a session. The row identity is what decides, not the fact that
+    // some session exists.
+    const stub = createMoiraStub(updateHandlers());
+    const error = (await runSetupProvisioning(
+      clientFor(stub),
+      provisioningRequest({
+        resume: resumedComplete,
+        sessionProviderId: "44444444-4444-4444-8444-444444444444",
+      }),
+    ).catch((caught: unknown) => caught)) as SetupEnabledProviderSessionError;
+
+    expect(error).toBeInstanceOf(SetupEnabledProviderSessionError);
+    expect(error.reason).toBe("different_provider");
+    expect(stub.requestsFor(`PATCH /api/v1/admin/auth/providers/${PROVIDER_ID}`)).toHaveLength(0);
+    expect(secretWrites).toEqual([]);
+  });
+
+  test("the gate reads the row it READ BACK, not the resume state's stale copy", async () => {
+    // The race the pre-check in the route cannot see: the derivation found the
+    // row DISABLED (so the route asked for no session and passed `null`), and
+    // between that read and this write the row was enabled. The fresh read is
+    // the only copy that cannot be stale, and it is what the assertion runs on.
+    const stub = createMoiraStub(
+      updateHandlers({
+        [`GET /api/v1/admin/auth/providers/${PROVIDER_ID}`]: () => ({
+          status: 200,
+          body: providerRecord({ enabled: true, version: 3 }),
+        }),
+      }),
+    );
+    await expect(
+      runSetupProvisioning(
+        clientFor(stub),
+        provisioningRequest({
+          resume: { ...resumedComplete, providerEnabled: false },
+          sessionProviderId: null,
+        }),
+      ),
+    ).rejects.toBeInstanceOf(SetupEnabledProviderSessionError);
+    expect(stub.requestsFor(`PATCH /api/v1/admin/auth/providers/${PROVIDER_ID}`)).toHaveLength(0);
+  });
+
+  test("assertEnabledProviderMayBeReSaved is the one spelling of the rule", () => {
+    // Exported and asserted directly, so the refusal cannot be softened into a
+    // warning inside the runner — and so the three states are pinned as three
+    // rather than collapsed into "needs a session".
+    const disabled = providerRecord({ enabled: false }) as unknown as AuthProviderSettingsRecord;
+    const enabled = providerRecord({ enabled: true }) as unknown as AuthProviderSettingsRecord;
+
+    // A disabled row authenticates nobody, so it is not an escalation surface
+    // and needs no session. Deleting this case would be the cheapest way to
+    // break first-run setup while every negative test stayed green.
+    expect(() => assertEnabledProviderMayBeReSaved(disabled, null)).not.toThrow();
+    expect(() => assertEnabledProviderMayBeReSaved(enabled, PROVIDER_ID)).not.toThrow();
+    expect(() => assertEnabledProviderMayBeReSaved(enabled, null)).toThrow(
+      SetupEnabledProviderSessionError,
+    );
+    // An empty string is not a session id. Without this it would read as one
+    // and satisfy a `!== null` test.
+    expect(() => assertEnabledProviderMayBeReSaved(enabled, "")).toThrow(
+      SetupEnabledProviderSessionError,
+    );
+    expect(() => assertEnabledProviderMayBeReSaved(enabled, "some-other-row")).toThrow(
+      SetupEnabledProviderSessionError,
+    );
+    // Still an ordering error to every caller that only knows the base class,
+    // so no existing catch silently lets it through.
+    expect(() => assertEnabledProviderMayBeReSaved(enabled, null)).toThrow(SetupOrderingError);
   });
 
   test("buildProviderPatchBody omits empty URL members rather than clearing them", () => {

@@ -137,6 +137,35 @@ export class SetupOrderingError extends Error {
   }
 }
 
+/**
+ * An ENABLED provider row was about to be re-saved by a caller who has not
+ * proved they are the operator.
+ *
+ * A subclass of `SetupOrderingError` on purpose: every existing caller that
+ * catches the base class keeps failing closed, and the route that knows how to
+ * phrase this particular refusal catches the subclass first to say the useful
+ * thing ("sign in through that provider, then save again") instead of the
+ * generic "the configuration must be corrected".
+ */
+export class SetupEnabledProviderSessionError extends SetupOrderingError {
+  /** The row that may not be re-saved. */
+  readonly providerId: string;
+  readonly reason: "no_session" | "different_provider";
+
+  constructor(providerId: string, reason: "no_session" | "different_provider") {
+    super(
+      `the auth provider ${providerId} is enabled, so re-saving it requires a console session ` +
+        `established through that same provider (${reason}). An enabled provider is a live ` +
+        "authenticator: rewriting its client id and endpoint URLs re-points sign-in at another " +
+        "IdP, and inside the setup window there is no admin grant yet to refuse that — the " +
+        "session is the only proof of operatorship available.",
+    );
+    this.name = "SetupEnabledProviderSessionError";
+    this.providerId = providerId;
+    this.reason = reason;
+  }
+}
+
 export type SetupProvisioningStepId =
   | "ensure_trusted_jwt_issuer"
   | "create_auth_provider"
@@ -278,6 +307,21 @@ export interface SetupProvisioningRequest {
    * regardless of who called it.
    */
   readonly resume?: SetupProvisioningState;
+  /**
+   * The `auth_provider_settings` row the CALLER's console session was
+   * established through, or `null` when the caller has no session.
+   *
+   * Required rather than optional, and required to be spelled `null` when there
+   * is none: this is the only thing that separates the operator re-saving their
+   * own live provider from an anonymous caller re-pointing it, and a field a
+   * new call site could simply forget would put that distinction back into
+   * review. `assertEnabledProviderMayBeReSaved` is where it is spent.
+   *
+   * MUST be server-derived — `SessionCheck.moiraProviderId`, which
+   * `consoleSessionCheck` takes from the configuration that resolved the
+   * cookie. Never a value off a request body.
+   */
+  readonly sessionProviderId: string | null;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -359,6 +403,72 @@ export function assertProviderIsBoundToTrustedIssuer(
         "row this console may re-save is derived from Moira's own records rather than named by " +
         "the caller",
     );
+  }
+}
+
+/**
+ * Refuse to re-save an ENABLED provider row without a session established
+ * through that same row.
+ *
+ * ============================================================================
+ * WHAT THIS CLOSES, AND WHY OWNERSHIP ALONE WAS NOT ENOUGH
+ * ============================================================================
+ *
+ * `assertProviderIsBoundToTrustedIssuer` answers "is this row the console's
+ * own". That is a necessary check and not a sufficient one, because the row
+ * the console owns is precisely the row an attacker wants: while a deployment
+ * is unclaimed the setup window is open to an ANONYMOUS caller, and the window
+ * runs on the bootstrap system key. Such a caller needs no `resume` at all —
+ * `deriveProvisioningState` finds the console's own provider row for them, and
+ * the update path then PATCHes it, rewriting `client_id`, the
+ * issuer/discovery/token/userinfo/jwks URLs and `allowed_email_domains`.
+ *
+ * When that row is already ENABLED, the allow-list is the last thing standing
+ * between an unclaimed deployment and an attacker: re-point the endpoints at an
+ * IdP they control, widen the allow-list to a domain they own, sign in, claim.
+ *
+ * The three cases, and why they differ:
+ *
+ *   * the row does NOT exist — CREATE, unguarded. An unclaimed, unprovisioned
+ *     deployment is claimable by whoever completes setup first; that is
+ *     inherent to first-run bootstrap, is not fixable in code here, and is
+ *     documented in `docs/console-architecture.md` instead of being assumed.
+ *   * the row exists and is NOT enabled — PATCH, unguarded. A disabled row
+ *     authenticates nobody, so rewriting it escalates nothing; it is a partial
+ *     setup attempt being completed.
+ *   * the row exists and IS enabled — PATCH only for a caller carrying a valid
+ *     console session established through that row.
+ *
+ * That last case is exactly the legitimate remedy the PATCH path exists for.
+ * The domain-refusal correction happens AFTER a successful sign-in: the
+ * operator signs in, tries to claim, Moira answers `403
+ * admin_claim_domain_not_allowed`, and they come back to widen the allow-list.
+ * They hold a session through this very provider at that moment, so the
+ * instruction stays followable.
+ *
+ * THE COST, STATED. An operator who enables a provider they then cannot sign in
+ * through (a mistyped client secret, say) can no longer correct it here — they
+ * hold no session, and no session can be obtained through a broken provider.
+ * They are not stuck: the create path is still open under a different provider
+ * slug, and they hold the bootstrap system key, which is the credential Moira's
+ * own admin API takes. What the console refuses to be is an unauthenticated
+ * proxy for that write.
+ *
+ * `sessionProviderId` is the row the CALLER's session was established through
+ * (`SessionCheck.moiraProviderId`), or `null` for no session. Never a string
+ * off a request body: it is resolved by `consoleSessionCheck` from the
+ * configuration that actually resolved the cookie.
+ */
+export function assertEnabledProviderMayBeReSaved(
+  provider: AuthProviderSettingsRecord,
+  sessionProviderId: string | null,
+): void {
+  if (!provider.enabled) return;
+  if (sessionProviderId === null || sessionProviderId === "") {
+    throw new SetupEnabledProviderSessionError(provider.id, "no_session");
+  }
+  if (sessionProviderId !== provider.id) {
+    throw new SetupEnabledProviderSessionError(provider.id, "different_provider");
   }
 }
 
@@ -665,8 +775,14 @@ export async function runSetupProvisioning(
       const current = await client.getAuthProvider(state.providerId);
       // …and the SAME read is what proves the row may be written at all. A GET
       // is not a privileged write; the PATCH below is, and it does not run
-      // unless the row is bound to the issuer this run just ensured.
+      // unless the row is bound to the issuer this run just ensured…
       assertProviderIsBoundToTrustedIssuer(current, state.trustedJwtIssuerId);
+      // …and, when that row is already ENABLED, unless the caller has proved
+      // they are the operator by carrying a session established through it.
+      // Asserted on the row just READ BACK rather than on the derived state, so
+      // a row that became enabled between the derivation and this write is
+      // still refused — the fresh read is the only copy that cannot be stale.
+      assertEnabledProviderMayBeReSaved(current, request.sessionProviderId);
       provider = await client.patchAuthProvider(
         current.id,
         buildProviderPatchBody(request.provider),

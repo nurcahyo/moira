@@ -476,6 +476,29 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "grant admin in a namespace this identity never authenticated against. Refused 403 with " +
       "nothing written.",
   },
+  [K.setup_enabled_provider_requires_session]: {
+    key: K.setup_enabled_provider_requires_session,
+    message:
+      "This sign-in provider is already enabled. Sign in through it first, then save your changes.",
+    description:
+      "Provisioning tried to re-save an ENABLED provider row with no console session behind the " +
+      "request. An enabled row is a live authenticator, so rewriting its client id and endpoint " +
+      "URLs re-points sign-in at another identity provider — and while the deployment is " +
+      "unclaimed there is no admin grant yet to refuse that. A session established through that " +
+      "same provider is the only proof of operatorship the setup window can ask for. Refused " +
+      "with nothing written.",
+  },
+  [K.setup_enabled_provider_session_mismatch]: {
+    key: K.setup_enabled_provider_session_mismatch,
+    message:
+      "You are signed in through a different sign-in provider. Sign in through the one you are " +
+      "changing before saving it.",
+    description:
+      "Same refusal as the requires-session one, for a caller who DOES hold a valid session but " +
+      "established it through another provider row (`SessionCheck.moiraProviderId` does not " +
+      "match the derived row). Separated because the remedy differs: sign out and back in " +
+      "through the provider being edited, rather than merely sign in.",
+  },
 
   /* --- accessibility ------------------------------------------------------ */
   //

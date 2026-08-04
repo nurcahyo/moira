@@ -322,7 +322,11 @@ describe("OAuth sign-in against a real mock IdP", () => {
       // issuer of the configuration that authenticated the session, so the
       // setup window's claim step can check a caller-supplied namespace
       // against it.
-      { allowedEmailDomains: ["example.com"], consoleIssuer: "https://console.example" },
+      {
+        allowedEmailDomains: ["example.com"],
+        consoleIssuer: "https://console.example",
+        moiraProviderId: "22222222-2222-4222-8222-222222222222",
+      },
     );
     expect(check.ok).toBe(true);
 
@@ -332,7 +336,11 @@ describe("OAuth sign-in against a real mock IdP", () => {
       // issuer of the configuration that authenticated the session, so the
       // setup window's claim step can check a caller-supplied namespace
       // against it.
-      { allowedEmailDomains: ["example.com"], consoleIssuer: "https://console.example" },
+      {
+        allowedEmailDomains: ["example.com"],
+        consoleIssuer: "https://console.example",
+        moiraProviderId: "22222222-2222-4222-8222-222222222222",
+      },
     );
     expect(outsider.ok).toBe(false);
   });
