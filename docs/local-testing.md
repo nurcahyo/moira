@@ -145,11 +145,25 @@ credential at all, as a synthesised `DevAdmin` actor holding `moira:admin`:
 
 ```
 GET /api/v1/admin/providers      no header -> 200
-GET /api/v1/admin/setup/status   no header -> 403   # the one exception
+GET /api/v1/admin/setup/status   no header -> 403   # one of the exceptions
 ```
 
-`setup/status` and `setup/auth-methods` refuse `DevAdmin` and need a real system
-key. Everything else does not. The listener is bound to `127.0.0.1`, so this is
+The CRUD routes are the rule; the setup and identity routes are not. Four of them
+do their own gating and a header-less `DevAdmin` gets nowhere:
+
+| route | admits |
+| --- | --- |
+| `GET /api/v1/admin/setup/status` | system key or trusted JWT (`require_setup_actor`) |
+| `GET /api/v1/admin/setup/auth-methods` | the same — it calls the same function |
+| `POST /api/v1/admin/setup/claim` | a system key and nothing else |
+| `POST /api/v1/admin/admin-invites/redeem` | a bearer JWT only (`verify_trusted_jwt_identity`) |
+
+`require_setup_actor` (`src/application/setup.rs`) returns `Forbidden` for
+`DevAdmin`, `ConsumerKey` and `Anonymous` alike, so "a real system key" is one of
+two answers — a trusted JWT also passes. `GET /api/v1/admin/setup/claim-status`
+goes the other way and is unauthenticated by design.
+
+The listener is bound to `127.0.0.1`, so this is
 reachable only from the machine itself — but do not bind it wider while admin auth
 is off, and do not carry this `.env` anywhere but a laptop.
 

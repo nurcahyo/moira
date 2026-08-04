@@ -133,7 +133,13 @@ Open `http://127.0.0.1:8080/docs` for the interactive Scalar reference, or fetch
 curl http://127.0.0.1:8080/openapi.json
 ```
 
-Moira generates the contract from the same annotated handlers registered through `utoipa_axum::OpenApiRouter`. The document covers all 152 operations across 100 paths — health, readiness, Prometheus metrics, documentation, native and streaming responses, execution and usage history, discovery, OpenAI compatibility, conversations, messages, memory, policies, RAG, and administration.
+Moira generates the contract from the same annotated handlers registered through `utoipa_axum::OpenApiRouter`. The full contract is 152 operations across 100 paths — health, readiness, Prometheus metrics, documentation, native and streaming responses, execution and usage history, discovery, OpenAI compatibility, conversations, messages, memory, policies, RAG, and administration.
+
+What that `curl` actually returns depends on `docs.expose_admin`, which ships `false` (`config/default.toml`). In that mode `/openapi.json` is public and serves the document with every `/api/v1/admin/` path stripped: 30 operations across 23 paths. Set `MOIRA_DOCS__EXPOSE_ADMIN=true` to serve all 152 — the document then requires admin authentication itself:
+
+```bash
+curl -H "X-Moira-System-Key: $MOIRA_SYSTEM_KEY" http://127.0.0.1:8080/openapi.json
+```
 
 The generated operations include:
 

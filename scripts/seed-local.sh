@@ -41,13 +41,32 @@ H=(-H "X-Moira-System-Key: $MOIRA_SYSTEM_KEY" -H 'Content-Type: application/json
 # the key-minting endpoints wrap it in `{resource, secret}`.
 id_of() { python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])'; }
 
+# Admin lists are cursor-paginated and default to 50 rows
+# (`PageQuery::limit` — `self.limit.unwrap_or(50).clamp(1, 200)`). Ask for the
+# clamp maximum so one page covers any plausible local database.
+PAGE="limit=200"
+
 # Find one row in a `{data: [...], pagination: {...}}` list response by field.
+#
+# "Not on this page" is not the same as "does not exist", and every caller below
+# treats an empty result as "absent, create it". If the list is truncated we
+# cannot tell the two apart, and guessing wrong creates a duplicate row — so this
+# refuses rather than guesses. `set -e` turns that into an abort at the call site.
 find_by() {
     python3 -c 'import json,sys
 field, want = sys.argv[1], sys.argv[2]
-rows = json.load(sys.stdin)["data"]
-hit = [r for r in rows if r.get(field) == want]
-print(hit[0]["id"] if hit else "")' "$1" "$2"
+d = json.load(sys.stdin)
+hit = [r for r in d["data"] if r.get(field) == want]
+if hit:
+    print(hit[0]["id"])
+elif (d.get("pagination") or {}).get("has_more"):
+    sys.stderr.write(
+        "   list truncated at %d rows; cannot tell whether %s=%s already exists.\n"
+        "   Seeding again could duplicate it. Clean the database or seed by hand.\n"
+        % (len(d["data"]), field, want))
+    raise SystemExit(3)
+else:
+    print("")' "$1" "$2"
 }
 
 step() { printf '\n\033[1m%s\033[0m\n' "$*"; }
@@ -70,7 +89,7 @@ print(d[0]["id"] if d else "")' || true)
 fi
 
 step "1. provider  ($BASE_URL)"
-PROVIDER_ID=$(curl -fsS "${H[@]}" "$B/api/v1/admin/providers" | find_by display_name "$NAME")
+PROVIDER_ID=$(curl -fsS "${H[@]}" "$B/api/v1/admin/providers?$PAGE" | find_by display_name "$NAME")
 if [ -n "$PROVIDER_ID" ]; then
     printf '   reuse  %s\n' "$PROVIDER_ID"
 else
@@ -83,7 +102,7 @@ else
 fi
 
 step "2. provider model  ($MODEL)"
-MODEL_ID=$(curl -fsS "${H[@]}" "$B/api/v1/admin/providers/$PROVIDER_ID/models" | find_by model_key "$MODEL")
+MODEL_ID=$(curl -fsS "${H[@]}" "$B/api/v1/admin/providers/$PROVIDER_ID/models?$PAGE" | find_by model_key "$MODEL")
 if [ -n "$MODEL_ID" ]; then
     printf '   reuse  %s\n' "$MODEL_ID"
 else
@@ -103,7 +122,7 @@ step "3. credential"
 # `credential_not_found` before it ever reaches the provider. The value below is
 # stored encrypted and, for an OpenAI-compatible box that ignores Authorization,
 # never used for anything.
-CRED_ID=$(curl -fsS "${H[@]}" "$B/api/v1/admin/provider-credentials" | find_by provider_id "$PROVIDER_ID")
+CRED_ID=$(curl -fsS "${H[@]}" "$B/api/v1/admin/provider-credentials?$PAGE" | find_by provider_id "$PROVIDER_ID")
 if [ -n "$CRED_ID" ]; then
     printf '   reuse  %s\n' "$CRED_ID"
 else
@@ -117,7 +136,7 @@ else
 fi
 
 step "4. route  (migration 0005 seeds this one)"
-ROUTE_ID=$(curl -fsS "${H[@]}" "$B/api/v1/admin/routes" | find_by route_key general)
+ROUTE_ID=$(curl -fsS "${H[@]}" "$B/api/v1/admin/routes?$PAGE" | find_by route_key general)
 if [ -z "$ROUTE_ID" ]; then
     printf '   no `general` route — the database is not the one 0005 migrated\n' >&2
     exit 1
@@ -125,11 +144,22 @@ fi
 printf '   %s\n' "$ROUTE_ID"
 
 step "5. routing policy"
-POLICY_ID=$(curl -fsS "${H[@]}" "$B/api/v1/admin/routing-policies" | python3 -c 'import json,sys
+# Two fields, so `find_by` does not fit — but the truncation rule is the same one.
+POLICY_ID=$(curl -fsS "${H[@]}" "$B/api/v1/admin/routing-policies?$PAGE" | python3 -c 'import json,sys
 route, provider = sys.argv[1], sys.argv[2]
-rows = json.load(sys.stdin)["data"]
-hit = [r for r in rows if r.get("route_id") == route and r.get("provider_id") == provider]
-print(hit[0]["id"] if hit else "")' "$ROUTE_ID" "$PROVIDER_ID")
+d = json.load(sys.stdin)
+hit = [r for r in d["data"]
+       if r.get("route_id") == route and r.get("provider_id") == provider]
+if hit:
+    print(hit[0]["id"])
+elif (d.get("pagination") or {}).get("has_more"):
+    sys.stderr.write(
+        "   routing-policies truncated at %d rows; cannot tell whether a policy for\n"
+        "   this route and provider already exists. Seeding again could duplicate it.\n"
+        % len(d["data"]))
+    raise SystemExit(3)
+else:
+    print("")' "$ROUTE_ID" "$PROVIDER_ID")
 if [ -n "$POLICY_ID" ]; then
     printf '   reuse  %s\n' "$POLICY_ID"
 else
@@ -148,7 +178,7 @@ step "6. application"
 # `executable_path: missing` until one exists — even though an admin-authenticated
 # execution already succeeds. The application is what the *consumer* path hangs
 # off, and that path is the one a real client uses.
-APP_ID=$(curl -fsS "${H[@]}" "$B/api/v1/admin/applications" | find_by application_slug local-test)
+APP_ID=$(curl -fsS "${H[@]}" "$B/api/v1/admin/applications?$PAGE" | find_by application_slug local-test)
 if [ -n "$APP_ID" ]; then
     printf '   reuse  %s\n' "$APP_ID"
 else

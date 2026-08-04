@@ -41,25 +41,48 @@ esac
 # --- contract -------------------------------------------------------------
 # Counting operations rather than checking for a 200: the document is generated
 # from the annotated handlers, so a wrong count means routes moved.
-counts=$(curl -s -m 15 "$B/openapi.json" 2>/dev/null | python3 -c '
+#
+# There are two documents, not one. With `docs.expose_admin = false` — the
+# default (`config/default.toml`) and what `scripts/dev-env.sh` writes —
+# `/openapi.json` serves `public_document()`, which drops every path starting
+# `/api/v1/admin/` (`src/http/openapi.rs`). So the count that comes back depends
+# on configuration, and pinning the full contract unconditionally fails on a
+# correctly configured machine. Detect which document arrived, pin that one.
+#
+# The key is sent because with `expose_admin = true` the document itself is
+# admin-authenticated; when it is false the header is simply ignored.
+verdict=$(curl -s -m 15 ${MOIRA_SYSTEM_KEY:+-H "X-Moira-System-Key: $MOIRA_SYSTEM_KEY"} \
+    "$B/openapi.json" 2>/dev/null | python3 -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
 except Exception:
-    print("0 0 0"); raise SystemExit
+    print("BAD did not parse"); raise SystemExit
+if "error" in d:
+    # Most likely `expose_admin = true` with no usable key: the document is
+    # behind admin auth in that mode.
+    print("BAD %s — %s" % (d["error"].get("code"), d["error"].get("message")))
+    raise SystemExit
+paths = d.get("paths") or {}
+if not paths:
+    print("BAD document has no paths"); raise SystemExit
 methods = ("get", "post", "put", "patch", "delete", "head", "options")
-ops = sum(1 for p in d["paths"].values() for m in p if m in methods)
-print(len(d["paths"]), ops, len(d.get("components", {}).get("schemas", {})))' 2>/dev/null)
-set -- $counts
-if [ "${1:-0}" -gt 0 ]; then
-    ok "openapi.json — $1 paths, $2 operations, $3 schemas"
-    # Pinned against the operation count, because that is the number the repo
-    # already asserts (`src/http/mod.rs`, 100 paths / 152 operations). Keep the
-    # two in step: if that test changes, change this.
-    [ "$2" = 152 ] || bad "operation count is $2, expected 152 — the contract moved"
-else
-    bad "openapi.json did not parse"
-fi
+ops = sum(1 for p in paths.values() for m in p if m in methods)
+schemas = len(d.get("components", {}).get("schemas", {}))
+admin = any(p.startswith("/api/v1/admin/") for p in paths)
+# full: the figure `src/http/mod.rs` asserts on the unfiltered router.
+# public: the same router after the admin strip. Keep both in step with that test.
+kind, want_paths, want_ops = ("full", 100, 152) if admin else ("public", 23, 30)
+got = "%d paths, %d operations, %d schemas" % (len(paths), ops, schemas)
+if (len(paths), ops) == (want_paths, want_ops):
+    print("OK  %s document — %s" % (kind, got))
+else:
+    print("BAD %s document — %s, expected %d paths / %d operations — the contract moved"
+          % (kind, got, want_paths, want_ops))' 2>/dev/null)
+case "$verdict" in
+    OK*) ok  "openapi.json — ${verdict#OK  }" ;;
+    *)   bad "openapi.json — ${verdict#BAD }" ;;
+esac
 
 # --- deployment readiness -------------------------------------------------
 # Moira diagnoses itself here, and it is stricter than a green health probe:
