@@ -5,6 +5,7 @@
 // never any credential (decision D4). The page server component builds it from
 // the BFF response; the organisms never see Moira's raw projection.
 
+import type { SetupProvisioningState } from "@/lib/setup-steps";
 import type { AuthMethod, JsonValue } from "@/lib/types";
 
 /** One provider row, as the BFF's narrowed `SetupMethodView` projected it. */
@@ -25,6 +26,16 @@ export type SetupViewModel =
       readonly kind: "ready";
       readonly claimed: boolean;
       readonly methods: readonly SetupMethodSummary[];
+      /**
+       * The provisioning state the BFF DERIVED from Moira plus the console's
+       * secret store — display-safe counts, ids and booleans. This is what
+       * makes the wizard survive the sign-in navigation and any revisit of a
+       * provisioned-but-unclaimed deployment: the browser's own memory of the
+       * state is gone after both, and this field is where it comes back from.
+       */
+      readonly provisioning: SetupProvisioningState;
+      /** Better Auth's provider id for the incumbent issuer. An identifier. */
+      readonly oauthProviderId: string | null;
     }
   | { readonly kind: "claimed" }
   | {

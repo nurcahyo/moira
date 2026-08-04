@@ -42,7 +42,11 @@ import { Label } from "@/components/atoms/Label";
 import { Spinner } from "@/components/atoms/Spinner";
 import { FormField } from "@/components/molecules/FormField";
 import { CONSOLE_MESSAGE_KEYS, t } from "@/lib/i18n";
-import { isProvisioningComplete, type SetupProvisioningState } from "@/lib/setup-steps";
+import {
+  isProvisioningComplete,
+  narrowProvisioningState,
+  type SetupProvisioningState,
+} from "@/lib/setup-steps";
 import type { JsonValue } from "@/lib/types";
 
 import type { SetupMethodSummary } from "./setup-view";
@@ -55,6 +59,14 @@ const SETUP_ENDPOINT = "/api/setup";
 export interface AuthSettingsStepProps {
   /** Existing provider rows, display-safe. Presence only — see `setup-view.ts`. */
   readonly methods: readonly SetupMethodSummary[];
+  /**
+   * The wizard's current provisioning state — server-rehydrated on load,
+   * updated by every provision response. When it names a provider row, a save
+   * RESUMES against that row (the BFF patches it) instead of creating a second
+   * one, and a stored console secret means the operator is not asked to re-type
+   * a secret the console already holds. Display-safe; never carries the secret.
+   */
+  readonly provisioning: SetupProvisioningState;
   /** A claim was refused for this domain; focus the allow-list and instruct. */
   readonly refusedDomain: string | null;
   /** Reports the state Moira confirmed. Never carries the secret. */
@@ -118,31 +130,9 @@ function parseDomains(raw: string): readonly string[] {
     .filter((domain) => domain !== "");
 }
 
-/** Narrow a BFF `state` payload back to the display-safe provisioning state. */
-function narrowProvisioningState(value: unknown): SetupProvisioningState | null {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
-  const record = value as Record<string, unknown>;
-  const nullableString = (member: unknown): string | null =>
-    typeof member === "string" ? member : null;
-  const nullableNumber = (member: unknown): number | null =>
-    typeof member === "number" && Number.isFinite(member) ? member : null;
-  const domains = record["allowedEmailDomains"];
-  return {
-    trustedJwtIssuerId: nullableString(record["trustedJwtIssuerId"]),
-    trustedJwtIssuerVersion: nullableNumber(record["trustedJwtIssuerVersion"]),
-    providerId: nullableString(record["providerId"]),
-    providerVersion: nullableNumber(record["providerVersion"]),
-    providerTrustedJwtIssuerId: nullableString(record["providerTrustedJwtIssuerId"]),
-    providerEnabled: record["providerEnabled"] === true,
-    allowedEmailDomains: Array.isArray(domains)
-      ? domains.filter((domain): domain is string => typeof domain === "string")
-      : [],
-    consoleSecretStored: record["consoleSecretStored"] === true,
-  };
-}
-
 export function AuthSettingsStep({
   methods,
+  provisioning,
   refusedDomain,
   onProvisioned,
   fetchImpl,
@@ -169,11 +159,28 @@ export function AuthSettingsStep({
     setForm((previous) => ({ ...previous, [name]: value }));
   }
 
+  /**
+   * The state a save resumes against: the recorded partial state of a failed
+   * attempt first, otherwise the wizard's provisioning state when it already
+   * names a provider row — the domain-refusal re-save, or any save after a
+   * reload/OAuth round trip. `null` means a genuinely fresh create.
+   */
+  function effectiveResume(): SetupProvisioningState | null {
+    if (resumeRef.current !== null) return resumeRef.current;
+    return provisioning.providerId !== null ? provisioning : null;
+  }
+
   function validate(): readonly FieldName[] {
     const missing: FieldName[] = [];
     if (form.displayName.trim() === "") missing.push("displayName");
     if (form.clientId.trim() === "") missing.push("clientId");
-    if (form.clientSecret === "") missing.push("clientSecret");
+    // The secret is required unless the console has ALREADY sealed one for the
+    // row being re-saved: the domain-refusal instruction is "add the domain and
+    // save again", and the operator may no longer hold a secret the console
+    // does. Typing a new one still re-seals it.
+    if (form.clientSecret === "" && effectiveResume()?.consoleSecretStored !== true) {
+      missing.push("clientSecret");
+    }
     if (
       form.discoveryUrl.trim() === "" &&
       (form.issuer.trim() === "" ||
@@ -200,6 +207,7 @@ export function AuthSettingsStep({
     setPhase({ kind: "pending" });
 
     submissionRef.current ??= crypto.randomUUID();
+    const resume = effectiveResume();
     const optional = (value: string): string | null => (value.trim() === "" ? null : value.trim());
     const body: Record<string, unknown> = {
       action: "provision",
@@ -213,7 +221,7 @@ export function AuthSettingsStep({
       token_url: optional(form.tokenUrl),
       allowed_email_domains: parseDomains(form.allowedDomains),
       submission_id: submissionRef.current,
-      ...(resumeRef.current === null ? {} : { resume: resumeRef.current }),
+      ...(resume === null ? {} : { resume }),
     };
 
     const send = fetchImpl ?? globalThis.fetch;
@@ -247,8 +255,12 @@ export function AuthSettingsStep({
       onProvisioned(state, typeof providerId === "string" ? providerId : null);
       if (isProvisioningComplete(state)) {
         // Done. The secret has been sealed console-side; nothing here needs it
-        // any longer, so the envelope drops it.
+        // any longer, so the envelope drops it. The SUBMISSION id is dropped
+        // too: this submission is finished, and a later re-save (the
+        // domain-refusal remedy) must not replay its idempotency keys against a
+        // changed body — that is `409 idempotency_conflict`, forever.
         resumeRef.current = null;
+        submissionRef.current = null;
         setForm((previous) => ({ ...previous, clientSecret: "" }));
         setPhase({ kind: "idle" });
         return;
@@ -268,7 +280,12 @@ export function AuthSettingsStep({
       const state = narrowProvisioningState(error["state"]);
       if (state !== null) {
         resumeRef.current = state;
-        onProvisioned(state, null);
+        // Report the partial state upward so the wizard's model tracks what was
+        // actually written — but NOT a complete one: a failed UPDATE of an
+        // already-complete provider carries the untouched complete state, and
+        // reporting it would both be redundant and advance the cursor away
+        // from the failure the operator is looking at.
+        if (!isProvisioningComplete(state)) onProvisioned(state, null);
       }
       setPhase({
         kind: "failed",

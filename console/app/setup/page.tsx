@@ -26,6 +26,7 @@
 // never be cached.
 
 import { CONSOLE_MESSAGE_KEYS, t } from "@/lib/i18n";
+import { EMPTY_PROVISIONING_STATE, narrowProvisioningState } from "@/lib/setup-steps";
 import type { AuthMethod, JsonValue } from "@/lib/types";
 import { SetupWizard } from "@/modules/setup/SetupWizard";
 import type { SetupMethodSummary, SetupViewModel } from "@/modules/setup/setup-view";
@@ -80,7 +81,17 @@ async function loadViewModel(): Promise<SetupViewModel> {
           .map(methodSummary)
           .filter((summary): summary is SetupMethodSummary => summary !== null)
       : [];
-    return { kind: "ready", claimed: payload["claimed"] === true, methods };
+    const providerId = payload["provider_id"];
+    return {
+      kind: "ready",
+      claimed: payload["claimed"] === true,
+      methods,
+      // The BFF's derived state: what has ALREADY been provisioned. An absent
+      // or unreadable field degrades to "nothing confirmed yet", never to a
+      // crash — the wizard then simply starts from the auth-settings step.
+      provisioning: narrowProvisioningState(payload["state"]) ?? EMPTY_PROVISIONING_STATE,
+      oauthProviderId: typeof providerId === "string" && providerId !== "" ? providerId : null,
+    };
   }
 
   const error = asRecord(payload?.["error"]);

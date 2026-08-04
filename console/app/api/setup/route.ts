@@ -54,11 +54,13 @@ import { consoleProviderIdFor, isInteractiveMethod, isProviderSlug } from "@/lib
 import { readJsonBody } from "@/lib/console-api";
 import { isMoiraRequestError } from "@/lib/errors";
 import { CONSOLE_MESSAGE_KEYS } from "@/lib/i18n/keys";
+import type { ConsoleSecretStore } from "@/lib/console-secrets";
 import {
   SetupOrderingError,
   SetupProvisioningError,
   claimAdminIdentity,
   consoleIssuerConfigFor,
+  deriveProvisioningState,
   runSetupProvisioning,
   type AuthProviderConfig,
   type SetupWizardState,
@@ -113,9 +115,31 @@ function methodView(method: PublicAuthMethod): SetupMethodView {
   };
 }
 
+/**
+ * "Is a client secret sealed for this row" — presence, never the value.
+ *
+ * Passed to `deriveProvisioningState` as a bound predicate, for the same reason
+ * `storeClientSecret` is a closure: `setup-flow.ts` must not be handed anything
+ * that can reveal.
+ */
+async function hasSealedSecret(store: ConsoleSecretStore, providerId: string): Promise<boolean> {
+  return (await store.read(providerId)) !== null;
+}
+
 export async function GET(): Promise<Response> {
   return withSetupWindow(async (context) => {
     const methods = await context.client.getSetupAuthMethods();
+    // Rehydrate what has ALREADY been provisioned for the incumbent issuer, so
+    // the wizard survives the OAuth round trip (sign-in is a full navigation
+    // away from /setup and back) and any revisit of a provisioned-but-unclaimed
+    // deployment. The state is display-safe by construction: ids, versions,
+    // booleans and a domain COUNT — never the allow-list itself (D4).
+    const consoleConfig = consoleIssuerConfigFor(context.env, context.env.jwksUrl, null);
+    const state = await deriveProvisioningState(
+      context.client,
+      (providerId) => hasSealedSecret(context.store, providerId),
+      consoleConfig.issuer,
+    );
     return setupJson({
       claimed: context.claimed,
       storage_mode: context.storageMode,
@@ -125,6 +149,11 @@ export async function GET(): Promise<Response> {
       jwks_url: context.env.jwksUrl,
       audience: context.env.adminApiAudience,
       methods: methods.methods.map(methodView),
+      state,
+      // Better Auth's providerId for the incumbent issuer — an identifier the
+      // sign-in step posts, not a credential. Derived by the one server
+      // function that owns the derivation.
+      provider_id: consoleProviderIdFor(context.env.bffIssuerUrl, consoleConfig.issuer),
     });
   });
 }
@@ -212,10 +241,23 @@ async function provision(context: SetupWindowContext, body: SetupRequestBody): P
   const clientId = trimmedString(body["client_id"]);
   if (clientId === "") return setupBadRequest(CONSOLE_MESSAGE_KEYS.setup_client_id_required);
 
+  const resumeValue = body["resume"];
+  const resume =
+    resumeValue === undefined || resumeValue === null ? null : parseProvisioningState(resumeValue);
+  if (resumeValue !== undefined && resumeValue !== null && resume === null) {
+    return setupBadRequest(CONSOLE_MESSAGE_KEYS.setup_resume_state_invalid);
+  }
+
   // Read once, into one binding, and never rebound. Nothing below puts it into a
   // response, and `runSetupProvisioning` receives the closure rather than this.
+  //
+  // An EMPTY secret is acceptable in exactly one shape: a re-save of a provider
+  // whose secret the console already sealed (`resume.consoleSecretStored`). The
+  // domain-refusal remedy says "add the domain and save again", and demanding
+  // the operator re-type a secret the console holds — and they may no longer
+  // have — would make that instruction unfollowable.
   const clientSecret = typeof body["client_secret"] === "string" ? body["client_secret"] : "";
-  if (clientSecret === "") {
+  if (clientSecret === "" && resume?.consoleSecretStored !== true) {
     return setupBadRequest(CONSOLE_MESSAGE_KEYS.setup_client_secret_required);
   }
 
@@ -239,13 +281,6 @@ async function provision(context: SetupWindowContext, body: SetupRequestBody): P
     // claim including the operator's own, so an empty submission would provision
     // a deployment nobody can ever become admin of.
     return setupBadRequest(CONSOLE_MESSAGE_KEYS.setup_allowed_email_domains_required);
-  }
-
-  const resumeValue = body["resume"];
-  const resume =
-    resumeValue === undefined || resumeValue === null ? null : parseProvisioningState(resumeValue);
-  if (resumeValue !== undefined && resumeValue !== null && resume === null) {
-    return setupBadRequest(CONSOLE_MESSAGE_KEYS.setup_resume_state_invalid);
   }
 
   // Stable per SUBMISSION, so a resume replays the same keys rather than minting
@@ -275,6 +310,12 @@ async function provision(context: SetupWindowContext, body: SetupRequestBody): P
       console: consoleConfig,
       provider,
       storeClientSecret: async (providerId, storedClientId) => {
+        if (clientSecret === "") {
+          // A re-save with no new secret: the guard above admitted this shape
+          // only because `resume.consoleSecretStored` says one is already
+          // sealed for the row, so there is nothing to write.
+          return;
+        }
         if (storedClientId === null || storedClientId === "") {
           // The AEAD binds `(providerId, clientId)`, so there is nothing to seal
           // against. Thrown rather than skipped: a provider enabled with no
@@ -374,9 +415,6 @@ async function claim(
   const slugResult = readSlug(body["slug"]);
   if (slugResult instanceof Response) return slugResult;
 
-  const state = parseProvisioningState(body["state"]);
-  if (state === null) return setupBadRequest(CONSOLE_MESSAGE_KEYS.setup_resume_state_invalid);
-
   const session = await context.readSession(request.headers);
   if (!session.ok) {
     // `session.messageKey` is already the keyed reason `checkSession` decided —
@@ -389,6 +427,26 @@ async function claim(
   }
   const identity = session.identity;
 
+  // The CONSOLE's issuer, derived from the slug rather than accepted from the
+  // body: a caller-supplied issuer string would be a caller-chosen
+  // `admin_identities` namespace.
+  const consoleIssuer = consoleIssuerConfigFor(
+    context.env,
+    context.env.jwksUrl,
+    slugResult.slug,
+  ).issuer;
+
+  // The provisioning state is DERIVED HERE, never read off the request body.
+  // The browser's copy does not survive the OAuth round trip (sign-in is a full
+  // navigation away from /setup and back), and a claim gated on whatever the
+  // client echoes would be gated on nothing at all. Moira's records plus the
+  // console's own secret store are the source of truth on every claim.
+  const state = await deriveProvisioningState(
+    context.client,
+    (providerId) => hasSealedSecret(context.store, providerId),
+    consoleIssuer,
+  );
+
   // `signedInWithAllowedIdentity` is TRUE because `checkSession` has just
   // applied the deployment's `allowed_email_domains` to this session — the same
   // list Moira applies at claim time. It is not an assumption restated here.
@@ -398,15 +456,6 @@ async function claim(
     signedInWithAllowedIdentity: true,
     claimSucceeded: false,
   };
-
-  // The CONSOLE's issuer, derived from the slug rather than accepted from the
-  // body: a caller-supplied issuer string would be a caller-chosen
-  // `admin_identities` namespace.
-  const consoleIssuer = consoleIssuerConfigFor(
-    context.env,
-    context.env.jwksUrl,
-    slugResult.slug,
-  ).issuer;
 
   try {
     const record = await claimAdminIdentity(context.client, wizard, {

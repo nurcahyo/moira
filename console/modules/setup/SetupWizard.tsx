@@ -84,15 +84,29 @@ function stepIndex(step: SetupStepId): number {
 }
 
 export function SetupWizard({ view, fetchImpl, navigate }: SetupWizardProps) {
-  const [provisioning, setProvisioning] = useState<SetupProvisioningState>(
-    EMPTY_PROVISIONING_STATE,
+  // Seeded from the SERVER-derived state, not from empty: the sign-in step is a
+  // full navigation to the IdP and back, so this component remounts with fresh
+  // state mid-flow, and only the BFF's rehydration can carry the wizard across
+  // that gap (and across any later revisit of a provisioned-but-unclaimed
+  // deployment).
+  const initialProvisioning =
+    view.kind === "ready" ? view.provisioning : EMPTY_PROVISIONING_STATE;
+  const [provisioning, setProvisioning] = useState<SetupProvisioningState>(initialProvisioning);
+  const [oauthProviderId, setOauthProviderId] = useState<string | null>(
+    view.kind === "ready" ? view.oauthProviderId : null,
   );
-  const [oauthProviderId, setOauthProviderId] = useState<string | null>(null);
   const [signedInEmail, setSignedInEmail] = useState<string | null>(null);
   const [claimSucceeded, setClaimSucceeded] = useState(false);
   const [claimedEmail, setClaimedEmail] = useState<string | null>(null);
   const [refusedDomain, setRefusedDomain] = useState<string | null>(null);
-  const [cursor, setCursor] = useState<SetupStepId>(view.kind === "claimed" ? "done" : "welcome");
+  const [cursor, setCursor] = useState<SetupStepId>(() => {
+    if (view.kind === "claimed") return "done";
+    // A rehydrated COMPLETE state lands the operator on sign-in/claim — the
+    // welcome and auth-settings steps are behind them, most notably right after
+    // the IdP redirects back here. Anything less than complete starts at
+    // welcome, exactly as a fresh deployment does.
+    return isProvisioningComplete(initialProvisioning) ? "sign_in" : "welcome";
+  });
 
   const claimed = view.kind === "claimed" || (view.kind === "ready" && view.claimed);
   const wizard: SetupWizardState = {
@@ -187,6 +201,7 @@ export function SetupWizard({ view, fetchImpl, navigate }: SetupWizardProps) {
       <div hidden={active !== "auth_settings"}>
         <AuthSettingsStep
           methods={methods}
+          provisioning={provisioning}
           refusedDomain={refusedDomain}
           onProvisioned={onProvisioned}
           {...(fetchImpl === undefined ? {} : { fetchImpl })}
@@ -199,7 +214,6 @@ export function SetupWizard({ view, fetchImpl, navigate }: SetupWizardProps) {
           methods={methods.filter((method) => method.interactive)}
           oauthProviderId={oauthProviderId}
           signedInEmail={signedInEmail}
-          provisioning={provisioning}
           onClaimed={onClaimed}
           onDomainRefused={onDomainRefused}
           {...(fetchImpl === undefined ? {} : { fetchImpl })}

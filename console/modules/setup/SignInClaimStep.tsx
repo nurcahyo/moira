@@ -14,18 +14,20 @@
 // `lib/auth-config.ts` and is not re-implemented here). The callback returns to
 // `/setup`, where the wizard's session probe picks the identity up.
 //
-// The claim goes through `POST /api/setup {action: "claim"}` with the recorded
-// provisioning state. A `403 admin_claim_domain_not_allowed` is NOT rendered as
-// a banner here: it is reported upward so the wizard returns the operator to
-// the auth-settings step with the offending domain named and the allow-list
-// field focused — the one place the refusal can still be fixed.
+// The claim goes through `POST /api/setup {action: "claim"}` and carries NO
+// provisioning state: the BFF derives the state from Moira's records plus the
+// console's secret store on every claim, because this component's memory does
+// not survive the sign-in navigation it itself initiates. A `403
+// admin_claim_domain_not_allowed` is NOT rendered as a banner here: it is
+// reported upward so the wizard returns the operator to the auth-settings step
+// with the offending domain named and the allow-list field focused — the one
+// place the refusal can still be fixed.
 
 import { useState } from "react";
 
 import { Button } from "@/components/atoms/Button";
 import { Spinner } from "@/components/atoms/Spinner";
 import { CONSOLE_MESSAGE_KEYS, t } from "@/lib/i18n";
-import type { SetupProvisioningState } from "@/lib/setup-steps";
 import type { JsonValue } from "@/lib/types";
 
 import type { SetupMethodSummary } from "./setup-view";
@@ -50,8 +52,6 @@ export interface SignInClaimStepProps {
   readonly oauthProviderId: string | null;
   /** The probed console session's email, when one exists. */
   readonly signedInEmail: string | null;
-  /** The recorded provisioning state the claim sends. Display-safe. */
-  readonly provisioning: SetupProvisioningState;
   readonly onClaimed: (email: string | null) => void;
   readonly onDomainRefused: (domain: string) => void;
   /** Injected by the unit test. Shipped call sites use the global. */
@@ -76,7 +76,6 @@ export function SignInClaimStep({
   methods,
   oauthProviderId,
   signedInEmail,
-  provisioning,
   onClaimed,
   onDomainRefused,
   fetchImpl,
@@ -136,7 +135,10 @@ export function SignInClaimStep({
       response = await send(SETUP_ENDPOINT, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ action: "claim", state: provisioning }),
+        // No state: the BFF re-derives the provisioning state from Moira and
+        // the console's secret store, so nothing here depends on what this
+        // document happens to remember.
+        body: JSON.stringify({ action: "claim" }),
       });
     } catch {
       setPhase({ kind: "failed", messageKey: CONSOLE_MESSAGE_KEYS.setup_request_unreachable });
