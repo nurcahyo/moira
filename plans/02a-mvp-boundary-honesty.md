@@ -130,6 +130,12 @@ This plan does not cross the Moira/Rig boundary at all — it touches only persi
 - In `ingest_rag_document` (`:1138-1211`), the `INSERT INTO rag_document_versions (...)` at `:1177-1197` hardcodes the literal `'indexed'` in `VALUES (..., 'indexed', $9)` (`:1184`). Replace the literal with a **bound parameter** carrying `rag_ingestion_status_to_db(RagIngestionStatus::Pending)` (see §3) rather than hand-writing `'pending'`, so the vocabulary has exactly one source of truth.
 - **Same fix in `create_rag_document`** (`:1013-1084`): the inline-content version-1 `INSERT` at `:1058-1074` hardcodes `'indexed'` in its `VALUES` clause (`:1064`) — change it identically.
 - The `UPDATE rag_document_versions SET superseded_at = …, ingestion_status = case when ingestion_status = 'indexed' then 'superseded' else ingestion_status end` at `:1166-1176` (supersession of the *previous* version) is a **read** comparison, not a write of `'indexed'`. Since nothing ever reaches `'indexed'` under this plan's scope, this `CASE` becomes a no-op until plan 11 lands a real pipeline. Leave the `CASE` structure in place (harmless, forward-compatible) but do not claim in comments that it does anything today.
+  > **Superseded by plan 11** (`plans/11-rag-memory-intelligence.md`). `'indexed'` is reachable and
+  > earned again — it is the terminal status of a real ingestion plan
+  > (`src/orchestration/ingestion.rs:158`) — so the `CASE` fires and is no longer a no-op. The
+  > current guard is `reindex_supersedes_the_previous_version_and_indexed_is_earned_not_laundered`
+  > (`tests/rag_ingestion_honesty.rs:772`). The instruction above described 02a's world correctly
+  > and is kept for that record; it must not be applied as written today.
 - **Add a code comment** directly above each corrected `INSERT`: `// Honest status: no chunking/embedding pipeline exists yet (see plans/11-rag-memory-intelligence.md). Content is stored verbatim; ingestion_status reflects "not yet processed", not "indexed for retrieval".`
 
 ### 3. `src/infra/pg_rows.rs` — surface the true value
@@ -225,9 +231,20 @@ Read during grounding and confirmed already honest about scope ("direct-text doc
 
 `docs/retrieval-citations.md` and `docs/conversation-summarization.md` were re-read and are **already honest** ("returns an empty list because retrieval context is not yet injected"; "Automatic summarization execution is not enabled yet"). Leave them untouched rather than churning them.
 
+> **Superseded by plan 11 and F31.** Both quoted sentences became false once plan 11 landed
+> retrieval, injection and summarization. F31 (commit `270df5e`) retired them across twelve OpenAPI
+> descriptions and the docs. What made this expensive is recorded in `docs/todo.md`: a "keep X until
+> Y" instruction needs its retirement listed as part of Y, not only as a condition on X.
+
 ### 11. `docs/todo.md` — reconciliation
 
 - Annotate the Phase 5 preamble (`docs/todo.md:77` area): `(Descoped for MVP: plans/02a-mvp-boundary-honesty.md makes the current no-op behavior honest in the API contract; full implementation remains tracked here for plans/11-rag-memory-intelligence.md.)`
+
+> **Superseded by F31 — do not apply this annotation today.** The descope it announces was reversed
+> when plan 11 wired the pipeline; re-adding it would reintroduce the exact false advertising F31
+> removed. The reversal, and the handoff rule it produced, are recorded on the "DONE, then REVERSED
+> (F31)" line in `docs/todo.md`'s Phase 5 section. The `:77` line number is also historical —
+> `docs/todo.md` gained a marker legend under issue #82; find the section by its heading.
 - Annotate the Phase 2 idempotency-extension line (`:22`, "Extend atomic idempotency and sanitized deterministic-failure replay to the runtime-policy, RAG, conversation, memory…") to point at `plans/02b-idempotency-replay.md` for the RAG/conversation/memory slice.
 - Do not delete or renumber existing TODO lines — only annotate.
 
@@ -258,7 +275,7 @@ Follows the existing harness exactly: `mod support;`, a `LifecycleFixture`-deriv
 | `create_rag_document_with_inline_content_reports_pending_ingestion_status` | the second `'indexed'` write site (`src/infra/repositories/conversation.rs:1064`) is fixed **and** the in-transaction response-row re-select from §3 works — without the re-select this returns `null` and the test fails, which is exactly the trap it exists to catch |
 | `create_rag_document_without_content_reports_null_ingestion_status` | `null`, not `"pending"` — proves `Option` semantics are real, not a default |
 | `rag_document_get_and_list_report_the_same_ingestion_status` | `GET /api/v1/admin/rag-documents/{id}` and `GET /api/v1/admin/rag-collections/{collection_id}/documents` agree with the create/ingest response — proves the `LEFT JOIN` covers **every** `rag_document_select(` call site |
-| `reindex_supersedes_the_previous_version_without_ever_writing_indexed` | `POST .../reindex` creates version N+1, marks version N `superseded_at`, and **no** row in `rag_document_versions` for this document ever holds `'indexed'` (`SELECT count(*) … WHERE ingestion_status = 'indexed'` is `0`). Also proves the existing supersession behavior did not regress |
+| `reindex_supersedes_the_previous_version_without_ever_writing_indexed` (**superseded by plan 11** — inverted and renamed to `reindex_supersedes_the_previous_version_and_indexed_is_earned_not_laundered`, `tests/rag_ingestion_honesty.rs:772`, because `'indexed'` is now written and earned) | `POST .../reindex` creates version N+1, marks version N `superseded_at`, and **no** row in `rag_document_versions` for this document ever holds `'indexed'` (`SELECT count(*) … WHERE ingestion_status = 'indexed'` is `0`). Also proves the existing supersession behavior did not regress |
 | `repeated_ingest_with_the_same_idempotency_key_creates_two_versions_until_02b` | the **honest interim** contract: sending `Idempotency-Key` twice produces two version rows (no replay). This is deliberately an assertion of *current* behavior. **02b replaces this test with its inverse** (`repeated_ingest_with_the_same_key_replays_and_creates_exactly_one_version`) — the test name encodes the hand-off, and 02b's Definition of Done includes deleting it |
 | `rag_document_error_responses_carry_catalog_message_keys` | `CONVENTIONS.md` §4 rule 5, second half: request a non-existent RAG document → the `ErrorDetail` envelope carries `code == "rag_document_not_found"`, `message_key == "moira.error.rag_document_not_found"`, and a **non-empty** `message`. **Do not call `moira::i18n::is_known_key` here** — `src/i18n/` is not declared in `src/lib.rs` (finding P0-5) and is therefore not compiled or reachable from `tests/`. Wiring it is 02b Wave 0 / plan 04 Wave 0; this test asserts the wire envelope only, and 02b upgrades it to a catalog assertion |
 
@@ -294,7 +311,14 @@ C, D, and E touch entirely disjoint files — no conflict risk.
 F and G are file-disjoint and may run in parallel, but **both** must land before the PR opens: `CONVENTIONS.md` §3 makes a single-layer plan unmergeable.
 
 ### Wave 4 — read-only reviewer
-Re-read the full diff against Findings Addressed and confirm: (1) no `ConversationService` public method signature changed; (2) no route added/removed from `src/http/mod.rs`'s router table; (3) **`Idempotency-Key` still appears exactly four times in `src/http/conversation.rs`** (`grep -c 'Idempotency-Key' src/http/conversation.rs` = 4) — a removal is a hard review failure under `CONVENTIONS.md` §0 D1; (4) no 02b/plan-11 scope crept in (grep the diff for `rag_chunks`, `rag_chunk_embeddings`, `conversation_summaries`, `claim_idempotency`, `AdminCommandRunner` — none should appear).
+Re-read the full diff against Findings Addressed and confirm: (1) no `ConversationService` public method signature changed; (2) no route added/removed from `src/http/mod.rs`'s router table; (3) **`Idempotency-Key` still appears exactly four times in `src/http/conversation.rs`** (`grep -c '("Idempotency-Key' src/http/conversation.rs` = 4) — a removal is a hard review failure under `CONVENTIONS.md` §0 D1; (4) no 02b/plan-11 scope crept in (grep the diff for `rag_chunks`, `rag_chunk_embeddings`, `conversation_summaries`, `claim_idempotency`, `AdminCommandRunner` — none should appear).
+
+> **Guard amended (issue #82).** The original wording of check (3) was
+> `grep -c 'Idempotency-Key' src/http/conversation.rs`. Both forms return `4` against the current
+> tree, so the guard was never broken — but the unanchored form counts any *prose* mention of the
+> header in an operation description as well as the parameter declarations it is meant to count,
+> and 02a itself rewrote those descriptions. `("Idempotency-Key` anchors on the `utoipa` parameter
+> tuple, so it counts declarations and only declarations. The expected value is unchanged.
 
 **Conflict-avoidance strategy.** `src/http/conversation.rs` is owned solely by Agent D across the whole plan; `src/infra/repositories/conversation.rs` solely by Agent C. No two agents in the same wave touch the same file.
 
@@ -320,9 +344,17 @@ Re-read the full diff against Findings Addressed and confirm: (1) no `Conversati
 ```
 Value is one of the existing `RagIngestionStatus` snake_case variants or `null` if no version exists. Under this plan's scope only `pending` and `null` are ever produced; the others become reachable when plan 11 lands.
 
+> **Superseded by plan 11.** The others are now reachable: ingestion transitions documents through
+> the pipeline to `indexed` (`src/orchestration/ingestion.rs`).
+
 **Status codes.** Unchanged for all affected routes.
 
 **Headers.** `Idempotency-Key` remains declared on the four RAG write routes and remains **accepted and ignored** at runtime. No `400`/`501` is introduced. This is binding: `CONVENTIONS.md` §0 D1 settled the "remove and reject" alternative — it is **not** an open product question and must not be reintroduced.
+
+> **Half superseded by plan 02b** (`plans/02b-idempotency-replay.md`, commit `e1c2658`). The header
+> is no longer ignored — the four routes replay for real through `AdminCommandRunner`. The binding
+> half stands and is unaffected: the parameter must stay declared, and "remove and reject" remains
+> settled by `CONVENTIONS.md` §0 D1.
 
 **Scopes/authorization rules.** Unchanged — `moira:rag-collections:write`, `moira:rag-documents:write`, `moira:rag-documents:ingest`, `moira:conversations:create`, etc.
 

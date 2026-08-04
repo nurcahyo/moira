@@ -4,6 +4,22 @@
 # cargo capture. Uploaded as a CI artifact; a local shard reproduction leaves it here.
 /shard-out
 
+# Local configuration. `scripts/dev-env.sh` writes a real 32-byte master key and
+# API-key pepper into `.env`, and `config/local.toml` is the TOML equivalent —
+# neither was ignored before that generator existed.
+/.env
+/.env.bak
+/config/local.toml
+
+# `scripts/bootstrap-key.sh` edits `.env` with `sed -i.keytmp`. BSD sed needs a
+# suffix, so a full copy of the file — key material and all — exists for the
+# length of that call, and survives it if the command fails partway.
+/.env.keytmp
+
+# macOS Finder metadata. `console/.gitignore` already had this; the root did not,
+# so a `git add .` from the repo root would have committed it.
+.DS_Store
+
 # cargo-mutants scratch tree and outcome report (scripts/mutants.sh)
 /mutants.out
 /mutants.out.old
