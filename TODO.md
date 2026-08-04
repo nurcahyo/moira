@@ -2,7 +2,8 @@
 
 Hardening items, leftovers, deferred follow-ups and known gaps surfaced while executing the
 iteration plans. Nothing here is silently dropped: an item that is not done lives here, and an item
-needing a human decision lives in [`NEED_CONFIRMATION.md`](./NEED_CONFIRMATION.md).
+needing a human decision lives in [`NEED_CONFIRMATION.md`](./NEED_CONFIRMATION.md). Decisions already
+answered live in [`docs/decisions-taken.md`](./docs/decisions-taken.md).
 
 Format: `- [ ] <item> — source: <plan> — <why deferred>`
 
@@ -61,4 +62,4 @@ Items fixed inside 04 are not listed here.
 ## Cross-cutting / infrastructure
 
 - [ ] Make DB-dependent test suites fail loudly when the database is absent locally — source: plans/02a-mvp-boundary-honesty.md — with `MOIRA_TEST_DATABASE_URL` unset and `CI` unset, all e2e tests return early and report `ok` in ~0.01s having proven nothing, so the literal CONVENTIONS §2 `cargo test --workspace --all-features` gate is fully green on a machine with no database. The `CI=true` path does panic correctly. Systemic, inherited from `tests/support/mod.rs`, not introduced by 02a; until it changes, PR test evidence must show the DB-backed run, not merely a green transcript.
-- [ ] Re-run the 02a gates against PostgreSQL 16 in CI — source: plans/02a-mvp-boundary-honesty.md — local verification used PostgreSQL 18.3 because Docker is unavailable on the dev machine. See [`NEED_CONFIRMATION.md`](./NEED_CONFIRMATION.md).
+- [ ] Re-run the 02a gates against PostgreSQL 16 in CI — source: plans/02a-mvp-boundary-honesty.md — local verification used PostgreSQL 18.3 because Docker is unavailable on the dev machine. The deviation was accepted with CI on PG16 as the authoritative gate — see [`docs/decisions-taken.md`](./docs/decisions-taken.md) §2/6, which also records what about it is and is not verified.

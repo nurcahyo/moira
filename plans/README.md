@@ -31,7 +31,8 @@ Updated as each plan merges. A plan is **Complete** only when its PR is merged w
 precede them; `06` is recommended before `07`.
 
 Open decisions carried out of executed plans live in [`../NEED_CONFIRMATION.md`](../NEED_CONFIRMATION.md);
-deferred hardening lives in [`../TODO.md`](../TODO.md).
+once answered they move to [`../docs/decisions-taken.md`](../docs/decisions-taken.md) with their
+evidence and reversal condition. Deferred hardening lives in [`../TODO.md`](../TODO.md).
 
 ## Index
 
