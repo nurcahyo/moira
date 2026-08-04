@@ -6,7 +6,7 @@ use moira::{
     application::{AdminService, ConversationService, PublicExecutionService},
     domain::{
         ConsumerKeyCreateRequest, ConversationMessageQuery, ConversationQuery, ExecutionQuery,
-        MemoryPatchRequest, MemoryPolicyPutRequest, MemoryQuery, UsageQuery,
+        MemoryPatchRequest, MemoryPolicyPutRequest, MemoryQuery, PublicListQuery, UsageQuery,
     },
     error::AppError,
     security::{Actor, ActorType},
@@ -217,8 +217,16 @@ async fn trusted_jwt_requires_a_valid_application_binding_for_public_reads() {
             )
             .await,
     );
-    assert_forbidden(public.list_models(&unbound).await);
-    assert_forbidden(public.list_routes(&unbound).await);
+    assert_forbidden(
+        public
+            .list_models(&unbound, &PublicListQuery::default())
+            .await,
+    );
+    assert_forbidden(
+        public
+            .list_routes(&unbound, &PublicListQuery::default())
+            .await,
+    );
     assert_forbidden(public.capabilities(&unbound).await);
 
     let resources = seed_public_resources(&fixture, fixture.application_id, "unbound-target").await;
@@ -390,7 +398,7 @@ async fn application_bound_actor_cannot_read_another_app_public_resources() {
         ..actor.clone()
     };
     let models = public
-        .list_models(&discovery_actor)
+        .list_models(&discovery_actor, &PublicListQuery::default())
         .await
         .expect("list application models");
     assert!(models.data.iter().any(|item| item.id == own.model_id));
@@ -403,7 +411,7 @@ async fn application_bound_actor_cannot_read_another_app_public_resources() {
     );
 
     let routes = public
-        .list_routes(&discovery_actor)
+        .list_routes(&discovery_actor, &PublicListQuery::default())
         .await
         .expect("list application routes");
     assert!(routes.data.iter().any(|item| item.id == own.route_id));

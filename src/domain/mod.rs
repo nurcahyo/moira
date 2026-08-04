@@ -63,16 +63,16 @@ pub use models::{
     ProviderConfig, ProviderKind, SetRoutingDefaultRequest, UpdateProviderRequest,
     UpsertCredentialRequest,
 };
-pub use pagination::{CursorScope, ListCursor, SeqCursor};
+pub use pagination::{CursorScope, Keyed, ListCursor, SeqCursor};
 pub use public::{
     ApplicationExecutionPolicyPutRequest, ApplicationExecutionPolicyRecord, ExecutionQuery,
     OpenAiCompatTextFormat, OpenAiCompatTextOptions, OpenAiResponseCompatRequest,
     PublicCapabilities, PublicContentPart, PublicExecutionSummary, PublicInputMessage,
-    PublicMessageRole, PublicModelCapabilities, PublicModelRef, PublicModelResource,
-    PublicOutputContentPart, PublicOutputItem, PublicResponse, PublicResponseFormat,
-    PublicResponseRecord, PublicResponseRequest, PublicResponseStatus, PublicRouteRef,
-    PublicRouteResource, PublicSseEnvelope, PublicToolDeclaration, PublicUsageRecord,
-    PublicUsageSummary, ResponsePersistenceMode, UsageQuery,
+    PublicListQuery, PublicMessageRole, PublicModelCapabilities, PublicModelRef,
+    PublicModelResource, PublicOutputContentPart, PublicOutputItem, PublicResponse,
+    PublicResponseFormat, PublicResponseRecord, PublicResponseRequest, PublicResponseStatus,
+    PublicRouteRef, PublicRouteResource, PublicSseEnvelope, PublicToolDeclaration,
+    PublicUsageRecord, PublicUsageSummary, ResponsePersistenceMode, UsageQuery,
 };
 pub use runtime::{
     AgentProfileCreateRequest, AgentProfilePatchRequest, AgentProfileRecord, AttemptStatus,

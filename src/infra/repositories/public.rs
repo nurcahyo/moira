@@ -6,8 +6,8 @@ use uuid::Uuid;
 
 use crate::{
     domain::{
-        ApplicationExecutionPolicyPutRequest, ApplicationExecutionPolicyRecord, ExecutionQuery,
-        IdempotencyRecord, PublicExecutionSummary, PublicModelCapabilities, PublicModelResource,
+        ApplicationExecutionPolicyPutRequest, ApplicationExecutionPolicyRecord, IdempotencyRecord,
+        Keyed, ListCursor, PublicExecutionSummary, PublicModelCapabilities, PublicModelResource,
         PublicResponseRecord, PublicRouteResource, PublicUsageRecord, PublicUsageSummary,
         ResponsePersistenceMode, UsageQuery,
     },
@@ -19,6 +19,7 @@ use crate::{
     security::IdempotencyHasher,
 };
 
+use super::keyset::{KeysetTail, bind_cursor, over_fetch_limit};
 use super::policy_row::get_or_create_policy_row;
 
 /// The execution-policy projection, spelled out rather than `*`.
@@ -173,23 +174,40 @@ pub trait PublicRepository: Send + Sync {
         access: &PublicAccess,
     ) -> Result<PublicExecutionSummary, AppError>;
 
+    /// # Pagination contract for the four `list_*` methods below (issue #93)
+    ///
+    /// Identical to [`super::AdminRepository`]'s, and deliberately so. Each takes the
+    /// already-decoded keyset `cursor` for its own sort key plus the caller's page `limit`,
+    /// and returns **up to `limit + 1`** rows in that query's documented order. The extra
+    /// row is the existence proof for `has_more`; trimming it, computing `has_more` and
+    /// encoding `next_cursor` belong to `src/application/public.rs`.
+    ///
+    /// The one difference from the admin lists is [`Keyed`]: these return wire DTOs, which
+    /// do not all carry the sort key the cursor is built from, so the repository hands the
+    /// key back beside the row rather than the application layer digging it out of a public
+    /// response shape. See [`crate::domain::Keyed`].
+    ///
+    /// A repository method here never returns `has_more` and never encodes a cursor.
     async fn list_executions_authorized(
         &self,
         access: &PublicAccess,
-        query: &ExecutionQuery,
-    ) -> Result<Vec<PublicExecutionSummary>, AppError>;
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<Keyed<PublicExecutionSummary>>, AppError>;
 
     async fn list_usage_authorized(
         &self,
         access: &PublicAccess,
         query: &UsageQuery,
-    ) -> Result<Vec<PublicUsageRecord>, AppError>;
+        cursor: Option<ListCursor>,
+    ) -> Result<Vec<Keyed<PublicUsageRecord>>, AppError>;
 
     async fn list_visible_models(
         &self,
         access: &PublicAccess,
+        cursor: Option<ListCursor>,
         limit: i64,
-    ) -> Result<Vec<PublicModelResource>, AppError>;
+    ) -> Result<Vec<Keyed<PublicModelResource>>, AppError>;
 
     async fn find_visible_model_id_by_key(
         &self,
@@ -200,8 +218,9 @@ pub trait PublicRepository: Send + Sync {
     async fn list_visible_routes(
         &self,
         access: &PublicAccess,
+        cursor: Option<ListCursor>,
         limit: i64,
-    ) -> Result<Vec<PublicRouteResource>, AppError>;
+    ) -> Result<Vec<Keyed<PublicRouteResource>>, AppError>;
 }
 
 impl PgPublicRepository {
@@ -647,37 +666,53 @@ impl PublicRepository for PgPublicRepository {
     async fn list_executions_authorized(
         &self,
         access: &PublicAccess,
-        query: &ExecutionQuery,
-    ) -> Result<Vec<PublicExecutionSummary>, AppError> {
-        let rows = sqlx::query(&format!(
-            "{}\norder by r.created_at desc, r.id desc\nlimit $5",
-            execution_summary_sql(
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<Keyed<PublicExecutionSummary>>, AppError> {
+        // `$1`..`$4` are the access predicate, so the cursor takes `$5`/`$6` and the limit
+        // whatever follows. The sort column is qualified because this query joins five
+        // relations that each have an `id`.
+        let tail = KeysetTail::new("r.created_at", cursor.as_ref(), 5);
+        let sql = format!(
+            "{}\n{}",
+            execution_summary_sql(&format!(
                 r#"
             where ($1::boolean
                    or (($2::uuid is null or r.application_id = $2)
                        and ($3::text is null or r.external_tenant_id = $3)
                        and ($4::text is null or r.external_user_id = $4)))
-            "#
-            )
-        ))
-        .bind(access.privileged)
-        .bind(access.application_id)
-        .bind(&access.external_tenant_id)
-        .bind(&access.external_user_id)
-        .bind(query.limit())
+              {}
+            "#,
+                tail.and_clause()
+            )),
+            tail.order_and_limit,
+        );
+        let rows = bind_cursor(
+            sqlx::query(&sql)
+                .bind(access.privileged)
+                .bind(access.application_id)
+                .bind(&access.external_tenant_id)
+                .bind(&access.external_user_id),
+            cursor.as_ref(),
+        )
+        .bind(over_fetch_limit(limit))
         .fetch_all(&self.pool)
         .await?;
-        rows.iter().map(execution_summary_from_row).collect()
+        rows.iter().map(keyed_execution_summary_from_row).collect()
     }
 
     async fn list_usage_authorized(
         &self,
         access: &PublicAccess,
         query: &UsageQuery,
-    ) -> Result<Vec<PublicUsageRecord>, AppError> {
-        let rows = sqlx::query(
+        cursor: Option<ListCursor>,
+    ) -> Result<Vec<Keyed<PublicUsageRecord>>, AppError> {
+        // The one public list keyed on `occurred_at` rather than `created_at`, matching the
+        // order it already documented. Twelve fixed parameters precede the cursor.
+        let tail = KeysetTail::new("u.occurred_at", cursor.as_ref(), 13);
+        let sql = format!(
             r#"
-            select u.execution_id, p.provider_type, pm.model_key,
+            select u.id, u.execution_id, p.provider_type, pm.model_key,
                    u.input_tokens, u.output_tokens, u.cached_input_tokens,
                    u.reasoning_tokens, u.total_tokens, u.estimated_total_cost,
                    u.currency, u.occurred_at
@@ -697,61 +732,97 @@ impl PublicRepository for PgPublicRepository {
               and ($10::uuid is null or r.route_id = $10)
               and ($11::timestamptz is null or u.occurred_at >= $11)
               and ($12::timestamptz is null or u.occurred_at <= $12)
-            order by u.occurred_at desc, u.id desc
-            limit $13
+              {}
+            {}
             "#,
+            tail.and_clause(),
+            tail.order_and_limit,
+        );
+        let rows = bind_cursor(
+            sqlx::query(&sql)
+                .bind(access.privileged)
+                .bind(access.application_id)
+                .bind(&access.external_tenant_id)
+                .bind(&access.external_user_id)
+                .bind(query.application_id)
+                .bind(&query.external_tenant_id)
+                .bind(&query.external_user_id)
+                .bind(query.provider_id)
+                .bind(query.provider_model_id)
+                .bind(query.route_id)
+                .bind(query.occurred_after)
+                .bind(query.occurred_before),
+            cursor.as_ref(),
         )
-        .bind(access.privileged)
-        .bind(access.application_id)
-        .bind(&access.external_tenant_id)
-        .bind(&access.external_user_id)
-        .bind(query.application_id)
-        .bind(&query.external_tenant_id)
-        .bind(&query.external_user_id)
-        .bind(query.provider_id)
-        .bind(query.provider_model_id)
-        .bind(query.route_id)
-        .bind(query.occurred_after)
-        .bind(query.occurred_before)
-        .bind(query.limit())
+        .bind(over_fetch_limit(query.limit()))
         .fetch_all(&self.pool)
         .await?;
-        rows.iter().map(usage_record_from_row).collect()
+        rows.iter().map(keyed_usage_record_from_row).collect()
     }
 
+    /// # Why the `distinct on` moved into a subquery
+    ///
+    /// A model is visible through however many routing policies name it, and the row this
+    /// list returns is the highest-priority one — which is what `distinct on (pm.id) … order
+    /// by pm.id, rp.priority, rp.weight` picks, and that `order by` is not optional: Postgres
+    /// requires the `distinct on` expression to lead it.
+    ///
+    /// So the de-duplication cannot also be the pagination order. Before issue #93 the list
+    /// was simply *returned* in `pm.id` order with a hard-coded limit of 200 and no cursor at
+    /// all. Wrapping the de-duplication in a subquery lets the outer query impose the
+    /// `(created_at desc, id desc)` order every other list in this codebase uses, and gives
+    /// the keyset predicate a single relation to compare against.
+    ///
+    /// **This changes the order `GET /v1/models` returns rows in**, from ascending
+    /// `provider_models.id` to newest-first. That order was never documented and could not be
+    /// paged through; the new one can be.
     async fn list_visible_models(
         &self,
         access: &PublicAccess,
+        cursor: Option<ListCursor>,
         limit: i64,
-    ) -> Result<Vec<PublicModelResource>, AppError> {
-        let rows = sqlx::query(
+    ) -> Result<Vec<Keyed<PublicModelResource>>, AppError> {
+        let tail = KeysetTail::new("m.created_at", cursor.as_ref(), 4);
+        let sql = format!(
             r#"
-            select distinct on (pm.id)
-                   pm.id, pm.model_key, pm.display_name, pm.capabilities, p.provider_type
-            from routing_policies rp
-            join provider_models pm on pm.id = rp.provider_model_id
-            join providers p on p.id = rp.provider_id
-            where rp.status = 'active'
-              and rp.deleted_at is null
-              and pm.status = 'active'
-              and pm.deleted_at is null
-              and p.status = 'active'
-              and p.deleted_at is null
-              and ($1::boolean
-                   or ((rp.application_id is null or rp.application_id = $2)
-                       and (rp.external_tenant_id is null
-                            or ($3::text is not null and rp.external_tenant_id = $3))))
-            order by pm.id, rp.priority asc, rp.weight desc
-            limit $4
+            select m.id, m.model_key, m.display_name, m.capabilities, m.provider_type,
+                   m.created_at
+            from (
+                select distinct on (pm.id)
+                       pm.id, pm.model_key, pm.display_name, pm.capabilities, pm.created_at,
+                       p.provider_type
+                from routing_policies rp
+                join provider_models pm on pm.id = rp.provider_model_id
+                join providers p on p.id = rp.provider_id
+                where rp.status = 'active'
+                  and rp.deleted_at is null
+                  and pm.status = 'active'
+                  and pm.deleted_at is null
+                  and p.status = 'active'
+                  and p.deleted_at is null
+                  and ($1::boolean
+                       or ((rp.application_id is null or rp.application_id = $2)
+                           and (rp.external_tenant_id is null
+                                or ($3::text is not null and rp.external_tenant_id = $3))))
+                order by pm.id, rp.priority asc, rp.weight desc
+            ) m
+            {}
+            {}
             "#,
+            tail.where_clause(),
+            tail.order_and_limit,
+        );
+        let rows = bind_cursor(
+            sqlx::query(&sql)
+                .bind(access.privileged)
+                .bind(access.application_id)
+                .bind(&access.external_tenant_id),
+            cursor.as_ref(),
         )
-        .bind(access.privileged)
-        .bind(access.application_id)
-        .bind(&access.external_tenant_id)
-        .bind(limit)
+        .bind(over_fetch_limit(limit))
         .fetch_all(&self.pool)
         .await?;
-        rows.iter().map(public_model_from_row).collect()
+        rows.iter().map(keyed_public_model_from_row).collect()
     }
 
     async fn find_visible_model_id_by_key(
@@ -789,14 +860,26 @@ impl PublicRepository for PgPublicRepository {
         .map_err(AppError::from)
     }
 
+    /// **This changes the order `GET /v1/routes` returns rows in**, from `route_key asc` to
+    /// `created_at desc, id desc`.
+    ///
+    /// `route_key` is unique among live routes, so the old order was total — but the cursor
+    /// codec's `ListCursor` is a `(timestamptz, uuid)` pair and cannot express a text key, and
+    /// inventing a third cursor shape for one endpoint is exactly the second mechanism this
+    /// change exists to avoid. The endpoint moves onto the convention every other list in the
+    /// codebase already uses instead. Callers that want alphabetical routes should sort the
+    /// page they received; nothing here promised an order a client could rely on, because
+    /// before issue #93 there was no way to see past the first 200 rows at all.
     async fn list_visible_routes(
         &self,
         access: &PublicAccess,
+        cursor: Option<ListCursor>,
         limit: i64,
-    ) -> Result<Vec<PublicRouteResource>, AppError> {
-        let rows = sqlx::query(
+    ) -> Result<Vec<Keyed<PublicRouteResource>>, AppError> {
+        let tail = KeysetTail::new("rd.created_at", cursor.as_ref(), 4);
+        let sql = format!(
             r#"
-            select rd.id, rd.route_key, rd.display_name, rd.description,
+            select rd.id, rd.route_key, rd.display_name, rd.description, rd.created_at,
                    coalesce(jsonb_agg(distinct pm.capabilities) filter (where pm.id is not null), '[]'::jsonb) as capabilities
             from route_definitions rd
             left join routing_policies rp on rp.route_id = rd.id
@@ -812,18 +895,24 @@ impl PublicRepository for PgPublicRepository {
                        and (rp.application_id is null or rp.application_id = $2)
                        and (rp.external_tenant_id is null
                             or ($3::text is not null and rp.external_tenant_id = $3))))
-            group by rd.id, rd.route_key, rd.display_name, rd.description
-            order by rd.route_key asc
-            limit $4
+              {}
+            group by rd.id, rd.route_key, rd.display_name, rd.description, rd.created_at
+            {}
             "#,
+            tail.and_clause(),
+            tail.order_and_limit,
+        );
+        let rows = bind_cursor(
+            sqlx::query(&sql)
+                .bind(access.privileged)
+                .bind(access.application_id)
+                .bind(&access.external_tenant_id),
+            cursor.as_ref(),
         )
-        .bind(access.privileged)
-        .bind(access.application_id)
-        .bind(&access.external_tenant_id)
-        .bind(limit)
+        .bind(over_fetch_limit(limit))
         .fetch_all(&self.pool)
         .await?;
-        rows.iter().map(public_route_from_row).collect()
+        rows.iter().map(keyed_public_route_from_row).collect()
     }
 }
 
@@ -973,6 +1062,38 @@ fn execution_summary_from_row(
         usage,
         failure_class,
     })
+}
+
+/// The four row readers below pair a wire DTO with the `(sort column, id)` the list is
+/// ordered by, so the application layer can mint `next_cursor` without that key having to
+/// appear in the public response. Each reads the key from the **same row** it built the DTO
+/// from — a key read from anywhere else could name a row the caller never saw.
+fn keyed_execution_summary_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<Keyed<PublicExecutionSummary>, AppError> {
+    let key = ListCursor::new(row.try_get("created_at")?, row.try_get("response_id")?);
+    Ok(Keyed::new(key, execution_summary_from_row(row)?))
+}
+
+fn keyed_usage_record_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<Keyed<PublicUsageRecord>, AppError> {
+    let key = ListCursor::new(row.try_get("occurred_at")?, row.try_get("id")?);
+    Ok(Keyed::new(key, usage_record_from_row(row)?))
+}
+
+fn keyed_public_model_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<Keyed<PublicModelResource>, AppError> {
+    let key = ListCursor::new(row.try_get("created_at")?, row.try_get("id")?);
+    Ok(Keyed::new(key, public_model_from_row(row)?))
+}
+
+fn keyed_public_route_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<Keyed<PublicRouteResource>, AppError> {
+    let key = ListCursor::new(row.try_get("created_at")?, row.try_get("id")?);
+    Ok(Keyed::new(key, public_route_from_row(row)?))
 }
 
 fn usage_record_from_row(row: &sqlx::postgres::PgRow) -> Result<PublicUsageRecord, AppError> {
@@ -1232,8 +1353,9 @@ impl PublicRepository for InMemoryPublicRepository {
     async fn list_executions_authorized(
         &self,
         _access: &PublicAccess,
-        _query: &ExecutionQuery,
-    ) -> Result<Vec<PublicExecutionSummary>, AppError> {
+        _cursor: Option<ListCursor>,
+        _limit: i64,
+    ) -> Result<Vec<Keyed<PublicExecutionSummary>>, AppError> {
         Err(not_stubbed("list_executions_authorized"))
     }
 
@@ -1241,15 +1363,17 @@ impl PublicRepository for InMemoryPublicRepository {
         &self,
         _access: &PublicAccess,
         _query: &UsageQuery,
-    ) -> Result<Vec<PublicUsageRecord>, AppError> {
+        _cursor: Option<ListCursor>,
+    ) -> Result<Vec<Keyed<PublicUsageRecord>>, AppError> {
         Err(not_stubbed("list_usage_authorized"))
     }
 
     async fn list_visible_models(
         &self,
         _access: &PublicAccess,
+        _cursor: Option<ListCursor>,
         _limit: i64,
-    ) -> Result<Vec<PublicModelResource>, AppError> {
+    ) -> Result<Vec<Keyed<PublicModelResource>>, AppError> {
         Err(not_stubbed("list_visible_models"))
     }
 
@@ -1264,8 +1388,9 @@ impl PublicRepository for InMemoryPublicRepository {
     async fn list_visible_routes(
         &self,
         _access: &PublicAccess,
+        _cursor: Option<ListCursor>,
         _limit: i64,
-    ) -> Result<Vec<PublicRouteResource>, AppError> {
+    ) -> Result<Vec<Keyed<PublicRouteResource>>, AppError> {
         Err(not_stubbed("list_visible_routes"))
     }
 }
@@ -1356,6 +1481,7 @@ mod tests {
                     external_tenant_id: None,
                     external_user_id: None,
                 },
+                None,
                 10,
             )
             .await
