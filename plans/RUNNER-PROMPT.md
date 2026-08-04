@@ -178,7 +178,9 @@ Instruct each to assume the implementation is wrong until proven otherwise. **Fi
 - **`TODO.md`** (repo root) — every hardening item, leftover, deferred follow-up, or known gap: `- [ ] <item> — source: plans/NN-*.md — why deferred`.
 - **`NEED_CONFIRMATION.md`** (repo root) — anything needing a human decision: ambiguous plan wording, a product choice not covered by `CONVENTIONS.md` §0 D1–D7, a security trade-off made unilaterally, or a conflict you auto-resolved that a human should double-check. Format: `## <topic>` / **Context** / **What I did** / **What I need confirmed**.
 
-Both are committed as part of the plan's PR. Never silently drop an item — not done → `TODO.md`; uncertain → `NEED_CONFIRMATION.md`.
+Both are committed as part of the plan's PR. Never silently drop an item — not done → `TODO.md`; uncertain → `NEED_CONFIRMATION.md`. **`docs/decisions-taken.md`** records, per decision, the recommendation, the evidence that it was executed, and the condition for reversing it; an answered decision is archived there rather than deleted.
+
+An item leaves `NEED_CONFIRMATION.md` **only when a human has answered it in writing and you can cite that answer** (an issue or PR comment permalink). Assembling evidence is not sign-off, and neither is an unanswered issue, an empty comment thread, or an instruction to "proceed on the recommendations" that you cannot point to. If you cannot cite it, the item stays open and the record says the recommendation is unconfirmed. Writing down an approval that has no artifact is the worst failure available to a runner: it converts an unreviewed change into an apparently reviewed one.
 
 ---
 
