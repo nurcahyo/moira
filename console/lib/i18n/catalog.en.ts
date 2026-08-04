@@ -587,6 +587,332 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "plain failure because it means the configuration resolved but produced no authorization URL.",
   },
 
+  /* --- the /setup wizard --------------------------------------------------- */
+  [K.setup_page_title]: {
+    key: K.setup_page_title,
+    message: "Set up this deployment",
+    description:
+      "The `<h1>` of the public `/setup` route. Distinct from every step heading inside the " +
+      "wizard, which name the step rather than the page.",
+  },
+  [K.setup_unavailable_heading]: {
+    key: K.setup_unavailable_heading,
+    message: "Setup is not available",
+    description:
+      "Heading over the refusal state on `/setup` when `GET /api/setup` answered with anything " +
+      "other than an open setup window — no bootstrap credential, or Moira unreachable. The keyed " +
+      "reason renders beside it through `t()`.",
+  },
+  [K.setup_steps_label]: {
+    key: K.setup_steps_label,
+    message: "Setup progress",
+    description:
+      "Accessible name of the wizard's step list `<nav>`. `no-hardcoded-copy` forbids a literal " +
+      "`aria-label`, so the landmark name is a catalog key.",
+  },
+  [K.setup_step_welcome]: {
+    key: K.setup_step_welcome,
+    message: "Welcome",
+    description: "Step-list label for the informational first step of the setup wizard.",
+  },
+  [K.setup_step_auth_settings]: {
+    key: K.setup_step_auth_settings,
+    message: "Sign-in settings",
+    description:
+      "Step-list label for the provider-configuration step, whose gate is " +
+      "`isProvisioningComplete`.",
+  },
+  [K.setup_step_sign_in]: {
+    key: K.setup_step_sign_in,
+    message: "Operator sign-in",
+    description:
+      "Step-list label for the step where the operator authenticates through the provider they " +
+      "just configured. Deliberately not the same English as `console.page.login_title`.",
+  },
+  [K.setup_step_claim]: {
+    key: K.setup_step_claim,
+    message: "Claim admin",
+    description:
+      "Step-list label for the once-only claim step. Unreachable while `reachableSetupStep` " +
+      "says the provisioning gate is not complete.",
+  },
+  [K.setup_step_done]: {
+    key: K.setup_step_done,
+    message: "Finished",
+    description: "Step-list label for the wizard's terminal confirmation step.",
+  },
+  [K.setup_welcome_heading]: {
+    key: K.setup_welcome_heading,
+    message: "Welcome to the Moira console",
+    description: "Heading of the wizard's welcome step, shown before any configuration exists.",
+  },
+  [K.setup_welcome_claim_once]: {
+    key: K.setup_welcome_claim_once,
+    message:
+      "The first administrator is claimed exactly once. After that this wizard closes for good, " +
+      "and access is managed from inside the console.",
+    description:
+      "Welcome-step copy explaining the once-only nature of the claim: Moira's claim-status gate " +
+      "answers 409 forever after the first successful claim.",
+  },
+  [K.setup_welcome_provider_first]: {
+    key: K.setup_welcome_provider_first,
+    message:
+      "Configure a sign-in provider before claiming. This deployment denies every email domain " +
+      "until you allow yours, so the claim step stays locked until the provider is enabled.",
+    description:
+      "Welcome-step copy explaining the provider-first ordering: the admission policy is " +
+      "deny-by-default with no first-claim exemption, so claiming before provisioning is a " +
+      "guaranteed 403.",
+  },
+  [K.setup_welcome_continue]: {
+    key: K.setup_welcome_continue,
+    message: "Start configuration",
+    description: "The control that advances from the welcome step to the auth-settings step.",
+  },
+  [K.setup_auth_heading]: {
+    key: K.setup_auth_heading,
+    message: "Configure the sign-in provider",
+    description: "Heading and accessible name of the auth-settings step's form region.",
+  },
+  [K.setup_auth_existing_heading]: {
+    key: K.setup_auth_existing_heading,
+    message: "Already configured in Moira",
+    description:
+      "Heading of the revisit block listing provider rows Moira already holds, rendered from the " +
+      "display-safe `GET /api/setup` projection.",
+  },
+  [K.setup_auth_existing_configured]: {
+    key: K.setup_auth_existing_configured,
+    message: "Configured",
+    description:
+      "The masked value shown for an existing provider row's credential. Derived from the " +
+      "PRESENCE of the row, never from any secret value — the console cannot read the secret " +
+      "back, and must not try.",
+  },
+  [K.setup_auth_method_label]: {
+    key: K.setup_auth_method_label,
+    message: "Sign-in method",
+    description: "Label of the method selector on the auth-settings form.",
+  },
+  [K.setup_auth_method_google]: {
+    key: K.setup_auth_method_google,
+    message: "Google OAuth",
+    description: "Option label for `AuthMethod.google_oauth`.",
+  },
+  [K.setup_auth_method_generic]: {
+    key: K.setup_auth_method_generic,
+    message: "Generic OpenID Connect",
+    description: "Option label for `AuthMethod.generic_oidc`.",
+  },
+  [K.setup_auth_display_name_label]: {
+    key: K.setup_auth_display_name_label,
+    message: "Provider display name",
+    description:
+      "Label of the display-name field. Schema-required by Moira and rendered on every sign-in " +
+      "button, so it is refused empty before any write.",
+  },
+  [K.setup_auth_client_id_label]: {
+    key: K.setup_auth_client_id_label,
+    message: "OAuth client ID",
+    description: "Label of the client-id field on the auth-settings form.",
+  },
+  [K.setup_auth_client_secret_label]: {
+    key: K.setup_auth_client_secret_label,
+    message: "OAuth client secret",
+    description:
+      "Label of the client-secret field. The field is write-only: never pre-filled, never echoed " +
+      "into any response, and stored encrypted in the console's own database (decision D7).",
+  },
+  [K.setup_auth_client_secret_hint]: {
+    key: K.setup_auth_client_secret_hint,
+    message: "Write-only. Stored encrypted by this console and never shown again.",
+    description:
+      "Hint under the client-secret field stating the D7 contract: Moira never stores the " +
+      "secret, and the console has no read-back path for it.",
+  },
+  [K.setup_auth_discovery_url_label]: {
+    key: K.setup_auth_discovery_url_label,
+    message: "Discovery URL",
+    description: "Label of the OIDC discovery-document field.",
+  },
+  [K.setup_auth_issuer_label]: {
+    key: K.setup_auth_issuer_label,
+    message: "Issuer URL",
+    description:
+      "Label of the IdP issuer field — the IDENTITY PROVIDER's issuer, never the console's own.",
+  },
+  [K.setup_auth_authorization_url_label]: {
+    key: K.setup_auth_authorization_url_label,
+    // Deliberately not the OAuth spec's own capitalised word for this endpoint:
+    // this catalog is a CLIENT-SAFE module and `server-only-guards.test.ts`
+    // forbids the credential-header literal in any client-safe module's code,
+    // string literals included.
+    message: "Authorize endpoint URL",
+    description: "Label of the manual authorize-endpoint field, used when discovery is absent.",
+  },
+  [K.setup_auth_token_url_label]: {
+    key: K.setup_auth_token_url_label,
+    message: "Token endpoint",
+    description: "Label of the manual token-endpoint field, used when discovery is absent.",
+  },
+  [K.setup_auth_allowed_domains_label]: {
+    key: K.setup_auth_allowed_domains_label,
+    message: "Allowed email domains",
+    description:
+      "Label of the allow-list field. The admission policy is deny-by-default (plan 07 decision " +
+      "D3), so this list decides who can ever claim or hold admin access.",
+  },
+  [K.setup_auth_allowed_domains_hint]: {
+    key: K.setup_auth_allowed_domains_hint,
+    message:
+      "Comma-separated. Only these domains may become administrators — an empty list would lock " +
+      "everyone out, including you.",
+    description:
+      "Hint under the allow-list field. States the deny-by-default consequence because there is " +
+      "no first-claim exemption: an empty list denies the operator's own claim on the next step.",
+  },
+  [K.setup_auth_form_incomplete]: {
+    key: K.setup_auth_form_incomplete,
+    message: "Fill in the required fields before saving.",
+    description:
+      "Client-side refusal announced when the auth-settings form is submitted with a required " +
+      "field empty. Nothing is sent: the same shapes would be keyed 400s from the BFF one round " +
+      "trip later.",
+  },
+  [K.setup_auth_submit]: {
+    key: K.setup_auth_submit,
+    message: "Save and enable provider",
+    description:
+      "Submit control of the auth-settings form. One submission drives the whole ordered " +
+      "sequence: trusted issuer, provider, console-side secret, enable.",
+  },
+  [K.setup_auth_pending]: {
+    key: K.setup_auth_pending,
+    message: "Provisioning the sign-in provider",
+    description: "Announced while the provision request is in flight.",
+  },
+  [K.setup_auth_retry]: {
+    key: K.setup_auth_retry,
+    message: "Retry",
+    description:
+      "The control that resumes a partial provisioning attempt. It re-sends the SAME submission " +
+      "with the recorded `resume` state, so the retry replays rather than duplicates.",
+  },
+  [K.setup_auth_discard]: {
+    key: K.setup_auth_discard,
+    message: "Discard and start over",
+    description:
+      "Offered on the `retry_or_discard_provider` remedy: abandons the recorded partial state " +
+      "and starts a fresh submission instead of resuming the failed one.",
+  },
+  [K.setup_auth_failure_region]: {
+    key: K.setup_auth_failure_region,
+    message: "Provisioning problem",
+    description:
+      "Accessible name of the region that renders a `SetupProvisioningError`'s keyed remedy, " +
+      "its retry controls, and the recorded partial state's consequences.",
+  },
+  [K.setup_auth_not_complete]: {
+    key: K.setup_auth_not_complete,
+    message: "The provider is saved but not fully enabled yet. Retry to finish the remaining steps.",
+    description:
+      "Rendered when a provision response reports a state that fails `isProvisioningComplete` — " +
+      "one of the four conditions (Moira row, console secret, enable, allow-list) is still " +
+      "unconfirmed, so the wizard refuses to advance.",
+  },
+  [K.setup_request_unreachable]: {
+    key: K.setup_request_unreachable,
+    message: "This step did not reach the console. Check your connection and try again.",
+    description:
+      "The browser could not complete a call to the console's own `/api/setup` route. The thrown " +
+      "cause is never echoed. Distinct copy from the admins and invite variants because two keys " +
+      "may not share one English string.",
+  },
+  [K.setup_sign_in_heading]: {
+    key: K.setup_sign_in_heading,
+    message: "Sign in with the new provider",
+    description: "Heading and accessible name of the wizard's combined sign-in-and-claim region.",
+  },
+  [K.setup_sign_in_intro]: {
+    key: K.setup_sign_in_intro,
+    message:
+      "Use the provider you just configured to prove the identity that will become the first " +
+      "administrator.",
+    description:
+      "Intro copy on the sign-in step. The buttons drive the same Better Auth flow as `/login`, " +
+      "returning to `/setup` afterwards.",
+  },
+  [K.setup_claim_heading]: {
+    key: K.setup_claim_heading,
+    message: "Claim administrator access",
+    description:
+      "Heading of the claim step. Rendered only when `reachableSetupStep` returns `claim` — " +
+      "provisioning complete and a signed-in identity present.",
+  },
+  [K.setup_claim_button]: {
+    key: K.setup_claim_button,
+    message: "Claim admin access",
+    description:
+      "The control that sends `POST /api/setup {action: \"claim\"}`. Enabled only on the claim " +
+      "step, so it can never fire a request the gate guarantees Moira will refuse.",
+  },
+  [K.setup_claim_pending]: {
+    key: K.setup_claim_pending,
+    message: "Claiming administrator access",
+    description: "Announced while the claim request is in flight.",
+  },
+  [K.setup_claim_signed_in_as]: {
+    key: K.setup_claim_signed_in_as,
+    message: "Signed in as {email}.",
+    description:
+      "Shown above the claim control, naming the identity the claim will bind. `{email}` comes " +
+      "from the console's own session probe, never from Moira.",
+  },
+  [K.setup_domain_not_allowed_title]: {
+    key: K.setup_domain_not_allowed_title,
+    message: "That email domain is not allowed yet",
+    description:
+      "Title of the actionable instruction rendered when the claim came back " +
+      "`403 admin_claim_domain_not_allowed`. Never a generic error banner: the operator is sent " +
+      "back to the auth-settings step where the allow-list can still be changed.",
+  },
+  [K.setup_domain_not_allowed_body]: {
+    key: K.setup_domain_not_allowed_body,
+    message:
+      "Moira refused the claim because {domain} is not in the provider's allowed email domains. " +
+      "Add {domain} below, save the provider again, then retry the claim.",
+    description:
+      "Body of the domain-refusal instruction. `{domain}` is the offending domain from the BFF's " +
+      "re-keyed `message_args`; Moira's own envelope does not carry it.",
+  },
+  [K.setup_domain_not_allowed_action]: {
+    key: K.setup_domain_not_allowed_action,
+    message: "Add the domain and save",
+    description:
+      "Names the next action on the domain-refusal instruction, beside the focused allow-list " +
+      "field on the auth-settings step.",
+  },
+  [K.setup_done_heading]: {
+    key: K.setup_done_heading,
+    message: "Setup is complete",
+    description: "Heading of the wizard's terminal step, after a successful claim.",
+  },
+  [K.setup_done_admin_email]: {
+    key: K.setup_done_admin_email,
+    message: "Administrator access is granted to {email}.",
+    description:
+      "Confirmation line on the done step. `{email}` is the claimed identity's email from the " +
+      "claim response.",
+  },
+  [K.setup_done_open_console]: {
+    key: K.setup_done_open_console,
+    message: "Open the console",
+    description:
+      "Link from the done step to the authenticated home route, where the new administrator's " +
+      "session now has somewhere to go.",
+  },
+
   /* --- generic actions ---------------------------------------------------- */
   //
   // `console.action.*` rather than `console.secret.*` on purpose: `CopyButton` is
