@@ -11,6 +11,26 @@ import {
 
 /**
  * ============================================================================
+ * DECLARED GAP: `/setup` IS AUDITED, BUT ONLY ITS "UNAVAILABLE" PANEL
+ * ============================================================================
+ *
+ * `/setup` is public, so the walker below visits it and axe runs — but the e2e
+ * environment sets no `MOIRA_SYSTEM_KEY`, and `withSetupWindow` answers `404
+ * setup_unavailable` without one. Every run therefore audits the refusal panel,
+ * and NONE of the wizard's steps — welcome, the auth-settings form, the
+ * sign-in/claim surface, done — has ever been rendered by this suite. Neither
+ * has any of the a11y evidence collected from it.
+ *
+ * Until that changes, the wizard's behaviour is covered by unit tests, not by
+ * this file: `tests/unit/modules/setup/SetupWizard.test.tsx` and
+ * `AuthSettingsStep.test.tsx` drive the steps through their fetch seam, and
+ * `tests/unit/api/setup-route.test.ts` drives the BFF door.
+ *
+ * REVERSAL CONDITION: issue #72 builds the setup e2e harness (a system key plus
+ * a stub Moira in the e2e environment). When it lands, the wizard steps belong
+ * here, and this note should shrink to whatever is still uncovered.
+ *
+ * ============================================================================
  * AUTOMATED ACCESSIBILITY GATE — and what it could NOT see until wave 5
  * ============================================================================
  *

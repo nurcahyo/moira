@@ -865,6 +865,16 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "Intro copy on the sign-in step. The buttons drive the same Better Auth flow as `/login`, " +
       "returning to `/setup` afterwards.",
   },
+  [K.setup_sign_in_edit_settings]: {
+    key: K.setup_sign_in_edit_settings,
+    message: "Change the sign-in provider settings",
+    description:
+      "Returns the operator from the sign-in/claim step to the auth-settings form. Without it a " +
+      "completed provision is a one-way door: a mistyped discovery URL, client id, or client " +
+      "secret leaves the operator on a sign-in button that can never succeed. The re-save goes " +
+      "back through the same server-derived provisioning path, so the control is navigation and " +
+      "never a second way to choose which row is written.",
+  },
   [K.setup_claim_heading]: {
     key: K.setup_claim_heading,
     message: "Claim administrator access",

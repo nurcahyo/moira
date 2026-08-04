@@ -302,6 +302,143 @@ describe("a FRESH deployment's sign-in stage is never a dead end", () => {
   });
 });
 
+describe("the sign-in step's controls do not lie about which provider they run", () => {
+  // Every button on this step posts the SAME server-derived `oauthProviderId` —
+  // the wizard provisions one provider under one console issuer. Rendering one
+  // button per interactive row therefore rendered a control per row that all
+  // ran the same provider: pressing "Continue with B" signed in through A.
+
+  const rowB = {
+    id: "44444444-4444-4444-8444-444444444444",
+    method: "generic_oidc" as const,
+    displayName: "Contractor IdP",
+    interactive: true,
+    clientIdConfigured: true,
+    discoveryUrlConfigured: true,
+    allowedEmailDomainCount: 1,
+  };
+
+  test("two interactive rows still yield ONE sign-in button, named after the provisioned row", async () => {
+    const { fetchImpl } = makeFetch({ session: { status: 200, body: null } });
+    render(
+      <SetupWizard
+        view={{
+          ...READY_PROVISIONED,
+          methods: [...READY_PROVISIONED.methods!, rowB],
+        }}
+        fetchImpl={fetchImpl}
+        navigate={() => {}}
+      />,
+    );
+
+    await screen.findByText(copy(K.setup_sign_in_intro));
+    // Named after the row the provisioning state actually points at…
+    expect(
+      screen.getByRole("button", {
+        name: copy(K.sign_in_button).replaceAll("{provider}", "Google Workspace"),
+      }),
+    ).toBeInTheDocument();
+    // …and there is no second control claiming to run the other row.
+    expect(
+      screen.queryByRole("button", {
+        name: copy(K.sign_in_button).replaceAll("{provider}", rowB.displayName),
+      }),
+    ).toBeNull();
+  });
+
+  test("a row the document does not hold gets the generic label, never another provider's name", async () => {
+    // The provisioned row is not in the server-rendered list (a fresh
+    // deployment's list predates the provision). Labelling the button with
+    // whatever row IS in the list would be the same lie in a different shape.
+    const { fetchImpl } = makeFetch({ session: { status: 200, body: null } });
+    render(
+      <SetupWizard
+        view={{ ...READY_PROVISIONED, methods: [rowB] }}
+        fetchImpl={fetchImpl}
+        navigate={() => {}}
+      />,
+    );
+
+    await screen.findByText(copy(K.setup_sign_in_intro));
+    expect(
+      screen.getByRole("button", { name: copy(K.sign_in_button_generic) }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", {
+        name: copy(K.sign_in_button).replaceAll("{provider}", rowB.displayName),
+      }),
+    ).toBeNull();
+  });
+});
+
+describe("a completed provision is not a one-way door", () => {
+  // Once provisioning completes the wizard lands on sign-in, and a reload lands
+  // there too. Without a control back to the form, an operator who mistyped a
+  // discovery URL, a client id, or the client secret has nowhere to fix it —
+  // the cursor clamp allowed backward movement all along, but nothing on screen
+  // used it.
+
+  test("the sign-in step offers a way back to the auth-settings form", async () => {
+    const { fetchImpl } = makeFetch({ session: { status: 200, body: null } });
+    render(<SetupWizard view={READY_PROVISIONED} fetchImpl={fetchImpl} navigate={() => {}} />);
+    await screen.findByText(copy(K.setup_sign_in_intro));
+
+    await userEvent.click(
+      screen.getByRole("button", { name: copy(K.setup_sign_in_edit_settings) }),
+    );
+
+    // The form is on screen (not merely mounted-and-hidden) and the sign-in
+    // surface is gone.
+    expect(
+      screen.getByText(copy(K.setup_auth_heading)).closest("div[hidden]"),
+    ).toBeNull();
+    expect(screen.queryByText(copy(K.setup_sign_in_intro))).toBeNull();
+    expect(screen.getByRole("button", { name: copy(K.setup_auth_submit) })).toBeInTheDocument();
+  });
+
+  test("the claim step offers it too, and a re-save from there returns to sign-in", async () => {
+    // The whole loop: back from the claim surface, correct the form, save, and
+    // the wizard advances again — through the ordinary provision action, whose
+    // target row the BFF derives. The back button is navigation, not a second
+    // way to choose what gets written.
+    const { calls, fetchImpl } = makeFetch({
+      session: { status: 200, body: { user: { email: "ops@example.com" } } },
+      provision: {
+        status: 201,
+        body: { state: COMPLETE_STATE, provider_id: "moira-console-idp" },
+      },
+    });
+    render(<SetupWizard view={READY_PROVISIONED} fetchImpl={fetchImpl} navigate={() => {}} />);
+    await screen.findByRole("button", { name: copy(K.setup_claim_button) });
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: copy(K.setup_sign_in_edit_settings) }));
+    expect(claimButton()).toBeNull();
+
+    await user.type(field(K.setup_auth_display_name_label), "Google Workspace");
+    await user.type(field(K.setup_auth_client_id_label), "client-123.apps.example");
+    await user.type(
+      field(K.setup_auth_discovery_url_label),
+      "https://accounts.google.com/.well-known/openid-configuration",
+    );
+    await user.type(field(K.setup_auth_allowed_domains_label), "example.com");
+    await user.click(screen.getByRole("button", { name: copy(K.setup_auth_submit) }));
+
+    expect(
+      await screen.findByRole("button", { name: copy(K.setup_claim_button) }),
+    ).toBeInTheDocument();
+
+    const save = calls.find((call) => call.body?.["action"] === "provision");
+    expect(save).toBeDefined();
+    // No secret was typed and none was demanded: the console holds one for the
+    // row it derived, which is the same fact the BFF checks server-side.
+    expect(save!.body!["client_secret"]).toBe("");
+    // The body carries the state as a HINT the server checks against its own —
+    // it is not what selects the row.
+    expect(save!.body!["resume"]).toMatchObject({ providerId: PROVIDER_ID });
+  });
+});
+
 describe("the wizard survives the OAuth round trip: a FRESH DOCUMENT rehydrates from the view", () => {
   // Sign-in is `location.assign` to the IdP and back — the wizard REMOUNTS with
   // empty React state on return. Everything it needs must come back through the

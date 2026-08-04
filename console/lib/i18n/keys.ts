@@ -270,6 +270,7 @@ export const CONSOLE_MESSAGE_KEYS = {
   setup_request_unreachable: "console.setup.request_unreachable",
   setup_sign_in_heading: "console.setup.sign_in_heading",
   setup_sign_in_intro: "console.setup.sign_in_intro",
+  setup_sign_in_edit_settings: "console.setup.sign_in_edit_settings",
   setup_claim_heading: "console.setup.claim_heading",
   setup_claim_button: "console.setup.claim_button",
   setup_claim_pending: "console.setup.claim_pending",

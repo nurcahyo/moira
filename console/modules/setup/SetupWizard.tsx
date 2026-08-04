@@ -15,6 +15,19 @@
 // is impossible, so the claim surface cannot exist on screen while a gate
 // condition is unconfirmed.
 //
+// "Backward is always allowed" is a statement about the CLAMP, and for a while
+// it was the only thing true about it: once provisioning completed, nothing on
+// screen moved the cursor back, and a reload landed on `sign_in` — so an
+// operator who had mistyped a discovery URL, a client id, or a client secret
+// had no way to reach the form that holds them. `SignInClaimStep` now renders
+// an explicit control for it (`onEditAuthSettings` below), which is why the
+// clamp's permissiveness is now observable rather than theoretical.
+//
+// That control is NAVIGATION and nothing else. Re-saving from the form posts
+// the same `POST /api/setup {action: "provision"}` as the first save, and the
+// row that request may touch is derived server-side from Moira's records — the
+// back button cannot become a second way to choose what gets written.
+//
 // ============================================================================
 // WHY EVERY STEP STAYS MOUNTED
 // ============================================================================
@@ -213,9 +226,13 @@ export function SetupWizard({ view, fetchImpl, navigate }: SetupWizardProps) {
           stage={reachable === "claim" ? "claim" : "sign_in"}
           methods={methods.filter((method) => method.interactive)}
           oauthProviderId={oauthProviderId}
+          // Moira's row id for the provider that was actually provisioned, so
+          // the one sign-in button can be labelled with that row's name.
+          providerRowId={provisioning.providerId}
           signedInEmail={signedInEmail}
           onClaimed={onClaimed}
           onDomainRefused={onDomainRefused}
+          onEditAuthSettings={() => setCursor("auth_settings")}
           {...(fetchImpl === undefined ? {} : { fetchImpl })}
           {...(navigate === undefined ? {} : { navigate })}
         />

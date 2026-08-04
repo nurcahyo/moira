@@ -14,6 +14,25 @@
 // `lib/auth-config.ts` and is not re-implemented here). The callback returns to
 // `/setup`, where the wizard's session probe picks the identity up.
 //
+// ============================================================================
+// ONE PROVIDER PER WIZARD RUN, THEREFORE ONE BUTTON
+// ============================================================================
+//
+// There is exactly ONE `oauthProviderId` here: the wizard provisions one
+// provider under one console issuer, and that string is what any sign-in button
+// on this step would post. Rendering a button per interactive method therefore
+// rendered controls that LIED — "Continue with B" ran provider A, because both
+// posted the same id. The step renders a single button, and `providerRowId`
+// names the row that button actually drives so the label can be that row's
+// display name rather than a guess.
+//
+// Signing in is not the only way out of this step: `onEditAuthSettings` sends
+// the operator back to the auth-settings form, because a mistyped discovery
+// URL, client id, or client secret is only fixable there and a completed
+// provision must not be a one-way door. That is navigation only — the re-save
+// goes through the same `/api/setup` provision action, whose target row the
+// server derives.
+//
 // The claim goes through `POST /api/setup {action: "claim"}` and carries NO
 // provisioning state: the BFF derives the state from Moira's records plus the
 // console's secret store on every claim, because this component's memory does
@@ -47,8 +66,8 @@ export interface SignInClaimStepProps {
   /** Which sub-surface is active, per `reachableSetupStep`. */
   readonly stage: "sign_in" | "claim";
   /**
-   * Interactive provider rows, for the sign-in buttons' labels. On a FRESH
-   * deployment this is empty — the rows come from the server render of
+   * Interactive provider rows, used ONLY to label the one sign-in button. On a
+   * FRESH deployment this is empty — the rows come from the server render of
    * `GET /api/setup`, which ran before anything was provisioned — so an empty
    * list must still render a working control: one generic sign-in button
    * driving the just-provisioned `oauthProviderId`.
@@ -56,10 +75,18 @@ export interface SignInClaimStepProps {
   readonly methods: readonly SetupMethodSummary[];
   /** Better Auth's provider id, from the provision response. Null on revisit. */
   readonly oauthProviderId: string | null;
+  /**
+   * Moira's row id for the provider `oauthProviderId` actually signs in
+   * through, so the button can be labelled with that row's display name. Never
+   * a selector: the request posts `oauthProviderId`, not this.
+   */
+  readonly providerRowId: string | null;
   /** The probed console session's email, when one exists. */
   readonly signedInEmail: string | null;
   readonly onClaimed: (email: string | null) => void;
   readonly onDomainRefused: (domain: string) => void;
+  /** Back to the auth-settings form — the only place a bad URL or id is fixable. */
+  readonly onEditAuthSettings: () => void;
   /** Injected by the unit test. Shipped call sites use the global. */
   readonly fetchImpl?: typeof fetch;
   /** Injected by the unit test. Shipped call sites navigate for real. */
@@ -81,9 +108,11 @@ export function SignInClaimStep({
   stage,
   methods,
   oauthProviderId,
+  providerRowId,
   signedInEmail,
   onClaimed,
   onDomainRefused,
+  onEditAuthSettings,
   fetchImpl,
   navigate,
 }: SignInClaimStepProps) {
@@ -92,6 +121,11 @@ export function SignInClaimStep({
   const send = fetchImpl ?? globalThis.fetch;
   const go = navigate ?? ((url: string) => globalThis.location.assign(url));
   const interactive = methods.filter((method) => method.interactive);
+  // The row the ONE button drives, when the server-rendered method list happens
+  // to contain it. It will not on a fresh deployment — that list predates the
+  // provision — and then the button is labelled generically rather than with
+  // some other provider's name.
+  const signInRow = interactive.find((method) => method.id === providerRowId) ?? null;
 
   async function signIn(): Promise<void> {
     if (oauthProviderId === null) {
@@ -208,13 +242,18 @@ export function SignInClaimStep({
     setPhase({ kind: "failed", messageKey: CONSOLE_MESSAGE_KEYS.setup_request_unreachable });
   }
 
-  /** One sign-in button label per provider — same fallback rules as /login. */
-  function buttonLabel(method: SetupMethodSummary, total: number): string {
-    if (method.displayName !== "") {
-      return t(CONSOLE_MESSAGE_KEYS.sign_in_button, { provider: method.displayName });
+  /**
+   * The single button's label — named after the row it actually drives, or
+   * generic when this document does not hold that row.
+   *
+   * The row id is never used as a label: it is a UUID, which tells an operator
+   * nothing and reads as leaked plumbing.
+   */
+  function signInLabel(row: SetupMethodSummary | null): string {
+    if (row === null || row.displayName === "") {
+      return t(CONSOLE_MESSAGE_KEYS.sign_in_button_generic);
     }
-    if (total === 1) return t(CONSOLE_MESSAGE_KEYS.sign_in_button_generic);
-    return t(CONSOLE_MESSAGE_KEYS.sign_in_button, { provider: method.id });
+    return t(CONSOLE_MESSAGE_KEYS.sign_in_button, { provider: row.displayName });
   }
 
   const busy = phase.kind === "signing_in" || phase.kind === "claiming";
@@ -227,38 +266,24 @@ export function SignInClaimStep({
         <>
           <p className={styles.body}>{t(CONSOLE_MESSAGE_KEYS.setup_sign_in_intro)}</p>
           <div className={styles.actions}>
-            {interactive.length === 0 ? (
-              // Fresh deployment: the server-rendered method list predates the
-              // provision that just completed, so no row exists to label a
-              // button — but `oauthProviderId` from the provision response
-              // does, and the flow works. One generic button, never zero.
-              <Button
-                type="button"
-                variant="primary"
-                loading={phase.kind === "signing_in"}
-                disabled={busy}
-                onClick={() => {
-                  void signIn();
-                }}
-              >
-                {t(CONSOLE_MESSAGE_KEYS.sign_in_button_generic)}
-              </Button>
-            ) : (
-              interactive.map((method) => (
-                <Button
-                  key={method.id}
-                  type="button"
-                  variant="primary"
-                  loading={phase.kind === "signing_in"}
-                  disabled={busy}
-                  onClick={() => {
-                    void signIn();
-                  }}
-                >
-                  {buttonLabel(method, interactive.length)}
-                </Button>
-              ))
-            )}
+            {/*
+              ONE button, always — never one per row. Every button on this step
+              would post the same `oauthProviderId`, so a second one could only
+              ever be a control that lies about which provider it runs. A fresh
+              deployment (no rows at all) still gets this button: the provision
+              response's `oauthProviderId` is what makes it work, not the list.
+            */}
+            <Button
+              type="button"
+              variant="primary"
+              loading={phase.kind === "signing_in"}
+              disabled={busy}
+              onClick={() => {
+                void signIn();
+              }}
+            >
+              {signInLabel(signInRow)}
+            </Button>
           </div>
           {phase.kind === "signing_in" && <Spinner label={t(CONSOLE_MESSAGE_KEYS.sign_in_pending)} />}
         </>
@@ -286,6 +311,19 @@ export function SignInClaimStep({
           </div>
         </div>
       )}
+
+      {/*
+        The way back. Present on BOTH sub-surfaces because both are dead ends
+        without it: a provision that landed with a mistyped discovery URL,
+        client id, or client secret cannot be corrected from a sign-in button,
+        and a reload lands here rather than on the form. Secondary, and never
+        disabled by `busy` alone being false — it is navigation, not a request.
+      */}
+      <div className={styles.actions}>
+        <Button type="button" variant="secondary" disabled={busy} onClick={onEditAuthSettings}>
+          {t(CONSOLE_MESSAGE_KEYS.setup_sign_in_edit_settings)}
+        </Button>
+      </div>
 
       {phase.kind === "failed" && (
         <p className={styles.problem} role="alert">
