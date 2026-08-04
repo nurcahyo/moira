@@ -594,9 +594,15 @@ describe("POST provision runs issuer -> provider -> secret -> enable", () => {
       CLAIM_STATUS_ROUTE,
       // The DERIVATION, before anything is written: which trusted issuer this
       // console owns, and therefore which provider row — if any — a write here
-      // is allowed to touch. It stops at the issuer list on a fresh deployment
-      // because there is no issuer yet, so there can be no bound row either.
+      // is allowed to touch.
       ISSUER_LIST_ROUTE,
+      // ...and the provider list, which is read EVEN THOUGH there is no trusted
+      // issuer yet and therefore no bound row to find. It answers the second
+      // question the gate needs: how many providers this DEPLOYMENT has enabled,
+      // whatever namespace they live in. A caller naming an unowned slug arrives
+      // in exactly this shape, so short-circuiting here would make the
+      // second-provider gate unreachable by the only caller it is for.
+      PROVIDER_LIST_ROUTE,
       ISSUER_LIST_ROUTE,
       ISSUER_CREATE_ROUTE,
       PROVIDER_CREATE_ROUTE,
@@ -830,7 +836,7 @@ describe("a partial write comes back resumable, with the remedy for its step", (
       CONSOLE_MESSAGE_KEYS.setup_client_secret_required,
     );
     // The derivation ran (it is what answered the question) and nothing else.
-    expect(stub.routes()).toEqual([CLAIM_STATUS_ROUTE, ISSUER_LIST_ROUTE]);
+    expect(stub.routes()).toEqual([CLAIM_STATUS_ROUTE, ISSUER_LIST_ROUTE, PROVIDER_LIST_ROUTE]);
     expect(store.puts).toEqual([]);
   });
 });
@@ -1009,7 +1015,7 @@ describe("the re-save target is server-derived, and `resume` is only a hint", ()
     // NOTHING left the console beyond the guard's claim-status read and the
     // derivation itself. The incumbent row was never even read, let alone
     // written, and no trusted issuer or provider was created on the way.
-    expect(stub.routes()).toEqual([CLAIM_STATUS_ROUTE, ISSUER_LIST_ROUTE]);
+    expect(stub.routes()).toEqual([CLAIM_STATUS_ROUTE, ISSUER_LIST_ROUTE, PROVIDER_LIST_ROUTE]);
     expect(stub.routes()).not.toContain(INCUMBENT_GET);
     expect(stub.routes()).not.toContain(INCUMBENT_PATCH);
     expect(stub.routes()).not.toContain(ISSUER_CREATE_ROUTE);
@@ -1364,7 +1370,11 @@ describe("an ENABLED provider is not re-pointed by a caller who cannot prove the
     store.sealedIds.add(PROVIDER_ID);
 
     const response = await POST(post(RE_POINT_BODY));
-    expect(response.status).toBe(403);
+    // 401, not 403: the module could only report "I was handed no session id",
+    // and the route resolves the session itself before phrasing the refusal —
+    // this caller genuinely has none, so signing in is the whole remedy. The
+    // next test is the same race for a caller who does hold one.
+    expect(response.status).toBe(401);
     expect(errorOf(await json(response))["code"]).toBe("setup_enabled_provider_requires_session");
     expect(stub.routes()).not.toContain(PROVIDER_PATCH_ROUTE);
     expect(store.puts).toEqual([]);
@@ -1383,6 +1393,9 @@ describe("an ENABLED provider is not re-pointed by a caller who cannot prove the
     expect(stub.routes()).toEqual([
       CLAIM_STATUS_ROUTE,
       ISSUER_LIST_ROUTE,
+      // Read, and answering zero: no provider is enabled on this deployment, so
+      // the second-provider gate asks for nothing.
+      PROVIDER_LIST_ROUTE,
       ISSUER_LIST_ROUTE,
       ISSUER_CREATE_ROUTE,
       PROVIDER_CREATE_ROUTE,
@@ -1462,6 +1475,365 @@ describe("an ENABLED provider is not re-pointed by a caller who cannot prove the
 });
 
 /* -------------------------------------------------------------------------- */
+/* THE LOCKOUT: a SECOND enabled provider is a denial of service              */
+/* -------------------------------------------------------------------------- */
+//
+// The gate above covers writes against an EXISTING row. It said nothing about
+// creating one, and the create path is reachable by an ANONYMOUS caller inside
+// the setup window: post a slug this console does not own and the derived state
+// for that namespace is empty, so nothing was in the way.
+//
+// Moira permits the write — each row binds its own trusted issuer, so the
+// partial unique index does not object — and the console then breaks.
+// `ambiguityGuard` refuses EVERY resolution once two providers are enabled: no
+// sign-in button for either, `consoleRuntime` not ok, session resolution
+// answering "no session" forever, and therefore the enabled-row gate above
+// permanently unsatisfiable. The operator is locked out of their own wizard by
+// a stranger who never authenticated.
+
+describe("a SECOND enabled provider needs the same operator as a re-save", () => {
+  const SECOND_SLUG = "backup";
+  const SECOND_CONSOLE_ISSUER = `${CONSOLE_ISSUER}/idp/${SECOND_SLUG}`;
+  const SECOND_ISSUER_ID = "55555555-5555-4555-8555-555555555555";
+  const SECOND_PROVIDER_ID = "66666666-6666-4666-8666-666666666666";
+  const SECOND_ENABLE_ROUTE = `POST /api/v1/admin/auth/providers/${SECOND_PROVIDER_ID}/enable`;
+
+  /** The provision an attacker sends: a well-formed slug nobody asked for. */
+  const SECOND_PROVIDER_BODY = {
+    ...PROVISION_BODY,
+    slug: SECOND_SLUG,
+    submission_id: "submission-0002",
+  };
+
+  /**
+   * A deployment with ONE enabled provider (the incumbent), and no trusted
+   * issuer for `SECOND_SLUG` — so the derived state for that namespace is empty
+   * and the create path is what would run.
+   *
+   * Every write route is booby-trapped rather than merely unrecorded: an
+   * assertion on `stub.routes()` proves no write was RECORDED, and a throwing
+   * handler proves none was ATTEMPTED by a path that swallowed its own failure.
+   */
+  function installIncumbentEnabled(session: SessionCheck): void {
+    install({
+      handlers: handlers({
+        [ISSUER_LIST_ROUTE]: populatedIssuerList,
+        [PROVIDER_LIST_ROUTE]: enabledProviderList,
+        [ISSUER_CREATE_ROUTE]: () => {
+          throw new Error("a second trusted issuer was registered without an operator session");
+        },
+        [PROVIDER_CREATE_ROUTE]: () => {
+          throw new Error("a second provider was created without an operator session");
+        },
+      }),
+      session,
+    });
+    store.sealedIds.add(PROVIDER_ID);
+  }
+
+  /** The same deployment, with the second provider's writes allowed through. */
+  function installIncumbentEnabledCreatable(session: SessionCheck): void {
+    install({
+      handlers: handlers({
+        [ISSUER_LIST_ROUTE]: populatedIssuerList,
+        [PROVIDER_LIST_ROUTE]: enabledProviderList,
+        [ISSUER_CREATE_ROUTE]: () => ({
+          status: 201,
+          body: issuerRecord({ id: SECOND_ISSUER_ID, issuer: SECOND_CONSOLE_ISSUER }),
+        }),
+        [PROVIDER_CREATE_ROUTE]: () => ({
+          status: 201,
+          body: providerRecord({
+            id: SECOND_PROVIDER_ID,
+            trusted_jwt_issuer_id: SECOND_ISSUER_ID,
+            enabled: false,
+          }),
+        }),
+        [SECOND_ENABLE_ROUTE]: () => ({
+          status: 200,
+          body: providerRecord({
+            id: SECOND_PROVIDER_ID,
+            trusted_jwt_issuer_id: SECOND_ISSUER_ID,
+            enabled: true,
+            version: 2,
+          }),
+        }),
+      }),
+      session,
+    });
+    store.sealedIds.add(PROVIDER_ID);
+  }
+
+  test("THE ATTACK: an anonymous caller with a fresh slug is refused, nothing written", async () => {
+    installIncumbentEnabled(NO_SESSION);
+    const response = await POST(post(SECOND_PROVIDER_BODY));
+
+    expect(response.status).toBe(401);
+    const error = errorOf(await json(response));
+    expect(error["code"]).toBe("setup_second_provider_requires_session");
+    expect(error["message_key"]).toBe(CONSOLE_MESSAGE_KEYS.setup_second_provider_requires_session);
+
+    // The whole wire: the guard's claim-status read, and the derivation that
+    // answered both questions. Nothing was created, and nothing was sealed.
+    expect(stub.routes()).toEqual([CLAIM_STATUS_ROUTE, ISSUER_LIST_ROUTE, PROVIDER_LIST_ROUTE]);
+    expect(stub.routes().filter((route) => !route.startsWith("GET "))).toEqual([]);
+    expect(store.puts).toEqual([]);
+  });
+
+  test("THE TEETH: the count is DEPLOYMENT-WIDE, and the slug cannot shrink it", async () => {
+    // The refusal above cannot have come from the derived state, and this is the
+    // proof: the console's own view model for that slug reports a namespace with
+    // NOTHING in it — no trusted issuer, no provider, not enabled. A guard
+    // reading `derived.providerEnabled`, or counting providers bound to this
+    // namespace, would see zero and let the write through.
+    //
+    // This is what fails if `operatorProofFor` is ever changed to read the
+    // enabled count out of `deployment.state` instead of out of
+    // `deployment.enabledProviderIds`.
+    installIncumbentEnabled(NO_SESSION);
+    const view = await json(
+      await GET(new Request(`https://console.example.com/api/setup?slug=${SECOND_SLUG}`)),
+    );
+    expect(view["slug"]).toBe(SECOND_SLUG);
+    expect(view["state"]).toMatchObject({
+      trustedJwtIssuerId: null,
+      providerId: null,
+      providerEnabled: false,
+    });
+
+    const response = await POST(post(SECOND_PROVIDER_BODY));
+    expect(response.status).toBe(401);
+    expect(errorOf(await json(response))["code"]).toBe("setup_second_provider_requires_session");
+  });
+
+  test("THE VARIANT: a valid session through a row this deployment has NOT enabled", async () => {
+    // A real, allow-listed, verified session — established through a provider
+    // that is not one of the deployment's enabled rows. Without this case the
+    // gate would be satisfied by "some session exists".
+    installIncumbentEnabled(SIGNED_IN_ELSEWHERE);
+    const response = await POST(post(SECOND_PROVIDER_BODY));
+
+    expect(response.status).toBe(403);
+    const error = errorOf(await json(response));
+    expect(error["code"]).toBe("setup_second_provider_session_mismatch");
+    expect(error["message_key"]).toBe(CONSOLE_MESSAGE_KEYS.setup_second_provider_session_mismatch);
+    expect(stub.routes()).toEqual([CLAIM_STATUS_ROUTE, ISSUER_LIST_ROUTE, PROVIDER_LIST_ROUTE]);
+    expect(store.puts).toEqual([]);
+  });
+
+  test("a session refused for a reason signing in cannot fix keeps ITS OWN key", async () => {
+    // Same rule as the re-save gate: an address the IdP never verified is told
+    // that, not told to sign in again.
+    installIncumbentEnabled(UNVERIFIED_HERE);
+    const response = await POST(post(SECOND_PROVIDER_BODY));
+    expect(response.status).toBe(403);
+    expect(errorOf(await json(response))["code"]).toBe("email_not_verified");
+    expect(store.puts).toEqual([]);
+  });
+
+  test("THE OPERATOR MAY: signed in through the enabled provider, the second one lands", async () => {
+    // The capability is not removed, only gated. An operator who can prove they
+    // are the operator — the same proof the re-save path takes — still registers
+    // an additional provider under its own slug, in its own namespace.
+    installIncumbentEnabledCreatable(SIGNED_IN);
+    const response = await POST(post(SECOND_PROVIDER_BODY));
+
+    expect(response.status).toBe(201);
+    const body = await json(response);
+    expect(body["console_issuer"]).toBe(SECOND_CONSOLE_ISSUER);
+    expect(body["state"]).toMatchObject({
+      trustedJwtIssuerId: SECOND_ISSUER_ID,
+      providerId: SECOND_PROVIDER_ID,
+      providerEnabled: true,
+    });
+    expect(stub.routes()).toContain(PROVIDER_CREATE_ROUTE);
+    expect(stub.routes()).toContain(SECOND_ENABLE_ROUTE);
+    // The incumbent was not touched on the way.
+    expect(stub.routes()).not.toContain(PROVIDER_PATCH_ROUTE);
+    expect(store.puts).toEqual([
+      { providerId: SECOND_PROVIDER_ID, clientId: CLIENT_ID, plaintext: CLIENT_SECRET },
+    ]);
+  });
+
+  test("...and the operator the ALLOW-LIST refused is admitted here too", async () => {
+    // Deliberately the same bar as the re-save gate rather than a stricter one.
+    // The console's own `checkSession` applies the incumbent's
+    // `allowed_email_domains`, so an operator whose address is outside that list
+    // holds `ok:false / email_domain_not_allowed` resolved through the enabled
+    // row — and refusing them here would make "add a working provider" depend on
+    // the very list they cannot sign in past. What that widens is stated in the
+    // gate's own note and in `docs/console-architecture.md`.
+    installIncumbentEnabledCreatable(OPERATOR_OUTSIDE_THE_ALLOW_LIST);
+    expect((await POST(post(SECOND_PROVIDER_BODY))).status).toBe(201);
+  });
+
+  test("CONTROL: with NO provider enabled, a second namespace is still ungated", async () => {
+    // The interrupted or deliberate multi-namespace first run. Nothing is
+    // enabled, so nothing can be locked out, so nothing is demanded — and the
+    // slug field in the wizard keeps working on a deployment that has not
+    // finished setup.
+    install({
+      handlers: handlers({
+        [ISSUER_LIST_ROUTE]: populatedIssuerList,
+        [PROVIDER_LIST_ROUTE]: () => ({
+          status: 200,
+          body: {
+            data: [providerRecord({ enabled: false })],
+            pagination: { has_more: false, next_cursor: null },
+          },
+        }),
+        [ISSUER_CREATE_ROUTE]: () => ({
+          status: 201,
+          body: issuerRecord({ id: SECOND_ISSUER_ID, issuer: SECOND_CONSOLE_ISSUER }),
+        }),
+        [PROVIDER_CREATE_ROUTE]: () => ({
+          status: 201,
+          body: providerRecord({
+            id: SECOND_PROVIDER_ID,
+            trusted_jwt_issuer_id: SECOND_ISSUER_ID,
+            enabled: false,
+          }),
+        }),
+        [SECOND_ENABLE_ROUTE]: () => ({
+          status: 200,
+          body: providerRecord({
+            id: SECOND_PROVIDER_ID,
+            trusted_jwt_issuer_id: SECOND_ISSUER_ID,
+            enabled: true,
+            version: 2,
+          }),
+        }),
+      }),
+      session: NO_SESSION,
+    });
+
+    expect((await POST(post(SECOND_PROVIDER_BODY))).status).toBe(201);
+  });
+
+  test("a DELETED enabled row does not count, because the resolver does not count it", async () => {
+    // `ambiguityGuard` counts `enabled && status === "active"`. Counting a
+    // deleted row here would refuse a create that breaks nothing, and the two
+    // numbers must be the same number or this gate refuses cases the console
+    // then handles perfectly well.
+    install({
+      handlers: handlers({
+        [ISSUER_LIST_ROUTE]: populatedIssuerList,
+        [PROVIDER_LIST_ROUTE]: () => ({
+          status: 200,
+          body: {
+            data: [providerRecord({ enabled: true, status: "deleted" })],
+            pagination: { has_more: false, next_cursor: null },
+          },
+        }),
+        [ISSUER_CREATE_ROUTE]: () => ({
+          status: 201,
+          body: issuerRecord({ id: SECOND_ISSUER_ID, issuer: SECOND_CONSOLE_ISSUER }),
+        }),
+        [PROVIDER_CREATE_ROUTE]: () => ({
+          status: 201,
+          body: providerRecord({
+            id: SECOND_PROVIDER_ID,
+            trusted_jwt_issuer_id: SECOND_ISSUER_ID,
+            enabled: false,
+          }),
+        }),
+        [SECOND_ENABLE_ROUTE]: () => ({
+          status: 200,
+          body: providerRecord({
+            id: SECOND_PROVIDER_ID,
+            trusted_jwt_issuer_id: SECOND_ISSUER_ID,
+            enabled: true,
+            version: 2,
+          }),
+        }),
+      }),
+      session: NO_SESSION,
+    });
+
+    expect((await POST(post(SECOND_PROVIDER_BODY))).status).toBe(201);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The stale-derivation race says WHY, rather than "sign in first" to all     */
+/* -------------------------------------------------------------------------- */
+//
+// One shape reaches the in-module lock: the derivation reported the row DISABLED
+// (so no proof was demanded and no session was ever resolved) and the fresh read
+// inside `runSetupProvisioning` found it ENABLED. `sessionProviderId` was `null`
+// for every caller alike, so the module can only report `no_session` — a fact
+// about what it was handed, not about the caller.
+//
+// Answering all of them with "This sign-in provider is already enabled. Sign in
+// through it first" told most of them to do what they had already done.
+
+describe("the mid-save race names the reason that actually applies", () => {
+  /** The derivation sees a DISABLED row; the read-back sees it enabled. */
+  function installRace(session: SessionCheck): void {
+    install({
+      handlers: handlers({
+        [ISSUER_LIST_ROUTE]: populatedIssuerList,
+        [PROVIDER_LIST_ROUTE]: () => ({
+          status: 200,
+          body: {
+            data: [providerRecord({ enabled: false })],
+            pagination: { has_more: false, next_cursor: null },
+          },
+        }),
+        [PROVIDER_GET_ROUTE]: () => ({
+          status: 200,
+          body: providerRecord({ enabled: true, version: 2 }),
+        }),
+        [PROVIDER_PATCH_ROUTE]: () => {
+          throw new Error("a row that became enabled mid-flight was PATCHed");
+        },
+      }),
+      session,
+    });
+    store.sealedIds.add(PROVIDER_ID);
+  }
+
+  test("an UNVERIFIED address is told that, not told to sign in again", async () => {
+    installRace(UNVERIFIED_HERE);
+    const response = await POST(post({ ...PROVISION_BODY, client_secret: "" }));
+
+    expect(response.status).toBe(403);
+    const error = errorOf(await json(response));
+    expect(error["code"]).toBe("email_not_verified");
+    expect(error["message_key"]).toBe(CONSOLE_MESSAGE_KEYS.email_not_verified);
+    expect(stub.routes()).not.toContain(PROVIDER_PATCH_ROUTE);
+  });
+
+  test("a session through ANOTHER row is told to switch providers", async () => {
+    installRace(SIGNED_IN_ELSEWHERE);
+    const response = await POST(post({ ...PROVISION_BODY, client_secret: "" }));
+
+    expect(response.status).toBe(403);
+    expect(errorOf(await json(response))["code"]).toBe(
+      "setup_enabled_provider_session_mismatch",
+    );
+    expect(stub.routes()).not.toContain(PROVIDER_PATCH_ROUTE);
+  });
+
+  test("the caller who COULD have proved it is told the state was stale", async () => {
+    // Not a session refusal at all: this operator is signed in through the very
+    // row that came back enabled, and would have been admitted had the
+    // derivation been fresh. "Sign in through it first" is the one instruction
+    // that cannot help them; a reload re-derives the truth and the save then
+    // goes through the ordinary re-save path.
+    installRace(SIGNED_IN);
+    const response = await POST(post({ ...PROVISION_BODY, client_secret: "" }));
+
+    expect(response.status).toBe(409);
+    const error = errorOf(await json(response));
+    expect(error["code"]).toBe("setup_provider_enabled_mid_save");
+    expect(error["message_key"]).toBe(CONSOLE_MESSAGE_KEYS.setup_provider_enabled_mid_save);
+    expect(stub.routes()).not.toContain(PROVIDER_PATCH_ROUTE);
+    expect(store.puts).toEqual([]);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
 /* Input the console refuses before any request leaves the process            */
 /* -------------------------------------------------------------------------- */
 
@@ -1487,7 +1859,7 @@ describe("provision input is validated before the first Moira write", () => {
       what: "a missing client secret",
       patch: { client_secret: "" },
       key: CONSOLE_MESSAGE_KEYS.setup_client_secret_required,
-      reads: [CLAIM_STATUS_ROUTE, ISSUER_LIST_ROUTE],
+      reads: [CLAIM_STATUS_ROUTE, ISSUER_LIST_ROUTE, PROVIDER_LIST_ROUTE],
     },
     {
       what: "a missing client id",

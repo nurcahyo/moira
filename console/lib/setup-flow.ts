@@ -456,14 +456,23 @@ export function assertProviderIsBoundToTrustedIssuer(
  *
  * THE COST, STATED. An operator who enables a provider they then cannot sign in
  * through at all (a mistyped client secret, say) can no longer correct that row
- * here — no session can be obtained through a broken provider, so there is
- * nothing to prove operatorship with. They are not stuck: the wizard's
- * auth-settings form carries a PROVIDER SLUG field, and a new slug is a new
- * console issuer with its own trusted issuer and its own row, so the create
- * path is still open from the console itself. Failing that they hold the
- * bootstrap system key, which is the credential Moira's own admin API takes.
- * What the console refuses to be is an unauthenticated proxy for a write
- * against a live authenticator.
+ * from the console — no session can be obtained through a broken provider, so
+ * there is nothing to prove operatorship with. Provisioning under a NEW SLUG is
+ * not the way out, and must not be described as one: the broken row is still
+ * enabled, so the console's second-provider gate (`operatorProofFor` in
+ * `app/api/setup/route.ts`) refuses that create for the same missing proof, and
+ * before that gate existed the write succeeded and left `ambiguityGuard`
+ * refusing to resolve EITHER provider.
+ *
+ * The way out is the bootstrap system key the operator already holds, which is
+ * the credential Moira's own admin API takes: disable the broken row
+ * (`POST /auth/providers/{id}/disable`), at which point it authenticates nobody,
+ * both console gates stand down, and the wizard re-saves and re-enables it the
+ * way it does an interrupted first run. That sequence, and the reason the slug
+ * detour is refused, are written down in `docs/console-architecture.md`.
+ *
+ * What the console refuses to be is an unauthenticated proxy for a write against
+ * a live authenticator.
  *
  * `sessionProviderId` is the row the CALLER authenticated through
  * (`SessionCheck.moiraProviderId`, or `resolvedProviderId` on an allow-list
@@ -921,18 +930,91 @@ export async function deriveProvisioningState(
   hasStoredSecret: (providerId: string) => Promise<boolean>,
   consoleIssuer: string,
 ): Promise<SetupProvisioningState> {
-  const issuer = await client.findTrustedJwtIssuerByIssuer(consoleIssuer);
-  if (issuer === null || issuer.status === "deleted") return EMPTY_PROVISIONING_STATE;
+  const issuer = await activeTrustedIssuerFor(client, consoleIssuer);
+  // No trusted issuer for this namespace means nothing has been provisioned in
+  // it, and the provider list cannot change that answer — so a READ does not
+  // pay for the scan. `deriveSetupDeploymentState` does, because the question
+  // IT answers is about the deployment rather than about this namespace.
+  if (issuer === null) return EMPTY_PROVISIONING_STATE;
+  const scan = await scanAuthProviders(client, issuer.id);
+  return provisioningStateFor(issuer, scan.bound, hasStoredSecret);
+}
 
+/**
+ * What the console derived about the DEPLOYMENT while handling one provisioning
+ * request: the state of the namespace being written, and every enabled provider
+ * row the deployment has, whatever namespace those belong to.
+ */
+export interface SetupDeploymentState {
+  /** Exactly what `deriveProvisioningState` returns for the same issuer. */
+  readonly state: SetupProvisioningState;
+  /**
+   * The ids of every ENABLED, `active` `auth_provider_settings` row in the
+   * deployment, in list order, whatever trusted issuer they are bound to.
+   *
+   * ============================================================================
+   * WHY THIS IS NOT SCOPED TO `consoleIssuer`, AND WHY THAT IS THE WHOLE POINT
+   * ============================================================================
+   *
+   * `state` describes ONE console-issuer namespace, and the slug on a provision
+   * body chooses which one. So a count taken from `state` answers "nothing is
+   * enabled here" for every slug this console does not already own — which is
+   * precisely the slug a caller picks when they want the ungated CREATE path.
+   * A guard reading that count could be defeated by choosing a different slug.
+   *
+   * The number that actually decides whether the console still works after a
+   * provisioning run is the one `ambiguityGuard` (`lib/auth-config.ts`) reads on
+   * the next cold resolve: enabled, `active`, deployment-wide. This is that
+   * number, counted with the same predicate, so the two cannot drift apart.
+   */
+  readonly enabledProviderIds: readonly string[];
+}
+
+/**
+ * `deriveProvisioningState`, plus the deployment-wide enabled-provider set.
+ *
+ * One extra fact, no extra request: the provider list is already paged for the
+ * bound row, and the enabled ids are collected on the same pass. The trusted
+ * issuer being ABSENT no longer short-circuits the scan, because the caller
+ * that needs this — the provisioning gate in `app/api/setup/route.ts` — needs
+ * the deployment's enabled set most in exactly that case.
+ */
+export async function deriveSetupDeploymentState(
+  client: MoiraClient,
+  hasStoredSecret: (providerId: string) => Promise<boolean>,
+  consoleIssuer: string,
+): Promise<SetupDeploymentState> {
+  const issuer = await activeTrustedIssuerFor(client, consoleIssuer);
+  const scan = await scanAuthProviders(client, issuer === null ? null : issuer.id);
+  return {
+    state:
+      issuer === null
+        ? EMPTY_PROVISIONING_STATE
+        : await provisioningStateFor(issuer, scan.bound, hasStoredSecret),
+    enabledProviderIds: scan.enabledProviderIds,
+  };
+}
+
+/** The trusted issuer registered for a console issuer string, if it is live. */
+async function activeTrustedIssuerFor(
+  client: MoiraClient,
+  consoleIssuer: string,
+): Promise<TrustedJwtIssuerRecord | null> {
+  const issuer = await client.findTrustedJwtIssuerByIssuer(consoleIssuer);
+  return issuer === null || issuer.status === "deleted" ? null : issuer;
+}
+
+async function provisioningStateFor(
+  issuer: TrustedJwtIssuerRecord,
+  provider: AuthProviderSettingsRecord | null,
+  hasStoredSecret: (providerId: string) => Promise<boolean>,
+): Promise<SetupProvisioningState> {
   const state: SetupProvisioningState = {
     ...EMPTY_PROVISIONING_STATE,
     trustedJwtIssuerId: issuer.id,
     trustedJwtIssuerVersion: issuer.version,
   };
-
-  const provider = await findProviderBoundTo(client, issuer.id);
   if (provider === null) return state;
-
   return {
     ...state,
     providerId: provider.id,
@@ -944,18 +1026,38 @@ export async function deriveProvisioningState(
   };
 }
 
+interface AuthProviderScan {
+  /**
+   * The row bound to the requested trusted issuer, or `null`.
+   *
+   * The ENABLED row wins when one exists — the partial unique index guarantees
+   * at most one — and otherwise the first non-deleted bound row is the resumable
+   * partial state a previous attempt left behind.
+   */
+  readonly bound: AuthProviderSettingsRecord | null;
+  /** See `SetupDeploymentState.enabledProviderIds`. */
+  readonly enabledProviderIds: readonly string[];
+}
+
 /**
- * The provider row bound to a trusted issuer, paging the list.
+ * One pass over `auth_provider_settings`, answering both questions at once.
  *
- * The ENABLED row wins when one exists — the partial unique index guarantees at
- * most one — and otherwise the first non-deleted bound row is the resumable
- * partial state a previous attempt left behind.
+ * Deliberately NOT short-circuited on the first enabled bound row, the way the
+ * bound-row lookup alone used to be: the enabled set has to be complete over
+ * every page or the guard that reads it would under-count on a deployment whose
+ * incumbent happens to sort early. The loop is bounded, and a console with more
+ * than one page of providers is already past the point of being usable.
+ *
+ * `trustedJwtIssuerId === null` means "no bound row to find" — the namespace has
+ * no trusted issuer — and the scan then only collects the enabled set.
  */
-async function findProviderBoundTo(
+async function scanAuthProviders(
   client: MoiraClient,
-  trustedJwtIssuerId: string,
-): Promise<AuthProviderSettingsRecord | null> {
-  let fallback: AuthProviderSettingsRecord | null = null;
+  trustedJwtIssuerId: string | null,
+): Promise<AuthProviderScan> {
+  let bound: AuthProviderSettingsRecord | null = null;
+  let boundIsEnabled = false;
+  const enabledProviderIds: string[] = [];
   let cursor: string | undefined;
   // Bounded so a paging bug cannot spin forever during setup.
   for (let page = 0; page < 50; page += 1) {
@@ -963,18 +1065,31 @@ async function findProviderBoundTo(
       cursor === undefined ? { limit: 100 } : { limit: 100, cursor },
     );
     for (const row of response.data) {
-      if (row.status === "deleted" || (row.trusted_jwt_issuer_id ?? null) !== trustedJwtIssuerId) {
+      // The SAME predicate `resolveAuthConfigs` and `ambiguityGuard` apply, so
+      // this count is the count that decides whether sign-in still resolves.
+      if (row.enabled && row.status === "active") enabledProviderIds.push(row.id);
+      if (
+        trustedJwtIssuerId === null ||
+        row.status === "deleted" ||
+        (row.trusted_jwt_issuer_id ?? null) !== trustedJwtIssuerId
+      ) {
         continue;
       }
-      if (row.enabled) return row;
-      fallback ??= row;
+      if (row.enabled) {
+        if (!boundIsEnabled) {
+          bound = row;
+          boundIsEnabled = true;
+        }
+      } else {
+        bound ??= row;
+      }
     }
     if (!response.pagination.has_more) break;
     const next = response.pagination.next_cursor;
     if (next === null || next === undefined || next === "") break;
     cursor = next;
   }
-  return fallback;
+  return { bound, enabledProviderIds };
 }
 
 /* -------------------------------------------------------------------------- */

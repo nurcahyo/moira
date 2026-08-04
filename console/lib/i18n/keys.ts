@@ -112,6 +112,9 @@ export const CONSOLE_MESSAGE_KEYS = {
   setup_claim_issuer_mismatch: "console.error.setup_claim_issuer_mismatch",
   setup_enabled_provider_requires_session: "console.error.setup_enabled_provider_requires_session",
   setup_enabled_provider_session_mismatch: "console.error.setup_enabled_provider_session_mismatch",
+  setup_second_provider_requires_session: "console.error.setup_second_provider_requires_session",
+  setup_second_provider_session_mismatch: "console.error.setup_second_provider_session_mismatch",
+  setup_provider_enabled_mid_save: "console.error.setup_provider_enabled_mid_save",
 
   /* --- accessibility ------------------------------------------------------ */
   a11y_loading: "console.a11y.loading",

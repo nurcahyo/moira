@@ -97,11 +97,19 @@ interface FormEnvelope {
    * The console-issuer namespace to provision under. Empty means the incumbent.
    *
    * This is the ONE field on this form that chooses a different provider row
-   * rather than rewriting the derived one — which is what makes it the escape
-   * hatch from a provider that was enabled with credentials nobody can sign in
-   * with. An enabled row may only be re-saved by somebody who authenticated
-   * through it, and a broken row authenticates nobody; a new slug is a new
-   * trusted issuer and a new row, so the create path stays open.
+   * rather than rewriting the derived one: a new slug is a new trusted issuer
+   * and a new row, so an ADDITIONAL provider can be registered beside the
+   * incumbent.
+   *
+   * It is NOT an escape hatch from a provider enabled with credentials nobody
+   * can sign in with, and must not be presented as one. Enabling a second
+   * provider while one is already enabled needs the same proof of an operator a
+   * re-save does (`operatorProofFor` in `app/api/setup/route.ts`), which is
+   * exactly what a broken provider cannot supply — and before that gate existed
+   * the write went through and left `ambiguityGuard` refusing to resolve EITHER
+   * provider. That repair is `docs/console-architecture.md`'s: disable the
+   * broken row through Moira's admin API with the bootstrap system key, then
+   * finish here.
    */
   readonly slug: string;
   readonly displayName: string;
@@ -452,11 +460,13 @@ export function AuthSettingsStep({
         </div>
 
         {/*
-          The escape hatch, rendered as an ordinary field rather than hidden
-          behind a disclosure: an operator who reaches this form from the
-          sign-in step's way back is often here BECAUSE the enabled provider is
-          broken, and that repair is only possible under a new slug. Empty is
-          the normal answer and the whole first run never touches it.
+          Rendered as an ordinary field rather than hidden behind a disclosure:
+          it is a permanent choice that becomes part of the sign-in URL, so an
+          operator who wants a second provider must be able to see it before
+          they save rather than discover it afterwards. Empty is the normal
+          answer and the whole first run never touches it. See the `slug` field
+          on `AuthSettingsForm` for what this is NOT — it is not the way out of
+          a provider enabled with credentials nobody can sign in with.
         */}
         <div className={styles.field}>
           <Label htmlFor={slugFieldId}>{t(CONSOLE_MESSAGE_KEYS.setup_auth_slug_label)}</Label>

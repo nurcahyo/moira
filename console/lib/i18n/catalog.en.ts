@@ -481,12 +481,54 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
     message:
       "This sign-in provider is already enabled. Sign in through it first, then save your changes.",
     description:
-      "Provisioning tried to re-save an ENABLED provider row with no console session behind the " +
-      "request. An enabled row is a live authenticator, so rewriting its client id and endpoint " +
-      "URLs re-points sign-in at another identity provider — and while the deployment is " +
-      "unclaimed there is no admin grant yet to refuse that. A session established through that " +
-      "same provider is the only proof of operatorship the setup window can ask for. Refused " +
-      "with nothing written.",
+      "Provisioning tried to re-save an ENABLED provider row with NO SESSION AT ALL behind the " +
+      "request — a 401, and the one refusal for which 'sign in first' is the whole remedy. An " +
+      "enabled row is a live authenticator, so rewriting its client id and endpoint URLs " +
+      "re-points sign-in at another identity provider, and while the deployment is unclaimed " +
+      "there is no admin grant yet to refuse that. A session established through that same " +
+      "provider is the only proof of operatorship the setup window can ask for. Deliberately NOT " +
+      "used for a caller who does hold a session and was refused for another reason: an " +
+      "unverified address, a domain outside the allow-list and an unresolvable provider each " +
+      "keep their own key, because each has already done what this sentence tells them to do.",
+  },
+  [K.setup_second_provider_requires_session]: {
+    key: K.setup_second_provider_requires_session,
+    message:
+      "This deployment already has an enabled sign-in provider. Sign in through it before adding " +
+      "another one.",
+    description:
+      "Provisioning would have ENABLED a second provider on a deployment that already has one, " +
+      "with no session behind the request (401). Not an escalation — a lockout: `ambiguityGuard` " +
+      "refuses every resolution once two providers are enabled, so the next cold resolve renders " +
+      "no sign-in button for EITHER of them and session resolution then answers 'no session' " +
+      "forever. An unauthenticated caller could reach this by naming a provider slug this " +
+      "console does not own, which is why the enabled count the gate reads is deployment-wide " +
+      "rather than taken from the slug's own namespace. Refused with nothing written.",
+  },
+  [K.setup_second_provider_session_mismatch]: {
+    key: K.setup_second_provider_session_mismatch,
+    message:
+      "You are signed in through a sign-in provider this deployment does not have enabled. Sign " +
+      "in through the enabled one before adding another.",
+    description:
+      "The same lockout refusal for a caller who DOES hold a valid session, established through " +
+      "a row that is not among the deployment's currently enabled providers. Separated because " +
+      "the remedy differs: sign out and back in through the enabled provider, rather than merely " +
+      "sign in.",
+  },
+  [K.setup_provider_enabled_mid_save]: {
+    key: K.setup_provider_enabled_mid_save,
+    message:
+      "This sign-in provider was enabled while your changes were being saved. Reload the page and " +
+      "save again.",
+    description:
+      "The stale-derivation race, and the only outcome of it that is NOT a session refusal: the " +
+      "console derived the row as disabled (so it asked for no proof of an operator), " +
+      "`runSetupProvisioning` read it back ENABLED and refused the write, and re-resolving the " +
+      "session afterwards shows the caller could have proved operatorship all along. Nothing is " +
+      "wrong with them or with the configuration — the console's copy of the state was stale, so " +
+      "this is a 409 for the same reason `setup_resume_state_conflict` is one, and a reload " +
+      "re-derives the truth.",
   },
   [K.setup_enabled_provider_session_mismatch]: {
     key: K.setup_enabled_provider_session_mismatch,
@@ -768,20 +810,25 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
     description:
       "Label of the provider-slug field. The slug picks the console-issuer namespace this " +
       "provider is registered under, and a new slug means a new trusted issuer and a new " +
-      "provider row rather than a rewrite of the incumbent.",
+      "provider row rather than a rewrite of the incumbent. What it does NOT pick is whether " +
+      "the write is gated: the enabled-provider count that decides that is deployment-wide.",
   },
   [K.setup_auth_slug_hint]: {
     key: K.setup_auth_slug_hint,
     message:
       "Leave empty for the default provider. Enter a short name — lower-case letters, digits and " +
-      "hyphens — to register a SEPARATE provider instead: the way out when the enabled one was " +
-      "saved with credentials nobody can sign in with. It becomes part of the sign-in URL and " +
-      "cannot be changed afterwards.",
+      "hyphens — to register a SEPARATE provider beside it. Once a provider is enabled, adding " +
+      "another one requires signing in through the enabled one first. It becomes part of the " +
+      "sign-in URL and cannot be changed afterwards.",
     description:
-      "Hint under the provider-slug field. States both what the slug is for (the documented " +
-      "escape hatch from a provider enabled with a mistyped client secret, which cannot be " +
-      "re-saved because that needs a session through it) and that it is permanent — it is a URL " +
-      "path segment and part of the issuer string Moira pins tokens to.",
+      "Hint under the provider-slug field. Says what the slug is for (registering an additional " +
+      "provider in its own console-issuer namespace), what it costs (permanent — it is a URL " +
+      "path segment and part of the issuer string Moira pins tokens to), and the one condition " +
+      "on it. It deliberately no longer calls the slug an escape hatch from a provider enabled " +
+      "with credentials nobody can sign in with: enabling a second provider while the first is " +
+      "still enabled is refused for the same missing proof, and before that refusal existed the " +
+      "write locked the console out of BOTH providers. That repair runs through Moira's admin " +
+      "API with the bootstrap system key — see `docs/console-architecture.md`.",
   },
   [K.setup_auth_display_name_label]: {
     key: K.setup_auth_display_name_label,

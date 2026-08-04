@@ -169,6 +169,24 @@ remove it.
   whose provider cannot be resolved is not. The cost is stated plainly: inside
   the setup window, anybody the deployment's IdP will authenticate can re-save
   the enabled row, not only an allow-listed address.
+- **A second sign-in provider cannot be enabled by anyone who did not
+  authenticate through the first.** This one is a denial of service rather than
+  an escalation, and it was reachable by an unauthenticated caller: provisioning
+  under a *different* provider slug derives a different console-issuer namespace,
+  which is empty, so the create path used to run with nothing in its way. Moira
+  permits the write — each row binds its own trusted issuer — and the console
+  then breaks, because it refuses to resolve sign-in at all while more than one
+  provider is enabled. No sign-in button renders for *either* provider, session
+  resolution answers "no session" forever, and the enabled-row rule above becomes
+  permanently unsatisfiable. The operator is locked out of their own wizard.
+
+  So a run that would enable a provider on a deployment that already has one
+  demands the same proof a re-save does: a console session resolved against a
+  provider the deployment currently has enabled. The count that decides this is
+  taken **deployment-wide**, not from the namespace the slug selects — a
+  namespace-scoped count is a count the caller chose. A deployment with nothing
+  enabled demands nothing, so a first run, and a deliberate multi-namespace setup
+  before anything is switched on, are both untouched.
 - **A disabled row may still be completed without a session**, deliberately: it
   authenticates nobody, and requiring a session would make an interrupted first
   run unresumable.
@@ -195,23 +213,38 @@ accepts end to end.
 
 What remains is the provider enabled with a credential **nobody at all** can sign
 in with — a mistyped client id or client secret, or a discovery URL pointing at
-the wrong IdP. That row cannot be corrected: no session can be obtained through
-it, so there is nothing to prove operatorship with. Two ways out, both intended,
-and the first is in the wizard itself:
+the wrong IdP. That row cannot be corrected *from the console*: no session can be
+obtained through it, so there is nothing to prove operatorship with, and the
+console will not be an unauthenticated proxy for a write against a live
+authenticator.
 
-- **Provision again under a different provider slug.** The auth-settings form has
-  a *Provider slug* field; leave it empty for the default provider, or enter a
-  short name to register a separate one. A new slug is a new console issuer with
-  its own trusted issuer and its own provider row, so the create path is still
-  open and the broken row is left untouched. The rest of the run stays in that
-  namespace — the sign-in callback returns to `/setup?slug=…` and the claim names
-  the same namespace — so a replacement provider can be provisioned, signed in
-  through, and claimed without leaving the console. The slug becomes part of the
-  OAuth redirect path and of the issuer string Moira pins tokens to, so it cannot
-  be changed afterwards.
-- **Correct the row directly against Moira's admin API** with the bootstrap
-  system key you already hold. The console declines to be an unauthenticated
-  proxy for that write; it does not deny you the write.
+The way out is the bootstrap system key you already hold. Moira's admin API takes
+it directly — `POST /api/v1/admin/auth/providers/{id}/disable` and `PATCH
+/api/v1/admin/auth/providers/{id}` both accept `systemKeyAuth` — so:
+
+```bash
+curl -fsS -X POST \
+  -H "Authorization: Bearer $MOIRA_SYSTEM_KEY" \
+  "$MOIRA_API_URL/api/v1/admin/auth/providers/$PROVIDER_ID/disable"
+```
+
+**Disable the broken row, then finish in the wizard.** A disabled row
+authenticates nobody, so both console rules above stand down: the setup window
+will re-save it and enable it again with no session, exactly as it does for an
+interrupted first run. Reload `/setup`, correct the client id, secret or
+discovery URL in the auth-settings form, and save. This is the recommended
+sequence, because the OAuth **client secret lives in the console and not in
+Moira** — patching the row against Moira's API alone cannot fix a mistyped
+secret, and only the console's own form can.
+
+> **Do not** try to route around this by provisioning again under a *different*
+> provider slug. It fails on purpose. The broken row is still enabled, so
+> enabling a second one is refused unless you can sign in through the first —
+> which is the thing you cannot do. Before that refusal existed the write
+> succeeded and left the console unable to resolve *either* provider, which is a
+> worse position than the one you started in. Disable the broken row first; the
+> slug field is for adding a provider beside a working one, not for escaping a
+> broken one.
 
 ## Routes, layouts, and where the auth boundary sits
 
