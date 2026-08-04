@@ -55,8 +55,8 @@ pub use setup::SetupService;
 // database and no provider.
 pub use summarization::{
     FAILURE_SUMMARIZATION_CALL_FAILED, FAILURE_SUMMARY_EMPTY, FAILURE_SUMMARY_TOO_LARGE,
-    MAXIMUM_SUMMARY_BYTES, PRIOR_SUMMARY_LABEL, SUMMARIZATION_INSTRUCTION,
-    SUMMARY_TRANSCRIPT_LABEL, SUMMARY_TRANSCRIPT_MESSAGES, SummarizationBacklog,
-    SummarizationPolicy, SummarizationSkip, ValidatedSummary, decide_summarization, parse_summary,
-    summarization_messages,
+    INLINE_REASONING_OPEN_TAG, MAXIMUM_SUMMARY_BYTES, PRIOR_SUMMARY_LABEL,
+    SUMMARIZATION_INSTRUCTION, SUMMARY_TRANSCRIPT_LABEL, SUMMARY_TRANSCRIPT_MESSAGES,
+    SummarizationBacklog, SummarizationPolicy, SummarizationSkip, ValidatedSummary,
+    decide_summarization, parse_summary, summarization_messages,
 };

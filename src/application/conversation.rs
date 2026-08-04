@@ -1,5 +1,6 @@
 use serde::Serialize;
 use serde_json::{Value, json};
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
@@ -1760,10 +1761,19 @@ impl ConversationService {
         lock.release().await;
 
         self.state.metrics.record_summarization_run(outcome.is_ok());
-        let row = outcome?;
+        let SummarizationRun {
+            row,
+            inline_reasoning,
+        } = outcome?;
         // Audited by shape, never by content: the version, the coverage boundary and the token
         // count. `audit_logs` records that a summary was produced and how far it reaches; the
         // summary body itself lives only in `conversation_summaries`.
+        //
+        // `inline_reasoning` (F57) is the durable, per-conversation half of that announcement and
+        // is a `bool` for the same reason — it says *that* the stored text opens with a reasoning
+        // block, never how much of it or what it said. It rides this existing row deliberately:
+        // F55 is the open question of whether a *failed* summarization deserves a table, and this
+        // is a successful run, so nothing here prejudges it.
         self.audit(
             actor,
             ctx,
@@ -1777,6 +1787,7 @@ impl ConversationService {
                 "token_count": row.token_count,
                 "message_count": plan.turns.len(),
                 "forced": force,
+                "inline_reasoning": inline_reasoning,
             }),
         )
         .await?;
@@ -1882,7 +1893,7 @@ impl ConversationService {
         conversation_uuid: Uuid,
         policy: &ConversationPolicyRecord,
         plan: &SummarizationPlan,
-    ) -> Result<ConversationSummaryRow, AppError> {
+    ) -> Result<SummarizationRun, AppError> {
         let _ = policy;
         // The route the conversation's own turns went to. `route_hint: None` would land on
         // `get_default_route()`, which is decision D-F3's exact trap — a route the caller never
@@ -1946,9 +1957,33 @@ impl ConversationService {
             .ok_or_else(|| summarization_failed(FAILURE_SUMMARIZATION_CALL_FAILED))?;
         let summary = parse_summary(&raw).map_err(summarization_failed)?;
 
+        // **Finding F57 — announce an inline reasoning block; do not remove it.**
+        //
+        // Why this is only announced is argued at `parse_summary`, against a measurement: the
+        // condition is decidable at offset 0, the *extent* of it is not. So the reply is stored
+        // exactly as the model sent it and the operator is told, three ways with three consumers,
+        // the same split `announce_dangling_agent_profile` uses for F50.
+        //
+        // The `warn!` carries the conversation id and two byte counts and **no summary text**.
+        // That is not incidental tidiness: `tests/content_leak_snapshots.rs` asserts summary
+        // bodies reach neither the log stream nor `audit_logs` nor a metric label, and a reply
+        // that is 63 % chain-of-thought is still 37 % the conversation's content.
+        if summary.inline_reasoning {
+            warn!(
+                conversation_id = %conversation_uuid,
+                stored_bytes = summary.text.len(),
+                covers_through_sequence = plan.covers_through_sequence,
+                "summarization reply opened with an inline reasoning block and is stored \
+                 verbatim; the summary is mostly chain-of-thought and is re-injected into every \
+                 later turn. Serve the model with a reasoning parser (vLLM: --reasoning-parser) \
+                 so the block arrives in its own field, which Moira discards"
+            );
+            self.state.metrics.record_summarization_inline_reasoning();
+        }
+
         let summary_hash = request_hash(summary.text.as_bytes());
         let token_count = budget_tokens(&summary.text);
-        insert_conversation_summary(
+        let row = insert_conversation_summary(
             pool,
             &ConversationSummaryInsert {
                 conversation_uuid,
@@ -1959,7 +1994,11 @@ impl ConversationService {
                 provider_model_id: None,
             },
         )
-        .await
+        .await?;
+        Ok(SummarizationRun {
+            row,
+            inline_reasoning: summary.inline_reasoning,
+        })
     }
 
     /// Summarises after an assistant turn, if the policy says to — plan 11 Sub-Phase E.
@@ -3127,6 +3166,18 @@ fn required_application_id(actor: &Actor) -> Result<Uuid, AppError> {
 
 /// What one summarization run will feed the model, once the trigger has said yes.
 #[derive(Debug)]
+/// What one completed summarization run produced.
+///
+/// A struct rather than a bare [`ConversationSummaryRow`] so F57's observation survives the
+/// return: the flag is decided inside `run_summarization`, where the raw reply is, and consumed by
+/// `summarize_conversation_unscoped`, where the audit row is written. A tuple would have carried
+/// it equally well and named neither half.
+struct SummarizationRun {
+    row: ConversationSummaryRow,
+    /// The stored summary opens with an inline reasoning block. See `parse_summary`.
+    inline_reasoning: bool,
+}
+
 struct SummarizationPlan {
     /// The active summary's text, when there is one and it was persisted in plaintext.
     previous_summary: Option<String>,
