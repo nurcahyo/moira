@@ -95,7 +95,18 @@ summary exists" and "the summary text is available" are two separate facts.
   call every turn forever. The instruction asks the model not to include secrets, and the leak
   suites assert summary text reaches neither logs nor audit rows. This reverses the moment a runs
   table exists to bound the retry.
-- `conversation_content_persistence` is not honoured — the summary is written to
-  `summary_text_plain` unconditionally, exactly as `conversation_messages.content_plain` already
-  is. That column is read by nothing in `src/` today; making summaries the first consumer would
-  have created an inconsistency rather than removed one.
+- `conversation_content_persistence` **is** honoured, as of finding F32's fix. The message path
+  enforces it in `add_message` and the summary write enforces it here: under a policy that does
+  not admit plaintext, `summary_text_plain` is null while `covers_through_sequence`,
+  `summary_hash` and `token_count` are still written. The run happened and really does cover that
+  backlog; recording the boundary without the body is the honest outcome.
+
+  Under a *steady* `none`/`metadata_only` this branch is never reached — messages carry no
+  plaintext, so `build_summarization_plan` refuses before any model call. It is reached when a
+  conversation accumulated plaintext under `plain_content` and the operator then tightened the
+  policy, which is the case `a_summary_is_withheld_when_the_policy_no_longer_admits_plaintext`
+  drives.
+- `encrypted_content` **does not encrypt**, and the admin API refuses it
+  (`conversation_content_persistence_unsupported`, 422). No cipher is wired to the
+  `content_encrypted`/`summary_text_encrypted` columns on any table. A policy row that already
+  holds the value keeps parsing and fails closed — no plaintext is written under it.
