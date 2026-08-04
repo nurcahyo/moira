@@ -313,14 +313,20 @@ For each of the four operations (`create_rag_collection` `:660-672`, `create_rag
 - Add the explicit `409` response entry to `responses(...)`.
 - Delete 02a's Sentence B from the operation description; keep Sentence A verbatim.
 
-Handler bodies do not change. No parameter is added or removed — `grep -c 'Idempotency-Key' src/http/conversation.rs` stays at `4`.
+Handler bodies do not change. No parameter is added or removed — `grep -c '("Idempotency-Key' src/http/conversation.rs` stays at `4`.
+
+> **Guard amended (issue #82).** Originally `grep -c 'Idempotency-Key' …`. Both forms return `4`
+> against the current tree, so the guard was never broken. The anchored form is used because this
+> very section rewrites the operation *descriptions*, and an unanchored count would rise or fall
+> with prose that mentions the header rather than with the parameter declarations the guard exists
+> to protect. The expected value is unchanged.
 
 ### 8. Documentation
 
 - **`docs/idempotency.md`** — replace 02a's "Conversation, memory, and RAG endpoints do **not** replay today…" paragraph with the real contract: add the three new operations to the operation table (`rag.collection.create`, `rag.document.create`, `rag.document.ingest`), state the 24-hour retention window (`IDEMPOTENCY_RETENTION_HOURS`, `src/application/admin_command.rs:17`), the `409 idempotency_conflict` / `409 idempotency_in_progress` semantics, and — explicitly — that `/reindex` shares `rag.document.ingest` with `/ingest` so the same key replays across the two aliases. Note that conversation/memory create routes still do not support replay.
 - **`docs/public-api.md`** — delete the fourth bullet of 02a's MVP-boundary section (the `Idempotency-Key` caveat) and replace it with a one-line statement that the RAG create/ingest/reindex routes now replay, pointing at `docs/idempotency.md`. **Leave the other three bullets** (no pipeline, no context injection, no summarization) untouched — they remain true.
 - **`docs/conversation-memory-rag-api.md`** — update the "does not do" column of 02a's table: remove "replay", keep "retrieve / inject / summarize".
-- **`docs/todo.md`** — annotate the Phase 2 idempotency-extension line (`:22`) as satisfied for the RAG slice by this plan, still open for runtime-policy/conversation/memory. Do not delete or renumber lines.
+- **`docs/todo.md`** — annotate the Phase 2 idempotency-extension line (`:22`) as satisfied for the RAG slice by this plan, still open for runtime-policy/conversation/memory. Do not delete or renumber lines. **Line reference is historical:** `docs/todo.md` gained a marker legend under issue #82, so the line has moved. Find it by its text — the Phase 2 bullet beginning "Extend atomic idempotency and sanitized deterministic-failure replay" — not by number.
 
 ### 9. Tests — **both layers are mandatory** (`plans/CONVENTIONS.md` §3)
 
@@ -393,7 +399,17 @@ The four documentation files in §8 have no automated assertion (markdown drift 
 F and G are file-disjoint (F re-enters `src/application/*.rs` only inside `#[cfg(test)] mod tests` blocks that Wave 2 did not create; if that overlap is uncomfortable, run F after Wave 3 sequentially rather than concurrently with G). **Both** must land before the PR opens.
 
 ### Wave 5 — read-only reviewer
-Confirm: (1) `grep -c 'Idempotency-Key' src/http/conversation.rs` is still `4` — nothing removed (`CONVENTIONS.md` §0 D1); (2) no `begin()`/`commit()` inside any `_with_connection` function; (3) `actor_fingerprint` has exactly one definition in the crate (`grep -rn 'fn actor_fingerprint' src/`); (4) no route added/removed from `src/http/mod.rs`'s router table; (5) no plan-11 scope (`rag_chunks`, `rag_chunk_embeddings`, `conversation_summaries` absent from the diff); (6) no new `request_hash(` call sites beyond relocating the two existing conversation content-hash sites (`:876`, `:967`), so plan 03's sweep stays a one-place change; (7) `docs/i18n-response-catalog.json` gained exactly one entry and no duplicate key; (8) no `sleep()` in any new test.
+Confirm: (1) `grep -c '("Idempotency-Key' src/http/conversation.rs` is still `4` — nothing removed (`CONVENTIONS.md` §0 D1; guard anchored on the `utoipa` parameter tuple per issue #82, expected value unchanged); (2) no `begin()`/`commit()` inside any `_with_connection` function; (3) `actor_fingerprint` has exactly one definition in the crate (`grep -rn 'fn actor_fingerprint(' src/` — one match, `src/application/admin/shared.rs:344`); (4) no route added/removed from `src/http/mod.rs`'s router table; (5) no plan-11 scope (`rag_chunks`, `rag_chunk_embeddings`, `conversation_summaries` absent from the diff); (6) no new `request_hash(` call sites beyond relocating the two existing conversation content-hash sites (`:876`, `:967`), so plan 03's sweep stays a one-place change; (7) `docs/i18n-response-catalog.json` gained exactly one entry and no duplicate key; (8) no `sleep()` in any new test.
+
+> **Guard (3) amended (issue #82).** As originally written — `grep -rn 'fn actor_fingerprint' src/`
+> — the check is **stale on arrival** and now returns `5`, not `1`. Commit `27fe021` unified the
+> fingerprint and, in doing so, added four unit tests named `actor_fingerprint_*`
+> (`src/application/admin/shared.rs:1063,1130,1147,1183`) that the unanchored pattern also matches.
+> The property the guard is asserting — one definition — is still true; only the pattern was wrong.
+> Anchoring on the opening paren counts definitions and not test names.
+>
+> **File paths in this section are historical.** `src/application/admin.rs` no longer exists; plan
+> 06 split it into the module directory `src/application/admin/`. Read it as that directory.
 
 **Conflict-avoidance strategy.** `src/infra/repositories/conversation.rs` is owned solely by Wave 1; `src/application/conversation.rs` and `src/application/admin.rs` solely by Wave 2 (production code) and Wave 4 Agent F (test modules); `src/http/conversation.rs` solely by Wave 3 Agent D. No two agents in the same wave share a file.
 
@@ -539,7 +555,7 @@ Plus the §9c amendments to `tests/rag_ingestion_honesty.rs`.
 
 **Deliberately deferred follow-ups (tracked, not dropped):**
 - **`If-Match` / optimistic concurrency** on the RAG mutations. `AdminCommandSpec::with_expected_version` is ready and the handlers already emit `ETag`; the missing piece is parsing `If-Match` and threading `expected_version`. Related to the TOCTOU window plan 06 records for the trusted-JWT-issuer handlers (`src/http/admin.rs:1449-1452,1480-1483,1532-1535,1563-1566`).
-- **Replay for conversation and memory create routes** (`POST /api/v1/conversations`, `.../messages`, `/api/v1/memories`) — they do not advertise the header today, so extending replay there is new API surface, not a P0-2 fix. `docs/todo.md:22` tracks it.
+- **Replay for conversation and memory create routes** (`POST /api/v1/conversations`, `.../messages`, `/api/v1/memories`) — they do not advertise the header today, so extending replay there is new API surface, not a P0-2 fix. `docs/todo.md`'s Phase 2 idempotency-extension bullet tracks it (the `:22` line number in the original text has since moved), and it is now also GitHub issue #92.
 - **Unifying `runtime_admin.rs`'s two-phase scheme** onto `AdminCommandRunner`, and `patch_credential`'s bypass of the runner (`src/application/admin.rs:583-612`) — both are plan 06 debt items.
 - **Ledger retention worker** — plan 04 (P1-5).
 - **Remaining P0-5 catalog gaps** (`database_unavailable`, `upstream_error`, `configuration_error`, `database_error`, `http_client_error`, `redis_error`, `capacity_exhausted`, `routing_policy_provider_model_mismatch`), the `docs/i18n-response-catalog.json` duplicate-key cleanup, and `every_coded_error_literal_in_src_has_a_catalog_entry` — plans 05/06.
