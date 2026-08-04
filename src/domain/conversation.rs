@@ -35,6 +35,44 @@ pub enum ConversationMessageType {
     Marker,
 }
 
+/// What an application persists of its conversation content.
+///
+/// Enforced in exactly two places, both of which write a body derived from caller content:
+/// `add_message` (`conversation_messages.content_plain`) and the summarization write
+/// (`conversation_summaries.summary_text_plain`). `add_message` is the choke point every
+/// message writer already goes through, so a new call site inherits the policy rather than
+/// having to remember it.
+///
+/// # What each value does
+///
+/// | Value | Body | Length-revealing metadata |
+/// |---|---|---|
+/// | `plain_content` (default) | stored as plaintext | stored |
+/// | `metadata_only` | **not stored** | stored |
+/// | `none` | **not stored** | **not stored** — `content_size_bytes` is `0`, `token_count` is null |
+/// | `encrypted_content` | **not stored** | stored |
+///
+/// `content_hash` is retained under every value. It is an HMAC under a deployment-held pepper,
+/// not a content address — see `crate::security::idempotency` — so it is a fingerprint of
+/// content rather than content, and dropping it would break the documented
+/// `"{pepper_version}:{base64url}"` shape the API contract already publishes. Caller-supplied
+/// `metadata` is likewise retained under every value: it is the caller's own JSON, not
+/// something derived from the message body.
+///
+/// # What it does NOT do
+///
+/// * **`encrypted_content` does not encrypt.** No cipher is wired to the `content_encrypted`
+///   columns on any table; they have no writer anywhere in `src/`. The value therefore
+///   **fails closed** — it stores no plaintext, which is the half of its promise that can be
+///   kept — and the admin API **refuses it on write** (`conversation_content_persistence_unsupported`,
+///   422) rather than accepting a setting Moira cannot honour. Existing rows holding it keep
+///   parsing and keep failing closed.
+/// * **It is not retroactive.** Changing the policy governs subsequent writes only. Plaintext
+///   already stored under `plain_content` stays stored and stays readable through the API;
+///   removing it is a retention concern, not a persistence-policy one.
+/// * **It does not govern memories or RAG documents.** `memory_records.content_plain` and
+///   `rag_document_versions.content_plain` are written under their own policies. This value is
+///   scoped to conversation messages and the summaries derived from them.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ConversationContentPersistence {
@@ -42,6 +80,36 @@ pub enum ConversationContentPersistence {
     MetadataOnly,
     PlainContent,
     EncryptedContent,
+}
+
+impl ConversationContentPersistence {
+    /// Whether a body derived from caller content may be written as plaintext.
+    ///
+    /// `PlainContent` alone. `EncryptedContent` is deliberately grouped with the refusals:
+    /// until a cipher exists, storing plaintext under a value named for encryption is the
+    /// failure mode this policy exists to prevent.
+    pub const fn persists_plaintext(self) -> bool {
+        matches!(self, Self::PlainContent)
+    }
+
+    /// Whether metadata *derived from* the content — its length in bytes and in tokens — may
+    /// be written.
+    ///
+    /// This is the only thing separating `None` from `MetadataOnly`; two enum values with
+    /// identical behaviour would be the same defect this policy is being wired to fix.
+    pub const fn persists_content_metadata(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// Whether Moira can deliver what this value's name promises.
+    ///
+    /// False for `EncryptedContent` only, and the single reason is that nothing writes the
+    /// `content_encrypted` columns. **Reversal condition:** this becomes unconditionally true
+    /// the day a cipher is wired to those columns — at which point `persists_plaintext` must
+    /// stay false for it and a `persists_ciphertext` arm joins them.
+    pub const fn is_enforceable(self) -> bool {
+        !matches!(self, Self::EncryptedContent)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]

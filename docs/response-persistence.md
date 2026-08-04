@@ -42,6 +42,24 @@ recorded on the response row at the moment it completed, not the application's p
 `reason` is an unconstrained string in the OpenAPI schema and these values may grow. Do not
 branch on it for control flow; it exists to explain a missing body to a human.
 
+### Asymmetry with conversation content persistence — deliberate, and tracked
+
+The two policies now answer an unimplementable mode differently, and the difference is worth
+naming so neither side is mistaken for an oversight:
+
+- The **conversation** policy refuses `encrypted_content` outright: `PUT` returns
+  **422 `conversation_content_persistence_unsupported`**, so no application can be configured
+  into a mode Moira cannot honour. See `docs/conversation-persistence.md`.
+- The **execution** policy's `ResponsePersistenceMode` still *accepts* both
+  `encrypted_content` and `plain_content` even though neither is implemented. F40 chose to
+  explain the gap at read time instead — the `content_persistence_not_implemented` string in
+  the table above — rather than reject the value at write time.
+
+The explanatory string is honest about the outcome, but it is a weaker guarantee than a
+refusal: an operator can still set a response persistence mode whose name promises a body that
+will never be stored. Aligning the two — either by refusing the unimplemented response modes
+or by implementing them — is a follow-up issue, not part of the conversation-content work.
+
 Responses that are queued, in progress, failed or cancelled return `output: []`, because they
 genuinely produced no output and `status` already says which.
 
