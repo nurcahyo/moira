@@ -87,6 +87,18 @@ Two things in there are measured rather than reasoned:
   set"`, which the previous pattern missed entirely. The **bare** variable name occurs
   **19** times — all GitHub env dumps — so it is deliberately not used.
 
+  **A pattern is only as good as the text reaching the log, and it was not reaching it**
+  (issue #77). `libtest` captures a test's output and prints it only when the test
+  *fails*, so a skip announced with `eprintln!` from a test that then reports `ok` never
+  appeared in the capture at all. Measured on this branch, before the fix: with the
+  no-database opt-out in force, `cargo test --test retention_worker` redirected to a file
+  held **zero** occurrences of `skipping` while all eight tests reported `ok`. Every skip
+  line in the tree is now written straight to `std::io::stderr()`
+  (`tests/support/mod.rs::announce_skip`), which is below `libtest`'s capture, and the
+  same measurement now yields **1**. The suites themselves also refuse to run without a
+  database by default, so this assertion is a second line of defence rather than the
+  only one.
+
 `gates.sh` gained one thing it did not have: it now asserts `__lib__`, `__bins__` and
 `__doc__` ran, and it reports a set *diff* naming the missing target rather than a count
 comparison that any 48 `Running` lines would satisfy. It runs the same

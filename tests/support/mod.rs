@@ -918,24 +918,29 @@ pub fn admin_actor() -> Actor {
 // `trusted_jwt_issuers` rows and 42 `active` `moira:admin` API keys by the time anyone
 // counted (findings F27 and F10 item 2). Both now take a `TestDatabase`.
 //
-// Two suites remain on the shared database, and `tests/test_database_isolation.rs` is the
-// guard that keeps that list from growing silently:
+// One suite remains, and `tests/test_database_isolation.rs` is the guard that keeps that
+// list from growing silently:
 //
 // * `tests/security_foundation.rs` — asserts the migration contract itself, so it must
-//   migrate from nothing rather than clone an already-migrated template. It already
-//   creates and force-drops its own database per run.
-// * `tests/retention_worker.rs` — `retention::run_once` is a cluster-wide sweep whose
-//   delete counter it asserts exact equality on, serialised by a global advisory lock
-//   (finding F10 item 1, still open). A private clone would scope the sweep to one
-//   database and dissolve both the lock and the exact-equality hazard; that is a change of
-//   retention test semantics, deliberately left outside F27.
+//   migrate from nothing rather than clone an already-migrated template. It creates and
+//   force-drops its own database per run, or migrates a pre-provisioned empty one named by
+//   `MOIRA_TEST_MIGRATION_DATABASE_URL` when the role has no `CREATEDB` (issue #77).
+//
+// `tests/retention_worker.rs` was the second entry until finding F10 item 1 was closed: the
+// sweep it asserts on is database-wide, never cluster-wide, so a private clone made its
+// counts exactly assertable rather than weakening them.
+//
+// **The library crate's own `#[cfg(test)]` modules were the last hole** and are closed the
+// same way by `src/test_support.rs` (issue #77): they used to run `MIGRATOR` against
+// `MOIRA_TEST_DATABASE_URL` itself, so one checkout's unmerged migration broke every other
+// checkout's lib tests. They now get one private database per test process.
 //
 // No test mixes its own pool with a `LifecycleFixture`, and none takes two fixtures at
 // once — `FIXTURE_BUDGET` is a bounded semaphore, so a test holding two permits while
 // others wait for their first would be a deadlock rather than a slowdown.
 
 const MAINTENANCE_DATABASE: &str = "postgres";
-const TEMPLATE_PREFIX: &str = "moira_test_template_";
+pub const TEMPLATE_PREFIX: &str = "moira_test_template_";
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
@@ -947,13 +952,64 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 /// fixture clones it, so clones run in parallel with each other but never during
 /// maintenance. Advisory locks are database-scoped, and this one is always taken on
 /// the maintenance database, so every test process agrees on it.
-const TEMPLATE_LOCK_KEY: i64 = i64::from_be_bytes(*b"moiratdb");
+pub const TEMPLATE_LOCK_KEY: i64 = i64::from_be_bytes(*b"moiratdb");
 
 /// A fixture database this old with no live connection is a leak from a killed test
 /// process. Sweeping is bounded by age *and* by connection count because a database
 /// is briefly connectionless between `CREATE DATABASE` and the fixture pool's first
 /// connection; an hour is several orders of magnitude beyond that window.
-const LEAKED_DATABASE_GRACE_SECONDS: u64 = 3_600;
+pub const LEAKED_DATABASE_GRACE_SECONDS: u64 = 3_600;
+
+/// How long a template may go unclaimed before another worktree may reclaim it.
+///
+/// Deliberately the same order as [`LEAKED_DATABASE_GRACE_SECONDS`] and for the same
+/// reason: it has to be far longer than the thing it must not interrupt. Every test
+/// binary refreshes the marker on the template it is about to clone from
+/// ([`prepare_template`]), and a `cargo test --workspace` run starts dozens of binaries
+/// over a few minutes, so a live neighbour re-stamps its template one to two orders of
+/// magnitude more often than this.
+pub const TEMPLATE_IDLE_GRACE_SECONDS: u64 = 3_600;
+
+/// The comment written on every template database this harness builds or clones from.
+///
+/// This is the *owning-run marker* `plans/reports/EXECUTION-LEDGER.md` asks for. Before
+/// it, [`sweep_leaked_databases`] dropped every `moira_test_template_*` that was not the
+/// calling process's own, on the theory that a template with no client backend is idle —
+/// but an idle-between-fixtures neighbour looks exactly like that, so two worktrees whose
+/// `migrations/` differ by one file destroyed each other's templates mid-run and produced
+/// a `3D000` indistinguishable from a real regression.
+///
+/// A PostgreSQL database carries no creation or access timestamp, and `pg_stat_activity`
+/// answers a different question, so the signal has to be written down. A shared comment
+/// (`COMMENT ON DATABASE`, read back through `shobj_description`) is the cheapest place
+/// that survives a process death, needs no extra table, and is owned by the same role
+/// that owns the database.
+pub const TEMPLATE_MARKER_PREFIX: &str = "moira-test-template last-used=";
+
+/// The marker text a template carries when it was last claimed at `epoch_seconds`.
+pub fn template_marker(epoch_seconds: u64) -> String {
+    format!("{TEMPLATE_MARKER_PREFIX}{epoch_seconds}")
+}
+
+/// The current wall-clock second, as the marker and the fixture-name grammar encode it.
+pub fn now_epoch_seconds() -> u64 {
+    unix_seconds()
+}
+
+/// A connection to the maintenance database this harness performs `CREATE`/`DROP DATABASE`
+/// on, plus the template name the calling tree's migration set resolves to.
+///
+/// `None` only when the [`ALLOW_NO_DATABASE`] opt-out is in force — otherwise resolving the
+/// origin panics, as every other entry point does.
+///
+/// Exists so `tests/test_database_sweep.rs` can drive [`sweep_leaked_databases`] against
+/// fabricated leaks without resolving `MOIRA_TEST_DATABASE_URL` itself, which
+/// `tests/test_database_isolation.rs` allows in exactly two files.
+pub async fn maintenance_connection() -> Option<(PgConnection, String)> {
+    let origin = database_origin().await?;
+    let connection = connect_maintenance(&origin.url_for(MAINTENANCE_DATABASE)).await;
+    Some((connection, origin.template.clone()))
+}
 
 /// Concurrent fixtures per test binary.
 ///
@@ -1166,25 +1222,94 @@ async fn connect_maintenance(maintenance_url: &str) -> PgConnection {
         .expect("connect the maintenance database")
 }
 
+/// The one deliberately-named way to run this tree's tests with no database at all.
+///
+/// Spelled out rather than inferred, and checked by value, because everything this
+/// variable disables is a *database-backed assertion* — the suites that carry almost all
+/// of Moira's real coverage. See [`refuse_to_run_without_a_database`] for why the default
+/// is now a failure.
+pub const ALLOW_NO_DATABASE: &str = "MOIRA_TEST_ALLOW_NO_DATABASE";
+
+/// Whether the opt-out is in force.
+///
+/// `CI=true` overrides it unconditionally: a CI run that cannot reach a database has a
+/// broken service container, and letting a workflow file set the opt-out would put the
+/// whole gate one YAML line away from testing nothing.
+pub fn no_database_opt_out_is_set() -> bool {
+    if env::var("CI").is_ok_and(|value| value.eq_ignore_ascii_case("true")) {
+        return false;
+    }
+    env::var(ALLOW_NO_DATABASE)
+        .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "True"))
+}
+
+/// Announces a skip on the **process's** stderr, not the test harness's captured one.
+///
+/// # This is not a stylistic preference
+///
+/// `libtest` captures `eprintln!` per test and prints it only for tests that **fail**, so a
+/// skip announced with `eprintln!` from a passing test never reaches the log at all.
+/// Measured on this branch: with the opt-out in force, `cargo test --test retention_worker`
+/// redirected to a file contained **zero** occurrences of `skipping`, while all eight tests
+/// reported `ok`. `scripts/gates.sh`'s zero-skip assertion greps that file — so for every
+/// suite whose skip is announced from inside a passing test on the test's own thread, the
+/// assertion could not have fired.
+///
+/// `libtest`'s capture is installed on `std::io::_print`/`_eprint`, which the `print!`
+/// family routes through. Writing to `std::io::stderr()` directly bypasses it and reaches
+/// the real file descriptor, which is what the gate reads.
+pub fn announce_skip(message: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "{message}");
+}
+
+/// The message a suite dies with when no database is configured and the opt-out is absent.
+///
+/// # Why the absence of a database is a failure and not a skip
+///
+/// It used to print one `eprintln!` and return `None`, and every database-backed test in
+/// the tree then returned early **and reported success**. A whole gate run could be green
+/// while asserting nothing: `plans/reports/EXECUTION-LEDGER.md` records a round of results
+/// invalidated exactly this way, by a `MOIRA_TEST_DATABASE_URL` that pointed at a database
+/// which was not there.
+///
+/// `scripts/gates.sh` grew an assertion that no suite printed a skip line, which caught it
+/// — but only for people who run the gates, and only as long as the skip text keeps
+/// matching the grep. That is the wrong place for the guarantee to live. The suite itself
+/// now refuses, so the gate's check is a second line of defence rather than the only one.
+pub fn refuse_to_run_without_a_database(reason: &str) -> ! {
+    panic!(
+        "{reason}\n\n\
+         Database-backed tests refuse to run without a database. Start PostgreSQL and set \
+         MOIRA_TEST_DATABASE_URL, for example:\n\n    \
+         export MOIRA_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/moira\n\n\
+         The role it names needs CREATEDB: every fixture clones its own private database \
+         from a migrated template and drops it again.\n\n\
+         If you genuinely mean to run the suite with no database — knowing that this \
+         silently removes almost all of Moira's coverage — set {ALLOW_NO_DATABASE}=1. It is \
+         ignored when CI=true, and the skip line it prints still reds `scripts/gates.sh`."
+    )
+}
+
 /// Resolves `MOIRA_TEST_DATABASE_URL` and readies the template, once per process.
 ///
-/// The skip/fail-closed behaviour is carried over verbatim, including the `CI`
-/// **value** check required by `plans/CONVENTIONS.md` §3: absent locally it skips,
-/// absent under `CI=true` it panics.
+/// Fail-closed by default now, not only under `CI=true`: see
+/// [`refuse_to_run_without_a_database`].
 async fn database_origin() -> Option<DatabaseOrigin> {
     DATABASE_ORIGIN
         .get_or_init(|| async {
             let database_url = match env::var("MOIRA_TEST_DATABASE_URL") {
                 Ok(value) if !value.trim().is_empty() => value,
-                _ if env::var("CI").is_ok_and(|value| value.eq_ignore_ascii_case("true")) => {
-                    panic!(
-                        "MOIRA_TEST_DATABASE_URL is required when CI=true for database-backed tests"
-                    )
-                }
-                _ => {
-                    eprintln!("skipping database-backed tests: MOIRA_TEST_DATABASE_URL is not set");
+                _ if no_database_opt_out_is_set() => {
+                    announce_skip(&format!(
+                        "skipping database-backed tests: MOIRA_TEST_DATABASE_URL is not set \
+                         and {ALLOW_NO_DATABASE} is in force"
+                    ));
                     return None;
                 }
+                _ => refuse_to_run_without_a_database(
+                    "MOIRA_TEST_DATABASE_URL is not set (or is empty).",
+                ),
             };
             let origin = DatabaseOrigin {
                 base: Url::parse(&database_url)
@@ -1262,6 +1387,7 @@ async fn clone_template(
         .await
         .expect("take the exclusive template maintenance lock for a rebuild");
     build_template(&mut rebuild, origin).await;
+    mark_template_in_use(&mut rebuild, &origin.template).await;
     sqlx::query("select pg_advisory_unlock($1)")
         .bind(TEMPLATE_LOCK_KEY)
         .execute(&mut rebuild)
@@ -1295,6 +1421,11 @@ async fn prepare_template(origin: &DatabaseOrigin) {
 
     sweep_leaked_databases(&mut maintenance, &origin.template).await;
     build_template(&mut maintenance, origin).await;
+    // The claim, refreshed once per test binary. This is what keeps a neighbouring
+    // worktree's sweep off a template this process is about to clone from dozens of
+    // times: the marker says "in use as of now", and `template_sweep_verdict` spares it
+    // for a whole grace period afterwards.
+    mark_template_in_use(&mut maintenance, &origin.template).await;
 
     sqlx::query("select pg_advisory_unlock($1)")
         .bind(TEMPLATE_LOCK_KEY)
@@ -1386,6 +1517,62 @@ async fn wait_for_no_connections(maintenance: &mut PgConnection, database: &str)
     );
 }
 
+/// What the sweep should do with a template database that is not this process's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateVerdict {
+    /// Someone stamped it recently. Leave it alone — it belongs to a live neighbour.
+    Spare,
+    /// Marked, and untouched for longer than [`TEMPLATE_IDLE_GRACE_SECONDS`]. Reclaim it.
+    Drop,
+    /// No marker this harness recognises. Spare it *and* stamp it now, so it becomes
+    /// reclaimable one grace period from here instead of never.
+    ///
+    /// Without this arm the sweep would trade a flake for a disk leak: templates built
+    /// before the marker existed, or by a checkout that predates it, would survive
+    /// forever at ~10 MB each.
+    Adopt,
+}
+
+/// The epoch second encoded in a template's marker comment, if it carries one.
+fn template_last_used(comment: Option<&str>) -> Option<u64> {
+    comment?
+        .trim()
+        .strip_prefix(TEMPLATE_MARKER_PREFIX)?
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()
+}
+
+/// The sweep's decision for one foreign template, as a pure function of its marker.
+///
+/// Exposed — and exercised directly by `tests/test_database_sweep.rs` — because the
+/// property that matters ("a live neighbour's template survives, a genuinely leaked one
+/// does not") is a property of this decision, and asserting it through a whole
+/// `CREATE DATABASE`/sweep cycle only is slower and proves less about the boundaries.
+pub fn template_sweep_verdict(comment: Option<&str>, now: u64) -> TemplateVerdict {
+    match template_last_used(comment) {
+        None => TemplateVerdict::Adopt,
+        Some(last_used) if now.saturating_sub(last_used) >= TEMPLATE_IDLE_GRACE_SECONDS => {
+            TemplateVerdict::Drop
+        }
+        Some(_) => TemplateVerdict::Spare,
+    }
+}
+
+/// Stamps `template` with the current time, claiming it for however long the grace period
+/// lasts.
+///
+/// Best effort on purpose: the marker is an optimisation over "never reclaim anything",
+/// and a role that cannot comment on a database it does not own must not turn that into a
+/// failed test run. A template that stays unmarked is simply adopted by whoever sweeps next.
+async fn mark_template_in_use(maintenance: &mut PgConnection, template: &str) {
+    let marker = format!("{TEMPLATE_MARKER_PREFIX}{}", unix_seconds());
+    let _ = sqlx::raw_sql(&format!("comment on database \"{template}\" is '{marker}'"))
+        .execute(&mut *maintenance)
+        .await;
+}
+
 /// Drops databases left behind by a test process that died before `Drop` could run.
 ///
 /// Runs under the exclusive template lock, so no other process can be mid-clone, and
@@ -1397,11 +1584,17 @@ async fn wait_for_no_connections(maintenance: &mut PgConnection, database: &str)
 /// * `moira_test_building_<uuid>` — a template build that crashed before its rename.
 ///   No grace period: nothing ever connects to one of these except the builder, which
 ///   holds the same exclusive lock this does.
-/// * `moira_test_template_<digest>` — a template for a migration set that is no longer
-///   current, i.e. left over from before a migration was added.
-async fn sweep_leaked_databases(maintenance: &mut PgConnection, current_template: &str) {
-    let idle: Vec<String> = sqlx::query_scalar(
-        "select d.datname from pg_database d \
+/// * `moira_test_template_<digest>` — a template for a migration set this cluster has
+///   not seen used for [`TEMPLATE_IDLE_GRACE_SECONDS`], judged by its marker comment
+///   rather than by its connection count. See [`TEMPLATE_MARKER_PREFIX`] and
+///   [`template_sweep_verdict`]: "no client backend" cannot tell an idle neighbour from
+///   a leak, which is what made this the cross-worktree hazard the ledger recorded.
+///
+/// `pub` so `tests/test_database_sweep.rs` can drive it against fabricated leaks. Callers
+/// must hold the exclusive [`TEMPLATE_LOCK_KEY`] on `maintenance`.
+pub async fn sweep_leaked_databases(maintenance: &mut PgConnection, current_template: &str) {
+    let idle: Vec<(String, Option<String>)> = sqlx::query_as(
+        "select d.datname, shobj_description(d.oid, 'pg_database') from pg_database d \
          where d.datname like 'moira\\_test\\_%' \
            and d.datname <> $1 \
            and not exists (\
@@ -1413,15 +1606,21 @@ async fn sweep_leaked_databases(maintenance: &mut PgConnection, current_template
     .await
     .expect("list candidate fixture databases");
 
-    for name in idle {
-        let sweepable =
-            if name.starts_with(TEMPLATE_PREFIX) || name.starts_with("moira_test_building_") {
-                true
-            } else {
-                fixture_database_age_seconds(&name)
-                    .is_some_and(|age| age >= LEAKED_DATABASE_GRACE_SECONDS)
-            };
-        if !sweepable {
+    let now = unix_seconds();
+    for (name, comment) in idle {
+        if name.starts_with(TEMPLATE_PREFIX) {
+            match template_sweep_verdict(comment.as_deref(), now) {
+                TemplateVerdict::Spare => continue,
+                TemplateVerdict::Adopt => {
+                    mark_template_in_use(&mut *maintenance, &name).await;
+                    continue;
+                }
+                TemplateVerdict::Drop => {}
+            }
+        } else if !name.starts_with("moira_test_building_")
+            && !fixture_database_age_seconds(&name)
+                .is_some_and(|age| age >= LEAKED_DATABASE_GRACE_SECONDS)
+        {
             continue;
         }
         // Best effort: another process may have taken the database between the query
@@ -1656,7 +1855,11 @@ pub fn test_redis() -> Option<moira::infra::redis::RedisClient> {
              Redis-backed tests"
         ),
         _ => {
-            eprintln!("skipping Redis-backed test: MOIRA_TEST_REDIS_URL is not set");
+            // Deliberately `announce_skip`, not `eprintln!`: the latter is captured by
+            // `libtest` and never reaches the log `scripts/gates.sh` greps. See
+            // [`announce_skip`] — this suite's skip line is one of the three the gate's
+            // pattern was written for, and it could not have been seen.
+            announce_skip("skipping Redis-backed test: MOIRA_TEST_REDIS_URL is not set");
             return None;
         }
     };

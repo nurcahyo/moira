@@ -5684,3 +5684,78 @@ recorded because each was individually indistinguishable from a regression:
 Exit 137 is worth its own line: it is not a test failure at all, and `scripts/gates.sh` cannot
 distinguish it from one. **Two agents must not run `cargo test --workspace` against this machine
 simultaneously** — not for the database's sake, for the RAM's.
+
+
+## THE TEST DATABASE INFRASTRUCTURE, CURED RATHER THAN MITIGATED — issue #77 — 2026-08-05
+
+Three properties the two sections above described as open. Each is now closed by a mechanism, and
+each has a test that fails without it.
+
+### 1. A missing database is a failure, not a skip
+
+`database_origin` used to print one line and return `None`, and every database-backed test then
+returned early **and reported success**. `scripts/gates.sh` asserts zero skip lines, which was the
+only guard — and it turns out it was not a guard at all.
+
+**`libtest` was eating the evidence.** A test's output is captured and printed only when the test
+*fails*, so a skip announced with `eprintln!` from a test that then reports `ok` never reached the
+log the gate greps. Measured on this branch, before the fix: with the opt-out in force,
+`cargo test --test retention_worker` redirected to a file held **zero** occurrences of `skipping`
+while all eight tests reported `ok`. Every skip line now goes to `std::io::stderr()` directly
+(`tests/support/mod.rs::announce_skip`), below the capture, and the same measurement yields **1**.
+
+The suites themselves now refuse. `MOIRA_TEST_ALLOW_NO_DATABASE=1` is the single, deliberately
+long-named opt-out, ignored when `CI=true`. With the variable unset,
+`cargo test --test retention_worker` reports `0 passed; 8 failed`.
+
+### 2. The template sweep spares a neighbour and still reclaims a leak
+
+The cure the section above named — "an age, or an owning-run marker" — is a `COMMENT ON DATABASE`
+carrying `moira-test-template last-used=<epoch>`, refreshed by every test binary's
+`prepare_template` and read back through `shobj_description`. `template_sweep_verdict` then reads:
+recently claimed → **spare**; claim older than an hour → **drop**; no marker this harness
+recognises → **spare and stamp**, so a template built before markers existed becomes reclaimable
+one grace period later instead of never. A `cargo test --workspace` run re-stamps its template
+dozens of times over a few minutes, which is one to two orders of magnitude inside the grace.
+
+`tests/test_database_sweep.rs` asserts **both** halves against a real cluster, holding the same
+exclusive advisory lock `prepare_template` sweeps under. With the old rule restored, its two
+sparing cases fail and its two reclaiming cases still pass — which is the point: sparing everything
+would have traded the flake for an unbounded disk leak.
+
+### 3. An unmerged migration can no longer poison anything
+
+Not "better reported" — unreachable. The library's `#[cfg(test)]` modules no longer connect to
+`MOIRA_TEST_DATABASE_URL` at all. `src/test_support.rs` creates **one private database per test
+process** (`moira_test_<epoch>_<uuid>`, the same name grammar a fixture clone uses, so the existing
+age-bounded sweep reclaims it with no new rule), migrates it once, and hands every test a pool onto
+it. The URL is now read only for its host, port and credentials.
+
+The two advisory locks that guard the singleton rows — `SetupStateLock`,
+`ISSUERLESS_GENERIC_OIDC_LOCK_KEY` — stay exactly as they were. They now serialise the threads of
+one process instead of every checkout on the machine, which is strictly less contention for the same
+guarantee, and their comments say so.
+
+The diagnostic half is kept anyway, because the next person to point `MOIRA_TEST_DATABASE_URL` at a
+colleague's database will meet the same `sqlx` message: `MigrateError::VersionMissing` is translated
+into text naming the database, the cause and the remedy. It is proven by
+`the_missing_migration_explanation_names_the_cause_and_the_remedy`, which fabricates the condition
+on a real database rather than mocking it — the assumption most likely to rot is that `sqlx` reports
+this situation as `VersionMissing` at all.
+
+### 4. A migration-contract path for a restricted CI
+
+`tests/security_foundation.rs` needed `CREATEDB`, with no alternative. `MOIRA_TEST_MIGRATION_DATABASE_URL`
+now names a pre-provisioned **empty** database that the suite migrates and mutates in place, over the
+identical `run_migration_contract` code path. It is a second variable rather than an overload
+because that database is deliberately damaged (`alter table responses drop column updated_at`), and
+the suite refuses to start if its public schema is not empty.
+
+### What did not change, and one thing to watch
+
+The `3D000` retry in `clone_template` stays. It is now a second line of defence rather than the
+mitigation, and a `3D000` from here on genuinely warrants suspicion rather than a shrug.
+
+**A transitional window exists while other checkouts are still on the old code.** A neighbour
+running the pre-#77 sweep still drops every foreign template on sight. Nothing on this branch can
+prevent that; `clone_template`'s single retry is what covers it until the change is everywhere.

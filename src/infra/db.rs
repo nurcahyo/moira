@@ -23,7 +23,11 @@ use crate::{
     },
 };
 
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+/// `pub(crate)` so `crate::test_support` can run the *same* migration set and read the
+/// typed `MigrateError` back. [`migrate`] flattens it into an `AppError` string, which is
+/// right for production and useless to a test that has to tell "this database was migrated
+/// by another checkout" apart from every other migration failure (issue #77).
+pub(crate) static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 pub async fn connect(settings: &DatabaseSettings) -> Result<Option<PgPool>, AppError> {
     let Some(url) = settings.url.as_deref().filter(|url| !url.is_empty()) else {
