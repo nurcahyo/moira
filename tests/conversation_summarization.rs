@@ -1490,3 +1490,116 @@ async fn the_coverage_boundary_names_the_last_message_the_run_read() {
 
     case.shutdown().await;
 }
+
+/// A summary is conversation content too — finding F32's second enforcement point.
+///
+/// # Why the policy has to be tightened *mid-conversation* to reach this
+///
+/// Under a steady `none`/`metadata_only`, `add_message` stores no plaintext, so
+/// `build_summarization_plan` finds no turns and refuses before any model call — the summary
+/// write is never reached and a guard on it would be one of the toothless ones this project
+/// keeps finding. The reachable path is the transition: a conversation that accumulated
+/// plaintext under `plain_content`, and an operator who then tightened the policy. The backlog
+/// is still readable, a run still fires, and without the guard the derived copy would be
+/// written in the clear under a setting that forbids exactly that.
+///
+/// Summarization is therefore **off** for the turn (so the backlog survives uncovered) and
+/// forced afterwards, which is the only way to get a real run against a tightened policy.
+#[tokio::test]
+async fn a_summary_is_withheld_when_the_policy_no_longer_admits_plaintext() {
+    let Some(case) = Case::new(
+        ConversationPolicyPutRequest {
+            summarization_enabled: Some(false),
+            ..ConversationPolicyPutRequest::default()
+        },
+        vec![completion(ASSISTANT_REPLY), completion(SUMMARY_BODY)],
+    )
+    .await
+    else {
+        return;
+    };
+
+    let (status, body) = case.respond(USER_TURN).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let conversation_id = body["conversation"]["id"]
+        .as_str()
+        .expect("a conversation id")
+        .to_string();
+    // Premise one: the turn stored plaintext, so there is something a summary could leak.
+    let stored_plaintext: i64 = sqlx::query_scalar(
+        "select count(*) from conversation_messages m join conversations c \
+         on c.id = m.conversation_id where c.public_id = $1 and m.content_plain is not null",
+    )
+    .bind(&conversation_id)
+    .fetch_one(&case.fixture.pool)
+    .await
+    .expect("count stored plaintext");
+    assert!(
+        stored_plaintext > 0,
+        "the turn stored no plaintext, so this case would prove nothing about withholding it"
+    );
+    assert_eq!(
+        case.summaries().await.len(),
+        0,
+        "summarization must not have run yet, or the backlog would already be covered"
+    );
+
+    // Tighten the policy and turn summarization on, in one write.
+    moira::application::ConversationService::new(&case.fixture.state)
+        .expect("conversation service")
+        .put_conversation_policy(
+            &case.fixture.actor,
+            &support::request_context(),
+            case.fixture.application_id,
+            ConversationPolicyPutRequest {
+                summarization_enabled: Some(true),
+                conversation_content_persistence: Some(
+                    moira::domain::ConversationContentPersistence::None,
+                ),
+                ..ConversationPolicyPutRequest::default()
+            },
+        )
+        .await
+        .expect("tighten the persistence policy");
+
+    let (status, _, summarize_body) = case
+        .summarize(&case.summarize_key, &conversation_id, true)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{summarize_body}");
+
+    // Premise two: the run genuinely happened. Without this, a null body below is
+    // indistinguishable from a summarizer that never ran.
+    assert_eq!(
+        case.completion.call_count().await,
+        2,
+        "the summarizer must have issued its own completion call"
+    );
+
+    let summaries = case.summaries().await;
+    assert_eq!(summaries.len(), 1, "{summaries:?}");
+    assert_eq!(
+        summaries[0].summary_text_plain, None,
+        "the summary body was written in plaintext under a policy that forbids plaintext — the \
+         derived copy is conversation content too"
+    );
+    // The run is still recorded: the boundary advances and the content address is written, so a
+    // later run does not re-summarise the same backlog and two identical runs stay comparable.
+    assert!(
+        summaries[0].covers_through_sequence > 0,
+        "the coverage boundary must still advance — the run really did cover that backlog"
+    );
+    assert!(
+        !summaries[0].summary_hash.is_empty(),
+        "summary_hash is a content address written even when the body is not"
+    );
+
+    // And the withheld body must not have leaked into the audit trail instead.
+    for (action, metadata) in case.audit_rows().await {
+        assert!(
+            !metadata.to_string().contains(SUMMARY_BODY),
+            "the withheld summary body reached audit metadata on {action}"
+        );
+    }
+
+    case.shutdown().await;
+}

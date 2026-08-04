@@ -83,13 +83,13 @@ use crate::{
     },
     error::AppError,
     infra::pg_rows::{
-        conversation_content_persistence_to_db, conversation_message_record_from_row,
-        conversation_message_role_to_db, conversation_message_type_to_db,
-        conversation_policy_record_from_row, conversation_record_from_row,
-        conversation_status_to_db, embedding_policy_record_from_row, history_strategy_to_db,
-        memory_consent_mode_to_db, memory_policy_record_from_row, memory_record_from_row,
-        memory_scope_to_db, memory_sensitivity_to_db, memory_status_to_db, memory_type_to_db,
-        rag_collection_record_from_row, rag_collection_status_to_db,
+        conversation_content_persistence_from_db, conversation_content_persistence_to_db,
+        conversation_message_record_from_row, conversation_message_role_to_db,
+        conversation_message_type_to_db, conversation_policy_record_from_row,
+        conversation_record_from_row, conversation_status_to_db, embedding_policy_record_from_row,
+        history_strategy_to_db, memory_consent_mode_to_db, memory_policy_record_from_row,
+        memory_record_from_row, memory_scope_to_db, memory_sensitivity_to_db, memory_status_to_db,
+        memory_type_to_db, rag_collection_record_from_row, rag_collection_status_to_db,
         rag_collection_visibility_to_db, rag_document_record_from_row, rag_ingestion_status_to_db,
         retrieval_policy_record_from_row,
     },
@@ -367,6 +367,17 @@ pub trait ConversationRepository: Send + Sync {
         status: ConversationStatus,
     ) -> Result<ConversationRecord, AppError>;
 
+    /// Appends a message, **applying the application's
+    /// [`ConversationContentPersistence`](crate::domain::ConversationContentPersistence)**.
+    ///
+    /// `insert.content_plain`, `content_size_bytes` and `token_count` are what the caller
+    /// *offers*; what is stored is whatever the policy admits. A caller therefore cannot force
+    /// plaintext into `conversation_messages` by constructing the insert differently, and the
+    /// returned record reflects what was stored rather than what was offered.
+    ///
+    /// This is the enforcement point on purpose: it is the only path into the table, so the
+    /// policy is applied once instead of at each of the (currently three) application-layer
+    /// call sites, where a fourth could omit it.
     async fn add_message(
         &self,
         insert: &ConversationMessageInsert,
@@ -1043,12 +1054,26 @@ impl ConversationRepository for PgConversationRepository {
         insert: &ConversationMessageInsert,
     ) -> Result<ConversationMessageRecord, AppError> {
         let mut tx = self.pool.begin().await?;
+        // The lock query also carries the persistence policy, so enforcement costs no extra
+        // round trip and cannot observe a policy from a different instant than the row it
+        // governs. `left join` + `coalesce` because an application that has never had a policy
+        // written gets the column default — the same `'plain_content'` the migration and
+        // `put_conversation_policy`'s `coalesce` already use, spelled once more here because a
+        // missing row must not mean "no policy" and therefore "store everything".
+        //
+        // `for update of c` rather than a bare `for update`: the nullable side of an outer join
+        // cannot be locked, and locking the policy row is not wanted anyway — a concurrent
+        // policy change should not serialise behind message writes.
         let conversation = sqlx::query(
             r#"
-            select id
-            from conversations
-            where public_id = $1 and deleted_at is null
-            for update
+            select c.id,
+                   coalesce(p.conversation_content_persistence, 'plain_content')
+                       as content_persistence
+            from conversations c
+            left join application_conversation_policies p
+                   on p.application_id = c.application_id
+            where c.public_id = $1 and c.deleted_at is null
+            for update of c
             "#,
         )
         .bind(&insert.conversation_public_id)
@@ -1062,6 +1087,22 @@ impl ConversationRepository for PgConversationRepository {
             )
         })?;
         let conversation_id: Uuid = conversation.try_get("id")?;
+        let persistence = conversation_content_persistence_from_db(
+            conversation.try_get::<String, _>("content_persistence")?,
+        )?;
+        // Applied here rather than at the three application-layer callers deliberately. This is
+        // the only path into `conversation_messages`, so a fourth writer inherits the policy
+        // instead of having to remember it — which is precisely what finding F32 was: two
+        // comments asserting this policy was honoured, guarding nothing.
+        let content_plain = insert
+            .content_plain
+            .as_deref()
+            .filter(|_| persistence.persists_plaintext());
+        let (content_size_bytes, token_count) = if persistence.persists_content_metadata() {
+            (insert.content_size_bytes, insert.token_count)
+        } else {
+            (0, None)
+        };
         let sequence: i64 = sqlx::query_scalar(
             r#"
             select coalesce(max(sequence_number), 0) + 1
@@ -1093,10 +1134,10 @@ impl ConversationRepository for PgConversationRepository {
         .bind(conversation_message_role_to_db(insert.role))
         .bind(conversation_message_type_to_db(insert.message_type))
         .bind(sequence)
-        .bind(&insert.content_plain)
+        .bind(content_plain)
         .bind(&insert.content_hash)
-        .bind(insert.content_size_bytes)
-        .bind(insert.token_count)
+        .bind(content_size_bytes)
+        .bind(token_count)
         .bind(&insert.metadata)
         .fetch_one(&mut *tx)
         .await?;
