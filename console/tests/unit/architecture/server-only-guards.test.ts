@@ -135,8 +135,29 @@ const EXEMPT_DTO_INTERFACES: ReadonlyArray<{
 
 const EXEMPT_DTO_INTERFACE_NAMES = EXEMPT_DTO_INTERFACES.map((entry) => entry.name);
 
-/** Field names that match the pattern but are not credentials. Asserted live. */
-const EXEMPT_DTO_FIELDS = ["token_url", "setup_token"] as const;
+/**
+ * Field names that match the pattern but are not credentials. Asserted live.
+ *
+ * `token_url` is an OAuth endpoint. `setup_token` is the reserved-and-rejected
+ * field modelled only so the shape matches the committed schema.
+ *
+ * `maximum_input_tokens` and `maximum_output_tokens` (issue #73) are LLM token
+ * BUDGETS on `RoutingPolicy*` — integer counts, nullable, with no credential
+ * meaning available to them under any reading. They are exempted BY FULL NAME
+ * rather than by relaxing `SECRET_DTO_FIELD_PATTERN`'s `token` alternative,
+ * which is the same trade W5-D4 recorded: dropping `token` from the pattern to
+ * accommodate two fields would un-guard `token_prefix`, `refresh_token` and
+ * `access_token` on every DTO in the console, forever.
+ *
+ * The reverse test below asserts each entry still matches something, so an
+ * exemption cannot outlive the field it was granted for.
+ */
+const EXEMPT_DTO_FIELDS = [
+  "token_url",
+  "setup_token",
+  "maximum_input_tokens",
+  "maximum_output_tokens",
+] as const;
 
 describe("credential-carrying modules are marked and contained", () => {
   test("the derived set is non-empty and covers the plaintext holders", () => {
@@ -387,5 +408,181 @@ describe("no rotate-secret anywhere", () => {
       "a fourth exempt interface means the allow-list has become the thing it was guarding " +
         "against — introduce a newtype instead (plan 09 §0.8.3 W5-D4)",
     ).toBeLessThanOrEqual(3);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The credential DTOs (issue #73)                                            */
+/* -------------------------------------------------------------------------- */
+//
+// WHAT HAPPENED AT THE CAP. Issue #73 needed four more secret-shaped DTOs
+// (`CredentialCreateRequest.secret`, `CredentialRecord.masked_secret` and
+// `.secret_fingerprint`, `RotateCredentialRequest.secret`,
+// `ApiKeyCredentialSecret.api_key`) and `EXEMPT_DTO_INTERFACES` was full. The
+// exemption was NOT taken — see the reversal condition above. The family moved
+// to `lib/moira-credential-types.ts`, which carries `import "server-only"`.
+//
+// That is strictly stronger than a fourth carve-out would have been. An
+// exemption permits a raw secret to be MODELLED in `lib/types.ts`, which is
+// asserted CLIENT-SAFE and which a `"use client"` component may import; moving
+// the family makes the shapes unnameable from the browser and puts the file in
+// `containedModulePaths()`, where the two reachability rules at the top of this
+// file already cover it with no new list.
+//
+// The rules below are what stops the move from being a way AROUND the guard
+// rather than a way to satisfy it: the same secret-shaped-member scan runs on
+// the new module, with its interfaces pinned member-for-member, and `lib/types.ts`
+// is asserted to have kept none of them.
+
+const CREDENTIAL_DTO_MODULE = "lib/moira-credential-types.ts";
+
+/**
+ * The interfaces in the credential module permitted to model a secret-shaped
+ * field, each with its member set PINNED — the same device as
+ * `EXEMPT_DTO_INTERFACES`, applied to the module the family moved to.
+ *
+ * There is no cap here and there does not need to be one: this module is
+ * server-only and contained, so the question it answers is "did a field ride in
+ * on a shape that was already allowed", not "is a secret reachable from the
+ * browser". The pin is what makes the first question answerable.
+ */
+const CREDENTIAL_DTO_INTERFACES: ReadonlyArray<{
+  readonly name: string;
+  readonly members: readonly string[];
+}> = [
+  { name: "ApiKeyCredentialSecret", members: ["api_key"] },
+  { name: "AzureCredentialSecret", members: ["api_key", "endpoint"] },
+  {
+    name: "CredentialCreateRequest",
+    members: [
+      "credential_type",
+      "display_name",
+      "expires_at",
+      "metadata",
+      "priority",
+      "provider_id",
+      "scope",
+      "secret",
+    ],
+  },
+  {
+    name: "CredentialRecord",
+    members: [
+      "created_at",
+      "credential_type",
+      "deleted_at",
+      "display_name",
+      "expires_at",
+      "id",
+      "last_used_at",
+      "last_validated_at",
+      "masked_secret",
+      "metadata",
+      "priority",
+      "provider_id",
+      "scope",
+      "secret_fingerprint",
+      "status",
+      "updated_at",
+      "version",
+    ],
+  },
+  { name: "RotateCredentialRequest", members: ["secret"] },
+  // The narrowed console-only body. It is a `type … = Omit<…> & { … }`, and the
+  // parser reads the intersection's object literal — which is exactly the two
+  // fields the narrowing exists to pin: `credential_type` to the literal
+  // `"api_key"`, and `secret` to the single-key newtype.
+  { name: "ConsoleApiKeyCredentialCreateRequest", members: ["credential_type", "secret"] },
+];
+
+describe("the credential DTOs are contained rather than exempted", () => {
+  test("the module declares the marker and is in the contained set", () => {
+    const source = readFileSync(join(CONSOLE_ROOT, CREDENTIAL_DTO_MODULE), "utf8");
+    expect(source.startsWith("// @server-only")).toBe(true);
+    expect(
+      CONTAINED_MODULE_PATHS,
+      "without the marker the module is browser-reachable and the whole reason for the move " +
+        "evaporates, while every other test here stays green",
+    ).toContain(CREDENTIAL_DTO_MODULE);
+  });
+
+  test("it is NOT on the client-safe list", () => {
+    // The list it must never join. `CLIENT_SAFE_MODULES` is what says "a
+    // component may import this", and a credential DTO on it is the exact
+    // arrangement the move exists to prevent.
+    expect(CLIENT_SAFE_MODULES as readonly string[]).not.toContain(CREDENTIAL_DTO_MODULE);
+  });
+
+  test("lib/types.ts kept none of the credential DTOs", () => {
+    // The other half of the move. Without this, a later edit could copy
+    // `CredentialRecord` back into the client-safe module and only the
+    // secret-field scan would catch it — and only for as long as nobody reached
+    // for a fourth exemption.
+    const source = readFileSync(join(CONSOLE_ROOT, "lib/types.ts"), "utf8");
+    const names = extractInterfaces("lib/types.ts", source, "[A-Za-z0-9_]+").map(
+      (declared) => declared.name,
+    );
+    for (const declared of CREDENTIAL_DTO_INTERFACES) {
+      expect(names, `${declared.name} belongs in ${CREDENTIAL_DTO_MODULE}`).not.toContain(
+        declared.name,
+      );
+    }
+  });
+
+  test("the parser reached the credential module's interfaces at all", () => {
+    // A parser that found nothing would make every pin below vacuous.
+    const source = readFileSync(join(CONSOLE_ROOT, CREDENTIAL_DTO_MODULE), "utf8");
+    const interfaces = extractInterfaces(CREDENTIAL_DTO_MODULE, source, "[A-Za-z0-9_]+");
+    expect(interfaces.filter((declared) => declared.members.length > 0).length).toBeGreaterThanOrEqual(
+      5,
+    );
+  });
+
+  test("every secret-shaped interface in the module is pinned", () => {
+    // Same rule as `lib/types.ts`, run on the module the family moved to: an
+    // interface here that declares a secret-shaped member must be one this list
+    // names, with its members pinned. A new `CredentialRecord.raw_secret` fails
+    // the pin; a whole new secret-bearing DTO fails this.
+    const source = readFileSync(join(CONSOLE_ROOT, CREDENTIAL_DTO_MODULE), "utf8");
+    const pinned = CREDENTIAL_DTO_INTERFACES.map((entry) => entry.name);
+    const unpinned = extractInterfaces(CREDENTIAL_DTO_MODULE, source, "[A-Za-z0-9_]+")
+      .filter((declared) => !pinned.includes(declared.name))
+      .flatMap((declared) =>
+        declared.members
+          .filter((member) => SECRET_DTO_FIELD_PATTERN.test(member))
+          .map((member) => `${declared.name}.${member}`),
+      );
+    expect(
+      unpinned,
+      "a secret-shaped field on an unpinned interface — add the interface to " +
+        "CREDENTIAL_DTO_INTERFACES with its full member set, or do not model the field",
+    ).toEqual([]);
+  });
+
+  for (const declared of CREDENTIAL_DTO_INTERFACES) {
+    test(`${declared.name} is still NEEDED and its members are pinned`, () => {
+      const source = readFileSync(join(CONSOLE_ROOT, CREDENTIAL_DTO_MODULE), "utf8");
+      const found = extractInterfaces(CREDENTIAL_DTO_MODULE, source, "[A-Za-z0-9_]+").find(
+        (candidate) => candidate.name === declared.name,
+      );
+      expect(found, `${declared.name} is pinned but was not found`).toBeDefined();
+      expect([...found!.members].sort()).toEqual([...declared.members].sort());
+      expect(
+        found!.members.some((member) => SECRET_DTO_FIELD_PATTERN.test(member)),
+        `${declared.name} declares no secret-shaped field — the pin carves out nothing`,
+      ).toBe(true);
+    });
+  }
+
+  test("the module holds no renderer and no logging", () => {
+    // What it must never grow. `masked_secret` is Moira's own redaction and is
+    // the only value here an operator may be shown; it must reach the browser
+    // because a route handler CHOSE to forward it, never because a component
+    // could import this file and reach for a helper that formats it.
+    const source = readFileSync(join(CONSOLE_ROOT, CREDENTIAL_DTO_MODULE), "utf8");
+    const codeOnly = source.replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "");
+    expect(codeOnly).not.toMatch(/console\.(log|info|warn|error|debug)/);
+    expect(codeOnly).not.toContain("react");
+    expect(codeOnly).not.toMatch(/process\.env/);
   });
 });
