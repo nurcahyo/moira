@@ -85,6 +85,7 @@ export const CONSOLE_MESSAGE_KEYS = {
   /* --- lib/setup-flow.ts -------------------------------------------------- */
   trusted_jwt_issuer_registration_failed: "console.error.trusted_jwt_issuer_registration_failed",
   auth_provider_create_failed: "console.error.auth_provider_create_failed",
+  auth_provider_update_failed: "console.error.auth_provider_update_failed",
   auth_provider_secret_write_failed: "console.error.auth_provider_secret_write_failed",
   auth_provider_enable_failed: "console.error.auth_provider_enable_failed",
 

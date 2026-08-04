@@ -140,6 +140,7 @@ export class SetupOrderingError extends Error {
 export type SetupProvisioningStepId =
   | "ensure_trusted_jwt_issuer"
   | "create_auth_provider"
+  | "update_auth_provider"
   | "store_console_secret"
   | "enable_auth_provider";
 
@@ -162,6 +163,7 @@ export type SetupPartialStateRemedy =
 export const SETUP_PARTIAL_STATE_MESSAGE_KEYS: Readonly<Record<SetupProvisioningStepId, string>> = {
   ensure_trusted_jwt_issuer: CONSOLE_MESSAGE_KEYS.trusted_jwt_issuer_registration_failed,
   create_auth_provider: CONSOLE_MESSAGE_KEYS.auth_provider_create_failed,
+  update_auth_provider: CONSOLE_MESSAGE_KEYS.auth_provider_update_failed,
   store_console_secret: CONSOLE_MESSAGE_KEYS.auth_provider_secret_write_failed,
   enable_auth_provider: CONSOLE_MESSAGE_KEYS.auth_provider_enable_failed,
 };
@@ -171,6 +173,9 @@ const SETUP_PARTIAL_STATE_REMEDIES: Readonly<
 > = {
   ensure_trusted_jwt_issuer: "retry",
   create_auth_provider: "retry_reuses_trusted_jwt_issuer",
+  // The row already exists; a retry replays the same PATCH, which is safe under
+  // `If-Match` and cannot mint a second provider row.
+  update_auth_provider: "retry",
   store_console_secret: "retry_or_discard_provider",
   enable_auth_provider: "retry_enable_no_secret_re_entry",
 };
@@ -269,7 +274,7 @@ export interface SetupProvisioningRequest {
 /* Trace — what actually happened, in order                                   */
 /* -------------------------------------------------------------------------- */
 
-export type SetupTraceOutcome = "created" | "reused" | "enabled" | "stored";
+export type SetupTraceOutcome = "created" | "reused" | "updated" | "enabled" | "stored";
 
 export interface SetupTraceEntry {
   readonly step: SetupProvisioningStepId;
@@ -472,6 +477,48 @@ export function buildProviderCreateBody(
   };
 }
 
+/**
+ * Build the `PATCH /api/v1/admin/auth/providers/{id}` body for a re-save.
+ *
+ * The re-save path exists because the domain-refusal remedy tells the operator
+ * to "add the domain and save again": replaying the CREATE for that would hit
+ * the submission's idempotency key with a changed body (`409
+ * idempotency_conflict`), and a fresh create would mint a second row that the
+ * partial unique index refuses at enable (`409
+ * duplicate_enabled_provider_for_issuer`). So an existing row is PATCHED.
+ *
+ * Deliberately absent: `enabled` (the client contract forbids patching it —
+ * enable stays its own commit point), `trusted_jwt_issuer_id` (the binding is
+ * not re-asserted; the read-back check verifies it instead), and `method`
+ * (Moira's patch schema has no such field). URL members are omitted rather than
+ * sent as null when the form left them empty, so a re-save cannot silently
+ * clear an endpoint the row already has.
+ */
+export function buildProviderPatchBody(provider: AuthProviderConfig) {
+  if (provider.allowedEmailDomains.length === 0) {
+    throw new SetupOrderingError(
+      "allowed_email_domains must be non-empty: an empty list denies every claim, including the " +
+        "operator's own first claim, and there is no first-claim exemption",
+    );
+  }
+  const withOptional = (key: string, value: string | null | undefined) =>
+    value === null || value === undefined || value === "" ? {} : { [key]: value };
+
+  return {
+    display_name: provider.displayName,
+    allowed_email_domains: [...provider.allowedEmailDomains],
+    requested_scopes: [...(provider.requestedScopes ?? [])],
+    redirect_uris: [...(provider.redirectUris ?? [])],
+    ...withOptional("issuer", provider.issuer),
+    ...withOptional("discovery_url", provider.discoveryUrl),
+    ...withOptional("authorization_url", provider.authorizationUrl),
+    ...withOptional("token_url", provider.tokenUrl),
+    ...withOptional("userinfo_url", provider.userinfoUrl),
+    ...withOptional("jwks_url", provider.jwksUrl),
+    ...withOptional("client_id", provider.clientId),
+  };
+}
+
 /* -------------------------------------------------------------------------- */
 /* The runner                                                                 */
 /* -------------------------------------------------------------------------- */
@@ -522,26 +569,65 @@ export async function runSetupProvisioning(
   };
 
   // ---- 2. the auth provider, BOUND to that issuer -------------------------
+  //
+  // Two shapes, decided by the resume state:
+  //
+  //   * no `providerId` yet -> CREATE, keyed on the submission's idempotency key
+  //     so a same-body retry replays rather than duplicates;
+  //   * a `providerId` -> the row EXISTS (a partial attempt, or a completed one
+  //     being re-saved after a claim-time domain refusal) -> PATCH it. Replaying
+  //     the create here with a CHANGED body would be `409 idempotency_conflict`,
+  //     and a fresh create would mint a second row beside it that the partial
+  //     unique index then refuses at enable.
+  const providerStep: SetupProvisioningStepId =
+    state.providerId === null ? "create_auth_provider" : "update_auth_provider";
   let provider: AuthProviderSettingsRecord;
-  try {
-    const body = buildProviderCreateBody(request.provider, state.trustedJwtIssuerId);
-    provider = await client.createAuthProvider(body, {
-      idempotencyKey: request.idempotencyKeys.authProvider,
-    });
-    trace.push({
-      step: "create_auth_provider",
-      operation: "createAuthProvider",
-      outcome: "created",
-    });
-  } catch (error) {
-    // The orphan trusted issuer is inert, but `state` records it so the retry
-    // adopts it rather than re-POSTing into the unique index.
-    throw new SetupProvisioningError(
-      "create_auth_provider",
-      state,
-      moiraErrorOf(error),
-      "could not create the auth provider configuration",
-    );
+  if (state.providerId === null) {
+    try {
+      const body = buildProviderCreateBody(request.provider, state.trustedJwtIssuerId);
+      provider = await client.createAuthProvider(body, {
+        idempotencyKey: request.idempotencyKeys.authProvider,
+      });
+      trace.push({
+        step: "create_auth_provider",
+        operation: "createAuthProvider",
+        outcome: "created",
+      });
+    } catch (error) {
+      // The orphan trusted issuer is inert, but `state` records it so the retry
+      // adopts it rather than re-POSTing into the unique index.
+      throw new SetupProvisioningError(
+        "create_auth_provider",
+        state,
+        moiraErrorOf(error),
+        "could not create the auth provider configuration",
+      );
+    }
+  } else {
+    try {
+      assertB1Invariant(state.trustedJwtIssuerId);
+      // Read the row first for a FRESH `If-Match`: the recorded version may be
+      // stale (the enable bumped it, or another tab saved), and a stale
+      // precondition would turn every re-save into `409 resource_version_conflict`.
+      const current = await client.getAuthProvider(state.providerId);
+      provider = await client.patchAuthProvider(
+        current.id,
+        buildProviderPatchBody(request.provider),
+        ifMatchFor(current),
+      );
+      trace.push({
+        step: "update_auth_provider",
+        operation: "patchAuthProvider",
+        outcome: "updated",
+      });
+    } catch (error) {
+      throw new SetupProvisioningError(
+        "update_auth_provider",
+        state,
+        moiraErrorOf(error),
+        "could not update the existing auth provider configuration",
+      );
+    }
   }
 
   state = {
@@ -550,14 +636,14 @@ export async function runSetupProvisioning(
     providerVersion: provider.version,
     providerTrustedJwtIssuerId: provider.trusted_jwt_issuer_id ?? null,
     providerEnabled: provider.enabled,
-    allowedEmailDomains: [...provider.allowed_email_domains],
+    allowedEmailDomainCount: provider.allowed_email_domains.length,
   };
 
   // Read-back check: if Moira did not persist the binding, stop here rather than
   // enabling a row that can never govern the console's issuer.
   if (state.providerTrustedJwtIssuerId !== state.trustedJwtIssuerId) {
     throw new SetupProvisioningError(
-      "create_auth_provider",
+      providerStep,
       state,
       null,
       "Moira returned a provider row without the trusted_jwt_issuer_id binding; " +
@@ -586,7 +672,13 @@ export async function runSetupProvisioning(
 
   // ---- 4. enable: the commit point ---------------------------------------
   // No Idempotency-Key: the spec does not declare one on this operation. Retry
-  // safety is If-Match plus enable being naturally idempotent.
+  // safety is If-Match plus enable being naturally idempotent. A row that is
+  // ALREADY enabled (the update path re-saving a live provider) is left alone:
+  // the commit already happened, and re-committing it would only spend a
+  // version bump on nothing.
+  if (provider.enabled) {
+    return { state, trace };
+  }
   let enabled: AuthProviderSettingsRecord;
   try {
     enabled = await client.enableAuthProvider(provider.id, ifMatchFor(provider));
@@ -609,10 +701,91 @@ export async function runSetupProvisioning(
     providerVersion: enabled.version,
     providerTrustedJwtIssuerId: enabled.trusted_jwt_issuer_id ?? null,
     providerEnabled: enabled.enabled,
-    allowedEmailDomains: [...enabled.allowed_email_domains],
+    allowedEmailDomainCount: enabled.allowed_email_domains.length,
   };
 
   return { state, trace };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Rehydration — what has ALREADY been provisioned, read back from the source  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Reconstruct the provisioning state for one console issuer from Moira's own
+ * records plus the console's secret store.
+ *
+ * This is what makes the wizard survive anything the browser forgets: the
+ * sign-in step is a FULL NAVIGATION to the IdP and back, so `/setup` reloads as
+ * a fresh document with empty React state, and a provisioned-but-unclaimed
+ * deployment may equally be revisited days later from a different browser. The
+ * state is therefore never trusted to the client's memory — `GET /api/setup`
+ * derives it here for display, and the claim action derives it AGAIN for its
+ * own gate rather than believing whatever the browser echoes back.
+ *
+ * `hasStoredSecret` is a predicate, not the store, for the same reason
+ * `storeClientSecret` is a closure: this module must not be able to reach a
+ * secret value, only answer "is one sealed for this row".
+ */
+export async function deriveProvisioningState(
+  client: MoiraClient,
+  hasStoredSecret: (providerId: string) => Promise<boolean>,
+  consoleIssuer: string,
+): Promise<SetupProvisioningState> {
+  const issuer = await client.findTrustedJwtIssuerByIssuer(consoleIssuer);
+  if (issuer === null || issuer.status === "deleted") return EMPTY_PROVISIONING_STATE;
+
+  const state: SetupProvisioningState = {
+    ...EMPTY_PROVISIONING_STATE,
+    trustedJwtIssuerId: issuer.id,
+    trustedJwtIssuerVersion: issuer.version,
+  };
+
+  const provider = await findProviderBoundTo(client, issuer.id);
+  if (provider === null) return state;
+
+  return {
+    ...state,
+    providerId: provider.id,
+    providerVersion: provider.version,
+    providerTrustedJwtIssuerId: provider.trusted_jwt_issuer_id ?? null,
+    providerEnabled: provider.enabled,
+    allowedEmailDomainCount: provider.allowed_email_domains.length,
+    consoleSecretStored: await hasStoredSecret(provider.id),
+  };
+}
+
+/**
+ * The provider row bound to a trusted issuer, paging the list.
+ *
+ * The ENABLED row wins when one exists — the partial unique index guarantees at
+ * most one — and otherwise the first non-deleted bound row is the resumable
+ * partial state a previous attempt left behind.
+ */
+async function findProviderBoundTo(
+  client: MoiraClient,
+  trustedJwtIssuerId: string,
+): Promise<AuthProviderSettingsRecord | null> {
+  let fallback: AuthProviderSettingsRecord | null = null;
+  let cursor: string | undefined;
+  // Bounded so a paging bug cannot spin forever during setup.
+  for (let page = 0; page < 50; page += 1) {
+    const response = await client.listAuthProviders(
+      cursor === undefined ? { limit: 100 } : { limit: 100, cursor },
+    );
+    for (const row of response.data) {
+      if (row.status === "deleted" || (row.trusted_jwt_issuer_id ?? null) !== trustedJwtIssuerId) {
+        continue;
+      }
+      if (row.enabled) return row;
+      fallback ??= row;
+    }
+    if (!response.pagination.has_more) break;
+    const next = response.pagination.next_cursor;
+    if (next === null || next === undefined || next === "") break;
+    cursor = next;
+  }
+  return fallback;
 }
 
 /* -------------------------------------------------------------------------- */

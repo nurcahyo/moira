@@ -336,7 +336,7 @@ export function parseProvisioningState(value: unknown): SetupProvisioningState |
   const providerVersion = nullableNumber(value["providerVersion"]);
   const providerTrustedJwtIssuerId = nullableString(value["providerTrustedJwtIssuerId"]);
   const providerEnabled = value["providerEnabled"];
-  const allowedEmailDomains = value["allowedEmailDomains"];
+  const allowedEmailDomainCount = value["allowedEmailDomainCount"];
   const consoleSecretStored = value["consoleSecretStored"];
 
   if (
@@ -347,8 +347,9 @@ export function parseProvisioningState(value: unknown): SetupProvisioningState |
     providerTrustedJwtIssuerId === undefined ||
     typeof providerEnabled !== "boolean" ||
     typeof consoleSecretStored !== "boolean" ||
-    !Array.isArray(allowedEmailDomains) ||
-    !allowedEmailDomains.every((domain) => typeof domain === "string")
+    typeof allowedEmailDomainCount !== "number" ||
+    !Number.isFinite(allowedEmailDomainCount) ||
+    allowedEmailDomainCount < 0
   ) {
     return null;
   }
@@ -361,7 +362,7 @@ export function parseProvisioningState(value: unknown): SetupProvisioningState |
     providerVersion,
     providerTrustedJwtIssuerId,
     providerEnabled,
-    allowedEmailDomains: [...(allowedEmailDomains as readonly string[])],
+    allowedEmailDomainCount,
     consoleSecretStored,
   };
 }

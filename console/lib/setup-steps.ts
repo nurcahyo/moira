@@ -42,6 +42,14 @@ export const SETUP_STEP_ORDER = [
  * response rather than what the console intended to send. The gate compares the
  * two: a provider row that came back without the binding does not advance the
  * wizard, whatever the request body said.
+ *
+ * Every field here is DISPLAY-SAFE BY CONSTRUCTION, because this state crosses
+ * to the browser: `GET /api/setup` rehydrates it so the wizard survives the
+ * OAuth round trip (the sign-in step is a full navigation away from `/setup`
+ * and back) and any later revisit of a provisioned-but-unclaimed deployment.
+ * That is why the allow-list is a COUNT and not the list — decision D4 keeps
+ * `allowed_email_domains`, the deny-by-default admin-claim policy, off the
+ * anonymous setup surface, and the gate below only ever needed non-emptiness.
  */
 export interface SetupProvisioningState {
   readonly trustedJwtIssuerId: string | null;
@@ -51,7 +59,8 @@ export interface SetupProvisioningState {
   /** As returned by Moira on the created/enabled row. */
   readonly providerTrustedJwtIssuerId: string | null;
   readonly providerEnabled: boolean;
-  readonly allowedEmailDomains: readonly string[];
+  /** How many domains the row's allow-list carries. Never the domains (D4). */
+  readonly allowedEmailDomainCount: number;
   /** The console-side OAuth client secret write (D7) succeeded. */
   readonly consoleSecretStored: boolean;
 }
@@ -63,7 +72,7 @@ export const EMPTY_PROVISIONING_STATE: SetupProvisioningState = {
   providerVersion: null,
   providerTrustedJwtIssuerId: null,
   providerEnabled: false,
-  allowedEmailDomains: [],
+  allowedEmailDomainCount: 0,
   consoleSecretStored: false,
 };
 
@@ -97,9 +106,39 @@ export function provisioningDeficiencies(
     missing.push("provider_not_bound_to_trusted_jwt_issuer");
   }
   if (!state.providerEnabled) missing.push("provider_not_enabled");
-  if (state.allowedEmailDomains.length === 0) missing.push("allowed_email_domains_empty");
+  if (state.allowedEmailDomainCount <= 0) missing.push("allowed_email_domains_empty");
   if (!state.consoleSecretStored) missing.push("console_secret_not_stored");
   return missing;
+}
+
+/**
+ * Narrow an untrusted JSON payload back to `SetupProvisioningState`.
+ *
+ * Lenient on purpose (missing members become their empty value): the callers
+ * are the wizard organisms reading their OWN BFF's responses, where a field the
+ * console cannot read must degrade to "not confirmed" rather than crash a step.
+ * The SERVER-side counterpart — `parseProvisioningState` in `setup-window.ts` —
+ * REFUSES instead, because there the payload is a caller-supplied `resume`.
+ */
+export function narrowProvisioningState(value: unknown): SetupProvisioningState | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const nullableString = (member: unknown): string | null =>
+    typeof member === "string" ? member : null;
+  const nullableNumber = (member: unknown): number | null =>
+    typeof member === "number" && Number.isFinite(member) ? member : null;
+  const count = record["allowedEmailDomainCount"];
+  return {
+    trustedJwtIssuerId: nullableString(record["trustedJwtIssuerId"]),
+    trustedJwtIssuerVersion: nullableNumber(record["trustedJwtIssuerVersion"]),
+    providerId: nullableString(record["providerId"]),
+    providerVersion: nullableNumber(record["providerVersion"]),
+    providerTrustedJwtIssuerId: nullableString(record["providerTrustedJwtIssuerId"]),
+    providerEnabled: record["providerEnabled"] === true,
+    allowedEmailDomainCount:
+      typeof count === "number" && Number.isFinite(count) && count > 0 ? count : 0,
+    consoleSecretStored: record["consoleSecretStored"] === true,
+  };
 }
 
 /** True only when every gate condition holds. */

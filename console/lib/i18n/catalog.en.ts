@@ -284,6 +284,17 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "`trusted_jwt_issuers_issuer_active_unique`, which is not mapped to a 409 and surfaces as " +
       "an opaque 500 database_error. Reuse-first provisioning is what avoids it.",
   },
+  [K.auth_provider_update_failed]: {
+    key: K.auth_provider_update_failed,
+    message:
+      "Saving the changes to the existing sign-in provider failed. Nothing was lost — the " +
+      "provider is unchanged; retry the save.",
+    description:
+      "`SetupProvisioningError` at step `update_auth_provider` — a re-save of a provider row " +
+      "that already exists (a resumed partial attempt, or the domain-refusal remedy's 'add the " +
+      "domain and save again'). The row is PATCHED rather than re-created, so a retry replays " +
+      "the same update safely and can never mint a duplicate row.",
+  },
   [K.auth_provider_secret_write_failed]: {
     key: K.auth_provider_secret_write_failed,
     message:
