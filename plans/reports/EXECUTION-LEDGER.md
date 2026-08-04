@@ -36,9 +36,26 @@ merge, self-paced cadence. Security findings escalate to the user immediately.
    Recovery when it happens anyway: if the stray commit is unpushed, `cherry-pick` it onto the right
    branch and `reset --hard origin/<branch>`. Never force-push to fix this while another agent is
    live.
-3. **Merge on green CI.** All three jobs green with steps executed → merge. A job that ran and
-   failed is real and blocks; investigate rather than override. The old infrastructure override is
-   **void** — CI works.
+3. **Merge on green CI.** Five checks green with steps executed → merge: **`rust`**, `supply-chain`,
+   `container-and-helm`, `console`, `console-container-and-helm`. A job that ran and failed is real
+   and blocks; investigate rather than override. The old infrastructure override is **void** — CI
+   works.
+
+   This sentence used to read "all three jobs green" and then named jobs that no longer exist. The
+   Rust half is now sharded across `rust-lint`, `rust-shard (0…4)` and `rust-migrations`; **`rust`**
+   is the aggregator that `needs:` all three, asserts each one's `result` is `success`, and then
+   proves the union of what the shards actually ran equals every target in the tree. It is the only
+   Rust check a human or a branch-protection rule should look at.
+
+   **Never gate on `rust-shard (0)`…`(4)` individually.** Matrix check names embed the shard index
+   and change every time `SHARD_TOTAL` is re-tuned, which silently un-gates the branch — the same
+   shape as every other guard in HANDOFF §3 that went quiet without going red.
+
+   One signal changed meaning with the sharding: `test:incomplete-log`. `cargo test` without
+   `--no-fail-fast` stops scheduling targets after the first failure, so incomplete-log used to
+   double as a failure symptom. The shards pass `--no-fail-fast` deliberately, which breaks that
+   coupling — completeness is now orthogonal to pass/fail, and one bug produces one red instead of
+   three. Older entries about that signal predate the change.
 4. **PR #23 is no longer HELD** — the user chose to branch plan 08 from it, so it lands as part of
    plan 08 rather than on its own.
 5. **OAuth / Google credentials: mock first.** No real Google client id or secret is available and

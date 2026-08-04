@@ -1,5 +1,9 @@
 /target
 
+# scripts/ci-shard-run.sh's evidence output — assigned.txt, ran.txt, skips.txt and the
+# cargo capture. Uploaded as a CI artifact; a local shard reproduction leaves it here.
+/shard-out
+
 # cargo-mutants scratch tree and outcome report (scripts/mutants.sh)
 /mutants.out
 /mutants.out.old
