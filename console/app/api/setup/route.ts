@@ -49,6 +49,33 @@
 // field, publishes COUNTS and PRESENCE rather than the domain list or the
 // endpoint URLs, and the browser is not offered a way to call auth-methods
 // itself.
+//
+// ============================================================================
+// WHICH ROW A PRIVILEGED WRITE MAY TOUCH IS DERIVED, NEVER SUBMITTED
+// ============================================================================
+//
+// The whole setup window runs on the BOOTSTRAP SYSTEM KEY with no session in
+// front of it, so any body field that selects a Moira row is a field that
+// selects what an anonymous caller can rewrite with that key. `resume` used to
+// be exactly that: a shape-checked payload whose `providerId` steered
+// `runSetupProvisioning` into `getAuthProvider` + `patchAuthProvider` on ANY
+// auth-provider row — including an enabled incumbent — and whose
+// `consoleSecretStored` boolean stood in for proof that the console already
+// holds that row's OAuth client secret. `GET` even publishes the row ids.
+//
+// So the authority moved server-side, and there is exactly one of it:
+// `deriveProvisioningState` (`lib/setup-flow.ts`) reads the trusted issuer for
+// THIS console issuer out of Moira and then the provider row BOUND to it, and
+// asks the console's own secret store whether a secret is sealed for that row.
+// The same function already backed `GET` and the claim gate; provisioning now
+// uses it too, which makes the derived state the single answer to both "which
+// row may be written" and "may the client secret be omitted".
+//
+// `body.resume` survives only as a HINT — something to CHECK the derived state
+// against, never something to act on. When the two disagree the request is
+// refused (`409 setup_resume_state_conflict`) instead of resolved in the
+// caller's favour, because a disagreement is either a stale browser or a
+// caller naming a row that is not this console's, and neither should write.
 
 import { consoleProviderIdFor, isInteractiveMethod, isProviderSlug } from "@/lib/auth-config";
 import { readJsonBody } from "@/lib/console-api";
@@ -63,6 +90,7 @@ import {
   deriveProvisioningState,
   runSetupProvisioning,
   type AuthProviderConfig,
+  type SetupProvisioningState,
   type SetupWizardState,
 } from "@/lib/setup-flow";
 import {
@@ -207,6 +235,40 @@ function stringList(value: unknown): readonly string[] {
     .filter((entry) => entry !== "");
 }
 
+/**
+ * Does the caller's `resume` hint contradict what the console derived?
+ *
+ * Only the three members that carry AUTHORITY are compared, and each is
+ * compared for exact equality:
+ *
+ *   * `providerId` — which row a privileged write would target;
+ *   * `trustedJwtIssuerId` — which trusted issuer that row must be bound to;
+ *   * `consoleSecretStored` — whether the client secret may be omitted.
+ *
+ * Versions and the domain COUNT are deliberately NOT compared. They drift for
+ * legitimate reasons — an enable bumps the version, a second tab saves, the
+ * allow-list changes between the render and the submit — and comparing them
+ * would turn the domain-refusal remedy ("add the domain and save again") back
+ * into a dead end without protecting anything: neither field selects a row and
+ * neither grants a permission.
+ *
+ * A hint that agrees adds nothing and is discarded; the derived state is what
+ * provisioning runs on either way. The check exists so a browser that believes
+ * something else is TOLD, rather than silently having its belief overwritten —
+ * and so a caller that names a row this console does not own is refused with
+ * nothing written.
+ */
+function resumeHintDisagrees(
+  hint: SetupProvisioningState,
+  derived: SetupProvisioningState,
+): boolean {
+  return (
+    hint.providerId !== derived.providerId ||
+    hint.trustedJwtIssuerId !== derived.trustedJwtIssuerId ||
+    hint.consoleSecretStored !== derived.consoleSecretStored
+  );
+}
+
 /** The slug this provider is provisioned under, or a keyed refusal. */
 function readSlug(value: unknown): { readonly slug: string | null } | Response {
   if (value === undefined || value === null) return { slug: null };
@@ -241,25 +303,19 @@ async function provision(context: SetupWindowContext, body: SetupRequestBody): P
   const clientId = trimmedString(body["client_id"]);
   if (clientId === "") return setupBadRequest(CONSOLE_MESSAGE_KEYS.setup_client_id_required);
 
+  // Narrowed here only so a payload the console cannot read is a keyed 400
+  // rather than a silent restart. Nothing is DECIDED from it — see
+  // `resumeHintDisagrees` below.
   const resumeValue = body["resume"];
-  const resume =
+  const resumeHint =
     resumeValue === undefined || resumeValue === null ? null : parseProvisioningState(resumeValue);
-  if (resumeValue !== undefined && resumeValue !== null && resume === null) {
+  if (resumeValue !== undefined && resumeValue !== null && resumeHint === null) {
     return setupBadRequest(CONSOLE_MESSAGE_KEYS.setup_resume_state_invalid);
   }
 
   // Read once, into one binding, and never rebound. Nothing below puts it into a
   // response, and `runSetupProvisioning` receives the closure rather than this.
-  //
-  // An EMPTY secret is acceptable in exactly one shape: a re-save of a provider
-  // whose secret the console already sealed (`resume.consoleSecretStored`). The
-  // domain-refusal remedy says "add the domain and save again", and demanding
-  // the operator re-type a secret the console holds — and they may no longer
-  // have — would make that instruction unfollowable.
   const clientSecret = typeof body["client_secret"] === "string" ? body["client_secret"] : "";
-  if (clientSecret === "" && resume?.consoleSecretStored !== true) {
-    return setupBadRequest(CONSOLE_MESSAGE_KEYS.setup_client_secret_required);
-  }
 
   const issuer = optionalUrl(body["issuer"]);
   const discoveryUrl = optionalUrl(body["discovery_url"]);
@@ -290,6 +346,43 @@ async function provision(context: SetupWindowContext, body: SetupRequestBody): P
 
   const consoleConfig = consoleIssuerConfigFor(context.env, context.env.jwksUrl, slugResult.slug);
 
+  // ---- the authority ------------------------------------------------------
+  //
+  // Everything above this line is SHAPE, refused without asking Moira anything.
+  // From here on the console needs to know what actually exists, and it asks
+  // the source of truth rather than the caller: Moira's records for this
+  // console issuer, plus the console's own secret store. `derived.providerId`
+  // is the ONLY row a privileged write below may target, and it can only ever
+  // be a row bound to this console's trusted issuer — `findProviderBoundTo`
+  // filters on exactly that binding.
+  const derived = await deriveProvisioningState(
+    context.client,
+    (providerId) => hasSealedSecret(context.store, providerId),
+    consoleConfig.issuer,
+  );
+
+  // An EMPTY secret is acceptable in exactly one shape: a re-save of a provider
+  // whose secret the console has ACTUALLY sealed. The domain-refusal remedy
+  // says "add the domain and save again", and demanding the operator re-type a
+  // secret the console holds — and they may no longer have — would make that
+  // instruction unfollowable. What must never stand in for that fact is a
+  // boolean the caller sent.
+  if (clientSecret === "" && !derived.consoleSecretStored) {
+    return setupBadRequest(CONSOLE_MESSAGE_KEYS.setup_client_secret_required);
+  }
+
+  if (resumeHint !== null && resumeHintDisagrees(resumeHint, derived)) {
+    // Either a browser whose copy went stale (another tab saved, the row was
+    // changed elsewhere) or a caller naming a row that is not this console's.
+    // The console cannot tell those apart and does not need to: neither may
+    // write, and a reload re-derives the truth.
+    return setupError(
+      409,
+      "setup_resume_state_conflict",
+      CONSOLE_MESSAGE_KEYS.setup_resume_state_conflict,
+    );
+  }
+
   const provider: AuthProviderConfig = {
     method: method as AuthMethod,
     displayName,
@@ -312,8 +405,8 @@ async function provision(context: SetupWindowContext, body: SetupRequestBody): P
       storeClientSecret: async (providerId, storedClientId) => {
         if (clientSecret === "") {
           // A re-save with no new secret: the guard above admitted this shape
-          // only because `resume.consoleSecretStored` says one is already
-          // sealed for the row, so there is nothing to write.
+          // only because the DERIVED state says the console has already sealed
+          // one for the bound row, so there is nothing to write.
           return;
         }
         if (storedClientId === null || storedClientId === "") {
@@ -329,7 +422,11 @@ async function provision(context: SetupWindowContext, body: SetupRequestBody): P
         await context.store.put(providerId, storedClientId, clientSecret);
       },
       idempotencyKeys,
-      ...(resume === null ? {} : { resume }),
+      // The DERIVED state, never the body's. When it names a provider row the
+      // flow PATCHes that row; when it does not, the flow creates one. Either
+      // way the row is this console's own, because that is the only kind
+      // `deriveProvisioningState` can return.
+      resume: derived,
     });
 
     return setupJson(

@@ -266,7 +266,17 @@ export interface SetupProvisioningRequest {
     readonly trustedJwtIssuer: string;
     readonly authProvider: string;
   };
-  /** State from a previous partial attempt, so a retry resumes. */
+  /**
+   * What has ALREADY been written, so a retry resumes rather than restarts.
+   *
+   * MUST be server-derived — `deriveProvisioningState`, or the state a previous
+   * run of this function returned. It is never a payload from a browser: its
+   * `providerId` selects the row the update path PATCHes, and the setup window
+   * runs on the bootstrap system key with no session in front of it, so a
+   * caller-chosen id here would be a caller-chosen privileged write.
+   * `assertProviderIsBoundToTrustedIssuer` enforces that inside this module
+   * regardless of who called it.
+   */
   readonly resume?: SetupProvisioningState;
 }
 
@@ -308,6 +318,46 @@ export function assertB1Invariant(trustedJwtIssuerId: string | null): asserts tr
         "matches neither stage and every claim is 403 admin_claim_domain_not_allowed — and from " +
         "wave 4B the console cannot resolve the provider's minted `iss` either, because that is " +
         "the bound trusted issuer's own `issuer` string.",
+    );
+  }
+}
+
+/**
+ * Refuse to WRITE to a provider row that is not bound to the console's trusted
+ * JWT issuer.
+ *
+ * The counterpart to `assertB1Invariant`, and the same kind of check: B1 is
+ * about the row a CREATE mints, this is about the row an UPDATE touches.
+ *
+ * It exists because the update path takes its row id from a resume state, and
+ * a resume state used to be a caller-supplied payload — so a caller could name
+ * any auth-provider row in Moira and have the console PATCH it with the
+ * bootstrap system key, while the deployment is still unclaimed and there is no
+ * session to refuse. `app/api/setup/route.ts` now derives the row id server-side
+ * so no caller can name one; this is the second lock, inside the module that
+ * actually issues the write, so the property holds for every caller rather than
+ * for the one that was audited.
+ *
+ * Ordered BEFORE the PATCH, deliberately. The read-back check further down
+ * catches a row Moira returned without the binding, but by then the write has
+ * already landed — that check is about a persistence failure, not about a
+ * target the console was never entitled to.
+ */
+export function assertProviderIsBoundToTrustedIssuer(
+  provider: AuthProviderSettingsRecord,
+  trustedJwtIssuerId: string,
+): void {
+  if (provider.status === "deleted") {
+    throw new SetupOrderingError(
+      `the auth provider ${provider.id} is deleted and must not be re-saved`,
+    );
+  }
+  if ((provider.trusted_jwt_issuer_id ?? null) !== trustedJwtIssuerId) {
+    throw new SetupOrderingError(
+      `the auth provider ${provider.id} is not bound to this console's trusted JWT issuer ` +
+        `(${trustedJwtIssuerId}); the console does not write to a row it does not own, and the ` +
+        "row this console may re-save is derived from Moira's own records rather than named by " +
+        "the caller",
     );
   }
 }
@@ -579,6 +629,9 @@ export async function runSetupProvisioning(
   //     the create here with a CHANGED body would be `409 idempotency_conflict`,
   //     and a fresh create would mint a second row beside it that the partial
   //     unique index then refuses at enable.
+  //
+  // The `providerId` is SERVER-DERIVED (see the `resume` field's own note), and
+  // the update path re-proves that on the row it read back before it writes.
   const providerStep: SetupProvisioningStepId =
     state.providerId === null ? "create_auth_provider" : "update_auth_provider";
   let provider: AuthProviderSettingsRecord;
@@ -610,6 +663,10 @@ export async function runSetupProvisioning(
       // stale (the enable bumped it, or another tab saved), and a stale
       // precondition would turn every re-save into `409 resource_version_conflict`.
       const current = await client.getAuthProvider(state.providerId);
+      // …and the SAME read is what proves the row may be written at all. A GET
+      // is not a privileged write; the PATCH below is, and it does not run
+      // unless the row is bound to the issuer this run just ensured.
+      assertProviderIsBoundToTrustedIssuer(current, state.trustedJwtIssuerId);
       provider = await client.patchAuthProvider(
         current.id,
         buildProviderPatchBody(request.provider),
@@ -621,6 +678,10 @@ export async function runSetupProvisioning(
         outcome: "updated",
       });
     } catch (error) {
+      // An ordering violation is a refusal the console decided, not a failed
+      // step: it names a configuration that must change before a retry can
+      // differ, so it is not dressed up as a resumable partial write.
+      if (error instanceof SetupOrderingError) throw error;
       throw new SetupProvisioningError(
         "update_auth_provider",
         state,

@@ -419,6 +419,17 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "treated as a fresh start: restarting re-registers the trusted JWT issuer and hits a unique " +
       "index Moira reports as an opaque server error.",
   },
+  [K.setup_resume_state_conflict]: {
+    key: K.setup_resume_state_conflict,
+    message:
+      "This attempt no longer matches what has actually been configured. Reload the page and " +
+      "save again.",
+    description:
+      "The submitted `resume` hint named a provider row, a trusted issuer, or a stored-secret " +
+      "state that disagrees with the one the console derived from Moira's own records. The hint " +
+      "is never the authority for which row a privileged write may touch, so a disagreement is " +
+      "refused rather than resolved in the caller's favour.",
+  },
   [K.setup_ordering_violated]: {
     key: K.setup_ordering_violated,
     message:

@@ -104,6 +104,7 @@ export const CONSOLE_MESSAGE_KEYS = {
   setup_allowed_email_domains_required: "console.error.setup_allowed_email_domains_required",
   setup_provider_slug_invalid: "console.error.setup_provider_slug_invalid",
   setup_resume_state_invalid: "console.error.setup_resume_state_invalid",
+  setup_resume_state_conflict: "console.error.setup_resume_state_conflict",
   setup_ordering_violated: "console.error.setup_ordering_violated",
   setup_claim_step_unreachable: "console.error.setup_claim_step_unreachable",
   setup_email_not_verified: "console.error.setup_email_not_verified",

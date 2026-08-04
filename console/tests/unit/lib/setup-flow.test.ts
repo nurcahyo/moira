@@ -24,6 +24,7 @@ import {
   SetupOrderingError,
   SetupProvisioningError,
   assertB1Invariant,
+  assertProviderIsBoundToTrustedIssuer,
   buildProviderCreateBody,
   buildProviderPatchBody,
   claimAdminIdentity,
@@ -40,6 +41,7 @@ import {
   type SetupProvisioningState,
   type SetupWizardState,
 } from "@/lib/setup-flow";
+import type { AuthProviderSettingsRecord } from "@/lib/types";
 import {
   MOIRA_STUB_BASE_URL,
   createMoiraStub,
@@ -458,10 +460,19 @@ describe("partial states are resumable, never restarted", () => {
 });
 
 /* -------------------------------------------------------------------------- */
-/* The update path — a resume that names a provider row PATCHES it            */
+/* The update path — a SERVER-DERIVED resume PATCHES the row it names, and     */
+/* only if that row is bound to this console's trusted issuer                  */
 /* -------------------------------------------------------------------------- */
+//
+// This group used to be titled "a resume that names a provider row is an
+// update" and asserted nothing about WHOSE row it was. That was the shape of
+// the blocker: `resume` arrived from the request body, its `providerId` chose
+// the row, and the only binding check ran on the response — after the PATCH had
+// already landed. `runSetupProvisioning` now proves the binding on the row it
+// reads back BEFORE it writes, so the property holds for every caller and not
+// merely for the route that was audited.
 
-describe("a resume that names a provider row is an update, never a second create", () => {
+describe("a server-derived resume that names a provider row is an update, never a second create", () => {
   const resumedComplete: SetupProvisioningState = {
     trustedJwtIssuerId: ISSUER_ID,
     trustedJwtIssuerVersion: 1,
@@ -589,6 +600,70 @@ describe("a resume that names a provider row is an update, never a second create
     // The state is the COMPLETE resume, untouched: the working provider did not
     // vanish from the model because one save of it failed.
     expect(isProvisioningComplete(error.state)).toBe(true);
+  });
+
+  test("a row bound to ANOTHER trusted issuer is never PATCHed — the check runs before the write", async () => {
+    // THE BLOCKER, at the module boundary. A resume naming a row that is not
+    // this console's — the incumbent Google provider of a live deployment, say,
+    // whose id `GET /api/setup` publishes — used to reach `patchAuthProvider`
+    // with the bootstrap system key, rewriting its allow-list, client id and
+    // endpoint URLs; the binding was only compared afterwards, on the response.
+    const stub = createMoiraStub(
+      updateHandlers({
+        [`GET /api/v1/admin/auth/providers/${PROVIDER_ID}`]: () => ({
+          status: 200,
+          body: providerRecord({
+            enabled: true,
+            version: 7,
+            trusted_jwt_issuer_id: "99999999-9999-4999-8999-999999999999",
+          }),
+        }),
+      }),
+    );
+
+    await expect(
+      runSetupProvisioning(clientFor(stub), provisioningRequest({ resume: resumedComplete })),
+    ).rejects.toThrow(SetupOrderingError);
+
+    // The read happened; the WRITE did not. Nothing about that row changed, and
+    // no enable was attempted on it either.
+    expect(stub.requestsFor(`GET /api/v1/admin/auth/providers/${PROVIDER_ID}`)).toHaveLength(1);
+    expect(stub.requestsFor(`PATCH /api/v1/admin/auth/providers/${PROVIDER_ID}`)).toHaveLength(0);
+    expect(stub.routes()).not.toContain(`POST /api/v1/admin/auth/providers/${PROVIDER_ID}/enable`);
+    expect(secretWrites).toEqual([]);
+  });
+
+  test("a DELETED row is refused rather than resurrected by a patch", async () => {
+    const stub = createMoiraStub(
+      updateHandlers({
+        [`GET /api/v1/admin/auth/providers/${PROVIDER_ID}`]: () => ({
+          status: 200,
+          body: providerRecord({ status: "deleted", enabled: false, version: 5 }),
+        }),
+      }),
+    );
+
+    await expect(
+      runSetupProvisioning(clientFor(stub), provisioningRequest({ resume: resumedComplete })),
+    ).rejects.toThrow(SetupOrderingError);
+    expect(stub.requestsFor(`PATCH /api/v1/admin/auth/providers/${PROVIDER_ID}`)).toHaveLength(0);
+  });
+
+  test("assertProviderIsBoundToTrustedIssuer is the one spelling of the rule", () => {
+    // Exported and asserted directly, so the refusal cannot be quietly softened
+    // into a warning inside the runner.
+    expect(() =>
+      assertProviderIsBoundToTrustedIssuer(
+        providerRecord() as unknown as AuthProviderSettingsRecord,
+        ISSUER_ID,
+      ),
+    ).not.toThrow();
+    expect(() =>
+      assertProviderIsBoundToTrustedIssuer(
+        providerRecord({ trusted_jwt_issuer_id: null }) as unknown as AuthProviderSettingsRecord,
+        ISSUER_ID,
+      ),
+    ).toThrow(SetupOrderingError);
   });
 
   test("buildProviderPatchBody omits empty URL members rather than clearing them", () => {

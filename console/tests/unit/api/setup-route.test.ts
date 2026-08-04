@@ -468,6 +468,11 @@ describe("POST provision runs issuer -> provider -> secret -> enable", () => {
 
     expect(stub.routes()).toEqual([
       CLAIM_STATUS_ROUTE,
+      // The DERIVATION, before anything is written: which trusted issuer this
+      // console owns, and therefore which provider row — if any — a write here
+      // is allowed to touch. It stops at the issuer list on a fresh deployment
+      // because there is no issuer yet, so there can be no bound row either.
+      ISSUER_LIST_ROUTE,
       ISSUER_LIST_ROUTE,
       ISSUER_CREATE_ROUTE,
       PROVIDER_CREATE_ROUTE,
@@ -657,6 +662,12 @@ describe("a partial write comes back resumable, with the remedy for its step", (
     expect(retry.status).toBe(201);
     expect(stub.routes()).toEqual([
       CLAIM_STATUS_ROUTE,
+      // Derivation: the issuer now exists, so the bound-provider lookup runs
+      // too and finds none — the first attempt died before the create.
+      ISSUER_LIST_ROUTE,
+      PROVIDER_LIST_ROUTE,
+      // Provisioning: reuse-first, so the issuer is adopted rather than
+      // re-POSTed, and the provider is created for the first time.
       ISSUER_LIST_ROUTE,
       PROVIDER_CREATE_ROUTE,
       PROVIDER_ENABLE_ROUTE,
@@ -673,15 +684,58 @@ describe("a partial write comes back resumable, with the remedy for its step", (
     expect(stub.routes()).toEqual([CLAIM_STATUS_ROUTE]);
   });
 
-  test("a resume that names a provider row PATCHes it and needs NO secret re-entry", async () => {
-    // The domain-refusal remedy, at the wire: "add {domain} below, save the
-    // provider again". Replaying the create against the same submission id with
-    // a changed body would be `409 idempotency_conflict`; a fresh create would
-    // mint a second row that the partial unique index refuses at enable. And
-    // the operator is NOT asked to re-type a secret the console already sealed.
+  test("an empty client_secret WITHOUT a sealed one on record is still refused", async () => {
+    // The relaxation is exactly one shape wide, and the fact it turns on is the
+    // console's own: a secret sealed for the row the SERVER derived. A resume
+    // that says `consoleSecretStored: true` cannot manufacture that fact — here
+    // the deployment is unprovisioned, so the derived answer is `false` and the
+    // secret is still required.
+    const resume = {
+      trustedJwtIssuerId: ISSUER_ID,
+      trustedJwtIssuerVersion: 1,
+      providerId: PROVIDER_ID,
+      providerVersion: 2,
+      providerTrustedJwtIssuerId: ISSUER_ID,
+      providerEnabled: false,
+      allowedEmailDomainCount: 1,
+      consoleSecretStored: true,
+    };
+    const response = await POST(post({ ...PROVISION_BODY, client_secret: "", resume }));
+    expect(response.status).toBe(400);
+    expect(errorOf(await json(response))["message_key"]).toBe(
+      CONSOLE_MESSAGE_KEYS.setup_client_secret_required,
+    );
+    // The derivation ran (it is what answered the question) and nothing else.
+    expect(stub.routes()).toEqual([CLAIM_STATUS_ROUTE, ISSUER_LIST_ROUTE]);
+    expect(store.puts).toEqual([]);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* THE BLOCKER: which row a privileged write may touch is DERIVED, not sent    */
+/* -------------------------------------------------------------------------- */
+//
+// The setup window runs on the bootstrap system key with no session in front of
+// it, so every body field that selects a Moira row selects what an anonymous
+// caller can rewrite with that key while the window is open. `resume` was
+// exactly that field: shape-checked only, its `providerId` steering
+// `getAuthProvider` + `patchAuthProvider`, its `consoleSecretStored` standing
+// in for proof that the console holds the row's OAuth client secret. `GET
+// /api/setup` publishes the row ids.
+//
+// The group below is what replaced the old "a resume that names a provider row
+// PATCHes it" test. That test asserted the unsafe behaviour as the contract:
+// it named a row in the body and expected the PATCH. The contract now is that
+// the row comes from `deriveProvisioningState`, that a disagreeing hint is
+// refused, and that the legitimate remedies still work.
+
+describe("the re-save target is server-derived, and `resume` is only a hint", () => {
+  /** A deployment whose console issuer already owns an enabled bound provider. */
+  function installReSavable(): void {
     install({
       handlers: handlers({
         [ISSUER_LIST_ROUTE]: populatedIssuerList,
+        [PROVIDER_LIST_ROUTE]: enabledProviderList,
         [PROVIDER_GET_ROUTE]: () => ({
           status: 200,
           body: providerRecord({ enabled: true, version: 2 }),
@@ -697,68 +751,217 @@ describe("a partial write comes back resumable, with the remedy for its step", (
       }),
     });
     store.sealedIds.add(PROVIDER_ID);
-    const resume = {
-      trustedJwtIssuerId: ISSUER_ID,
-      trustedJwtIssuerVersion: 1,
-      providerId: PROVIDER_ID,
-      providerVersion: 2,
-      providerTrustedJwtIssuerId: ISSUER_ID,
-      providerEnabled: true,
-      allowedEmailDomainCount: 1,
-      consoleSecretStored: true,
-    };
+  }
 
-    const response = await POST(
-      post({
-        ...PROVISION_BODY,
-        client_secret: "",
-        allowed_email_domains: ["example.com", "gmail.com"],
-        resume,
-      }),
-    );
+  const AGREEING_HINT = {
+    trustedJwtIssuerId: ISSUER_ID,
+    trustedJwtIssuerVersion: 1,
+    providerId: PROVIDER_ID,
+    providerVersion: 2,
+    providerTrustedJwtIssuerId: ISSUER_ID,
+    providerEnabled: true,
+    allowedEmailDomainCount: 1,
+    consoleSecretStored: true,
+  };
+
+  /** The domain-refusal remedy's body: add the domain, no secret re-entry. */
+  const RE_SAVE_BODY = {
+    ...PROVISION_BODY,
+    client_secret: "",
+    allowed_email_domains: ["example.com", "gmail.com"],
+  };
+
+  const DERIVE_THEN_PATCH = [
+    CLAIM_STATUS_ROUTE,
+    // The authority: this console's trusted issuer, then the row bound to it.
+    ISSUER_LIST_ROUTE,
+    PROVIDER_LIST_ROUTE,
+    // Provisioning: adopt the issuer, read the row for a fresh If-Match, patch.
+    ISSUER_LIST_ROUTE,
+    PROVIDER_GET_ROUTE,
+    PROVIDER_PATCH_ROUTE,
+  ];
+
+  test("the domain-refusal re-save PATCHes the DERIVED row and needs no secret re-entry", async () => {
+    // The remedy the `console.setup.domain_not_allowed.*` copy prescribes must
+    // still be followable: "add {domain} below, save the provider again".
+    // Replaying the create against the same submission id with a changed body
+    // would be `409 idempotency_conflict`; a fresh create would mint a second
+    // row the partial unique index refuses at enable. So the PATCH stays — it
+    // is the TARGET that stopped coming from the request.
+    installReSavable();
+    const response = await POST(post({ ...RE_SAVE_BODY, resume: AGREEING_HINT }));
     expect(response.status).toBe(201);
+    expect(stub.routes()).toEqual(DERIVE_THEN_PATCH);
 
-    // Reuse the issuer, read the row for a fresh If-Match, patch it. No create,
-    // no enable (the row is already the committed one).
-    expect(stub.routes()).toEqual([
-      CLAIM_STATUS_ROUTE,
-      ISSUER_LIST_ROUTE,
-      PROVIDER_GET_ROUTE,
-      PROVIDER_PATCH_ROUTE,
-    ]);
     const patched = stub.bodyOf(PROVIDER_PATCH_ROUTE) as Record<string, unknown>;
     expect(patched["allowed_email_domains"]).toEqual(["example.com", "gmail.com"]);
     expect("enabled" in patched).toBe(false);
     // The sealed secret still stands; nothing was re-written and nothing asked.
     expect(store.puts).toEqual([]);
-
-    const body = await json(response);
-    expect(body["state"]).toMatchObject({
+    expect((await json(response))["state"]).toMatchObject({
       providerEnabled: true,
       allowedEmailDomainCount: 2,
       consoleSecretStored: true,
     });
   });
 
-  test("an empty client_secret WITHOUT a sealed one on record is still refused", async () => {
-    // The relaxation is exactly one shape wide: no resume, or a resume whose
-    // `consoleSecretStored` is false, still requires the secret.
-    const resume = {
-      trustedJwtIssuerId: ISSUER_ID,
-      trustedJwtIssuerVersion: 1,
-      providerId: PROVIDER_ID,
-      providerVersion: 2,
-      providerTrustedJwtIssuerId: ISSUER_ID,
-      providerEnabled: false,
-      allowedEmailDomainCount: 1,
-      consoleSecretStored: false,
-    };
-    const response = await POST(post({ ...PROVISION_BODY, client_secret: "", resume }));
-    expect(response.status).toBe(400);
-    expect(errorOf(await json(response))["message_key"]).toBe(
-      CONSOLE_MESSAGE_KEYS.setup_client_secret_required,
+  test("the same re-save works with NO resume at all — the hint was never what chose the row", async () => {
+    // The reload case, and the proof that the hint is not load-bearing: a fresh
+    // document (a back-navigation after a reload, say) sends no `resume`, and
+    // the console still finds the row it owns, still patches it, and still does
+    // not ask for a secret it already holds.
+    installReSavable();
+    const response = await POST(post(RE_SAVE_BODY));
+    expect(response.status).toBe(201);
+    expect(stub.routes()).toEqual(DERIVE_THEN_PATCH);
+    expect(store.puts).toEqual([]);
+  });
+
+  test("a resume naming a row this console does NOT own is refused, with nothing written", async () => {
+    // The attack. The deployment is unclaimed and the system key is present, so
+    // the window is open to an anonymous caller. Moira holds an incumbent
+    // provider row — enabled, bound to somebody else's trusted issuer, its id
+    // handed out by `GET /api/setup` — and the caller names it, intending to
+    // rewrite its allow-list, client id and endpoint URLs and then sign in as
+    // an administrator.
+    const INCUMBENT_ID = "55555555-5555-4555-8555-555555555555";
+    const INCUMBENT_GET = `GET /api/v1/admin/auth/providers/${INCUMBENT_ID}`;
+    const INCUMBENT_PATCH = `PATCH /api/v1/admin/auth/providers/${INCUMBENT_ID}`;
+    install({
+      handlers: handlers({
+        [INCUMBENT_GET]: () => ({
+          status: 200,
+          body: providerRecord({
+            id: INCUMBENT_ID,
+            enabled: true,
+            version: 9,
+            trusted_jwt_issuer_id: "99999999-9999-4999-8999-999999999999",
+          }),
+        }),
+        [INCUMBENT_PATCH]: () => {
+          throw new Error("the console must never PATCH a row it does not own");
+        },
+      }),
+    });
+
+    const response = await POST(
+      post({
+        ...PROVISION_BODY,
+        allowed_email_domains: ["attacker.example"],
+        client_id: "attacker-client-id",
+        resume: {
+          trustedJwtIssuerId: "99999999-9999-4999-8999-999999999999",
+          trustedJwtIssuerVersion: 1,
+          providerId: INCUMBENT_ID,
+          providerVersion: 9,
+          providerTrustedJwtIssuerId: "99999999-9999-4999-8999-999999999999",
+          providerEnabled: true,
+          allowedEmailDomainCount: 1,
+          consoleSecretStored: true,
+        },
+      }),
     );
-    expect(stub.routes()).toEqual([CLAIM_STATUS_ROUTE]);
+
+    expect(response.status).toBe(409);
+    const error = errorOf(await json(response));
+    expect(error["code"]).toBe("setup_resume_state_conflict");
+    expect(error["message_key"]).toBe(CONSOLE_MESSAGE_KEYS.setup_resume_state_conflict);
+
+    // NOTHING left the console beyond the guard's claim-status read and the
+    // derivation itself. The incumbent row was never even read, let alone
+    // written, and no trusted issuer or provider was created on the way.
+    expect(stub.routes()).toEqual([CLAIM_STATUS_ROUTE, ISSUER_LIST_ROUTE]);
+    expect(stub.routes()).not.toContain(INCUMBENT_GET);
+    expect(stub.routes()).not.toContain(INCUMBENT_PATCH);
+    expect(stub.routes()).not.toContain(ISSUER_CREATE_ROUTE);
+    expect(stub.routes()).not.toContain(PROVIDER_CREATE_ROUTE);
+    expect(store.puts).toEqual([]);
+  });
+
+  test("a resume that claims a stored secret the console does not hold is refused", async () => {
+    // The second half of the same defect: `consoleSecretStored` was a boolean
+    // the caller sent, standing in for proof of ownership. Here the row IS this
+    // console's, but nothing is sealed for it — so the hint disagrees and the
+    // request is refused rather than admitted with an empty secret.
+    install({
+      handlers: handlers({
+        [ISSUER_LIST_ROUTE]: populatedIssuerList,
+        [PROVIDER_LIST_ROUTE]: enabledProviderList,
+      }),
+    });
+    const response = await POST(
+      post({ ...PROVISION_BODY, resume: { ...AGREEING_HINT, consoleSecretStored: true } }),
+    );
+    expect(response.status).toBe(409);
+    expect(errorOf(await json(response))["code"]).toBe("setup_resume_state_conflict");
+    expect(stub.routes()).toEqual([CLAIM_STATUS_ROUTE, ISSUER_LIST_ROUTE, PROVIDER_LIST_ROUTE]);
+    expect(stub.routes()).not.toContain(PROVIDER_PATCH_ROUTE);
+  });
+
+  test("a stale hint that has not caught up with the derived row is refused, not resolved", async () => {
+    // A browser that still believes nothing is provisioned, against a console
+    // that now owns a row. The console cannot tell this apart from the attack
+    // above and does not try: neither writes, and a reload re-derives the truth.
+    installReSavable();
+    const response = await POST(
+      post({ ...RE_SAVE_BODY, resume: { ...AGREEING_HINT, providerId: null } }),
+    );
+    expect(response.status).toBe(409);
+    expect(errorOf(await json(response))["message_key"]).toBe(
+      CONSOLE_MESSAGE_KEYS.setup_resume_state_conflict,
+    );
+    expect(stub.routes()).not.toContain(PROVIDER_PATCH_ROUTE);
+  });
+
+  test("a version or domain-count that drifted is NOT a conflict — the remedy stays followable", async () => {
+    // Only the three members that carry authority are compared. Versions and
+    // the domain count drift for ordinary reasons (an enable bumped one, the
+    // operator just edited the other), and refusing on those would put the
+    // domain-refusal remedy straight back into the dead end it came from.
+    installReSavable();
+    const response = await POST(
+      post({
+        ...RE_SAVE_BODY,
+        resume: { ...AGREEING_HINT, providerVersion: 1, allowedEmailDomainCount: 7 },
+      }),
+    );
+    expect(response.status).toBe(201);
+    expect(stub.routes()).toEqual(DERIVE_THEN_PATCH);
+  });
+
+  test("a row Moira reports bound elsewhere is refused BEFORE the patch, not after", async () => {
+    // Defence in depth, driven through the route: even with the derived id, the
+    // runner re-proves the binding on the row it reads back. A row that changed
+    // hands between the derivation and the read is refused with the write
+    // unmade — the read-back check further down would only have noticed after.
+    installReSavable();
+    install({
+      handlers: handlers({
+        [ISSUER_LIST_ROUTE]: populatedIssuerList,
+        [PROVIDER_LIST_ROUTE]: enabledProviderList,
+        [PROVIDER_GET_ROUTE]: () => ({
+          status: 200,
+          body: providerRecord({
+            enabled: true,
+            version: 2,
+            trusted_jwt_issuer_id: "99999999-9999-4999-8999-999999999999",
+          }),
+        }),
+        [PROVIDER_PATCH_ROUTE]: () => {
+          throw new Error("the console must never PATCH a row it does not own");
+        },
+      }),
+    });
+    store.sealedIds.add(PROVIDER_ID);
+
+    const response = await POST(post(RE_SAVE_BODY));
+    expect(response.status).toBe(409);
+    expect(errorOf(await json(response))["message_key"]).toBe(
+      CONSOLE_MESSAGE_KEYS.setup_ordering_violated,
+    );
+    expect(stub.routes()).not.toContain(PROVIDER_PATCH_ROUTE);
+    expect(store.puts).toEqual([]);
   });
 });
 
@@ -771,6 +974,13 @@ describe("provision input is validated before the first Moira write", () => {
     readonly what: string;
     readonly patch: Record<string, unknown>;
     readonly key: string;
+    /**
+     * The reads this refusal is allowed to have made. Almost every one is pure
+     * shape and makes none beyond the guard's; the missing-secret refusal is
+     * the exception, because whether an empty secret is admissible is a fact
+     * about the console's own store and can only be answered by deriving it.
+     */
+    readonly reads?: readonly string[];
   }> = [
     {
       what: "an empty allow-list, which would deny the operator's own claim",
@@ -781,6 +991,7 @@ describe("provision input is validated before the first Moira write", () => {
       what: "a missing client secret",
       patch: { client_secret: "" },
       key: CONSOLE_MESSAGE_KEYS.setup_client_secret_required,
+      reads: [CLAIM_STATUS_ROUTE, ISSUER_LIST_ROUTE],
     },
     {
       what: "a missing client id",
@@ -815,8 +1026,9 @@ describe("provision input is validated before the first Moira write", () => {
       const response = await POST(post({ ...PROVISION_BODY, ...refusal.patch }));
       expect(response.status).toBe(400);
       expect(errorOf(await json(response))["message_key"]).toBe(refusal.key);
-      // The claim-status read is the guard's; nothing else went out.
-      expect(stub.routes()).toEqual([CLAIM_STATUS_ROUTE]);
+      // The claim-status read is the guard's; nothing beyond the declared reads
+      // went out, and in particular nothing was WRITTEN.
+      expect(stub.routes()).toEqual([...(refusal.reads ?? [CLAIM_STATUS_ROUTE])]);
       expect(store.puts).toEqual([]);
     });
   }
@@ -1058,6 +1270,7 @@ describe("every key this route emits is real English", () => {
     CONSOLE_MESSAGE_KEYS.setup_allowed_email_domains_required,
     CONSOLE_MESSAGE_KEYS.setup_provider_slug_invalid,
     CONSOLE_MESSAGE_KEYS.setup_resume_state_invalid,
+    CONSOLE_MESSAGE_KEYS.setup_resume_state_conflict,
     CONSOLE_MESSAGE_KEYS.setup_ordering_violated,
     CONSOLE_MESSAGE_KEYS.setup_claim_step_unreachable,
     CONSOLE_MESSAGE_KEYS.setup_email_not_verified,
