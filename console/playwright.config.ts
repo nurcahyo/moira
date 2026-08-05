@@ -1,5 +1,10 @@
 import { defineConfig, devices } from "@playwright/test";
 
+import {
+  AUTH_CONSOLE_ORIGIN,
+  AUTH_CONSOLE_PORT,
+  AUTH_STORAGE_STATE,
+} from "./e2e/support/authenticated-fixture";
 import { installConsoleE2eEnv } from "./e2e/support/console-env";
 import { SENTINEL_ENV } from "./e2e/support/secrets";
 
@@ -130,49 +135,132 @@ export default defineConfig({
     video: "retain-on-failure",
   },
 
+  /**
+   * ==========================================================================
+   * TWO CONSOLES, AND WHICH SPEC RUNS AGAINST WHICH
+   * ==========================================================================
+   *
+   * `chromium` is the scaffold: `https://moira.invalid`, `db.invalid:1`, no IdP.
+   * The smoke, a11y, i18n-key, secret-leak and gate specs all want that, because
+   * a suite that proves "nothing real is in reach" is stronger when nothing real
+   * IS in reach.
+   *
+   * `authenticated` is the second stack (`e2e/support/authenticated-stack.ts`):
+   * the same standalone artifact with a fixture Moira, a real mock IdP, the
+   * console's own database, and a mock OpenAI-compatible endpoint. It is the
+   * "authenticated Playwright project" whose absence `a11y.e2e.ts` and
+   * `llm-settings.e2e.ts` both record as a REVERSAL CONDITION.
+   *
+   * The split is by `testMatch`/`testIgnore` rather than by folder so the two
+   * environments can never be pointed at each other's specs by accident: an
+   * authenticated spec run against `moira.invalid` would fail on the first click,
+   * and a leak scan run against the authenticated stack would be scanning a
+   * server whose secrets were never harvested as needles.
+   */
   projects: [
     {
       name: "chromium",
       use: { ...devices["Desktop Chrome"] },
+      testIgnore: [/authenticated-session\.e2e\.ts/, /llm-settings-authenticated\.e2e\.ts/],
+    },
+    {
+      // Signs in for real, through the browser, and saves the storage state.
+      // Separate from the suite that uses it so a broken sign-in reports itself
+      // as a broken sign-in rather than as six failing assertions about the LLM
+      // screen.
+      name: "authenticated-setup",
+      testMatch: /authenticated-session\.e2e\.ts/,
+      use: {
+        ...devices["Desktop Chrome"],
+        baseURL: AUTH_CONSOLE_ORIGIN,
+        // The fixture certificate is self-signed and trusted by the console
+        // process through NODE_EXTRA_CA_CERTS. A browser has no such store here.
+        ignoreHTTPSErrors: true,
+      },
+    },
+    {
+      name: "authenticated",
+      testMatch: /llm-settings-authenticated\.e2e\.ts/,
+      dependencies: ["authenticated-setup"],
+      use: {
+        ...devices["Desktop Chrome"],
+        baseURL: AUTH_CONSOLE_ORIGIN,
+        ignoreHTTPSErrors: true,
+        storageState: AUTH_STORAGE_STATE,
+      },
     },
   ],
 
   ...(externalBaseURL
     ? {}
     : {
-        webServer: {
-          command: startCommand,
-          url: baseURL,
-          reuseExistingServer: !isCI,
-          timeout: 300_000,
-          stdout: "pipe" as const,
-          stderr: "pipe" as const,
-          env: {
-            // `next start` honours PORT.
-            PORT: String(port),
-            NODE_ENV: "production",
-            // `lib/env.ts` validates eagerly and refuses to boot without
-            // these. The rest come from `installConsoleE2eEnv()` above, which
-            // the server inherits; only the origin is decided here.
-            //
-            // NOTE the deliberate mismatch: the server listens on plain http on
-            // loopback, but declares an https PUBLIC origin. That is not a
-            // fudge — it is what a real deployment looks like. The console runs
-            // behind a TLS-terminating ingress (`charts/moira-console`'s
-            // Ingress forces an https redirect), so the origin it advertises as
-            // its issuer and JWKS host is never the address it binds.
-            //
-            // The alternative — declaring `http://127.0.0.1:PORT` and setting
-            // `CONSOLE_ALLOW_INSECURE_URLS=true` — CANNOT work here, because
-            // `NODE_ENV` is `production` two lines above and `lib/env.ts` makes
-            // that flag a hard failure in production, exactly as Moira's
-            // `Settings::validate` does for `auth.jwks.allow_insecure_dev_urls`.
-            // Trying it fails the boot with `ConsoleConfigError`.
-            CONSOLE_PUBLIC_ORIGIN: "https://console.e2e.invalid",
-            // Server-only sentinel secrets for the secret-leak gate.
-            // Never prefixed NEXT_PUBLIC_ — see e2e/support/secrets.ts.
-            ...SENTINEL_ENV,
+        webServer: [
+          {
+            command: startCommand,
+            url: baseURL,
+            reuseExistingServer: !isCI,
+            timeout: 300_000,
+            stdout: "pipe" as const,
+            stderr: "pipe" as const,
+            env: {
+              // `next start` honours PORT.
+              PORT: String(port),
+              NODE_ENV: "production",
+              // `lib/env.ts` validates eagerly and refuses to boot without
+              // these. The rest come from `installConsoleE2eEnv()` above, which
+              // the server inherits; only the origin is decided here.
+              //
+              // NOTE the deliberate mismatch: the server listens on plain http on
+              // loopback, but declares an https PUBLIC origin. That is not a
+              // fudge — it is what a real deployment looks like. The console runs
+              // behind a TLS-terminating ingress (`charts/moira-console`'s
+              // Ingress forces an https redirect), so the origin it advertises as
+              // its issuer and JWKS host is never the address it binds.
+              //
+              // The alternative — declaring `http://127.0.0.1:PORT` and setting
+              // `CONSOLE_ALLOW_INSECURE_URLS=true` — CANNOT work here, because
+              // `NODE_ENV` is `production` two lines above and `lib/env.ts` makes
+              // that flag a hard failure in production, exactly as Moira's
+              // `Settings::validate` does for `auth.jwks.allow_insecure_dev_urls`.
+              // Trying it fails the boot with `ConsoleConfigError`.
+              CONSOLE_PUBLIC_ORIGIN: "https://console.e2e.invalid",
+              // Server-only sentinel secrets for the secret-leak gate.
+              // Never prefixed NEXT_PUBLIC_ — see e2e/support/secrets.ts.
+              ...SENTINEL_ENV,
+            },
           },
-        },
+          {
+            /**
+             * The authenticated stack. It BUILDS NOTHING — the entry above owns
+             * `bun run build`, and two Next builds writing one `.next`
+             * concurrently is a corrupted output — so it waits for that server
+             * to answer before spawning its own copy of the same artifact.
+             *
+             * `--preload` is load-bearing: the stack seeds the console's OAuth
+             * client secret through the SHIPPED `PostgresConsoleSecretStore`,
+             * which carries `import "server-only"`, and that package's `default`
+             * export condition is a bare `throw`. Same neutralisation
+             * `tests/support/durability-probe.ts` already uses for a plain `bun`
+             * process.
+             */
+            command:
+              "bun --preload ./tests/support/server-only-runtime-shim.ts " +
+              "e2e/support/authenticated-stack.ts",
+            url: `${AUTH_CONSOLE_ORIGIN}/login`,
+            ignoreHTTPSErrors: true,
+            reuseExistingServer: !isCI,
+            // Includes waiting for the first entry's build.
+            timeout: 300_000,
+            stdout: "pipe" as const,
+            stderr: "pipe" as const,
+            env: {
+              // Everything else the console needs is composed by the stack
+              // itself and handed to the child it spawns; only the port the
+              // browser will use is decided here, and it must agree with
+              // `AUTH_CONSOLE_ORIGIN`.
+              CONSOLE_E2E_AUTH_PORT: String(AUTH_CONSOLE_PORT),
+            },
+          },
+        ],
       }),
 });
