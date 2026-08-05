@@ -26,7 +26,13 @@
 //
 // Re-checks the session itself — `app/api/**` is outside every route group.
 
-import { notFound, withConsoleSession } from "@/lib/console-api";
+import {
+  badRequest,
+  lookupOnPage,
+  notFound,
+  withConsoleSession,
+  type PageLookup,
+} from "@/lib/console-api";
 import { CONSOLE_MESSAGE_KEYS } from "@/lib/i18n/keys";
 import { LIST_PAGE_LIMIT } from "@/lib/llm-settings";
 import { ifMatchFor, type MoiraClient } from "@/lib/moira-client";
@@ -46,22 +52,37 @@ const NO_STORE = { "cache-control": "no-store" } as const;
  */
 type OwnedCredential = Awaited<ReturnType<MoiraClient["listProviderCredentials"]>>["data"][number];
 
-/** The credential row, only if it belongs to the provider named in the path. */
+/**
+ * The credential row, only if it belongs to the provider named in the path.
+ *
+ * Issue #117: three-case, not `record | null`. The list IS filtered server-side
+ * by `provider_id`, so one page covers far more here than on the unfiltered
+ * policy list — but "far more" is not "all", and a deployment with per-tenant or
+ * per-application credential scopes reaches page two on one provider. Answering
+ * 404 there tells the operator a credential row they can see on the screen does
+ * not exist.
+ */
 async function ownedCredential(
   client: MoiraClient,
   providerId: string,
   credentialId: string,
-): Promise<OwnedCredential | null> {
+): Promise<PageLookup<OwnedCredential>> {
   const provider = await client.getProvider(providerId);
   const page = await client.listProviderCredentials({
     providerId: provider.id,
     limit: LIST_PAGE_LIMIT,
   });
-  return (
-    page.data.find(
-      (candidate) => candidate.id === credentialId && candidate.provider_id === provider.id,
-    ) ?? null
+  return lookupOnPage(
+    page,
+    (candidate) => candidate.id === credentialId && candidate.provider_id === provider.id,
   );
+}
+
+/** The refusal for a lookup that did not find its row. */
+function refuse(lookup: PageLookup<unknown>): Response {
+  return lookup.kind === "truncated"
+    ? badRequest(CONSOLE_MESSAGE_KEYS.llm_list_truncated)
+    : notFound(CONSOLE_MESSAGE_KEYS.llm_key_row_not_found);
 }
 
 export async function DELETE(
@@ -70,8 +91,9 @@ export async function DELETE(
 ): Promise<Response> {
   const { id, credentialId } = await context.params;
   return withConsoleSession(request, async ({ client }) => {
-    const row = await ownedCredential(client, id, credentialId);
-    if (row === null) return notFound(CONSOLE_MESSAGE_KEYS.llm_key_row_not_found);
+    const lookup = await ownedCredential(client, id, credentialId);
+    if (lookup.kind !== "found") return refuse(lookup);
+    const row = lookup.row;
 
     const record = await client.disableProviderCredential(row.id, ifMatchFor(row));
     return Response.json({ id: record.id }, { headers: NO_STORE });
@@ -84,8 +106,9 @@ export async function POST(
 ): Promise<Response> {
   const { id, credentialId } = await context.params;
   return withConsoleSession(request, async ({ client }) => {
-    const row = await ownedCredential(client, id, credentialId);
-    if (row === null) return notFound(CONSOLE_MESSAGE_KEYS.llm_key_row_not_found);
+    const lookup = await ownedCredential(client, id, credentialId);
+    if (lookup.kind !== "found") return refuse(lookup);
+    const row = lookup.row;
 
     // Already active: answer with the row rather than burning a version on a
     // write that changes nothing.

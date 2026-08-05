@@ -1180,8 +1180,28 @@ assertKeyContract<
 
 /**
  * The only model-create body this console may construct: `capabilities` is
- * promoted to REQUIRED and non-nullable, which makes the `no_eligible_model`
- * defect above unrepresentable rather than merely documented.
+ * promoted from optional to REQUIRED, so the field cannot be forgotten.
+ *
+ * ============================================================================
+ * WHAT THE TYPE DOES **NOT** GUARANTEE (issue #113)
+ * ============================================================================
+ *
+ * This comment used to claim the promotion made the `no_eligible_model` defect
+ * "unrepresentable". It does not, and reading it that way is how a runtime check
+ * gets skipped as redundant. `JsonValue` INCLUDES `null`, so
+ * `{ model_key, capabilities: null }` satisfies this type exactly — and `null` is
+ * stored as SQL `null`, which is the same defect the required key was meant to
+ * prevent. TypeScript is also erased: a body that arrived over HTTP, or through
+ * an `any`, is not checked by anything here at all.
+ *
+ * So the division of labour is: the REQUIRED KEY makes omission a compile error,
+ * and `assertProviderModelCreateIsSafe` in `lib/moira-client.ts` refuses BOTH
+ * omission and `null` at runtime, on every call. Neither is redundant, and
+ * `tests/unit/lib/moira-client.test.ts` pins that the guard is still invoked.
+ *
+ * Narrowing `capabilities` to exclude `null` was considered and rejected: it
+ * would make this type say something `#/components/schemas/ProviderModelCreateRequest`
+ * does not, and the value is a free-form JSON document whose shape Moira owns.
  */
 export type ConsoleProviderModelCreateRequest = Omit<
   ProviderModelCreateRequest,

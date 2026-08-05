@@ -40,11 +40,28 @@
 // The dedupe also REFUSES A TRUNCATED PAGE rather than reading "not on page one"
 // as "does not exist" — the same rule `findOnPage` applies inside the chain, for
 // the same reason: guessing wrong creates the duplicate the dedupe exists to
-// prevent.
+// prevent. Issue #117 extended that rule to the MODEL lookup above it, which had
+// been reading a truncated page as "this provider does not own that model".
+//
+// ============================================================================
+// THE MODEL'S STATUS IS AN INVARIANT OF THIS ENDPOINT, NOT OF THE SELECT
+// ============================================================================
+//
+// Issue #117: this handler accepted any `provider_model_id` the provider owned,
+// whatever its status. The UI filters the dropdown, so only a direct caller
+// could reach it — and Moira stores such a policy happily while `runtime.rs`,
+// which joins `provider_models` on `pm.status = 'active'`, never selects it. The
+// check lives here now, so the invariant does not depend on the client.
 //
 // Re-checks the session itself — `app/api/**` is outside every route group.
 
-import { badRequest, notFound, readJsonBody, withConsoleSession } from "@/lib/console-api";
+import {
+  badRequest,
+  lookupOnPage,
+  notFound,
+  readJsonBody,
+  withConsoleSession,
+} from "@/lib/console-api";
 import { CONSOLE_MESSAGE_KEYS } from "@/lib/i18n/keys";
 import { GENERAL_ROUTE_KEY } from "@/lib/llm-view";
 import { LIST_PAGE_LIMIT } from "@/lib/llm-settings";
@@ -68,8 +85,31 @@ export async function POST(
 
     const provider = await client.getProvider(id);
     const models = await client.listProviderModels(provider.id, { limit: LIST_PAGE_LIMIT });
-    const model = models.data.find((row) => row.id === requestedModelId);
-    if (model === undefined) return notFound(CONSOLE_MESSAGE_KEYS.llm_model_not_found);
+    const found = lookupOnPage(models, (row) => row.id === requestedModelId);
+    // The same rule the dedupe below already applied to the policy list, now
+    // applied to the model list too (issue #117): a truncated page is refused,
+    // not reported as a model this provider does not own.
+    if (found.kind === "truncated") return badRequest(CONSOLE_MESSAGE_KEYS.llm_list_truncated);
+    if (found.kind === "absent") return notFound(CONSOLE_MESSAGE_KEYS.llm_model_not_found);
+    const model = found.row;
+
+    // THE MODEL'S STATUS IS ENFORCED HERE, NOT ONLY IN THE SELECT (issue #117).
+    //
+    // The screen filters the dropdown, so this only fires for a caller posting
+    // directly — which is exactly the caller a server-side invariant is for. A
+    // policy bound to a `disabled` or `deprecated` model is STORED by Moira and
+    // then never selected: `runtime.rs` joins `provider_models` on
+    // `pm.status = 'active'`. The operator gets a routing row that reads as
+    // configured, a chain report that says routing exists, and completions that
+    // fail `no_eligible_model` with nothing on this screen contradicting them.
+    //
+    // Refused rather than repaired. Enabling the model as a side effect of
+    // binding routing would undo a disable the operator performed deliberately,
+    // from a control that never mentioned it; `POST .../models/{modelId}` is the
+    // door back, and it is one click away on the same screen.
+    if (model.status !== "active") {
+      return badRequest(CONSOLE_MESSAGE_KEYS.llm_model_not_selectable);
+    }
 
     const route = await client.findRouteByKey(GENERAL_ROUTE_KEY);
     if (route === null) return badRequest(CONSOLE_MESSAGE_KEYS.llm_general_route_missing);

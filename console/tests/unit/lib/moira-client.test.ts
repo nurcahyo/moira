@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 
 import { isMoiraRequestError } from "@/lib/errors";
+// The namespace import is load-bearing: the guard-invocation block at the foot
+// of this file derives the set of guards from this module's OWN exports, so a
+// guard added without a pin fails there rather than going unnoticed.
+import * as moiraClientModule from "@/lib/moira-client";
 import {
   AUTH_PROVIDER_OPERATION_NAMES,
   LLM_CONFIG_OPERATION_NAMES,
@@ -656,7 +660,65 @@ const credentialRecord = {
   version: 2,
 };
 
+/**
+ * Every registered operation that is NOT LLM runtime configuration and NOT an
+ * auth-provider operation, spelled out.
+ *
+ * Issue #113: `LLM_CONFIG_OPERATION_NAMES` is now DERIVED from the registry by
+ * path, which removes the drift the issue was about but leaves one question the
+ * derivation cannot answer on its own — "is this registry entry LLM
+ * configuration, and did anybody decide?". This list is the answer. Together
+ * with the two exported name sets it partitions `MOIRA_OPERATIONS` exactly, so
+ * registering ANY new operation fails here until somebody classifies it.
+ */
+const OPERATIONS_OUTSIDE_THE_LLM_AND_AUTH_PROVIDER_SURFACES = [
+  "claimAdminIdentity",
+  "createAdminInvite",
+  "createTrustedJwtIssuer",
+  "deleteAdminIdentity",
+  "enableTrustedJwtIssuer",
+  "getAdminInvite",
+  "getSetupAuthMethods",
+  "getSetupClaimStatus",
+  "getSetupSignInMethods",
+  "listAdminIdentities",
+  "listAdminInvites",
+  "listTrustedJwtIssuers",
+  "patchAdminIdentity",
+  "previewAdminInvite",
+  "redeemAdminInvite",
+  "revokeAdminInvite",
+] as const satisfies readonly MoiraOperationName[];
+
 describe("the LLM configuration surface is administration, never bootstrap", () => {
+  test("the derived set is COMPLETE: every operation is classified exactly once", () => {
+    // The completeness assertion issue #113 asked for, kept after the list was
+    // derived rather than dropped as redundant. Derivation stops the set going
+    // STALE; it cannot stop a family being added at a path nobody thought to
+    // include, and an LLM operation missing from this set inherits none of the
+    // security assertions below.
+    const all = (Object.keys(MOIRA_OPERATIONS) as MoiraOperationName[]).sort();
+    const classified = [
+      ...LLM_CONFIG_OPERATION_NAMES,
+      ...AUTH_PROVIDER_OPERATION_NAMES,
+      ...OPERATIONS_OUTSIDE_THE_LLM_AND_AUTH_PROVIDER_SURFACES,
+    ].sort();
+    expect(
+      classified,
+      "an operation is registered that no named surface claims, or one is claimed twice. If it " +
+        "is LLM runtime configuration, register it under one of the collections " +
+        "LLM_CONFIG_OPERATION_NAMES derives from; otherwise add it to the list above.",
+    ).toEqual(all);
+    // A floor, so an empty or broken derivation cannot make the rules below
+    // vacuous by having nothing to iterate.
+    expect(LLM_CONFIG_OPERATION_NAMES.length).toBeGreaterThanOrEqual(22);
+    // And the derivation still excludes the neighbouring surface whose path only
+    // LOOKS like this one's: `/api/v1/admin/auth/providers`.
+    for (const name of AUTH_PROVIDER_OPERATION_NAMES) {
+      expect(LLM_CONFIG_OPERATION_NAMES, `${name} is not LLM configuration`).not.toContain(name);
+    }
+  });
+
   test("every one of its operations requires a credential", () => {
     // The security posture stated as a property of the SET. The setup path is
     // unauthenticated by design — it runs before any admin exists — and none of
@@ -1102,4 +1164,231 @@ describe("a refused LLM write maps through lib/errors.ts like every other failur
     expect(JSON.stringify(caught.moiraError)).not.toContain("sk-fake-key-for-this-test");
     expect(String((caught as Error).stack ?? "")).not.toContain("sk-fake-key-for-this-test");
   });
+});
+
+/* -------------------------------------------------------------------------- */
+/* THE GUARDS ARE INVOKED, NOT MERELY EXPORTED (issue #113)                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * ============================================================================
+ * WHAT THIS BLOCK EXISTS FOR
+ * ============================================================================
+ *
+ * Every guard above is tested by CALLING IT DIRECTLY. Not one of those tests can
+ * observe whether the client method that is supposed to call it still does —
+ * they construct their own inputs, exactly as finding F25 described. Delete
+ * `assertProviderModelCreateIsSafe(...)` from `createProviderModel`'s body and
+ * every gate in this repo stayed green: the guard's own tests kept passing, and
+ * the method's tests only ever fed it VALID bodies.
+ *
+ * `tests/unit/architecture/guard-reachability.test.ts` cannot close this either,
+ * and says so about `readIdpSubject` for the same reason: these guards are
+ * defined and called inside `lib/moira-client.ts` alone, so its rule — "called
+ * from a file that is not the defining one" — can never apply to them.
+ *
+ * ============================================================================
+ * HOW EACH PIN IS BUILT SO IT REDS ON EXACTLY THAT DELETION
+ * ============================================================================
+ *
+ * Each row hands its method a body that ONLY its guard refuses, against a stub
+ * that ANSWERS THAT ROUTE SUCCESSFULLY. That second half is what makes the
+ * failure unambiguous:
+ *
+ *   guard present -> rejects with MoiraClientContractError, nothing on the wire
+ *   guard deleted -> the request is sent, the stub answers 2xx, the call RESOLVES
+ *
+ * so a deleted guard fails on the rejection assertion rather than on some
+ * incidental transport error a hostile stub would also have produced.
+ * `stub.requests` is then asserted EMPTY: a guard that threw after the request
+ * had already gone out would satisfy the rejection and still have written.
+ *
+ * The `ifMatch` arguments below are deliberately non-empty. `#buildHeaders`
+ * refuses an empty precondition, and that refusal is ALSO a
+ * `MoiraClientContractError` — a pin that let it fire would pass with the guard
+ * gone.
+ */
+
+interface GuardPin {
+  /** The exported guard whose call site is being pinned. */
+  readonly guard: string;
+  /** The client method that must call it. */
+  readonly method: string;
+  /** The route the stub answers successfully, and that must stay untouched. */
+  readonly route: string;
+  /** The body only this guard refuses, sent through the real method. */
+  readonly call: (client: MoiraClient) => Promise<unknown>;
+  /** What ships if the call site is gone, quoted in the failure message. */
+  readonly consequence: string;
+}
+
+const GUARD_PINS: readonly GuardPin[] = [
+  {
+    guard: "assertClaimRequestIsSafe",
+    method: "claimAdminIdentity",
+    route: "POST /api/v1/admin/setup/claim",
+    call: (client) =>
+      client.claimAdminIdentity({
+        email: "ops@example.com",
+        email_verified: true,
+        scopes: [],
+      } as unknown as Parameters<MoiraClient["claimAdminIdentity"]>[0]),
+    consequence:
+      "`scopes: []` reaches Moira and creates a permanent admin grant with zero scopes — a no-op " +
+      "admin that no retry can revoke",
+  },
+  {
+    guard: "assertTrustedIssuerCreateIsSafe",
+    method: "createTrustedJwtIssuer",
+    route: "POST /api/v1/admin/jwt-issuers",
+    call: (client) =>
+      client.createTrustedJwtIssuer({
+        issuer: "https://console.example.com",
+        scopes_claim: "scopes",
+      } as unknown as Parameters<MoiraClient["createTrustedJwtIssuer"]>[0]),
+    consequence:
+      "the console's own issuer is created able to self-assert scopes, displacing admin_identities " +
+      "as the source of human authorization",
+  },
+  {
+    guard: "assertProviderCreateIsSafe",
+    method: "createAuthProvider",
+    route: "POST /api/v1/admin/auth/providers",
+    call: (client) =>
+      client.createAuthProvider({
+        display_name: "Console IdP",
+        trusted_jwt_issuer_id: "issuer-1",
+        enabled: false,
+      } as unknown as Parameters<MoiraClient["createAuthProvider"]>[0]),
+    consequence:
+      "`enabled` is sent on create, so the row's lifecycle no longer has enableAuthProvider() as " +
+      "its single commit point",
+  },
+  {
+    guard: "assertLlmProviderCreateIsSafe",
+    method: "createProvider",
+    route: "POST /api/v1/admin/providers",
+    call: (client) =>
+      client.createProvider({
+        provider_type: "open_ai_compatible",
+        display_name: "Local vLLM",
+      } as unknown as Parameters<MoiraClient["createProvider"]>[0]),
+    consequence:
+      "an open_ai_compatible provider is created with no base_url, silently falls back to the " +
+      "vendor's public API, and sends prompts the operator believed were local to a third party",
+  },
+  {
+    guard: "assertLlmProviderPatchIsSafe",
+    method: "patchProvider",
+    route: "PATCH /api/v1/admin/providers/prov-1",
+    call: (client) =>
+      client.patchProvider(
+        "prov-1",
+        { provider_type: "open_ai" } as unknown as Parameters<MoiraClient["patchProvider"]>[1],
+        "4",
+      ),
+    consequence:
+      "an immutable field is PATCHed, and additionalProperties:false answers a flat 400 naming " +
+      "nothing — a validation failure shown for a request that is impossible, not invalid",
+  },
+  {
+    guard: "assertProviderModelCreateIsSafe",
+    method: "createProviderModel",
+    route: "POST /api/v1/admin/providers/prov-1/models",
+    call: (client) =>
+      client.createProviderModel("prov-1", {
+        model_key: "Qwen/Qwen3-4B",
+      } as unknown as Parameters<MoiraClient["createProviderModel"]>[1]),
+    consequence:
+      "capabilities is stored as SQL null, routing's capability filter matches the row against " +
+      "nothing, and the first completion fails `no_eligible_model` naming neither model nor field",
+  },
+  {
+    guard: "assertCredentialCreateIsSafe",
+    method: "createProviderCredential",
+    route: "POST /api/v1/admin/provider-credentials",
+    call: (client) =>
+      client.createProviderCredential({
+        provider_id: "prov-1",
+        credential_type: "api_key",
+        scope: { type: "global" },
+        secret: { api_key: "k", endpoint: null },
+      } as unknown as Parameters<MoiraClient["createProviderCredential"]>[0]),
+    consequence:
+      "`endpoint: null` makes the untagged CredentialSecret match two arms at once and the request " +
+      "is refused as ambiguous, with no field named",
+  },
+  {
+    guard: "assertCredentialRotateIsSafe",
+    method: "rotateProviderCredential",
+    route: "POST /api/v1/admin/provider-credentials/cred-1/rotate",
+    call: (client) =>
+      client.rotateProviderCredential(
+        "cred-1",
+        { secret: { api_key: "k2", endpoint: null } } as unknown as Parameters<
+          MoiraClient["rotateProviderCredential"]
+        >[1],
+        "2",
+      ),
+    consequence: "the same untagged-union ambiguity, on the request that replaces a live key",
+  },
+  {
+    guard: "assertRoutingPolicyCreateIsSafe",
+    method: "createRoutingPolicy",
+    route: "POST /api/v1/admin/routing-policies",
+    call: (client) =>
+      client.createRoutingPolicy({
+        route_id: "",
+        provider_id: "prov-1",
+        provider_model_id: "mod-1",
+      } as unknown as Parameters<MoiraClient["createRoutingPolicy"]>[0]),
+    consequence:
+      "a policy is created with an empty foreign key on the one write that decides which provider " +
+      "live traffic reaches",
+  },
+];
+
+describe("every input guard is actually invoked by the method that owns it", () => {
+  test("the pinned set is EXACTLY the guards this module exports", () => {
+    // The completeness half. A tenth guard added without a pin here would ship
+    // with a call site nothing can see, which is the state issue #113 found the
+    // first nine in. Derived from the module's own exports rather than typed
+    // out, so it cannot be satisfied by editing a list.
+    const exported = Object.keys(moiraClientModule)
+      .filter((name) => /^assert[A-Za-z]*IsSafe$/.test(name))
+      .sort();
+    expect(exported.length, "no guards were discovered — this rule would pass on nothing").toBe(9);
+    expect(
+      GUARD_PINS.map((pin) => pin.guard).sort(),
+      "a guard is exported with no pin below. Add one: a body only that guard refuses, sent " +
+        "through the method that must call it, against a stub that would ANSWER it successfully.",
+    ).toEqual(exported);
+  });
+
+  for (const pin of GUARD_PINS) {
+    test(`${pin.method}() calls ${pin.guard}()`, async () => {
+      // The stub SUCCEEDS on this route. With the call site deleted the request
+      // is sent, this resolves, and the assertion below fails — which is the
+      // whole design of this test.
+      const { stub, client } = clientWith({
+        [pin.route]: () => ({ status: 200, body: { id: "irrelevant-to-this-assertion" } }),
+      });
+
+      const caught = await pin.call(client).then(
+        () => null,
+        (error: unknown) => error,
+      );
+
+      expect(
+        caught instanceof MoiraClientContractError,
+        `${pin.method}() did not refuse a body that ${pin.guard}() refuses, so the guard call is ` +
+          `gone from its body. Consequence: ${pin.consequence}.`,
+      ).toBe(true);
+      expect(
+        stub.requests.map((request) => request.route),
+        `${pin.method}() reached Moira before refusing. A guard that throws after the write has ` +
+          "already gone out is not a guard.",
+      ).toEqual([]);
+    });
+  }
 });

@@ -1157,3 +1157,183 @@ describe("provider input is validated before the first Moira write", () => {
     expect(stub.routes()).toEqual([]);
   });
 });
+
+/* -------------------------------------------------------------------------- */
+/* THE MODEL'S STATUS IS THE SERVER'S INVARIANT, NOT THE SELECT'S (issue #117) */
+/* -------------------------------------------------------------------------- */
+
+describe("routing refuses a model routing would never select", () => {
+  // The select on `/settings/llm` already filters these out, which is exactly
+  // why the check is asserted HERE: the only caller that can reach it is one
+  // posting directly, and "the client would not do that" is not an invariant.
+  //
+  // What ships without it is worse than an error. Moira STORES the policy; the
+  // screen then reports routing as configured; and `runtime.rs`, which joins
+  // `provider_models` on `pm.status = 'active'`, never selects it — so every
+  // completion fails `no_eligible_model` while the console says the chain is
+  // complete.
+  for (const status of ["disabled", "deprecated"]) {
+    test(`a \`${status}\` model cannot have routing bound to it`, async () => {
+      install({
+        handlers: handlers({
+          [MODEL_LIST]: () => ({ status: 200, body: page([modelRecord({ status })]) }),
+          [POLICY_LIST]: () => ({ status: 200, body: EMPTY_PAGE }),
+        }),
+      });
+      const response = await ROUTING_POST(
+        request("POST", { provider_model_id: MODEL_ID }),
+        params({ id: PROVIDER_ID }),
+      );
+      expect(response.status).toBe(400);
+      expect(errorOf(await json(response))["message_key"]).toBe(
+        CONSOLE_MESSAGE_KEYS.llm_model_not_selectable,
+      );
+      expect(stub.routes()).not.toContain(POLICY_CREATE);
+    });
+  }
+
+  test("it REFUSES rather than enabling the model as a side effect", async () => {
+    // The tempting repair, deliberately not made. `disabled` is a state an
+    // operator put the row into on purpose, and a control labelled "bind
+    // routing" that silently reverses it is a control that does something it
+    // does not say. The undo is one click away on the same screen.
+    install({
+      handlers: handlers({
+        [MODEL_LIST]: () => ({ status: 200, body: page([modelRecord({ status: "disabled" })]) }),
+        [POLICY_LIST]: () => ({ status: 200, body: EMPTY_PAGE }),
+      }),
+    });
+    await ROUTING_POST(
+      request("POST", { provider_model_id: MODEL_ID }),
+      params({ id: PROVIDER_ID }),
+    );
+    expect(stub.routes()).not.toContain(MODEL_ENABLE);
+    expect(stub.routes()).not.toContain(POLICY_CREATE);
+  });
+
+  test("an active model still binds — the check is per-status, not blanket", async () => {
+    install({ handlers: handlers({ [POLICY_LIST]: () => ({ status: 200, body: EMPTY_PAGE }) }) });
+    const response = await ROUTING_POST(
+      request("POST", { provider_model_id: MODEL_ID }),
+      params({ id: PROVIDER_ID }),
+    );
+    expect(response.status).toBe(201);
+    expect(stub.routes()).toContain(POLICY_CREATE);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* "NOT ON PAGE ONE" IS NOT "DOES NOT EXIST" (issue #117)                      */
+/* -------------------------------------------------------------------------- */
+
+/** A page that answers nothing and admits there is more. */
+const TRUNCATED = () => ({
+  status: 200,
+  body: { data: [], pagination: { has_more: true, next_cursor: "page-two" } },
+});
+
+describe("an ownership lookup that ran out of page says so", () => {
+  // The dedupe inside `POST .../routing` already refused a truncated policy
+  // list; these four lookups did not. Each listed one page and took
+  // `.find(...) ?? null`, so a row on page two was answered 404 — "that model
+  // does not belong to this provider" about a model that does, on the screen
+  // whose whole job is to explain the deployment.
+  //
+  // Fail-closed either way, and that is the point: the fix is not about
+  // reachability, it is about the console not asserting something false. The
+  // keyed refusal `llm_list_truncated` already exists and already says the true
+  // thing.
+  const cases: ReadonlyArray<{
+    readonly what: string;
+    readonly listRoute: string;
+    readonly call: () => Promise<Response>;
+    readonly write: string;
+  }> = [
+    {
+      what: "disabling a model",
+      listRoute: MODEL_LIST,
+      call: () => MODEL_DELETE(request("DELETE"), params({ id: PROVIDER_ID, modelId: MODEL_ID })),
+      write: MODEL_DISABLE,
+    },
+    {
+      what: "enabling a model",
+      listRoute: MODEL_LIST,
+      call: () =>
+        MODEL_ENABLE_POST(request("POST"), params({ id: PROVIDER_ID, modelId: MODEL_ID })),
+      write: MODEL_ENABLE,
+    },
+    {
+      what: "disabling a credential row",
+      listRoute: CREDENTIAL_LIST,
+      call: () =>
+        CREDENTIAL_DELETE(
+          request("DELETE"),
+          params({ id: PROVIDER_ID, credentialId: CREDENTIAL_ID }),
+        ),
+      write: CREDENTIAL_DISABLE,
+    },
+    {
+      what: "enabling a credential row",
+      listRoute: CREDENTIAL_LIST,
+      call: () =>
+        CREDENTIAL_ENABLE_POST(
+          request("POST"),
+          params({ id: PROVIDER_ID, credentialId: CREDENTIAL_ID }),
+        ),
+      write: CREDENTIAL_ENABLE,
+    },
+    {
+      what: "disabling a routing policy",
+      listRoute: POLICY_LIST,
+      call: () =>
+        ROUTING_DELETE(request("DELETE"), params({ id: PROVIDER_ID, policyId: POLICY_ID })),
+      write: POLICY_DISABLE,
+    },
+    {
+      what: "enabling a routing policy",
+      listRoute: POLICY_LIST,
+      call: () =>
+        ROUTING_ENABLE_POST(request("POST"), params({ id: PROVIDER_ID, policyId: POLICY_ID })),
+      write: POLICY_ENABLE,
+    },
+    {
+      what: "binding routing to a model",
+      listRoute: MODEL_LIST,
+      call: () =>
+        ROUTING_POST(
+          request("POST", { provider_model_id: MODEL_ID }),
+          params({ id: PROVIDER_ID }),
+        ),
+      write: POLICY_CREATE,
+    },
+  ];
+
+  for (const scenario of cases) {
+    test(`${scenario.what}: a truncated page is llm_list_truncated, not 404`, async () => {
+      install({ handlers: handlers({ [scenario.listRoute]: TRUNCATED }) });
+      const response = await scenario.call();
+      expect(response.status).toBe(400);
+      expect(errorOf(await json(response))["message_key"]).toBe(
+        CONSOLE_MESSAGE_KEYS.llm_list_truncated,
+      );
+      // Still fail-closed: the truthful refusal must not have become a write.
+      expect(stub.routes()).not.toContain(scenario.write);
+    });
+  }
+
+  test("a COMPLETE page with no match is still a 404 — the two cases stay distinct", async () => {
+    // The other half. If `truncated` had simply replaced `absent`, an ownership
+    // violation would answer 400 "there are more rows than one page can show",
+    // which is a different untrue statement.
+    install({ handlers: handlers({ [MODEL_LIST]: () => ({ status: 200, body: EMPTY_PAGE }) }) });
+    const response = await MODEL_DELETE(
+      request("DELETE"),
+      params({ id: PROVIDER_ID, modelId: MODEL_ID }),
+    );
+    expect(response.status).toBe(404);
+    expect(errorOf(await json(response))["message_key"]).toBe(
+      CONSOLE_MESSAGE_KEYS.llm_model_not_found,
+    );
+    expect(stub.routes()).not.toContain(MODEL_DISABLE);
+  });
+});

@@ -659,41 +659,72 @@ export const AUTH_PROVIDER_OPERATION_NAMES = [
 ] as const satisfies readonly MoiraOperationName[];
 
 /**
+ * The collection segment — the fourth path segment of `/api/v1/admin/<here>` —
+ * of every family that makes up LLM runtime configuration.
+ *
+ * Compared as a WHOLE SEGMENT rather than as a string prefix. `providers` and
+ * `provider-models` are different families whose names share a prefix, and
+ * `/api/v1/admin/auth/providers` is a different surface entirely that a naive
+ * `startsWith` on `/api/v1/admin/provider` would swallow.
+ */
+const LLM_CONFIG_COLLECTIONS: ReadonlySet<string> = new Set([
+  "providers",
+  "provider-models",
+  "provider-credentials",
+  "routes",
+  "routing-policies",
+]);
+
+/** The collection segment of a spec path, or `""` if it has none. */
+function collectionSegmentOf(path: string): string {
+  // ["", "api", "v1", "admin", "<collection>", …]
+  const segments = path.split("/");
+  if (segments[1] !== "api" || segments[2] !== "v1" || segments[3] !== "admin") return "";
+  return segments[4] ?? "";
+}
+
+/**
  * The LLM runtime-configuration surface: the operations an LLM settings page may
  * reach, named so a test can assert properties of the SET rather than of each
  * entry — "all of them require a credential", "the routes family is read-only".
  *
- * `POST /api/v1/admin/routes`, `DELETE` on every family, and
- * `PUT .../runtime-policy` are all real operations that are deliberately absent.
- * The last is worth naming because it is the one mutation in Moira's whole admin
- * surface with an OPTIONAL `If-Match`, and a registry that carried it would
- * invite "If-Match is required on writes" to be read as a rule with no
- * exceptions.
+ * ============================================================================
+ * DERIVED FROM THE REGISTRY, NOT TRANSCRIBED FROM IT (issue #113)
+ * ============================================================================
+ *
+ * This was a hand-maintained array of twenty-two names. It was exact when it was
+ * written and nothing made it stay exact: registering a twenty-third operation
+ * under one of these families left the list silently short, and every set-level
+ * assertion built on it — "every LLM operation requires a credential", in this
+ * file AND in `tests/contract/openapi-contract.test.ts` — then passed by not
+ * looking at the new entry. A list that shrinks its own coverage without failing
+ * is worse than no list.
+ *
+ * Deriving it removes the drift instead of detecting it: membership is now a
+ * consequence of the path an operation is registered at, so a new operation on
+ * one of these families joins the set the moment it exists and inherits every
+ * assertion.
+ *
+ * WHAT REMAINS DELIBERATE, AND WHERE IT IS NOW PINNED. The absences were the
+ * hand-written list's real content, and they are absences from `MOIRA_OPERATIONS`
+ * itself — not from this array — so deriving preserves every one of them:
+ *
+ *   `POST /api/v1/admin/routes`     unregistered; pinned by the "routes family is
+ *                                   READ-ONLY" assertions in the unit and
+ *                                   contract suites, which count GET/GET.
+ *   `DELETE` on every family        unregistered; the console disables instead.
+ *   `PUT .../runtime-policy`        unregistered, and worth naming: it is the one
+ *                                   mutation in Moira's whole admin surface with
+ *                                   an OPTIONAL `If-Match`, which `requiresIfMatch`
+ *                                   cannot express. Pinned by name in
+ *                                   `openapi-contract.test.ts`.
+ *
+ * The type is `readonly MoiraOperationName[]` rather than a literal tuple: a
+ * derived value has no literal type, and the names were never used as literals.
  */
-export const LLM_CONFIG_OPERATION_NAMES = [
-  "listProviders",
-  "createProvider",
-  "getProvider",
-  "patchProvider",
-  "enableProvider",
-  "disableProvider",
-  "listProviderModels",
-  "createProviderModel",
-  "enableProviderModel",
-  "disableProviderModel",
-  "listProviderCredentials",
-  "createProviderCredential",
-  "enableProviderCredential",
-  "disableProviderCredential",
-  "rotateProviderCredential",
-  "listRoutes",
-  "getRoute",
-  "listRoutingPolicies",
-  "createRoutingPolicy",
-  "patchRoutingPolicy",
-  "enableRoutingPolicy",
-  "disableRoutingPolicy",
-] as const satisfies readonly MoiraOperationName[];
+export const LLM_CONFIG_OPERATION_NAMES: readonly MoiraOperationName[] = (
+  Object.keys(MOIRA_OPERATIONS) as MoiraOperationName[]
+).filter((name) => LLM_CONFIG_COLLECTIONS.has(collectionSegmentOf(MOIRA_OPERATIONS[name].path)));
 
 /* -------------------------------------------------------------------------- */
 /* Contract errors — the console built a request it is forbidden to build      */
