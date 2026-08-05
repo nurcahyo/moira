@@ -74,6 +74,15 @@
 // The partial unique index means each additional provider MUST get its own
 // trusted-issuer row: two enabled providers bound to one issuer is refused
 // `409 duplicate_enabled_provider_for_issuer` at the enable step.
+//
+// WHAT 4B DID NOT DO, so this module's generality is not mistaken for a
+// capability: the console still resolves sign-in only while EXACTLY ONE provider
+// is enabled (`ambiguityGuard`, `lib/auth-config.ts`). A second row is therefore
+// only reachable while nothing is enabled yet, and
+// `provisioningAdmissionFor` (`app/api/setup/route.ts`) refuses any run that
+// would take the deployment-wide enabled count above one. This module is
+// per-provider so that the limit lives in one place instead of being smeared
+// through the write ordering — not because two enabled providers work.
 
 import "server-only";
 
@@ -458,11 +467,13 @@ export function assertProviderIsBoundToTrustedIssuer(
  * through at all (a mistyped client secret, say) can no longer correct that row
  * from the console — no session can be obtained through a broken provider, so
  * there is nothing to prove operatorship with. Provisioning under a NEW SLUG is
- * not the way out, and must not be described as one: the broken row is still
- * enabled, so the console's second-provider gate (`operatorProofFor` in
- * `app/api/setup/route.ts`) refuses that create for the same missing proof, and
- * before that gate existed the write succeeded and left `ambiguityGuard`
- * refusing to resolve EITHER provider.
+ * not the way out, and must not be described as one: the console supports one
+ * enabled provider at a time, so `provisioningAdmissionFor` in
+ * `app/api/setup/route.ts` refuses that create outright (`409
+ * setup_single_enabled_provider_only`) while the broken row is still enabled.
+ * Before that refusal existed the write succeeded and left `ambiguityGuard`
+ * refusing to resolve EITHER provider — a worse position than the one it was
+ * reached from.
  *
  * The way out is the bootstrap system key the operator already holds, which is
  * the credential Moira's own admin API takes: disable the broken row
@@ -960,12 +971,14 @@ export interface SetupDeploymentState {
    * body chooses which one. So a count taken from `state` answers "nothing is
    * enabled here" for every slug this console does not already own — which is
    * precisely the slug a caller picks when they want the ungated CREATE path.
-   * A guard reading that count could be defeated by choosing a different slug.
+   * A rule reading that count could be defeated by choosing a different slug.
    *
    * The number that actually decides whether the console still works after a
    * provisioning run is the one `ambiguityGuard` (`lib/auth-config.ts`) reads on
    * the next cold resolve: enabled, `active`, deployment-wide. This is that
-   * number, counted with the same predicate, so the two cannot drift apart.
+   * number, counted with the same predicate, so the two cannot drift apart —
+   * and `provisioningAdmissionFor` in `app/api/setup/route.ts` refuses a run
+   * that would take it above one.
    */
   readonly enabledProviderIds: readonly string[];
 }

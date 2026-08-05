@@ -1,21 +1,16 @@
 [test]
-# Bun's default per-test deadline is 5s, and several React suites spend most of
-# a test inside `userEvent.type` — one awaited macrotask per keystroke, through
-# happy-dom, through React's controlled-input round trip. On an unloaded machine
-# `AuthSettingsStep.test.tsx` finishes those in well under a second; on a machine
-# also running a Rust build they cross 5s and the suite reds with `timed out`
-# rather than with a failed expectation.
+# THE PER-TEST DEADLINE IS NOT SET HERE, DELIBERATELY. `[test] timeout = 20000`
+# used to sit on this line and did nothing: Bun 1.3.14 reads this file — the
+# `preload` array below is what loads the modules — but silently ignores an
+# unknown `[test]` key, so the deadline stayed at Bun's 5s default while the
+# setting read as coverage it did not provide. It lives in
+# `./tests/support/test-deadline.ts` now, which states the reasoning and the
+# probe that proves the mechanism works.
 #
-# This raises the DEADLINE and nothing else: no assertion is relaxed, no test is
-# skipped, and a test that genuinely hangs still fails — 20s just fails it for
-# the right reason. Verified before changing it: the same suite that reported 9
-# `timed out` failures under load reported `38 pass, 0 fail` at a longer
-# deadline, and every one of the affected tests was one that types into five
-# form fields first.
-timeout = 20000
-
 # Order matters and each entry runs to completion before the next starts.
 #
+#   test-deadline     raises the per-test deadline. First, so a preload that is
+#                     itself slow on cold cache cannot burn a test's budget.
 #   native-globals    captures Bun's real `fetch` before happy-dom replaces it.
 #                     Must be before dom-register, or the capture is happy-dom's
 #                     own implementation, which silently drops Bun's per-request
@@ -30,4 +25,5 @@ preload = [
   "./tests/support/server-only-shim.ts",
   "./tests/support/dom-register.ts",
   "./tests/support/dom-setup.ts",
+  "./tests/support/test-deadline.ts",
 ]

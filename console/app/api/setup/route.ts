@@ -126,15 +126,15 @@
 // request does not need to pay for it.
 //
 // ============================================================================
-// A SECOND ENABLED PROVIDER IS A LOCKOUT, SO IT NEEDS THE SAME OPERATOR
+// ONE ENABLED PROVIDER. A SECOND IS A LOCKOUT, SO IT IS REFUSED OUTRIGHT
 // ============================================================================
 //
-// The gate above covers writes against an EXISTING row. It said nothing about
-// CREATING one, and that was reachable by an unauthenticated caller: POST
+// The gate above covers writes against an EXISTING row. It says nothing about
+// CREATING one, and the create path is reachable inside the setup window: POST
 // provision with a DIFFERENT slug, and the derived state for that slug's issuer
-// namespace is empty, so the create path ran ungated — new trusted issuer, new
-// provider row, secret sealed, row enabled. Moira permits it (each row binds its
-// own trusted issuer, so the partial unique index does not object).
+// namespace is empty, so a new trusted issuer, a new provider row, a sealed
+// secret and an enable all follow. Moira permits it (each row binds its own
+// trusted issuer, so the partial unique index does not object).
 //
 // The console then breaks. `ambiguityGuard` (`lib/auth-config.ts`) refuses ANY
 // resolution once more than one provider is enabled, so on the next cold resolve
@@ -143,11 +143,18 @@
 // enabled-row gate above permanently unsatisfiable. Not an escalation: a denial
 // of service that locks the operator out of their own wizard.
 //
-// So `operatorProofFor` asks for the same operator on that path too, and the
-// count it asks about is the count `ambiguityGuard` itself reads: enabled and
-// `active`, DEPLOYMENT-WIDE, from `SetupDeploymentState.enabledProviderIds`.
-// Counting inside the derived state instead would be counting inside a namespace
-// the caller chose, which is the same hole with an extra step.
+// The console therefore supports exactly ONE enabled auth provider, and
+// `provisioningAdmissionFor` says so at the point the second one would be
+// created — a 409 `setup_single_enabled_provider_only`, for every caller alike.
+// Demanding proof of an operator instead (which is what stood here first) stops
+// an anonymous caller and waves through the only person who can satisfy it: the
+// legitimate operator, who is then locked out by their own successful request.
+// A limit is not a permission, so it is not spelled as one.
+//
+// The count is the count `ambiguityGuard` itself reads: enabled and `active`,
+// DEPLOYMENT-WIDE, from `SetupDeploymentState.enabledProviderIds`. Counting
+// inside the derived state instead would be counting inside a namespace the
+// caller chose, which is the same hole with an extra step.
 //
 // This is the rule `ambiguityGuard` already enforces, moved to the point where
 // the damage would be done instead of discovered afterwards.
@@ -168,23 +175,24 @@
 //              and B's allow-list was never applied to it either. Refused 403,
 //              nothing written.
 //
-//   provision  the namespace stays caller-chosen, and that is the feature: an
-//              additional provider is registered under an operator-chosen
-//              stable slug (see `consoleIssuerForSlug`'s note on why the slug
-//              and not the row UUID). What the slug CANNOT do is choose a row:
-//              the derivation reads the trusted issuer for that namespace and
-//              then only the provider BOUND to it, so a slug this console does
-//              not already own can only ever create, never rewrite — and
+//   provision  the namespace stays caller-chosen, and that is the feature: a
+//              provider is registered under an operator-chosen stable slug (see
+//              `consoleIssuerForSlug`'s note on why the slug and not the row
+//              UUID). What the slug CANNOT do is choose a row: the derivation
+//              reads the trusted issuer for that namespace and then only the
+//              provider BOUND to it, so a slug this console does not already
+//              own can only ever create, never rewrite — and
 //              `scanAuthProviders` filters on exactly that binding.
 //
 //              What it also cannot do, since the lockout note above, is DECIDE
-//              WHETHER A CREATE IS GATED. The enabled-provider count that gate
-//              reads is deployment-wide, so choosing an unowned slug changes
-//              which namespace is written and nothing else. On a deployment
-//              with no enabled provider a well-formed slug nobody asked for
-//              still buys a new disabled-then-enabled row under a namespace
-//              with no admins, inside a window already gated on holding the
-//              bootstrap system key; on a deployment with one, it buys a 401.
+//              WHETHER A CREATE IS ALLOWED. The enabled-provider count that
+//              decision reads is deployment-wide, so choosing an unowned slug
+//              changes which namespace is written and nothing else. On a
+//              deployment with no enabled provider a well-formed slug nobody
+//              asked for still buys a new disabled-then-enabled row under a
+//              namespace with no admins, inside a window already gated on
+//              holding the bootstrap system key; on a deployment with one, it
+//              buys a 409 and nothing is written.
 
 import { consoleProviderIdFor, isInteractiveMethod, isProviderSlug } from "@/lib/auth-config";
 import { readJsonBody } from "@/lib/console-api";
@@ -448,7 +456,10 @@ function readSlug(value: unknown): { readonly slug: string | null } | Response {
  *
  * `admissible` is the set of `auth_provider_settings` rows a session must have
  * been established through to count. Never empty — a run that needs no proof
- * carries `null` instead of this — and always server-derived.
+ * carries `null` instead of this — and always server-derived. It holds exactly
+ * one row today, the one being re-saved; it stays a set because the comparison
+ * is a membership test either way and a one-element array is not a reason to
+ * write the test twice.
  */
 interface OperatorProofRequirement {
   readonly admissible: readonly string[];
@@ -461,63 +472,95 @@ interface OperatorProofRequirement {
 }
 
 /**
- * What this provisioning run must prove before it may run, or `null`.
+ * Whether this provisioning run may run at all, and what it must prove first.
  *
- * Two shapes need proof, and they are the same rule seen from two sides — a
- * provisioning run always ends with a provider ENABLED, so the question is
- * always "what does that do to a deployment that already has one?".
+ * A provisioning run ALWAYS ends with a provider enabled — step 4 of
+ * `runSetupProvisioning` is the commit point, and the only run that skips it is
+ * one whose row is enabled already. So the question is always "what does that do
+ * to a deployment that already has an enabled provider?", and there are exactly
+ * three answers:
  *
- *   RE-SAVE of an enabled row      The row is a live authenticator and PATCHing
- *                                  it re-points sign-in. An ESCALATION. Proof
- *                                  is a session through that same row.
- *   CREATE (or completing a        The run ADDS an enabled row. If the
- *   disabled row) while another    deployment already has one, the next cold
- *   provider is enabled            resolve sees two and `ambiguityGuard`
- *                                  refuses ALL of them: no sign-in button for
- *                                  either provider, `consoleRuntime` not ok,
- *                                  session resolution answering "no session"
- *                                  forever — which also makes the re-save gate
- *                                  above permanently unsatisfiable. A LOCKOUT.
- *                                  Proof is a session through a provider the
- *                                  deployment currently has enabled.
+ *   `ungated`   Nothing is enabled deployment-wide. The run takes the count from
+ *               0 to 1, which is the state the console supports. A first run,
+ *               and the completion of an interrupted one, land here and are
+ *               asked for nothing — there is no operator to prove yet, which is
+ *               inherent to first-run bootstrap and documented rather than
+ *               assumed.
+ *   `operator`  The run RE-SAVES the row that is already enabled. The count does
+ *               not change, but the row is a live authenticator and PATCHing it
+ *               re-points sign-in at another IdP. An ESCALATION, so proof is a
+ *               session established through that same row.
+ *   `refused`   The run would ADD a second enabled provider. See below.
  *
- * The second is the one a slug can otherwise walk around: an unauthenticated
- * caller inside the setup window posts a slug this console does not own, the
- * derived state for that namespace is empty, and the create path used to run
- * ungated. `SetupDeploymentState.enabledProviderIds` is therefore counted
- * DEPLOYMENT-WIDE with `ambiguityGuard`'s own predicate rather than read out of
- * the derived state — see its note on why a namespace-scoped count is exactly
- * the count a caller chooses.
+ * ============================================================================
+ * WHY THE THIRD IS A REFUSAL AND NOT A STRONGER PROOF
+ * ============================================================================
  *
- * The refusal is moved to where the damage would be done rather than left to be
- * discovered afterwards: `ambiguityGuard` already enforces this rule, but only
- * on the next resolve, by which time the row is written and enabled.
+ * This console supports exactly ONE enabled auth provider. That is not a policy
+ * choice made here, it is what `lib/auth-config.ts` does: `ambiguityGuard`
+ * refuses EVERY resolution once more than one row is enabled and `active`, so
+ * the next cold resolve renders no sign-in button for EITHER provider,
+ * `consoleRuntime` is not ok, and session resolution answers "no session"
+ * forever — which also makes the `operator` branch above permanently
+ * unsatisfiable. There is no session, no operator and no configuration under
+ * which two enabled providers work; wave 4B built the multi-provider resolution
+ * but did not switch it on, and `resolveAuthConfigs` returning N is capability,
+ * not permission.
  *
- * Nothing is demanded of the first run: an unprovisioned deployment has no
- * enabled provider, so there is no proof to be had and none is asked for. That
- * is inherent to first-run bootstrap and is documented rather than assumed.
+ * So proof of an operator is the wrong gate. It was the gate here until this
+ * change, and it stopped an anonymous caller while waving through the person the
+ * lockout actually harms: a legitimate operator signs in, satisfies the proof,
+ * gets their second provider created and enabled, and is locked out of their own
+ * console on the next reload. A gate that only the victim can pass is not a
+ * gate. The honest answer is that the limit is one, said at the point the second
+ * one would be created, with the remedy that actually exists — disable the
+ * current provider through Moira's admin API with the bootstrap system key
+ * (`docs/console-architecture.md` has the procedure), which takes the count back
+ * to 0 and puts this run on the `ungated` branch.
+ *
+ * ============================================================================
+ * THE COUNT IS DEPLOYMENT-WIDE, AND THAT IS LOAD-BEARING TWICE
+ * ============================================================================
+ *
+ * `SetupDeploymentState.enabledProviderIds` is collected with `ambiguityGuard`'s
+ * OWN predicate (`enabled && status === "active"`), deployment-wide, never out
+ * of the derived state. Once for correctness: the number that decides whether
+ * the console still resolves after this run is that number, so the two must not
+ * be able to drift. Once for security: `derived` describes the namespace the
+ * caller's `slug` selected, so a namespace-scoped count answers "nothing is
+ * enabled here" for every slug this console does not already own — which is
+ * exactly the slug an anonymous caller picks to reach an ungated create.
+ *
+ * The consequence, stated because an operator can meet it: a deployment with an
+ * enabled NON-INTERACTIVE provider row (a `jwt_bearer` method serving API
+ * clients, say) counts as having one, and the wizard refuses to add an
+ * interactive one beside it. That is not over-refusal — `ambiguityGuard` counts
+ * that row too, so the console would refuse to resolve sign-in afterwards. The
+ * previous gate reached the same deployment as an unsatisfiable 401.
  */
-function operatorProofFor(deployment: SetupDeploymentState): OperatorProofRequirement | null {
+type ProvisioningAdmission =
+  | { readonly kind: "ungated" }
+  | { readonly kind: "operator"; readonly requirement: OperatorProofRequirement }
+  | { readonly kind: "refused" };
+
+function provisioningAdmissionFor(deployment: SetupDeploymentState): ProvisioningAdmission {
   const derived = deployment.state;
   if (derived.providerId !== null && derived.providerEnabled) {
     return {
-      admissible: [derived.providerId],
-      absentCode: "setup_enabled_provider_requires_session",
-      absentKey: CONSOLE_MESSAGE_KEYS.setup_enabled_provider_requires_session,
-      mismatchCode: "setup_enabled_provider_session_mismatch",
-      mismatchKey: CONSOLE_MESSAGE_KEYS.setup_enabled_provider_session_mismatch,
+      kind: "operator",
+      requirement: {
+        admissible: [derived.providerId],
+        absentCode: "setup_enabled_provider_requires_session",
+        absentKey: CONSOLE_MESSAGE_KEYS.setup_enabled_provider_requires_session,
+        mismatchCode: "setup_enabled_provider_session_mismatch",
+        mismatchKey: CONSOLE_MESSAGE_KEYS.setup_enabled_provider_session_mismatch,
+      },
     };
   }
   // The derived row is absent or disabled, so it is not itself one of these:
   // whatever this run enables is an ADDITION to them.
-  if (deployment.enabledProviderIds.length === 0) return null;
-  return {
-    admissible: deployment.enabledProviderIds,
-    absentCode: "setup_second_provider_requires_session",
-    absentKey: CONSOLE_MESSAGE_KEYS.setup_second_provider_requires_session,
-    mismatchCode: "setup_second_provider_session_mismatch",
-    mismatchKey: CONSOLE_MESSAGE_KEYS.setup_second_provider_session_mismatch,
-  };
+  if (deployment.enabledProviderIds.length === 0) return { kind: "ungated" };
+  return { kind: "refused" };
 }
 
 /**
@@ -548,7 +591,7 @@ function operatorProofFor(deployment: SetupDeploymentState): OperatorProofRequir
  *
  * What that widens, stated: inside the setup window, anybody the deployment's
  * IdP will authenticate — not only an allow-listed address — can re-save the
- * enabled row, or add a second provider beside it. It does NOT admit an
+ * enabled row. It does NOT admit an
  * anonymous caller (the hole closed by the commit this gate came from), a
  * session through a row the requirement does not name, an unverified address,
  * or a session whose provider could not be resolved at all. Those keep their
@@ -741,15 +784,22 @@ async function provision(
   );
   const derived = deployment.state;
 
-  // ---- and who may spend that authority --------------------------------
+  // ---- and whether it may be spent at all, and by whom ---------------------
   //
-  // Which row may be written is settled above; this settles who may ask for the
-  // write. Two shapes need an operator and `operatorProofFor` decides which one
-  // applies: re-saving a live authenticator (an escalation) and adding a second
-  // enabled provider to a deployment that already has one (a lockout). Both are
-  // proved the same way — a session the console resolved against a provider row
-  // it names — and both are resolved by ONE call, so no path pays for a session
-  // read it does not need.
+  // Which row may be written is settled above; this settles whether the write
+  // may happen and who may ask for it. `provisioningAdmissionFor` decides which
+  // of the three shapes this run is: an ordinary run that takes the deployment
+  // from no enabled provider to one (nothing asked), a re-save of the live
+  // authenticator (an escalation — proved by a session through that same row),
+  // or a run that would leave the deployment with TWO enabled providers, which
+  // the console cannot resolve sign-in for at all. The last is refused outright
+  // rather than gated: see that function's note on why proof of an operator is
+  // the wrong question for a limit.
+  //
+  // The refusal precedes the session read, which is not merely an optimisation:
+  // the answer does not depend on the caller, so resolving a session in order to
+  // deliver the same 409 to everybody would be spending a Moira read to look
+  // like a gate.
   //
   // WHERE THIS SITS, honestly: it is the first check that consults the
   // DEPLOYMENT, not the first check in the handler. Two refusals run in `POST`
@@ -766,7 +816,21 @@ async function provision(
   // which would otherwise disclose the derived row's id and binding — and it
   // precedes every write. A new check that reads `derived`, `deployment` or
   // Moira belongs BELOW this line, not above it.
-  const operator = await operatorSessionFor(context, request, operatorProofFor(deployment));
+  const admission = provisioningAdmissionFor(deployment);
+  if (admission.kind === "refused") {
+    // A conflict with what the deployment currently IS, not a fact about the
+    // caller — so a 409, and the same answer for every caller alike.
+    return setupError(
+      409,
+      "setup_single_enabled_provider_only",
+      CONSOLE_MESSAGE_KEYS.setup_single_enabled_provider_only,
+    );
+  }
+  const operator = await operatorSessionFor(
+    context,
+    request,
+    admission.kind === "operator" ? admission.requirement : null,
+  );
   if (operator instanceof Response) return operator;
 
   // An EMPTY secret is acceptable in exactly one shape: a re-save of a provider

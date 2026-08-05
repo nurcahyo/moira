@@ -550,21 +550,25 @@ describe("a claim-time domain refusal focuses the allow-list with the instructio
 });
 
 /* -------------------------------------------------------------------------- */
-/* THE ESCAPE HATCH: a provider slug, in the UI rather than only in the BFF    */
+/* The provider slug, in the UI rather than only in the BFF                    */
 /* -------------------------------------------------------------------------- */
 //
-// An ENABLED provider row may only be re-saved by somebody who authenticated
-// through it. A row enabled with a mistyped client secret authenticates nobody,
-// so it cannot be corrected — and `docs/console-architecture.md` names the way
-// out: "provision again under a different provider slug".
+// The slug picks the console-issuer namespace a provider is registered under. It
+// is a permanent choice — a URL path segment and part of the issuer string Moira
+// pins tokens to — so an operator who wants their own name for the provider has
+// to be able to make it BEFORE the first save, not discover it afterwards. The
+// form had no field for it at all, so every wizard provision resolved to the
+// incumbent console issuer and the only way to choose otherwise was a
+// hand-crafted POST.
 //
-// That instruction was unfollowable. The form had no slug field and never sent
-// one, so every wizard provision resolved to the incumbent console issuer and
-// derived the same enabled row; the only remaining paths were a hand-crafted
-// POST or Moira's admin API. The tests below are what stops the documented
-// remedy from silently becoming a dead end again.
+// What it is NOT is an escape hatch from a provider enabled with credentials
+// nobody can sign in with. The console supports one enabled sign-in provider at
+// a time, so that run is refused `409 setup_single_enabled_provider_only` before
+// anything is written (`tests/unit/api/setup-route.test.ts` owns that property).
+// The tests below are about the field's plumbing: what it sends, what it seeds
+// from, and what it invalidates when it changes.
 
-describe("the wizard can provision under a different provider slug", () => {
+describe("the wizard can provision under a chosen provider slug", () => {
   test("a typed slug reaches the BFF on the provision body", async () => {
     const { calls, fetchImpl } = makeFetch([
       { status: 201, body: { state: COMPLETE_STATE, provider_id: "moira-console-idp-recovery" } },
@@ -630,10 +634,9 @@ describe("the wizard can provision under a different provider slug", () => {
   });
 
   test("changing the slug drops the resume state — a new namespace is a CREATE", async () => {
-    // The escape hatch's whole point is a NEW row. `resume` names a provider the
-    // BFF derived for the OLD console issuer, and replaying it under a new slug
-    // is the disagreement answered `409 setup_resume_state_conflict` — which
-    // would leave the operator exactly as stuck as before.
+    // A new slug means a NEW row. `resume` names a provider the BFF derived for
+    // the OLD console issuer, and replaying it under a new slug is the
+    // disagreement answered `409 setup_resume_state_conflict`.
     const { calls, fetchImpl } = makeFetch([{ status: 201, body: { state: COMPLETE_STATE } }]);
     render(
       <AuthSettingsStep

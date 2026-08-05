@@ -98,18 +98,18 @@ interface FormEnvelope {
    *
    * This is the ONE field on this form that chooses a different provider row
    * rather than rewriting the derived one: a new slug is a new trusted issuer
-   * and a new row, so an ADDITIONAL provider can be registered beside the
-   * incumbent.
+   * and a new row, so a provider can be registered under a name of the
+   * operator's choosing instead of the incumbent one.
    *
-   * It is NOT an escape hatch from a provider enabled with credentials nobody
-   * can sign in with, and must not be presented as one. Enabling a second
-   * provider while one is already enabled needs the same proof of an operator a
-   * re-save does (`operatorProofFor` in `app/api/setup/route.ts`), which is
-   * exactly what a broken provider cannot supply — and before that gate existed
-   * the write went through and left `ambiguityGuard` refusing to resolve EITHER
-   * provider. That repair is `docs/console-architecture.md`'s: disable the
-   * broken row through Moira's admin API with the bootstrap system key, then
-   * finish here.
+   * What it is NOT is a way to add a provider beside an ENABLED one, and it must
+   * not be presented as one — least of all as the escape hatch from a provider
+   * enabled with credentials nobody can sign in with. The console supports one
+   * enabled sign-in provider at a time (`ambiguityGuard` in
+   * `lib/auth-config.ts` refuses to resolve any deployment with more), so
+   * `provisioningAdmissionFor` in `app/api/setup/route.ts` refuses that run
+   * outright with `409 setup_single_enabled_provider_only`. That repair is
+   * `docs/console-architecture.md`'s: disable the broken row through Moira's
+   * admin API with the bootstrap system key, then finish here.
    */
   readonly slug: string;
   readonly displayName: string;
@@ -462,11 +462,12 @@ export function AuthSettingsStep({
         {/*
           Rendered as an ordinary field rather than hidden behind a disclosure:
           it is a permanent choice that becomes part of the sign-in URL, so an
-          operator who wants a second provider must be able to see it before
-          they save rather than discover it afterwards. Empty is the normal
-          answer and the whole first run never touches it. See the `slug` field
-          on `AuthSettingsForm` for what this is NOT — it is not the way out of
-          a provider enabled with credentials nobody can sign in with.
+          operator who wants their own name for the provider must be able to see
+          it before they save rather than discover it afterwards. Empty is the
+          normal answer and the whole first run never touches it. See the `slug`
+          field on `FormEnvelope` for what this is NOT — it is not a way to add
+          a provider beside an enabled one, and not the way out of a provider
+          enabled with credentials nobody can sign in with.
         */}
         <div className={styles.field}>
           <Label htmlFor={slugFieldId}>{t(CONSOLE_MESSAGE_KEYS.setup_auth_slug_label)}</Label>

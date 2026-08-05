@@ -169,24 +169,31 @@ remove it.
   whose provider cannot be resolved is not. The cost is stated plainly: inside
   the setup window, anybody the deployment's IdP will authenticate can re-save
   the enabled row, not only an allow-listed address.
-- **A second sign-in provider cannot be enabled by anyone who did not
-  authenticate through the first.** This one is a denial of service rather than
-  an escalation, and it was reachable by an unauthenticated caller: provisioning
-  under a *different* provider slug derives a different console-issuer namespace,
-  which is empty, so the create path used to run with nothing in its way. Moira
-  permits the write — each row binds its own trusted issuer — and the console
-  then breaks, because it refuses to resolve sign-in at all while more than one
-  provider is enabled. No sign-in button renders for *either* provider, session
-  resolution answers "no session" forever, and the enabled-row rule above becomes
-  permanently unsatisfiable. The operator is locked out of their own wizard.
+- **A second sign-in provider cannot be enabled at all — by anybody, however
+  they authenticated.** This one is a denial of service rather than an
+  escalation. The console resolves sign-in only while *exactly one* provider is
+  enabled: with two, it refuses every resolution, no sign-in button renders for
+  *either* provider, session resolution answers "no session" forever, and the
+  enabled-row rule above becomes permanently unsatisfiable. The operator is
+  locked out of their own wizard.
 
-  So a run that would enable a provider on a deployment that already has one
-  demands the same proof a re-save does: a console session resolved against a
-  provider the deployment currently has enabled. The count that decides this is
-  taken **deployment-wide**, not from the namespace the slug selects — a
-  namespace-scoped count is a count the caller chose. A deployment with nothing
-  enabled demands nothing, so a first run, and a deliberate multi-namespace setup
-  before anything is switched on, are both untouched.
+  The route reached it under a *different* provider slug, which derives a
+  different console-issuer namespace — an empty one, so the create path had
+  nothing in its way, and Moira permits the write because each row binds its own
+  trusted issuer. Demanding proof of an operator was not the fix: an
+  unauthenticated caller is stopped by it, and the one person who can satisfy it
+  is the legitimate operator, who then locks themselves out with a request that
+  succeeded. So a provisioning run that would leave the deployment with two
+  enabled providers is **refused outright**, before anything is written, with the
+  same answer for every caller: `409 setup_single_enabled_provider_only`, whose
+  message names the limit and points at the disable procedure below.
+
+  The count that decides this is taken **deployment-wide**, not from the
+  namespace the slug selects — a namespace-scoped count is a count the caller
+  chose — and it uses the same predicate the sign-in resolver uses (`enabled` and
+  `active`), so the two cannot disagree. A deployment with nothing enabled is
+  untouched: a first run, the completion of an interrupted one, and provisioning
+  under a chosen slug before anything is switched on all still work.
 - **A disabled row may still be completed without a session**, deliberately: it
   authenticates nobody, and requiring a session would make an interrupted first
   run unresumable.
@@ -220,31 +227,62 @@ authenticator.
 
 The way out is the bootstrap system key you already hold. Moira's admin API takes
 it directly — `POST /api/v1/admin/auth/providers/{id}/disable` and `PATCH
-/api/v1/admin/auth/providers/{id}` both accept `systemKeyAuth` — so:
+/api/v1/admin/auth/providers/{id}` both accept `systemKeyAuth`.
+
+Two things about that API are easy to get wrong, and getting either wrong is the
+whole difference between a recovery and a confusing refusal:
+
+- **The system key is a header of its own, `X-Moira-System-Key`.** It is not a
+  bearer token. `Authorization: Bearer <system key>` is read as a trusted JWT,
+  fails to verify, and answers `401` — the key never gets looked at.
+- **Every write on this resource requires `If-Match`,** carrying the row's
+  current `version`. `disable`, `enable`, `PATCH` and `DELETE` all declare it
+  `required`; without it the handler answers `400 if_match_required` before doing
+  anything. So the procedure is *read, then write* — three requests, not one.
 
 ```bash
+# 1. Find the enabled row. 200, with `data[]` — note the id of the broken one.
+curl -fsS \
+  -H "X-Moira-System-Key: $MOIRA_SYSTEM_KEY" \
+  "$MOIRA_API_URL/api/v1/admin/auth/providers" \
+  | jq -r '.data[] | select(.enabled) | "\(.id)\t\(.display_name)"'
+
+# 2. Read its CURRENT version. 200, and the same number also arrives as `ETag`.
+PROVIDER_ID=<the id from step 1>
+VERSION=$(curl -fsS \
+  -H "X-Moira-System-Key: $MOIRA_SYSTEM_KEY" \
+  "$MOIRA_API_URL/api/v1/admin/auth/providers/$PROVIDER_ID" | jq -r '.version')
+
+# 3. Disable it, with that version as the precondition. 200, and the row comes
+#    back with `"enabled": false` and `version` bumped by one.
 curl -fsS -X POST \
-  -H "Authorization: Bearer $MOIRA_SYSTEM_KEY" \
+  -H "X-Moira-System-Key: $MOIRA_SYSTEM_KEY" \
+  -H "If-Match: $VERSION" \
   "$MOIRA_API_URL/api/v1/admin/auth/providers/$PROVIDER_ID/disable"
 ```
 
+If step 3 answers `409 resource_version_conflict`, something changed the row
+between steps 2 and 3: re-run step 2 and try again. A quoted ETag value works
+too — the handler trims the quotes before parsing.
+
 **Disable the broken row, then finish in the wizard.** A disabled row
-authenticates nobody, so both console rules above stand down: the setup window
-will re-save it and enable it again with no session, exactly as it does for an
-interrupted first run. Reload `/setup`, correct the client id, secret or
-discovery URL in the auth-settings form, and save. This is the recommended
-sequence, because the OAuth **client secret lives in the console and not in
-Moira** — patching the row against Moira's API alone cannot fix a mistyped
-secret, and only the console's own form can.
+authenticates nobody and no longer counts towards the one-enabled-provider limit,
+so every console rule above stands down: the setup window will re-save it and
+enable it again with no session, exactly as it does for an interrupted first run.
+Reload `/setup`, correct the client id, secret or discovery URL in the
+auth-settings form, and save. This is the recommended sequence, because the OAuth
+**client secret lives in the console and not in Moira** — patching the row
+against Moira's API alone cannot fix a mistyped secret, and only the console's
+own form can.
 
 > **Do not** try to route around this by provisioning again under a *different*
-> provider slug. It fails on purpose. The broken row is still enabled, so
-> enabling a second one is refused unless you can sign in through the first —
-> which is the thing you cannot do. Before that refusal existed the write
-> succeeded and left the console unable to resolve *either* provider, which is a
-> worse position than the one you started in. Disable the broken row first; the
-> slug field is for adding a provider beside a working one, not for escaping a
-> broken one.
+> provider slug. It is refused on purpose, for everybody: the broken row is still
+> enabled, and the console supports one enabled sign-in provider at a time, so
+> the run comes back `409 setup_single_enabled_provider_only` with nothing
+> written. Before that refusal existed the write succeeded and left the console
+> unable to resolve *either* provider, which is a worse position than the one you
+> started in. Disable the broken row first; the slug names the provider you are
+> configuring, and it is not an escape hatch.
 
 ## Routes, layouts, and where the auth boundary sits
 

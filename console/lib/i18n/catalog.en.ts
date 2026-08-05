@@ -491,30 +491,24 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "unverified address, a domain outside the allow-list and an unresolvable provider each " +
       "keep their own key, because each has already done what this sentence tells them to do.",
   },
-  [K.setup_second_provider_requires_session]: {
-    key: K.setup_second_provider_requires_session,
+  [K.setup_single_enabled_provider_only]: {
+    key: K.setup_single_enabled_provider_only,
     message:
-      "This deployment already has an enabled sign-in provider. Sign in through it before adding " +
-      "another one.",
+      "This console supports one enabled sign-in provider at a time, and this deployment already " +
+      "has one. Disable the current provider through Moira's admin API using the bootstrap " +
+      "system key, then save here again.",
     description:
       "Provisioning would have ENABLED a second provider on a deployment that already has one, " +
-      "with no session behind the request (401). Not an escalation — a lockout: `ambiguityGuard` " +
-      "refuses every resolution once two providers are enabled, so the next cold resolve renders " +
-      "no sign-in button for EITHER of them and session resolution then answers 'no session' " +
-      "forever. An unauthenticated caller could reach this by naming a provider slug this " +
-      "console does not own, which is why the enabled count the gate reads is deployment-wide " +
-      "rather than taken from the slug's own namespace. Refused with nothing written.",
-  },
-  [K.setup_second_provider_session_mismatch]: {
-    key: K.setup_second_provider_session_mismatch,
-    message:
-      "You are signed in through a sign-in provider this deployment does not have enabled. Sign " +
-      "in through the enabled one before adding another.",
-    description:
-      "The same lockout refusal for a caller who DOES hold a valid session, established through " +
-      "a row that is not among the deployment's currently enabled providers. Separated because " +
-      "the remedy differs: sign out and back in through the enabled provider, rather than merely " +
-      "sign in.",
+      "and the console cannot render sign-in for either of them afterwards: `ambiguityGuard` " +
+      "(`lib/auth-config.ts`) refuses EVERY resolution once more than one provider is enabled, " +
+      "so the next cold resolve produces no sign-in button, `consoleRuntime` is not ok, and " +
+      "session resolution answers 'no session' forever. That is a lockout, not an escalation, " +
+      "and it is refused for every caller alike — an operator holding a session through the " +
+      "enabled provider satisfies no proof that makes the outcome survivable, so proof is not " +
+      "what is asked for. A 409, because it is a conflict with the deployment's current state " +
+      "rather than anything about the caller. The count is deployment-wide, taken with " +
+      "`ambiguityGuard`'s own predicate, so naming a provider slug this console does not own " +
+      "cannot shrink it. Refused with nothing written.",
   },
   [K.setup_provider_enabled_mid_save]: {
     key: K.setup_provider_enabled_mid_save,
@@ -811,23 +805,23 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "Label of the provider-slug field. The slug picks the console-issuer namespace this " +
       "provider is registered under, and a new slug means a new trusted issuer and a new " +
       "provider row rather than a rewrite of the incumbent. What it does NOT pick is whether " +
-      "the write is gated: the enabled-provider count that decides that is deployment-wide.",
+      "the write is allowed: the enabled-provider count that decides that is deployment-wide.",
   },
   [K.setup_auth_slug_hint]: {
     key: K.setup_auth_slug_hint,
     message:
       "Leave empty for the default provider. Enter a short name — lower-case letters, digits and " +
-      "hyphens — to register a SEPARATE provider beside it. Once a provider is enabled, adding " +
-      "another one requires signing in through the enabled one first. It becomes part of the " +
-      "sign-in URL and cannot be changed afterwards.",
+      "hyphens — to register this provider under its own name instead. It becomes part of the " +
+      "sign-in URL and cannot be changed afterwards. Only one sign-in provider can be enabled " +
+      "at a time, so a new name here does not add a second one beside an enabled provider.",
     description:
-      "Hint under the provider-slug field. Says what the slug is for (registering an additional " +
-      "provider in its own console-issuer namespace), what it costs (permanent — it is a URL " +
-      "path segment and part of the issuer string Moira pins tokens to), and the one condition " +
-      "on it. It deliberately no longer calls the slug an escape hatch from a provider enabled " +
-      "with credentials nobody can sign in with: enabling a second provider while the first is " +
-      "still enabled is refused for the same missing proof, and before that refusal existed the " +
-      "write locked the console out of BOTH providers. That repair runs through Moira's admin " +
+      "Hint under the provider-slug field. Says what the slug is for (choosing the " +
+      "console-issuer namespace this provider is registered under), what it costs (permanent — " +
+      "it is a URL path segment and part of the issuer string Moira pins tokens to), and the " +
+      "limit that bounds it. It deliberately does NOT offer the slug as a remedy for a provider " +
+      "enabled with credentials nobody can sign in with: a second enabled provider is refused " +
+      "outright (`setup_single_enabled_provider_only`), because the console cannot resolve " +
+      "sign-in for either of them once two are enabled. That repair runs through Moira's admin " +
       "API with the bootstrap system key — see `docs/console-architecture.md`.",
   },
   [K.setup_auth_display_name_label]: {

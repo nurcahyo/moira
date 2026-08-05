@@ -1475,23 +1475,33 @@ describe("an ENABLED provider is not re-pointed by a caller who cannot prove the
 });
 
 /* -------------------------------------------------------------------------- */
-/* THE LOCKOUT: a SECOND enabled provider is a denial of service              */
+/* THE LIMIT: the console supports ONE enabled provider, so a second is refused */
 /* -------------------------------------------------------------------------- */
 //
-// The gate above covers writes against an EXISTING row. It said nothing about
-// creating one, and the create path is reachable by an ANONYMOUS caller inside
-// the setup window: post a slug this console does not own and the derived state
-// for that namespace is empty, so nothing was in the way.
+// The gate above covers writes against an EXISTING row. It says nothing about
+// creating one, and the create path is reachable inside the setup window: post
+// a slug this console does not own and the derived state for that namespace is
+// empty, so nothing is in the way.
 //
 // Moira permits the write — each row binds its own trusted issuer, so the
 // partial unique index does not object — and the console then breaks.
 // `ambiguityGuard` refuses EVERY resolution once two providers are enabled: no
 // sign-in button for either, `consoleRuntime` not ok, session resolution
 // answering "no session" forever, and therefore the enabled-row gate above
-// permanently unsatisfiable. The operator is locked out of their own wizard by
-// a stranger who never authenticated.
+// permanently unsatisfiable.
+//
+// Demanding proof of an operator was the first answer, and it was the wrong
+// shape: it stops a stranger and admits the one person who can satisfy it — the
+// legitimate operator, who is then locked out by their own successful request.
+// The console supports ONE enabled provider, so that is what is enforced, at the
+// point the second one would be created, for every caller alike.
+//
+// THE MUTATION THESE TESTS EXIST FOR: change `provisioningAdmissionFor`'s last
+// line back to a proof requirement over `deployment.enabledProviderIds`, and
+// "THE OPERATOR MAY NOT" below goes red — a 201 with the second row created,
+// enabled and its secret sealed.
 
-describe("a SECOND enabled provider needs the same operator as a re-save", () => {
+describe("a SECOND enabled provider is refused, whoever asks", () => {
   const SECOND_SLUG = "backup";
   const SECOND_CONSOLE_ISSUER = `${CONSOLE_ISSUER}/idp/${SECOND_SLUG}`;
   const SECOND_ISSUER_ID = "55555555-5555-4555-8555-555555555555";
@@ -1531,7 +1541,14 @@ describe("a SECOND enabled provider needs the same operator as a re-save", () =>
     store.sealedIds.add(PROVIDER_ID);
   }
 
-  /** The same deployment, with the second provider's writes allowed through. */
+  /**
+   * The same deployment with every write route WORKING rather than throwing.
+   *
+   * This is the fixture that makes the mutation visible: if the refusal is
+   * removed, these handlers happily create the trusted issuer, create the
+   * provider row and enable it, so the test sees a 201 with a second enabled
+   * provider instead of a 409 — which is exactly the lockout, reproduced.
+   */
   function installIncumbentEnabledCreatable(session: SessionCheck): void {
     install({
       handlers: handlers({
@@ -1564,31 +1581,59 @@ describe("a SECOND enabled provider needs the same operator as a re-save", () =>
     store.sealedIds.add(PROVIDER_ID);
   }
 
-  test("THE ATTACK: an anonymous caller with a fresh slug is refused, nothing written", async () => {
-    installIncumbentEnabled(NO_SESSION);
-    const response = await POST(post(SECOND_PROVIDER_BODY));
-
-    expect(response.status).toBe(401);
+  /** The refusal, asserted whole: the code, the key, and nothing written. */
+  async function expectRefused(response: Response): Promise<void> {
+    expect(response.status).toBe(409);
     const error = errorOf(await json(response));
-    expect(error["code"]).toBe("setup_second_provider_requires_session");
-    expect(error["message_key"]).toBe(CONSOLE_MESSAGE_KEYS.setup_second_provider_requires_session);
+    expect(error["code"]).toBe("setup_single_enabled_provider_only");
+    expect(error["message_key"]).toBe(CONSOLE_MESSAGE_KEYS.setup_single_enabled_provider_only);
 
-    // The whole wire: the guard's claim-status read, and the derivation that
-    // answered both questions. Nothing was created, and nothing was sealed.
+    // The whole wire: the window's claim-status read, and the derivation that
+    // answered the question. Nothing was created, and nothing was sealed.
     expect(stub.routes()).toEqual([CLAIM_STATUS_ROUTE, ISSUER_LIST_ROUTE, PROVIDER_LIST_ROUTE]);
     expect(stub.routes().filter((route) => !route.startsWith("GET "))).toEqual([]);
     expect(store.puts).toEqual([]);
+  }
+
+  test("THE OPERATOR MAY NOT: a session through the enabled provider changes nothing", async () => {
+    // THE MUTATION TEST, and the finding this describe block was rewritten for.
+    //
+    // Every write route here WORKS. A legitimate operator, signed in through the
+    // deployment's own enabled provider — the strongest caller the setup window
+    // can see, and the one the previous gate was satisfied by — asks for a
+    // second provider under a slug of their own. If the refusal is removed they
+    // get a 201, a second enabled row, and a console that resolves sign-in for
+    // NEITHER provider on the next reload. There is no proof that makes that
+    // outcome survivable, so proof is not what is asked for.
+    installIncumbentEnabledCreatable(SIGNED_IN);
+    await expectRefused(await POST(post(SECOND_PROVIDER_BODY)));
+  });
+
+  test("...and so does the operator the allow-list refused", async () => {
+    // The one caller the re-save gate goes out of its way to admit. Admitting
+    // them HERE would hand the wizard's own remedy path a way to break the
+    // console, so the limit does not have an exception for them either.
+    installIncumbentEnabledCreatable(OPERATOR_OUTSIDE_THE_ALLOW_LIST);
+    await expectRefused(await POST(post(SECOND_PROVIDER_BODY)));
+  });
+
+  test("THE ATTACK: an anonymous caller with a fresh slug is refused, nothing written", async () => {
+    // The security property this block closed first, and it still holds: an
+    // unauthenticated caller inside the setup window cannot create and enable a
+    // second provider. It holds a fortiori now — nobody can.
+    installIncumbentEnabled(NO_SESSION);
+    await expectRefused(await POST(post(SECOND_PROVIDER_BODY)));
   });
 
   test("THE TEETH: the count is DEPLOYMENT-WIDE, and the slug cannot shrink it", async () => {
-    // The refusal above cannot have come from the derived state, and this is the
+    // The refusal cannot have come from the derived state, and this is the
     // proof: the console's own view model for that slug reports a namespace with
-    // NOTHING in it — no trusted issuer, no provider, not enabled. A guard
+    // NOTHING in it — no trusted issuer, no provider, not enabled. A rule
     // reading `derived.providerEnabled`, or counting providers bound to this
     // namespace, would see zero and let the write through.
     //
-    // This is what fails if `operatorProofFor` is ever changed to read the
-    // enabled count out of `deployment.state` instead of out of
+    // This is what fails if `provisioningAdmissionFor` is ever changed to read
+    // the enabled count out of `deployment.state` instead of out of
     // `deployment.enabledProviderIds`.
     installIncumbentEnabled(NO_SESSION);
     const view = await json(
@@ -1602,76 +1647,65 @@ describe("a SECOND enabled provider needs the same operator as a re-save", () =>
     });
 
     const response = await POST(post(SECOND_PROVIDER_BODY));
-    expect(response.status).toBe(401);
-    expect(errorOf(await json(response))["code"]).toBe("setup_second_provider_requires_session");
+    expect(response.status).toBe(409);
+    expect(errorOf(await json(response))["code"]).toBe("setup_single_enabled_provider_only");
   });
 
-  test("THE VARIANT: a valid session through a row this deployment has NOT enabled", async () => {
-    // A real, allow-listed, verified session — established through a provider
-    // that is not one of the deployment's enabled rows. Without this case the
-    // gate would be satisfied by "some session exists".
-    installIncumbentEnabled(SIGNED_IN_ELSEWHERE);
-    const response = await POST(post(SECOND_PROVIDER_BODY));
-
-    expect(response.status).toBe(403);
-    const error = errorOf(await json(response));
-    expect(error["code"]).toBe("setup_second_provider_session_mismatch");
-    expect(error["message_key"]).toBe(CONSOLE_MESSAGE_KEYS.setup_second_provider_session_mismatch);
-    expect(stub.routes()).toEqual([CLAIM_STATUS_ROUTE, ISSUER_LIST_ROUTE, PROVIDER_LIST_ROUTE]);
-    expect(store.puts).toEqual([]);
+  test("the answer does not depend on the caller, so it is the same for all of them", async () => {
+    // A limit is not a permission. Four callers the previous gate answered four
+    // different ways — 401 sign in, 403 wrong provider, 403 unverified, 201 —
+    // now get one answer, because the deployment is the thing that is wrong.
+    for (const session of [NO_SESSION, SIGNED_IN_ELSEWHERE, UNVERIFIED_HERE, OUTSIDER_ELSEWHERE]) {
+      installIncumbentEnabled(session);
+      const response = await POST(post(SECOND_PROVIDER_BODY));
+      expect(response.status).toBe(409);
+      expect(errorOf(await json(response))["code"]).toBe("setup_single_enabled_provider_only");
+      expect(store.puts).toEqual([]);
+    }
   });
 
-  test("a session refused for a reason signing in cannot fix keeps ITS OWN key", async () => {
-    // Same rule as the re-save gate: an address the IdP never verified is told
-    // that, not told to sign in again.
-    installIncumbentEnabled(UNVERIFIED_HERE);
-    const response = await POST(post(SECOND_PROVIDER_BODY));
-    expect(response.status).toBe(403);
-    expect(errorOf(await json(response))["code"]).toBe("email_not_verified");
-    expect(store.puts).toEqual([]);
-  });
-
-  test("THE OPERATOR MAY: signed in through the enabled provider, the second one lands", async () => {
-    // The capability is not removed, only gated. An operator who can prove they
-    // are the operator — the same proof the re-save path takes — still registers
-    // an additional provider under its own slug, in its own namespace.
-    installIncumbentEnabledCreatable(SIGNED_IN);
-    const response = await POST(post(SECOND_PROVIDER_BODY));
-
-    expect(response.status).toBe(201);
-    const body = await json(response);
-    expect(body["console_issuer"]).toBe(SECOND_CONSOLE_ISSUER);
-    expect(body["state"]).toMatchObject({
-      trustedJwtIssuerId: SECOND_ISSUER_ID,
-      providerId: SECOND_PROVIDER_ID,
-      providerEnabled: true,
+  test("the refusal costs no session read at all", async () => {
+    // It is not a fact about the caller, so resolving a session in order to
+    // deliver the same 409 to everybody would be spending a Moira read to look
+    // like a gate. A `readSession` that throws must never be reached.
+    stub = createMoiraStub(
+      handlers({
+        [ISSUER_LIST_ROUTE]: populatedIssuerList,
+        [PROVIDER_LIST_ROUTE]: enabledProviderList,
+        [ISSUER_CREATE_ROUTE]: () => {
+          throw new Error("a second trusted issuer was registered past the single-provider limit");
+        },
+        [PROVIDER_CREATE_ROUTE]: () => {
+          throw new Error("a second provider was created past the single-provider limit");
+        },
+      }),
+    );
+    store = new RecordingSecretStore();
+    const env = envWith();
+    setSetupWindowDependenciesForTests({
+      env,
+      client: new MoiraClient({
+        baseUrl: MOIRA_STUB_BASE_URL,
+        systemKey: env.moiraSystemKey,
+        fetch: stub.fetch,
+      }),
+      store,
+      storageMode: "ephemeral",
+      readSession: async () => {
+        throw new Error("the single-provider refusal resolved a session it does not need");
+      },
     });
-    expect(stub.routes()).toContain(PROVIDER_CREATE_ROUTE);
-    expect(stub.routes()).toContain(SECOND_ENABLE_ROUTE);
-    // The incumbent was not touched on the way.
-    expect(stub.routes()).not.toContain(PROVIDER_PATCH_ROUTE);
-    expect(store.puts).toEqual([
-      { providerId: SECOND_PROVIDER_ID, clientId: CLIENT_ID, plaintext: CLIENT_SECRET },
-    ]);
+
+    const response = await POST(post(SECOND_PROVIDER_BODY));
+    expect(response.status).toBe(409);
+    expect(errorOf(await json(response))["code"]).toBe("setup_single_enabled_provider_only");
   });
 
-  test("...and the operator the ALLOW-LIST refused is admitted here too", async () => {
-    // Deliberately the same bar as the re-save gate rather than a stricter one.
-    // The console's own `checkSession` applies the incumbent's
-    // `allowed_email_domains`, so an operator whose address is outside that list
-    // holds `ok:false / email_domain_not_allowed` resolved through the enabled
-    // row — and refusing them here would make "add a working provider" depend on
-    // the very list they cannot sign in past. What that widens is stated in the
-    // gate's own note and in `docs/console-architecture.md`.
-    installIncumbentEnabledCreatable(OPERATOR_OUTSIDE_THE_ALLOW_LIST);
-    expect((await POST(post(SECOND_PROVIDER_BODY))).status).toBe(201);
-  });
-
-  test("CONTROL: with NO provider enabled, a second namespace is still ungated", async () => {
-    // The interrupted or deliberate multi-namespace first run. Nothing is
-    // enabled, so nothing can be locked out, so nothing is demanded — and the
-    // slug field in the wizard keeps working on a deployment that has not
-    // finished setup.
+  test("CONTROL: with NO provider enabled, a chosen slug is still ungated", async () => {
+    // The interrupted first run, and the operator who wants their own name for
+    // the provider. Nothing is enabled, so this run takes the count to ONE and
+    // nothing can be locked out — the limit is one, not zero, and the slug field
+    // in the wizard keeps working on a deployment that has not finished setup.
     install({
       handlers: handlers({
         [ISSUER_LIST_ROUTE]: populatedIssuerList,
@@ -1713,7 +1747,7 @@ describe("a SECOND enabled provider needs the same operator as a re-save", () =>
   test("a DELETED enabled row does not count, because the resolver does not count it", async () => {
     // `ambiguityGuard` counts `enabled && status === "active"`. Counting a
     // deleted row here would refuse a create that breaks nothing, and the two
-    // numbers must be the same number or this gate refuses cases the console
+    // numbers must be the same number or this refusal fires on cases the console
     // then handles perfectly well.
     install({
       handlers: handlers({
@@ -2175,6 +2209,7 @@ describe("every key this route emits is real English", () => {
     CONSOLE_MESSAGE_KEYS.setup_claim_domain_not_allowed,
     CONSOLE_MESSAGE_KEYS.setup_enabled_provider_requires_session,
     CONSOLE_MESSAGE_KEYS.setup_enabled_provider_session_mismatch,
+    CONSOLE_MESSAGE_KEYS.setup_single_enabled_provider_only,
   ] as const;
 
   test("each resolves to English rather than to its own name", () => {
