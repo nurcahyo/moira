@@ -96,11 +96,30 @@ const fn min_api_key_prefix_length() -> usize {
     longest + 1 + MIN_RANDOM_PREFIX_CHARS
 }
 
-#[derive(Debug, Clone)]
+/// # `Debug` is hand-written for the same reason as [`crate::security::IdempotencyHasher`]
+///
+/// This type was **not** already redacted. What is redacted in this module is
+/// [`GeneratedApiKey::raw_key`], via `SecretString` — a different secret on a different type.
+/// The API-key pepper sat behind a plain `#[derive(Debug)]`, reachable from `AuthService`,
+/// which does derive `Debug` and is held for the lifetime of the process. A leaked pepper
+/// turns every stored Argon2id key hash into an offline-verifiable target, so it is redacted
+/// here and the derive is pinned by
+/// `crate::security::idempotency::tests::debug_redacts_the_pepper_everywhere_it_is_reachable`.
+#[derive(Clone)]
 pub struct ApiKeyHasher {
     pepper: Vec<u8>,
     pepper_version: String,
     prefix_length: usize,
+}
+
+impl std::fmt::Debug for ApiKeyHasher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiKeyHasher")
+            .field("pepper", &"[redacted]")
+            .field("pepper_version", &self.pepper_version)
+            .field("prefix_length", &self.prefix_length)
+            .finish()
+    }
 }
 
 /// A freshly minted API key. `raw_key` is the only place the plaintext exists — everything

@@ -47,9 +47,17 @@ pub struct PgAdminCommandTransaction {
 ///
 /// `legacy_key_hash` exists because the switch to keyed hashing (P1-1) changed the index
 /// key as well as the compared digest, so a row written before the switch is unreachable by
-/// the new key hash alone. It is `None` once the operator closes the dual-read window
-/// (`idempotency.accept_legacy_hashes = false`), which also removes the extra lookup it
-/// costs on every claim.
+/// the new key hash alone. The caller passes `None` to close that dual-read window, which
+/// also removes the extra lookup it costs on every claim. `idempotency.accept_legacy_hashes`
+/// is the setting that is *meant* to drive that choice, but no production construction site
+/// wires it into `AdminCommandRunner` yet, so on this path the window is currently always
+/// open regardless of configuration — tracked in `TODO.md`.
+///
+/// `legacy_actor_fingerprint` exists for the analogous reason on the other index column:
+/// peppering the actor fingerprint changed its spelling, so a claim must be able to address
+/// a pre-deploy row under either one. It is **not** governed by the same switch — the caller
+/// populates it unconditionally, because the two windows opened at different deploys and
+/// close independently. Both legacy values are read-only.
 #[derive(Debug, Clone)]
 pub struct AdminIdempotencyClaim {
     pub record_id: Uuid,
@@ -57,7 +65,10 @@ pub struct AdminIdempotencyClaim {
     pub key_hash: String,
     /// The pre-switch key hash, tried only when `key_hash` misses. Never written.
     pub legacy_key_hash: Option<String>,
+    /// The peppered fingerprint written for a fresh claim and tried first on lookup.
     pub actor_fingerprint: String,
+    /// The pre-pepper, unkeyed fingerprint. Read-only, never written.
+    pub legacy_actor_fingerprint: Option<String>,
     pub operation: String,
     /// The body digest written for a fresh claim.
     pub request_hash: String,
@@ -726,6 +737,15 @@ impl PgAdminCommandTransaction {
         &mut self,
         claim: &AdminIdempotencyClaim,
     ) -> Result<AdminIdempotencyClaimOutcome, AppError> {
+        // NOTE(rolling deploy): this key is derived from the *current* fingerprint, which
+        // changed spelling when the fingerprint was peppered. Two instances on opposite sides
+        // of a rolling deploy therefore derive different keys for the same actor and key, so
+        // they do not exclude each other for the duration of the rollout. The unique index
+        // still bounds the damage, but the two also insert at different index points, so a
+        // duplicate execution is possible in that window. Keying the lock on a
+        // migration-stable value fixes it and is tracked in `TODO.md` — it is a separate
+        // concern from the dual-read below, changes behaviour this suite pins explicitly, and
+        // wants its own change and its own test rather than riding along here.
         let lock_key =
             advisory_lock_key(&claim.key_hash, &claim.actor_fingerprint, &claim.operation);
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -746,39 +766,60 @@ impl PgAdminCommandTransaction {
             sleep(Duration::from_millis(20)).await;
         }
 
-        // Every key hash this claim can reach is swept: an expired pre-switch row must not
-        // be resurrected as a replay by the legacy lookup below.
+        // Every position in the unique index this claim can reach is swept: an expired
+        // pre-switch row must not be resurrected as a replay by the legacy lookups below.
+        // Both index columns have been redefined under deployed rows — the key hash by the
+        // HMAC switch (plan 03, P1-1) and the fingerprint by the pepper — so the sweep is
+        // the cross product of the spellings of each.
         let mut sweep_key_hashes = vec![claim.key_hash.clone()];
         sweep_key_hashes.extend(claim.legacy_key_hash.clone());
+        let mut sweep_fingerprints = vec![claim.actor_fingerprint.clone()];
+        sweep_fingerprints.extend(claim.legacy_actor_fingerprint.clone());
         sqlx::query(
             r#"
             delete from idempotency_records
             where idempotency_key_hash = any($1)
-              and actor_fingerprint = $2
+              and actor_fingerprint = any($2)
               and operation = $3
               and expires_at <= now()
             "#,
         )
         .bind(sweep_key_hashes)
-        .bind(&claim.actor_fingerprint)
+        .bind(&sweep_fingerprints)
         .bind(&claim.operation)
         .execute(self.connection())
         .await?;
 
-        // Dual lookup: the current key hash first, then the pre-switch one — the latter
-        // only while the dual-read window is open, so closing it removes the extra query
-        // (plan 03 finding F4). The advisory lock above is keyed on `claim.key_hash`, which
-        // is identical for every concurrent request carrying the same Idempotency-Key, so
-        // both branches stay serialized.
-        let mut existing = self
-            .load_idempotency(&claim.key_hash, &claim.actor_fingerprint, &claim.operation)
-            .await?;
-        if existing.is_none()
-            && let Some(legacy_key_hash) = &claim.legacy_key_hash
+        // Dual lookup on both index columns: the current spelling of each is tried first, so
+        // a post-deploy row always wins and a legacy hit is only ever *read*. The two windows
+        // close independently, so the query count falls in two steps rather than one: closing
+        // the key-hash window (`legacy_key_hash: None`, plan 03 finding F4) drops the inner
+        // probe, and retiring the fingerprint window drops the outer one. Only when both are
+        // closed does this collapse back to a single query.
+        //
+        // The advisory lock above is keyed on the *current* pair, which is identical for
+        // every concurrent request carrying the same Idempotency-Key and actor — so within
+        // one fingerprint spelling every branch below stays serialized against its peers.
+        // Across a rolling deploy that spelling differs; see the NOTE on the lock key.
+        let mut existing = None;
+        'sweep: for fingerprint in [
+            Some(&claim.actor_fingerprint),
+            claim.legacy_actor_fingerprint.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
         {
-            existing = self
-                .load_idempotency(legacy_key_hash, &claim.actor_fingerprint, &claim.operation)
-                .await?;
+            for key_hash in [Some(&claim.key_hash), claim.legacy_key_hash.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                existing = self
+                    .load_idempotency(key_hash, fingerprint, &claim.operation)
+                    .await?;
+                if existing.is_some() {
+                    break 'sweep;
+                }
+            }
         }
 
         if let Some(record) = existing {
