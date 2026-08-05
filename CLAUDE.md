@@ -15,6 +15,8 @@ Use `.claude/skills/moira-rig-integration/SKILL.md` for any work that touches Ri
 
 Follow the same source layout documented in `docs/project-structure.md`.
 
+Merging between the long-lived branches: a merge of `develop` into `main`, or `main` into `develop`, **must use a merge commit** (`gh pr merge <N> --merge`) — never `--squash`, never `--rebase`. Squashing a sync writes a new commit with no ancestry link to the source branch, which permanently diverges the two branches, makes `git merge-base --is-ancestor` and every "is this merged" check lie, and makes each later promotion re-conflict; PR #102 did exactly this. Feature and plan branches merging into `develop` still squash as normal. Read `plans/CONVENTIONS.md` §1A before merging either direction — GitHub cannot enforce the `main` → `develop` half, so it is on you.
+
 Core checks before handoff:
 
 ```bash

@@ -59,6 +59,57 @@ Each iteration plan is executed on its **own branch** and lands via **its own pu
 
 ---
 
+## 1A. Long-lived branches (`main` / `develop`) and merge method
+
+This repository has two long-lived branches. **`main`** is the default branch and the release branch; **`develop`** is the integration branch. Feature and plan branches land on `develop`; `develop` is periodically promoted to `main`, and `main` is occasionally synced back into `develop`.
+
+Unlike the rest of this file, this section is **not** scoped to the iteration plans. It binds **every** merge between `main` and `develop`, whoever or whatever performs it, plan-related or not.
+
+> **Note on §1.** §1 above was written before `develop` existed and still tells plan branches to branch from and land on `main`. Current practice is that all feature, fix, and plan branches target `develop` — of the last twelve merged pull requests, eleven based on `develop` and only the `develop` → `main` promotion based on `main`. Reconciling §1's wording is out of scope here; where the two differ on *base branch*, current practice governs, and nothing in §1 overrides the merge-method rule below.
+
+**A merge between the two long-lived branches — `develop` into `main`, or `main` into `develop`, in either direction — MUST use a merge commit. Never a squash, never a rebase.** On the command line that is `gh pr merge <N> --merge`; in the GitHub UI it is "Create a merge commit".
+
+**Feature and plan branches merging into `develop` continue to squash.** That rule is unchanged, and the `--squash` in `plans/RUNNER-PROMPT.md` §9.2 remains correct for those PRs. The prohibition here is deliberately narrow: it applies only to the two sync/promotion directions between `main` and `develop`. Do not generalise it, and do not generalise the squash habit into it.
+
+### Why (the reason is load-bearing — do not delete it and keep the rule)
+
+A squash discards the incoming branch's commits and writes one brand-new commit that has **no parent link to the branch it came from**. The history it appears to carry is not an ancestor of the result. Three consequences follow, and all three have already happened here:
+
+1. **The two branches diverge permanently.** The same change now exists twice, as two commits with different SHAs, and git has no way to know they are the same change.
+2. **The ordinary "is this merged?" checks stop telling the truth.** `git branch --merged`, `git merge-base --is-ancestor`, and GitHub's own merged indicators all answer from ancestry. After a squashed sync they report *not merged* for work that is demonstrably present in the tree.
+3. **Every subsequent promotion conflicts with the last.** Each promotion re-presents commits the target already contains under a different SHA, so the same conflicts must be resolved again, by hand, every time.
+
+**The instance — PR #102** (`sync/main-into-develop` → `develop`, merged 2026-08-04) squashed an entire `main`-into-`develop` sync into a single commit, `85e9528`, which has exactly one parent. All of the following is verifiable in the repository today:
+
+- The work of PR #57 exists on `main` as commit `b083812` and on `develop` as commit `85e9528`. The two are **patch-identical** — the same 12 files, the same 1096 insertions and 28 deletions — with different SHAs and unrelated parents.
+- `git merge-base --is-ancestor origin/main origin/develop` consequently reports that `main` is **not** contained in `develop`. The only substantive commit causing that is `b083812`, whose content `develop` has had since PR #102.
+- A later branch audit had to fall back on comparing **PR head SHAs** to establish what had actually shipped, because ancestry no longer answered the question. That fallback is a direct cost of PR #102, not a quirk of the audit.
+
+**The counter-example — PR #129** (`develop` → `main`, "release: promote develop to main", merged 2026-08-05) used a merge commit, `aa269e6`, which has two parents: the previous `main` and the promoted `develop` head. Because of that single choice, `git merge-base --is-ancestor origin/develop origin/main` answers cleanly, and the next promotion starts from a true common ancestor instead of replaying resolved conflicts. This is the shape every sync in both directions must have.
+
+### Enforcement — what is configuration, and what is discipline
+
+Stated plainly, because a rule that pretends to be enforced is worse than one that admits it is a convention.
+
+A GitHub repository ruleset can restrict merge methods (`pull_request.allowed_merge_methods`), but its `conditions.ref_name` matches only a pull request's **base** branch. **No condition in the ruleset or branch-protection schema inspects a PR's head branch.** Configuration therefore cannot express "no squash when the source is `main`" — only "no squash into this branch, from anywhere". That asymmetry decides what each half of this rule rests on:
+
+| Direction | Pinnable by configuration? | Why |
+|---|---|---|
+| `develop` → `main` | **Yes** | `main` receives promotions only. Narrowing `allowed_merge_methods` on `main` to `["merge"]` costs nothing, because no feature branch targets `main`. |
+| `main` → `develop` | **No** | `develop` also receives feature PRs, which must keep squashing. A merge-method restriction on `develop` would hit both kinds of PR, and configuration cannot tell them apart. |
+
+So: the `develop` → `main` half can and should be pinned in configuration. **The `main` → `develop` half rests entirely on the person or agent performing the merge choosing "Create a merge commit".** No setting will catch that mistake. Only a required status check that compares `head.ref` against `base.ref` could, and no such check exists in this repository.
+
+**Configuration state, verified 2026-08-06 — this is a snapshot, re-check it before relying on it:**
+
+- Neither `main` nor `develop` has classic branch protection; `GET /repos/nurcahyo/moira/branches/{branch}/protection` returns 404 for both.
+- One repository ruleset exists (id `20430947`, named `develop`, `enforcement: active`). Despite the name its conditions cover **both** long-lived branches (`~DEFAULT_BRANCH` and `refs/heads/develop`). It requires a pull request, but with `required_approving_review_count: 0`, and it declares **no required status checks**. Its `allowed_merge_methods` is `["merge", "squash", "rebase"]` — all three, so **no merge-method restriction is in force on either branch**.
+- Repository-wide, all three merge methods remain enabled.
+
+**Until `allowed_merge_methods` on `main` is narrowed to `["merge"]`, both halves of this rule are convention only, enforced by whoever clicks merge.**
+
+---
+
 ## 2. Required gates (every PR, no exceptions)
 
 **Rust (all plans touching `src/`, `migrations/`, `tests/`)**
