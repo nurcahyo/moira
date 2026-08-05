@@ -515,6 +515,16 @@ function resolveOne(
  * makes two enabled rows on one trusted issuer unrepresentable, so a
  * per-trusted-issuer version could never fire, and a guard that cannot fire is
  * the F25 shape with extra steps.
+ *
+ * WHAT THIS GUARD IS FOR, NOW THAT THE WRITE SIDE ALSO ENFORCES IT.
+ * `provisioningAdmissionFor` (`app/api/setup/route.ts`) refuses a provisioning
+ * run that would take the deployment-wide enabled count above one, counted with
+ * the predicate on the line below, so the wizard can no longer produce the state
+ * this function answers. It stays anyway, and is not redundant: the enabled
+ * count is Moira's, not the console's, and Moira's admin API enables rows
+ * without asking the console anything. This is what keeps a state the console
+ * cannot render from being rendered wrongly; the write-side refusal is what
+ * keeps an operator from walking into it through the UI.
  */
 export function ambiguityGuard(
   enabledCount: number,

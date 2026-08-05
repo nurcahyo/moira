@@ -28,21 +28,27 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createRemoteJWKSet, decodeProtectedHeader, jwtVerify } from "jose";
 import { memoryAdapter } from "better-auth/adapters/memory";
 
+import { POST as SETUP_POST } from "@/app/api/setup/route";
 import { CONSOLE_OAUTH_PROVIDER_ID, type ResolvedAuthConfig } from "@/lib/auth-config";
 import {
+  consoleSessionCheck,
   createConsoleMemoryDatabase,
   MissingIdpSubjectError,
   MOIRA_JWT_ALGORITHM,
   readIdpSubject,
 } from "@/lib/auth";
+import type { ConsoleSecretStore, SealedClientSecret } from "@/lib/console-secrets";
 import { readConsoleEnv, type ConsoleEnv } from "@/lib/env";
+import { MoiraClient } from "@/lib/moira-client";
 import {
   checkSession,
   mintMoiraToken,
   SESSION_REJECTION_MESSAGE_KEYS,
 } from "@/lib/moira-session";
+import { setSetupWindowDependenciesForTests } from "@/lib/setup-window";
 
 import { createBrowserAgent } from "../support/browser-agent";
+import { createMoiraStub, MOIRA_STUB_BASE_URL, type StubHandler } from "../support/moira-stub";
 import {
   reserveConsolePort,
   startConsoleServer,
@@ -318,13 +324,29 @@ describe("OAuth sign-in against a real mock IdP", () => {
   test("the session passes the console's own allow-list check", async () => {
     const check = checkSession(
       { email: OPERATOR.email, emailVerified: true, idpSubject: OPERATOR.sub },
-      { allowedEmailDomains: ["example.com"] },
+      // `consoleIssuer` is required from issue #71: the verdict carries the
+      // issuer of the configuration that authenticated the session, so the
+      // setup window's claim step can check a caller-supplied namespace
+      // against it.
+      {
+        allowedEmailDomains: ["example.com"],
+        consoleIssuer: "https://console.example",
+        moiraProviderId: "22222222-2222-4222-8222-222222222222",
+      },
     );
     expect(check.ok).toBe(true);
 
     const outsider = checkSession(
       { email: "someone@evilexample.com", emailVerified: true, idpSubject: "x" },
-      { allowedEmailDomains: ["example.com"] },
+      // `consoleIssuer` is required from issue #71: the verdict carries the
+      // issuer of the configuration that authenticated the session, so the
+      // setup window's claim step can check a caller-supplied namespace
+      // against it.
+      {
+        allowedEmailDomains: ["example.com"],
+        consoleIssuer: "https://console.example",
+        moiraProviderId: "22222222-2222-4222-8222-222222222222",
+      },
     );
     expect(outsider.ok).toBe(false);
   });
@@ -661,5 +683,255 @@ describe("a session outside the allow-list cannot be exchanged for a Moira crede
     } finally {
       permissive.stop();
     }
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The setup window's enabled-provider gate, on a REAL session                */
+/* -------------------------------------------------------------------------- */
+//
+// ============================================================================
+// WHAT THIS CLOSES THAT `tests/unit/api/setup-route.test.ts` CANNOT
+// ============================================================================
+//
+// That suite substitutes `readSession` wholesale, so no route test there
+// exercises the shipped resolution. Its fixtures are built by calling
+// `checkSession` rather than hand-written, which stops a route test being handed
+// a verdict the decider cannot produce — but `checkSession` is one level BELOW
+// the shipped path. Nothing there proves that a real cookie, resolved by
+// `consoleSessionCheck` against real Better Auth state, arrives at the gate in
+// the shape the gate admits.
+//
+// That matters for exactly one caller, and it is the one the whole PATCH path
+// exists for: the operator whose own email domain is missing from the
+// `allowed_email_domains` they have come back to widen. The console's own
+// session check refuses them (`email_domain_not_allowed`), and the gate admits
+// them anyway — but only because the refusal names the row that resolved it. If
+// `consoleSessionCheck` ever stopped carrying `resolvedProviderId` through, the
+// unit suite would stay green and the documented remedy would be a dead end on
+// every real deployment.
+//
+// So this drives the SHIPPED route handler with a SHIPPED session verdict from a
+// REAL authorization-code exchange. Only Moira is a stub, because Moira is the
+// one participant this repository does not run in-process here.
+
+describe("the setup window's re-save gate, driven by a real console session", () => {
+  const MOIRA_PROVIDER_ID = "11111111-1111-4111-8111-111111111111";
+  const TRUSTED_ISSUER_ID = "22222222-2222-4222-8222-222222222222";
+  const PROVIDER_GET_ROUTE = `GET /api/v1/admin/auth/providers/${MOIRA_PROVIDER_ID}`;
+  const PROVIDER_PATCH_ROUTE = `PATCH /api/v1/admin/auth/providers/${MOIRA_PROVIDER_ID}`;
+  /** The address the mock IdP signs in; `corp.test` deliberately excludes it. */
+  const WIDENED_DOMAINS = ["corp.test", "example.com"];
+
+  let idp: MockIdp;
+  let consoleServer: ConsoleServer;
+  let env: ConsoleEnv;
+  let configs: readonly ResolvedAuthConfig[];
+
+  /** Presence-only, which is all the route may consult. */
+  const store: ConsoleSecretStore = {
+    async put() {},
+    async read(): Promise<SealedClientSecret> {
+      return {
+        version: 1,
+        iv: "AAAA",
+        ciphertext: "AAAA",
+        clientId: CLIENT_ID,
+        updatedAt: "2026-08-05T00:00:00Z",
+      };
+    },
+    async reveal() {
+      return null;
+    },
+    async remove() {},
+    async newestUpdatedAt() {
+      return null;
+    },
+  };
+
+  function issuerRecord() {
+    return {
+      id: TRUSTED_ISSUER_ID,
+      // The CONSOLE's own issuer, which is what the derivation looks up.
+      issuer: env.bffIssuerUrl,
+      jwks_url: env.jwksUrl,
+      expected_audiences: [AUDIENCE],
+      allowed_algorithms: ["ES256"],
+      subject_claim: "sub",
+      clock_skew_seconds: 60,
+      allow_delegation: false,
+      status: "active",
+      created_at: "2026-08-05T00:00:00Z",
+      updated_at: "2026-08-05T00:00:00Z",
+      version: 1,
+      scopes_claim: null,
+    };
+  }
+
+  function providerRecord(overrides: Record<string, unknown> = {}) {
+    return {
+      id: MOIRA_PROVIDER_ID,
+      method: "generic_oidc",
+      display_name: "Mock IdP",
+      enabled: true,
+      requested_scopes: ["openid", "email", "profile"],
+      allowed_email_domains: ["corp.test"],
+      allowed_algorithms: [],
+      expected_audiences: [],
+      redirect_uris: [],
+      metadata: {},
+      status: "active",
+      created_at: "2026-08-05T00:00:00Z",
+      updated_at: "2026-08-05T00:00:00Z",
+      version: 2,
+      issuer: idp.issuer,
+      discovery_url: idp.discoveryUrl,
+      client_id: CLIENT_ID,
+      trusted_jwt_issuer_id: TRUSTED_ISSUER_ID,
+      ...overrides,
+    };
+  }
+
+  /**
+   * Wire the shipped setup route to a stub Moira and the REAL session read.
+   *
+   * `readSession` is the only substituted dependency that is not Moira, and it
+   * is substituted with the shipped function rather than with a fixture:
+   * `readConsoleSession` differs from this only by resolving `configs` through
+   * `consoleRuntime`, which would need a second Moira read of the same rows the
+   * stub below already serves.
+   */
+  function installSetupRoute(): ReturnType<typeof createMoiraStub> {
+    const handlers: Record<string, StubHandler> = {
+      "GET /api/v1/admin/setup/claim-status": () => ({ status: 200, body: { claimed: false } }),
+      "GET /api/v1/admin/jwt-issuers": () => ({
+        status: 200,
+        body: { data: [issuerRecord()], pagination: { has_more: false, next_cursor: null } },
+      }),
+      "GET /api/v1/admin/auth/providers": () => ({
+        status: 200,
+        body: { data: [providerRecord()], pagination: { has_more: false, next_cursor: null } },
+      }),
+      [PROVIDER_GET_ROUTE]: () => ({ status: 200, body: providerRecord() }),
+      [PROVIDER_PATCH_ROUTE]: () => ({
+        status: 200,
+        body: providerRecord({ version: 3, allowed_email_domains: WIDENED_DOMAINS }),
+      }),
+    };
+    const stub = createMoiraStub(handlers);
+    setSetupWindowDependenciesForTests({
+      env: { ...env, moiraSystemKey: "sk_test_bootstrap" },
+      client: new MoiraClient({
+        baseUrl: MOIRA_STUB_BASE_URL,
+        systemKey: "sk_test_bootstrap",
+        fetch: stub.fetch,
+      }),
+      store,
+      storageMode: "ephemeral",
+      readSession: (headers) => consoleSessionCheck(consoleServer.auth, configs, headers),
+    });
+    return stub;
+  }
+
+  function provisionRequest(cookie: string | null): Request {
+    return new Request(`${consoleServer.origin}/api/setup`, {
+      method: "POST",
+      headers:
+        cookie === null
+          ? { "content-type": "application/json" }
+          : { "content-type": "application/json", cookie },
+      body: JSON.stringify({
+        action: "provision",
+        method: "generic_oidc",
+        display_name: "Mock IdP",
+        issuer: idp.issuer,
+        discovery_url: idp.discoveryUrl,
+        client_id: CLIENT_ID,
+        // Empty on purpose: the remedy is "widen the list and save again", and
+        // the operator is not made to re-type a secret the console already holds.
+        client_secret: "",
+        allowed_email_domains: WIDENED_DOMAINS,
+        submission_id: "integration-submission-0001",
+      }),
+    });
+  }
+
+  beforeAll(async () => {
+    useNativeWhatwgGlobals();
+
+    const port = reserveConsolePort();
+    const consoleOrigin = `https://localhost:${port}`;
+    trustFixtureCa(consoleOrigin);
+
+    idp = await startMockIdp({ clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, user: OPERATOR });
+    trustFixtureCa(idp.origin);
+
+    env = envFor(consoleOrigin);
+    configs = [
+      {
+        ...configFor(idp, CLIENT_SECRET, env),
+        moiraProviderId: MOIRA_PROVIDER_ID,
+        trustedJwtIssuerId: TRUSTED_ISSUER_ID,
+        // OPERATOR is `operator@example.com`. This is the list they came back to
+        // widen, and it is the list their own session is refused by.
+        allowedEmailDomains: ["corp.test"],
+      },
+    ];
+    consoleServer = startConsoleServer(
+      { env, configs, database: memoryAdapter(createConsoleMemoryDatabase()) },
+      port,
+    );
+  });
+
+  afterAll(() => {
+    setSetupWindowDependenciesForTests(null);
+    consoleServer?.stop();
+    idp?.stop();
+    untrustFixtureCa();
+    restoreDomWhatwgGlobals();
+  });
+
+  test("the shipped resolver really produces the verdict the gate admits", async () => {
+    // The premise, asserted rather than assumed. Everything below depends on
+    // `consoleSessionCheck` refusing this operator on the allow-list AND naming
+    // the row that refused them; a resolver that returned `resolvedProviderId:
+    // null` would turn the next test's 201 into a 401 on a real deployment.
+    const outcome = await signIn(consoleServer.origin);
+    const headers = new Headers({ cookie: outcome.agent.cookieHeaderFor(consoleServer.origin) });
+    const check = await consoleSessionCheck(consoleServer.auth, configs, headers);
+
+    expect(check.ok).toBe(false);
+    if (check.ok) throw new Error("unreachable");
+    expect(check.rejection).toBe("email_domain_not_allowed");
+    expect(check.resolvedProviderId).toBe(MOIRA_PROVIDER_ID);
+  });
+
+  test("THE REMEDY, end to end: that operator widens the list and the PATCH lands", async () => {
+    const outcome = await signIn(consoleServer.origin);
+    const stub = installSetupRoute();
+
+    const response = await SETUP_POST(
+      provisionRequest(outcome.agent.cookieHeaderFor(consoleServer.origin)),
+    );
+
+    expect(response.status).toBe(201);
+    expect(stub.routes()).toContain(PROVIDER_PATCH_ROUTE);
+    const patched = stub.bodyOf(PROVIDER_PATCH_ROUTE) as Record<string, unknown>;
+    expect(patched["allowed_email_domains"]).toEqual(WIDENED_DOMAINS);
+  });
+
+  test("...and the same request without the cookie is refused, with nothing written", async () => {
+    // The negative control. Without it the test above would pass on a gate that
+    // admitted everybody, which is the hole the gate was added to close.
+    const stub = installSetupRoute();
+
+    const response = await SETUP_POST(provisionRequest(null));
+
+    expect(response.status).toBe(401);
+    const body = (await response.json()) as Record<string, unknown>;
+    expect((body["error"] as Record<string, unknown>)["code"]).toBe(
+      "setup_enabled_provider_requires_session",
+    );
+    expect(stub.routes()).not.toContain(PROVIDER_PATCH_ROUTE);
   });
 });

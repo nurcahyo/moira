@@ -1,6 +1,6 @@
-import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
 
+import { auditPage } from "./support/axe";
 import { APP_DIR } from "./support/paths";
 import {
   discoverPageRoutes,
@@ -10,6 +10,32 @@ import {
 } from "./support/routes";
 
 /**
+ * ============================================================================
+ * WHAT THIS FILE AUDITS ON `/setup`, AND WHERE THE REST OF IT IS AUDITED
+ * ============================================================================
+ *
+ * `/setup` is public, so the walker below visits it and axe runs — but THIS
+ * server has no `MOIRA_SYSTEM_KEY` and points at `https://moira.invalid`, so
+ * `withSetupWindow` answers `404 setup_unavailable` and `SetupWizard` renders
+ * its refusal panel. That panel is a real state of a real deployment (the
+ * operator removed the bootstrap key after finishing, which is what they are
+ * told to do), so auditing it here is correct — but for two waves it was ALL
+ * that was audited, and the line's name did not say so.
+ *
+ * The wizard's own steps — welcome, the auth-settings form, the sign-in
+ * surface, done — are audited by `setup-wizard.e2e.ts`, against the setup
+ * fixture console (`e2e/support/setup-fixture.ts`): the same standalone
+ * artifact, given a bootstrap key and a stub Moira on loopback, so the window
+ * actually opens and the steps actually render.
+ *
+ * REMAINING GAP, declared rather than implied: the `claim` SUB-SURFACE of
+ * `SignInClaimStep` (`stage === "claim"`) is not reached by any e2e. It is
+ * gated on a Better Auth session, which needs a completed OAuth round trip
+ * against a mock IdP inside the e2e environment — issue #72's harness. Until
+ * then it is covered by `tests/unit/modules/setup/SignInClaimStep.test.tsx`,
+ * and `setup-wizard.e2e.ts` asserts positively that the fixture stops at
+ * `sign_in`, so the gap cannot quietly become something else.
+ *
  * ============================================================================
  * AUTOMATED ACCESSIBILITY GATE — and what it could NOT see until wave 5
  * ============================================================================
@@ -91,9 +117,6 @@ import {
  */
 
 const routes: DiscoveredRoute[] = discoverPageRoutes(APP_DIR);
-
-const AXE_TAGS = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"];
-const BLOCKING_IMPACTS = new Set(["critical", "serious"]);
 
 /** Where the `(console)` layout sends an unauthenticated visitor. */
 const SIGN_IN_PATH = "/login";
@@ -216,27 +239,11 @@ test.describe("accessibility", () => {
           "describing a different page from the one it is named for",
       ).toBe(expectedPathname(route));
 
-      const results = await new AxeBuilder({ page }).withTags(AXE_TAGS).analyze();
-
-      await testInfo.attach(`axe-${route.pattern.replace(/\W+/g, "_")}.json`, {
-        body: JSON.stringify(results.violations, null, 2),
-        contentType: "application/json",
-      });
-
-      const blocking = results.violations.filter((v) => BLOCKING_IMPACTS.has(v.impact ?? ""));
-
-      const report = blocking
-        .map(
-          (v) =>
-            `  [${v.impact}] ${v.id}: ${v.help}\n` +
-            v.nodes.map((n) => `      ${n.target.join(" ")}`).join("\n") +
-            `\n      ${v.helpUrl}`,
-        )
-        .join("\n");
+      const audit = await auditPage(page, testInfo, route.pattern);
 
       expect(
-        blocking.map((v) => v.id),
-        `critical/serious accessibility violations on ${route.pattern}:\n${report}`,
+        audit.ids,
+        `critical/serious accessibility violations on ${route.pattern}:\n${audit.report}`,
       ).toEqual([]);
     });
   }

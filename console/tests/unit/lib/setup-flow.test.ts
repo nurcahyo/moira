@@ -21,13 +21,18 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import { MoiraClient } from "@/lib/moira-client";
 import {
   EMPTY_PROVISIONING_STATE,
+  SetupEnabledProviderSessionError,
   SetupOrderingError,
   SetupProvisioningError,
   assertB1Invariant,
+  assertEnabledProviderMayBeReSaved,
+  assertProviderIsBoundToTrustedIssuer,
   buildProviderCreateBody,
+  buildProviderPatchBody,
   claimAdminIdentity,
   claimIdempotencyKey,
   consoleIssuerConfigFor,
+  deriveProvisioningState,
   isProvisioningComplete,
   provisioningDeficiencies,
   reachableSetupStep,
@@ -38,6 +43,7 @@ import {
   type SetupProvisioningState,
   type SetupWizardState,
 } from "@/lib/setup-flow";
+import type { AuthProviderSettingsRecord } from "@/lib/types";
 import {
   MOIRA_STUB_BASE_URL,
   createMoiraStub,
@@ -162,6 +168,13 @@ function provisioningRequest(
       trustedJwtIssuer: "idem-issuer-0001",
       authProvider: "idem-provider-0001",
     },
+    // NO SESSION by default, because that is the true condition of the window
+    // this runs in: setup happens before the first admin exists and, on a fresh
+    // deployment, before any provider a human could sign in through. A default
+    // of "signed in as the operator" would quietly authorise every re-save
+    // below, which is precisely the fact under test — so the enabled-row cases
+    // pass `sessionProviderId` explicitly and visibly.
+    sessionProviderId: null,
     ...overrides,
   };
 }
@@ -456,6 +469,441 @@ describe("partial states are resumable, never restarted", () => {
 });
 
 /* -------------------------------------------------------------------------- */
+/* The update path — a SERVER-DERIVED resume PATCHES the row it names, and     */
+/* only if that row is bound to this console's trusted issuer                  */
+/* -------------------------------------------------------------------------- */
+//
+// This group used to be titled "a resume that names a provider row is an
+// update" and asserted nothing about WHOSE row it was. That was the shape of
+// the blocker: `resume` arrived from the request body, its `providerId` chose
+// the row, and the only binding check ran on the response — after the PATCH had
+// already landed. `runSetupProvisioning` now proves the binding on the row it
+// reads back BEFORE it writes, so the property holds for every caller and not
+// merely for the route that was audited.
+
+describe("a server-derived resume that names a provider row is an update, never a second create", () => {
+  const resumedComplete: SetupProvisioningState = {
+    trustedJwtIssuerId: ISSUER_ID,
+    trustedJwtIssuerVersion: 1,
+    providerId: PROVIDER_ID,
+    providerVersion: 2,
+    providerTrustedJwtIssuerId: ISSUER_ID,
+    providerEnabled: true,
+    allowedEmailDomainCount: 1,
+    consoleSecretStored: true,
+  };
+
+  function updateHandlers(overrides: Record<string, StubHandler> = {}) {
+    return happyPathHandlers({
+      "GET /api/v1/admin/jwt-issuers": () => ({
+        status: 200,
+        body: { data: [issuerRecord()], pagination: { has_more: false, next_cursor: null } },
+      }),
+      [`GET /api/v1/admin/auth/providers/${PROVIDER_ID}`]: () => ({
+        status: 200,
+        body: providerRecord({ enabled: true, version: 3 }),
+      }),
+      [`PATCH /api/v1/admin/auth/providers/${PROVIDER_ID}`]: () => ({
+        status: 200,
+        body: providerRecord({
+          enabled: true,
+          version: 4,
+          allowed_email_domains: ["example.com", "gmail.com"],
+        }),
+      }),
+      "POST /api/v1/admin/auth/providers": () => {
+        throw new Error("a resume with a providerId must never re-create the provider");
+      },
+      ...overrides,
+    });
+  }
+
+  test("the domain-refusal re-save PATCHes the existing row with a fresh If-Match", async () => {
+    // The scenario the `console.setup.domain_not_allowed.*` copy prescribes:
+    // add the domain, save again, retry the claim. Replaying the CREATE here
+    // would 409 on the submission's idempotency key (changed body); a fresh
+    // create would mint a second row that the partial unique index refuses at
+    // enable. The PATCH is what makes the instruction followable.
+    const stub = createMoiraStub(updateHandlers());
+    const result = await runSetupProvisioning(
+      clientFor(stub),
+      provisioningRequest({
+        provider: { ...providerConfig, allowedEmailDomains: ["example.com", "gmail.com"] },
+        resume: resumedComplete,
+        // The row is ENABLED, so the re-save takes an operator: a session
+        // established through this very provider. That is exactly the state the
+        // remedy is reached from — the operator signed in, tried to claim, and
+        // Moira answered 403 admin_claim_domain_not_allowed.
+        sessionProviderId: PROVIDER_ID,
+      }),
+    );
+
+    const patch = stub.requestsFor(`PATCH /api/v1/admin/auth/providers/${PROVIDER_ID}`)[0];
+    expect(patch).toBeDefined();
+    // Read-then-patch: the If-Match is the FRESH version from the read, not the
+    // possibly-stale recorded one.
+    expect(patch?.headers["If-Match"]).toBe("3");
+    const body = stub.bodyOf(
+      `PATCH /api/v1/admin/auth/providers/${PROVIDER_ID}`,
+    ) as Record<string, unknown>;
+    expect(body["allowed_email_domains"]).toEqual(["example.com", "gmail.com"]);
+    // Enable is never patched directly, and the binding is not re-asserted.
+    expect("enabled" in body).toBe(false);
+    expect("trusted_jwt_issuer_id" in body).toBe(false);
+
+    expect(stub.requestsFor("POST /api/v1/admin/auth/providers")).toHaveLength(0);
+    // Already enabled: the commit point is not re-run.
+    expect(stub.routes()).not.toContain(
+      `POST /api/v1/admin/auth/providers/${PROVIDER_ID}/enable`,
+    );
+    expect(isProvisioningComplete(result.state)).toBe(true);
+    expect(result.state.allowedEmailDomainCount).toBe(2);
+    expect(result.trace.map((entry) => entry.step)).toContain("update_auth_provider");
+  });
+
+  test("a partial resume with a DISABLED row patches, stores, then enables it", async () => {
+    const stub = createMoiraStub(
+      updateHandlers({
+        [`GET /api/v1/admin/auth/providers/${PROVIDER_ID}`]: () => ({
+          status: 200,
+          body: providerRecord({ enabled: false, version: 2 }),
+        }),
+        [`PATCH /api/v1/admin/auth/providers/${PROVIDER_ID}`]: () => ({
+          status: 200,
+          body: providerRecord({ enabled: false, version: 3 }),
+        }),
+        [`POST /api/v1/admin/auth/providers/${PROVIDER_ID}/enable`]: () => ({
+          status: 200,
+          body: providerRecord({ enabled: true, version: 4 }),
+        }),
+      }),
+    );
+    // A CONTROL for the enabled-row gate below: no session is passed (the
+    // helper's default), and a DISABLED row must still be completable — it
+    // authenticates nobody, so rewriting it escalates nothing, and requiring a
+    // session here would make an interrupted first-run setup unresumable.
+    const result = await runSetupProvisioning(
+      clientFor(stub),
+      provisioningRequest({
+        resume: { ...resumedComplete, providerEnabled: false, consoleSecretStored: false },
+        sessionProviderId: null,
+      }),
+    );
+
+    expect(result.trace.map((entry) => entry.step)).toEqual([
+      "ensure_trusted_jwt_issuer",
+      "update_auth_provider",
+      "store_console_secret",
+      "enable_auth_provider",
+    ]);
+    expect(isProvisioningComplete(result.state)).toBe(true);
+  });
+
+  test("a failed patch names the update step, keeps the resume state, and remedies with retry", async () => {
+    const stub = createMoiraStub(
+      updateHandlers({
+        [`PATCH /api/v1/admin/auth/providers/${PROVIDER_ID}`]: () => ({
+          status: 400,
+          body: errorEnvelope("auth_provider_url_not_allowed"),
+        }),
+      }),
+    );
+    const error = (await runSetupProvisioning(
+      clientFor(stub),
+      // Enabled row, so the operator's session is what admits the attempt at
+      // all; this test is about what happens when Moira then refuses the PATCH.
+      provisioningRequest({ resume: resumedComplete, sessionProviderId: PROVIDER_ID }),
+    ).catch((caught: unknown) => caught)) as SetupProvisioningError;
+
+    expect(error).toBeInstanceOf(SetupProvisioningError);
+    expect(error.step).toBe("update_auth_provider");
+    expect(error.remedy).toBe("retry");
+    // The state is the COMPLETE resume, untouched: the working provider did not
+    // vanish from the model because one save of it failed.
+    expect(isProvisioningComplete(error.state)).toBe(true);
+  });
+
+  test("a row bound to ANOTHER trusted issuer is never PATCHed — the check runs before the write", async () => {
+    // THE BLOCKER, at the module boundary. A resume naming a row that is not
+    // this console's — the incumbent Google provider of a live deployment, say,
+    // whose id `GET /api/setup` publishes — used to reach `patchAuthProvider`
+    // with the bootstrap system key, rewriting its allow-list, client id and
+    // endpoint URLs; the binding was only compared afterwards, on the response.
+    const stub = createMoiraStub(
+      updateHandlers({
+        [`GET /api/v1/admin/auth/providers/${PROVIDER_ID}`]: () => ({
+          status: 200,
+          body: providerRecord({
+            enabled: true,
+            version: 7,
+            trusted_jwt_issuer_id: "99999999-9999-4999-8999-999999999999",
+          }),
+        }),
+      }),
+    );
+
+    const error = (await runSetupProvisioning(
+      clientFor(stub),
+      // Signed in through this very row, so the session gate is satisfied and
+      // cannot be what refuses: the OWNERSHIP check is, and it runs first.
+      provisioningRequest({ resume: resumedComplete, sessionProviderId: PROVIDER_ID }),
+    ).catch((caught: unknown) => caught)) as Error;
+    expect(error).toBeInstanceOf(SetupOrderingError);
+    expect(
+      error,
+      "ownership must be decided before operatorship: a row this console does not own is refused " +
+        "whoever is signed in",
+    ).not.toBeInstanceOf(SetupEnabledProviderSessionError);
+
+    // The read happened; the WRITE did not. Nothing about that row changed, and
+    // no enable was attempted on it either.
+    expect(stub.requestsFor(`GET /api/v1/admin/auth/providers/${PROVIDER_ID}`)).toHaveLength(1);
+    expect(stub.requestsFor(`PATCH /api/v1/admin/auth/providers/${PROVIDER_ID}`)).toHaveLength(0);
+    expect(stub.routes()).not.toContain(`POST /api/v1/admin/auth/providers/${PROVIDER_ID}/enable`);
+    expect(secretWrites).toEqual([]);
+  });
+
+  test("a DELETED row is refused rather than resurrected by a patch", async () => {
+    const stub = createMoiraStub(
+      updateHandlers({
+        [`GET /api/v1/admin/auth/providers/${PROVIDER_ID}`]: () => ({
+          status: 200,
+          body: providerRecord({ status: "deleted", enabled: false, version: 5 }),
+        }),
+      }),
+    );
+
+    await expect(
+      runSetupProvisioning(clientFor(stub), provisioningRequest({ resume: resumedComplete })),
+    ).rejects.toThrow(SetupOrderingError);
+    expect(stub.requestsFor(`PATCH /api/v1/admin/auth/providers/${PROVIDER_ID}`)).toHaveLength(0);
+  });
+
+  test("assertProviderIsBoundToTrustedIssuer is the one spelling of the rule", () => {
+    // Exported and asserted directly, so the refusal cannot be quietly softened
+    // into a warning inside the runner.
+    expect(() =>
+      assertProviderIsBoundToTrustedIssuer(
+        providerRecord() as unknown as AuthProviderSettingsRecord,
+        ISSUER_ID,
+      ),
+    ).not.toThrow();
+    expect(() =>
+      assertProviderIsBoundToTrustedIssuer(
+        providerRecord({ trusted_jwt_issuer_id: null }) as unknown as AuthProviderSettingsRecord,
+        ISSUER_ID,
+      ),
+    ).toThrow(SetupOrderingError);
+  });
+
+  /* ------------------------------------------------------------------------ */
+  /* An ENABLED row may only be re-saved by somebody signed in through it      */
+  /* ------------------------------------------------------------------------ */
+  //
+  // Ownership settles WHICH row; this settles WHO. The residual the group above
+  // does not close: an anonymous caller inside the open setup window needs no
+  // resume at all — the route derives the console's OWN row for them — and if
+  // that row is enabled, PATCHing it re-points sign-in (client id, discovery,
+  // authorization, token, userinfo, jwks) at an IdP they control and widens the
+  // allow-list to a domain they own. Sign in, claim, done.
+  //
+  // These run at the MODULE boundary deliberately: the route refuses earlier
+  // and more cheaply, but a property that only holds in the one caller that was
+  // audited is not a property.
+
+  test("an ENABLED row is NOT re-saved for a caller with no session", async () => {
+    const stub = createMoiraStub(updateHandlers());
+    const error = (await runSetupProvisioning(
+      clientFor(stub),
+      // `sessionProviderId: null` — the default, spelled out because it IS the
+      // scenario: the window is open, nobody is signed in, the row is live.
+      provisioningRequest({ resume: resumedComplete, sessionProviderId: null }),
+    ).catch((caught: unknown) => caught)) as SetupEnabledProviderSessionError;
+
+    expect(error).toBeInstanceOf(SetupEnabledProviderSessionError);
+    expect(error.reason).toBe("no_session");
+    expect(error.providerId).toBe(PROVIDER_ID);
+    // Refused BEFORE the write, not detected after it. The read is allowed —
+    // a GET is not a privileged write — but nothing else may have happened.
+    expect(stub.requestsFor(`PATCH /api/v1/admin/auth/providers/${PROVIDER_ID}`)).toHaveLength(0);
+    expect(stub.routes()).not.toContain(`POST /api/v1/admin/auth/providers/${PROVIDER_ID}/enable`);
+    expect(stub.requestsFor("POST /api/v1/admin/auth/providers")).toHaveLength(0);
+    expect(secretWrites).toEqual([]);
+  });
+
+  test("an ENABLED row is NOT re-saved for a session established through ANOTHER row", async () => {
+    // A real, valid, allow-listed session — through a different provider. On a
+    // multi-provider deployment that is the wrong tab; on an unclaimed one it
+    // is the same escalation with one extra step, because any enabled provider
+    // can mint a session. The row identity is what decides, not the fact that
+    // some session exists.
+    const stub = createMoiraStub(updateHandlers());
+    const error = (await runSetupProvisioning(
+      clientFor(stub),
+      provisioningRequest({
+        resume: resumedComplete,
+        sessionProviderId: "44444444-4444-4444-8444-444444444444",
+      }),
+    ).catch((caught: unknown) => caught)) as SetupEnabledProviderSessionError;
+
+    expect(error).toBeInstanceOf(SetupEnabledProviderSessionError);
+    expect(error.reason).toBe("different_provider");
+    expect(stub.requestsFor(`PATCH /api/v1/admin/auth/providers/${PROVIDER_ID}`)).toHaveLength(0);
+    expect(secretWrites).toEqual([]);
+  });
+
+  test("the gate reads the row it READ BACK, not the resume state's stale copy", async () => {
+    // The race the pre-check in the route cannot see: the derivation found the
+    // row DISABLED (so the route asked for no session and passed `null`), and
+    // between that read and this write the row was enabled. The fresh read is
+    // the only copy that cannot be stale, and it is what the assertion runs on.
+    const stub = createMoiraStub(
+      updateHandlers({
+        [`GET /api/v1/admin/auth/providers/${PROVIDER_ID}`]: () => ({
+          status: 200,
+          body: providerRecord({ enabled: true, version: 3 }),
+        }),
+      }),
+    );
+    await expect(
+      runSetupProvisioning(
+        clientFor(stub),
+        provisioningRequest({
+          resume: { ...resumedComplete, providerEnabled: false },
+          sessionProviderId: null,
+        }),
+      ),
+    ).rejects.toBeInstanceOf(SetupEnabledProviderSessionError);
+    expect(stub.requestsFor(`PATCH /api/v1/admin/auth/providers/${PROVIDER_ID}`)).toHaveLength(0);
+  });
+
+  test("assertEnabledProviderMayBeReSaved is the one spelling of the rule", () => {
+    // Exported and asserted directly, so the refusal cannot be softened into a
+    // warning inside the runner — and so the three states are pinned as three
+    // rather than collapsed into "needs a session".
+    const disabled = providerRecord({ enabled: false }) as unknown as AuthProviderSettingsRecord;
+    const enabled = providerRecord({ enabled: true }) as unknown as AuthProviderSettingsRecord;
+
+    // A disabled row authenticates nobody, so it is not an escalation surface
+    // and needs no session. Deleting this case would be the cheapest way to
+    // break first-run setup while every negative test stayed green.
+    expect(() => assertEnabledProviderMayBeReSaved(disabled, null)).not.toThrow();
+    expect(() => assertEnabledProviderMayBeReSaved(enabled, PROVIDER_ID)).not.toThrow();
+    expect(() => assertEnabledProviderMayBeReSaved(enabled, null)).toThrow(
+      SetupEnabledProviderSessionError,
+    );
+    // An empty string is not a session id. Without this it would read as one
+    // and satisfy a `!== null` test.
+    expect(() => assertEnabledProviderMayBeReSaved(enabled, "")).toThrow(
+      SetupEnabledProviderSessionError,
+    );
+    expect(() => assertEnabledProviderMayBeReSaved(enabled, "some-other-row")).toThrow(
+      SetupEnabledProviderSessionError,
+    );
+    // Still an ordering error to every caller that only knows the base class,
+    // so no existing catch silently lets it through.
+    expect(() => assertEnabledProviderMayBeReSaved(enabled, null)).toThrow(SetupOrderingError);
+  });
+
+  test("buildProviderPatchBody omits empty URL members rather than clearing them", () => {
+    const body = buildProviderPatchBody({
+      ...providerConfig,
+      issuer: null,
+      discoveryUrl: "",
+    }) as Record<string, unknown>;
+    expect("issuer" in body).toBe(false);
+    expect("discovery_url" in body).toBe(false);
+    expect(body["display_name"]).toBe("Google Workspace");
+    expect(() =>
+      buildProviderPatchBody({ ...providerConfig, allowedEmailDomains: [] }),
+    ).toThrow(SetupOrderingError);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Rehydration — deriveProvisioningState                                      */
+/* -------------------------------------------------------------------------- */
+
+describe("deriveProvisioningState reads the truth back from Moira and the store", () => {
+  const providerList = (rows: unknown[]): StubHandler => () => ({
+    status: 200,
+    body: { data: rows, pagination: { has_more: false, next_cursor: null } },
+  });
+
+  test("an unprovisioned deployment derives the empty state", async () => {
+    const stub = createMoiraStub({ "GET /api/v1/admin/jwt-issuers": emptyIssuerList });
+    const state = await deriveProvisioningState(clientFor(stub), async () => false, CONSOLE_ISSUER);
+    expect(state).toEqual(EMPTY_PROVISIONING_STATE);
+  });
+
+  test("a fully provisioned deployment derives a COMPLETE state — this is what survives the OAuth round trip", async () => {
+    const stub = createMoiraStub({
+      "GET /api/v1/admin/jwt-issuers": () => ({
+        status: 200,
+        body: { data: [issuerRecord()], pagination: { has_more: false, next_cursor: null } },
+      }),
+      "GET /api/v1/admin/auth/providers": providerList([
+        providerRecord({ enabled: true, version: 2 }),
+      ]),
+    });
+    const state = await deriveProvisioningState(clientFor(stub), async () => true, CONSOLE_ISSUER);
+    expect(isProvisioningComplete(state)).toBe(true);
+    expect(state.providerId).toBe(PROVIDER_ID);
+    expect(state.allowedEmailDomainCount).toBe(1);
+  });
+
+  test("a provider bound to a DIFFERENT issuer does not count", async () => {
+    const stub = createMoiraStub({
+      "GET /api/v1/admin/jwt-issuers": () => ({
+        status: 200,
+        body: { data: [issuerRecord()], pagination: { has_more: false, next_cursor: null } },
+      }),
+      "GET /api/v1/admin/auth/providers": providerList([
+        providerRecord({
+          enabled: true,
+          trusted_jwt_issuer_id: "99999999-9999-4999-8999-999999999999",
+        }),
+      ]),
+    });
+    const state = await deriveProvisioningState(clientFor(stub), async () => true, CONSOLE_ISSUER);
+    expect(state.providerId).toBeNull();
+    expect(state.trustedJwtIssuerId).toBe(ISSUER_ID);
+    expect(isProvisioningComplete(state)).toBe(false);
+  });
+
+  test("a missing console secret keeps the derived state incomplete", async () => {
+    const stub = createMoiraStub({
+      "GET /api/v1/admin/jwt-issuers": () => ({
+        status: 200,
+        body: { data: [issuerRecord()], pagination: { has_more: false, next_cursor: null } },
+      }),
+      "GET /api/v1/admin/auth/providers": providerList([
+        providerRecord({ enabled: true, version: 2 }),
+      ]),
+    });
+    const state = await deriveProvisioningState(clientFor(stub), async () => false, CONSOLE_ISSUER);
+    expect(state.consoleSecretStored).toBe(false);
+    expect(provisioningDeficiencies(state)).toEqual(["console_secret_not_stored"]);
+  });
+
+  test("the ENABLED bound row wins over a disabled leftover", async () => {
+    const stub = createMoiraStub({
+      "GET /api/v1/admin/jwt-issuers": () => ({
+        status: 200,
+        body: { data: [issuerRecord()], pagination: { has_more: false, next_cursor: null } },
+      }),
+      "GET /api/v1/admin/auth/providers": providerList([
+        providerRecord({ id: "44444444-4444-4444-8444-444444444444", enabled: false }),
+        providerRecord({ enabled: true, version: 2 }),
+      ]),
+    });
+    const state = await deriveProvisioningState(clientFor(stub), async () => true, CONSOLE_ISSUER);
+    expect(state.providerId).toBe(PROVIDER_ID);
+    expect(state.providerEnabled).toBe(true);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
 /* Gates                                                                      */
 /* -------------------------------------------------------------------------- */
 
@@ -467,7 +915,7 @@ describe("the claim step is navigation state, not advice", () => {
     providerVersion: 2,
     providerTrustedJwtIssuerId: ISSUER_ID,
     providerEnabled: true,
-    allowedEmailDomains: ["example.com"],
+    allowedEmailDomainCount: 1,
     consoleSecretStored: true,
   };
 
@@ -500,7 +948,7 @@ describe("the claim step is navigation state, not advice", () => {
   });
 
   test("an_empty_allow_list_never_opens_the_claim_step", () => {
-    const denyAll = { ...committed, allowedEmailDomains: [] };
+    const denyAll = { ...committed, allowedEmailDomainCount: 0 };
     expect(provisioningDeficiencies(denyAll)).toEqual(["allowed_email_domains_empty"]);
     expect(reachableSetupStep(wizard({ provisioning: denyAll }))).toBe("auth_settings");
   });
@@ -549,7 +997,7 @@ describe("the claim body", () => {
       providerVersion: 2,
       providerTrustedJwtIssuerId: ISSUER_ID,
       providerEnabled: true,
-      allowedEmailDomains: ["example.com"],
+      allowedEmailDomainCount: 1,
       consoleSecretStored: true,
     },
     signedInWithAllowedIdentity: true,

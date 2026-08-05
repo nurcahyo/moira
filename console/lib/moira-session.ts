@@ -72,11 +72,71 @@ export const SESSION_REJECTION_MESSAGE_KEYS: Readonly<Record<SessionRejection, s
 };
 
 export type SessionCheck =
-  | { readonly ok: true; readonly identity: ConsoleSessionIdentity }
-  | { readonly ok: false; readonly rejection: SessionRejection; readonly messageKey: string };
+  | {
+      readonly ok: true;
+      readonly identity: ConsoleSessionIdentity;
+      /**
+       * The CONSOLE ISSUER of the provider this session was established
+       * through — `ResolvedAuthConfig.consoleIssuer`, never a caller's string.
+       *
+       * Carried on the verdict because a caller that wants to act in an
+       * `admin_identities` NAMESPACE has to be able to prove the session
+       * belongs to it, and only the resolution knows which one that is. The
+       * setup window's claim step is the first such caller: its namespace comes
+       * from a request-body slug, and without this it had nothing to check that
+       * slug against — signing in through provider A and posting provider B's
+       * slug would have granted admin in B's namespace.
+       */
+      readonly consoleIssuer: string;
+      /**
+       * The `auth_provider_settings` ROW this session was established through —
+       * `ResolvedAuthConfig.moiraProviderId`, never a caller's string.
+       *
+       * `consoleIssuer` answers "which `admin_identities` namespace"; this
+       * answers "which provider row", and the two are not interchangeable when
+       * the question is whether a caller may REWRITE that row. The setup
+       * window's provisioning step is the caller that needs it: an already
+       * ENABLED provider is a live authenticator, so re-pointing its client id
+       * and endpoint URLs is equivalent to replacing the deployment's identity
+       * provider. It may therefore only be re-saved by somebody who has proved
+       * they are the operator, and the only proof available inside a window
+       * that runs on the bootstrap system key is a session established THROUGH
+       * THAT SAME ROW.
+       */
+      readonly moiraProviderId: string;
+    }
+  | {
+      readonly ok: false;
+      readonly rejection: SessionRejection;
+      readonly messageKey: string;
+      /**
+       * The `auth_provider_settings` ROW that RESOLVED this session, when the
+       * refusal was decided with that row in hand — otherwise `null`.
+       *
+       * A refusal is not always "there is nobody here". `email_domain_not_allowed`
+       * in particular is decided AFTER Better Auth resolved the cookie against a
+       * provider row: the person did authenticate through that row, and the
+       * console then refused them on the deployment's own
+       * `allowed_email_domains`. A caller that needs to know WHICH row
+       * authenticated a refused session — the setup window's provisioning gate,
+       * whose whole purpose is to let that operator widen the very list that
+       * refused them — has no other way to learn it, because the `ok: true`
+       * branch's `moiraProviderId` never arrives.
+       *
+       * `null` means nothing resolved: no session at all, or a session whose
+       * provider this configuration does not contain. A caller must treat
+       * `null` as "no proof", never as "any row".
+       */
+      readonly resolvedProviderId: string | null;
+    };
 
-function reject(rejection: SessionRejection): SessionCheck {
-  return { ok: false, rejection, messageKey: SESSION_REJECTION_MESSAGE_KEYS[rejection] };
+function reject(rejection: SessionRejection, resolvedProviderId: string | null): SessionCheck {
+  return {
+    ok: false,
+    rejection,
+    messageKey: SESSION_REJECTION_MESSAGE_KEYS[rejection],
+    resolvedProviderId,
+  };
 }
 
 /**
@@ -89,9 +149,16 @@ function reject(rejection: SessionRejection): SessionCheck {
  * correct — but a caller holding the verdict as an exception needs to put it back into the
  * shape every other caller uses, and must not re-derive it, or two spellings of the same
  * rule appear.
+ *
+ * `resolvedProviderId` defaults to `null` — "nothing resolved" — because most
+ * callers of this form learned the verdict before any provider row was in hand.
+ * The one that does hold it (`SessionNotAdmissibleError`) passes it back.
  */
-export function rejectedSession(rejection: SessionRejection): SessionCheck {
-  return reject(rejection);
+export function rejectedSession(
+  rejection: SessionRejection,
+  resolvedProviderId: string | null = null,
+): SessionCheck {
+  return reject(rejection, resolvedProviderId);
 }
 
 /**
@@ -102,20 +169,38 @@ export function rejectedSession(rejection: SessionRejection): SessionCheck {
  * console session, and a deployment where the two disagree is a deployment where
  * somebody can hold a console session they can do nothing with — which reads to
  * them as a broken console rather than as a denied identity.
+ *
+ * Every refusal decided from here on names the row `config` came from, on
+ * `SessionCheck.resolvedProviderId`. The refusals are still refusals; naming the
+ * row only tells a caller WHICH authenticator turned this person away, which is
+ * the fact the setup window's provisioning gate needs and could not otherwise
+ * see. The `session === null` case names nothing: no cookie resolved, so no row
+ * authenticated anybody, whatever configuration happened to be passed in.
  */
 export function checkSession(
   session: Partial<ConsoleSessionIdentity> | null | undefined,
-  config: Pick<ResolvedAuthConfig, "allowedEmailDomains">,
+  config: Pick<ResolvedAuthConfig, "allowedEmailDomains" | "consoleIssuer" | "moiraProviderId">,
 ): SessionCheck {
-  if (session === null || session === undefined) return reject("no_session");
+  if (session === null || session === undefined) return reject("no_session", null);
+  const resolved = config.moiraProviderId;
   const { email, emailVerified, idpSubject } = session;
-  if (typeof email !== "string" || email === "") return reject("no_session");
-  if (emailVerified !== true) return reject("email_not_verified");
+  if (typeof email !== "string" || email === "") return reject("no_session", null);
+  if (emailVerified !== true) return reject("email_not_verified", resolved);
   if (!isEmailDomainAllowed(email, config.allowedEmailDomains)) {
-    return reject("email_domain_not_allowed");
+    return reject("email_domain_not_allowed", resolved);
   }
-  if (typeof idpSubject !== "string" || idpSubject === "") return reject("idp_subject_missing");
-  return { ok: true, identity: { email, emailVerified: true, idpSubject } };
+  if (typeof idpSubject !== "string" || idpSubject === "") {
+    return reject("idp_subject_missing", resolved);
+  }
+  return {
+    ok: true,
+    identity: { email, emailVerified: true, idpSubject },
+    // Both taken from the configuration that AUTHENTICATED this session, never
+    // from anything the caller sent — see the fields' own notes on
+    // `SessionCheck`.
+    consoleIssuer: config.consoleIssuer,
+    moiraProviderId: config.moiraProviderId,
+  };
 }
 
 /**
@@ -129,8 +214,19 @@ export function checkSession(
 export class SessionNotAdmissibleError extends Error {
   readonly rejection: SessionRejection;
   readonly messageKey: string;
+  /**
+   * The row that resolved the refused session, carried so a caller that learns
+   * the verdict by CATCHING can put back the same `SessionCheck` a caller that
+   * learns it by VALUE would have got. Dropping it here would make the two
+   * spellings disagree, which is the thing `rejectedSession` exists to prevent.
+   */
+  readonly resolvedProviderId: string | null;
 
-  constructor(rejection: SessionRejection, messageKey: string) {
+  constructor(
+    rejection: SessionRejection,
+    messageKey: string,
+    resolvedProviderId: string | null = null,
+  ) {
     super(
       `the console session is not admissible (${rejection}). Refusing to mint a Moira-bound ` +
         "JWT: Moira would refuse the claim anyway, and a token issued here would be a " +
@@ -139,6 +235,7 @@ export class SessionNotAdmissibleError extends Error {
     this.name = "SessionNotAdmissibleError";
     this.rejection = rejection;
     this.messageKey = messageKey;
+    this.resolvedProviderId = resolvedProviderId;
   }
 }
 
@@ -174,10 +271,16 @@ export class SessionNotAdmissibleError extends Error {
  */
 export function assertAdmissibleSession(
   session: Partial<ConsoleSessionIdentity> | null | undefined,
-  config: Pick<ResolvedAuthConfig, "allowedEmailDomains">,
+  config: Pick<ResolvedAuthConfig, "allowedEmailDomains" | "consoleIssuer" | "moiraProviderId">,
 ): ConsoleSessionIdentity {
   const check = checkSession(session, config);
-  if (!check.ok) throw new SessionNotAdmissibleError(check.rejection, check.messageKey);
+  if (!check.ok) {
+    throw new SessionNotAdmissibleError(
+      check.rejection,
+      check.messageKey,
+      check.resolvedProviderId,
+    );
+  }
   return check.identity;
 }
 

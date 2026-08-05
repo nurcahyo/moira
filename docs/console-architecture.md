@@ -127,6 +127,163 @@ There is no rotate-secret endpoint and there must never be one; rotation is a
 console `put()`. `tests/unit/architecture/server-only-guards.test.ts` scans the
 whole tree for that endpoint's name as a bare literal, comments included.
 
+## The setup window: do not expose an unclaimed console to an untrusted network
+
+**While a deployment is unclaimed, the setup window is open by design, and the
+first party to complete setup becomes its owner.** The console must therefore not
+be reachable from an untrusted network until the first admin has been claimed.
+Bind it to a private network, an operator VPN, or a bastion for that interval,
+and open it up afterwards.
+
+The window is open exactly while both of these hold, and both are re-read from
+Moira on every request rather than cached:
+
+1. the console holds a bootstrap system key (`MOIRA_SYSTEM_KEY`), and
+2. Moira answers `claimed: false` on `GET /api/v1/admin/setup/claim-status`.
+
+Removing the system key after setup closes the window permanently — `/api/setup`
+then answers `404`, and that is why the post-setup runbook tells operators to
+remove it.
+
+### What is protected inside the window
+
+- **A row bound to another console's trusted issuer cannot be touched at all.**
+  Which provider row a privileged write may target is derived server-side from
+  Moira's own records — this console's trusted issuer, then the provider row
+  bound to it — and is never named by the caller. A request that names a
+  different row is refused with nothing written.
+- **An enabled provider cannot be re-pointed by anyone who did not authenticate
+  through it.** An enabled row is a live authenticator, so rewriting its client
+  id or its issuer/discovery/token/userinfo/JWKS URLs would repoint sign-in at
+  another identity provider. Re-saving one requires a console session that Better
+  Auth resolved against that same row; otherwise the request is refused and
+  nothing is written.
+
+  "Authenticated through it", not "holds an admissible session", and the
+  difference is what keeps the domain-refusal remedy below followable. The
+  console's own session check also applies the row's `allowed_email_domains`, so
+  the operator who is here to *widen* that list arrives holding a session the
+  check has already refused. That one shape — refused on the allow-list, resolved
+  through the row being written — is admitted; a caller with no session at all, a
+  session through another row, an address the IdP never verified, or a session
+  whose provider cannot be resolved is not. The cost is stated plainly: inside
+  the setup window, anybody the deployment's IdP will authenticate can re-save
+  the enabled row, not only an allow-listed address.
+- **A second sign-in provider cannot be enabled at all — by anybody, however
+  they authenticated.** This one is a denial of service rather than an
+  escalation. The console resolves sign-in only while *exactly one* provider is
+  enabled: with two, it refuses every resolution, no sign-in button renders for
+  *either* provider, session resolution answers "no session" forever, and the
+  enabled-row rule above becomes permanently unsatisfiable. The operator is
+  locked out of their own wizard.
+
+  The route reached it under a *different* provider slug, which derives a
+  different console-issuer namespace — an empty one, so the create path had
+  nothing in its way, and Moira permits the write because each row binds its own
+  trusted issuer. Demanding proof of an operator was not the fix: an
+  unauthenticated caller is stopped by it, and the one person who can satisfy it
+  is the legitimate operator, who then locks themselves out with a request that
+  succeeded. So a provisioning run that would leave the deployment with two
+  enabled providers is **refused outright**, before anything is written, with the
+  same answer for every caller: `409 setup_single_enabled_provider_only`, whose
+  message names the limit and points at the disable procedure below.
+
+  The count that decides this is taken **deployment-wide**, not from the
+  namespace the slug selects — a namespace-scoped count is a count the caller
+  chose — and it uses the same predicate the sign-in resolver uses (`enabled` and
+  `active`), so the two cannot disagree. A deployment with nothing enabled is
+  untouched: a first run, the completion of an interrupted one, and provisioning
+  under a chosen slug before anything is switched on all still work.
+- **A disabled row may still be completed without a session**, deliberately: it
+  authenticates nobody, and requiring a session would make an interrupted first
+  run unresumable.
+- **The OAuth client secret never crosses to Moira**, and the setup responses
+  publish counts and presence rather than the allow-list or the endpoint URLs.
+
+### What is NOT protected, and cannot be
+
+- **An unprovisioned, unclaimed deployment is claimable by whoever finishes setup
+  first.** There is no admin yet to authorise the first admin, and no session to
+  require, so reachability is the only thing that decides it. This is inherent to
+  first-run bootstrap and is not something the console can close in code — it is
+  closed by not publishing the console until the claim is done.
+- **Anyone who can reach the window can read the setup view model** — whether the
+  deployment is claimed, which sign-in methods exist, how many domains are
+  allow-listed. It is narrowed, but it is not secret.
+
+### The one consequence operators meet
+
+A domain refusal is *not* one of them: the operator whose own domain is missing
+from the allow-list still authenticated through the row, so the wizard's
+"Edit auth settings" way back, widen the list, save again is a path the console
+accepts end to end.
+
+What remains is the provider enabled with a credential **nobody at all** can sign
+in with — a mistyped client id or client secret, or a discovery URL pointing at
+the wrong IdP. That row cannot be corrected *from the console*: no session can be
+obtained through it, so there is nothing to prove operatorship with, and the
+console will not be an unauthenticated proxy for a write against a live
+authenticator.
+
+The way out is the bootstrap system key you already hold. Moira's admin API takes
+it directly — `POST /api/v1/admin/auth/providers/{id}/disable` and `PATCH
+/api/v1/admin/auth/providers/{id}` both accept `systemKeyAuth`.
+
+Two things about that API are easy to get wrong, and getting either wrong is the
+whole difference between a recovery and a confusing refusal:
+
+- **The system key is a header of its own, `X-Moira-System-Key`.** It is not a
+  bearer token. `Authorization: Bearer <system key>` is read as a trusted JWT,
+  fails to verify, and answers `401` — the key never gets looked at.
+- **Every write on this resource requires `If-Match`,** carrying the row's
+  current `version`. `disable`, `enable`, `PATCH` and `DELETE` all declare it
+  `required`; without it the handler answers `400 if_match_required` before doing
+  anything. So the procedure is *read, then write* — three requests, not one.
+
+```bash
+# 1. Find the enabled row. 200, with `data[]` — note the id of the broken one.
+curl -fsS \
+  -H "X-Moira-System-Key: $MOIRA_SYSTEM_KEY" \
+  "$MOIRA_API_URL/api/v1/admin/auth/providers" \
+  | jq -r '.data[] | select(.enabled) | "\(.id)\t\(.display_name)"'
+
+# 2. Read its CURRENT version. 200, and the same number also arrives as `ETag`.
+PROVIDER_ID=<the id from step 1>
+VERSION=$(curl -fsS \
+  -H "X-Moira-System-Key: $MOIRA_SYSTEM_KEY" \
+  "$MOIRA_API_URL/api/v1/admin/auth/providers/$PROVIDER_ID" | jq -r '.version')
+
+# 3. Disable it, with that version as the precondition. 200, and the row comes
+#    back with `"enabled": false` and `version` bumped by one.
+curl -fsS -X POST \
+  -H "X-Moira-System-Key: $MOIRA_SYSTEM_KEY" \
+  -H "If-Match: $VERSION" \
+  "$MOIRA_API_URL/api/v1/admin/auth/providers/$PROVIDER_ID/disable"
+```
+
+If step 3 answers `409 resource_version_conflict`, something changed the row
+between steps 2 and 3: re-run step 2 and try again. A quoted ETag value works
+too — the handler trims the quotes before parsing.
+
+**Disable the broken row, then finish in the wizard.** A disabled row
+authenticates nobody and no longer counts towards the one-enabled-provider limit,
+so every console rule above stands down: the setup window will re-save it and
+enable it again with no session, exactly as it does for an interrupted first run.
+Reload `/setup`, correct the client id, secret or discovery URL in the
+auth-settings form, and save. This is the recommended sequence, because the OAuth
+**client secret lives in the console and not in Moira** — patching the row
+against Moira's API alone cannot fix a mistyped secret, and only the console's
+own form can.
+
+> **Do not** try to route around this by provisioning again under a *different*
+> provider slug. It is refused on purpose, for everybody: the broken row is still
+> enabled, and the console supports one enabled sign-in provider at a time, so
+> the run comes back `409 setup_single_enabled_provider_only` with nothing
+> written. Before that refusal existed the write succeeded and left the console
+> unable to resolve *either* provider, which is a worse position than the one you
+> started in. Disable the broken row first; the slug names the provider you are
+> configuring, and it is not an escape hatch.
+
 ## Routes, layouts, and where the auth boundary sits
 
 ```
