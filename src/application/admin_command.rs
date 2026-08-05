@@ -25,10 +25,19 @@ pub struct AdminCommandSpec {
     idempotency: Option<AdminCommandIdempotency>,
 }
 
+/// The idempotency envelope of a command: the raw `Idempotency-Key` and the canonical
+/// actor-identity bytes.
+///
+/// Both are carried *unhashed* so that [`AdminCommandRunner`] — the layer that actually owns
+/// the [`IdempotencyHasher`] — derives the current keyed value and the legacy unkeyed one
+/// from the same bytes. Storing a pre-hashed fingerprint here would put the choice of
+/// keying at each of the thirty spec-building call sites instead of in the one place that
+/// knows whether the dual-read window is open.
 #[derive(Debug, Clone)]
 pub struct AdminCommandIdempotency {
     pub key: String,
-    pub actor_fingerprint: String,
+    /// `crate::application::admin::actor_identity_bytes` output. Not a digest.
+    pub actor_identity: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -59,6 +68,11 @@ pub struct AdminCommandRunner {
     ///
     /// `true` reproduces the behaviour shipped with the HMAC switch. `false` stops
     /// accepting unkeyed digests **and** drops the extra legacy lookup per claim.
+    ///
+    /// It is `true` on every production runner today: nothing outside the tests calls
+    /// [`Self::accepting_legacy_hashes`], so the operator setting never reaches this field
+    /// and the key-hash window on this path cannot actually be closed. Pre-existing since
+    /// plan 03, not introduced with the pepper. Tracked in `TODO.md` and issue #125.
     accept_legacy_hashes: bool,
 }
 
@@ -176,9 +190,14 @@ impl AdminCommandRunner {
 
     /// Wires `idempotency.accept_legacy_hashes` (plan 03 finding F4).
     ///
-    /// A builder rather than a `new` parameter so the twelve existing construction sites in
-    /// `application/admin.rs` and `application/conversation.rs` keep compiling and keep
-    /// their current behaviour until each is opted in.
+    /// A builder rather than a `new` parameter so the construction sites that existed when
+    /// plan 03 landed kept compiling and kept their current behaviour until each was opted
+    /// in. **None of them has been opted in yet** — the only caller is a test — so
+    /// `idempotency.accept_legacy_hashes` is inert on the admin-command path. There are now
+    /// nineteen production sites, spread across `application/identity.rs`,
+    /// `application/conversation.rs`, `application/admin/` and `application/auth_settings.rs`
+    /// rather than the two modules this note originally named. Wiring them is its own change,
+    /// tracked in `TODO.md` and issue #125.
     #[must_use]
     pub fn accepting_legacy_hashes(mut self, accept_legacy_hashes: bool) -> Self {
         self.accept_legacy_hashes = accept_legacy_hashes;
@@ -217,7 +236,27 @@ impl AdminCommandRunner {
                 legacy_key_hash: self
                     .accept_legacy_hashes
                     .then(|| self.hasher.legacy_hash(idempotency.key.as_bytes())),
-                actor_fingerprint: idempotency.actor_fingerprint.clone(),
+                actor_fingerprint: self.hasher.hash(&idempotency.actor_identity),
+                // The fingerprint is the *second* column of that same unique index and it
+                // moved from an unkeyed digest to a keyed one when the pepper landed, so a
+                // row written before *that* deploy sits at a point of the index the peppered
+                // value cannot address. Probing the unkeyed spelling keeps those rows
+                // replayable until they expire; the write path above emits only the peppered
+                // value, so the legacy one can never re-enter the ledger.
+                //
+                // Deliberately NOT gated on `accept_legacy_hashes`. That switch governs the
+                // plan-03 *key-hash* window, which operators were told to close 24h after
+                // that deploy — an instruction a deployment may already have followed.
+                // Hanging the fingerprint window off it would ship this
+                // change with no dual-read at all on the very path it exists to protect, and
+                // every pre-pepper admin ledger row would become unreachable the moment the
+                // pepper landed: a retried admin command would execute a second time instead
+                // of replaying. The two windows opened at different deploys and must close
+                // independently — see the matching unconditional probes in
+                // `runtime_admin::idempotency_replay` and `public::claim_idempotency`.
+                legacy_actor_fingerprint: Some(
+                    self.hasher.legacy_hash(&idempotency.actor_identity),
+                ),
                 operation: spec.operation.clone(),
                 request_hash: self.hasher.hash(envelope),
                 expires_at: Utc::now() + Duration::hours(IDEMPOTENCY_RETENTION_HOURS),
@@ -326,8 +365,10 @@ impl AdminCommandRunner {
 /// most.
 ///
 /// A stored value with no `':'` separator is a pre-switch, unkeyed SHA-256. Once the
-/// operator closes the dual-read window (`idempotency.accept_legacy_hashes = false`) it is
-/// rejected outright instead of being handed to `verify`'s legacy arm (finding F4).
+/// dual-read window is closed (`accept_legacy_hashes = false`) it is rejected outright
+/// instead of being handed to `verify`'s legacy arm (finding F4). See the note on
+/// `AdminCommandRunner::accept_legacy_hashes`: no production runner closes it today, because
+/// nothing wires the setting into the runner — issue #125.
 fn verify_stored_request_hash(
     hasher: &IdempotencyHasher,
     accept_legacy_hashes: bool,

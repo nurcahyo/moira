@@ -69,8 +69,10 @@ pub struct TrustedJwtIdentity {
 }
 
 /// How long a successfully fetched JWKS stays *fresh*. An expired entry is not
-/// evicted: it is retained as a last-known-good fallback (see [`JwksCache::load`]).
-const JWKS_CACHE_TTL: Duration = Duration::from_secs(300);
+/// immediately evicted: it is retained as a last-known-good fallback (see
+/// [`JwksCache::load`]) until it passes `JwksFetchSettings::max_stale_seconds`, which is the
+/// hard ceiling on that retention.
+const JWKS_CACHE_TTL: Duration = Duration::from_secs(crate::config::JWKS_FRESHNESS_SECONDS);
 
 #[derive(Debug, Clone)]
 pub struct AuthService {
@@ -84,6 +86,10 @@ pub struct AuthService {
 struct CachedJwks {
     jwks: JwkSet,
     expires_at: Instant,
+    /// When this key set was last successfully fetched. `expires_at` bounds *freshness*;
+    /// this bounds how long the entry may go on serving as a last-known-good fallback after
+    /// freshness lapses, which is a different question with a different limit.
+    stored_at: Instant,
 }
 
 /// The single JWKS cache shared by `AuthService`'s trusted-issuer path and by both
@@ -147,10 +153,30 @@ impl JwksCache {
             .map(|entry| entry.jwks.clone())
     }
 
-    /// Any cached value, expired or not — the last-known-good fallback.
+    /// The last-known-good fallback: a cached value past its TTL but still **inside** the
+    /// stale ceiling.
+    ///
+    /// Beyond `max_stale_seconds` the entry is *evicted* and `None` is returned, so the
+    /// caller fails closed. Eviction rather than a bare refusal matters: leaving the row in
+    /// place would let it be reconsidered on every subsequent request, and would keep a key
+    /// set nobody can vouch for resident in memory indefinitely.
+    ///
+    /// Takes the write lock because it may evict. That is on the refresh-failure path only —
+    /// the fresh path in [`Self::fresh`] still takes a read lock.
     async fn retained(&self, url: &str) -> Option<JwkSet> {
-        let guard = self.entries.read().await;
-        guard.get(url).map(|entry| entry.jwks.clone())
+        let max_stale = Duration::from_secs(self.settings.max_stale_seconds);
+        let mut guard = self.entries.write().await;
+        let entry = guard.get(url)?;
+        if entry.stored_at.elapsed() <= max_stale {
+            return Some(entry.jwks.clone());
+        }
+        tracing::warn!(
+            jwks_url = %url,
+            max_stale_seconds = self.settings.max_stale_seconds,
+            "cached JWKS exceeded the stale ceiling; evicting and failing closed"
+        );
+        guard.remove(url);
+        None
     }
 
     async fn lock_for(&self, url: &str) -> Arc<Mutex<()>> {
@@ -214,11 +240,16 @@ impl JwksCache {
     }
 
     async fn store(&self, url: &str, jwks: JwkSet) {
+        let now = Instant::now();
         self.entries.write().await.insert(
             url.to_string(),
             CachedJwks {
                 jwks,
-                expires_at: Instant::now() + JWKS_CACHE_TTL,
+                expires_at: now + JWKS_CACHE_TTL,
+                // A successful fetch restarts the stale clock, which is the whole point of
+                // tracking it separately: an issuer that is merely slow to refresh never
+                // approaches the ceiling, and only one that stops answering entirely does.
+                stored_at: now,
             },
         );
     }
@@ -255,6 +286,26 @@ impl JwksCache {
         for entry in self.entries.write().await.values_mut() {
             entry.expires_at = stale;
         }
+    }
+
+    /// Backdates every cached entry's *fetch* time by `age`, so a test can drive an entry
+    /// past `max_stale_seconds` without waiting. Also expires it, since an entry cannot be
+    /// meaningfully stale while still fresh.
+    #[cfg(test)]
+    async fn age_all(&self, age: Duration) {
+        let now = Instant::now();
+        let backdated = now.checked_sub(age).unwrap_or(now);
+        for entry in self.entries.write().await.values_mut() {
+            entry.stored_at = backdated;
+            entry.expires_at = backdated;
+        }
+    }
+
+    /// Whether anything at all is cached for `url`. Lets a test assert *eviction* rather
+    /// than merely a refusal to serve.
+    #[cfg(test)]
+    async fn contains(&self, url: &str) -> bool {
+        self.entries.read().await.contains_key(url)
     }
 }
 
@@ -633,15 +684,9 @@ impl AuthService {
             .ok_or_else(|| AppError::Unauthorized("JWT iss claim is required".to_string()))?;
         let issuer_config = self.load_issuer(pool, &issuer).await?;
         let algorithm = algorithm_from_name(algorithm_name(header.alg))?;
-        if !issuer_config
-            .allowed_algorithms
-            .iter()
-            .any(|allowed| allowed == algorithm_name(algorithm))
-        {
-            return Err(AppError::Unauthorized(
-                "JWT algorithm is not allowed for issuer".to_string(),
-            ));
-        }
+        // Built before the JWKS is fetched, so a token naming a disallowed algorithm is
+        // refused without any outbound request being made on its behalf.
+        let validation = trusted_jwt_validation(&issuer_config, algorithm)?;
 
         let jwks = self.jwks(pool, &issuer_config).await?;
         let jwk = jwks
@@ -649,21 +694,6 @@ impl AuthService {
             .ok_or_else(|| AppError::Unauthorized("no matching JWKS key".to_string()))?;
         let key = DecodingKey::from_jwk(jwk)
             .map_err(|err| AppError::Unauthorized(format!("invalid jwk: {err}")))?;
-
-        let mut validation = Validation::new(algorithm);
-        validation.leeway = issuer_config.clock_skew_seconds.max(0) as u64;
-        validation.set_issuer(&[issuer_config.issuer.as_str()]);
-        if issuer_config.expected_audiences.is_empty() {
-            validation.validate_aud = false;
-        } else {
-            validation.set_audience(
-                &issuer_config
-                    .expected_audiences
-                    .iter()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>(),
-            );
-        }
 
         let claims = decode::<Value>(token, &key, &validation)
             .map_err(|err| AppError::Unauthorized(err.to_string()))?
@@ -1248,6 +1278,65 @@ fn algorithm_name(algorithm: Algorithm) -> &'static str {
     }
 }
 
+/// Builds the [`Validation`] a trusted-issuer token is decoded under, after refusing any
+/// algorithm the issuer has not allowlisted.
+///
+/// Extracted from [`AuthService::authenticate_trusted_jwt_with_issuer`] so both refusals —
+/// the per-issuer algorithm allowlist and the audience expectation — are reachable by a test
+/// without a database, a JWKS endpoint or a signed token per case. The production path builds
+/// its `Validation` *only* here; there is no second construction site to drift from.
+///
+/// Two independent gates keep the classic algorithm-confusion attack out, and they are worth
+/// naming because only one of them is per-issuer:
+///
+/// 1. [`algorithm_from_name`] maps the token's `alg` header and has no `HS*` arm at all, so
+///    no configuration anywhere can make Moira verify an RSA public key as an HMAC secret;
+/// 2. this allowlist then narrows the surviving asymmetric set to what *this* issuer
+///    registered.
+fn trusted_jwt_validation(
+    issuer_config: &TrustedIssuerConfig,
+    algorithm: Algorithm,
+) -> Result<Validation, AppError> {
+    if !issuer_config
+        .allowed_algorithms
+        .iter()
+        .any(|allowed| allowed == algorithm_name(algorithm))
+    {
+        return Err(AppError::Unauthorized(
+            "JWT algorithm is not allowed for issuer".to_string(),
+        ));
+    }
+
+    let mut validation = Validation::new(algorithm);
+    validation.leeway = issuer_config.clock_skew_seconds.max(0) as u64;
+    validation.set_issuer(&[issuer_config.issuer.as_str()]);
+    if issuer_config.expected_audiences.is_empty() {
+        // An issuer that registered no audience accepts any `aud`. That is a deliberate
+        // configuration choice — `expected_audiences` is how an operator opts into audience
+        // binding — not a fallback applied when validation is inconvenient.
+        validation.validate_aud = false;
+    } else {
+        validation.set_audience(
+            &issuer_config
+                .expected_audiences
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
+        // `set_audience` alone only constrains an `aud` that is *present*: a token carrying
+        // no `aud` at all passes it. That would leave audience binding half-applied — an
+        // issuer that opted in would still accept its own audience-less tokens, which are
+        // exactly the ones minted for some other flow and never scoped to Moira. Requiring
+        // the claim closes that, and is only done for issuers that registered an expectation,
+        // so the opt-out above keeps its meaning.
+        //
+        // The set is *replaced*, not extended, so `exp` has to be restated or expiry
+        // validation would be dropped by this line.
+        validation.set_required_spec_claims(&["exp", "aud"]);
+    }
+    Ok(validation)
+}
+
 fn algorithm_from_name(name: &str) -> Result<Algorithm, AppError> {
     match name {
         "RS256" => Ok(Algorithm::RS256),
@@ -1461,6 +1550,83 @@ mod tests {
             "the retained entry must be served and the failure reported for auditing"
         );
         assert_eq!(stub.hits.load(Ordering::SeqCst), 2);
+    }
+
+    /// The negative half of `a_failed_refresh_serves_the_last_known_good_cached_jwks`.
+    ///
+    /// That test proves stale retention *works*; on its own it is satisfied by retention
+    /// that never ends, which is exactly the gap here. This one proves the retention
+    /// **stops**: past `max_stale_seconds` the entry is refused *and* evicted, so an IdP
+    /// that never comes back cannot keep a retired signing key verifying tokens forever.
+    ///
+    /// Both sides of the boundary are asserted deliberately. A bound that refused
+    /// unconditionally would also pass a test that only checked the far side, and it would
+    /// break the availability property the retention exists for.
+    #[tokio::test]
+    async fn a_cached_jwks_past_the_stale_ceiling_is_evicted_and_refused() {
+        const MAX_STALE: u64 = 600;
+
+        let stub = spawn(StubPlan {
+            fail_after_first: true,
+            ..StubPlan::json(EMPTY_JWKS)
+        })
+        .await;
+
+        let cache = JwksCache::new(JwksFetchSettings {
+            max_stale_seconds: MAX_STALE,
+            ..stub_settings()
+        })
+        .expect("the jwks cache must build its client");
+
+        cache
+            .load(&stub.url)
+            .await
+            .expect("the first fetch must warm the cache");
+        assert!(cache.contains(&stub.url).await);
+
+        // Inside the ceiling: every later fetch 500s, and last-known-good still answers.
+        cache.age_all(Duration::from_secs(MAX_STALE / 2)).await;
+        let outcome = cache
+            .load(&stub.url)
+            .await
+            .expect("inside the ceiling a failed refresh must still serve the cached keys");
+        assert!(
+            matches!(outcome, JwksOutcome::Stale { .. }),
+            "the retention window must still be open at half the ceiling"
+        );
+        assert!(cache.contains(&stub.url).await);
+
+        // Past the ceiling: fail closed rather than authenticate on a key nobody can vouch
+        // for any more.
+        cache.age_all(Duration::from_secs(MAX_STALE + 1)).await;
+        let error = cache
+            .load(&stub.url)
+            .await
+            .expect_err("past the stale ceiling authentication must fail closed");
+        assert_eq!(error.reason().as_str(), "status");
+        assert!(
+            !cache.contains(&stub.url).await,
+            "the expired entry must be evicted, not merely refused — otherwise it stays \
+             resident and is reconsidered on every subsequent request"
+        );
+    }
+
+    /// The freshness window and the constant `Settings::validate` reasons about are one
+    /// value, not two that happen to agree today.
+    ///
+    /// `validate_jwks_stale_ceiling` refuses a `max_stale_seconds` below
+    /// [`JWKS_FRESHNESS_SECONDS`] because `JwksCache::fresh` serves inside that window
+    /// without consulting the ceiling. If `JWKS_CACHE_TTL` were later widened here alone, the
+    /// validator would keep admitting ceilings the cache silently overruns, and every other
+    /// test would stay green.
+    #[test]
+    fn the_jwks_freshness_window_matches_the_cache_ttl() {
+        assert_eq!(
+            JWKS_CACHE_TTL,
+            Duration::from_secs(crate::config::JWKS_FRESHNESS_SECONDS),
+            "the stale-ceiling validator is derived from JWKS_FRESHNESS_SECONDS; the cache \
+             TTL must be the same value or the bound it enforces is the wrong one"
+        );
     }
 
     #[tokio::test]
@@ -1726,6 +1892,115 @@ mod tests {
         .unwrap();
         assert_eq!(allowed.external_user_id.as_deref(), Some("user-1"));
         assert_eq!(allowed.delegated_subject.as_deref(), Some("user-1"));
+    }
+
+    /// An issuer registers which algorithms it signs with. A token naming any other one must
+    /// be refused *before* the key set is fetched, let alone before the signature is checked.
+    #[test]
+    fn a_token_algorithm_outside_the_issuer_allowlist_is_refused() {
+        let issuer = TrustedIssuerConfig {
+            allowed_algorithms: vec!["RS256".to_string()],
+            ..trusted_issuer_with_application_claim()
+        };
+
+        // The allowlisted one builds a validation, and it is pinned to that algorithm — a
+        // `Validation` that quietly accepted the whole supported set would pass a test that
+        // only checked the refusal below.
+        let allowed = trusted_jwt_validation(&issuer, Algorithm::RS256)
+            .expect("the issuer's registered algorithm must be accepted");
+        assert_eq!(allowed.algorithms, vec![Algorithm::RS256]);
+
+        for refused in [
+            Algorithm::RS512,
+            Algorithm::PS256,
+            Algorithm::ES256,
+            Algorithm::EdDSA,
+        ] {
+            assert!(
+                matches!(
+                    trusted_jwt_validation(&issuer, refused),
+                    Err(AppError::Unauthorized(_))
+                ),
+                "{refused:?} is not registered for this issuer and must be refused"
+            );
+        }
+
+        // The other half of the algorithm-confusion defence, and the reason the loop above
+        // contains no `HS*` case: the symmetric algorithms have no arm in
+        // `algorithm_from_name` at all, so an attacker cannot ask Moira to verify an RSA
+        // *public* key as an HMAC shared secret regardless of what an issuer registers.
+        for symmetric in ["HS256", "HS384", "HS512"] {
+            assert!(
+                matches!(
+                    algorithm_from_name(symmetric),
+                    Err(AppError::Unauthorized(_))
+                ),
+                "{symmetric} must not be reachable as a trusted-JWT algorithm"
+            );
+        }
+    }
+
+    /// Audience binding is what stops a token minted for another relying party of the *same*
+    /// IdP from authenticating here. The issuer signature is valid in that scenario, so
+    /// nothing but the `aud` check refuses it.
+    #[test]
+    fn a_token_audience_outside_the_issuer_expectation_is_refused() {
+        use jsonwebtoken::{EncodingKey, Header, encode};
+
+        // HS256 keeps the test free of RSA key material. It is a test-only convenience and
+        // deliberately not reachable in production — see the assertion on `algorithm_from_name`
+        // in `a_token_algorithm_outside_the_issuer_allowlist_is_refused`. What is under test
+        // here is the `Validation` this issuer produces, which is algorithm-independent.
+        let issuer = TrustedIssuerConfig {
+            allowed_algorithms: vec!["HS256".to_string()],
+            expected_audiences: vec!["moira".to_string()],
+            ..trusted_issuer_with_application_claim()
+        };
+        let secret = EncodingKey::from_secret(b"audience-test-secret");
+        let key = DecodingKey::from_secret(b"audience-test-secret");
+        let validation = trusted_jwt_validation(&issuer, Algorithm::HS256)
+            .expect("the issuer's registered algorithm must be accepted");
+
+        let token_for = |audience: &str| {
+            encode(
+                &Header::new(Algorithm::HS256),
+                &json!({
+                    "iss": issuer.issuer,
+                    "sub": "user-1",
+                    "aud": audience,
+                    "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp(),
+                }),
+                &secret,
+            )
+            .expect("the test token must encode")
+        };
+
+        // A correctly-addressed token still authenticates: the refusal below is the audience
+        // check doing its job, not the whole decode failing for an unrelated reason.
+        decode::<Value>(&token_for("moira"), &key, &validation)
+            .expect("a token addressed to this issuer's audience must verify");
+
+        assert!(
+            decode::<Value>(&token_for("another-relying-party"), &key, &validation).is_err(),
+            "a validly-signed token minted for a different audience must be refused"
+        );
+
+        // And the opt-out is explicit rather than accidental: an issuer that registered no
+        // audience accepts any, which is why leaving `expected_audiences` empty is a
+        // configuration decision an operator has to make.
+        let unbound = TrustedIssuerConfig {
+            expected_audiences: Vec::new(),
+            ..issuer.clone()
+        };
+        let unbound_validation = trusted_jwt_validation(&unbound, Algorithm::HS256)
+            .expect("the issuer's registered algorithm must be accepted");
+        assert!(!unbound_validation.validate_aud);
+        decode::<Value>(
+            &token_for("another-relying-party"),
+            &key,
+            &unbound_validation,
+        )
+        .expect("an issuer with no registered audience must not bind one");
     }
 
     #[test]

@@ -61,14 +61,24 @@
 
 mod support;
 
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use moira::{
-    application::{AdminService, PublicExecutionService, RuntimeAdminService},
+    application::{
+        AdminCommandIdempotency, AdminCommandMutation, AdminCommandRunner, AdminCommandSpec,
+        AdminService, PublicExecutionService, RuntimeAdminService,
+    },
     domain::{
         AgentProfileCreateRequest, ApplicationCreateRequest, PublicResponse,
         RouteDefinitionCreateRequest, RouteSelectionStrategy,
     },
+    infra::repositories::PgAdminRepository,
     security::{Actor, ActorType, IdempotencyHasher, secret_fingerprint},
 };
 use serde_json::json;
@@ -287,6 +297,44 @@ fn legacy_runtime_admin_fingerprint(actor: &Actor) -> String {
         )
         .as_bytes(),
     )
+}
+
+/// The unified 10-field formula as it was spelled **before** the fingerprint was peppered:
+/// the same identity tuple, reduced by the unkeyed [`secret_fingerprint`] rather than by the
+/// keyed [`IdempotencyHasher`].
+///
+/// Restated here rather than imported for the same reason as
+/// [`legacy_runtime_admin_fingerprint`], and the reason bites harder for this one: the field
+/// list *is* the security property. If a field is dropped from the production tuple, this
+/// copy stops agreeing and `downgrade_fingerprint`'s equality assertion fails, rather than
+/// the migration test quietly downgrading a row to a value production never wrote and
+/// proving nothing.
+///
+/// Field order and encoding must match `actor_identity_bytes` in
+/// `src/application/admin/shared.rs` exactly — it is a `serde_json` tuple, not a delimited
+/// string, so that no field's value can be made ambiguous by a separator character.
+fn unkeyed_unified_fingerprint(actor: &Actor) -> String {
+    secret_fingerprint(&unified_identity_bytes(actor))
+}
+
+/// The canonical actor-identity tuple `actor_fingerprint` and `unkeyed_actor_fingerprint`
+/// are both derived from — restated here for the reasons given on
+/// [`unkeyed_unified_fingerprint`], and shared with the tests that have to hand these bytes
+/// to `AdminCommandIdempotency::actor_identity` unhashed.
+fn unified_identity_bytes(actor: &Actor) -> Vec<u8> {
+    serde_json::to_vec(&(
+        actor.actor_type,
+        &actor.subject,
+        actor.api_key_id,
+        actor.trusted_jwt_issuer_id,
+        actor.internal_application_id,
+        &actor.application_id,
+        &actor.tenant_id,
+        &actor.external_user_id,
+        &actor.external_tenant_id,
+        &actor.delegated_subject,
+    ))
+    .expect("actor identity fields are serializable")
 }
 
 /// The pre-plan-06 public formula — the same, plus the resolved application id. See
@@ -651,6 +699,428 @@ async fn every_idempotent_command_path_writes_one_actor_fingerprint() {
     );
     assert_eq!(fixture.ledger_rows(ROUTE_OPERATION, &key).await.len(), 1);
     assert_eq!(fixture.ledger_rows(RESPONSE_OPERATION, &key).await.len(), 1);
+
+    provider.shutdown().await;
+}
+
+/// Every path writes the fingerprint in the **peppered** format.
+///
+/// The column is `varchar(128)` and the peppered value is `"{pepper_version}:" + 43`
+/// characters, which is what makes peppering a no-migration change. Asserting the stored
+/// width here is what keeps that claim honest: a longer `pepper_version` would be refused by
+/// PostgreSQL at write time, in production, on a path that only runs when a caller sends an
+/// `Idempotency-Key`.
+#[tokio::test]
+async fn every_idempotent_command_path_writes_a_peppered_fingerprint() {
+    let Some(fixture) = FingerprintFixture::new().await else {
+        return;
+    };
+    let key = fixture.key("peppered");
+    let actor = fixture.actor(Uuid::now_v7());
+
+    RuntimeAdminService::new(&fixture.fixture.state)
+        .expect("runtime admin service")
+        .create_route_definition(
+            &actor,
+            &request_context_with_idempotency_key(Some(&key)),
+            fixture.route_request("peppered"),
+        )
+        .await
+        .expect("runtime-admin path");
+
+    AdminService::new(&fixture.fixture.state)
+        .expect("admin service")
+        .create_application(
+            &actor,
+            &request_context_with_idempotency_key(Some(&key)),
+            ApplicationCreateRequest {
+                external_application_id: Some(format!("fp-peppered-{}", fixture.suffix)),
+                application_slug: Some(format!("fp-peppered-{}", fixture.suffix)),
+                display_name: format!("Fingerprint peppered {}", fixture.suffix),
+                metadata: json!({ "suite": "actor_fingerprint_unification" }),
+            },
+        )
+        .await
+        .expect("admin-command path");
+
+    let stored = fixture.distinct_fingerprints(&key).await;
+    assert_eq!(stored.len(), 1, "one actor and one key, one index point");
+    let fingerprint = &stored[0];
+
+    assert!(
+        fingerprint.starts_with("v1:"),
+        "the stored fingerprint must carry the pepper version prefix, got {fingerprint:?}"
+    );
+    assert_eq!(
+        fingerprint.len(),
+        46,
+        "\"v1:\" + 43 base64url characters; anything wider risks the varchar(128) column"
+    );
+    assert!(fingerprint.len() <= 128);
+
+    // The whole point: what is stored is *not* derivable from the actor's identity alone.
+    // An attacker holding a database dump cannot enumerate candidate actors against it
+    // without also holding the pepper, which the database never contains.
+    assert_ne!(
+        *fingerprint,
+        unkeyed_unified_fingerprint(&actor),
+        "a stored fingerprint equal to the unkeyed digest means the pepper is not applied"
+    );
+}
+
+/// The migration half of peppering the fingerprint, runtime-admin side.
+///
+/// A row written by the previous release carries the **unkeyed** spelling of the unified
+/// formula. The fingerprint is a column of the unique index
+/// `(idempotency_key_hash, actor_fingerprint, operation)`, so that row sits at a point of the
+/// index the peppered value cannot address at all: if the read path only looked for the
+/// peppered value it would miss, and a client retrying across the deploy would get a
+/// **second execution** where it asked for a replay.
+///
+/// This is the assertion that makes peppering a migration rather than a one-line edit.
+#[tokio::test]
+async fn an_unkeyed_fingerprint_row_still_replays_after_the_pepper_switch() {
+    let Some(fixture) = FingerprintFixture::new().await else {
+        return;
+    };
+    let service = RuntimeAdminService::new(&fixture.fixture.state).expect("runtime admin service");
+    let key = fixture.key("runtime-unkeyed");
+    let actor = fixture.actor(Uuid::now_v7());
+    let request = fixture.route_request("unkeyed");
+
+    let first = service
+        .create_route_definition(
+            &actor,
+            &request_context_with_idempotency_key(Some(&key)),
+            request.clone(),
+        )
+        .await
+        .expect("pre-downgrade route");
+
+    let rows = fixture.ledger_rows(ROUTE_OPERATION, &key).await;
+    assert_eq!(rows.len(), 1);
+    fixture
+        .downgrade_fingerprint(
+            ROUTE_OPERATION,
+            &key,
+            &rows[0].0,
+            &unkeyed_unified_fingerprint(&actor),
+        )
+        .await;
+
+    let replay = service
+        .create_route_definition(
+            &actor,
+            &request_context_with_idempotency_key(Some(&key)),
+            request.clone(),
+        )
+        .await
+        .expect(
+            "a pre-pepper ledger row must still replay — an error here means an in-flight key \
+             stopped matching across the deploy",
+        );
+
+    assert_eq!(
+        replay.id, first.id,
+        "the replay must return the originally created route"
+    );
+    assert_eq!(
+        fixture.route_count(&request.route_key).await,
+        1,
+        "a replay must not create a second route definition"
+    );
+    let after = fixture.ledger_rows(ROUTE_OPERATION, &key).await;
+    assert_eq!(after.len(), 1, "a replay must not insert a second row");
+    assert_eq!(
+        after[0].0,
+        unkeyed_unified_fingerprint(&actor),
+        "the replay must go through the unkeyed read path, not silently re-claim under the \
+         peppered fingerprint — re-claiming would hide a missed lookup behind a fresh insert"
+    );
+}
+
+/// The same migration, on the **admin-command** path.
+///
+/// It is a genuinely different read path and cannot be inferred from the runtime-admin test
+/// above: `runtime_admin::idempotency_replay` sweeps in the application layer, whereas this
+/// one resolves inside `PgAdminCommandTransaction::claim_idempotency`, under the advisory
+/// lock, through `AdminIdempotencyClaim::legacy_actor_fingerprint`. Dropping the legacy
+/// fingerprint from the claim leaves the runtime-admin test green.
+#[tokio::test]
+async fn an_unkeyed_fingerprint_row_still_replays_through_the_admin_command_claim() {
+    let Some(fixture) = FingerprintFixture::new().await else {
+        return;
+    };
+    let key = fixture.key("admin-unkeyed");
+    let actor = fixture.actor(Uuid::now_v7());
+    let slug = format!("fp-unkeyed-{}", fixture.suffix);
+    let request = ApplicationCreateRequest {
+        external_application_id: Some(slug.clone()),
+        application_slug: Some(slug.clone()),
+        display_name: format!("Fingerprint unkeyed {}", fixture.suffix),
+        metadata: json!({ "suite": "actor_fingerprint_unification" }),
+    };
+
+    let service = AdminService::new(&fixture.fixture.state).expect("admin service");
+    let first = service
+        .create_application(
+            &actor,
+            &request_context_with_idempotency_key(Some(&key)),
+            request.clone(),
+        )
+        .await
+        .expect("pre-downgrade application");
+
+    let rows = fixture.ledger_rows(APPLICATION_OPERATION, &key).await;
+    assert_eq!(rows.len(), 1);
+    fixture
+        .downgrade_fingerprint(
+            APPLICATION_OPERATION,
+            &key,
+            &rows[0].0,
+            &unkeyed_unified_fingerprint(&actor),
+        )
+        .await;
+
+    let replay = service
+        .create_application(
+            &actor,
+            &request_context_with_idempotency_key(Some(&key)),
+            request.clone(),
+        )
+        .await
+        .expect(
+            "a pre-pepper ledger row must still replay through the admin-command claim — an \
+             error here means an in-flight key stopped matching across the deploy",
+        );
+
+    assert_eq!(
+        replay.id, first.id,
+        "the replay must return the originally created application"
+    );
+    assert_eq!(
+        fixture
+            .count(
+                "select count(*) from applications where application_slug = $1",
+                &slug,
+            )
+            .await,
+        1,
+        "a replay must not create a second application"
+    );
+    let after = fixture.ledger_rows(APPLICATION_OPERATION, &key).await;
+    assert_eq!(after.len(), 1, "a replay must not insert a second row");
+    assert_eq!(
+        after[0].0,
+        unkeyed_unified_fingerprint(&actor),
+        "the replay must resolve through the claim's legacy fingerprint, not re-claim under \
+         the peppered one"
+    );
+}
+
+/// The fingerprint migration window must not be closed by the **plan-03 key-hash** switch.
+///
+/// `idempotency.accept_legacy_hashes` governs a different, older window: the unkeyed →
+/// keyed switch of `idempotency_key_hash` and `request_hash`. Operators were told to flip it
+/// to `false` one retention period after *that* deploy, which is several releases back, so a
+/// current deployment may well already be running with it closed.
+///
+/// The fingerprint moved to a keyed digest much later. Hanging its dual-read off the same
+/// switch would mean a deployment that had already followed those instructions received the
+/// pepper with **no dual-read at all** on this path: every pre-pepper admin ledger row would
+/// become unaddressable the moment the pepper landed, and a retried admin command would
+/// execute a second time instead of replaying. Before the pepper this was safe precisely
+/// because the fingerprint was stable — current-fingerprint plus current-key-hash still hit.
+///
+/// So the claim is exercised with the older window explicitly **closed**, which is the state
+/// the two tests above never reach: they run through `AdminService`, where the runner is
+/// built with the window open. Re-gating `legacy_actor_fingerprint` on `accept_legacy_hashes`
+/// leaves both of them green and fails only this one.
+#[tokio::test]
+async fn an_unkeyed_fingerprint_row_replays_even_with_the_key_hash_window_closed() {
+    let Some(fixture) = FingerprintFixture::new().await else {
+        return;
+    };
+    let key = fixture.key("claim-window-closed");
+    let actor = fixture.actor(Uuid::now_v7());
+    const OPERATION: &str = "application.create";
+
+    // The plan-03 key-hash window is CLOSED, exactly as TODO.md instructs operators to leave
+    // it once its own retention period has elapsed.
+    let runner = AdminCommandRunner::new(
+        PgAdminRepository::new(fixture.fixture.pool.clone()),
+        fixture.hasher.clone(),
+    )
+    .accepting_legacy_hashes(false);
+
+    let spec = || {
+        AdminCommandSpec::new(
+            OPERATION,
+            json!({}),
+            json!({ "suite": "actor_fingerprint_unification", "key": key }),
+        )
+        .expect("a well-formed admin command spec")
+        .with_idempotency(Some(AdminCommandIdempotency {
+            key: key.clone(),
+            actor_identity: unified_identity_bytes(&actor),
+        }))
+    };
+
+    // A counter rather than a database side effect: what must not happen twice is the
+    // *mutation*, and counting it states that directly.
+    let executions = Arc::new(AtomicUsize::new(0));
+
+    let counter = executions.clone();
+    let first = runner
+        .execute(spec(), move |_transaction| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(AdminCommandMutation {
+                    client_response: json!({ "created": true }),
+                    replay_response: json!({ "created": true }),
+                    status: 201,
+                    resource_id: Some("fingerprint-claim-window".to_string()),
+                })
+            })
+        })
+        .await
+        .expect("the first claim must be acquired");
+    assert!(!first.replayed, "the first call must not be a replay");
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+
+    let rows = fixture.ledger_rows(OPERATION, &key).await;
+    assert_eq!(rows.len(), 1);
+    let unkeyed = unkeyed_unified_fingerprint(&actor);
+    fixture
+        .downgrade_fingerprint(OPERATION, &key, &rows[0].0, &unkeyed)
+        .await;
+
+    let counter = executions.clone();
+    let replay = runner
+        .execute(spec(), move |_transaction| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(AdminCommandMutation {
+                    client_response: json!({ "created": true }),
+                    replay_response: json!({ "created": true }),
+                    status: 201,
+                    resource_id: Some("fingerprint-claim-window".to_string()),
+                })
+            })
+        })
+        .await
+        .expect(
+            "a pre-pepper ledger row must still replay through the claim with the plan-03 \
+             key-hash window closed — the fingerprint window is a separate, newer one",
+        );
+
+    assert!(
+        replay.replayed,
+        "the claim must resolve to the existing row, not acquire a fresh one"
+    );
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        1,
+        "the mutation must not run a second time — a second execution here is the duplicate \
+         admin command the dual-read exists to prevent",
+    );
+    let after = fixture.ledger_rows(OPERATION, &key).await;
+    assert_eq!(after.len(), 1, "a replay must not insert a second row");
+    assert_eq!(
+        after[0].0, unkeyed,
+        "the replay must resolve through the claim's unkeyed fingerprint"
+    );
+}
+
+/// The same migration, on the **public** `/v1/responses` path — the third read path that
+/// gained an unkeyed-fingerprint probe, and the one where a miss is most expensive.
+///
+/// It cannot be inferred from either test above. `runtime_admin::idempotency_replay` and
+/// `PgAdminCommandTransaction::claim_idempotency` are different code with different sweeps;
+/// `public::claim_idempotency` builds its own candidate list, and deleting the two
+/// `unkeyed_actor_fingerprint` entries from it leaves both of those tests green.
+///
+/// What that deletion would cost is asserted here directly rather than argued: every
+/// `/v1/responses` ledger row written before the pepper deploy becomes unaddressable, so a
+/// client retrying its `Idempotency-Key` across the deploy is answered with a **second
+/// billable provider execution** instead of its stored response. The mock provider's call
+/// count is what proves it — a silent re-execution shows up as `2`, not as a plausible body.
+#[tokio::test]
+async fn an_unkeyed_fingerprint_row_still_replays_through_the_public_response_path() {
+    let Some(fixture) = FingerprintFixture::new().await else {
+        return;
+    };
+    // Scripted with a single completion on purpose: if the sweep misses, the second call
+    // does not merely mis-count, it runs off the end of the script.
+    let provider = MockOpenAiServer::start([ProviderScript::Completion {
+        text: "unkeyed fingerprint payload".to_string(),
+    }])
+    .await;
+    fixture
+        .fixture
+        .add_provider(provider.base_url(), 10, RuntimePolicy::default())
+        .await;
+    fixture.fixture.enable_public_streaming().await;
+
+    let service = PublicExecutionService::new(&fixture.fixture.state).expect("public service");
+    let key = fixture.key("public-unkeyed");
+    let actor = fixture.actor(Uuid::now_v7());
+    let request = public_response_request(&fixture.fixture.route_key);
+
+    let first: PublicResponse = service
+        .create_response(
+            &actor,
+            &request_context_with_idempotency_key(Some(&key)),
+            request.clone(),
+        )
+        .await
+        .expect("pre-downgrade response");
+    assert_eq!(
+        provider.call_count().await,
+        1,
+        "the first request must genuinely execute"
+    );
+
+    let rows = fixture.ledger_rows(RESPONSE_OPERATION, &key).await;
+    assert_eq!(rows.len(), 1);
+    let unkeyed = unkeyed_unified_fingerprint(&actor);
+    fixture
+        .downgrade_fingerprint(RESPONSE_OPERATION, &key, &rows[0].0, &unkeyed)
+        .await;
+
+    let replay: PublicResponse = service
+        .create_response(
+            &actor,
+            &request_context_with_idempotency_key(Some(&key)),
+            request,
+        )
+        .await
+        .expect(
+            "a pre-pepper /v1/responses ledger row must still replay — an error here means an \
+             in-flight idempotency key stopped matching across the pepper deploy",
+        );
+
+    assert_eq!(
+        replay.id, first.id,
+        "the replay must return the originally created response"
+    );
+    assert_eq!(
+        provider.call_count().await,
+        1,
+        "a replay must not re-execute against the provider — a second call here is the \
+         duplicate billable execution the unkeyed sweep exists to prevent",
+    );
+    let after = fixture.ledger_rows(RESPONSE_OPERATION, &key).await;
+    assert_eq!(
+        after.len(),
+        1,
+        "a replay must not insert a second ledger row alongside the unkeyed one"
+    );
+    assert_eq!(
+        after[0].0, unkeyed,
+        "the replay must go through the unkeyed read path, not re-claim under the peppered \
+         fingerprint — re-claiming would hide a missed lookup behind a fresh insert"
+    );
 
     provider.shutdown().await;
 }

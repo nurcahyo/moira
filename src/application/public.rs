@@ -1114,8 +1114,8 @@ impl PublicExecutionService {
         let Some(key) = ctx.idempotency_key.as_deref() else {
             return Ok(None);
         };
-        let actor_fingerprint = crate::application::admin::actor_fingerprint(actor);
         let hasher = &self.state.idempotency_hasher;
+        let actor_fingerprint = crate::application::admin::actor_fingerprint(hasher, actor);
         let request_bytes = normalized_request_bytes(&(application_id, request))?;
 
         // Pre-claim sweep, deliberately *before* the claim insert, over every historical
@@ -1126,8 +1126,11 @@ impl PublicExecutionService {
         //   * `idempotency_key_hash` — unkeyed SHA-256 → keyed HMAC (plan 03, P1-1). The
         //     current hash needs no pre-claim probe: the claim's `on conflict` finds it.
         //   * `actor_fingerprint` — this module's 4-field formula → the crate-wide 10-field
-        //     one (plan 06, Module 16 / P2-15). Both key hashes must be probed under the
-        //     legacy value, because a pre-plan-06 row may carry either.
+        //     one (plan 06, Module 16 / P2-15), and then that 10-field digest from unkeyed
+        //     SHA-256 → keyed HMAC when the fingerprint was peppered (issue #95). Both key
+        //     hashes must be probed under each legacy value, because a pre-deploy row may
+        //     carry either. A *peppered* 4-field digest is deliberately absent: the narrow
+        //     formula was retired before the pepper existed, so nothing ever wrote one.
         //
         // Skipping the sweep is not a slow replay, it is a *wrong* one: an unswept row sits
         // at a different point of the unique index, so the claim below would insert
@@ -1135,22 +1138,27 @@ impl PublicExecutionService {
         // second time against the provider — a contractual replay turned into a duplicate
         // billable call.
         //
-        // Cost: up to three indexed lookups per idempotent request, on the miss path only.
-        // The write below always uses the current pair, so the legacy value can never
-        // re-enter the ledger and the sweep drains as rows expire.
+        // Cost: up to five indexed lookups per idempotent request, on the miss path only.
+        // The write below always uses the current pair, so no legacy value can ever re-enter
+        // the ledger and the sweep drains as rows expire.
         //
         // TODO(post-deploy): drop the two `legacy_actor_fingerprint` probes once every ledger
-        // row written before plan 06 shipped has expired. `idempotency_record` sets
-        // `expires_at` 24h ahead, so the earliest safe removal date is the deploy date of
-        // Module 16 + 1 day. The plan-03 `legacy_hash` probe has its own, earlier window.
+        // row written before plan 06 shipped has expired, and the two
+        // `unkeyed_actor_fingerprint` probes once every row written before the pepper deploy
+        // has expired. `idempotency_record` sets `expires_at` 24h ahead, so each window closes
+        // 24h after the deploy that carries it. The plan-03 `legacy_hash` probe has its own,
+        // earlier window.
         //
         // Gated on a DEPLOY, not on a merge, and deliberately not owned by any plan — see the
         // matching note in `runtime_admin.rs`.
+        let unkeyed_actor_fingerprint = crate::application::admin::unkeyed_actor_fingerprint(actor);
         let legacy_actor_fingerprint = legacy_public_actor_fingerprint(actor, application_id);
         let legacy_key_hash = hasher.legacy_hash(key.as_bytes());
         let current_key_hash = hasher.hash(key.as_bytes());
         let candidates = [
             (&legacy_key_hash, &actor_fingerprint),
+            (&current_key_hash, &unkeyed_actor_fingerprint),
+            (&legacy_key_hash, &unkeyed_actor_fingerprint),
             (&current_key_hash, &legacy_actor_fingerprint),
             (&legacy_key_hash, &legacy_actor_fingerprint),
         ];
@@ -2999,9 +3007,10 @@ mod tests {
                  stops holding, `claim_idempotency`'s legacy sweep is probing a value \
                  production never wrote and pre-deploy rows will not replay"
             );
+            let hasher = crate::security::IdempotencyHasher::new(b"public-pepper".to_vec(), "v1");
             assert_ne!(
-                crate::application::admin::actor_fingerprint(&base),
-                crate::application::admin::actor_fingerprint(&variant),
+                crate::application::admin::actor_fingerprint(&hasher, &base),
+                crate::application::admin::actor_fingerprint(&hasher, &variant),
                 "the unified formula must isolate replay across `{field}`"
             );
         }
@@ -3032,9 +3041,10 @@ mod tests {
             effective_application_id(&base),
             base.internal_application_id
         );
+        let hasher = crate::security::IdempotencyHasher::new(b"public-pepper".to_vec(), "v1");
         assert_ne!(
-            crate::application::admin::actor_fingerprint(&base),
-            crate::application::admin::actor_fingerprint(&other),
+            crate::application::admin::actor_fingerprint(&hasher, &base),
+            crate::application::admin::actor_fingerprint(&hasher, &other),
             "application identity must still partition the ledger without the argument"
         );
         assert_ne!(
