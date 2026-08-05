@@ -66,6 +66,28 @@ import {
  * serves the unit and integration suites, not this one), delete the entries from
  * the list below and KEEP the URL assertion. The assertion is what will prove
  * the authenticated run is doing anything.
+ *
+ * ----------------------------------------------------------------------------
+ * UPDATE (issue #75): THAT PROJECT NOW EXISTS, AND THIS FILE STILL CANNOT USE IT
+ * ----------------------------------------------------------------------------
+ *
+ * `e2e/support/authenticated-stack.ts` stands up a second console — a fixture
+ * Moira, a mock IdP and the console's own database — and the `authenticated`
+ * project drives it with a real session. `/settings/llm` IS axe-audited there,
+ * signed in, in `e2e/llm-settings-authenticated.e2e.ts`.
+ *
+ * It stays on the list below anyway, and that is not an oversight. This walker
+ * runs in the `chromium` project, against the SCAFFOLD server, where
+ * `MOIRA_API_URL` is `https://moira.invalid` and every gated route still
+ * redirects. The list's meaning is unchanged — "gated routes this walker cannot
+ * audit" — and the bidirectional assertion below is what keeps that honest. What
+ * changed is that `/settings/llm` is no longer UNAUDITED; it is audited
+ * elsewhere, by a suite that could see it.
+ *
+ * `/` and `/admins` have no authenticated coverage yet. Moving them is a
+ * separate change: each needs its own spec in the authenticated project, and
+ * adding them to that project's `testMatch` without one would audit nothing
+ * while looking like it had.
  */
 
 const routes: DiscoveredRoute[] = discoverPageRoutes(APP_DIR);
@@ -92,6 +114,11 @@ const ROUTES_NOT_AUDITED_PENDING_AUTHENTICATED_E2E: readonly string[] = [
   // `/login` and does NOT audit it. Listed rather than silently uncovered: the
   // bidirectional assertion means adding a gated screen without touching this
   // file fails, which is the only thing keeping the gap a reviewed fact.
+  //
+  // NOT a gap any more, though it is still on this list: issue #75 audits this
+  // route WITH a session, in `e2e/llm-settings-authenticated.e2e.ts`, against
+  // the second stack. See the UPDATE in this file's header for why the entry
+  // stays.
   "/settings/llm",
 ];
 

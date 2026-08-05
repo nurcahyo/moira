@@ -44,8 +44,27 @@ import { discoverPageRoutes } from "./support/routes";
  * property than a browser could give: it exercises the real credential boundary
  * rather than a storage state somebody minted for it.
  *
- * REVERSAL CONDITION: when an authenticated Playwright project exists, move the
- * chain here and keep both assertions below.
+ * ============================================================================
+ * UPDATE (issue #75): THE AUTHENTICATED PROJECT NOW EXISTS
+ * ============================================================================
+ *
+ * `e2e/support/authenticated-stack.ts` stands up a SECOND console — the same
+ * standalone artifact against a fixture Moira, a mock IdP, a mock `/v1/models`
+ * endpoint and the console's own database — and
+ * `e2e/llm-settings-authenticated.e2e.ts` drives the whole chain through a
+ * browser carrying a session the console itself minted.
+ *
+ * THIS FILE IS NOT REDUNDANT AND WAS NOT WEAKENED. It runs in the `chromium`
+ * project, against the scaffold environment, and it is the only place that
+ * asserts what a browser gets from a console with NOTHING reachable behind it —
+ * which is the state a misconfigured deployment is actually in. What the new
+ * suite adds is the half stated below as unavailable: it asserts the specific
+ * refusal (`401 no_session`) that this environment cannot distinguish from a
+ * 503, because there Moira resolves and 503 is not available as an excuse.
+ *
+ * The two halves of the REVERSAL CONDITION are therefore split rather than
+ * moved: the chain now lives in the authenticated suite, and both assertions
+ * below stay exactly as they are.
  */
 
 const LLM_PAGE = "/settings/llm";
@@ -137,6 +156,12 @@ const GUARDED_ENDPOINTS: ReadonlyArray<{
  *
  * REVERSAL CONDITION: when an authenticated Playwright project exists,
  * `MOIRA_API_URL` points at something resolvable and 503 can leave this set.
+ *
+ * ISSUE #75: it exists, and 503 still cannot leave THIS set — the scaffold
+ * environment this suite runs in is deliberately unreachable and that has not
+ * changed. `e2e/llm-settings-authenticated.e2e.ts` makes the narrower assertion
+ * against the second stack, where `withConsoleSession` reaches the session check
+ * and answers `401 no_session` by name.
  */
 const REFUSAL_STATUSES = new Set([401, 403, 503]);
 
