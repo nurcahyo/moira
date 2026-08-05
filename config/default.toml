@@ -95,6 +95,18 @@ maximum_schema_bytes = 65536
 heartbeat_seconds = 15
 rate_limiter_max_entries = 10000
 
+# SSRF policy for caller-supplied image URLs. Moira validates these but does not fetch
+# them: the provider performs the request, so this section governs which addresses a
+# caller may point the provider at, not what may come back.
+[public_api.image_urls]
+dns_timeout_ms = 1000
+total_validation_timeout_ms = 3000
+# Exact hostnames. Empty means "any host that passes the address-range rules". Setting it
+# is the only control that still binds if the provider follows a redirect Moira never sees.
+allowed_hosts = []
+# Dev only. Production start-up refuses to come up while this is true.
+allow_insecure_dev_urls = false
+
 [redis]
 enabled = false
 url = ""
