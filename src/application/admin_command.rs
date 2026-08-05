@@ -71,7 +71,8 @@ pub struct AdminCommandRunner {
     ///
     /// It is `true` on every production runner today: nothing outside the tests calls
     /// [`Self::accepting_legacy_hashes`], so the operator setting never reaches this field
-    /// and the key-hash window on this path cannot actually be closed. Tracked in `TODO.md`.
+    /// and the key-hash window on this path cannot actually be closed. Pre-existing since
+    /// plan 03, not introduced with the pepper. Tracked in `TODO.md` and issue #125.
     accept_legacy_hashes: bool,
 }
 
@@ -189,11 +190,14 @@ impl AdminCommandRunner {
 
     /// Wires `idempotency.accept_legacy_hashes` (plan 03 finding F4).
     ///
-    /// A builder rather than a `new` parameter so the twelve existing construction sites in
-    /// `application/admin.rs` and `application/conversation.rs` keep compiling and keep
-    /// their current behaviour until each is opted in. **None of them has been opted in
-    /// yet** — the only caller is a test — so `idempotency.accept_legacy_hashes` is inert on
-    /// the admin-command path. Wiring it is its own change, tracked in `TODO.md`.
+    /// A builder rather than a `new` parameter so the construction sites that existed when
+    /// plan 03 landed kept compiling and kept their current behaviour until each was opted
+    /// in. **None of them has been opted in yet** — the only caller is a test — so
+    /// `idempotency.accept_legacy_hashes` is inert on the admin-command path. There are now
+    /// nineteen production sites, spread across `application/identity.rs`,
+    /// `application/conversation.rs`, `application/admin/` and `application/auth_settings.rs`
+    /// rather than the two modules this note originally named. Wiring them is its own change,
+    /// tracked in `TODO.md` and issue #125.
     #[must_use]
     pub fn accepting_legacy_hashes(mut self, accept_legacy_hashes: bool) -> Self {
         self.accept_legacy_hashes = accept_legacy_hashes;
@@ -363,7 +367,8 @@ impl AdminCommandRunner {
 /// A stored value with no `':'` separator is a pre-switch, unkeyed SHA-256. Once the
 /// dual-read window is closed (`accept_legacy_hashes = false`) it is rejected outright
 /// instead of being handed to `verify`'s legacy arm (finding F4). See the note on
-/// `AdminCommandRunner::accept_legacy_hashes`: no production runner closes it today.
+/// `AdminCommandRunner::accept_legacy_hashes`: no production runner closes it today, because
+/// nothing wires the setting into the runner — issue #125.
 fn verify_stored_request_hash(
     hasher: &IdempotencyHasher,
     accept_legacy_hashes: bool,

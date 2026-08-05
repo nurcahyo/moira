@@ -51,7 +51,7 @@ pub struct PgAdminCommandTransaction {
 /// also removes the extra lookup it costs on every claim. `idempotency.accept_legacy_hashes`
 /// is the setting that is *meant* to drive that choice, but no production construction site
 /// wires it into `AdminCommandRunner` yet, so on this path the window is currently always
-/// open regardless of configuration — tracked in `TODO.md`.
+/// open regardless of configuration — tracked in `TODO.md` and issue #125.
 ///
 /// `legacy_actor_fingerprint` exists for the analogous reason on the other index column:
 /// peppering the actor fingerprint changed its spelling, so a claim must be able to address
