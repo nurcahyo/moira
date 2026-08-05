@@ -43,3 +43,23 @@ ca179b044030a773ec40fa429aee45be2c666240:tests/public_authorization.rs:private-k
 # that file is that nothing in it can reach anything real.
 b2dd3e2078552b4a3740e5e4b4700836c284efe7:console/e2e/support/console-env.ts:generic-api-key:33
 f0ecbbcd3a4e7a03e3a9993889a638245cff8561:console/e2e/support/console-env.ts:generic-api-key:33
+#
+# ── console/e2e/support/authenticated-stack.ts: the AUTHENTICATED fixture (issue #75) ─
+# The same class of finding as the two lines above, in the second e2e stack rather than
+# the scaffold, and read before it was added: `CONSOLE_SECRET_ENCRYPTION_KEY` there is
+# 32 bytes invented for that fixture, used to seal ONE row — the fixture OAuth client
+# secret — into a throwaway `*_playwright` database the stack creates, migrates and
+# truncates on every run. It is handed to a `node .next/standalone/server.js` child on
+# loopback whose Moira, IdP and model endpoint are all mocks this same process started.
+# It decrypts nothing outside that process tree and unlocks nothing that outlives it.
+#
+# WHY THE VALUE STAYS IN THE FILE RATHER THAN BEING GENERATED TO DODGE THIS ENTRY.
+# It could be: the stack seals and unseals the row inside one process, so a per-run
+# random key would work and would leave nothing for gitleaks to find in the tree. It is
+# not done, for two reasons. The scan walks HISTORY, so the finding at a5d7a50 needs a
+# baseline line whatever the tree says next — rewriting the code would buy nothing here
+# and would only move the same decision out of this file, where it is reviewed, and into
+# a fixture, where it is not. And a fixture whose credentials are printed constants is
+# reproducible: a failed run can be re-entered byte for byte, which is why
+# `BETTER_AUTH_SECRET` and `AUTH_CLIENT_SECRET` beside it are constants too.
+a5d7a5015ebddd9bffcec47a1c225711d5c1df92:console/e2e/support/authenticated-stack.ts:generic-api-key:134

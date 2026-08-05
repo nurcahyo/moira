@@ -1,11 +1,12 @@
 import { defineConfig, devices } from "@playwright/test";
 
-import {
-  AUTH_CONSOLE_ORIGIN,
-  AUTH_CONSOLE_PORT,
-  AUTH_STORAGE_STATE,
-} from "./e2e/support/authenticated-fixture";
+import { AUTH_CONSOLE_ORIGIN, AUTH_STORAGE_STATE } from "./e2e/support/authenticated-fixture";
 import { installConsoleE2eEnv } from "./e2e/support/console-env";
+// Imported for its LOAD-TIME EFFECT as much as for the number: `fixed-ports.ts`
+// runs `assertFixedPortsDisjoint()` at import, so two harnesses claiming one port
+// fail here — at config load, before a build — instead of as an EADDRINUSE from
+// whichever server lost the race five minutes in.
+import { SCAFFOLD_CONSOLE_PORT } from "./e2e/support/fixed-ports";
 import { SENTINEL_ENV } from "./e2e/support/secrets";
 
 // Must run before `forbiddenValues()` reads `process.env` — see console-env.ts.
@@ -28,10 +29,11 @@ installConsoleE2eEnv();
  */
 
 /**
- * Deliberately not 3000 (a dev `next dev` would clash) and not 3100 (commonly
- * taken by local Docker port mappings). Override with CONSOLE_E2E_PORT.
+ * Declared in `e2e/support/fixed-ports.ts` with every other fixed port in the
+ * harness — see that file for why they are in one place. Override the whole run
+ * with CONSOLE_E2E_PORT.
  */
-const port = Number(process.env.CONSOLE_E2E_PORT ?? 3210);
+const port = SCAFFOLD_CONSOLE_PORT;
 
 /** Set CONSOLE_E2E_BASE_URL to test an already-running console (no webServer). */
 const externalBaseURL = process.env.CONSOLE_E2E_BASE_URL;
@@ -253,13 +255,13 @@ export default defineConfig({
             timeout: 300_000,
             stdout: "pipe" as const,
             stderr: "pipe" as const,
-            env: {
-              // Everything else the console needs is composed by the stack
-              // itself and handed to the child it spawns; only the port the
-              // browser will use is decided here, and it must agree with
-              // `AUTH_CONSOLE_ORIGIN`.
-              CONSOLE_E2E_AUTH_PORT: String(AUTH_CONSOLE_PORT),
-            },
+            // No `env`. Everything the console needs is composed by the stack
+            // itself and handed to the child it spawns, and the ports come from
+            // `e2e/support/fixed-ports.ts`, which the stack imports directly.
+            // The `CONSOLE_E2E_AUTH_PORT` that used to be set here was read by
+            // nothing — a value that has to agree with `AUTH_CONSOLE_ORIGIN` and
+            // is passed through a second channel is a second place for the two
+            // to disagree.
           },
         ],
       }),

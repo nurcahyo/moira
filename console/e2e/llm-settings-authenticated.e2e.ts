@@ -103,10 +103,67 @@ function writesIn(requests: readonly RecordedMoiraRequest[]): string[] {
   return requests.filter((request) => request.method !== "GET").map((request) => request.route);
 }
 
-/** Type the fixture endpoint's ORIGIN, so the `/v1` canonicalisation is visible. */
+/**
+ * Type the fixture endpoint's ORIGIN, so the `/v1` canonicalisation is visible.
+ *
+ * ============================================================================
+ * IT REFUSES A NON-LOOPBACK VALUE, AND IT CHECKS THE VALUE SURVIVED
+ * ============================================================================
+ *
+ * The field arrives PRE-FILLED with `LOCAL_VLLM_BASE_URL`, which names a REAL
+ * deployment. Every test here types over it — and the first version of this
+ * helper did the typing and nothing else, which is how the suite came to probe
+ * that deployment from a test run.
+ *
+ * REPRODUCED. `page.goto(..., { waitUntil: "domcontentloaded" })` returns before
+ * React hydrates. `ConnectVllmPanel` renders a CONTROLLED input
+ * (`value={baseUrl}`, `useState(defaultBaseUrl)`), so a `fill()` that lands
+ * before hydration writes the DOM node and nothing else: hydration then restores
+ * `defaultBaseUrl` and the typed address is gone with no error anywhere.
+ * Pressing Discover next sent `https://local-llm.motrait.com` to the BFF, which
+ * probed it — and because that deployment really does serve `Qwen3-4B`, the
+ * `toBeChecked()` assertion on the first advertised model PASSED. The run went
+ * green while contacting production. It surfaced only when the recorded
+ * `POST /api/v1/admin/providers` body was compared against the fixture URL.
+ *
+ * So the helper now does three things instead of one:
+ *
+ *   1. refuses a non-loopback value outright — the caller's mistake, caught
+ *      before anything is typed;
+ *   2. waits for `networkidle` FIRST, so React owns the input by the time it is
+ *      filled and `fill()` runs the `onChange` that updates the state;
+ *   3. asserts the field still holds the value afterwards, so a fill that is
+ *      discarded again — by hydration or by anything else — fails HERE, loudly,
+ *      instead of redirecting the probe to a real host.
+ *
+ * Step 2 is the fix and step 3 is the alarm, in that order and not the other way
+ * round. Removing step 2 and keeping step 3 was run as a negative control: three
+ * repeats of the chain test, three failures, and in all three the `toHaveValue`
+ * in step 3 PASSED — hydration reverted the field after the assertion had
+ * already observed it. The alarm alone catches nothing.
+ *
+ * `authenticated-stack.ts` makes the matching assertion from the other side,
+ * about the socket it bound.
+ */
 async function fillEndpoint(page: import("@playwright/test").Page, value: string): Promise<void> {
+  const host = new URL(value).hostname;
+  if (host !== "127.0.0.1" && host !== "localhost") {
+    throw new Error(
+      `refusing to type ${value} into the endpoint field: only a loopback address the harness ` +
+        "itself bound may be probed. The field's pre-filled default names a real deployment, and " +
+        "a suite that contacts it is testing someone else's uptime.",
+    );
+  }
+  await page.waitForLoadState("networkidle");
   const field = page.getByLabel(t(CONSOLE_MESSAGE_KEYS.llm_connect_endpoint_label));
   await field.fill(value);
+  await expect(
+    field,
+    "the endpoint field did not keep the address that was typed into it. The panel's input is " +
+      "controlled by React state, so a fill that lands before hydration is silently reverted to " +
+      "the PRE-FILLED DEFAULT — which names a real deployment. Pressing Discover after that " +
+      "probes production and can still go green.",
+  ).toHaveValue(value);
 }
 
 async function runAxe(
@@ -144,6 +201,16 @@ async function runAxe(
  * and produce a failure that reproduces once in ten runs. Serial is not a
  * concession here — a suite whose subject is the ORDER of a sequence of writes
  * cannot share a recorder with anything.
+ *
+ * AND `--repeat-each` DOES NOT WORK ON THIS FILE, which is worth writing down
+ * because the failure it produces looks like a real ordering bug. Observed while
+ * checking the fix in `fillEndpoint`: `--repeat-each=3` fails the chain test with
+ * a window containing two page renders' worth of reads and none of the four
+ * writes — the reuse-first lookups found rows a previous repeat had left, so the
+ * chain correctly created nothing. `beforeEach`'s `resetFixture()` cannot close
+ * that: a repeat begins while the previous one's `router.refresh()` is still in
+ * flight against the same fixture. Repeat the whole `playwright test`
+ * invocation instead; three consecutive runs were used to confirm the fix.
  */
 test.describe.configure({ mode: "serial" });
 
@@ -194,23 +261,63 @@ test.describe("without a console session", () => {
     //
     // Here Moira resolves and the console is fully configured, so 503 is not
     // available as an excuse. `no_session` is the check itself, named.
-    const response = await request.fetch("/api/llm/connect-vllm", {
+    //
+    // ======================================================================
+    // BOTH STAGES ARE PROBED, AND WITH ADDRESSES THAT WOULD WORK
+    // ======================================================================
+    //
+    // The first version sent `base_url: UNREACHABLE_ENDPOINT_URL` and then
+    // asserted that the fixture had recorded no probe and had created no rows.
+    // Neither assertion could fail. `127.0.0.1:1` is refused by the kernel, so
+    // even with the session gate DELETED the mock endpoint would have recorded
+    // nothing; and `discover` writes nothing to Moira on any path, so the row
+    // counts stay at zero whatever happens. Two green lines that described the
+    // address in the request body rather than the gate under test.
+    //
+    // So `discover` is sent the address of the mock this harness STARTED — a
+    // probe that reaches it is recorded, which is what makes "no probe left the
+    // deployment" a claim about the gate — and `connect` is sent a body that
+    // would build the whole chain, which is what makes the row counts one.
+    const fixture = await readFixture();
+
+    const discover = await request.fetch("/api/llm/connect-vllm", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      data: { action: "discover", base_url: UNREACHABLE_ENDPOINT_URL },
+      data: { action: "discover", base_url: fixture.vllmOrigin },
     });
 
-    expect(response.status()).toBe(401);
-    const body = (await response.json()) as { error?: { code?: string; message_key?: string } };
+    expect(discover.status()).toBe(401);
+    const body = (await discover.json()) as { error?: { code?: string; message_key?: string } };
     expect(body.error?.code).toBe("no_session");
     expect(body.error?.message_key).toMatch(/^console\./);
-    expect(response.headers()["cache-control"]).toBe("no-store");
+    expect(discover.headers()["cache-control"]).toBe("no-store");
+
+    const connect = await request.fetch("/api/llm/connect-vllm", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      data: {
+        action: "connect",
+        base_url: fixture.vllmOrigin,
+        display_name: "unauthenticated-caller",
+        model_keys: [DISCOVERABLE_MODEL_KEYS[0]],
+      },
+    });
+
+    expect(connect.status()).toBe(401);
+    expect(
+      ((await connect.json()) as { error?: { code?: string } }).error?.code,
+      "the connect stage answered something other than the session refusal",
+    ).toBe("no_session");
 
     // Refused before anything was contacted: no probe left the deployment, and
     // no admin call was made to be refused.
-    const fixture = await readFixture();
-    expect(fixture.vllmRequests, "an unauthenticated caller made the BFF probe a host").toEqual([]);
-    expect(fixture.rows).toEqual({
+    const after = await readFixture();
+    expect(after.vllmRequests, "an unauthenticated caller made the BFF probe a host").toEqual([]);
+    expect(
+      writesIn(after.moiraRequests),
+      "an unauthenticated caller reached Moira's admin plane",
+    ).toEqual([]);
+    expect(after.rows).toEqual({
       providers: 0,
       providerModels: 0,
       providerCredentials: 0,
@@ -256,7 +363,7 @@ test.describe("with a console session", () => {
     // addresses. Typing the canonical form would hide a regression that dropped
     // the suffix.
     await fillEndpoint(page, fixture.vllmOrigin);
-    await resetRecording();
+    await resetRecording(page);
     await page
       .getByRole("button", { name: t(CONSOLE_MESSAGE_KEYS.llm_connect_discover_submit) })
       .click();
@@ -305,10 +412,24 @@ test.describe("with a console session", () => {
       .click();
     await expect(page.getByRole("checkbox", { name: FIRST_MODEL })).toBeChecked();
 
+    // WHICH HOST ANSWERED, before the recording that would forget it is cleared.
+    //
+    // `toBeChecked()` above cannot tell the fixture endpoint from the shipped
+    // default: `https://local-llm.motrait.com` also serves `Qwen3-4B`, so a
+    // probe that went there advertises the same first model and satisfies the
+    // same assertion. The mock's own request log is the only thing that names
+    // the host, and after `resetRecording` it is gone.
+    const probed = await readFixture();
+    expect(
+      probed.vllmRequests,
+      "discovery did not reach the mock endpoint this harness started, so it reached something " +
+        "else — see fillEndpoint for how that happens without any assertion noticing.",
+    ).toEqual(["GET /v1/models"]);
+
     // The recording starts at the click this test is about. Rows are NOT reset:
     // an ordering assertion must not be bought by wiping the state the click is
     // supposed to find.
-    await resetRecording();
+    await resetRecording(page);
     await page.getByRole("button", { name: t(CONSOLE_MESSAGE_KEYS.llm_connect_submit) }).click();
 
     await expect(page.getByText(t(CONSOLE_MESSAGE_KEYS.llm_connect_done))).toBeVisible();
@@ -336,8 +457,28 @@ test.describe("with a console session", () => {
     // ---- what each write actually carried ---------------------------------
     const find = (route: string) => after.moiraRequests.find((entry) => entry.route === route)!;
 
+    // ======================================================================
+    // AS THE HUMAN, NOT AS THE BOOTSTRAP KEY
+    // ======================================================================
+    //
+    // `lib/moira-session.ts` gives `moiraClientForSession` no `systemKey`, and
+    // says why: `MoiraClient`'s `admin` arm PREFERS the system key when both are
+    // present, so a client built with one "would silently authenticate every
+    // admin call as the bootstrap key instead of as the human — defeating the
+    // audit trail and making the `admin_identities` grant untested in practice".
+    //
+    // This stack sets `MOIRA_SYSTEM_KEY` (a cold `consoleRuntime()` cannot
+    // resolve an auth configuration without it), so that regression is one
+    // constructor argument away here and it changes nothing a status code can
+    // see. `credential` names which header arrived; `authenticated: boolean`,
+    // which this replaced, was true for both.
     for (const entry of after.moiraRequests) {
-      expect(entry.authenticated, `${entry.route} went out unauthenticated`).toBe(true);
+      expect(
+        entry.credential,
+        `${entry.route} did not go out as the signed-in operator. "system_key" means the ` +
+          "bootstrap credential was handed to a session-scoped client — see " +
+          "moiraClientForSession in lib/moira-session.ts.",
+      ).toBe("operator");
     }
     for (const write of CHAIN_WRITES) {
       expect(find(write).idempotencyKey, `${write} carried no Idempotency-Key`).not.toBeNull();
@@ -410,7 +551,7 @@ test.describe("with a console session", () => {
   }) => {
     await page.goto(LLM_PAGE, { waitUntil: "domcontentloaded" });
     await fillEndpoint(page, UNREACHABLE_ENDPOINT_URL);
-    await resetRecording();
+    await resetRecording(page);
     await page
       .getByRole("button", { name: t(CONSOLE_MESSAGE_KEYS.llm_connect_discover_submit) })
       .click();

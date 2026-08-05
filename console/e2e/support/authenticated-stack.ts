@@ -77,6 +77,7 @@ import {
   MOIRA_IDS,
   type FixtureReport,
 } from "./authenticated-fixture";
+import { FIXED_PORTS, SCAFFOLD_CONSOLE_PORT, assertFixedPortsAreFree } from "./fixed-ports";
 import { createMoiraFixture, discoveryBody } from "./moira-fixture";
 
 /* -------------------------------------------------------------------------- */
@@ -129,8 +130,18 @@ const DATABASE_URL = ((): string => {
 const CONSOLE_ENV = {
   MOIRA_ADMIN_API_AUDIENCE: AUTH_ADMIN_API_AUDIENCE,
   BETTER_AUTH_SECRET: "moira-console-authenticated-e2e-better-auth-secret-4b19",
-  // 32 bytes, base64, free of `+` and `/` for the same reason `console-env.ts`
-  // gives: a needle containing `/` is discarded by the secret-leak harness.
+  // 32 bytes, base64. It seals ONE row — the fixture OAuth client secret — into
+  // the throwaway `*_playwright` database this stack truncates on every run, and
+  // the same process hands it to the console child that unseals it.
+  //
+  // It is BASELINED in `.gitleaksignore`, under its own heading, with the reason
+  // it is a constant rather than a per-run random value. An earlier version of
+  // this comment claimed the alphabet avoided `+` and `/` "for the same reason
+  // console-env.ts gives" — that a needle containing `/` is discarded by the
+  // secret-leak harness. That reason does not apply here: `forbiddenValues()`
+  // harvests the PLAYWRIGHT RUNNER's ambient environment, and this value never
+  // enters it — it is composed in this file and passed to a spawned child. The
+  // secret-leak suite runs against the scaffold server, not this stack.
   CONSOLE_SECRET_ENCRYPTION_KEY: "gTdKq2mBcXWvPzR8sLnY4hJeA6uF0iOaQwErTyUiOpA=",
   // The bootstrap credential. `consoleRuntime()` cannot resolve an auth
   // configuration without one on a cold process — see `lib/auth-runtime.ts`.
@@ -237,9 +248,23 @@ function shutdown(code: number): never {
   process.exit(code);
 }
 
+/**
+ * The three fixed ports THIS process binds — not the scaffold's, which is
+ * expected to be occupied by the time this runs (entry 0 owns the build, and
+ * step 0 below waits for it to answer).
+ */
+const OWN_FIXED_PORTS = FIXED_PORTS.filter((claim) => claim.port !== SCAFFOLD_CONSOLE_PORT);
+
 async function main(): Promise<void> {
-  // ---- 0. wait for the scaffold's server, i.e. for the build ---------------
-  const scaffoldPort = Number(process.env["CONSOLE_E2E_PORT"] ?? 3210);
+  // ---- 0. the ports are ours, checked before anything is started -----------
+  //
+  // Before the database, the IdP and a five-minute build wait: an EADDRINUSE
+  // raised at step 5, after all of that, reads as a broken stack rather than as
+  // a taken port. See `fixed-ports.ts` for the collision this exists for.
+  await assertFixedPortsAreFree(OWN_FIXED_PORTS);
+
+  // ---- 1. wait for the scaffold's server, i.e. for the build ---------------
+  const scaffoldPort = SCAFFOLD_CONSOLE_PORT;
   if (process.env["CONSOLE_E2E_BASE_URL"] === undefined) {
     log(`waiting for the scaffold server on :${scaffoldPort} (it owns the build)`);
     await waitFor("the scaffold e2e server", 300_000, () =>
@@ -254,7 +279,7 @@ async function main(): Promise<void> {
     );
   }
 
-  // ---- 1. TLS, the identity provider, and the endpoint --------------------
+  // ---- 2. TLS, the identity provider, and the endpoint --------------------
   const tls = fixtureTls();
 
   const idp = await startMockIdp({
@@ -287,17 +312,37 @@ async function main(): Promise<void> {
   const vllmOrigin = `http://127.0.0.1:${vllm.port}`;
   const vllmBaseUrl = `${vllmOrigin}/v1`;
 
+  // ======================================================================
+  // THE FIXTURE ENDPOINT IS A SOCKET THIS PROCESS BOUND — ASSERTED, NOT HOPED
+  // ======================================================================
+  //
   // The rule this whole harness is written under: a test must never probe the
   // real deployment named by the field's pre-filled default.
-  if (vllmOrigin === LOCAL_VLLM_BASE_URL || vllmBaseUrl === LOCAL_VLLM_BASE_URL) {
+  //
+  // The first version of this guard compared `vllmOrigin` against
+  // `LOCAL_VLLM_BASE_URL` for equality. It could not fail. `vllmOrigin` is built
+  // two lines above as `http://127.0.0.1:${vllm.port}` from a port the OS just
+  // assigned, and `LOCAL_VLLM_BASE_URL` is `https://local-llm.motrait.com`; the
+  // two differ in scheme, host and port on every possible run, so the guard was
+  // a comment with an `if` around it.
+  //
+  // What is actually worth asserting is the POSITIVE property the equality was
+  // standing in for: the address the specs will be handed is loopback, and it is
+  // the port `Bun.serve` reported. That fails the moment an edit points the
+  // fixture at any host this process did not bind — including, but not limited
+  // to, the shipped default.
+  const parsedVllm = new URL(vllmBaseUrl);
+  if (parsedVllm.hostname !== "127.0.0.1" || parsedVllm.port !== String(vllm.port)) {
     throw new Error(
-      `the fixture endpoint resolved to ${LOCAL_VLLM_BASE_URL}, which is the shipped default ` +
-        "and a real deployment. The authenticated suite must discover from a mock it started.",
+      `the fixture endpoint resolved to ${vllmBaseUrl}, which is not the loopback socket this ` +
+        `process bound (127.0.0.1:${vllm.port}). The authenticated suite must discover from a ` +
+        `mock it started — never from the shipped default (${LOCAL_VLLM_BASE_URL}) or any other ` +
+        "host that might be a real deployment.",
     );
   }
   log(`mock OpenAI-compatible endpoint at ${vllmBaseUrl}`);
 
-  // ---- 2. the fixture Moira, on TLS ---------------------------------------
+  // ---- 3. the fixture Moira, on TLS ---------------------------------------
   const moira = createMoiraFixture({
     idp: {
       issuer: idp.issuer,
@@ -322,14 +367,14 @@ async function main(): Promise<void> {
   const moiraBaseUrl = `https://localhost:${moiraServer.port}`;
   log(`fixture Moira at ${moiraBaseUrl}`);
 
-  // ---- 3. the database -----------------------------------------------------
+  // ---- 4. the database -----------------------------------------------------
   const pool = await prepareDatabase();
   stoppers.push(() => {
     void pool.end();
   });
   log(`console database ready at ${redactDsn(DATABASE_URL)}`);
 
-  // ---- 4. the console itself ----------------------------------------------
+  // ---- 5. the console itself ----------------------------------------------
   const child = Bun.spawn({
     cmd: ["node", ".next/standalone/server.js"],
     stdout: "inherit",
@@ -360,7 +405,7 @@ async function main(): Promise<void> {
   );
   log(`console listening internally on ${internalOrigin}`);
 
-  // ---- 5. TLS termination, started only once the console answers -----------
+  // ---- 6. TLS termination, started only once the console answers -----------
   //
   // Order matters: Playwright treats this port answering as "the stack is up",
   // so it must not answer before there is something behind it.
@@ -421,7 +466,7 @@ async function main(): Promise<void> {
   stoppers.push(() => proxy.stop(true));
   log(`console reachable at ${AUTH_CONSOLE_ORIGIN}`);
 
-  // ---- 6. the control surface a spec drives the fixture through -----------
+  // ---- 7. the control surface a spec drives the fixture through -----------
   const control = Bun.serve({
     port: AUTH_CONTROL_PORT,
     hostname: "127.0.0.1",

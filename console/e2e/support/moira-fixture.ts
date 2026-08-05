@@ -35,10 +35,29 @@ import {
   DISCOVERABLE_MODEL_KEYS,
   MOIRA_IDS,
   type FixtureReport,
+  type RecordedCredential,
   type RecordedMoiraRequest,
 } from "./authenticated-fixture";
 
 const NOW = "2026-08-04T00:00:00Z";
+
+/**
+ * WHICH credential the caller presented — not merely whether it presented one.
+ *
+ * `X-Moira-System-Key` is checked FIRST because that is the order `MoiraClient`
+ * itself resolves them in: its `admin` arm prefers the system key whenever one is
+ * configured and only falls back to the bearer token. A request carrying both is
+ * therefore a system-key request as far as Moira is concerned, and reporting it
+ * as `operator` would describe the wrong caller.
+ *
+ * See `RecordedCredential` in `authenticated-fixture.ts` for why the boolean this
+ * replaced could not fail.
+ */
+function credentialOf(headers: Headers): RecordedCredential {
+  if (headers.get("x-moira-system-key") !== null) return "system_key";
+  if (headers.get("authorization") !== null) return "operator";
+  return "none";
+}
 
 interface Row {
   readonly id: string;
@@ -191,9 +210,7 @@ export function createMoiraFixture(options: MoiraFixtureOptions): MoiraFixture {
       route: `${method} ${path}`,
       method,
       path,
-      authenticated:
-        request.headers.get("authorization") !== null ||
-        request.headers.get("x-moira-system-key") !== null,
+      credential: credentialOf(request.headers),
       idempotencyKey: request.headers.get("idempotency-key"),
       body,
     });
