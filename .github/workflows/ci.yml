@@ -354,9 +354,13 @@ jobs:
             | tar -xz -C "$RUNNER_TEMP/bin" gitleaks
           # `git` (not `dir`) is the history-walking subcommand; `dir` would scan the
           # checked-out tree and reintroduce the blind spot fetch-depth: 0 just paid for.
-          # `.gitleaksignore` at the repo root is picked up automatically and holds the
-          # triaged baseline — 13 test fixtures, each read and justified in that file.
+          # `.gitleaks.toml` holds the triaged fixture allowlist, keyed on the VALUE of each
+          # known-inert fixture rather than on a `commit:path:rule:line` fingerprint. The
+          # fingerprint form could not survive this repository's squash merges: the commit a
+          # fixture is baselined against never reaches `develop`, so the entry went stale the
+          # moment it merged. The file's header carries the full reasoning.
           "$RUNNER_TEMP/bin/gitleaks" git . \
+            --config .gitleaks.toml \
             --redact \
             --no-banner \
             --no-color \
