@@ -74,6 +74,15 @@
 // The partial unique index means each additional provider MUST get its own
 // trusted-issuer row: two enabled providers bound to one issuer is refused
 // `409 duplicate_enabled_provider_for_issuer` at the enable step.
+//
+// WHAT 4B DID NOT DO, so this module's generality is not mistaken for a
+// capability: the console still resolves sign-in only while EXACTLY ONE provider
+// is enabled (`ambiguityGuard`, `lib/auth-config.ts`). A second row is therefore
+// only reachable while nothing is enabled yet, and
+// `provisioningAdmissionFor` (`app/api/setup/route.ts`) refuses any run that
+// would take the deployment-wide enabled count above one. This module is
+// per-provider so that the limit lives in one place instead of being smeared
+// through the write ordering — not because two enabled providers work.
 
 import "server-only";
 
@@ -81,123 +90,38 @@ import { consoleIssuerForSlug } from "./auth-config";
 import { MoiraClient, ifMatchFor, type MoiraOperationName } from "./moira-client";
 import { isMoiraRequestError, type MoiraError } from "./errors";
 import { CONSOLE_MESSAGE_KEYS } from "./i18n/keys";
+import {
+  EMPTY_PROVISIONING_STATE,
+  provisioningDeficiencies,
+  reachableSetupStep,
+  type SetupProvisioningState,
+  type SetupWizardState,
+} from "./setup-steps";
 import type { AuthMethod, AuthProviderSettingsRecord, TrustedJwtIssuerRecord } from "./types";
 
 /* -------------------------------------------------------------------------- */
 /* Wizard steps and their gates                                               */
 /* -------------------------------------------------------------------------- */
+//
+// The step types and the pure gate functions moved to `lib/setup-steps.ts` so
+// the wizard UI (`"use client"` organisms in `modules/setup/**`) can recompute
+// `reachableSetupStep` without importing this credential-carrying module. They
+// are re-exported here verbatim: this module remains the canonical import for
+// every server-side caller, and nothing about their behaviour changed.
 
-export type SetupStepId = "welcome" | "auth_settings" | "sign_in" | "claim" | "done";
-
-/** Wizard order. `claim` is last, and unreachable without `auth_settings`. */
-export const SETUP_STEP_ORDER = [
-  "welcome",
-  "auth_settings",
-  "sign_in",
-  "claim",
-  "done",
-] as const satisfies readonly SetupStepId[];
-
-/**
- * Everything the wizard knows about what has actually been written.
- *
- * Deliberately records `providerTrustedJwtIssuerId` READ BACK FROM MOIRA's
- * response rather than what the console intended to send. The gate compares the
- * two: a provider row that came back without the binding does not advance the
- * wizard, whatever the request body said.
- */
-export interface SetupProvisioningState {
-  readonly trustedJwtIssuerId: string | null;
-  readonly trustedJwtIssuerVersion: number | null;
-  readonly providerId: string | null;
-  readonly providerVersion: number | null;
-  /** As returned by Moira on the created/enabled row. */
-  readonly providerTrustedJwtIssuerId: string | null;
-  readonly providerEnabled: boolean;
-  readonly allowedEmailDomains: readonly string[];
-  /** The console-side OAuth client secret write (D7) succeeded. */
-  readonly consoleSecretStored: boolean;
-}
-
-export const EMPTY_PROVISIONING_STATE: SetupProvisioningState = {
-  trustedJwtIssuerId: null,
-  trustedJwtIssuerVersion: null,
-  providerId: null,
-  providerVersion: null,
-  providerTrustedJwtIssuerId: null,
-  providerEnabled: false,
-  allowedEmailDomains: [],
-  consoleSecretStored: false,
-};
-
-/** Why the auth-settings step is not complete. Empty means it is. */
-export type ProvisioningDeficiency =
-  | "trusted_jwt_issuer_not_registered"
-  | "provider_not_created"
-  | "provider_not_bound_to_trusted_jwt_issuer"
-  | "provider_not_enabled"
-  | "allowed_email_domains_empty"
-  | "console_secret_not_stored";
-
-/**
- * The five-condition advance gate, plus the D7 secret condition.
- *
- * The third condition is the one plan 08's body never had: it is not enough for
- * the provider row to exist and be enabled — it must be BOUND to the console's
- * trusted JWT issuer, or `admission_policy` never selects it — and from wave 4B
- * the binding is also where the console reads this provider's minted `iss`.
- */
-export function provisioningDeficiencies(
-  state: SetupProvisioningState,
-): readonly ProvisioningDeficiency[] {
-  const missing: ProvisioningDeficiency[] = [];
-  if (state.trustedJwtIssuerId === null) missing.push("trusted_jwt_issuer_not_registered");
-  if (state.providerId === null) missing.push("provider_not_created");
-  if (
-    state.trustedJwtIssuerId === null ||
-    state.providerTrustedJwtIssuerId !== state.trustedJwtIssuerId
-  ) {
-    missing.push("provider_not_bound_to_trusted_jwt_issuer");
-  }
-  if (!state.providerEnabled) missing.push("provider_not_enabled");
-  if (state.allowedEmailDomains.length === 0) missing.push("allowed_email_domains_empty");
-  if (!state.consoleSecretStored) missing.push("console_secret_not_stored");
-  return missing;
-}
-
-/** True only when every gate condition holds. */
-export function isProvisioningComplete(state: SetupProvisioningState): boolean {
-  return provisioningDeficiencies(state).length === 0;
-}
-
-export interface SetupWizardState {
-  /** `GET /setup/claim-status`. `true` means setup is over. */
-  readonly claimed: boolean;
-  readonly provisioning: SetupProvisioningState;
-  /** A verified IdP session exists whose email domain is in the allow-list. */
-  readonly signedInWithAllowedIdentity: boolean;
-  /** The claim returned 200/201. */
-  readonly claimSucceeded: boolean;
-}
-
-/**
- * The furthest step the operator may reach.
- *
- * Navigation state, not advice: `claim` is unreachable while the provider is not
- * committed, so an operator cannot deep-link into a request that is guaranteed
- * to 403.
- */
-export function reachableSetupStep(state: SetupWizardState): SetupStepId {
-  if (state.claimSucceeded) return "done";
-  if (state.claimed) return "done";
-  if (!isProvisioningComplete(state.provisioning)) {
-    // `welcome` is informational; the operator lands on `auth_settings` because
-    // that is where the only outstanding work is.
-    return "auth_settings";
-  }
-  if (!state.signedInWithAllowedIdentity) return "sign_in";
-  return "claim";
-}
+export {
+  EMPTY_PROVISIONING_STATE,
+  SETUP_STEP_ORDER,
+  isProvisioningComplete,
+  provisioningDeficiencies,
+  reachableSetupStep,
+} from "./setup-steps";
+export type {
+  ProvisioningDeficiency,
+  SetupProvisioningState,
+  SetupStepId,
+  SetupWizardState,
+} from "./setup-steps";
 
 /** Guard used by the claim action itself, not only by navigation. */
 export function assertClaimStepIsReachable(state: SetupWizardState): void {
@@ -222,9 +146,39 @@ export class SetupOrderingError extends Error {
   }
 }
 
+/**
+ * An ENABLED provider row was about to be re-saved by a caller who has not
+ * proved they are the operator.
+ *
+ * A subclass of `SetupOrderingError` on purpose: every existing caller that
+ * catches the base class keeps failing closed, and the route that knows how to
+ * phrase this particular refusal catches the subclass first to say the useful
+ * thing ("sign in through that provider, then save again") instead of the
+ * generic "the configuration must be corrected".
+ */
+export class SetupEnabledProviderSessionError extends SetupOrderingError {
+  /** The row that may not be re-saved. */
+  readonly providerId: string;
+  readonly reason: "no_session" | "different_provider";
+
+  constructor(providerId: string, reason: "no_session" | "different_provider") {
+    super(
+      `the auth provider ${providerId} is enabled, so re-saving it requires a console session ` +
+        `established through that same provider (${reason}). An enabled provider is a live ` +
+        "authenticator: rewriting its client id and endpoint URLs re-points sign-in at another " +
+        "IdP, and inside the setup window there is no admin grant yet to refuse that — the " +
+        "session is the only proof of operatorship available.",
+    );
+    this.name = "SetupEnabledProviderSessionError";
+    this.providerId = providerId;
+    this.reason = reason;
+  }
+}
+
 export type SetupProvisioningStepId =
   | "ensure_trusted_jwt_issuer"
   | "create_auth_provider"
+  | "update_auth_provider"
   | "store_console_secret"
   | "enable_auth_provider";
 
@@ -247,6 +201,7 @@ export type SetupPartialStateRemedy =
 export const SETUP_PARTIAL_STATE_MESSAGE_KEYS: Readonly<Record<SetupProvisioningStepId, string>> = {
   ensure_trusted_jwt_issuer: CONSOLE_MESSAGE_KEYS.trusted_jwt_issuer_registration_failed,
   create_auth_provider: CONSOLE_MESSAGE_KEYS.auth_provider_create_failed,
+  update_auth_provider: CONSOLE_MESSAGE_KEYS.auth_provider_update_failed,
   store_console_secret: CONSOLE_MESSAGE_KEYS.auth_provider_secret_write_failed,
   enable_auth_provider: CONSOLE_MESSAGE_KEYS.auth_provider_enable_failed,
 };
@@ -256,6 +211,9 @@ const SETUP_PARTIAL_STATE_REMEDIES: Readonly<
 > = {
   ensure_trusted_jwt_issuer: "retry",
   create_auth_provider: "retry_reuses_trusted_jwt_issuer",
+  // The row already exists; a retry replays the same PATCH, which is safe under
+  // `If-Match` and cannot mint a second provider row.
+  update_auth_provider: "retry",
   store_console_secret: "retry_or_discard_provider",
   enable_auth_provider: "retry_enable_no_secret_re_entry",
 };
@@ -346,15 +304,40 @@ export interface SetupProvisioningRequest {
     readonly trustedJwtIssuer: string;
     readonly authProvider: string;
   };
-  /** State from a previous partial attempt, so a retry resumes. */
+  /**
+   * What has ALREADY been written, so a retry resumes rather than restarts.
+   *
+   * MUST be server-derived — `deriveProvisioningState`, or the state a previous
+   * run of this function returned. It is never a payload from a browser: its
+   * `providerId` selects the row the update path PATCHes, and the setup window
+   * runs on the bootstrap system key with no session in front of it, so a
+   * caller-chosen id here would be a caller-chosen privileged write.
+   * `assertProviderIsBoundToTrustedIssuer` enforces that inside this module
+   * regardless of who called it.
+   */
   readonly resume?: SetupProvisioningState;
+  /**
+   * The `auth_provider_settings` row the CALLER's console session was
+   * established through, or `null` when the caller has no session.
+   *
+   * Required rather than optional, and required to be spelled `null` when there
+   * is none: this is the only thing that separates the operator re-saving their
+   * own live provider from an anonymous caller re-pointing it, and a field a
+   * new call site could simply forget would put that distinction back into
+   * review. `assertEnabledProviderMayBeReSaved` is where it is spent.
+   *
+   * MUST be server-derived — `SessionCheck.moiraProviderId`, which
+   * `consoleSessionCheck` takes from the configuration that resolved the
+   * cookie. Never a value off a request body.
+   */
+  readonly sessionProviderId: string | null;
 }
 
 /* -------------------------------------------------------------------------- */
 /* Trace — what actually happened, in order                                   */
 /* -------------------------------------------------------------------------- */
 
-export type SetupTraceOutcome = "created" | "reused" | "enabled" | "stored";
+export type SetupTraceOutcome = "created" | "reused" | "updated" | "enabled" | "stored";
 
 export interface SetupTraceEntry {
   readonly step: SetupProvisioningStepId;
@@ -389,6 +372,135 @@ export function assertB1Invariant(trustedJwtIssuerId: string | null): asserts tr
         "wave 4B the console cannot resolve the provider's minted `iss` either, because that is " +
         "the bound trusted issuer's own `issuer` string.",
     );
+  }
+}
+
+/**
+ * Refuse to WRITE to a provider row that is not bound to the console's trusted
+ * JWT issuer.
+ *
+ * The counterpart to `assertB1Invariant`, and the same kind of check: B1 is
+ * about the row a CREATE mints, this is about the row an UPDATE touches.
+ *
+ * It exists because the update path takes its row id from a resume state, and
+ * a resume state used to be a caller-supplied payload — so a caller could name
+ * any auth-provider row in Moira and have the console PATCH it with the
+ * bootstrap system key, while the deployment is still unclaimed and there is no
+ * session to refuse. `app/api/setup/route.ts` now derives the row id server-side
+ * so no caller can name one; this is the second lock, inside the module that
+ * actually issues the write, so the property holds for every caller rather than
+ * for the one that was audited.
+ *
+ * Ordered BEFORE the PATCH, deliberately. The read-back check further down
+ * catches a row Moira returned without the binding, but by then the write has
+ * already landed — that check is about a persistence failure, not about a
+ * target the console was never entitled to.
+ */
+export function assertProviderIsBoundToTrustedIssuer(
+  provider: AuthProviderSettingsRecord,
+  trustedJwtIssuerId: string,
+): void {
+  if (provider.status === "deleted") {
+    throw new SetupOrderingError(
+      `the auth provider ${provider.id} is deleted and must not be re-saved`,
+    );
+  }
+  if ((provider.trusted_jwt_issuer_id ?? null) !== trustedJwtIssuerId) {
+    throw new SetupOrderingError(
+      `the auth provider ${provider.id} is not bound to this console's trusted JWT issuer ` +
+        `(${trustedJwtIssuerId}); the console does not write to a row it does not own, and the ` +
+        "row this console may re-save is derived from Moira's own records rather than named by " +
+        "the caller",
+    );
+  }
+}
+
+/**
+ * Refuse to re-save an ENABLED provider row without a session established
+ * through that same row.
+ *
+ * ============================================================================
+ * WHAT THIS CLOSES, AND WHY OWNERSHIP ALONE WAS NOT ENOUGH
+ * ============================================================================
+ *
+ * `assertProviderIsBoundToTrustedIssuer` answers "is this row the console's
+ * own". That is a necessary check and not a sufficient one, because the row
+ * the console owns is precisely the row an attacker wants: while a deployment
+ * is unclaimed the setup window is open to an ANONYMOUS caller, and the window
+ * runs on the bootstrap system key. Such a caller needs no `resume` at all —
+ * `deriveProvisioningState` finds the console's own provider row for them, and
+ * the update path then PATCHes it, rewriting `client_id`, the
+ * issuer/discovery/token/userinfo/jwks URLs and `allowed_email_domains`.
+ *
+ * When that row is already ENABLED, the allow-list is the last thing standing
+ * between an unclaimed deployment and an attacker: re-point the endpoints at an
+ * IdP they control, widen the allow-list to a domain they own, sign in, claim.
+ *
+ * The three cases, and why they differ:
+ *
+ *   * the row does NOT exist — CREATE, unguarded. An unclaimed, unprovisioned
+ *     deployment is claimable by whoever completes setup first; that is
+ *     inherent to first-run bootstrap, is not fixable in code here, and is
+ *     documented in `docs/console-architecture.md` instead of being assumed.
+ *   * the row exists and is NOT enabled — PATCH, unguarded. A disabled row
+ *     authenticates nobody, so rewriting it escalates nothing; it is a partial
+ *     setup attempt being completed.
+ *   * the row exists and IS enabled — PATCH only for a caller who authenticated
+ *     through that row.
+ *
+ * That last case is exactly the legitimate remedy the PATCH path exists for.
+ * The domain-refusal correction happens AFTER a successful sign-in: the
+ * operator signs in, tries to claim, Moira answers `403
+ * admin_claim_domain_not_allowed`, and they come back to widen the allow-list.
+ * They authenticated through this very provider at that moment, so the
+ * instruction stays followable.
+ *
+ * "Authenticated through", not "holds an admissible session": the console's own
+ * `checkSession` applies the same allow-list, so that operator's session is
+ * itself refused on the list they are here to widen. Deciding which refusals
+ * still prove operatorship is the ROUTE's job (`operatorSessionFor` in
+ * `app/api/setup/route.ts`, which admits exactly that one shape); by the time a
+ * value reaches this function the question is already settled and this compares
+ * ids.
+ *
+ * THE COST, STATED. An operator who enables a provider they then cannot sign in
+ * through at all (a mistyped client secret, say) can no longer correct that row
+ * from the console — no session can be obtained through a broken provider, so
+ * there is nothing to prove operatorship with. Provisioning under a NEW SLUG is
+ * not the way out, and must not be described as one: the console supports one
+ * enabled provider at a time, so `provisioningAdmissionFor` in
+ * `app/api/setup/route.ts` refuses that create outright (`409
+ * setup_single_enabled_provider_only`) while the broken row is still enabled.
+ * Before that refusal existed the write succeeded and left `ambiguityGuard`
+ * refusing to resolve EITHER provider — a worse position than the one it was
+ * reached from.
+ *
+ * The way out is the bootstrap system key the operator already holds, which is
+ * the credential Moira's own admin API takes: disable the broken row
+ * (`POST /auth/providers/{id}/disable`), at which point it authenticates nobody,
+ * both console gates stand down, and the wizard re-saves and re-enables it the
+ * way it does an interrupted first run. That sequence, and the reason the slug
+ * detour is refused, are written down in `docs/console-architecture.md`.
+ *
+ * What the console refuses to be is an unauthenticated proxy for a write against
+ * a live authenticator.
+ *
+ * `sessionProviderId` is the row the CALLER authenticated through
+ * (`SessionCheck.moiraProviderId`, or `resolvedProviderId` on an allow-list
+ * refusal), or `null` for no session. Never a string off a request body: it is
+ * resolved by `consoleSessionCheck` from the configuration that actually
+ * resolved the cookie.
+ */
+export function assertEnabledProviderMayBeReSaved(
+  provider: AuthProviderSettingsRecord,
+  sessionProviderId: string | null,
+): void {
+  if (!provider.enabled) return;
+  if (sessionProviderId === null || sessionProviderId === "") {
+    throw new SetupEnabledProviderSessionError(provider.id, "no_session");
+  }
+  if (sessionProviderId !== provider.id) {
+    throw new SetupEnabledProviderSessionError(provider.id, "different_provider");
   }
 }
 
@@ -557,6 +669,48 @@ export function buildProviderCreateBody(
   };
 }
 
+/**
+ * Build the `PATCH /api/v1/admin/auth/providers/{id}` body for a re-save.
+ *
+ * The re-save path exists because the domain-refusal remedy tells the operator
+ * to "add the domain and save again": replaying the CREATE for that would hit
+ * the submission's idempotency key with a changed body (`409
+ * idempotency_conflict`), and a fresh create would mint a second row that the
+ * partial unique index refuses at enable (`409
+ * duplicate_enabled_provider_for_issuer`). So an existing row is PATCHED.
+ *
+ * Deliberately absent: `enabled` (the client contract forbids patching it —
+ * enable stays its own commit point), `trusted_jwt_issuer_id` (the binding is
+ * not re-asserted; the read-back check verifies it instead), and `method`
+ * (Moira's patch schema has no such field). URL members are omitted rather than
+ * sent as null when the form left them empty, so a re-save cannot silently
+ * clear an endpoint the row already has.
+ */
+export function buildProviderPatchBody(provider: AuthProviderConfig) {
+  if (provider.allowedEmailDomains.length === 0) {
+    throw new SetupOrderingError(
+      "allowed_email_domains must be non-empty: an empty list denies every claim, including the " +
+        "operator's own first claim, and there is no first-claim exemption",
+    );
+  }
+  const withOptional = (key: string, value: string | null | undefined) =>
+    value === null || value === undefined || value === "" ? {} : { [key]: value };
+
+  return {
+    display_name: provider.displayName,
+    allowed_email_domains: [...provider.allowedEmailDomains],
+    requested_scopes: [...(provider.requestedScopes ?? [])],
+    redirect_uris: [...(provider.redirectUris ?? [])],
+    ...withOptional("issuer", provider.issuer),
+    ...withOptional("discovery_url", provider.discoveryUrl),
+    ...withOptional("authorization_url", provider.authorizationUrl),
+    ...withOptional("token_url", provider.tokenUrl),
+    ...withOptional("userinfo_url", provider.userinfoUrl),
+    ...withOptional("jwks_url", provider.jwksUrl),
+    ...withOptional("client_id", provider.clientId),
+  };
+}
+
 /* -------------------------------------------------------------------------- */
 /* The runner                                                                 */
 /* -------------------------------------------------------------------------- */
@@ -607,26 +761,82 @@ export async function runSetupProvisioning(
   };
 
   // ---- 2. the auth provider, BOUND to that issuer -------------------------
+  //
+  // Two shapes, decided by the resume state:
+  //
+  //   * no `providerId` yet -> CREATE, keyed on the submission's idempotency key
+  //     so a same-body retry replays rather than duplicates;
+  //   * a `providerId` -> the row EXISTS (a partial attempt, or a completed one
+  //     being re-saved after a claim-time domain refusal) -> PATCH it. Replaying
+  //     the create here with a CHANGED body would be `409 idempotency_conflict`,
+  //     and a fresh create would mint a second row beside it that the partial
+  //     unique index then refuses at enable.
+  //
+  // The `providerId` is SERVER-DERIVED (see the `resume` field's own note), and
+  // the update path re-proves that on the row it read back before it writes.
+  const providerStep: SetupProvisioningStepId =
+    state.providerId === null ? "create_auth_provider" : "update_auth_provider";
   let provider: AuthProviderSettingsRecord;
-  try {
-    const body = buildProviderCreateBody(request.provider, state.trustedJwtIssuerId);
-    provider = await client.createAuthProvider(body, {
-      idempotencyKey: request.idempotencyKeys.authProvider,
-    });
-    trace.push({
-      step: "create_auth_provider",
-      operation: "createAuthProvider",
-      outcome: "created",
-    });
-  } catch (error) {
-    // The orphan trusted issuer is inert, but `state` records it so the retry
-    // adopts it rather than re-POSTing into the unique index.
-    throw new SetupProvisioningError(
-      "create_auth_provider",
-      state,
-      moiraErrorOf(error),
-      "could not create the auth provider configuration",
-    );
+  if (state.providerId === null) {
+    try {
+      const body = buildProviderCreateBody(request.provider, state.trustedJwtIssuerId);
+      provider = await client.createAuthProvider(body, {
+        idempotencyKey: request.idempotencyKeys.authProvider,
+      });
+      trace.push({
+        step: "create_auth_provider",
+        operation: "createAuthProvider",
+        outcome: "created",
+      });
+    } catch (error) {
+      // The orphan trusted issuer is inert, but `state` records it so the retry
+      // adopts it rather than re-POSTing into the unique index.
+      throw new SetupProvisioningError(
+        "create_auth_provider",
+        state,
+        moiraErrorOf(error),
+        "could not create the auth provider configuration",
+      );
+    }
+  } else {
+    try {
+      assertB1Invariant(state.trustedJwtIssuerId);
+      // Read the row first for a FRESH `If-Match`: the recorded version may be
+      // stale (the enable bumped it, or another tab saved), and a stale
+      // precondition would turn every re-save into `409 resource_version_conflict`.
+      const current = await client.getAuthProvider(state.providerId);
+      // …and the SAME read is what proves the row may be written at all. A GET
+      // is not a privileged write; the PATCH below is, and it does not run
+      // unless the row is bound to the issuer this run just ensured…
+      assertProviderIsBoundToTrustedIssuer(current, state.trustedJwtIssuerId);
+      // …and, when that row is already ENABLED, unless the caller has proved
+      // they are the operator by carrying a session established through it.
+      // Asserted on the row just READ BACK rather than on the derived state, so
+      // a row that became enabled between the derivation and this write is
+      // still refused — the fresh read is the only copy that cannot be stale.
+      assertEnabledProviderMayBeReSaved(current, request.sessionProviderId);
+      provider = await client.patchAuthProvider(
+        current.id,
+        buildProviderPatchBody(request.provider),
+        ifMatchFor(current),
+      );
+      trace.push({
+        step: "update_auth_provider",
+        operation: "patchAuthProvider",
+        outcome: "updated",
+      });
+    } catch (error) {
+      // An ordering violation is a refusal the console decided, not a failed
+      // step: it names a configuration that must change before a retry can
+      // differ, so it is not dressed up as a resumable partial write.
+      if (error instanceof SetupOrderingError) throw error;
+      throw new SetupProvisioningError(
+        "update_auth_provider",
+        state,
+        moiraErrorOf(error),
+        "could not update the existing auth provider configuration",
+      );
+    }
   }
 
   state = {
@@ -635,14 +845,14 @@ export async function runSetupProvisioning(
     providerVersion: provider.version,
     providerTrustedJwtIssuerId: provider.trusted_jwt_issuer_id ?? null,
     providerEnabled: provider.enabled,
-    allowedEmailDomains: [...provider.allowed_email_domains],
+    allowedEmailDomainCount: provider.allowed_email_domains.length,
   };
 
   // Read-back check: if Moira did not persist the binding, stop here rather than
   // enabling a row that can never govern the console's issuer.
   if (state.providerTrustedJwtIssuerId !== state.trustedJwtIssuerId) {
     throw new SetupProvisioningError(
-      "create_auth_provider",
+      providerStep,
       state,
       null,
       "Moira returned a provider row without the trusted_jwt_issuer_id binding; " +
@@ -671,7 +881,13 @@ export async function runSetupProvisioning(
 
   // ---- 4. enable: the commit point ---------------------------------------
   // No Idempotency-Key: the spec does not declare one on this operation. Retry
-  // safety is If-Match plus enable being naturally idempotent.
+  // safety is If-Match plus enable being naturally idempotent. A row that is
+  // ALREADY enabled (the update path re-saving a live provider) is left alone:
+  // the commit already happened, and re-committing it would only spend a
+  // version bump on nothing.
+  if (provider.enabled) {
+    return { state, trace };
+  }
   let enabled: AuthProviderSettingsRecord;
   try {
     enabled = await client.enableAuthProvider(provider.id, ifMatchFor(provider));
@@ -694,10 +910,199 @@ export async function runSetupProvisioning(
     providerVersion: enabled.version,
     providerTrustedJwtIssuerId: enabled.trusted_jwt_issuer_id ?? null,
     providerEnabled: enabled.enabled,
-    allowedEmailDomains: [...enabled.allowed_email_domains],
+    allowedEmailDomainCount: enabled.allowed_email_domains.length,
   };
 
   return { state, trace };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Rehydration — what has ALREADY been provisioned, read back from the source  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Reconstruct the provisioning state for one console issuer from Moira's own
+ * records plus the console's secret store.
+ *
+ * This is what makes the wizard survive anything the browser forgets: the
+ * sign-in step is a FULL NAVIGATION to the IdP and back, so `/setup` reloads as
+ * a fresh document with empty React state, and a provisioned-but-unclaimed
+ * deployment may equally be revisited days later from a different browser. The
+ * state is therefore never trusted to the client's memory — `GET /api/setup`
+ * derives it here for display, and the claim action derives it AGAIN for its
+ * own gate rather than believing whatever the browser echoes back.
+ *
+ * `hasStoredSecret` is a predicate, not the store, for the same reason
+ * `storeClientSecret` is a closure: this module must not be able to reach a
+ * secret value, only answer "is one sealed for this row".
+ */
+export async function deriveProvisioningState(
+  client: MoiraClient,
+  hasStoredSecret: (providerId: string) => Promise<boolean>,
+  consoleIssuer: string,
+): Promise<SetupProvisioningState> {
+  const issuer = await activeTrustedIssuerFor(client, consoleIssuer);
+  // No trusted issuer for this namespace means nothing has been provisioned in
+  // it, and the provider list cannot change that answer — so a READ does not
+  // pay for the scan. `deriveSetupDeploymentState` does, because the question
+  // IT answers is about the deployment rather than about this namespace.
+  if (issuer === null) return EMPTY_PROVISIONING_STATE;
+  const scan = await scanAuthProviders(client, issuer.id);
+  return provisioningStateFor(issuer, scan.bound, hasStoredSecret);
+}
+
+/**
+ * What the console derived about the DEPLOYMENT while handling one provisioning
+ * request: the state of the namespace being written, and every enabled provider
+ * row the deployment has, whatever namespace those belong to.
+ */
+export interface SetupDeploymentState {
+  /** Exactly what `deriveProvisioningState` returns for the same issuer. */
+  readonly state: SetupProvisioningState;
+  /**
+   * The ids of every ENABLED, `active` `auth_provider_settings` row in the
+   * deployment, in list order, whatever trusted issuer they are bound to.
+   *
+   * ============================================================================
+   * WHY THIS IS NOT SCOPED TO `consoleIssuer`, AND WHY THAT IS THE WHOLE POINT
+   * ============================================================================
+   *
+   * `state` describes ONE console-issuer namespace, and the slug on a provision
+   * body chooses which one. So a count taken from `state` answers "nothing is
+   * enabled here" for every slug this console does not already own — which is
+   * precisely the slug a caller picks when they want the ungated CREATE path.
+   * A rule reading that count could be defeated by choosing a different slug.
+   *
+   * The number that actually decides whether the console still works after a
+   * provisioning run is the one `ambiguityGuard` (`lib/auth-config.ts`) reads on
+   * the next cold resolve: enabled, `active`, deployment-wide. This is that
+   * number, counted with the same predicate, so the two cannot drift apart —
+   * and `provisioningAdmissionFor` in `app/api/setup/route.ts` refuses a run
+   * that would take it above one.
+   */
+  readonly enabledProviderIds: readonly string[];
+}
+
+/**
+ * `deriveProvisioningState`, plus the deployment-wide enabled-provider set.
+ *
+ * One extra fact, no extra request: the provider list is already paged for the
+ * bound row, and the enabled ids are collected on the same pass. The trusted
+ * issuer being ABSENT no longer short-circuits the scan, because the caller
+ * that needs this — the provisioning gate in `app/api/setup/route.ts` — needs
+ * the deployment's enabled set most in exactly that case.
+ */
+export async function deriveSetupDeploymentState(
+  client: MoiraClient,
+  hasStoredSecret: (providerId: string) => Promise<boolean>,
+  consoleIssuer: string,
+): Promise<SetupDeploymentState> {
+  const issuer = await activeTrustedIssuerFor(client, consoleIssuer);
+  const scan = await scanAuthProviders(client, issuer === null ? null : issuer.id);
+  return {
+    state:
+      issuer === null
+        ? EMPTY_PROVISIONING_STATE
+        : await provisioningStateFor(issuer, scan.bound, hasStoredSecret),
+    enabledProviderIds: scan.enabledProviderIds,
+  };
+}
+
+/** The trusted issuer registered for a console issuer string, if it is live. */
+async function activeTrustedIssuerFor(
+  client: MoiraClient,
+  consoleIssuer: string,
+): Promise<TrustedJwtIssuerRecord | null> {
+  const issuer = await client.findTrustedJwtIssuerByIssuer(consoleIssuer);
+  return issuer === null || issuer.status === "deleted" ? null : issuer;
+}
+
+async function provisioningStateFor(
+  issuer: TrustedJwtIssuerRecord,
+  provider: AuthProviderSettingsRecord | null,
+  hasStoredSecret: (providerId: string) => Promise<boolean>,
+): Promise<SetupProvisioningState> {
+  const state: SetupProvisioningState = {
+    ...EMPTY_PROVISIONING_STATE,
+    trustedJwtIssuerId: issuer.id,
+    trustedJwtIssuerVersion: issuer.version,
+  };
+  if (provider === null) return state;
+  return {
+    ...state,
+    providerId: provider.id,
+    providerVersion: provider.version,
+    providerTrustedJwtIssuerId: provider.trusted_jwt_issuer_id ?? null,
+    providerEnabled: provider.enabled,
+    allowedEmailDomainCount: provider.allowed_email_domains.length,
+    consoleSecretStored: await hasStoredSecret(provider.id),
+  };
+}
+
+interface AuthProviderScan {
+  /**
+   * The row bound to the requested trusted issuer, or `null`.
+   *
+   * The ENABLED row wins when one exists — the partial unique index guarantees
+   * at most one — and otherwise the first non-deleted bound row is the resumable
+   * partial state a previous attempt left behind.
+   */
+  readonly bound: AuthProviderSettingsRecord | null;
+  /** See `SetupDeploymentState.enabledProviderIds`. */
+  readonly enabledProviderIds: readonly string[];
+}
+
+/**
+ * One pass over `auth_provider_settings`, answering both questions at once.
+ *
+ * Deliberately NOT short-circuited on the first enabled bound row, the way the
+ * bound-row lookup alone used to be: the enabled set has to be complete over
+ * every page or the guard that reads it would under-count on a deployment whose
+ * incumbent happens to sort early. The loop is bounded, and a console with more
+ * than one page of providers is already past the point of being usable.
+ *
+ * `trustedJwtIssuerId === null` means "no bound row to find" — the namespace has
+ * no trusted issuer — and the scan then only collects the enabled set.
+ */
+async function scanAuthProviders(
+  client: MoiraClient,
+  trustedJwtIssuerId: string | null,
+): Promise<AuthProviderScan> {
+  let bound: AuthProviderSettingsRecord | null = null;
+  let boundIsEnabled = false;
+  const enabledProviderIds: string[] = [];
+  let cursor: string | undefined;
+  // Bounded so a paging bug cannot spin forever during setup.
+  for (let page = 0; page < 50; page += 1) {
+    const response = await client.listAuthProviders(
+      cursor === undefined ? { limit: 100 } : { limit: 100, cursor },
+    );
+    for (const row of response.data) {
+      // The SAME predicate `resolveAuthConfigs` and `ambiguityGuard` apply, so
+      // this count is the count that decides whether sign-in still resolves.
+      if (row.enabled && row.status === "active") enabledProviderIds.push(row.id);
+      if (
+        trustedJwtIssuerId === null ||
+        row.status === "deleted" ||
+        (row.trusted_jwt_issuer_id ?? null) !== trustedJwtIssuerId
+      ) {
+        continue;
+      }
+      if (row.enabled) {
+        if (!boundIsEnabled) {
+          bound = row;
+          boundIsEnabled = true;
+        }
+      } else {
+        bound ??= row;
+      }
+    }
+    if (!response.pagination.has_more) break;
+    const next = response.pagination.next_cursor;
+    if (next === null || next === undefined || next === "") break;
+    cursor = next;
+  }
+  return { bound, enabledProviderIds };
 }
 
 /* -------------------------------------------------------------------------- */

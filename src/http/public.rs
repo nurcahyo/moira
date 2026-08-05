@@ -17,8 +17,9 @@ use crate::{
     application::{PublicExecutionService, RequestContext},
     domain::{
         ExecutionQuery, ListResponse, OpenAiResponseCompatRequest, PublicCapabilities,
-        PublicExecutionSummary, PublicModelResource, PublicResponse, PublicResponseRequest,
-        PublicRouteResource, PublicSseEnvelope, PublicUsageRecord, UsageQuery,
+        PublicExecutionSummary, PublicListQuery, PublicModelResource, PublicResponse,
+        PublicResponseRequest, PublicRouteResource, PublicSseEnvelope, PublicUsageRecord,
+        UsageQuery,
     },
     error::{AppError, ErrorResponse},
 };
@@ -274,8 +275,10 @@ pub async fn list_usage(
     get,
     path = "/api/v1/models",
     tag = "discovery",
+    params(PublicListQuery),
     responses(
         (status = 200, description = "Models available to the caller", body = ListResponse<PublicModelResource>),
+        (status = 400, description = "Invalid query or pagination cursor", body = ErrorResponse),
         (status = 401, description = "Authentication failed", body = ErrorResponse),
         (status = 403, description = "Operation is not permitted", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
@@ -289,11 +292,12 @@ pub async fn list_usage(
 pub async fn list_models(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<PublicListQuery>,
 ) -> Result<(HeaderMap, Json<ListResponse<PublicModelResource>>), AppError> {
     let actor = public_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let response = PublicExecutionService::new(&state)?
-        .list_models(&actor)
+        .list_models(&actor, &query)
         .await?;
     Ok((json_headers(&ctx.request_id), Json(response)))
 }
@@ -302,8 +306,10 @@ pub async fn list_models(
     get,
     path = "/api/v1/routes",
     tag = "discovery",
+    params(PublicListQuery),
     responses(
         (status = 200, description = "Routes available to the caller", body = ListResponse<PublicRouteResource>),
+        (status = 400, description = "Invalid query or pagination cursor", body = ErrorResponse),
         (status = 401, description = "Authentication failed", body = ErrorResponse),
         (status = 403, description = "Operation is not permitted", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
@@ -317,11 +323,12 @@ pub async fn list_models(
 pub async fn list_routes(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<PublicListQuery>,
 ) -> Result<(HeaderMap, Json<ListResponse<PublicRouteResource>>), AppError> {
     let actor = public_actor(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let response = PublicExecutionService::new(&state)?
-        .list_routes(&actor)
+        .list_routes(&actor, &query)
         .await?;
     Ok((json_headers(&ctx.request_id), Json(response)))
 }

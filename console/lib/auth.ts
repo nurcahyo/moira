@@ -813,7 +813,12 @@ export async function consoleSessionCheck(
     // 500 an ordinary session read — but this catch is kept deliberately: it costs
     // nothing, and without it a future change that clears the flag would turn every
     // refusal on this path into a 500 with no local explanation.
-    if (error instanceof SessionNotAdmissibleError) return rejectedSession(error.rejection);
+    // The row is carried back too: `checkSession` named it on the refusal, and
+    // a caller that reads the verdict here must see the same value one that
+    // read it as a return would have.
+    if (error instanceof SessionNotAdmissibleError) {
+      return rejectedSession(error.rejection, error.resolvedProviderId);
+    }
     if (error instanceof MissingIdpSubjectError) return rejectedSession("idp_subject_missing");
     if (
       error instanceof UnknownSessionProviderError ||
@@ -823,7 +828,12 @@ export async function consoleSessionCheck(
     }
     throw error;
   }
-  if (session === null || session === undefined) return checkSession(null, { allowedEmailDomains: [] });
+  // `rejectedSession`, not `checkSession(null, …)`: with no session there is no
+  // authenticating configuration to answer from, and passing an invented one
+  // just to satisfy the parameter would be inventing the very field
+  // `SessionCheck.consoleIssuer` exists to make trustworthy. The verdict is the
+  // same one `checkSession` returns for a null session.
+  if (session === null || session === undefined) return rejectedSession("no_session");
 
   let config: ResolvedAuthConfig;
   try {

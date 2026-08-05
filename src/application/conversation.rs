@@ -3120,7 +3120,7 @@ pub(crate) fn conversation_command_spec<T: Serialize>(
                 .as_ref()
                 .map(|key| AdminCommandIdempotency {
                     key: key.clone(),
-                    actor_fingerprint: crate::application::admin::actor_fingerprint(actor),
+                    actor_identity: crate::application::admin::actor_identity_bytes(actor),
                 }),
         )
     })

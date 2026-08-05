@@ -186,15 +186,10 @@ mod tests {
 
     #[tokio::test]
     async fn migrated_database_supports_setup_inspection() {
-        let Ok(database_url) = std::env::var("MOIRA_TEST_DATABASE_URL") else {
-            eprintln!(
-                "skipping setup repository integration: set MOIRA_TEST_DATABASE_URL to run it"
-            );
+        let Some(database) = crate::test_support::test_database().await else {
             return;
         };
-        let pool = PgPool::connect(&database_url).await.unwrap();
-        crate::infra::db::migrate(&pool).await.unwrap();
-        PgSetupRepository::new(pool)
+        PgSetupRepository::new(database.pool().clone())
             .inspect()
             .await
             .expect("setup readiness snapshot");

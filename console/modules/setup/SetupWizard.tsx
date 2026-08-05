@@ -1,0 +1,260 @@
+"use client";
+
+// The setup wizard's coordinator: the fifth organism, holding the four step
+// organisms mounted on one page.
+//
+// ============================================================================
+// NAVIGATION IS `reachableSetupStep`, NOT FREE-FORM LOCAL STATE
+// ============================================================================
+//
+// The wizard keeps a CURSOR (which step the operator is looking at) but the
+// cursor is clamped to `reachableSetupStep(state)` from `lib/setup-steps.ts` —
+// the same pure gate the server enforces on the claim action itself. Moving
+// backward (to re-read the welcome copy, or to fix the allow-list after a
+// domain refusal) is always allowed; moving beyond the furthest reachable step
+// is impossible, so the claim surface cannot exist on screen while a gate
+// condition is unconfirmed.
+//
+// "Backward is always allowed" is a statement about the CLAMP, and for a while
+// it was the only thing true about it: once provisioning completed, nothing on
+// screen moved the cursor back, and a reload landed on `sign_in` — so an
+// operator who had mistyped a discovery URL, a client id, or a client secret
+// had no way to reach the form that holds them. `SignInClaimStep` now renders
+// an explicit control for it (`onEditAuthSettings` below), which is why the
+// clamp's permissiveness is now observable rather than theoretical.
+//
+// That control is NAVIGATION and nothing else. Re-saving from the form posts
+// the same `POST /api/setup {action: "provision"}` as the first save, and the
+// row that request may touch is derived server-side from Moira's records — the
+// back button cannot become a second way to choose what gets written.
+//
+// ============================================================================
+// WHY EVERY STEP STAYS MOUNTED
+// ============================================================================
+//
+// All step organisms are mounted together and inactive ones carry `hidden`.
+// That is what "kembali ke AuthSettingsStep dengan state terjaga" requires: the
+// auth-settings form's envelope (including the typed client secret) is that
+// organism's LOCAL state, deliberately never lifted here — lifting it would put
+// the secret into this component's props or state and hand it back down as a
+// prop, the exact shape `no-secret-props` exists to forbid. Keeping the
+// organism mounted preserves the envelope across step changes without this
+// coordinator ever seeing it.
+//
+// ============================================================================
+// WHAT THIS COMPONENT KNOWS ABOUT THE SESSION
+// ============================================================================
+//
+// Once provisioning is complete it probes the console's OWN session endpoint
+// (`/api/auth/get-session`) for a signed-in identity. The probe informs
+// NAVIGATION only — the claim request is authorised by the BFF's session check
+// against the same allow-list Moira applies, never by this hint.
+
+import { useEffect, useState } from "react";
+
+import { CONSOLE_MESSAGE_KEYS, t } from "@/lib/i18n";
+import {
+  EMPTY_PROVISIONING_STATE,
+  SETUP_STEP_ORDER,
+  isProvisioningComplete,
+  reachableSetupStep,
+  type SetupProvisioningState,
+  type SetupStepId,
+  type SetupWizardState,
+} from "@/lib/setup-steps";
+
+import { AuthSettingsStep } from "./AuthSettingsStep";
+import { DoneStep } from "./DoneStep";
+import { SignInClaimStep } from "./SignInClaimStep";
+import { WelcomeStep } from "./WelcomeStep";
+import type { SetupViewModel } from "./setup-view";
+import styles from "./SetupWizard.module.css";
+
+export type { SetupMethodSummary, SetupViewModel } from "./setup-view";
+
+
+/** Better Auth's session read, mounted by the console itself. */
+const SESSION_ENDPOINT = "/api/auth/get-session";
+
+const STEP_LABEL_KEYS: Readonly<Record<SetupStepId, string>> = {
+  welcome: CONSOLE_MESSAGE_KEYS.setup_step_welcome,
+  auth_settings: CONSOLE_MESSAGE_KEYS.setup_step_auth_settings,
+  sign_in: CONSOLE_MESSAGE_KEYS.setup_step_sign_in,
+  claim: CONSOLE_MESSAGE_KEYS.setup_step_claim,
+  done: CONSOLE_MESSAGE_KEYS.setup_step_done,
+};
+
+export interface SetupWizardProps {
+  readonly view: SetupViewModel;
+  /** Injected by the unit test. Shipped call sites use the global. */
+  readonly fetchImpl?: typeof fetch;
+  /** Injected by the unit test. Shipped call sites navigate for real. */
+  readonly navigate?: (url: string) => void;
+}
+
+function stepIndex(step: SetupStepId): number {
+  return SETUP_STEP_ORDER.indexOf(step);
+}
+
+export function SetupWizard({ view, fetchImpl, navigate }: SetupWizardProps) {
+  // Seeded from the SERVER-derived state, not from empty: the sign-in step is a
+  // full navigation to the IdP and back, so this component remounts with fresh
+  // state mid-flow, and only the BFF's rehydration can carry the wizard across
+  // that gap (and across any later revisit of a provisioned-but-unclaimed
+  // deployment).
+  const initialProvisioning =
+    view.kind === "ready" ? view.provisioning : EMPTY_PROVISIONING_STATE;
+  const [provisioning, setProvisioning] = useState<SetupProvisioningState>(initialProvisioning);
+  const [oauthProviderId, setOauthProviderId] = useState<string | null>(
+    view.kind === "ready" ? view.oauthProviderId : null,
+  );
+  // The console-issuer namespace this run is in. Seeded from the SERVER echo of
+  // `?slug=` for the same reason the provisioning state is: the sign-in step is
+  // a full navigation away and back, and only the server's answer survives it.
+  // Updated when a provision confirms a different one, so the claim that
+  // follows names the namespace that was actually written.
+  const [slug, setSlug] = useState<string | null>(view.kind === "ready" ? view.slug : null);
+  const [signedInEmail, setSignedInEmail] = useState<string | null>(null);
+  const [claimSucceeded, setClaimSucceeded] = useState(false);
+  const [claimedEmail, setClaimedEmail] = useState<string | null>(null);
+  const [refusedDomain, setRefusedDomain] = useState<string | null>(null);
+  const [cursor, setCursor] = useState<SetupStepId>(() => {
+    if (view.kind === "claimed") return "done";
+    // A rehydrated COMPLETE state lands the operator on sign-in/claim — the
+    // welcome and auth-settings steps are behind them, most notably right after
+    // the IdP redirects back here. Anything less than complete starts at
+    // welcome, exactly as a fresh deployment does.
+    return isProvisioningComplete(initialProvisioning) ? "sign_in" : "welcome";
+  });
+
+  const claimed = view.kind === "claimed" || (view.kind === "ready" && view.claimed);
+  const wizard: SetupWizardState = {
+    claimed,
+    provisioning,
+    signedInWithAllowedIdentity: signedInEmail !== null,
+    claimSucceeded,
+  };
+  const reachable = reachableSetupStep(wizard);
+  // The clamp: backwards is free, beyond `reachable` is impossible.
+  const active: SetupStepId = stepIndex(cursor) <= stepIndex(reachable) ? cursor : reachable;
+
+  const provisioningComplete = isProvisioningComplete(provisioning);
+
+  useEffect(() => {
+    if (!provisioningComplete || signedInEmail !== null || claimSucceeded || claimed) return;
+    let cancelled = false;
+    const send = fetchImpl ?? globalThis.fetch;
+    void (async () => {
+      try {
+        const response = await send(SESSION_ENDPOINT, {
+          headers: { accept: "application/json" },
+        });
+        if (!response.ok) return;
+        const body = (await response.json()) as { user?: { email?: unknown } } | null;
+        const email = body?.user?.email;
+        if (!cancelled && typeof email === "string" && email !== "") {
+          setSignedInEmail(email);
+        }
+      } catch {
+        // Signed out until proven otherwise; the claim path re-checks anyway.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [provisioningComplete, signedInEmail, claimSucceeded, claimed, fetchImpl]);
+
+  if (view.kind === "unavailable") {
+    return (
+      <section className={styles.panel} aria-label={t(CONSOLE_MESSAGE_KEYS.setup_unavailable_heading)}>
+        <h2 className={styles.heading}>{t(CONSOLE_MESSAGE_KEYS.setup_unavailable_heading)}</h2>
+        <p className={styles.problem} role="alert">
+          {t(view.messageKey, view.messageArgs, view.message)}
+        </p>
+      </section>
+    );
+  }
+
+  const methods = view.kind === "ready" ? view.methods : [];
+
+  function onProvisioned(
+    state: SetupProvisioningState,
+    providerId: string | null,
+    provisionedSlug: string | null,
+  ): void {
+    setProvisioning(state);
+    if (providerId !== null) setOauthProviderId(providerId);
+    setSlug(provisionedSlug);
+    setRefusedDomain(null);
+    if (isProvisioningComplete(state)) setCursor("sign_in");
+  }
+
+  function onClaimed(email: string | null): void {
+    setClaimedEmail(email);
+    setClaimSucceeded(true);
+    setCursor("done");
+  }
+
+  function onDomainRefused(domain: string): void {
+    setRefusedDomain(domain === "" ? null : domain);
+    setCursor("auth_settings");
+  }
+
+  const showSignInClaim = provisioningComplete && (active === "sign_in" || active === "claim");
+
+  return (
+    <div className={styles.wizard}>
+      <nav aria-label={t(CONSOLE_MESSAGE_KEYS.setup_steps_label)}>
+        <ol className={styles.steps}>
+          {SETUP_STEP_ORDER.map((step) => (
+            <li
+              key={step}
+              className={step === active ? styles.stepactive : styles.stepitem}
+              aria-current={step === active ? "step" : undefined}
+            >
+              {t(STEP_LABEL_KEYS[step])}
+            </li>
+          ))}
+        </ol>
+      </nav>
+
+      <div hidden={active !== "welcome"}>
+        <WelcomeStep onContinue={() => setCursor("auth_settings")} />
+      </div>
+
+      <div hidden={active !== "auth_settings"}>
+        <AuthSettingsStep
+          methods={methods}
+          provisioning={provisioning}
+          refusedDomain={refusedDomain}
+          slug={slug}
+          onProvisioned={onProvisioned}
+          {...(fetchImpl === undefined ? {} : { fetchImpl })}
+        />
+      </div>
+
+      {showSignInClaim && (
+        <SignInClaimStep
+          stage={reachable === "claim" ? "claim" : "sign_in"}
+          methods={methods.filter((method) => method.interactive)}
+          oauthProviderId={oauthProviderId}
+          // Moira's row id for the provider that was actually provisioned, so
+          // the one sign-in button can be labelled with that row's name.
+          providerRowId={provisioning.providerId}
+          // The namespace the claim writes into and the callback returns to.
+          // Never re-derived down there: the provision that created this run's
+          // provider is the only thing that knows it.
+          slug={slug}
+          signedInEmail={signedInEmail}
+          onClaimed={onClaimed}
+          onDomainRefused={onDomainRefused}
+          onEditAuthSettings={() => setCursor("auth_settings")}
+          {...(fetchImpl === undefined ? {} : { fetchImpl })}
+          {...(navigate === undefined ? {} : { navigate })}
+        />
+      )}
+
+      {active === "done" && <DoneStep email={claimedEmail} />}
+    </div>
+  );
+}

@@ -11,7 +11,10 @@ use crate::{
     // The one crate-wide fingerprint formula (plan 06, Module 16). This module previously
     // had its own 3-field copy writing the same `idempotency_records` unique index; what
     // remains of it is `legacy_actor_fingerprint`, which is read-only.
-    application::{RequestContext, admin::actor_fingerprint},
+    application::{
+        RequestContext,
+        admin::{actor_fingerprint, unkeyed_actor_fingerprint},
+    },
     domain::{
         AgentProfileCreateRequest, AgentProfilePatchRequest, AgentProfileRecord, AuditLogInsert,
         AuditResult, CursorScope, IdempotencyRecord, ListCursor, ListResponse, Pagination,
@@ -921,39 +924,49 @@ impl<'a> RuntimeAdminService<'a> {
         //
         //   * `idempotency_key_hash` — unkeyed SHA-256 → keyed HMAC (plan 03, P1-1);
         //   * `actor_fingerprint`    — this module's 3-field formula → the crate-wide
-        //     10-field one (plan 06, Module 16 / P2-15).
+        //     10-field one (plan 06, Module 16 / P2-15), and then that 10-field digest from
+        //     unkeyed SHA-256 → keyed HMAC when the fingerprint was peppered (issue #95).
         //
-        // Three of the four combinations are reachable in a live ledger. The fourth
-        // (current fingerprint + legacy key hash) is not — a row carrying the pre-plan-03
-        // key hash necessarily predates plan 06 too, so it also carries the legacy
-        // fingerprint — but it is still probed, because it costs one indexed lookup on a
-        // path that has already missed twice and dropping it would narrow replay coverage
-        // on an argument about deploy ordering rather than about the data.
+        // The fingerprint therefore has three historical spellings, tried newest first so a
+        // post-deploy row always wins. Note the fourth conceivable one — a *peppered*
+        // 3-field digest — has never been written by anything and is deliberately absent:
+        // the narrow formula was retired before the pepper existed.
         //
-        // Order is load-bearing: the current fingerprint is tried first so a post-deploy
-        // row always wins, and a legacy hit is only ever *read*. `record_idempotency`
-        // writes `actor_fingerprint(actor)` unconditionally, so the legacy value can never
-        // re-enter the ledger and the fallback drains as rows expire.
+        // Some key-hash/fingerprint combinations are unreachable on a strict reading of
+        // deploy ordering (a row carrying the pre-plan-03 key hash necessarily predates the
+        // later fingerprint changes too), but they are still probed, because each costs one
+        // indexed lookup on a path that has already missed and dropping them would narrow
+        // replay coverage on an argument about deploy ordering rather than about the data.
         //
-        // TODO(post-deploy): delete `legacy_actor_fingerprint` and the second half of this
-        // sweep once every ledger row written before plan 06 shipped has expired.
-        // `idempotency_records.expires_at` is set 24h ahead (`record_idempotency` below),
-        // so the window closes 24h after the deploy that carries Module 16; the earliest
-        // safe removal date is therefore deploy-date + 1 day.
+        // A legacy hit is only ever *read*. `record_idempotency` writes
+        // `actor_fingerprint(hasher, actor)` unconditionally, so no legacy value can
+        // re-enter the ledger and every fallback drains as rows expire.
+        //
+        // TODO(post-deploy): delete `legacy_actor_fingerprint` and the corresponding arm of
+        // this sweep once every ledger row written before plan 06 shipped has expired, and
+        // the `unkeyed_actor_fingerprint` arm once every row written before the pepper
+        // deploy has expired. `idempotency_records.expires_at` is set 24h ahead
+        // (`record_idempotency` below), so each window closes 24h after the deploy that
+        // carries it; the earliest safe removal date is therefore that deploy-date + 1 day.
         //
         // Gated on a DEPLOY, not on a merge, and deliberately not owned by any plan — plan 07
         // was originally named here, but a plan lands when it is merged and this window does
         // not open until the code is running in production. Removing it early means a client
         // retrying an idempotent request across the deploy boundary misses its ledger row and
         // executes a second time, which is the exact failure the sweep exists to prevent.
-        let actor_fingerprint = actor_fingerprint(actor);
+        let actor_fingerprint = actor_fingerprint(hasher, actor);
+        let unkeyed_actor_fingerprint = unkeyed_actor_fingerprint(actor);
         let legacy_actor_fingerprint = legacy_actor_fingerprint(actor);
         let key_hashes = [
             hasher.hash(key.as_bytes()),
             hasher.legacy_hash(key.as_bytes()),
         ];
         let mut record = None;
-        'sweep: for fingerprint in [&actor_fingerprint, &legacy_actor_fingerprint] {
+        'sweep: for fingerprint in [
+            &actor_fingerprint,
+            &unkeyed_actor_fingerprint,
+            &legacy_actor_fingerprint,
+        ] {
             for key_hash in &key_hashes {
                 record = self
                     .admin_repo
@@ -1007,7 +1020,7 @@ impl<'a> RuntimeAdminService<'a> {
         let record = IdempotencyRecord {
             id: Uuid::now_v7(),
             idempotency_key_hash: hasher.hash(key.as_bytes()),
-            actor_fingerprint: actor_fingerprint(actor),
+            actor_fingerprint: actor_fingerprint(hasher, actor),
             operation: operation.to_string(),
             request_hash: hasher.hash(&normalized_request_bytes(request)?),
             response_status: Some(200),
@@ -1437,20 +1450,22 @@ mod tests {
                  stops holding, the legacy fallback is reading a value production never \
                  wrote and pre-deploy rows will not replay"
             );
+            let hasher =
+                crate::security::IdempotencyHasher::new(b"runtime-admin-pepper".to_vec(), "v1");
             assert_ne!(
-                actor_fingerprint(&base),
-                actor_fingerprint(&variant),
+                actor_fingerprint(&hasher, &base),
+                actor_fingerprint(&hasher, &variant),
                 "the unified formula must isolate replay across `{field}`"
             );
         }
     }
 
-    /// The fallback is a *read* concession, not a second write format. If the two formulas
-    /// ever agreed, `idempotency_replay`'s second sweep pass would be redundant; if
-    /// `record_idempotency` ever emitted the legacy value, the hole would be back.
+    /// The fallback is a *read* concession, not a second write format. If any two of the
+    /// three spellings ever agreed, a sweep pass would be redundant; if `record_idempotency`
+    /// ever emitted a legacy value, the hole would be back.
     #[test]
     fn the_legacy_and_unified_fingerprints_are_distinct_values() {
-        use crate::security::ActorType;
+        use crate::security::{ActorType, IdempotencyHasher};
 
         let actor = Actor {
             actor_type: ActorType::SystemKey,
@@ -1458,7 +1473,20 @@ mod tests {
             api_key_id: Some(Uuid::now_v7()),
             ..Actor::default()
         };
+        let hasher = IdempotencyHasher::new(b"runtime-admin-pepper".to_vec(), "v1");
 
-        assert_ne!(actor_fingerprint(&actor), legacy_actor_fingerprint(&actor));
+        let peppered = actor_fingerprint(&hasher, &actor);
+        let unkeyed = unkeyed_actor_fingerprint(&actor);
+        let legacy = legacy_actor_fingerprint(&actor);
+
+        assert_ne!(peppered, unkeyed);
+        assert_ne!(peppered, legacy);
+        assert_ne!(unkeyed, legacy);
+
+        // The peppered value is the only one that carries a version prefix, which is what
+        // lets a reader tell at a glance which migration window a stored row belongs to.
+        assert!(peppered.starts_with("v1:"));
+        assert!(!unkeyed.contains(':'));
+        assert!(!legacy.contains(':'));
     }
 }

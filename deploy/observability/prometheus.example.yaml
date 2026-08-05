@@ -1,0 +1,33 @@
+# A minimal, complete prometheus.yml that scrapes Moira and loads the alert
+# rules in this directory. Copy it, adjust the targets, and run:
+#
+#   prometheus --config.file=prometheus.yml
+#
+# There are no credentials in this file and none are needed: Moira's /metrics
+# endpoint carries no authentication. It answers 404 — which Prometheus reports
+# as a failed scrape — unless MOIRA_TELEMETRY__PROMETHEUS_ENABLED=true.
+#
+# If you put Moira's /metrics behind a proxy that does require auth, do NOT add
+# the secret here. Use `authorization.credentials_file` and keep the file out of
+# version control.
+---
+global:
+  scrape_interval: 15s
+  evaluation_interval: 30s
+
+rule_files:
+  - prometheus-rules.yaml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+scrape_configs:
+  # The job name matters: the alert rules match on `job=~"moira.*"`.
+  - job_name: moira
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - moira:8080

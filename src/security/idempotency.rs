@@ -97,10 +97,30 @@ type HmacSha256 = Hmac<Sha256>;
 /// configured `pepper_version` must never contain.
 const VERSION_SEPARATOR: char = ':';
 
-#[derive(Debug, Clone)]
+/// # `Debug` is hand-written, and must stay hand-written
+///
+/// `#[derive(Debug)]` here prints `pepper` as a byte array, and the whole security value of
+/// this type is that the pepper lives *outside* the database. A derived `Debug` puts it back
+/// inside the blast radius of anything that formats a value transitively containing this
+/// hasher — `AdminCommandRunner`, `AppState`'s constructor arguments, a `tracing` field, a
+/// panic message. `tests::debug_redacts_the_pepper_everywhere_it_is_reachable` pins the
+/// wiring rather than merely the helper.
+#[derive(Clone)]
 pub struct IdempotencyHasher {
     pepper: Vec<u8>,
     pepper_version: String,
+}
+
+impl std::fmt::Debug for IdempotencyHasher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The version is safe and genuinely useful in a log line: it says which pepper a
+        // stored digest belongs to. The pepper itself is never rendered, not even its length,
+        // which would narrow a brute force.
+        f.debug_struct("IdempotencyHasher")
+            .field("pepper", &"[redacted]")
+            .field("pepper_version", &self.pepper_version)
+            .finish()
+    }
 }
 
 impl IdempotencyHasher {
@@ -236,5 +256,150 @@ mod tests {
         assert!(!hashed.contains("sk-live"));
         assert!(!hashed.contains("secret"));
         assert_eq!(hashed, hasher().hash(b"sk-live-super-secret-value"));
+    }
+
+    /// Asserts `rendered` discloses `pepper` in **neither** spelling a `Debug` impl can
+    /// produce.
+    ///
+    /// The two-spelling check is the entire point. `#[derive(Debug)]` on a `Vec<u8>` field
+    /// prints `[105, 100, 101, ...]`, not the ASCII text, so a test that only searched for
+    /// the readable string would stay green against the exact regression it exists to catch —
+    /// someone replacing the hand-written impl with a derive. Both spellings are searched, so
+    /// neither a `Vec<u8>` nor a `String` pepper field can slip through.
+    fn assert_pepper_is_not_disclosed(what: &str, rendered: &str, pepper: &[u8]) {
+        let as_text = String::from_utf8_lossy(pepper);
+        assert!(
+            !rendered.contains(as_text.as_ref()),
+            "{what} disclosed its pepper as text: {rendered}"
+        );
+
+        let as_bytes = format!("{pepper:?}");
+        assert!(
+            !rendered.contains(&as_bytes),
+            "{what} disclosed its pepper as a byte array — this is what `#[derive(Debug)]` \
+             on a `Vec<u8>` actually prints: {rendered}"
+        );
+
+        // Whole-value absence is not enough. A `Debug` impl that printed a "safe-looking"
+        // prefix — `pepper: "abcd…"`, a fingerprint, the first few bytes for correlation —
+        // passes both checks above while still handing out key material: the pepper's whole
+        // job is to be unguessable, and every disclosed byte is one an offline attacker no
+        // longer has to search. So no non-trivial prefix or suffix may appear either, in
+        // text or byte-array spelling.
+        //
+        // Eight is below any plausible "identifying" excerpt and far above the run length
+        // that could collide by chance with ordinary struct text.
+        const MAX_DISCLOSED: usize = 8;
+        for length in MAX_DISCLOSED..=pepper.len() {
+            for window in [&pepper[..length], &pepper[pepper.len() - length..]] {
+                let text = String::from_utf8_lossy(window);
+                assert!(
+                    !rendered.contains(text.as_ref()),
+                    "{what} disclosed a {length}-byte run of its pepper as text — a truncated \
+                     excerpt is still key material: {rendered}"
+                );
+                assert!(
+                    !rendered.contains(&format!("{window:?}")),
+                    "{what} disclosed a {length}-byte run of its pepper as a byte array: \
+                     {rendered}"
+                );
+            }
+        }
+    }
+
+    /// The **wiring** test for pepper redaction, not the predicate test.
+    ///
+    /// A predicate test — "`IdempotencyHasher`'s `Debug` redacts its pepper" — is satisfied by
+    /// a correct impl on a type nothing logs. What actually leaks a pepper is a `Debug` on
+    /// some *container*: `AdminCommandRunner` is formatted by any `tracing` field or panic
+    /// message that captures it, `AuthService` lives for the whole process, and `Settings`
+    /// holds both peppers as configured, one level above either hasher. Each of those derives
+    /// `Debug`, so each is only as safe as the leaf it contains — and that dependency is
+    /// invisible at the leaf.
+    ///
+    /// So this walks the real containers, constructed the way production constructs them, and
+    /// requires the pepper to be absent from each. Redacting a leaf and forgetting a container
+    /// that reaches the secret by another route fails here; a correct leaf with no container
+    /// coverage would not have.
+    // `tokio::test` because `PgPool::connect_lazy` and `reqwest::Client` both require a
+    // runtime to exist. Neither performs any I/O here: the pool never opens a connection and
+    // the JWKS cache never fetches.
+    #[tokio::test]
+    async fn debug_redacts_the_pepper_everywhere_it_is_reachable() {
+        use crate::{
+            application::AdminCommandRunner,
+            config::{JwksFetchSettings, Settings},
+            infra::repositories::PgAdminRepository,
+            security::{ApiKeyHasher, AuthService, JwksCache},
+        };
+
+        const IDEMPOTENCY_PEPPER: &[u8] = b"idempotency-pepper-that-must-never-be-printed";
+        const API_KEY_PEPPER: &[u8] = b"api-key-pepper-that-must-never-be-printed";
+        const CONFIGURED_IDEMPOTENCY_PEPPER: &str = "Y29uZmlndXJlZC1pZGVtcG90ZW5jeS1wZXBwZXI";
+        const CONFIGURED_API_KEY_PEPPER: &str = "Y29uZmlndXJlZC1hcGkta2V5LXBlcHBlcg";
+
+        // ---- the leaves ----
+        let idempotency_hasher = IdempotencyHasher::new(IDEMPOTENCY_PEPPER.to_vec(), "v1");
+        let rendered = format!("{idempotency_hasher:?}");
+        assert_pepper_is_not_disclosed("IdempotencyHasher", &rendered, IDEMPOTENCY_PEPPER);
+        // The version *is* disclosed on purpose: it names which pepper a stored digest
+        // belongs to and is not itself secret. Asserting it keeps the redaction from being
+        // "fixed" by making `Debug` uselessly opaque.
+        assert!(
+            rendered.contains("v1"),
+            "the pepper version must stay visible"
+        );
+
+        let key_hasher = ApiKeyHasher::new(API_KEY_PEPPER.to_vec(), "v1", 20);
+        assert_pepper_is_not_disclosed("ApiKeyHasher", &format!("{key_hasher:?}"), API_KEY_PEPPER);
+
+        // ---- the containers that actually get logged ----
+
+        // `connect_lazy` builds the pool object without opening a connection, so the real
+        // `AdminCommandRunner` — the one every admin mutation goes through — is constructible
+        // here with no database.
+        let pool = sqlx::PgPool::connect_lazy("postgres://moira:moira@127.0.0.1:5432/moira")
+            .expect("a lazy pool must not require a reachable database");
+        let runner = AdminCommandRunner::new(
+            PgAdminRepository::new(pool),
+            IdempotencyHasher::new(IDEMPOTENCY_PEPPER.to_vec(), "v1"),
+        );
+        assert_pepper_is_not_disclosed(
+            "AdminCommandRunner",
+            &format!("{runner:?}"),
+            IDEMPOTENCY_PEPPER,
+        );
+
+        let auth = AuthService::new(
+            Default::default(),
+            Default::default(),
+            ApiKeyHasher::new(API_KEY_PEPPER.to_vec(), "v1", 20),
+            JwksCache::new(JwksFetchSettings::default())
+                .expect("the jwks cache must build its client"),
+        );
+        assert_pepper_is_not_disclosed("AuthService", &format!("{auth:?}"), API_KEY_PEPPER);
+
+        // `Settings` reaches both peppers in their *configured* form, before either hasher
+        // exists. Redacting only the hashers would leave this one printing them.
+        let mut settings = Settings::default();
+        settings.api_keys.pepper_base64 = Some(CONFIGURED_API_KEY_PEPPER.to_string());
+        settings.idempotency.pepper_base64 = Some(CONFIGURED_IDEMPOTENCY_PEPPER.to_string());
+        let rendered = format!("{settings:?}");
+        assert_pepper_is_not_disclosed(
+            "Settings.api_keys",
+            &rendered,
+            CONFIGURED_API_KEY_PEPPER.as_bytes(),
+        );
+        assert_pepper_is_not_disclosed(
+            "Settings.idempotency",
+            &rendered,
+            CONFIGURED_IDEMPOTENCY_PEPPER.as_bytes(),
+        );
+        // Whether a pepper is configured at all stays visible — the dev-fallback warnings and
+        // `Settings::validate` both turn on it, and it is not the secret.
+        assert!(
+            rendered.contains("[redacted]"),
+            "a configured pepper must render as a redaction marker, not vanish: {rendered}"
+        );
     }
 }

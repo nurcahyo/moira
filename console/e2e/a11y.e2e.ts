@@ -1,6 +1,6 @@
-import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
 
+import { auditPage } from "./support/axe";
 import { APP_DIR } from "./support/paths";
 import {
   discoverPageRoutes,
@@ -10,6 +10,32 @@ import {
 } from "./support/routes";
 
 /**
+ * ============================================================================
+ * WHAT THIS FILE AUDITS ON `/setup`, AND WHERE THE REST OF IT IS AUDITED
+ * ============================================================================
+ *
+ * `/setup` is public, so the walker below visits it and axe runs — but THIS
+ * server has no `MOIRA_SYSTEM_KEY` and points at `https://moira.invalid`, so
+ * `withSetupWindow` answers `404 setup_unavailable` and `SetupWizard` renders
+ * its refusal panel. That panel is a real state of a real deployment (the
+ * operator removed the bootstrap key after finishing, which is what they are
+ * told to do), so auditing it here is correct — but for two waves it was ALL
+ * that was audited, and the line's name did not say so.
+ *
+ * The wizard's own steps — welcome, the auth-settings form, the sign-in
+ * surface, done — are audited by `setup-wizard.e2e.ts`, against the setup
+ * fixture console (`e2e/support/setup-fixture.ts`): the same standalone
+ * artifact, given a bootstrap key and a stub Moira on loopback, so the window
+ * actually opens and the steps actually render.
+ *
+ * REMAINING GAP, declared rather than implied: the `claim` SUB-SURFACE of
+ * `SignInClaimStep` (`stage === "claim"`) is not reached by any e2e. It is
+ * gated on a Better Auth session, which needs a completed OAuth round trip
+ * against a mock IdP inside the e2e environment — issue #72's harness. Until
+ * then it is covered by `tests/unit/modules/setup/SignInClaimStep.test.tsx`,
+ * and `setup-wizard.e2e.ts` asserts positively that the fixture stops at
+ * `sign_in`, so the gap cannot quietly become something else.
+ *
  * ============================================================================
  * AUTOMATED ACCESSIBILITY GATE — and what it could NOT see until wave 5
  * ============================================================================
@@ -66,12 +92,31 @@ import {
  * serves the unit and integration suites, not this one), delete the entries from
  * the list below and KEEP the URL assertion. The assertion is what will prove
  * the authenticated run is doing anything.
+ *
+ * ----------------------------------------------------------------------------
+ * UPDATE (issue #75): THAT PROJECT NOW EXISTS, AND THIS FILE STILL CANNOT USE IT
+ * ----------------------------------------------------------------------------
+ *
+ * `e2e/support/authenticated-stack.ts` stands up a second console — a fixture
+ * Moira, a mock IdP and the console's own database — and the `authenticated`
+ * project drives it with a real session. `/settings/llm` IS axe-audited there,
+ * signed in, in `e2e/llm-settings-authenticated.e2e.ts`.
+ *
+ * It stays on the list below anyway, and that is not an oversight. This walker
+ * runs in the `chromium` project, against the SCAFFOLD server, where
+ * `MOIRA_API_URL` is `https://moira.invalid` and every gated route still
+ * redirects. The list's meaning is unchanged — "gated routes this walker cannot
+ * audit" — and the bidirectional assertion below is what keeps that honest. What
+ * changed is that `/settings/llm` is no longer UNAUDITED; it is audited
+ * elsewhere, by a suite that could see it.
+ *
+ * `/` and `/admins` have no authenticated coverage yet. Moving them is a
+ * separate change: each needs its own spec in the authenticated project, and
+ * adding them to that project's `testMatch` without one would audit nothing
+ * while looking like it had.
  */
 
 const routes: DiscoveredRoute[] = discoverPageRoutes(APP_DIR);
-
-const AXE_TAGS = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"];
-const BLOCKING_IMPACTS = new Set(["critical", "serious"]);
 
 /** Where the `(console)` layout sends an unauthenticated visitor. */
 const SIGN_IN_PATH = "/login";
@@ -85,7 +130,20 @@ const SIGN_IN_PATH = "/login";
  * gated routes EXACTLY, so adding a gated screen without touching this file
  * fails, and so does leaving an entry here after the route stops being gated.
  */
-const ROUTES_NOT_AUDITED_PENDING_AUTHENTICATED_E2E: readonly string[] = ["/", "/admins"];
+const ROUTES_NOT_AUDITED_PENDING_AUTHENTICATED_E2E: readonly string[] = [
+  "/",
+  "/admins",
+  // Issue #74. Inside `(console)`, so the walker below asserts it redirects to
+  // `/login` and does NOT audit it. Listed rather than silently uncovered: the
+  // bidirectional assertion means adding a gated screen without touching this
+  // file fails, which is the only thing keeping the gap a reviewed fact.
+  //
+  // NOT a gap any more, though it is still on this list: issue #75 audits this
+  // route WITH a session, in `e2e/llm-settings-authenticated.e2e.ts`, against
+  // the second stack. See the UPDATE in this file's header for why the entry
+  // stays.
+  "/settings/llm",
+];
 
 /** The pathname a route's fixture URL resolves to. */
 function expectedPathname(route: DiscoveredRoute): string {
@@ -181,27 +239,11 @@ test.describe("accessibility", () => {
           "describing a different page from the one it is named for",
       ).toBe(expectedPathname(route));
 
-      const results = await new AxeBuilder({ page }).withTags(AXE_TAGS).analyze();
-
-      await testInfo.attach(`axe-${route.pattern.replace(/\W+/g, "_")}.json`, {
-        body: JSON.stringify(results.violations, null, 2),
-        contentType: "application/json",
-      });
-
-      const blocking = results.violations.filter((v) => BLOCKING_IMPACTS.has(v.impact ?? ""));
-
-      const report = blocking
-        .map(
-          (v) =>
-            `  [${v.impact}] ${v.id}: ${v.help}\n` +
-            v.nodes.map((n) => `      ${n.target.join(" ")}`).join("\n") +
-            `\n      ${v.helpUrl}`,
-        )
-        .join("\n");
+      const audit = await auditPage(page, testInfo, route.pattern);
 
       expect(
-        blocking.map((v) => v.id),
-        `critical/serious accessibility violations on ${route.pattern}:\n${report}`,
+        audit.ids,
+        `critical/serious accessibility violations on ${route.pattern}:\n${audit.report}`,
       ).toEqual([]);
     });
   }

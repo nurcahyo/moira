@@ -80,13 +80,16 @@ pub(crate) const TRUSTED_JWT_ISSUERS_CURSOR: CursorScope =
     CursorScope::new("admin.trusted_jwt_issuers");
 pub(crate) const AUDIT_LOGS_CURSOR: CursorScope = CursorScope::new("admin.audit_logs");
 
-/// What a paginated admin list needs from its caller: how many rows, and where to resume.
+/// What a paginated list needs from its caller: how many rows, and where to resume.
 ///
-/// # There is exactly one way to build one, deliberately
+/// # Every way to build one takes the cursor too, deliberately
 ///
-/// [`From<&PageQuery>`] is the only constructor. It carries both the `limit` *and* the
-/// `cursor` query parameter through to the service, so a handler cannot obtain a
-/// `PageRequest` without having decided what to do about the cursor.
+/// [`From<&PageQuery>`] covers the admin lists;
+/// [`Self::from_limit_and_cursor`] is what the public lists' own query types go through
+/// (`impl From<&ExecutionQuery>` and friends live in `crate::application::public`, next to
+/// the services that use them). Both carry the `limit` *and* the `cursor` through to the
+/// service, so a handler cannot obtain a `PageRequest` without having decided what to do
+/// about the cursor.
 ///
 /// An earlier revision also had a `From<i64>` bridge that hardcoded `cursor: None`, so a
 /// handler passing a bare `query.limit()` still type-checked while silently dropping the
@@ -103,6 +106,16 @@ pub struct PageRequest {
 }
 
 impl PageRequest {
+    /// The constructor the public list query types go through (issue #93).
+    ///
+    /// Both arguments are required, which is the whole guarantee: there is still no way to
+    /// name a page size without also naming what happens to the cursor. `limit` must already
+    /// be clamped by the query type it came from — this does not clamp, because the two
+    /// surfaces' clamps are theirs to define.
+    pub(crate) fn from_limit_and_cursor(limit: i64, cursor: Option<String>) -> Self {
+        Self { limit, cursor }
+    }
+
     /// Rows the caller asked for, clamped. The repository fetches one more than this.
     pub fn limit(&self) -> i64 {
         self.limit
@@ -300,8 +313,8 @@ pub(crate) fn validate_application_identifiers(
     Ok(())
 }
 
-/// **The** actor fingerprint. One formula, crate-wide, for every writer of
-/// `idempotency_records` (plan 06, Module 16 / P2-15).
+/// The canonical actor-identity bytes behind **the** actor fingerprint. One formula,
+/// crate-wide, for every writer of `idempotency_records` (plan 06, Module 16 / P2-15).
 ///
 /// The fingerprint is the actor half of the unique index
 /// `(idempotency_key_hash, actor_fingerprint, operation)`
@@ -336,13 +349,17 @@ pub(crate) fn validate_application_identifiers(
 /// | `delegated_subject` | On-behalf-of delegation: the delegate and the delegator are different actors for replay purposes. |
 ///
 /// Serialised as a `serde_json` tuple rather than a `format!` string so no field can be
-/// made ambiguous by a separator character appearing inside another field's value, then
-/// reduced by `secret_fingerprint` so the ledger stores no caller identity in the clear.
+/// made ambiguous by a separator character appearing inside another field's value.
 ///
 /// `pub(crate)` exists so `crate::application::{conversation, runtime_admin, public}` reuse
 /// this exact formula; do not copy the body anywhere.
-pub(crate) fn actor_fingerprint(actor: &Actor) -> String {
-    let identity = serde_json::to_vec(&(
+///
+/// Returns *bytes* rather than a digest so the caller — which is the layer that holds the
+/// [`IdempotencyHasher`] — can derive both the current peppered fingerprint and the legacy
+/// unkeyed one from a single serialisation, exactly as `AdminCommandSpec::envelope_bytes`
+/// already does for the request hash.
+pub(crate) fn actor_identity_bytes(actor: &Actor) -> Vec<u8> {
+    serde_json::to_vec(&(
         actor.actor_type,
         &actor.subject,
         actor.api_key_id,
@@ -354,8 +371,37 @@ pub(crate) fn actor_fingerprint(actor: &Actor) -> String {
         &actor.external_tenant_id,
         &actor.delegated_subject,
     ))
-    .expect("actor identity fields are serializable");
-    secret_fingerprint(&identity)
+    .expect("actor identity fields are serializable")
+}
+
+/// **The** actor fingerprint written to `idempotency_records.actor_fingerprint`.
+///
+/// Peppered through [`IdempotencyHasher`] rather than reduced by the unkeyed
+/// [`secret_fingerprint`]. The reason is the same one that moved `idempotency_key_hash` and
+/// `request_hash` onto the keyed hasher (plan 03, P1-1) and it applies here with more force,
+/// not less: the pre-image of this digest is a *small, highly structured, low-entropy* tuple —
+/// an actor type from a four-variant enum, a handful of UUIDs, a subject string, a tenant
+/// slug. An attacker holding a database dump can enumerate candidate actors offline against
+/// an unkeyed SHA-256 and recover exactly who issued which idempotent command, which is a
+/// caller-identity disclosure from a database-only compromise. Keying the digest with a
+/// pepper the database never contains removes the offline oracle.
+///
+/// The output carries the `"{pepper_version}:"` prefix and is 46 characters, well inside the
+/// `varchar(128)` column, so this needs no migration.
+pub(crate) fn actor_fingerprint(hasher: &IdempotencyHasher, actor: &Actor) -> String {
+    hasher.hash(&actor_identity_bytes(actor))
+}
+
+/// The unkeyed fingerprint this formula produced **before** it was peppered.
+///
+/// Read-only, and never written: the fingerprint is a column of the unique index
+/// `(idempotency_key_hash, actor_fingerprint, operation)`, so a row stored under the unkeyed
+/// value is *unreachable* by the peppered one. Every read path that can meet a pre-deploy
+/// row probes this value too, and the probes drain as rows expire — see the sweep comments
+/// in `AdminCommandRunner::execute`, `runtime_admin::idempotency_replay` and
+/// `public::claim_idempotency`.
+pub(crate) fn unkeyed_actor_fingerprint(actor: &Actor) -> String {
+    secret_fingerprint(&actor_identity_bytes(actor))
 }
 
 pub(crate) fn admin_command_spec<T: Serialize>(
@@ -371,7 +417,7 @@ pub(crate) fn admin_command_spec<T: Serialize>(
                 .as_ref()
                 .map(|key| AdminCommandIdempotency {
                     key: key.clone(),
-                    actor_fingerprint: actor_fingerprint(actor),
+                    actor_identity: actor_identity_bytes(actor),
                 }),
         )
     })
@@ -1090,17 +1136,26 @@ mod tests {
             idempotency_key: Some("replay-key".to_string()),
         };
 
-        let direct = actor_fingerprint(&actor);
+        let direct = actor_identity_bytes(&actor);
 
         let spec =
             conversation_command_spec(&ctx, &actor, "rag.collection.create", json!({}), &json!({}))
                 .unwrap();
 
         assert!(
-            format!("{spec:?}").contains(&format!("actor_fingerprint: {direct:?}")),
-            "conversation_command_spec must embed the exact fingerprint produced by \
-             admin::actor_fingerprint, not a divergent copy"
+            format!("{spec:?}").contains(&format!("actor_identity: {direct:?}")),
+            "conversation_command_spec must embed the exact actor identity produced by \
+             admin::actor_identity_bytes, not a divergent copy"
         );
+    }
+
+    /// A fixed hasher for the fingerprint tests below.
+    ///
+    /// The pepper is constant across every call within a test, so peppering does not weaken
+    /// any of the discrimination assertions: two actors that differ in an identity field
+    /// still have to produce two different digests under one and the same key.
+    fn fingerprint_hasher() -> IdempotencyHasher {
+        IdempotencyHasher::new(b"actor-fingerprint-test-pepper".to_vec(), "v1")
     }
 
     /// A trusted-JWT actor whose only distinguishing field is set by the caller.
@@ -1137,8 +1192,8 @@ mod tests {
         };
 
         assert_ne!(
-            actor_fingerprint(&first),
-            actor_fingerprint(&second),
+            actor_fingerprint(&fingerprint_hasher(), &first),
+            actor_fingerprint(&fingerprint_hasher(), &second),
             "trusted_jwt_issuer_id must partition the replay ledger"
         );
     }
@@ -1159,8 +1214,8 @@ mod tests {
             ..base.clone()
         };
         assert_ne!(
-            actor_fingerprint(&tenant_claim),
-            actor_fingerprint(&other_tenant_claim),
+            actor_fingerprint(&fingerprint_hasher(), &tenant_claim),
+            actor_fingerprint(&fingerprint_hasher(), &other_tenant_claim),
             "tenant_id must partition the replay ledger"
         );
 
@@ -1173,8 +1228,8 @@ mod tests {
             ..base
         };
         assert_ne!(
-            actor_fingerprint(&external_tenant),
-            actor_fingerprint(&other_external_tenant),
+            actor_fingerprint(&fingerprint_hasher(), &external_tenant),
+            actor_fingerprint(&fingerprint_hasher(), &other_external_tenant),
             "external_tenant_id must partition the replay ledger"
         );
     }
@@ -1193,8 +1248,8 @@ mod tests {
         };
 
         assert_ne!(
-            actor_fingerprint(&first),
-            actor_fingerprint(&second),
+            actor_fingerprint(&fingerprint_hasher(), &first),
+            actor_fingerprint(&fingerprint_hasher(), &second),
             "delegated_subject must partition the replay ledger"
         );
     }
@@ -1296,11 +1351,11 @@ mod tests {
             ),
         ];
 
-        let baseline = actor_fingerprint(&base);
+        let baseline = actor_fingerprint(&fingerprint_hasher(), &base);
         let mut seen = std::collections::HashSet::new();
         seen.insert(baseline.clone());
         for (field, mutated) in mutations {
-            let fingerprint = actor_fingerprint(&mutated);
+            let fingerprint = actor_fingerprint(&fingerprint_hasher(), &mutated);
             assert_ne!(
                 fingerprint, baseline,
                 "changing `{field}` alone must change the fingerprint"
@@ -1324,6 +1379,9 @@ mod tests {
             ..base.clone()
         };
 
-        assert_eq!(actor_fingerprint(&base), actor_fingerprint(&re_scoped));
+        assert_eq!(
+            actor_fingerprint(&fingerprint_hasher(), &base),
+            actor_fingerprint(&fingerprint_hasher(), &re_scoped)
+        );
     }
 }

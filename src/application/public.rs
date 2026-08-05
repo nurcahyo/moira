@@ -12,19 +12,22 @@ use crate::{
     app::AppState,
     application::{
         ConversationExecutionLink, ConversationService, ExecutionService, RequestContext,
+        admin::{PageRequest, shared::paginate},
     },
+    config::ImageUrlSettings,
     domain::{
         ApplicationExecutionPolicyPutRequest, ApplicationExecutionPolicyRecord, AuditLogInsert,
-        AuditResult, CallerRuntimeIdentity, DomainMessage, DomainMessageContent, DomainMessageRole,
-        ExecutionCommand, ExecutionFailure, ExecutionFailureClass, ExecutionOptions,
-        ExecutionOutcome, ExecutionQuery, ExecutionStatus, IdempotencyRecord, ListResponse,
-        OpenAiCompatTextFormat, OpenAiCompatTextOptions, OpenAiResponseCompatRequest,
-        PublicCapabilities, PublicCitation, PublicContentPart, PublicConversationRef,
-        PublicExecutionSummary, PublicInputMessage, PublicMessageRole, PublicModelRef,
-        PublicModelResource, PublicOutputContentPart, PublicOutputItem, PublicResponse,
-        PublicResponseFormat, PublicResponseRecord, PublicResponseRequest, PublicResponseStatus,
-        PublicRouteRef, PublicRouteResource, PublicSseEnvelope, PublicUsageRecord,
-        PublicUsageSummary, RuntimeEventEnvelope, RuntimeEventType, UsageQuery,
+        AuditResult, CallerRuntimeIdentity, CursorScope, DomainMessage, DomainMessageContent,
+        DomainMessageRole, ExecutionCommand, ExecutionFailure, ExecutionFailureClass,
+        ExecutionOptions, ExecutionOutcome, ExecutionQuery, ExecutionStatus, IdempotencyRecord,
+        Keyed, ListResponse, OpenAiCompatTextFormat, OpenAiCompatTextOptions,
+        OpenAiResponseCompatRequest, PublicCapabilities, PublicCitation, PublicContentPart,
+        PublicConversationRef, PublicExecutionSummary, PublicInputMessage, PublicListQuery,
+        PublicMessageRole, PublicModelRef, PublicModelResource, PublicOutputContentPart,
+        PublicOutputItem, PublicResponse, PublicResponseFormat, PublicResponseRecord,
+        PublicResponseRequest, PublicResponseStatus, PublicRouteRef, PublicRouteResource,
+        PublicSseEnvelope, PublicUsageRecord, PublicUsageSummary, RuntimeEventEnvelope,
+        RuntimeEventType, UsageQuery,
     },
     error::AppError,
     infra::repositories::{
@@ -32,8 +35,69 @@ use crate::{
         PublicRepository, ResponseStartedInsert, ResponseTerminalUpdate,
         default_application_execution_policy, idempotency_record,
     },
-    security::{Actor, ActorType, IdempotencyHasher, secret_fingerprint},
+    security::{
+        Actor, ActorType, HostResolver, IdempotencyHasher, OutboundDenialReason, OutboundUrlDenial,
+        OutboundUrlPolicy, SystemResolver, secret_fingerprint, validate_outbound_url,
+    },
 };
+
+/// Cursor scopes for the four public lists (issue #93).
+///
+/// Same contract as the admin scopes in `crate::application::admin::shared`: the label is
+/// mixed into the cursor's integrity tag but never stored inside it, so a cursor minted by
+/// one list fails closed with `400 invalid_cursor` on another instead of paging through an
+/// unrelated key space. `/v1/executions` and `/v1/usage` are the pair that most needs it —
+/// both are `(timestamp, uuid)` over rows keyed by the same execution, so nothing in the
+/// payload distinguishes them.
+const EXECUTIONS_CURSOR: CursorScope = CursorScope::new("public.executions");
+const USAGE_CURSOR: CursorScope = CursorScope::new("public.usage");
+const MODELS_CURSOR: CursorScope = CursorScope::new("public.models");
+const ROUTES_CURSOR: CursorScope = CursorScope::new("public.routes");
+
+/// The public list queries reach the shared [`PageRequest`] the same way `PageQuery` does:
+/// by a `From` that carries **both** the limit and the cursor.
+///
+/// That is the whole point of the conversion existing at all. `PageRequest` deliberately has
+/// no constructor taking a bare limit, because the nine admin lists once shipped exactly that
+/// — they compiled, they paginated, and they silently dropped every cursor a caller sent. The
+/// four public lists shipped the same defect for longer: they advertised a `cursor` parameter
+/// and bound it to no SQL whatsoever. Going through `PageRequest` means a handler cannot get
+/// a page size here without having also handed over the cursor.
+impl From<&ExecutionQuery> for PageRequest {
+    fn from(query: &ExecutionQuery) -> Self {
+        Self::from_limit_and_cursor(query.limit(), query.cursor.clone())
+    }
+}
+
+impl From<&UsageQuery> for PageRequest {
+    fn from(query: &UsageQuery) -> Self {
+        Self::from_limit_and_cursor(query.limit(), query.cursor.clone())
+    }
+}
+
+impl From<&PublicListQuery> for PageRequest {
+    fn from(query: &PublicListQuery) -> Self {
+        Self::from_limit_and_cursor(query.limit(), query.cursor.clone())
+    }
+}
+
+/// Assembles a public page from the repository's over-fetched, key-tagged rows.
+///
+/// This is `crate::application::admin::shared::paginate` with the [`Keyed`] wrapper peeled
+/// off afterwards — the trimming, the `has_more` arithmetic and the "encode the last row
+/// actually returned, never the over-fetched one" rule are that function's, not a second
+/// copy of them. The only thing done here is dropping the sort keys, which exist so the
+/// cursor can be minted and must not reach the wire.
+fn paginate_public<T>(
+    rows: Vec<Keyed<T>>,
+    page: &PageRequest,
+    scope: CursorScope,
+) -> ListResponse<T> {
+    let keyed = paginate(rows, page, scope, |row| row.key);
+    let mut response = ListResponse::new(keyed.data.into_iter().map(|row| row.row).collect());
+    response.pagination = keyed.pagination;
+    response
+}
 
 #[derive(Clone)]
 pub struct PublicExecutionService {
@@ -766,10 +830,16 @@ impl PublicExecutionService {
             actor,
             can_read_all(actor, "moira:executions:read", &self.state),
         )?;
-        self.public_repo
-            .list_executions_authorized(&access, query)
-            .await
-            .map(ListResponse::new)
+        // Decoded after the authorization check and before the query, exactly as the admin
+        // lists do it: an unauthorized caller learns nothing about cursor validity, and a
+        // bad cursor never reaches Postgres.
+        let page = PageRequest::from(query);
+        let cursor = page.decode(EXECUTIONS_CURSOR)?;
+        let rows = self
+            .public_repo
+            .list_executions_authorized(&access, cursor, page.limit())
+            .await?;
+        Ok(paginate_public(rows, &page, EXECUTIONS_CURSOR))
     }
 
     pub async fn list_usage(
@@ -780,44 +850,56 @@ impl PublicExecutionService {
     ) -> Result<ListResponse<PublicUsageRecord>, AppError> {
         self.state.authz.require(actor, "moira:usage:read")?;
         let access = public_access(actor, can_read_all(actor, "moira:usage:read", &self.state))?;
-        let records = self
+        let page = PageRequest::from(query);
+        let cursor = page.decode(USAGE_CURSOR)?;
+        let rows = self
             .public_repo
-            .list_usage_authorized(&access, query)
+            .list_usage_authorized(&access, query, cursor)
             .await?;
+        let response = paginate_public(rows, &page, USAGE_CURSOR);
+        // Counts the rows the caller actually receives, not the over-fetched probe row.
         self.audit(
             actor,
             ctx,
             "usage.read",
             AuditResult::Success,
             None,
-            json!({ "count": records.len() }),
+            json!({ "count": response.data.len() }),
         )
         .await?;
-        Ok(ListResponse::new(records))
+        Ok(response)
     }
 
     pub async fn list_models(
         &self,
         actor: &Actor,
+        query: &PublicListQuery,
     ) -> Result<ListResponse<PublicModelResource>, AppError> {
         self.state.authz.require(actor, "moira:models:read")?;
         let access = public_access(actor, false)?;
-        self.public_repo
-            .list_visible_models(&access, 200)
-            .await
-            .map(ListResponse::new)
+        let page = PageRequest::from(query);
+        let cursor = page.decode(MODELS_CURSOR)?;
+        let rows = self
+            .public_repo
+            .list_visible_models(&access, cursor, page.limit())
+            .await?;
+        Ok(paginate_public(rows, &page, MODELS_CURSOR))
     }
 
     pub async fn list_routes(
         &self,
         actor: &Actor,
+        query: &PublicListQuery,
     ) -> Result<ListResponse<PublicRouteResource>, AppError> {
         self.state.authz.require(actor, "moira:routes:read")?;
         let access = public_access(actor, false)?;
-        self.public_repo
-            .list_visible_routes(&access, 200)
-            .await
-            .map(ListResponse::new)
+        let page = PageRequest::from(query);
+        let cursor = page.decode(ROUTES_CURSOR)?;
+        let rows = self
+            .public_repo
+            .list_visible_routes(&access, cursor, page.limit())
+            .await?;
+        Ok(paginate_public(rows, &page, ROUTES_CURSOR))
     }
 
     pub async fn capabilities(&self, actor: &Actor) -> Result<PublicCapabilities, AppError> {
@@ -903,7 +985,7 @@ impl PublicExecutionService {
         application_id: Option<Uuid>,
         stream: bool,
     ) -> Result<PreparedExecution, AppError> {
-        validate_request(&self.state, actor, &request, &policy, stream)?;
+        validate_request(&self.state, actor, &request, &policy, stream).await?;
         let access = public_access(actor, false)?;
         let model_hint = match request.model.take() {
             Some(model) => Some(resolve_model_hint(&self.public_repo, &access, &model).await?),
@@ -1032,8 +1114,8 @@ impl PublicExecutionService {
         let Some(key) = ctx.idempotency_key.as_deref() else {
             return Ok(None);
         };
-        let actor_fingerprint = crate::application::admin::actor_fingerprint(actor);
         let hasher = &self.state.idempotency_hasher;
+        let actor_fingerprint = crate::application::admin::actor_fingerprint(hasher, actor);
         let request_bytes = normalized_request_bytes(&(application_id, request))?;
 
         // Pre-claim sweep, deliberately *before* the claim insert, over every historical
@@ -1044,8 +1126,11 @@ impl PublicExecutionService {
         //   * `idempotency_key_hash` — unkeyed SHA-256 → keyed HMAC (plan 03, P1-1). The
         //     current hash needs no pre-claim probe: the claim's `on conflict` finds it.
         //   * `actor_fingerprint` — this module's 4-field formula → the crate-wide 10-field
-        //     one (plan 06, Module 16 / P2-15). Both key hashes must be probed under the
-        //     legacy value, because a pre-plan-06 row may carry either.
+        //     one (plan 06, Module 16 / P2-15), and then that 10-field digest from unkeyed
+        //     SHA-256 → keyed HMAC when the fingerprint was peppered (issue #95). Both key
+        //     hashes must be probed under each legacy value, because a pre-deploy row may
+        //     carry either. A *peppered* 4-field digest is deliberately absent: the narrow
+        //     formula was retired before the pepper existed, so nothing ever wrote one.
         //
         // Skipping the sweep is not a slow replay, it is a *wrong* one: an unswept row sits
         // at a different point of the unique index, so the claim below would insert
@@ -1053,22 +1138,27 @@ impl PublicExecutionService {
         // second time against the provider — a contractual replay turned into a duplicate
         // billable call.
         //
-        // Cost: up to three indexed lookups per idempotent request, on the miss path only.
-        // The write below always uses the current pair, so the legacy value can never
-        // re-enter the ledger and the sweep drains as rows expire.
+        // Cost: up to five indexed lookups per idempotent request, on the miss path only.
+        // The write below always uses the current pair, so no legacy value can ever re-enter
+        // the ledger and the sweep drains as rows expire.
         //
         // TODO(post-deploy): drop the two `legacy_actor_fingerprint` probes once every ledger
-        // row written before plan 06 shipped has expired. `idempotency_record` sets
-        // `expires_at` 24h ahead, so the earliest safe removal date is the deploy date of
-        // Module 16 + 1 day. The plan-03 `legacy_hash` probe has its own, earlier window.
+        // row written before plan 06 shipped has expired, and the two
+        // `unkeyed_actor_fingerprint` probes once every row written before the pepper deploy
+        // has expired. `idempotency_record` sets `expires_at` 24h ahead, so each window closes
+        // 24h after the deploy that carries it. The plan-03 `legacy_hash` probe has its own,
+        // earlier window.
         //
         // Gated on a DEPLOY, not on a merge, and deliberately not owned by any plan — see the
         // matching note in `runtime_admin.rs`.
+        let unkeyed_actor_fingerprint = crate::application::admin::unkeyed_actor_fingerprint(actor);
         let legacy_actor_fingerprint = legacy_public_actor_fingerprint(actor, application_id);
         let legacy_key_hash = hasher.legacy_hash(key.as_bytes());
         let current_key_hash = hasher.hash(key.as_bytes());
         let candidates = [
             (&legacy_key_hash, &actor_fingerprint),
+            (&current_key_hash, &unkeyed_actor_fingerprint),
+            (&legacy_key_hash, &unkeyed_actor_fingerprint),
             (&current_key_hash, &legacy_actor_fingerprint),
             (&legacy_key_hash, &legacy_actor_fingerprint),
         ];
@@ -1217,7 +1307,7 @@ async fn resolve_model_hint(
         .ok_or_else(|| AppError::unprocessable("model_not_found", "model is not visible"))
 }
 
-fn validate_request(
+async fn validate_request(
     state: &AppState,
     actor: &Actor,
     request: &PublicResponseRequest,
@@ -1366,7 +1456,7 @@ fn validate_request(
     }
     validate_metadata(state, &request.metadata)?;
     validate_response_format(state, &request.response_format)?;
-    validate_content(state, request, policy)
+    validate_content(state, request, policy).await
 }
 
 fn validate_override(
@@ -1387,12 +1477,13 @@ fn validate_override(
     Ok(())
 }
 
-fn validate_content(
+async fn validate_content(
     state: &AppState,
     request: &PublicResponseRequest,
     policy: &ApplicationExecutionPolicyRecord,
 ) -> Result<(), AppError> {
     let mut image_count = 0usize;
+    let mut image_urls: Vec<&str> = Vec::new();
     for message in &request.input {
         if message.content.is_empty()
             || message.content.len() > state.settings.public_api.maximum_content_parts_per_message
@@ -1436,12 +1527,12 @@ fn validate_content(
                             "too many image inputs",
                         ));
                     }
-                    validate_image_url(image_url)?;
+                    image_urls.push(image_url.as_str());
                 }
             }
         }
     }
-    Ok(())
+    validate_image_urls(state, image_urls).await
 }
 
 fn validate_metadata(state: &AppState, metadata: &Value) -> Result<(), AppError> {
@@ -1737,31 +1828,122 @@ fn validate_response_format(
     Ok(())
 }
 
-fn validate_image_url(value: &str) -> Result<(), AppError> {
-    let url = url::Url::parse(value)
-        .map_err(|_| AppError::unprocessable("image_url_not_allowed", "image URL is invalid"))?;
-    if url.scheme() != "https" {
-        return Err(AppError::unprocessable(
-            "image_url_not_allowed",
-            "image URL must use https",
-        ));
+/// The client-visible message for every image URL refused on address-space grounds.
+///
+/// Deliberately one message for all of them. Whether a host resolved into private space,
+/// sits outside the egress allow-list, or failed to resolve at all are facts about the
+/// deployment's internal network, and a caller who can tell them apart has a working
+/// internal port and address scanner built out of 422 responses. The specific reason is
+/// recorded server-side by [`image_url_policy`]'s caller instead.
+///
+/// Scheme and parse failures are *not* funnelled through this message: those are
+/// properties of the string the caller already holds, so naming them tells the caller
+/// nothing it did not supply, and a precise message is worth far more than the nothing it
+/// leaks.
+const IMAGE_URL_REJECTED_MESSAGE: &str = "image URL is not allowed";
+
+/// This deployment's image-URL policy.
+///
+/// Note what is *not* here compared with the JWKS policy: no content-type allow-list and
+/// no response byte cap. Moira never fetches the image — it is handed to the provider as
+/// `UserContent::image_url` — so there is no response for Moira to police. See
+/// [`crate::config::ImageUrlSettings`] for the full reasoning.
+fn image_url_policy(settings: &ImageUrlSettings) -> OutboundUrlPolicy {
+    OutboundUrlPolicy {
+        subject: "image url",
+        dns_timeout: Duration::from_millis(settings.dns_timeout_ms.max(1)),
+        allowed_hosts: settings.allowed_hosts.clone(),
+        // The image path has always refused these and continues to.
+        reject_credentials: true,
+        allow_insecure: settings.allow_insecure_dev_urls,
     }
-    if url.username() != "" || url.password().is_some() {
-        return Err(AppError::unprocessable(
-            "image_url_not_allowed",
-            "image URL credentials are not allowed",
-        ));
+}
+
+/// Validates every caller-supplied image URL through the shared SSRF guard.
+///
+/// Runs *after* the structural checks in [`validate_content`] rather than inline with
+/// them: resolution is the only part of request validation that touches the network, and a
+/// request that is already refusable for being too large or malformed must not be able to
+/// buy a DNS lookup with the attempt.
+async fn validate_image_urls(state: &AppState, urls: Vec<&str>) -> Result<(), AppError> {
+    validate_image_urls_with(&state.settings.public_api.image_urls, urls, &SystemResolver).await
+}
+
+/// [`validate_image_urls`] with the resolver and settings supplied explicitly.
+///
+/// Split out so the request-level controls — de-duplication, the request-wide budget, and
+/// the single client-visible message — are provable against a scripted resolver, with no
+/// `AppState`, no database and no network. Those three are exactly the properties that a
+/// test using the real resolver cannot pin down.
+///
+/// Distinct URLs are resolved once each, and the whole loop is bounded by one request-wide
+/// deadline, so `maximum_image_count` slow hostnames cost one budget between them rather
+/// than one each.
+async fn validate_image_urls_with<R: HostResolver>(
+    settings: &ImageUrlSettings,
+    urls: Vec<&str>,
+    resolver: &R,
+) -> Result<(), AppError> {
+    if urls.is_empty() {
+        return Ok(());
     }
-    if matches!(
-        url.host_str(),
-        Some("localhost") | Some("127.0.0.1") | Some("::1")
-    ) {
-        return Err(AppError::unprocessable(
-            "image_url_not_allowed",
-            "local image URLs are not allowed",
-        ));
+    let mut distinct: Vec<&str> = Vec::with_capacity(urls.len());
+    for url in urls {
+        if !distinct.contains(&url) {
+            distinct.push(url);
+        }
     }
-    Ok(())
+
+    let policy = image_url_policy(settings);
+    let budget = Duration::from_millis(settings.total_validation_timeout_ms.max(1));
+
+    let checks = async {
+        for raw in distinct {
+            if let Err(denial) = validate_outbound_url(raw, &policy, resolver).await {
+                return Err(image_denial_to_error(&denial));
+            }
+        }
+        Ok(())
+    };
+
+    match tokio::time::timeout(budget, checks).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!(
+                budget_ms = budget.as_millis(),
+                "image URL validation exceeded the request-wide budget"
+            );
+            Err(AppError::unprocessable(
+                "image_url_not_allowed",
+                IMAGE_URL_REJECTED_MESSAGE,
+            ))
+        }
+    }
+}
+
+/// Maps a guard denial onto the caller-visible error, logging the server-side detail.
+///
+/// The detail can name a resolved internal address, so it goes to the log and never into
+/// the response body.
+fn image_denial_to_error(denial: &OutboundUrlDenial) -> AppError {
+    tracing::warn!(
+        reason = denial.reason().as_str(),
+        detail = denial.detail(),
+        "refused a caller-supplied image URL"
+    );
+    let message = match denial.reason() {
+        // Facts about the caller's own string: safe, and useful, to name precisely.
+        OutboundDenialReason::Url => "image URL is invalid",
+        OutboundDenialReason::Scheme => "image URL must use https",
+        OutboundDenialReason::Credentials => "image URL credentials are not allowed",
+        // Everything below is a fact about the deployment's network. One message.
+        OutboundDenialReason::Host
+        | OutboundDenialReason::Resolution
+        | OutboundDenialReason::IpRange
+        | OutboundDenialReason::HostNotAllowed
+        | OutboundDenialReason::Timeout => IMAGE_URL_REJECTED_MESSAGE,
+    };
+    AppError::unprocessable("image_url_not_allowed", message)
 }
 
 fn map_public_messages(
@@ -2825,9 +3007,10 @@ mod tests {
                  stops holding, `claim_idempotency`'s legacy sweep is probing a value \
                  production never wrote and pre-deploy rows will not replay"
             );
+            let hasher = crate::security::IdempotencyHasher::new(b"public-pepper".to_vec(), "v1");
             assert_ne!(
-                crate::application::admin::actor_fingerprint(&base),
-                crate::application::admin::actor_fingerprint(&variant),
+                crate::application::admin::actor_fingerprint(&hasher, &base),
+                crate::application::admin::actor_fingerprint(&hasher, &variant),
                 "the unified formula must isolate replay across `{field}`"
             );
         }
@@ -2858,9 +3041,10 @@ mod tests {
             effective_application_id(&base),
             base.internal_application_id
         );
+        let hasher = crate::security::IdempotencyHasher::new(b"public-pepper".to_vec(), "v1");
         assert_ne!(
-            crate::application::admin::actor_fingerprint(&base),
-            crate::application::admin::actor_fingerprint(&other),
+            crate::application::admin::actor_fingerprint(&hasher, &base),
+            crate::application::admin::actor_fingerprint(&hasher, &other),
             "application identity must still partition the ledger without the argument"
         );
         assert_ne!(
@@ -3103,5 +3287,224 @@ mod tests {
                 "{mode:?} did not reach its reason through the serialised output_summary"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Image-URL admission control (issue #89)
+    //
+    // The guard itself is proved in `crate::security::ssrf`. What is proved here
+    // is the request-level behaviour layered on top of it: one lookup per distinct
+    // URL, one budget for the whole request, and one client-visible message that
+    // does not turn a 422 into an internal-network oracle.
+    // -----------------------------------------------------------------------
+
+    struct CountingResolver {
+        answer: Vec<std::net::SocketAddr>,
+        delay: Option<Duration>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingResolver {
+        fn returning(address: &str) -> Self {
+            Self {
+                answer: vec![std::net::SocketAddr::new(
+                    address.parse().expect("test address must parse"),
+                    443,
+                )],
+                delay: None,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn slow(delay: Duration) -> Self {
+            Self {
+                delay: Some(delay),
+                ..Self::returning("93.184.216.34")
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl HostResolver for CountingResolver {
+        async fn resolve(
+            &self,
+            _host: &str,
+            _port: u16,
+        ) -> std::io::Result<Vec<std::net::SocketAddr>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(delay) = self.delay {
+                tokio::time::sleep(delay).await;
+            }
+            Ok(self.answer.clone())
+        }
+    }
+
+    fn image_settings() -> ImageUrlSettings {
+        ImageUrlSettings::default()
+    }
+
+    /// The whole client-visible payload, with the request id pinned so the only
+    /// differences left between two of these are differences the caller could actually
+    /// use to tell two refusals apart.
+    fn message_of(error: &AppError) -> String {
+        format!(
+            "{:?}",
+            error.error_response(Some("fixed-request-id".to_string()))
+        )
+    }
+
+    /// A caller may repeat the same image URL across messages. Resolving it once per
+    /// occurrence would let one request buy `maximum_image_count` lookups of a hostname
+    /// the attacker controls, which is a free amplifier pointed at someone else's DNS.
+    #[tokio::test]
+    async fn repeated_image_urls_are_resolved_once_per_request() {
+        let resolver = CountingResolver::returning("93.184.216.34");
+        let url = "https://images.example.com/a.png";
+        validate_image_urls_with(&image_settings(), vec![url, url, url], &resolver)
+            .await
+            .expect("a public host must be accepted");
+        assert_eq!(
+            resolver.calls(),
+            1,
+            "three occurrences of one URL must cost one lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_image_urls_are_each_resolved() {
+        let resolver = CountingResolver::returning("93.184.216.34");
+        validate_image_urls_with(
+            &image_settings(),
+            vec!["https://a.example.com/1.png", "https://b.example.com/2.png"],
+            &resolver,
+        )
+        .await
+        .expect("public hosts must be accepted");
+        assert_eq!(
+            resolver.calls(),
+            2,
+            "de-duplication must not collapse genuinely different hosts"
+        );
+    }
+
+    /// Each host resolves within the per-host budget, but together they exceed the
+    /// request-wide one. Without the request-wide deadline this request costs
+    /// `images * dns_timeout_ms` instead of `total_validation_timeout_ms`.
+    #[tokio::test]
+    async fn many_slow_hosts_are_bounded_by_the_request_wide_budget() {
+        let settings = ImageUrlSettings {
+            dns_timeout_ms: 5_000,
+            total_validation_timeout_ms: 150,
+            ..image_settings()
+        };
+        let resolver = CountingResolver::slow(Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        let error = validate_image_urls_with(
+            &settings,
+            vec![
+                "https://a.example.com/1.png",
+                "https://b.example.com/2.png",
+                "https://c.example.com/3.png",
+                "https://d.example.com/4.png",
+                "https://e.example.com/5.png",
+            ],
+            &resolver,
+        )
+        .await
+        .expect_err("the request-wide budget must fire");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the request budget, not the sum of the per-host budgets, must bound this"
+        );
+        assert!(
+            message_of(&error).contains("image_url_not_allowed"),
+            "budget exhaustion still answers with the catalogued code: {}",
+            message_of(&error)
+        );
+    }
+
+    /// The core non-leak property. A resolved internal address is a fact about the
+    /// deployment's network and must not be reconstructable from the response.
+    #[tokio::test]
+    async fn a_refused_image_url_never_names_the_address_it_resolved_to() {
+        let resolver = CountingResolver::returning("169.254.169.254");
+        let error = validate_image_urls_with(
+            &image_settings(),
+            vec!["https://images.example.com/a.png"],
+            &resolver,
+        )
+        .await
+        .expect_err("a host resolving to the metadata endpoint must be refused");
+        let body = message_of(&error);
+        assert!(
+            !body.contains("169.254.169.254"),
+            "the resolved address must not reach the caller: {body}"
+        );
+        assert!(
+            body.contains("image_url_not_allowed"),
+            "the catalogued code is preserved: {body}"
+        );
+    }
+
+    /// The property that makes the 422 useless as a scanner: two different
+    /// address-space outcomes must be indistinguishable to the caller. Any change that
+    /// reintroduces a per-reason message — however well meant — fails here.
+    #[tokio::test]
+    async fn address_space_refusals_are_indistinguishable_to_the_caller() {
+        let private = validate_image_urls_with(
+            &image_settings(),
+            vec!["https://10.0.0.7/a.png"],
+            &CountingResolver::returning("93.184.216.34"),
+        )
+        .await
+        .expect_err("a private literal must be refused");
+
+        let off_list = validate_image_urls_with(
+            &ImageUrlSettings {
+                allowed_hosts: vec!["allowed.example.com".to_string()],
+                ..image_settings()
+            },
+            vec!["https://images.example.com/a.png"],
+            &CountingResolver::returning("93.184.216.34"),
+        )
+        .await
+        .expect_err("a host off the allow-list must be refused");
+
+        assert_eq!(
+            message_of(&private),
+            message_of(&off_list),
+            "a caller must not be able to tell 'private address' from 'not allow-listed'"
+        );
+    }
+
+    /// The counterpart: a mistake in the caller's own string is still named precisely,
+    /// because saying so tells the caller nothing it did not already send.
+    #[tokio::test]
+    async fn a_scheme_mistake_is_still_reported_precisely() {
+        let error = validate_image_urls_with(
+            &image_settings(),
+            vec!["http://images.example.com/a.png"],
+            &CountingResolver::returning("93.184.216.34"),
+        )
+        .await
+        .expect_err("http must be refused");
+        assert!(
+            message_of(&error).contains("https"),
+            "a scheme mistake is worth naming: {}",
+            message_of(&error)
+        );
+    }
+
+    /// A request with no images must not touch the resolver at all.
+    #[tokio::test]
+    async fn a_request_without_images_costs_no_resolution() {
+        let resolver = CountingResolver::returning("93.184.216.34");
+        validate_image_urls_with(&image_settings(), Vec::new(), &resolver)
+            .await
+            .expect("an image-free request is valid");
+        assert_eq!(resolver.calls(), 0);
     }
 }

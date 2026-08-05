@@ -10,6 +10,14 @@ pub mod i18n;
 pub mod infra;
 pub mod orchestration;
 pub mod security;
+/// Database scaffolding for this crate's own `#[cfg(test)]` modules.
+///
+/// Compiled only under `cfg(test)` and never part of the shipped library. It exists
+/// because the alternative — the library's unit tests connecting straight to
+/// `MOIRA_TEST_DATABASE_URL` and migrating it — made one checkout's unmerged migration
+/// break every other checkout's tests (issue #77). See the module docs.
+#[cfg(test)]
+mod test_support;
 
 use axum::{
     Router,

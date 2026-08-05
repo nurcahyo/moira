@@ -1,0 +1,101 @@
+# gitleaks configuration — the triaged fixture allowlist.
+#
+# WHY THIS REPLACED THE FINGERPRINT BASELINE IN `.gitleaksignore`.
+#
+# A gitleaks fingerprint is `commit:path:rule:line`. Pinning a finding that precisely is
+# a real virtue — it is why the old baseline was a baseline and not a hole — but it has
+# one fatal interaction with how this repository merges. Every PR lands as a SQUASH, so
+# the commit a contributor baselines against never reaches `develop`: the squash mints a
+# new SHA, and the line number moves with any edit above it. The fingerprint goes stale
+# at the exact moment the change merges, and `develop` reds on a finding that was triaged
+# and approved days earlier. That is what happened to the issue #75 fixture in PR #120 —
+# three consecutive red runs on `develop` — and it would have happened to every future
+# fixture. It is a property of the mechanism, not a mistake anyone made.
+#
+# WHAT THIS IS NOT, AND THE TRAP ON THE WAY HERE. The old baseline's header warned
+# against replacing fingerprints with an allowlist over `paths`, because allowlisting
+# `tests/` would blind the scanner to a real key committed into a test — a likely place
+# for one to land. That warning is correct, and honouring it is harder than it looks:
+# gitleaks combines the conditions inside one allowlist with OR by default, so an entry
+# carrying both `paths` and `regexes` is satisfied by the PATH ALONE and is exactly the
+# hole the warning describes. The first draft of this file omitted `condition = "AND"`
+# and was that hole. Nothing in review caught it; the mutation below did.
+#
+# WHAT THIS IS. Each entry requires BOTH one known VALUE — matched against the secret
+# gitleaks captured — AND a file where that value legitimately appears. A different
+# secret in the same file still fires, which is the property the fingerprints were
+# protecting, while a value survives a squash and a line move.
+#
+# MEASURED, NOT ASSERTED, over the full history:
+#   1. with this config the scan reports no leaks;
+#   2. with a second, DIFFERENT base64 key added beside the fixture in
+#      `authenticated-stack.ts`, it reports that finding — the path is not a hole;
+#   3. with the SAME fixture value copied into a new file, it does NOT report it.
+#
+# Result 3 is inherent to pinning a value rather than a location, and it is recorded here
+# rather than smoothed over: these entries say "this exact string is inert", and copying
+# an inert string elsewhere does not make it a secret. What they do NOT say is "anything
+# in these files is fine" — result 2 is the proof of that, and it is the one to re-run.
+#
+# Adding an entry without reading the underlying value is how an allowlist becomes the
+# thing that hides the incident. Read it first, and write down why it is inert.
+
+[extend]
+useDefault = true
+
+
+# A 32-byte base64 key composed in the fixture file itself. It seals exactly one row — the fixture
+# OAuth client secret — into the throwaway `*_playwright` database this stack truncates on every
+# run, and the same process hands it to the console child that unseals it. It never enters the
+# Playwright runner's ambient environment.
+[[allowlists]]
+description = "Playwright authenticated-stack fixture key"
+condition = "AND"
+targetRules = ["generic-api-key"]
+regexTarget = "secret"
+regexes = ['''^gTdKq2mBcXWvPzR8''']
+paths = [
+  '''^console/e2e/support/authenticated\-stack\.ts$''',
+]
+
+# A fixture value for the Playwright console environment, composed in the fixture file and used
+# only against the throwaway test database.
+[[allowlists]]
+description = "Playwright console-env fixture key"
+condition = "AND"
+targetRules = ["generic-api-key"]
+regexTarget = "secret"
+regexes = ['''^1wEFCqo384H0xewV''']
+paths = [
+  '''^console/e2e/support/console\-env\.ts$''',
+]
+
+# An invented string matching no provider's key format, used as INPUT to the masking unit tests.
+# The point of those tests is that this value comes back out masked.
+[[allowlists]]
+description = "masking unit-test input"
+condition = "AND"
+targetRules = ["generic-api-key"]
+regexTarget = "secret"
+regexes = ['''^sk\-live\-01234567''']
+paths = [
+  '''^src/security/masking\.rs$''',
+]
+
+# A test-only RSA private key generated for this suite. It signs assertions against a JWKS the
+# test itself publishes, and authenticates nothing outside the test process.
+# `tests/secret_leak_snapshots.rs` uses it as a deliberate NEEDLE: that suite fails if the key, or
+# any signature made with it, ever reaches a driven surface. Deleting it would remove the fixture
+# that proves Moira does not leak keys.
+[[allowlists]]
+description = "test-only RSA private key (also the needle in the leak-snapshot suite)"
+condition = "AND"
+targetRules = ["private-key"]
+regexTarget = "secret"
+regexes = ['''^-----BEGIN[A-Z ]*PRIVATE KEY-----\s+MIIEvQIBADANBgkqhkiG9w0B''']
+paths = [
+  '''^tests/admin_invite_lifecycle\.rs$''',
+  '''^tests/identity_claim\.rs$''',
+  '''^tests/public_authorization\.rs$''',
+  '''^tests/secret_leak_snapshots\.rs$''',
+]

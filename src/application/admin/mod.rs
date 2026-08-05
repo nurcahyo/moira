@@ -60,11 +60,14 @@ use providers::ProviderAdminService;
 
 pub use shared::PageRequest;
 
-/// Re-exported so `crate::application::conversation` keeps resolving
-/// `crate::application::admin::actor_fingerprint` — it must reuse this exact formula, since
+/// Re-exported so `crate::application::{conversation, runtime_admin, public}` keep resolving
+/// `crate::application::admin::actor_fingerprint` — they must reuse this exact formula, since
 /// the fingerprint is part of the `idempotency_records` unique index and of the advisory
 /// lock key.
-pub(crate) use shared::actor_fingerprint;
+///
+/// `unkeyed_actor_fingerprint` is the read-only pre-pepper spelling of the same formula, and
+/// `actor_identity_bytes` is the shared pre-image both derive from.
+pub(crate) use shared::{actor_fingerprint, actor_identity_bytes, unkeyed_actor_fingerprint};
 
 pub struct AdminService<'a> {
     applications: ApplicationAdminService<'a>,

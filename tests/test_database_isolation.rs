@@ -33,6 +33,14 @@
 //! weakening them, and this file's second test is what forced the entry to be deleted
 //! rather than left to rot.
 //!
+//! **`src/` is scanned too, since issue #77.** It was not, and that was the hole the whole
+//! of #77 problem 3 came through: nine `#[cfg(test)]` modules under `src/**` resolved the
+//! variable and ran `MIGRATOR` against the database it names, so one checkout's unmerged
+//! migration broke every other checkout's lib tests — including `main`'s — with a message
+//! naming a version its author had never seen. A guard that watched `tests/` only could
+//! never have seen it. The library's tests now go through `src/test_support.rs`, and that
+//! file is the single allowlisted entry for the whole of `src/`.
+//!
 //! **What it does not.** It matches source text, not behaviour: a suite that reached the
 //! same URL indirectly — through a helper, a second environment variable, or a `var(` call
 //! rustfmt happened to split across lines — would pass. It also cannot tell whether an
@@ -41,29 +49,38 @@
 use std::{collections::BTreeSet, fs, path::PathBuf};
 
 /// Files permitted to resolve `MOIRA_TEST_DATABASE_URL` themselves, each with the reason a
-/// disposable clone is not available to it. Paths are relative to `tests/`.
+/// disposable clone is not available to it. Paths are relative to the crate root.
 ///
 /// Entries are liabilities, not exemptions: `every_allowlist_entry_is_still_load_bearing`
 /// fails if one stops being needed, so the list can only shrink without review.
 const SHARED_DATABASE_ALLOWLIST: &[(&str, &str)] = &[
     (
-        "support/mod.rs",
+        "tests/support/mod.rs",
         "owns the mechanism — it resolves the variable to build the maintenance, template \
          and per-fixture clone URLs that every other suite borrows",
     ),
     (
-        "security_foundation.rs",
+        "tests/security_foundation.rs",
         "asserts the migration contract itself, so it must apply migrations to a database \
          built from nothing rather than to a clone of an already-migrated template; it \
          already creates and force-drops its own database per run",
     ),
+    (
+        "src/test_support.rs",
+        "owns the same mechanism for the library crate's own #[cfg(test)] modules — it \
+         resolves the variable for its host and credentials only, and creates one private \
+         database per test process rather than connecting to the one the URL names",
+    ),
 ];
 
-/// A floor on the number of test sources scanned. Without it a mistyped directory, a
-/// `read_dir` that silently yielded nothing, or a future move of this file would leave
-/// every assertion below iterating an empty set and passing — the shape of a guard this
-/// project has already been bitten by six times.
-const MINIMUM_SUITES_SCANNED: usize = 30;
+/// The roots scanned, each with a floor on how many `.rs` files it must yield.
+///
+/// Without a floor a mistyped directory, a `read_dir` that silently yielded nothing, or a
+/// future move of this file would leave every assertion below iterating an empty set and
+/// passing — the shape of a guard this project has already been bitten by six times. The
+/// floors are **per root** on purpose: one number over both would let a broken `src/` scan
+/// hide behind the size of `tests/`.
+const SCANNED_ROOTS: &[(&str, usize)] = &[("tests", 30), ("src", 30)];
 
 /// The call that hands a suite the shared database URL. Matching the `var("…")` call rather
 /// than the bare variable name keeps the many suites that only *mention* it — in a doc
@@ -89,47 +106,54 @@ fn code_only(source: &str) -> String {
         .join("\n")
 }
 
-fn tests_directory() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests")
+fn crate_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Every `.rs` file under `tests/`, keyed by its path relative to `tests/`.
+/// Every `.rs` file under each of [`SCANNED_ROOTS`], keyed by its path relative to the
+/// crate root.
 fn test_sources() -> Vec<(String, String)> {
-    let root = tests_directory();
-    let mut pending = vec![root.clone()];
+    let crate_root = crate_root();
     let mut found = Vec::new();
 
-    while let Some(directory) = pending.pop() {
-        let entries = fs::read_dir(&directory)
-            .unwrap_or_else(|err| panic!("read the test directory {}: {err}", directory.display()));
-        for entry in entries {
-            let path = entry.expect("read a test directory entry").path();
-            if path.is_dir() {
-                pending.push(path);
-                continue;
+    for (root_name, minimum) in SCANNED_ROOTS {
+        let root = crate_root.join(root_name);
+        let mut pending = vec![root.clone()];
+        let mut in_this_root = 0usize;
+
+        while let Some(directory) = pending.pop() {
+            let entries = fs::read_dir(&directory)
+                .unwrap_or_else(|err| panic!("read the directory {}: {err}", directory.display()));
+            for entry in entries {
+                let path = entry.expect("read a directory entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|extension| extension != "rs") {
+                    continue;
+                }
+                let name = path
+                    .strip_prefix(&crate_root)
+                    .expect("every scanned path is under the crate root")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let source = fs::read_to_string(&path)
+                    .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+                found.push((name, source));
+                in_this_root += 1;
             }
-            if path.extension().is_none_or(|extension| extension != "rs") {
-                continue;
-            }
-            let name = path
-                .strip_prefix(&root)
-                .expect("every scanned path is under tests/")
-                .to_string_lossy()
-                .replace('\\', "/");
-            let source = fs::read_to_string(&path)
-                .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
-            found.push((name, source));
         }
+
+        assert!(
+            in_this_root >= *minimum,
+            "expected at least {minimum} sources under {}, found {in_this_root} — the scan \
+             is not reaching that tree, so every assertion in this file would pass \
+             vacuously for it",
+            root.display()
+        );
     }
 
-    assert!(
-        found.len() >= MINIMUM_SUITES_SCANNED,
-        "expected at least {MINIMUM_SUITES_SCANNED} test sources under {}, found {} — the \
-         scan is not reaching the test tree, so every assertion in this file would pass \
-         vacuously",
-        root.display(),
-        found.len()
-    );
     found
 }
 
@@ -162,7 +186,10 @@ fn no_unlisted_suite_resolves_the_shared_test_database_url() {
          as well as the happy one. Rows written to the shared database are never cleaned \
          up by anything: that is finding F27, which had accumulated 160 \
          `trusted_jwt_issuers` rows and 42 active `moira:admin` API keys when it was \
-         measured.\n\nIf a suite genuinely cannot use a clone, add it to \
+         measured.\n\nUnder `src/`, use `crate::test_support::test_database()` instead — a \
+         `#[cfg(test)]` module that migrates the shared database applies an unmerged \
+         migration to it and breaks every other checkout's lib tests, which is issue \
+         #77.\n\nIf a file genuinely cannot use a private database, add it to \
          SHARED_DATABASE_ALLOWLIST in this file with the reason."
     );
 }

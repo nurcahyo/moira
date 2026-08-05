@@ -58,7 +58,7 @@
 import "server-only";
 
 import { consoleSessionCheck } from "./auth";
-import { consoleRuntime } from "./auth-runtime";
+import { consoleRuntime, type ConsoleRuntime } from "./auth-runtime";
 import { consoleEnv, type ConsoleEnv } from "./env";
 import { isMoiraRequestError, type MoiraError } from "./errors";
 import type { MoiraClient } from "./moira-client";
@@ -82,6 +82,53 @@ export interface ConsoleApiContext {
 }
 
 export type ConsoleApiHandler = (context: ConsoleApiContext) => Promise<Response>;
+
+/* -------------------------------------------------------------------------- */
+/* Test seam                                                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The three process-wide things a route handler cannot be tested without.
+ *
+ * ============================================================================
+ * WHAT THIS DELIBERATELY DOES **NOT** SUBSTITUTE
+ * ============================================================================
+ *
+ * `consoleSessionCheck`. That is the gate, and a seam that replaced it would
+ * turn every "the handler refuses without a session" test into an assertion
+ * about the stub — green whether or not the handler calls `withConsoleSession`
+ * at all, which is finding F25's exact shape.
+ *
+ * So a test supplies a real `ConsoleAuth` (the same `createConsoleAuth` the
+ * process builds) plus real resolved configs, and the check runs for real
+ * against the request's own headers. A request with no session cookie is a 401
+ * because the shipped code decided so; a request carrying one minted by the
+ * shipped sign-in flow is admitted for the same reason.
+ *
+ * The seam exists because the other three are unreachable in a unit test:
+ * `consoleRuntime()` calls Moira to resolve the configuration, `consoleEnv()`
+ * reads `process.env` and refuses to boot without a database in production, and
+ * `moiraClientForSession` mints a JWT against a live signing key.
+ *
+ * Modelled on `setSetupWindowDependenciesForTests` — same shape, same
+ * `null`-restores-production contract.
+ */
+export interface ConsoleApiDependencies {
+  readonly runtime: () => Promise<ConsoleRuntime>;
+  readonly env: () => ConsoleEnv;
+  readonly clientFor: (
+    env: ConsoleEnv,
+    runtime: Extract<ConsoleRuntime, { ok: true }>,
+    headers: Headers,
+  ) => MoiraClient;
+}
+
+let dependencies: ConsoleApiDependencies | null = null;
+
+/** Install substitutes, or pass `null` to restore the shipped wiring. */
+export function setConsoleApiDependenciesForTests(overrides: ConsoleApiDependencies | null): void {
+  dependencies = overrides;
+}
 
 const NO_STORE = { "cache-control": "no-store" } as const;
 
@@ -126,9 +173,10 @@ export async function withConsoleSession(
   request: Request,
   handler: ConsoleApiHandler,
 ): Promise<Response> {
-  let runtimeState: Awaited<ReturnType<typeof consoleRuntime>>;
+  const wiring = dependencies;
+  let runtimeState: ConsoleRuntime;
   try {
-    runtimeState = await consoleRuntime();
+    runtimeState = await (wiring === null ? consoleRuntime() : wiring.runtime());
   } catch (error) {
     // A Moira outage lands here, because resolving the configuration means
     // calling Moira. Without this catch it escapes as an unhandled rejection and
@@ -143,14 +191,21 @@ export async function withConsoleSession(
     return keyed(503, runtimeState.resolution.problem, runtimeState.resolution.messageKey);
   }
 
+  // THE SESSION CHECK ITSELF IS NEVER SUBSTITUTED. `setConsoleApiDependenciesForTests`
+  // replaces the environment, the runtime and the Moira transport — the three
+  // things a test cannot supply — and deliberately not this line, so a test that
+  // exercises a handler exercises the REAL gate. See that function's header.
   const check = await consoleSessionCheck(runtimeState.auth, runtimeState.configs, request.headers);
   if (!check.ok) {
     const status = check.rejection === "no_session" ? 401 : 403;
     return keyed(status, check.rejection, check.messageKey);
   }
 
-  const env = consoleEnv();
-  const client = moiraClientForSession(env, runtimeState.auth, request.headers);
+  const env = wiring === null ? consoleEnv() : wiring.env();
+  const client =
+    wiring === null
+      ? moiraClientForSession(env, runtimeState.auth, request.headers)
+      : wiring.clientFor(env, runtimeState, request.headers);
 
   try {
     return await handler({ identity: check.identity, client, env });
@@ -184,4 +239,68 @@ export async function readJsonBody(request: Request): Promise<Record<string, unk
 /** A 400 for a body the console itself rejected, keyed like every other refusal. */
 export function badRequest(messageKey: string): Response {
   return keyed(400, "invalid_request", messageKey);
+}
+
+/**
+ * A 404 the CONSOLE decided, for a nested resource that does not belong to the
+ * parent named in the path.
+ *
+ * Distinct from Moira's own 404 on purpose. "This model id exists, but not under
+ * this provider" is a refusal only the console can make — Moira's flat
+ * `POST /provider-models/{id}/disable` would happily act on it — and it is the
+ * check that stops a request body choosing which row a privileged call touches.
+ */
+export function notFound(messageKey: string): Response {
+  return keyed(404, "not_found", messageKey);
+}
+
+/* -------------------------------------------------------------------------- */
+/* "NOT ON PAGE ONE" IS NOT "DOES NOT EXIST" (issue #117)                      */
+/* -------------------------------------------------------------------------- */
+
+/** The shape of any Moira list response, structurally — no import edge needed. */
+interface PagedResponse<T> {
+  readonly data: readonly T[];
+  readonly pagination: { readonly has_more: boolean };
+}
+
+/**
+ * The outcome of looking one row up in a single listed page.
+ *
+ * Three cases, because two of them are not the same answer. `absent` means the
+ * whole list was seen and the row is not in it; `truncated` means the page ran
+ * out first and NOTHING IS KNOWN about the row.
+ */
+export type PageLookup<T> =
+  | { readonly kind: "found"; readonly row: T }
+  | { readonly kind: "absent" }
+  | { readonly kind: "truncated" };
+
+/**
+ * Find one row on a single page, distinguishing a truncated page from an absent
+ * row.
+ *
+ * ============================================================================
+ * WHY THE THIRD CASE EXISTS (issue #117)
+ * ============================================================================
+ *
+ * The ownership lookups behind enable/disable each listed with `LIST_PAGE_LIMIT`
+ * and took `.find(...) ?? null`, so a row on page two was reported as
+ * `not found` — a 404 saying "this model does not belong to this provider" about
+ * a model that does. Fail-closed, and the operator is told something untrue
+ * about their own deployment, on the screen whose entire job is to explain it.
+ *
+ * `lib/llm-settings.ts`'s `findOnPage` already draws this distinction for the
+ * connect chain, and throws to carry the partial progress a chain has made. A
+ * route handler has no progress to carry, so this returns the distinction
+ * instead and each handler chooses its own keyed refusal.
+ *
+ * The right answer to `truncated` is never "act anyway" and never "say it does
+ * not exist" — it is `llm_list_truncated`, which tells the operator the list
+ * outgrew one page.
+ */
+export function lookupOnPage<T>(page: PagedResponse<T>, match: (row: T) => boolean): PageLookup<T> {
+  const hit = page.data.find(match);
+  if (hit !== undefined) return { kind: "found", row: hit };
+  return page.pagination.has_more ? { kind: "truncated" } : { kind: "absent" };
 }

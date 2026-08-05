@@ -215,20 +215,26 @@ struct Walk {
     exhausted: bool,
     /// The `next_cursor` of the final page fetched.
     final_next_cursor: Option<String>,
+    /// The field that identifies a row in this list. `"id"` for every admin list; the
+    /// public lists name theirs differently (`response_id`, `execution_id`) and one of them
+    /// has no `id` field at all, so it is a parameter rather than a constant.
+    id_field: String,
 }
 
 impl Walk {
     fn ids(&self) -> Vec<String> {
         self.rows
             .iter()
-            .map(|row| {
-                row["id"]
-                    .as_str()
-                    .unwrap_or_else(|| panic!("listed row has no string `id`: {row}"))
-                    .to_string()
-            })
+            .map(|row| row_id(row, &self.id_field))
             .collect()
     }
+}
+
+fn row_id(row: &Value, id_field: &str) -> String {
+    row[id_field]
+        .as_str()
+        .unwrap_or_else(|| panic!("listed row has no string `{id_field}`: {row}"))
+        .to_string()
 }
 
 /// Pages through `base_path` until the server reports no more rows, or until every id in
@@ -248,6 +254,18 @@ async fn walk_all(
     consumer_key: Option<&str>,
     limit: usize,
     stop_once_seen: &BTreeSet<String>,
+) -> Walk {
+    walk_all_by(router, base_path, consumer_key, limit, stop_once_seen, "id").await
+}
+
+/// [`walk_all`] for a list whose rows are identified by something other than `id`.
+async fn walk_all_by(
+    router: &Router,
+    base_path: &str,
+    consumer_key: Option<&str>,
+    limit: usize,
+    stop_once_seen: &BTreeSet<String>,
+    id_field: &str,
 ) -> Walk {
     let mut rows: Vec<Value> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -286,10 +304,7 @@ async fn walk_all(
         );
 
         for row in &page {
-            let id = row["id"]
-                .as_str()
-                .unwrap_or_else(|| panic!("listed row has no string `id`: {row}"))
-                .to_string();
+            let id = row_id(row, id_field);
             assert!(
                 seen.insert(id.clone()),
                 "row {id} was returned twice while paging {base_path} (page {pages}) — a \
@@ -313,6 +328,7 @@ async fn walk_all(
                 pages,
                 exhausted: true,
                 final_next_cursor: next_cursor,
+                id_field: id_field.to_string(),
             };
         }
 
@@ -322,6 +338,7 @@ async fn walk_all(
                 pages,
                 exhausted: false,
                 final_next_cursor: next_cursor,
+                id_field: id_field.to_string(),
             };
         }
 
@@ -394,6 +411,9 @@ impl PaginationFixture {
                 MemoryPolicyPutRequest {
                     enabled: Some(true),
                     user_can_list: Some(true),
+                    // Issue #93's memory walk seeds its rows through `POST /v1/memories`,
+                    // which is gated separately from listing them.
+                    manual_memory_enabled: Some(true),
                     ..MemoryPolicyPutRequest::default()
                 },
             )
@@ -414,6 +434,13 @@ impl PaginationFixture {
                         "moira:conversations:read".to_string(),
                         "moira:conversations:write".to_string(),
                         "moira:memories:read".to_string(),
+                        // Issue #93. The four public lists are consumer-key scoped, and the
+                        // memory walk needs to write the rows it then pages through.
+                        "moira:memories:create".to_string(),
+                        "moira:executions:read".to_string(),
+                        "moira:usage:read".to_string(),
+                        "moira:models:read".to_string(),
+                        "moira:routes:read".to_string(),
                     ],
                     expires_at: None,
                 },
@@ -928,6 +955,562 @@ impl PaginationFixture {
         .await
         .expect("read documented RAG document order")
     }
+
+    // -- issue #93: the four public lists ----------------------------------
+    //
+    // All four are scoped to this fixture's application through the consumer key, so each
+    // walk runs out of rows on its own and `exhausted` is asserted rather than a stop set.
+
+    /// One timestamp per row, or one shared timestamp for every row when `tied`.
+    ///
+    /// The tied form is the case the `id` tiebreaker exists for. It is not hypothetical for
+    /// these tables: `usage_records.occurred_at` defaults to `now()`, which is the
+    /// *transaction* timestamp, so a burst of usage rows written together shares one value
+    /// exactly.
+    fn pinned_timestamp(
+        base: chrono::DateTime<Utc>,
+        nth: usize,
+        tied: bool,
+    ) -> chrono::DateTime<Utc> {
+        if tied {
+            base
+        } else {
+            base + ChronoDuration::minutes(nth as i64)
+        }
+    }
+
+    /// `responses` rows, inserted directly.
+    ///
+    /// There is no public write path that produces an execution summary without a live
+    /// provider, and pagination is a property of the read path. Returns the **response**
+    /// ids, because `(created_at, responses.id)` is the key `/v1/executions` orders by —
+    /// `execution_id` is a different column and would page through a different key space.
+    async fn seed_executions(&self, count: usize, tied: bool) -> Vec<Uuid> {
+        let base = Utc::now() + ChronoDuration::days(3_650);
+        let mut ids = Vec::with_capacity(count);
+        for nth in 0..count {
+            let id = sqlx::query_scalar::<_, Uuid>(
+                r#"
+                insert into responses
+                    (execution_id, request_id, application_id, status, created_at,
+                     started_at, completed_at, usage_summary, metadata)
+                values ($1, $2, $3, 'completed', $4, $4, $4, '{}'::jsonb,
+                        jsonb_build_object('suite', 'list_pagination'))
+                returning id
+                "#,
+            )
+            .bind(Uuid::now_v7())
+            .bind(format!("pag-exec-{}-{nth}", self.suffix))
+            .bind(self.inner.application_id)
+            .bind(Self::pinned_timestamp(base, nth, tied))
+            .fetch_one(self.pool())
+            .await
+            .expect("insert pagination response");
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// The order `/v1/executions` documents, as the public `resp_…` identifiers it returns.
+    async fn expected_execution_order(&self, ids: &[Uuid]) -> Vec<String> {
+        sqlx::query_scalar::<_, Uuid>(
+            "select id from responses where id = any($1) order by created_at desc, id desc",
+        )
+        .bind(ids)
+        .fetch_all(self.pool())
+        .await
+        .expect("read documented execution order")
+        .into_iter()
+        .map(|id| format!("resp_{id}"))
+        .collect()
+    }
+
+    /// `usage_records` rows, one per execution so `execution_id` identifies a row uniquely.
+    async fn seed_usage_records(&self, count: usize, tied: bool) -> Vec<Uuid> {
+        let base = Utc::now() + ChronoDuration::days(3_650);
+        let mut ids = Vec::with_capacity(count);
+        for nth in 0..count {
+            let id = sqlx::query_scalar::<_, Uuid>(
+                r#"
+                insert into usage_records
+                    (request_id, execution_id, application_id, input_tokens, output_tokens,
+                     total_tokens, occurred_at, metadata)
+                values ($1, $2, $3, 10, 20, 30, $4,
+                        jsonb_build_object('suite', 'list_pagination'))
+                returning id
+                "#,
+            )
+            .bind(format!("pag-usage-{}-{nth}", self.suffix))
+            .bind(Uuid::now_v7())
+            .bind(self.inner.application_id)
+            .bind(Self::pinned_timestamp(base, nth, tied))
+            .fetch_one(self.pool())
+            .await
+            .expect("insert pagination usage record");
+            ids.push(id);
+        }
+        ids
+    }
+
+    async fn expected_usage_order(&self, ids: &[Uuid]) -> Vec<String> {
+        sqlx::query_scalar::<_, Uuid>(
+            "select execution_id from usage_records where id = any($1) \
+             order by occurred_at desc, id desc",
+        )
+        .bind(ids)
+        .fetch_all(self.pool())
+        .await
+        .expect("read documented usage order")
+        .into_iter()
+        .map(|id| format!("exec_{id}"))
+        .collect()
+    }
+
+    /// A provider, a model under it and an application-scoped routing policy per model.
+    ///
+    /// One provider each: `provider_models` is unique on `(provider_id, model_key)` among
+    /// live rows, and reusing one provider would force distinct model keys for no gain.
+    async fn seed_visible_models(&self, count: usize, tied: bool) -> Vec<Uuid> {
+        let mut ids = Vec::with_capacity(count);
+        for nth in 0..count {
+            let provider_id = self.create_provider(nth).await;
+            let model_id = self.create_provider_model(provider_id, nth).await;
+            self.create_routing_policy(self.inner.route_id, provider_id, model_id, nth)
+                .await;
+            ids.push(model_id);
+        }
+
+        let base = Utc::now() + ChronoDuration::days(3_650);
+        for (nth, id) in ids.iter().enumerate() {
+            sqlx::query("update provider_models set created_at = $2 where id = $1")
+                .bind(id)
+                .bind(Self::pinned_timestamp(base, nth, tied))
+                .execute(self.pool())
+                .await
+                .expect("pin provider model created_at");
+        }
+        ids
+    }
+
+    async fn expected_visible_model_order(&self, ids: &[Uuid]) -> Vec<String> {
+        sqlx::query_scalar::<_, Uuid>(
+            "select id from provider_models where id = any($1) and deleted_at is null \
+             order by created_at desc, id desc",
+        )
+        .bind(ids)
+        .fetch_all(self.pool())
+        .await
+        .expect("read documented visible model order")
+        .into_iter()
+        .map(|id| id.to_string())
+        .collect()
+    }
+
+    /// Routes made visible to a consumer key, which requires an application-scoped routing
+    /// policy on each — a bare `route_definitions` row is invisible to `/v1/routes`.
+    async fn seed_visible_routes(&self, count: usize, tied: bool) -> Vec<Uuid> {
+        let provider_id = self.create_provider(9_000).await;
+        let model_id = self.create_provider_model(provider_id, 9_000).await;
+        let ids = self.seed_route_definitions(count, tied).await;
+        for (nth, route_id) in ids.iter().enumerate() {
+            self.create_routing_policy(*route_id, provider_id, model_id, nth)
+                .await;
+        }
+        ids
+    }
+
+    async fn create_provider(&self, nth: usize) -> Uuid {
+        let created = post(
+            &self.router,
+            "/api/v1/admin/providers",
+            None,
+            json!({
+                "provider_type": "open_ai_compatible",
+                "display_name": format!("Pagination provider {} #{nth}", self.suffix),
+                "metadata": {"suite": "list_pagination"}
+            }),
+        )
+        .await;
+        assert_eq!(
+            created.status,
+            StatusCode::CREATED,
+            "create provider failed: {}",
+            created.body
+        );
+        parse_uuid(&created.body, "provider id")
+    }
+
+    async fn create_provider_model(&self, provider_id: Uuid, nth: usize) -> Uuid {
+        let created = post(
+            &self.router,
+            &format!("/api/v1/admin/providers/{provider_id}/models"),
+            None,
+            json!({
+                "model_key": format!("pag-model-{}-{nth}", self.suffix),
+                "display_name": format!("Pagination model #{nth}"),
+                "capabilities": {"text": true, "streaming": true}
+            }),
+        )
+        .await;
+        assert_eq!(
+            created.status,
+            StatusCode::CREATED,
+            "create provider model failed: {}",
+            created.body
+        );
+        parse_uuid(&created.body, "provider model id")
+    }
+
+    async fn create_routing_policy(
+        &self,
+        route_id: Uuid,
+        provider_id: Uuid,
+        provider_model_id: Uuid,
+        priority: usize,
+    ) {
+        let created = post(
+            &self.router,
+            "/api/v1/admin/routing-policies",
+            None,
+            json!({
+                "application_id": self.inner.application_id,
+                "route_id": route_id,
+                "provider_id": provider_id,
+                "provider_model_id": provider_model_id,
+                "priority": priority as i64,
+                "weight": 1,
+                "metadata": {"suite": "list_pagination"}
+            }),
+        )
+        .await;
+        assert_eq!(
+            created.status,
+            StatusCode::CREATED,
+            "create routing policy failed: {}",
+            created.body
+        );
+    }
+
+    // -- issue #93: the nine admin lists that had no walk test ---------------
+
+    async fn seed_providers(&self, count: usize, tied: bool) -> Vec<Uuid> {
+        let mut ids = Vec::with_capacity(count);
+        for nth in 0..count {
+            ids.push(self.create_provider(nth).await);
+        }
+        self.pin_created_at("providers", &ids, tied).await;
+        ids
+    }
+
+    async fn seed_provider_models(&self, provider_id: Uuid, count: usize, tied: bool) -> Vec<Uuid> {
+        let mut ids = Vec::with_capacity(count);
+        for nth in 0..count {
+            ids.push(self.create_provider_model(provider_id, nth).await);
+        }
+        self.pin_created_at("provider_models", &ids, tied).await;
+        ids
+    }
+
+    /// Provider credentials, either global-scoped (the `/admin/provider-credentials` list)
+    /// or bound to one external user (the `/admin/users/{id}/provider-credentials` list).
+    async fn seed_credentials(
+        &self,
+        provider_id: Uuid,
+        count: usize,
+        external_user_id: Option<&str>,
+        tied: bool,
+    ) -> Vec<Uuid> {
+        let mut ids = Vec::with_capacity(count);
+        for nth in 0..count {
+            let scope = match external_user_id {
+                Some(user) => json!({"type": "user", "external_user_id": user}),
+                None => json!({"type": "global"}),
+            };
+            let created = post(
+                &self.router,
+                "/api/v1/admin/provider-credentials",
+                None,
+                json!({
+                    "provider_id": provider_id,
+                    "credential_type": "api_key",
+                    "scope": scope,
+                    "secret": {"api_key": format!("sk-pagination-{}-{nth}", self.suffix)},
+                    "display_name": format!("Pagination credential {} #{nth}", self.suffix),
+                    "priority": 100,
+                    "metadata": {"suite": "list_pagination"}
+                }),
+            )
+            .await;
+            assert_eq!(
+                created.status,
+                StatusCode::CREATED,
+                "create provider credential failed: {}",
+                created.body
+            );
+            ids.push(parse_uuid(&created.body, "credential id"));
+        }
+        self.pin_created_at("provider_credentials", &ids, tied)
+            .await;
+        ids
+    }
+
+    async fn seed_system_keys(&self, count: usize, tied: bool) -> Vec<Uuid> {
+        let mut ids = Vec::with_capacity(count);
+        for nth in 0..count {
+            let created = post(
+                &self.router,
+                "/api/v1/admin/system-keys",
+                None,
+                json!({
+                    "display_name": format!("Pagination system key {} #{nth}", self.suffix),
+                    "scopes": ["moira:models:read"]
+                }),
+            )
+            .await;
+            assert_eq!(
+                created.status,
+                StatusCode::CREATED,
+                "create system key failed: {}",
+                created.body
+            );
+            ids.push(parse_uuid(&created.body, "system key id"));
+        }
+        self.pin_created_at("system_api_keys", &ids, tied).await;
+        ids
+    }
+
+    async fn seed_consumer_keys(&self, count: usize, tied: bool) -> Vec<Uuid> {
+        let mut ids = Vec::with_capacity(count);
+        for nth in 0..count {
+            let created = post(
+                &self.router,
+                "/api/v1/admin/consumer-keys",
+                None,
+                json!({
+                    "application_id": self.inner.application_id,
+                    "display_name": format!("Pagination consumer key {} #{nth}", self.suffix),
+                    "scopes": ["moira:models:read"]
+                }),
+            )
+            .await;
+            assert_eq!(
+                created.status,
+                StatusCode::CREATED,
+                "create consumer key failed: {}",
+                created.body
+            );
+            ids.push(parse_uuid(&created.body, "consumer key id"));
+        }
+        self.pin_created_at("consumer_api_keys", &ids, tied).await;
+        ids
+    }
+
+    /// Trusted JWT issuers.
+    ///
+    /// `example.com` subdomains are used deliberately: registration re-runs the JWKS URL
+    /// policy, which treats a name that does not resolve as acceptable (availability, not
+    /// security) but refuses anything resolving into denied address space. A loopback URL
+    /// would be refused here even though the fixture allows insecure dev URLs elsewhere.
+    async fn seed_trusted_jwt_issuers(&self, count: usize, tied: bool) -> Vec<Uuid> {
+        let mut ids = Vec::with_capacity(count);
+        for nth in 0..count {
+            let created = post(
+                &self.router,
+                "/api/v1/admin/jwt-issuers",
+                None,
+                json!({
+                    "issuer": format!("https://pag-{}-{nth}.example.com/", self.suffix),
+                    "jwks_url": format!(
+                        "https://pag-{}-{nth}.example.com/.well-known/jwks.json",
+                        self.suffix
+                    ),
+                    "expected_audiences": ["moira"]
+                }),
+            )
+            .await;
+            assert_eq!(
+                created.status,
+                StatusCode::CREATED,
+                "create trusted JWT issuer failed: {}",
+                created.body
+            );
+            ids.push(parse_uuid(&created.body, "trusted JWT issuer id"));
+        }
+        self.pin_created_at("trusted_jwt_issuers", &ids, tied).await;
+        ids
+    }
+
+    async fn seed_rag_collections(&self, count: usize, tied: bool) -> Vec<String> {
+        let mut public_ids = Vec::with_capacity(count);
+        for nth in 0..count {
+            let created = post(
+                &self.router,
+                "/api/v1/admin/rag-collections",
+                None,
+                json!({
+                    "application_id": self.inner.application_id,
+                    "collection_key": format!("pag-collection-{}-{nth}", self.suffix),
+                    "display_name": format!("Pagination collection {} #{nth}", self.suffix),
+                    "visibility": "application",
+                    "metadata": {"suite": "list_pagination"}
+                }),
+            )
+            .await;
+            assert_eq!(
+                created.status,
+                StatusCode::CREATED,
+                "create RAG collection failed: {}",
+                created.body
+            );
+            public_ids.push(
+                created.body["id"]
+                    .as_str()
+                    .expect("collection id")
+                    .to_string(),
+            );
+        }
+
+        let base = Utc::now() + ChronoDuration::days(3_650);
+        for (nth, public_id) in public_ids.iter().enumerate() {
+            sqlx::query("update rag_collections set created_at = $2 where public_id = $1")
+                .bind(public_id)
+                .bind(Self::pinned_timestamp(base, nth, tied))
+                .execute(self.pool())
+                .await
+                .expect("pin RAG collection created_at");
+        }
+        public_ids
+    }
+
+    async fn seed_memories(&self, count: usize, tied: bool) -> Vec<String> {
+        let mut public_ids = Vec::with_capacity(count);
+        for nth in 0..count {
+            let created = post(
+                &self.router,
+                "/api/v1/memories",
+                self.key(),
+                json!({
+                    "type": "fact",
+                    "content": format!("pagination memory {} #{nth}", self.suffix),
+                    "metadata": {"suite": "list_pagination"}
+                }),
+            )
+            .await;
+            assert_eq!(
+                created.status,
+                StatusCode::CREATED,
+                "create memory failed: {}",
+                created.body
+            );
+            public_ids.push(created.body["id"].as_str().expect("memory id").to_string());
+        }
+
+        // `/v1/memories` orders by `updated_at desc, id desc`, and the version trigger
+        // rewrites `updated_at` on every update — so one statement touching several rows
+        // stamps them all with the same transaction timestamp, which is exactly the tie.
+        let mut groups: Vec<Vec<String>> = Vec::new();
+        if tied {
+            for pair in public_ids.chunks(2) {
+                groups.push(pair.to_vec());
+            }
+        } else {
+            for id in &public_ids {
+                groups.push(vec![id.clone()]);
+            }
+        }
+        for group in groups {
+            sqlx::query("update memory_records set metadata = metadata where public_id = any($1)")
+                .bind(&group)
+                .execute(self.pool())
+                .await
+                .expect("stamp memory updated_at");
+        }
+        public_ids
+    }
+
+    async fn expected_memory_order(&self, ids: &[String]) -> Vec<String> {
+        sqlx::query_scalar::<_, String>(
+            "select public_id from memory_records where public_id = any($1) \
+             and deleted_at is null order by updated_at desc, id desc",
+        )
+        .bind(ids)
+        .fetch_all(self.pool())
+        .await
+        .expect("read documented memory order")
+    }
+
+    /// Rewrites `created_at` on rows this fixture just seeded, pushing them to the head of
+    /// the global ordering and — when `tied` — onto one shared timestamp.
+    ///
+    /// The table name is interpolated, which is safe and checked: every caller passes a
+    /// literal from the closed set below, and the ids are bound.
+    async fn pin_created_at(&self, table: &str, ids: &[Uuid], tied: bool) {
+        assert!(
+            [
+                "providers",
+                "provider_models",
+                "provider_credentials",
+                "system_api_keys",
+                "consumer_api_keys",
+                "trusted_jwt_issuers",
+            ]
+            .contains(&table),
+            "{table} is not one of the tables this helper is allowed to touch"
+        );
+        let base = Utc::now() + ChronoDuration::days(3_650);
+        for (nth, id) in ids.iter().enumerate() {
+            sqlx::query(&format!("update {table} set created_at = $2 where id = $1"))
+                .bind(id)
+                .bind(Self::pinned_timestamp(base, nth, tied))
+                .execute(self.pool())
+                .await
+                .unwrap_or_else(|error| panic!("pin {table} created_at: {error}"));
+        }
+    }
+
+    /// The order a global admin list documents, for a table keyed on `created_at`.
+    async fn expected_created_at_order(&self, table: &str, ids: &[Uuid]) -> Vec<String> {
+        let soft_deleted = table != "system_api_keys" && table != "consumer_api_keys";
+        let predicate = if soft_deleted {
+            "and deleted_at is null"
+        } else {
+            ""
+        };
+        sqlx::query_scalar::<_, Uuid>(&format!(
+            "select id from {table} where id = any($1) {predicate} \
+             order by created_at desc, id desc"
+        ))
+        .bind(ids)
+        .fetch_all(self.pool())
+        .await
+        .unwrap_or_else(|error| panic!("read documented {table} order: {error}"))
+        .into_iter()
+        .map(|id| id.to_string())
+        .collect()
+    }
+
+    async fn distinct_created_at(&self, table: &str, ids: &[Uuid]) -> i64 {
+        sqlx::query_scalar::<_, i64>(&format!(
+            "select count(distinct created_at) from {table} where id = any($1)"
+        ))
+        .bind(ids)
+        .fetch_one(self.pool())
+        .await
+        .unwrap_or_else(|error| panic!("count distinct {table} created_at: {error}"))
+    }
+}
+
+/// Reads the created row's `id` out of a create response.
+///
+/// Most admin creates return the record itself; the two key creates wrap it in `resource`
+/// alongside the one-time secret, so both shapes are accepted rather than one of them being
+/// silently read as a missing id.
+fn parse_uuid(body: &Value, what: &str) -> Uuid {
+    let raw = body["id"]
+        .as_str()
+        .or_else(|| body["resource"]["id"].as_str())
+        .unwrap_or_else(|| panic!("{what} is missing from {body}"));
+    Uuid::parse_str(raw).unwrap_or_else(|error| panic!("{what} is not a uuid: {raw} ({error})"))
 }
 
 /// Flips one character of a cursor to a different character from the same base64url
@@ -1596,6 +2179,593 @@ async fn cursor_pointing_past_deleted_rows_returns_an_empty_final_page() {
     );
     assert!(!second.has_more());
     assert_eq!(second.next_cursor(), None);
+
+    fixture.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// Issue #93 — the four public lists
+//
+// Before this change all four advertised a `cursor` and bound it to no SQL. `/v1/executions`
+// and `/v1/usage` accepted the parameter and ignored it, so page two was page one again;
+// `/v1/models` and `/v1/routes` had no `cursor` parameter at all and a hard-coded limit of
+// 200, so row 201 was unreachable and the response said nothing about it. A single-page test
+// passes against every one of those bugs — only a full walk does not.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn public_execution_list_pages_through_the_cursor_it_advertises() {
+    let Some(fixture) = PaginationFixture::new().await else {
+        return;
+    };
+
+    let ids = fixture.seed_executions(7, false).await;
+    let expected = fixture.expected_execution_order(&ids).await;
+    assert_eq!(expected.len(), 7, "all seeded executions must be listable");
+
+    let stop: BTreeSet<String> = expected.iter().cloned().collect();
+    let walk = walk_all_by(
+        &fixture.router,
+        "/api/v1/executions",
+        fixture.key(),
+        2,
+        &stop,
+        "response_id",
+    )
+    .await;
+
+    assert!(walk.pages > 1, "7 executions at limit=2 must span pages");
+    assert!(
+        walk.exhausted,
+        "the list is scoped to this application and must run out of rows"
+    );
+    assert_seeded_order(&walk, &expected, "public executions");
+    assert_eq!(
+        walk.ids().len(),
+        7,
+        "the scoped walk must return exactly the seeded rows and nothing else"
+    );
+
+    let rejected = get(
+        &fixture.router,
+        "/api/v1/executions?cursor=not-a-cursor",
+        fixture.key(),
+    )
+    .await;
+    assert_invalid_cursor(&rejected);
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn public_executions_tied_on_created_at_are_ordered_deterministically_by_id() {
+    let Some(fixture) = PaginationFixture::new().await else {
+        return;
+    };
+
+    // Six responses sharing one `created_at`. A cursor keyed on the timestamp alone has no
+    // defined position inside this group, so a page boundary landing in it returns one row
+    // twice and another never — which is what `walk_all` fails on.
+    let ids = fixture.seed_executions(6, true).await;
+    let distinct = sqlx::query_scalar::<_, i64>(
+        "select count(distinct created_at) from responses where id = any($1)",
+    )
+    .bind(&ids)
+    .fetch_one(fixture.pool())
+    .await
+    .expect("count distinct created_at");
+    assert_eq!(
+        distinct, 1,
+        "the tie test is worthless unless every seeded row shares one timestamp"
+    );
+
+    let expected = fixture.expected_execution_order(&ids).await;
+    let stop: BTreeSet<String> = expected.iter().cloned().collect();
+
+    let first = walk_all_by(
+        &fixture.router,
+        "/api/v1/executions",
+        fixture.key(),
+        2,
+        &stop,
+        "response_id",
+    )
+    .await;
+    assert!(first.pages > 1, "6 tied rows at limit=2 must span pages");
+    assert_seeded_order(&first, &expected, "tied public executions, first walk");
+
+    // Repeating the walk must produce the same sequence, or a caller resuming from a stored
+    // cursor sees a different result set.
+    let second = walk_all_by(
+        &fixture.router,
+        "/api/v1/executions",
+        fixture.key(),
+        2,
+        &stop,
+        "response_id",
+    )
+    .await;
+    assert_seeded_order(&second, &expected, "tied public executions, second walk");
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn public_execution_list_last_page_is_exactly_full_and_reports_no_more() {
+    let Some(fixture) = PaginationFixture::new().await else {
+        return;
+    };
+
+    // Six rows at limit=3: the final page is exactly full. This is the boundary an
+    // over-fetch of `limit + 1` exists to get right — a `has_more` computed from
+    // `rows.len() == limit` instead would claim a further page here and strand the caller on
+    // an empty one, and a `<=` keyset predicate would re-serve the boundary row.
+    let ids = fixture.seed_executions(6, false).await;
+    let expected = fixture.expected_execution_order(&ids).await;
+    let stop: BTreeSet<String> = expected.iter().cloned().collect();
+
+    let walk = walk_all_by(
+        &fixture.router,
+        "/api/v1/executions",
+        fixture.key(),
+        3,
+        &stop,
+        "response_id",
+    )
+    .await;
+
+    assert!(walk.exhausted, "the walk must reach a real last page");
+    assert_eq!(
+        walk.pages, 2,
+        "6 rows at limit=3 is exactly two full pages, not three"
+    );
+    assert!(
+        walk.final_next_cursor.is_none(),
+        "an exactly-full last page must still carry a null next_cursor, got {:?}",
+        walk.final_next_cursor
+    );
+    assert_seeded_order(&walk, &expected, "public executions at an exact boundary");
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn public_usage_list_pages_through_the_cursor_it_advertises() {
+    let Some(fixture) = PaginationFixture::new().await else {
+        return;
+    };
+
+    // `usage_records.occurred_at` defaults to `now()` — the transaction timestamp — so rows
+    // written together really do collide in production. Seeded tied for exactly that reason.
+    let ids = fixture.seed_usage_records(7, true).await;
+    let distinct = sqlx::query_scalar::<_, i64>(
+        "select count(distinct occurred_at) from usage_records where id = any($1)",
+    )
+    .bind(&ids)
+    .fetch_one(fixture.pool())
+    .await
+    .expect("count distinct occurred_at");
+    assert_eq!(
+        distinct, 1,
+        "the tie test is worthless unless every seeded row shares one timestamp"
+    );
+
+    let expected = fixture.expected_usage_order(&ids).await;
+    assert_eq!(expected.len(), 7);
+    let stop: BTreeSet<String> = expected.iter().cloned().collect();
+
+    let walk = walk_all_by(
+        &fixture.router,
+        "/api/v1/usage",
+        fixture.key(),
+        2,
+        &stop,
+        "execution_id",
+    )
+    .await;
+
+    assert!(walk.pages > 1, "7 usage rows at limit=2 must span pages");
+    assert!(walk.exhausted, "the scoped usage list must terminate");
+    assert_seeded_order(&walk, &expected, "public usage");
+
+    let rejected = get(
+        &fixture.router,
+        "/api/v1/usage?cursor=not-a-cursor",
+        fixture.key(),
+    )
+    .await;
+    assert_invalid_cursor(&rejected);
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn public_model_list_pages_through_the_cursor_it_advertises() {
+    let Some(fixture) = PaginationFixture::new().await else {
+        return;
+    };
+
+    let ids = fixture.seed_visible_models(7, false).await;
+    let expected = fixture.expected_visible_model_order(&ids).await;
+    assert_eq!(expected.len(), 7, "all seeded models must be visible");
+    let stop: BTreeSet<String> = expected.iter().cloned().collect();
+
+    let walk = walk_all(&fixture.router, "/api/v1/models", fixture.key(), 2, &stop).await;
+
+    assert!(walk.pages > 1, "7 models at limit=2 must span pages");
+    assert!(walk.exhausted, "the scoped model list must terminate");
+    assert_seeded_order(&walk, &expected, "public models");
+    assert_eq!(
+        walk.ids().len(),
+        7,
+        "the walk must return exactly the visible models and nothing else"
+    );
+
+    // The route used to ignore `limit` entirely — it had no such parameter and passed a
+    // hard-coded 200 — which a walk alone would not notice.
+    let single = get(&fixture.router, "/api/v1/models?limit=3", fixture.key()).await;
+    assert_eq!(single.status, StatusCode::OK, "{}", single.body);
+    assert_eq!(
+        single.rows().len(),
+        3,
+        "the route must honour `limit`: {}",
+        single.body
+    );
+    assert!(single.has_more());
+
+    let rejected = get(
+        &fixture.router,
+        "/api/v1/models?cursor=not-a-cursor",
+        fixture.key(),
+    )
+    .await;
+    assert_invalid_cursor(&rejected);
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn public_route_list_pages_through_the_cursor_it_advertises() {
+    let Some(fixture) = PaginationFixture::new().await else {
+        return;
+    };
+
+    let ids = fixture.seed_visible_routes(7, false).await;
+    let expected = fixture.expected_route_order(&ids).await;
+    assert_eq!(expected.len(), 7, "all seeded routes must be visible");
+    let stop: BTreeSet<String> = expected.iter().cloned().collect();
+
+    let walk = walk_all(&fixture.router, "/api/v1/routes", fixture.key(), 2, &stop).await;
+
+    assert!(walk.pages > 1, "7 routes at limit=2 must span pages");
+    assert!(walk.exhausted, "the scoped route list must terminate");
+    assert_seeded_order(&walk, &expected, "public routes");
+
+    let rejected = get(
+        &fixture.router,
+        "/api/v1/routes?cursor=not-a-cursor",
+        fixture.key(),
+    )
+    .await;
+    assert_invalid_cursor(&rejected);
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_public_cursor_is_refused_by_a_different_public_list() {
+    let Some(fixture) = PaginationFixture::new().await else {
+        return;
+    };
+
+    // `/v1/executions` and `/v1/usage` both page a `(timestamp, uuid)` key over rows keyed
+    // by the same execution, so nothing in the cursor payload distinguishes them — only the
+    // per-endpoint scope mixed into the integrity tag does. Without it this request would
+    // silently return a page of the wrong list rather than a `400`.
+    fixture.seed_executions(3, false).await;
+    fixture.seed_usage_records(3, false).await;
+
+    let executions = get(&fixture.router, "/api/v1/executions?limit=1", fixture.key()).await;
+    assert_eq!(executions.status, StatusCode::OK, "{}", executions.body);
+    let execution_cursor = executions.next_cursor().expect("execution cursor");
+
+    let crossed = get(
+        &fixture.router,
+        &format!("/api/v1/usage?limit=1&cursor={execution_cursor}"),
+        fixture.key(),
+    )
+    .await;
+    assert_invalid_cursor(&crossed);
+
+    // And a tampered cursor from the endpoint that minted it must fail closed too, so the
+    // rejection above is attributable to the scope rather than to blanket refusal.
+    let honest = get(
+        &fixture.router,
+        &format!("/api/v1/executions?limit=1&cursor={execution_cursor}"),
+        fixture.key(),
+    )
+    .await;
+    assert_eq!(
+        honest.status,
+        StatusCode::OK,
+        "an untampered cursor must be accepted: {}",
+        honest.body
+    );
+    let tampered = tamper(&execution_cursor);
+    let rejected = get(
+        &fixture.router,
+        &format!("/api/v1/executions?limit=1&cursor={tampered}"),
+        fixture.key(),
+    )
+    .await;
+    assert_invalid_cursor(&rejected);
+
+    fixture.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// Issue #93 — the nine admin lists that plan 04 fixed but never walked
+//
+// Each of these already ran the shared keyset mechanism; none had a test that proved it end
+// to end over HTTP. `applications`, `routes`, `audit-events`, `conversations`,
+// `rag-collections/{id}/documents` and conversation messages are covered above.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn admin_provider_list_pages_through_the_cursor_it_advertises() {
+    let Some(fixture) = PaginationFixture::new().await else {
+        return;
+    };
+
+    let ids = fixture.seed_providers(7, false).await;
+    let expected = fixture.expected_created_at_order("providers", &ids).await;
+    assert_eq!(expected.len(), 7);
+    let stop: BTreeSet<String> = expected.iter().cloned().collect();
+
+    let walk = walk_all(&fixture.router, "/api/v1/admin/providers", None, 2, &stop).await;
+
+    assert!(walk.pages > 1, "7 providers at limit=2 must span pages");
+    assert_seeded_order(&walk, &expected, "admin providers");
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn admin_provider_model_list_pages_through_the_cursor_it_advertises() {
+    let Some(fixture) = PaginationFixture::new().await else {
+        return;
+    };
+
+    // This list is narrowed by a path parameter, so its keyset predicate carries one fixed
+    // parameter before the cursor — the numbering `KeysetTail` exists to keep straight.
+    let provider_id = fixture.create_provider(0).await;
+    let ids = fixture.seed_provider_models(provider_id, 7, true).await;
+    assert_eq!(
+        fixture.distinct_created_at("provider_models", &ids).await,
+        1,
+        "seeded tied, to exercise the id tiebreaker"
+    );
+
+    let expected = fixture
+        .expected_created_at_order("provider_models", &ids)
+        .await;
+    let stop: BTreeSet<String> = expected.iter().cloned().collect();
+
+    let walk = walk_all(
+        &fixture.router,
+        &format!("/api/v1/admin/providers/{provider_id}/models"),
+        None,
+        2,
+        &stop,
+    )
+    .await;
+
+    assert!(walk.pages > 1, "7 models at limit=2 must span pages");
+    assert!(
+        walk.exhausted,
+        "a list narrowed to one provider must run out of rows"
+    );
+    assert_seeded_order(&walk, &expected, "admin provider models");
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn admin_credential_lists_page_through_the_cursor_they_advertise() {
+    let Some(fixture) = PaginationFixture::new().await else {
+        return;
+    };
+
+    let provider_id = fixture.create_provider(0).await;
+    let external_user_id = format!("pag-user-{}", fixture.suffix);
+    let global = fixture.seed_credentials(provider_id, 7, None, false).await;
+    let per_user = fixture
+        .seed_credentials(provider_id, 7, Some(&external_user_id), false)
+        .await;
+
+    // The global list sees both sets; the per-user list sees only its own.
+    let all: Vec<Uuid> = global.iter().chain(per_user.iter()).copied().collect();
+    let expected_all = fixture
+        .expected_created_at_order("provider_credentials", &all)
+        .await;
+    let stop_all: BTreeSet<String> = expected_all.iter().cloned().collect();
+    let walk = walk_all(
+        &fixture.router,
+        "/api/v1/admin/provider-credentials",
+        None,
+        3,
+        &stop_all,
+    )
+    .await;
+    assert!(walk.pages > 1, "14 credentials at limit=3 must span pages");
+    assert_seeded_order(&walk, &expected_all, "admin provider credentials");
+
+    let expected_user = fixture
+        .expected_created_at_order("provider_credentials", &per_user)
+        .await;
+    let stop_user: BTreeSet<String> = expected_user.iter().cloned().collect();
+    let user_walk = walk_all(
+        &fixture.router,
+        &format!("/api/v1/admin/users/{external_user_id}/provider-credentials"),
+        None,
+        2,
+        &stop_user,
+    )
+    .await;
+    assert!(user_walk.pages > 1, "7 rows at limit=2 must span pages");
+    assert!(
+        user_walk.exhausted,
+        "a list narrowed to one external user must run out of rows"
+    );
+    assert_seeded_order(&user_walk, &expected_user, "admin user credentials");
+    assert_eq!(
+        user_walk.ids().len(),
+        7,
+        "the per-user list must not leak the globally scoped credentials"
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn admin_api_key_lists_page_through_the_cursor_they_advertise() {
+    let Some(fixture) = PaginationFixture::new().await else {
+        return;
+    };
+
+    let system_ids = fixture.seed_system_keys(7, false).await;
+    let expected_system = fixture
+        .expected_created_at_order("system_api_keys", &system_ids)
+        .await;
+    let stop_system: BTreeSet<String> = expected_system.iter().cloned().collect();
+    let system_walk = walk_all(
+        &fixture.router,
+        "/api/v1/admin/system-keys",
+        None,
+        2,
+        &stop_system,
+    )
+    .await;
+    assert!(system_walk.pages > 1, "7 keys at limit=2 must span pages");
+    assert_seeded_order(&system_walk, &expected_system, "admin system keys");
+
+    // Seeded tied: the two key lists share one query builder, and a missing tiebreaker there
+    // would break both.
+    let consumer_ids = fixture.seed_consumer_keys(6, true).await;
+    assert_eq!(
+        fixture
+            .distinct_created_at("consumer_api_keys", &consumer_ids)
+            .await,
+        1,
+        "the tie test is worthless unless every seeded row shares one timestamp"
+    );
+    let expected_consumer = fixture
+        .expected_created_at_order("consumer_api_keys", &consumer_ids)
+        .await;
+    let stop_consumer: BTreeSet<String> = expected_consumer.iter().cloned().collect();
+    let consumer_walk = walk_all(
+        &fixture.router,
+        "/api/v1/admin/consumer-keys",
+        None,
+        2,
+        &stop_consumer,
+    )
+    .await;
+    assert!(
+        consumer_walk.pages > 1,
+        "6 tied rows at limit=2 must span pages"
+    );
+    assert_seeded_order(&consumer_walk, &expected_consumer, "admin consumer keys");
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn admin_trusted_jwt_issuer_list_pages_through_the_cursor_it_advertises() {
+    let Some(fixture) = PaginationFixture::new().await else {
+        return;
+    };
+
+    let ids = fixture.seed_trusted_jwt_issuers(7, false).await;
+    let expected = fixture
+        .expected_created_at_order("trusted_jwt_issuers", &ids)
+        .await;
+    assert_eq!(expected.len(), 7);
+    let stop: BTreeSet<String> = expected.iter().cloned().collect();
+
+    let walk = walk_all(&fixture.router, "/api/v1/admin/jwt-issuers", None, 2, &stop).await;
+
+    assert!(walk.pages > 1, "7 issuers at limit=2 must span pages");
+    assert_seeded_order(&walk, &expected, "admin trusted JWT issuers");
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn admin_rag_collection_list_pages_through_the_cursor_it_advertises() {
+    let Some(fixture) = PaginationFixture::new().await else {
+        return;
+    };
+
+    let ids = fixture.seed_rag_collections(7, false).await;
+    let expected = sqlx::query_scalar::<_, String>(
+        "select public_id from rag_collections where public_id = any($1) \
+         and deleted_at is null order by created_at desc, id desc",
+    )
+    .bind(&ids)
+    .fetch_all(fixture.pool())
+    .await
+    .expect("read documented RAG collection order");
+    assert_eq!(expected.len(), 7);
+    let stop: BTreeSet<String> = expected.iter().cloned().collect();
+
+    let walk = walk_all(
+        &fixture.router,
+        "/api/v1/admin/rag-collections",
+        None,
+        2,
+        &stop,
+    )
+    .await;
+
+    assert!(walk.pages > 1, "7 collections at limit=2 must span pages");
+    assert_seeded_order(&walk, &expected, "admin RAG collections");
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn memory_list_pages_through_the_cursor_it_advertises() {
+    let Some(fixture) = PaginationFixture::new().await else {
+        return;
+    };
+
+    // Three pairs, each pair sharing one `updated_at` written by the production version
+    // trigger rather than by the test — the same tie the conversation walk exercises, on the
+    // other list that pages by `updated_at`.
+    let ids = fixture.seed_memories(6, true).await;
+    let expected = fixture.expected_memory_order(&ids).await;
+    assert_eq!(expected.len(), 6);
+    let distinct = sqlx::query_scalar::<_, i64>(
+        "select count(distinct updated_at) from memory_records where public_id = any($1)",
+    )
+    .bind(&ids)
+    .fetch_one(fixture.pool())
+    .await
+    .expect("count distinct updated_at");
+    assert!(
+        distinct < ids.len() as i64,
+        "the seeded memories must contain at least one timestamp tie, got {distinct} \
+         distinct timestamps for {} rows",
+        ids.len()
+    );
+
+    let stop: BTreeSet<String> = expected.iter().cloned().collect();
+    let walk = walk_all(&fixture.router, "/api/v1/memories", fixture.key(), 2, &stop).await;
+
+    assert!(walk.pages > 1, "6 memories at limit=2 must span pages");
+    assert!(walk.exhausted, "the scoped memory list must terminate");
+    assert_seeded_order(&walk, &expected, "memories");
 
     fixture.cleanup().await;
 }

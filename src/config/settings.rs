@@ -173,6 +173,21 @@ pub struct JwksFetchSettings {
     /// JWKS URLs. MUST stay `false` outside development; `Settings::validate`
     /// hard-fails production when it is `true`.
     pub allow_insecure_dev_urls: bool,
+    /// Hard ceiling on how long a cached JWKS may keep authenticating callers after it
+    /// stopped being refreshable.
+    ///
+    /// The cache serves a last-known-good key set when a refresh fails, so a transient IdP
+    /// outage does not break authentication. Without a ceiling that fallback has no end: an
+    /// IdP that stays unreachable — or a `jwks_url` that has been permanently decommissioned
+    /// — leaves a key set verifying tokens for as long as the process lives. That converts
+    /// key rotation and key *revocation* at the IdP into advisory operations, because the
+    /// retired key keeps being accepted here.
+    ///
+    /// Past this bound the entry is evicted and authentication fails closed rather than on a
+    /// key nobody can vouch for any more. The default trades availability for that bound
+    /// deliberately: 24 hours is far longer than any transient outage the retention exists to
+    /// absorb, and far shorter than "forever".
+    pub max_stale_seconds: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -195,13 +210,56 @@ pub struct CallerAuthSettings {
     pub dev_trust_headers: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// `Debug` is hand-written: `pepper_base64` is the API-key pepper exactly as configured, and
+/// this struct is reachable from `Settings`, which does derive `Debug`. Redacting the hasher
+/// alone would leave the same secret printable one field earlier in its life.
+#[derive(Clone, Deserialize)]
 pub struct ApiKeySettings {
     pub pepper_base64: Option<String>,
     pub pepper_version: String,
     pub allow_insecure_dev_pepper: bool,
     pub prefix_length: usize,
 }
+
+impl std::fmt::Debug for ApiKeySettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiKeySettings")
+            .field(
+                "pepper_base64",
+                &redacted_optional_pepper(&self.pepper_base64),
+            )
+            .field("pepper_version", &self.pepper_version)
+            .field("allow_insecure_dev_pepper", &self.allow_insecure_dev_pepper)
+            .field("prefix_length", &self.prefix_length)
+            .finish()
+    }
+}
+
+/// Renders a configured pepper for `Debug` without disclosing it.
+///
+/// Whether a pepper is *set* is operationally important — the dev-fallback warnings and
+/// `Settings::validate` both turn on it — and is not itself a secret, so `None` and `Some`
+/// stay distinguishable while the value never is. The length is not rendered either: it
+/// bounds a brute force.
+fn redacted_optional_pepper(pepper: &Option<String>) -> &'static str {
+    match pepper {
+        Some(_) => "[redacted]",
+        None => "None",
+    }
+}
+
+/// How long a successfully fetched JWKS stays *fresh*, in seconds.
+///
+/// Lives here rather than in `security::auth` because `Settings::validate` has to reason
+/// about it: `auth.jwks.max_stale_seconds` is a ceiling on *retention past freshness*, so a
+/// ceiling below this constant is not a stricter policy, it is an unenforceable one. The
+/// fresh read path (`JwksCache::fresh`) serves any entry inside this window on a read lock
+/// without consulting the ceiling at all, so an entry aged between `max_stale_seconds` and
+/// this value would keep authenticating callers past the bound an operator thought they set.
+///
+/// `security::auth::JWKS_CACHE_TTL` is derived from this value, and
+/// `the_jwks_freshness_window_matches_the_cache_ttl` fails if the two ever drift apart.
+pub const JWKS_FRESHNESS_SECONDS: u64 = 300;
 
 /// Widest value the idempotency ledger accepts: `idempotency_records.request_hash`,
 /// `idempotency_records.idempotency_key_hash` and every `content_hash` column are
@@ -233,7 +291,10 @@ pub const IDEMPOTENCY_PEPPER_VERSION_MAX_LENGTH: usize =
 /// Mirrors `ApiKeySettings`'s pepper contract exactly. `#[serde(default)]` on the
 /// container so setting only `MOIRA_IDEMPOTENCY__PEPPER_BASE64` is a valid
 /// configuration — the remaining fields fall back to `Default`.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// `Debug` is hand-written for the same reason as [`ApiKeySettings`]: `pepper_base64` is the
+/// idempotency pepper as configured, and `Settings` derives `Debug`.
+#[derive(Clone, Deserialize)]
 #[serde(default)]
 pub struct IdempotencySettings {
     pub pepper_base64: Option<String>,
@@ -273,6 +334,20 @@ pub struct IdempotencySettings {
     /// bounded window documented for pepper rotation. Flipping it back to `true` restores
     /// the old behaviour with no data change.
     pub accept_legacy_hashes: bool,
+}
+
+impl std::fmt::Debug for IdempotencySettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IdempotencySettings")
+            .field(
+                "pepper_base64",
+                &redacted_optional_pepper(&self.pepper_base64),
+            )
+            .field("pepper_version", &self.pepper_version)
+            .field("allow_insecure_dev_pepper", &self.allow_insecure_dev_pepper)
+            .field("accept_legacy_hashes", &self.accept_legacy_hashes)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -333,6 +408,71 @@ pub struct PublicApiSettings {
     pub maximum_schema_bytes: usize,
     pub heartbeat_seconds: u64,
     pub rate_limiter_max_entries: usize,
+    /// SSRF policy for caller-supplied image URLs.
+    ///
+    /// `#[serde(default)]` on [`ImageUrlSettings`] itself, so a config file written
+    /// before this section existed still deserializes into the hardened defaults.
+    #[serde(default)]
+    pub image_urls: ImageUrlSettings,
+}
+
+/// SSRF policy applied to every `input_image.image_url` in a public request.
+///
+/// **This path validates a URL it does not fetch.** The image URL is handed to the
+/// provider (`UserContent::image_url`), and the provider is what performs the request.
+/// That makes the guard *admission control*, not a fetch policy, and it is why this
+/// section has no content-type or response-size knob: there is no response for Moira to
+/// inspect. The controls that survive the hand-off are the address-space rules and the
+/// allow-list.
+///
+/// `#[serde(default)]` on the container so an operator may override one knob without
+/// restating the others.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ImageUrlSettings {
+    /// Budget for resolving a single image hostname.
+    ///
+    /// Tighter than the JWKS budget by default and deliberately so: a JWKS URL is
+    /// admin-configured, resolved behind a singleflight lock and cached, whereas these
+    /// are caller-supplied, uncached, and there can be `maximum_image_count` of them in
+    /// one request.
+    pub dns_timeout_ms: u64,
+    /// Ceiling on the time spent resolving *all* image hosts in one request.
+    ///
+    /// Without it the worst case is `maximum_image_count * dns_timeout_ms`, which turns a
+    /// single request into a cheap way to occupy a connection and a blocking-pool thread
+    /// per image. The JWKS path needs no equivalent because it validates exactly one URL.
+    pub total_validation_timeout_ms: u64,
+    /// Optional egress allow-list of exact hostnames. Empty (the default) means any host
+    /// that passes the address-range rules is accepted.
+    ///
+    /// A deployment that knows which origins its images come from should set this: it is
+    /// the only control that still binds when the provider follows a redirect Moira never
+    /// sees. See `OutboundUrlPolicy::allowed_hosts`.
+    ///
+    /// Matching is on the host alone — not the port or path — and against the URL crate's
+    /// normalised host, so an internationalised domain must be listed in its punycode form
+    /// (`xn--mnchen-3ya.example`, not `münchen.example`). Case is ignored. A subdomain is
+    /// **not** implied by its parent: list every host you intend to permit.
+    pub allowed_hosts: Vec<String>,
+    /// Dev-only escape hatch permitting `http://` and private/loopback/link-local image
+    /// URLs. MUST stay `false` outside development; `Settings::validate` hard-fails
+    /// production when it is `true`.
+    ///
+    /// Separate from `auth.jwks.allow_insecure_dev_urls` on purpose — see
+    /// `OutboundUrlPolicy::allow_insecure`.
+    pub allow_insecure_dev_urls: bool,
+}
+
+impl Default for ImageUrlSettings {
+    fn default() -> Self {
+        Self {
+            dns_timeout_ms: 1_000,
+            total_validation_timeout_ms: 3_000,
+            allowed_hosts: Vec::new(),
+            allow_insecure_dev_urls: false,
+        }
+    }
 }
 
 /// The optional Redis coordination client's configuration.
@@ -526,6 +666,10 @@ impl Settings {
         // random tail is not a tuning choice either.
         self.validate_api_key_prefix(&mut violations);
 
+        // And again: a stale-JWKS ceiling below the freshness window is a bound that cannot
+        // be enforced, because the fresh read path never consults it.
+        self.validate_jwks_stale_ceiling(&mut violations);
+
         // `rag_chunks.chunk_index`, `start_offset` and `end_offset` are all `integer`, and the
         // chunker casts into them. A ceiling at or above `i32::MAX` would make those casts
         // saturate silently, so it is rejected at startup rather than discovered as a chunk
@@ -588,6 +732,9 @@ impl Settings {
         if self.auth.jwks.allow_insecure_dev_urls {
             features.push("insecure_jwks_urls");
         }
+        if self.public_api.image_urls.allow_insecure_dev_urls {
+            features.push("insecure_image_urls");
+        }
         if self.provider_security.allow_http_provider_urls {
             features.push("http_provider_urls");
         }
@@ -630,6 +777,44 @@ impl Settings {
                  so \"{{version}}:{{digest}}\" fits the varchar({IDEMPOTENCY_HASH_MAX_LENGTH}) ledger columns, \
                  got {}",
                 version.len()
+            ));
+        }
+    }
+
+    /// Rejects a stale-JWKS ceiling the cache cannot actually honour.
+    ///
+    /// `max_stale_seconds` bounds how long a key set may keep authenticating callers after it
+    /// stopped being refreshable, and it is the headline control on the unbounded-retention
+    /// finding. Two ways to configure it into meaninglessness are refused at startup rather
+    /// than discovered as keys outliving their revocation:
+    ///
+    /// * **Zero** disables the last-known-good fallback entirely. That is not the fail-closed
+    ///   reading it looks like — it is a different policy (no outage tolerance at all), and an
+    ///   operator who wants it should say so by other means, not by a bound of zero that reads
+    ///   like "no retention allowed" and silently becomes "every transient IdP blip is an
+    ///   outage".
+    /// * **Below [`JWKS_FRESHNESS_SECONDS`]** is worse, because it looks like it tightened the
+    ///   bound and did not. `JwksCache::fresh` serves any entry inside the freshness window on
+    ///   a read lock without ever consulting the ceiling, so an entry aged between the ceiling
+    ///   and the freshness window keeps authenticating callers past the limit that was set.
+    ///   The ceiling only starts to apply once freshness has lapsed, so it has to sit at or
+    ///   above it to mean anything.
+    ///
+    /// No upper bound is imposed: the default is the policy, and an operator who deliberately
+    /// widens the window is making a stated availability trade, not tripping over a default.
+    fn validate_jwks_stale_ceiling(&self, violations: &mut Vec<String>) {
+        let ceiling = self.auth.jwks.max_stale_seconds;
+        if ceiling == 0 {
+            violations.push(
+                "auth.jwks.max_stale_seconds must be greater than zero; a ceiling of zero \
+                 disables the last-known-good fallback rather than bounding it"
+                    .to_string(),
+            );
+        } else if ceiling < JWKS_FRESHNESS_SECONDS {
+            violations.push(format!(
+                "auth.jwks.max_stale_seconds must be at least the JWKS freshness window \
+                 ({JWKS_FRESHNESS_SECONDS}s), or the ceiling is unenforceable: a still-fresh \
+                 cache entry is served without consulting it, got {ceiling}"
             ));
         }
     }
@@ -768,6 +953,12 @@ impl Settings {
         if self.auth.jwks.allow_insecure_dev_urls {
             violations
                 .push("auth.jwks.allow_insecure_dev_urls must be false in production".to_string());
+        }
+        if self.public_api.image_urls.allow_insecure_dev_urls {
+            violations.push(
+                "public_api.image_urls.allow_insecure_dev_urls must be false in production"
+                    .to_string(),
+            );
         }
         if self.workers.enabled {
             violations.push("workers.enabled must be false until workers are implemented".into());
@@ -1037,6 +1228,10 @@ impl Default for JwksFetchSettings {
             // unhardened JWKS fetch is an SSRF primitive, so the escape hatch must
             // be opted into explicitly even in development.
             allow_insecure_dev_urls: false,
+            // 24 hours. See the field doc: long enough that no realistic transient IdP
+            // outage reaches it, short enough that a revoked signing key stops being
+            // honoured within a day even if the IdP never comes back.
+            max_stale_seconds: 86_400,
         }
     }
 }
@@ -1152,6 +1347,7 @@ impl Default for PublicApiSettings {
             maximum_schema_bytes: 64 * 1024,
             heartbeat_seconds: 15,
             rate_limiter_max_entries: 10_000,
+            image_urls: ImageUrlSettings::default(),
         }
     }
 }
@@ -1604,6 +1800,52 @@ mod tests {
         );
     }
 
+    /// The image-URL escape hatch is a *separate* flag from the JWKS one on purpose, so
+    /// production must refuse it on its own account. If the two were ever collapsed into
+    /// one knob this fails, which is the point.
+    #[test]
+    fn production_rejects_allow_insecure_dev_image_urls() {
+        let mut settings = valid_production_settings();
+        settings.public_api.image_urls.allow_insecure_dev_urls = true;
+        assert!(
+            !settings.auth.jwks.allow_insecure_dev_urls,
+            "the JWKS flag stays off, so only the image flag can produce the violation"
+        );
+
+        let error = settings
+            .validate(ProcessMode::Serve)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "public_api.image_urls.allow_insecure_dev_urls must be false in production"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn image_url_settings_defaults_fail_closed() {
+        let settings = ImageUrlSettings::default();
+
+        assert!(
+            !settings.allow_insecure_dev_urls,
+            "the SSRF escape hatch must default to disabled"
+        );
+        assert!(
+            settings.allowed_hosts.is_empty(),
+            "the egress allow-list is opt-in; the address rules carry the default posture"
+        );
+        assert!(
+            settings.dns_timeout_ms > 0 && settings.total_validation_timeout_ms > 0,
+            "a zero budget would make every image URL fail closed on timing alone"
+        );
+        assert!(
+            settings.total_validation_timeout_ms >= settings.dns_timeout_ms,
+            "a request-wide budget below the per-host one would cut short the first lookup"
+        );
+    }
+
     #[test]
     fn jwks_fetch_settings_defaults_fail_closed() {
         let settings = JwksFetchSettings::default();
@@ -1614,10 +1856,72 @@ mod tests {
             !settings.allow_insecure_dev_urls,
             "the SSRF escape hatch must default to disabled"
         );
+        // The headline control of the stale-retention finding, pinned at the value that
+        // actually ships. The eviction test supplies its own short ceiling, so without this
+        // assertion the default could be widened back to "effectively forever" — reopening
+        // the finding — with the whole suite still green.
+        assert_eq!(
+            settings.max_stale_seconds, 86_400,
+            "the stale-JWKS ceiling must default to 24h; a wider default reopens the \
+             unbounded-retention finding, and no other test pins the shipped value"
+        );
+        assert!(
+            settings.max_stale_seconds >= JWKS_FRESHNESS_SECONDS,
+            "the shipped default must itself satisfy the bound Settings::validate imposes"
+        );
         assert_eq!(
             AuthSettings::default().jwks.max_response_bytes,
             settings.max_response_bytes,
             "AuthSettings must embed the shared JwksFetchSettings default"
+        );
+        assert_eq!(
+            AuthSettings::default().jwks.max_stale_seconds,
+            settings.max_stale_seconds,
+            "AuthSettings must embed the shared stale ceiling, not a second default"
+        );
+    }
+
+    /// A stale ceiling below the freshness window is refused, in every environment.
+    ///
+    /// The failure it prevents is a silent one: such a ceiling reads like a *tightening* but
+    /// `JwksCache::fresh` never consults it, so entries younger than the freshness window go
+    /// on authenticating callers past the bound the operator believed they had set.
+    #[test]
+    fn a_stale_jwks_ceiling_below_the_freshness_window_is_refused() {
+        // `Settings::default()` is a development profile, which is the point: this bound is
+        // structural, not production hardening, so it must bite outside production too.
+        let mut settings = Settings::default();
+        settings.auth.jwks.max_stale_seconds = JWKS_FRESHNESS_SECONDS - 1;
+
+        let error = settings
+            .validate(ProcessMode::Serve)
+            .expect_err("a ceiling the fresh read path ignores must not start the process")
+            .to_string();
+        assert!(
+            error.contains("auth.jwks.max_stale_seconds"),
+            "the violation must name the offending key, got: {error}"
+        );
+
+        settings.auth.jwks.max_stale_seconds = JWKS_FRESHNESS_SECONDS;
+        settings
+            .validate(ProcessMode::Serve)
+            .expect("a ceiling exactly at the freshness window is enforceable and allowed");
+    }
+
+    /// A zero ceiling is refused too: it disables the last-known-good fallback rather than
+    /// bounding it, which is a different policy wearing a fail-closed costume.
+    #[test]
+    fn a_zero_stale_jwks_ceiling_is_refused() {
+        let mut settings = Settings::default();
+        settings.auth.jwks.max_stale_seconds = 0;
+
+        let error = settings
+            .validate(ProcessMode::Serve)
+            .expect_err("a zero stale ceiling must not start the process")
+            .to_string();
+        assert!(
+            error.contains("auth.jwks.max_stale_seconds"),
+            "the violation must name the offending key, got: {error}"
         );
     }
 

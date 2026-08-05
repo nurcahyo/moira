@@ -1493,21 +1493,20 @@ mod tests {
         }
     }
 
-    /// Mutual exclusion for the `setup_state` singleton, keyed so that every process
-    /// touching the shared test database agrees on it.
+    /// Mutual exclusion for the `setup_state` singleton.
     ///
     /// PostgreSQL advisory locks are *database*-scoped, which is exactly the scope of the
-    /// problem: `setup_state` is one row per database, and `MOIRA_TEST_DATABASE_URL` is a
-    /// database several test threads — and, under `cargo test --workspace`, several test
-    /// *binaries* — share. A `Mutex` in this module would only serialise the threads of
-    /// one binary, so the lock lives in the database instead.
+    /// problem: `setup_state` is one row per database, and these tests share one database
+    /// across the threads `cargo test` runs them on. A `Mutex` in this module would work
+    /// for threads but not for the `sqlx` sessions the tests open, so the lock lives in
+    /// the database instead.
     ///
-    /// The integration suites take the other established route (`tests/support/mod.rs`
-    /// clones a private database per fixture) and therefore never contend for this key.
-    /// That harness is an integration-test module, not part of the library crate, so it is
-    /// unreachable from a `#[cfg(test)]` module in `src/`; reproducing its
-    /// `CREATE DATABASE … TEMPLATE`, leak-sweeping machinery inside the shipped crate to
-    /// isolate six tests would be far more code than this lock, for the same guarantee.
+    /// **Issue #77 narrowed what this has to protect against, and did not remove it.**
+    /// The database is now private to the test *process*
+    /// (`crate::test_support::test_database`), created and migrated by this binary, so a
+    /// neighbouring worktree's run can no longer touch the singleton. Before that it was
+    /// `MOIRA_TEST_DATABASE_URL` itself — shared by every checkout on the machine — and
+    /// this key was the only thing standing between them.
     const SETUP_STATE_LOCK_KEY: i64 = i64::from_be_bytes(*b"moirastp");
 
     /// Exclusive access to the `setup_state` singleton for the lifetime of one test.
@@ -1558,7 +1557,8 @@ mod tests {
         .expect("reset the setup singleton");
     }
 
-    /// A pool onto the shared test database, plus exclusive access to `setup_state`.
+    /// A pool onto this process's private test database, plus exclusive access to
+    /// `setup_state`.
     ///
     /// # The guard is not optional, and must be bound for the whole test
     ///
@@ -1578,16 +1578,13 @@ mod tests {
     /// singleton exclusively for the test's duration closes it, which is why the lock is
     /// taken here rather than a reset being relied on alone.
     async fn migrated_pool() -> Option<(sqlx::PgPool, SetupStateLock)> {
-        let database_url = std::env::var("MOIRA_TEST_DATABASE_URL").ok()?;
-        let pool = sqlx::PgPool::connect(&database_url)
-            .await
-            .expect("connect the test database");
-        // Before the lock, not under it: `migrate` takes sqlx's own advisory lock, and
-        // acquiring ours first would order the two locks differently in different tests.
-        crate::infra::db::migrate(&pool).await.expect("migrate");
-        let lock = SetupStateLock::acquire(&database_url).await;
-        reset_setup_state(&pool).await;
-        Some((pool, lock))
+        // Already created and migrated once for this process; `test_database` refuses to
+        // run — it does not skip — when no database is configured and the deliberate
+        // opt-out is absent.
+        let database = crate::test_support::test_database().await?;
+        let lock = SetupStateLock::acquire(database.url()).await;
+        reset_setup_state(database.pool()).await;
+        Some((database.pool().clone(), lock))
     }
 
     async fn register_issuer(pool: &sqlx::PgPool, issuer: &str) -> Uuid {
@@ -1634,7 +1631,6 @@ mod tests {
     #[tokio::test]
     async fn a_system_key_claim_is_denied_on_a_fresh_deployment() {
         let Some((pool, _setup_lock)) = migrated_pool().await else {
-            eprintln!("skipping admin identity claim integration: set MOIRA_TEST_DATABASE_URL");
             return;
         };
         let issuer = format!("https://fresh-{}.invalid", Uuid::now_v7().simple());
@@ -1673,7 +1669,6 @@ mod tests {
     #[tokio::test]
     async fn a_system_key_claim_is_denied_when_the_allow_list_is_empty() {
         let Some((pool, _setup_lock)) = migrated_pool().await else {
-            eprintln!("skipping admin identity claim integration: set MOIRA_TEST_DATABASE_URL");
             return;
         };
         let issuer = format!("https://empty-{}.invalid", Uuid::now_v7().simple());
@@ -1714,7 +1709,6 @@ mod tests {
     #[tokio::test]
     async fn a_configured_domain_lets_the_claim_through_and_marks_setup_claimed() {
         let Some((pool, _setup_lock)) = migrated_pool().await else {
-            eprintln!("skipping admin identity claim integration: set MOIRA_TEST_DATABASE_URL");
             return;
         };
         let issuer = format!("https://allowed-{}.invalid", Uuid::now_v7().simple());
@@ -1779,7 +1773,6 @@ mod tests {
     #[tokio::test]
     async fn a_populated_setup_token_is_refused_rather_than_ignored() {
         let Some((pool, _setup_lock)) = migrated_pool().await else {
-            eprintln!("skipping admin identity claim integration: set MOIRA_TEST_DATABASE_URL");
             return;
         };
         let state =
@@ -1804,7 +1797,6 @@ mod tests {
     #[tokio::test]
     async fn a_trusted_jwt_actor_cannot_claim_even_with_admin_scope() {
         let Some((pool, _setup_lock)) = migrated_pool().await else {
-            eprintln!("skipping admin identity claim integration: set MOIRA_TEST_DATABASE_URL");
             return;
         };
         let state =
@@ -1835,7 +1827,6 @@ mod tests {
     #[tokio::test]
     async fn claim_rejects_a_scope_outside_admin_scopes() {
         let Some((pool, _setup_lock)) = migrated_pool().await else {
-            eprintln!("skipping admin identity claim integration: set MOIRA_TEST_DATABASE_URL");
             return;
         };
         let state =

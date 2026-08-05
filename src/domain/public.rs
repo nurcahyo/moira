@@ -421,6 +421,17 @@ pub struct PublicCapabilities {
     pub max_output_tokens: i64,
 }
 
+/// The default page size for every public list, and the ceiling a caller may raise it to.
+///
+/// Same numbers as the admin lists (`PageQuery::limit`), so one convention covers the whole
+/// API rather than one per surface.
+const DEFAULT_PAGE_LIMIT: i64 = 50;
+const MAX_PAGE_LIMIT: i64 = 200;
+
+fn clamp_limit(limit: Option<i64>) -> i64 {
+    limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT)
+}
+
 #[derive(Debug, Clone, Deserialize, Default, IntoParams)]
 #[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
@@ -433,13 +444,17 @@ pub struct UsageQuery {
     pub route_id: Option<Uuid>,
     pub occurred_after: Option<DateTime<Utc>>,
     pub occurred_before: Option<DateTime<Utc>>,
+    /// Opaque `pagination.next_cursor` from a previous response for this same list.
+    /// Rejected with `400 invalid_cursor` if malformed, tampered with, or minted by a
+    /// different list.
     pub cursor: Option<String>,
+    /// Rows per page. Defaults to 50 and is clamped to 1..=200.
     pub limit: Option<i64>,
 }
 
 impl UsageQuery {
     pub fn limit(&self) -> i64 {
-        self.limit.unwrap_or(50).clamp(1, 200)
+        clamp_limit(self.limit)
     }
 }
 
@@ -447,13 +462,46 @@ impl UsageQuery {
 #[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
 pub struct ExecutionQuery {
+    /// Opaque `pagination.next_cursor` from a previous response for this same list.
+    /// Rejected with `400 invalid_cursor` if malformed, tampered with, or minted by a
+    /// different list.
     pub cursor: Option<String>,
+    /// Rows per page. Defaults to 50 and is clamped to 1..=200.
     pub limit: Option<i64>,
 }
 
 impl ExecutionQuery {
     pub fn limit(&self) -> i64 {
-        self.limit.unwrap_or(50).clamp(1, 200)
+        clamp_limit(self.limit)
+    }
+}
+
+/// Pagination for the two discovery lists, `GET /v1/models` and `GET /v1/routes`.
+///
+/// Kept separate from [`ExecutionQuery`], which is field-identical today, because the two
+/// are different contracts: `ExecutionQuery` is where per-execution filters would land, and
+/// sharing one type would silently publish any such filter on the discovery routes as an
+/// accepted-and-ignored parameter — the trap `PageQuery` already documents on the admin
+/// surface.
+///
+/// Before issue #93 these two routes took **no query parameters at all** and their handlers
+/// passed a hard-coded limit of 200, so an application with more visible models than that
+/// had no way to reach the rest and the response said nothing about it.
+#[derive(Debug, Clone, Deserialize, Default, IntoParams)]
+#[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
+pub struct PublicListQuery {
+    /// Opaque `pagination.next_cursor` from a previous response for this same list.
+    /// Rejected with `400 invalid_cursor` if malformed, tampered with, or minted by a
+    /// different list.
+    pub cursor: Option<String>,
+    /// Rows per page. Defaults to 50 and is clamped to 1..=200.
+    pub limit: Option<i64>,
+}
+
+impl PublicListQuery {
+    pub fn limit(&self) -> i64 {
+        clamp_limit(self.limit)
     }
 }
 

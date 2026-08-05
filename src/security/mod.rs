@@ -26,5 +26,7 @@ pub use crypto::{
 pub use idempotency::IdempotencyHasher;
 pub use masking::{mask_plain_secret, mask_secret_value, request_hash, secret_fingerprint};
 pub use ssrf::{
-    JwksDenialReason, JwksFetchError, fetch_jwks_hardened, is_denied_ip, validate_jwks_url,
+    HostResolver, JwksDenialReason, JwksFetchError, OutboundDenialReason, OutboundUrlDenial,
+    OutboundUrlPolicy, SystemResolver, fetch_jwks_hardened, is_denied_ip, validate_jwks_url,
+    validate_outbound_url,
 };

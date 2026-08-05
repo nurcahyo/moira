@@ -18,8 +18,19 @@ use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let mode =
-        ProcessMode::parse(std::env::args().nth(1).as_deref()).context("parse process mode")?;
+    // Triaged against `rust.lang.security.args.args`, which is blocking in CI (see the
+    // `sast` job in .github/workflows/ci.yml). The rule's concern is argv being trusted
+    // for a security decision. It is not, here: argv selects which process mode this
+    // binary runs in, and every privileged path derives its `Actor` and its scopes from
+    // configuration and from the request identity, never from the command line. An
+    // attacker who can set this process's argv already owns the process.
+    //
+    // The argv read gets its own `let` so the suppression lands on the line semgrep
+    // reports: rustfmt splits the combined expression after the `=`, which would push
+    // `std::env::args()` one line down and out of the comment's reach.
+    // nosemgrep: rust.lang.security.args.args
+    let mode_arg = std::env::args().nth(1);
+    let mode = ProcessMode::parse(mode_arg.as_deref()).context("parse process mode")?;
     let settings = Settings::load().context("load settings")?;
     settings.validate(mode).context("validate settings")?;
     // Held for the whole process: the OTLP batch processor buffers spans and
@@ -192,6 +203,11 @@ async fn bootstrap_system_key(settings: Settings) -> anyhow::Result<()> {
 }
 
 async fn execute_test(settings: Settings) -> anyhow::Result<()> {
+    // Triaged against `rust.lang.security.args.args`, as in `main` above. These are the
+    // arguments of the `execute-test` operator subcommand; they choose a route and a
+    // prompt for a diagnostic execution. The `Actor` used for that execution is built
+    // below from fixed values, not from argv.
+    // nosemgrep: rust.lang.security.args.args
     let args = std::env::args().skip(2).collect::<Vec<_>>();
     let request = diagnostic_request_from_args(&args)?;
     let pool = db::connect(&settings.database)

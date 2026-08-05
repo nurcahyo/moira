@@ -13,11 +13,22 @@ dist/
 playwright-report/
 test-results/
 coverage/
+# The setup-wizard e2e fixture's generated TLS material. Regenerated on demand
+# by e2e/support/setup-fixture.ts; a private key never belongs in the tree.
+.setup-e2e/
 
 # env
 .env
 .env.local
 .env.*.local
+# `make env-force` moves the current file aside under this name; it still holds
+# BETTER_AUTH_SECRET and CONSOLE_SECRET_ENCRYPTION_KEY.
+.env.local.bak
+# The in-place edits leave a copy of the same file behind under these suffixes:
+# `scripts/bootstrap-key.sh` uses `sed -i.keytmp`, `make console-db` uses
+# `sed -i.sedtmp`. Both suffixes are required by BSD sed, not optional.
+.env.local.keytmp
+.env.local.sedtmp
 
 # typescript
 *.tsbuildinfo

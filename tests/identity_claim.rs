@@ -93,13 +93,31 @@ struct ConsoleIssuer {
 }
 
 impl ConsoleIssuer {
+    /// The default registration: RS256 only, no audience expectation — the shape the claim
+    /// tests in this file exercise.
     async fn start(pool: &sqlx::PgPool) -> Self {
+        Self::start_with(pool, &["RS256"], &[]).await
+    }
+
+    /// A registration with an explicit algorithm allowlist and audience expectation, for the
+    /// negative tests that have to *vary* them.
+    async fn start_with(
+        pool: &sqlx::PgPool,
+        allowed_algorithms: &[&str],
+        expected_audiences: &[&str],
+    ) -> Self {
+        // The JWK deliberately carries **no** `alg` member. `alg` is optional in a JWK and
+        // plenty of real IdPs omit it, but the reason it matters here is specific: with it
+        // present, a token signed RS384 could be refused merely because the key advertised
+        // RS256, and the algorithm-allowlist test would pass without the allowlist existing.
+        // Omitting it makes the same RSA key verify RS256 and RS384 alike, so the per-issuer
+        // allowlist is the only thing left that can refuse the token — which is the whole
+        // property under test.
         let jwks = json!({
             "keys": [{
                 "kty": "RSA",
                 "kid": TEST_KEY_ID,
                 "use": "sig",
-                "alg": "RS256",
                 "n": TEST_RSA_MODULUS,
                 "e": "AQAB"
             }]
@@ -125,16 +143,64 @@ impl ConsoleIssuer {
             insert into trusted_jwt_issuers (
                 id, issuer, jwks_url, expected_audiences, allowed_algorithms, subject_claim
             )
-            values ($1, $2, $3, '{}', array['RS256'], 'sub')
+            values ($1, $2, $3, $4, $5, 'sub')
             "#,
         )
         .bind(id)
         .bind(&issuer)
         .bind(format!("http://{address}/jwks"))
+        .bind(
+            expected_audiences
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            allowed_algorithms
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>(),
+        )
         .execute(pool)
         .await
         .expect("register the console trusted JWT issuer");
         Self { id, issuer, task }
+    }
+
+    /// Mints a token with an explicit signing algorithm and `aud` claim.
+    ///
+    /// Signed with the same RSA private key regardless of `algorithm`, so the signature is
+    /// genuinely valid under whichever RSA variant is named — a refusal can therefore only
+    /// come from the issuer's registered policy, never from a broken signature.
+    fn token_with(&self, algorithm: Algorithm, audience: Option<&str>) -> String {
+        let mut claims = json!({
+            "iss": self.issuer,
+            "sub": "policy-probe",
+            "exp": chrono::Utc::now().timestamp() + 3600
+        });
+        if let Some(audience) = audience {
+            claims["aud"] = Value::String(audience.to_string());
+        }
+        let mut header = Header::new(algorithm);
+        header.kid = Some(TEST_KEY_ID.to_string());
+        encode(
+            &header,
+            &claims,
+            &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes())
+                .expect("parse test RSA private key"),
+        )
+        .expect("sign test JWT")
+    }
+
+    fn bearer_with(&self, algorithm: Algorithm, audience: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", self.token_with(algorithm, audience))
+                .parse()
+                .expect("authorization header"),
+        );
+        headers
     }
 
     fn token(&self, subject: &str, scopes: &[&str]) -> String {
@@ -344,6 +410,109 @@ fn claim_body(issuer: &str, subject: &str, email: &str) -> Value {
         "email": email,
         "email_verified": true
     })
+}
+
+/// The per-issuer algorithm allowlist, asserted **through the production path**.
+///
+/// `trusted_jwt_validation` has unit coverage, but a unit test on a helper cannot see
+/// whether `authenticate_trusted_jwt_with_issuer` still calls it: replacing that call with a
+/// bare `Validation::new(algorithm)` deletes both the allowlist and the audience binding from
+/// every request Moira serves while leaving those unit tests green. This test fails on that
+/// edit, because it goes in through `/api/v1/admin/setup/claim` over the real router and the
+/// real `trusted_jwt_issuers` row.
+///
+/// The entry point is `AuthService::authenticate_admin`, whose bearer branch *is*
+/// `authenticate_trusted_jwt_with_issuer` — the same call every authenticated admin request
+/// makes, against a real `trusted_jwt_issuers` row and a real JWKS endpoint. A positive
+/// control accompanies each refusal, so neither test can be satisfied by an issuer that
+/// simply rejects everything.
+#[tokio::test]
+async fn a_token_signed_with_an_algorithm_outside_the_issuer_allowlist_is_refused_end_to_end() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    // Registered for RS256 only.
+    let issuer = ConsoleIssuer::start_with(&fixture.pool, &["RS256"], &[]).await;
+
+    // RS384: a real signature, by the same key, under an algorithm this issuer never
+    // allowlisted. The JWK carries no `alg`, so nothing but the allowlist can refuse it.
+    let refused = fixture
+        .state
+        .auth
+        .authenticate_admin(&fixture.pool, &issuer.bearer_with(Algorithm::RS384, None))
+        .await;
+    assert!(
+        refused.is_err(),
+        "a token whose algorithm the issuer never allowlisted must not authenticate; \
+         accepting it means the per-issuer allowlist is no longer consulted on the \
+         production path",
+    );
+
+    // Positive control: same issuer, same key, the allowlisted algorithm.
+    fixture
+        .state
+        .auth
+        .authenticate_admin(&fixture.pool, &issuer.bearer_with(Algorithm::RS256, None))
+        .await
+        .expect(
+            "an allowlisted algorithm must still authenticate — otherwise the refusal above \
+             proves only that this issuer rejects every token",
+        );
+}
+
+/// Audience binding, asserted through the same production path and for the same reason.
+///
+/// An issuer that registers `expected_audiences` is opting into audience binding, so a token
+/// minted for a *different* relying party must not authenticate here. Dropping the
+/// `set_audience` call — or bypassing the helper that makes it — turns every such token into
+/// a valid credential for Moira.
+#[tokio::test]
+async fn a_token_carrying_an_audience_outside_the_issuer_expectation_is_refused_end_to_end() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let issuer = ConsoleIssuer::start_with(&fixture.pool, &["RS256"], &["moira-console"]).await;
+
+    // A token this IdP minted for a different relying party.
+    let refused = fixture
+        .state
+        .auth
+        .authenticate_admin(
+            &fixture.pool,
+            &issuer.bearer_with(Algorithm::RS256, Some("some-other-service")),
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "a token minted for another relying party must not authenticate against Moira; \
+         accepting it means the issuer's audience expectation is no longer bound on the \
+         production path",
+    );
+
+    // A token with no `aud` at all must not slip through an issuer that registered one.
+    let missing = fixture
+        .state
+        .auth
+        .authenticate_admin(&fixture.pool, &issuer.bearer_with(Algorithm::RS256, None))
+        .await;
+    assert!(
+        missing.is_err(),
+        "an issuer that registered an expected audience must refuse a token carrying none",
+    );
+
+    // Positive control: the expected audience authenticates.
+    fixture
+        .state
+        .auth
+        .authenticate_admin(
+            &fixture.pool,
+            &issuer.bearer_with(Algorithm::RS256, Some("moira-console")),
+        )
+        .await
+        .expect(
+            "a token carrying the expected audience must still authenticate — otherwise the \
+             refusals above prove only that this issuer rejects every token",
+        );
 }
 
 #[tokio::test]

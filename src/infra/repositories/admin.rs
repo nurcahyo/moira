@@ -3,7 +3,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
-use sqlx::{PgConnection, PgPool, Postgres, Row, Transaction, postgres::PgArguments, query::Query};
+use sqlx::{PgConnection, PgPool, Postgres, Row, Transaction};
 use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
@@ -26,6 +26,8 @@ use crate::{
     security::EncryptedSecret,
 };
 
+use super::keyset::{KeysetTail, bind_cursor, over_fetch_limit};
+
 #[derive(Debug, Clone)]
 pub struct PgAdminRepository {
     pool: PgPool,
@@ -45,9 +47,17 @@ pub struct PgAdminCommandTransaction {
 ///
 /// `legacy_key_hash` exists because the switch to keyed hashing (P1-1) changed the index
 /// key as well as the compared digest, so a row written before the switch is unreachable by
-/// the new key hash alone. It is `None` once the operator closes the dual-read window
-/// (`idempotency.accept_legacy_hashes = false`), which also removes the extra lookup it
-/// costs on every claim.
+/// the new key hash alone. The caller passes `None` to close that dual-read window, which
+/// also removes the extra lookup it costs on every claim. `idempotency.accept_legacy_hashes`
+/// is the setting that is *meant* to drive that choice, but no production construction site
+/// wires it into `AdminCommandRunner` yet, so on this path the window is currently always
+/// open regardless of configuration — tracked in `TODO.md` and issue #125.
+///
+/// `legacy_actor_fingerprint` exists for the analogous reason on the other index column:
+/// peppering the actor fingerprint changed its spelling, so a claim must be able to address
+/// a pre-deploy row under either one. It is **not** governed by the same switch — the caller
+/// populates it unconditionally, because the two windows opened at different deploys and
+/// close independently. Both legacy values are read-only.
 #[derive(Debug, Clone)]
 pub struct AdminIdempotencyClaim {
     pub record_id: Uuid,
@@ -55,7 +65,10 @@ pub struct AdminIdempotencyClaim {
     pub key_hash: String,
     /// The pre-switch key hash, tried only when `key_hash` misses. Never written.
     pub legacy_key_hash: Option<String>,
+    /// The peppered fingerprint written for a fresh claim and tried first on lookup.
     pub actor_fingerprint: String,
+    /// The pre-pepper, unkeyed fingerprint. Read-only, never written.
+    pub legacy_actor_fingerprint: Option<String>,
     pub operation: String,
     /// The body digest written for a fresh claim.
     pub request_hash: String,
@@ -724,6 +737,15 @@ impl PgAdminCommandTransaction {
         &mut self,
         claim: &AdminIdempotencyClaim,
     ) -> Result<AdminIdempotencyClaimOutcome, AppError> {
+        // NOTE(rolling deploy): this key is derived from the *current* fingerprint, which
+        // changed spelling when the fingerprint was peppered. Two instances on opposite sides
+        // of a rolling deploy therefore derive different keys for the same actor and key, so
+        // they do not exclude each other for the duration of the rollout. The unique index
+        // still bounds the damage, but the two also insert at different index points, so a
+        // duplicate execution is possible in that window. Keying the lock on a
+        // migration-stable value fixes it and is tracked in `TODO.md` — it is a separate
+        // concern from the dual-read below, changes behaviour this suite pins explicitly, and
+        // wants its own change and its own test rather than riding along here.
         let lock_key =
             advisory_lock_key(&claim.key_hash, &claim.actor_fingerprint, &claim.operation);
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -744,39 +766,60 @@ impl PgAdminCommandTransaction {
             sleep(Duration::from_millis(20)).await;
         }
 
-        // Every key hash this claim can reach is swept: an expired pre-switch row must not
-        // be resurrected as a replay by the legacy lookup below.
+        // Every position in the unique index this claim can reach is swept: an expired
+        // pre-switch row must not be resurrected as a replay by the legacy lookups below.
+        // Both index columns have been redefined under deployed rows — the key hash by the
+        // HMAC switch (plan 03, P1-1) and the fingerprint by the pepper — so the sweep is
+        // the cross product of the spellings of each.
         let mut sweep_key_hashes = vec![claim.key_hash.clone()];
         sweep_key_hashes.extend(claim.legacy_key_hash.clone());
+        let mut sweep_fingerprints = vec![claim.actor_fingerprint.clone()];
+        sweep_fingerprints.extend(claim.legacy_actor_fingerprint.clone());
         sqlx::query(
             r#"
             delete from idempotency_records
             where idempotency_key_hash = any($1)
-              and actor_fingerprint = $2
+              and actor_fingerprint = any($2)
               and operation = $3
               and expires_at <= now()
             "#,
         )
         .bind(sweep_key_hashes)
-        .bind(&claim.actor_fingerprint)
+        .bind(&sweep_fingerprints)
         .bind(&claim.operation)
         .execute(self.connection())
         .await?;
 
-        // Dual lookup: the current key hash first, then the pre-switch one — the latter
-        // only while the dual-read window is open, so closing it removes the extra query
-        // (plan 03 finding F4). The advisory lock above is keyed on `claim.key_hash`, which
-        // is identical for every concurrent request carrying the same Idempotency-Key, so
-        // both branches stay serialized.
-        let mut existing = self
-            .load_idempotency(&claim.key_hash, &claim.actor_fingerprint, &claim.operation)
-            .await?;
-        if existing.is_none()
-            && let Some(legacy_key_hash) = &claim.legacy_key_hash
+        // Dual lookup on both index columns: the current spelling of each is tried first, so
+        // a post-deploy row always wins and a legacy hit is only ever *read*. The two windows
+        // close independently, so the query count falls in two steps rather than one: closing
+        // the key-hash window (`legacy_key_hash: None`, plan 03 finding F4) drops the inner
+        // probe, and retiring the fingerprint window drops the outer one. Only when both are
+        // closed does this collapse back to a single query.
+        //
+        // The advisory lock above is keyed on the *current* pair, which is identical for
+        // every concurrent request carrying the same Idempotency-Key and actor — so within
+        // one fingerprint spelling every branch below stays serialized against its peers.
+        // Across a rolling deploy that spelling differs; see the NOTE on the lock key.
+        let mut existing = None;
+        'sweep: for fingerprint in [
+            Some(&claim.actor_fingerprint),
+            claim.legacy_actor_fingerprint.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
         {
-            existing = self
-                .load_idempotency(legacy_key_hash, &claim.actor_fingerprint, &claim.operation)
-                .await?;
+            for key_hash in [Some(&claim.key_hash), claim.legacy_key_hash.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                existing = self
+                    .load_idempotency(key_hash, fingerprint, &claim.operation)
+                    .await?;
+                if existing.is_some() {
+                    break 'sweep;
+                }
+            }
         }
 
         if let Some(record) = existing {
@@ -2444,92 +2487,6 @@ async fn insert_audit_with_connection(
     Ok(())
 }
 
-/// How many rows a list query actually asks Postgres for.
-///
-/// One more than the caller wants. That extra row is the existence proof for `has_more`:
-/// the application layer trims it off and reports `has_more = true` if it was there. It is
-/// what keeps `has_more` from costing a second `count(*)` over the whole table on every
-/// single page.
-fn over_fetch_limit(limit: i64) -> i64 {
-    limit.saturating_add(1)
-}
-
-/// The `order by` / `limit` tail shared by every admin list query, plus the optional
-/// keyset predicate that makes the advertised `cursor` parameter real.
-///
-/// Two things here are load-bearing:
-///
-/// * **Strictly less-than.** Every admin list is ordered descending, so "the page after
-///   this cursor" is the rows whose sort key is strictly *below* it. `<=` would re-emit
-///   the cursor row itself at the top of every page.
-/// * **The `id` tiebreaker.** The comparison is on the row constructor
-///   `(sort_column, id)`, not on `sort_column` alone. Without the `id` leg, rows sharing a
-///   timestamp come back in an unspecified order, and a page boundary landing inside such
-///   a group silently skips or repeats rows — the exact defect P1-4 describes. None of the
-///   nine admin lists had this tiebreaker before plan 04.
-///
-/// `sort_column` is always a literal chosen by the call sites in this file and is never
-/// caller input. The cursor's *values* never reach the SQL text at all: they are bound as
-/// parameters by [`bind_cursor`].
-struct KeysetTail {
-    /// The bare keyset condition, or `None` when the caller asked for the first page.
-    condition: Option<String>,
-    order_and_limit: String,
-}
-
-impl KeysetTail {
-    /// `first_param` is the next unused `$n` after the query's own fixed parameters, so
-    /// the numbering stays correct whether or not a cursor is present.
-    fn new(sort_column: &str, cursor: Option<&ListCursor>, first_param: usize) -> Self {
-        let (condition, limit_param) = match cursor {
-            Some(_) => (
-                Some(format!(
-                    "({sort_column}, id) < (${first_param}::timestamptz, ${}::uuid)",
-                    first_param + 1
-                )),
-                first_param + 2,
-            ),
-            None => (None, first_param),
-        };
-
-        Self {
-            condition,
-            order_and_limit: format!("order by {sort_column} desc, id desc limit ${limit_param}"),
-        }
-    }
-
-    /// The condition as an `and …` clause, for a query that already has a `where`.
-    fn and_clause(&self) -> String {
-        match &self.condition {
-            Some(condition) => format!("and {condition}"),
-            None => String::new(),
-        }
-    }
-
-    /// The condition as a `where …` clause, for a query that has none (`audit_logs`).
-    fn where_clause(&self) -> String {
-        match &self.condition {
-            Some(condition) => format!("where {condition}"),
-            None => String::new(),
-        }
-    }
-}
-
-/// Binds the cursor's two values, in the order [`KeysetTail`] numbered them.
-///
-/// This is the only place a cursor value meets a query, and it is a bind every time. A
-/// forged or malformed cursor has already been rejected by `ListCursor::decode`, and even
-/// a valid one is a typed `DateTime<Utc>` / `Uuid` that cannot reach the SQL text.
-fn bind_cursor<'q>(
-    query: Query<'q, Postgres, PgArguments>,
-    cursor: Option<&ListCursor>,
-) -> Query<'q, Postgres, PgArguments> {
-    match cursor {
-        Some(cursor) => query.bind(cursor.ts).bind(cursor.id),
-        None => query,
-    }
-}
-
 fn credential_select_sql(suffix: &str) -> String {
     format!(
         r#"
@@ -2714,139 +2671,4 @@ async fn lock_and_match_version(
         return Err(version_conflict());
     }
     Ok(current_version)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn cursor() -> ListCursor {
-        ListCursor::new(
-            DateTime::from_timestamp_micros(1_753_401_600_123_456).expect("in-range timestamp"),
-            Uuid::parse_str("018f3a7c-1c2d-7e4f-8a9b-0c1d2e3f4a5b").expect("valid uuid"),
-        )
-    }
-
-    #[test]
-    fn keyset_predicate_is_omitted_when_no_cursor_is_supplied() {
-        let tail = KeysetTail::new("created_at", None, 1);
-
-        assert_eq!(tail.and_clause(), "");
-        assert_eq!(tail.where_clause(), "");
-        // With no cursor, the limit takes the first free parameter slot.
-        assert_eq!(
-            tail.order_and_limit,
-            "order by created_at desc, id desc limit $1"
-        );
-    }
-
-    #[test]
-    fn keyset_predicate_uses_strict_less_than_for_descending_lists() {
-        let tail = KeysetTail::new("created_at", Some(&cursor()), 1);
-
-        assert_eq!(
-            tail.and_clause(),
-            "and (created_at, id) < ($1::timestamptz, $2::uuid)"
-        );
-        // `<=` would re-emit the cursor row at the top of every page.
-        assert!(!tail.and_clause().contains("<="));
-        assert!(!tail.and_clause().contains('>'));
-    }
-
-    #[test]
-    fn keyset_predicate_uses_the_occurred_at_column_for_audit_logs() {
-        // The one admin list whose sort key is not `created_at`, and the one that has to
-        // introduce its own `where`.
-        let tail = KeysetTail::new("occurred_at", Some(&cursor()), 1);
-
-        assert_eq!(
-            tail.where_clause(),
-            "where (occurred_at, id) < ($1::timestamptz, $2::uuid)"
-        );
-        assert_eq!(
-            tail.order_and_limit,
-            "order by occurred_at desc, id desc limit $3"
-        );
-        assert!(!tail.where_clause().contains("created_at"));
-    }
-
-    #[test]
-    fn every_keyset_ordering_carries_the_id_tiebreaker() {
-        // Without `id desc`, rows sharing a timestamp come back in an unspecified order and
-        // a page boundary inside such a group silently skips or repeats them. All nine
-        // admin lists lacked this before plan 04.
-        for column in ["created_at", "occurred_at"] {
-            for cursor in [None, Some(&cursor())] {
-                let tail = KeysetTail::new(column, cursor, 1);
-                assert!(
-                    tail.order_and_limit
-                        .starts_with(&format!("order by {column} desc, id desc limit $")),
-                    "missing id tiebreaker for {column}: {}",
-                    tail.order_and_limit
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn keyset_parameter_numbering_follows_the_querys_own_fixed_parameters() {
-        // `list_provider_models` and `list_user_credentials` each bind one fixed parameter
-        // before the cursor, so the cursor starts at `$2` and the limit lands at `$4`.
-        let tail = KeysetTail::new("created_at", Some(&cursor()), 2);
-        assert_eq!(
-            tail.and_clause(),
-            "and (created_at, id) < ($2::timestamptz, $3::uuid)"
-        );
-        assert_eq!(
-            tail.order_and_limit,
-            "order by created_at desc, id desc limit $4"
-        );
-
-        // …and without a cursor the limit moves up to the slot the cursor would have used.
-        let first_page = KeysetTail::new("created_at", None, 2);
-        assert_eq!(
-            first_page.order_and_limit,
-            "order by created_at desc, id desc limit $2"
-        );
-    }
-
-    #[test]
-    fn keyset_predicate_binds_parameters_and_never_interpolates_values() {
-        // The strongest form of this assertion: two cursors that share no bytes must
-        // produce byte-identical SQL. If any cursor-derived value ever reached the query
-        // text, these would differ.
-        let one = ListCursor::new(
-            DateTime::from_timestamp_micros(1).expect("in-range timestamp"),
-            Uuid::parse_str("ffffffff-ffff-4fff-bfff-ffffffffffff").expect("valid uuid"),
-        );
-        let two = cursor();
-
-        for column in ["created_at", "occurred_at"] {
-            let a = KeysetTail::new(column, Some(&one), 1);
-            let b = KeysetTail::new(column, Some(&two), 1);
-
-            assert_eq!(a.and_clause(), b.and_clause());
-            assert_eq!(a.where_clause(), b.where_clause());
-            assert_eq!(a.order_and_limit, b.order_and_limit);
-
-            // And nothing that looks like a value is present at all — only `$n` holes.
-            let fragment = format!("{} {}", a.where_clause(), a.order_and_limit);
-            for forbidden in ["ffffffff", "018f3a7c", "1753401600", "'", "1970"] {
-                assert!(
-                    !fragment.contains(forbidden),
-                    "cursor-derived literal {forbidden:?} leaked into SQL: {fragment}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn over_fetch_limit_is_limit_plus_one() {
-        assert_eq!(over_fetch_limit(1), 2);
-        assert_eq!(over_fetch_limit(50), 51);
-        assert_eq!(over_fetch_limit(200), 201);
-        // Never panics on a hostile value, and never wraps to a negative limit — Postgres
-        // rejects a negative `LIMIT`, so wrapping would turn a bad input into a 500.
-        assert_eq!(over_fetch_limit(i64::MAX), i64::MAX);
-    }
 }

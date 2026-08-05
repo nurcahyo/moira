@@ -48,6 +48,12 @@ import "server-only";
 
 import { MoiraRequestError, toMoiraError, toTransportError } from "./errors";
 import type {
+  ApiKeyCredentialSecret,
+  ConsoleApiKeyCredentialCreateRequest,
+  CredentialRecord,
+  RotateCredentialRequest,
+} from "./moira-credential-types";
+import type {
   AdminIdentityPatchRequest,
   AdminIdentityRecord,
   AdminInviteCreateRequest,
@@ -60,7 +66,16 @@ import type {
   ConsoleAuthProviderCreateRequest,
   ConsoleClaimAdminIdentityRequest,
   ConsoleTrustedJwtIssuerCreateRequest,
+  ConsoleProviderModelCreateRequest,
   ListResponse,
+  ProviderCreateRequest,
+  ProviderModelRecord,
+  ProviderPatchRequest,
+  ProviderRecord,
+  RouteDefinitionRecord,
+  RoutingPolicyCreateRequest,
+  RoutingPolicyPatchRequest,
+  RoutingPolicyRecord,
   SetupAuthMethodsResponse,
   SetupClaimStatusResponse,
   SetupSignInMethodsResponse,
@@ -391,6 +406,243 @@ export const MOIRA_OPERATIONS = {
     declaresIdempotencyKey: false,
     requiresIfMatch: true,
   }),
+
+  /* ======================================================================== */
+  /* LLM runtime configuration (issue #73)                                    */
+  /* ======================================================================== */
+  //
+  // ORDINARY ADMINISTRATION, NOT SETUP. Every operation below declares the usual
+  // `[bearerAuth, systemKeyAuth, consumerKeyAuth]` triple, i.e. `credential:
+  // "admin"` — none of them is anonymous, and none of them belongs on the
+  // pre-admin bootstrap path the way `claim-status` does. Any console route
+  // handler that reaches them therefore sits behind `withConsoleSession`, the
+  // same gate `app/api/admins/**` uses.
+  //
+  // The three flags on each entry are transcribed from `docs/openapi.json` and
+  // re-derived by `tests/contract/openapi-contract.test.ts` on every run. Two
+  // shapes recur and neither is guessable:
+  //
+  //   create  optional `Idempotency-Key`, no `If-Match`
+  //   mutate  required `If-Match`, no `Idempotency-Key`
+  //
+  // `rotate_credential` is the only operation that declares BOTH, and
+  // `create_provider_model` is the only create that also takes a path parameter.
+
+  listProviders: op({
+    id: "list_providers",
+    method: "GET",
+    path: "/api/v1/admin/providers",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: false,
+  }),
+  createProvider: op({
+    id: "create_provider",
+    method: "POST",
+    path: "/api/v1/admin/providers",
+    credential: "admin",
+    declaresIdempotencyKey: true,
+    requiresIfMatch: false,
+  }),
+  getProvider: op({
+    id: "get_provider",
+    method: "GET",
+    path: "/api/v1/admin/providers/{id}",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: false,
+  }),
+  /**
+   * `PATCH /api/v1/admin/providers/{id}`. `If-Match` required, no key.
+   *
+   * `provider_type` IS NOT IN `ProviderPatchRequest`, and with
+   * `additionalProperties: false` that makes it a flat `400` rather than an
+   * error naming an immutable field — see `assertLlmProviderPatchIsSafe`.
+   */
+  patchProvider: op({
+    id: "patch_provider",
+    method: "PATCH",
+    path: "/api/v1/admin/providers/{id}",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: true,
+  }),
+  enableProvider: op({
+    id: "enable_provider",
+    method: "POST",
+    path: "/api/v1/admin/providers/{id}/enable",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: true,
+  }),
+  disableProvider: op({
+    id: "disable_provider",
+    method: "POST",
+    path: "/api/v1/admin/providers/{id}/disable",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: true,
+  }),
+
+  /**
+   * Models are NESTED under their provider for list and create, and FLAT for
+   * enable and disable. Transcribed, not guessed: the write paths are
+   * `/api/v1/admin/provider-models/{id}/…`, so a caller holding only a model id
+   * needs no provider id to disable it — and a caller holding only a provider id
+   * cannot enumerate models any other way.
+   */
+  listProviderModels: op({
+    id: "list_provider_models",
+    method: "GET",
+    path: "/api/v1/admin/providers/{provider_id}/models",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: false,
+  }),
+  createProviderModel: op({
+    id: "create_provider_model",
+    method: "POST",
+    path: "/api/v1/admin/providers/{provider_id}/models",
+    credential: "admin",
+    declaresIdempotencyKey: true,
+    requiresIfMatch: false,
+  }),
+  enableProviderModel: op({
+    id: "enable_provider_model",
+    method: "POST",
+    path: "/api/v1/admin/provider-models/{id}/enable",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: true,
+  }),
+  disableProviderModel: op({
+    id: "disable_provider_model",
+    method: "POST",
+    path: "/api/v1/admin/provider-models/{id}/disable",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: true,
+  }),
+
+  listProviderCredentials: op({
+    id: "list_credentials",
+    method: "GET",
+    path: "/api/v1/admin/provider-credentials",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: false,
+  }),
+  createProviderCredential: op({
+    id: "create_credential",
+    method: "POST",
+    path: "/api/v1/admin/provider-credentials",
+    credential: "admin",
+    declaresIdempotencyKey: true,
+    requiresIfMatch: false,
+  }),
+  enableProviderCredential: op({
+    id: "enable_credential",
+    method: "POST",
+    path: "/api/v1/admin/provider-credentials/{id}/enable",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: true,
+  }),
+  disableProviderCredential: op({
+    id: "disable_credential",
+    method: "POST",
+    path: "/api/v1/admin/provider-credentials/{id}/disable",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: true,
+  }),
+  /**
+   * `POST .../provider-credentials/{id}/rotate` — the ONLY operation in this
+   * registry declaring a REQUIRED `If-Match` and an optional `Idempotency-Key`
+   * together, which is why it is asserted rather than assumed.
+   *
+   * Both are load-bearing and for different failures: the precondition stops a
+   * rotation from landing on a row somebody has just disabled, and the key stops
+   * a retried request from installing a second replacement key that the first
+   * response never told the operator about.
+   */
+  rotateProviderCredential: op({
+    id: "rotate_credential",
+    method: "POST",
+    path: "/api/v1/admin/provider-credentials/{id}/rotate",
+    credential: "admin",
+    declaresIdempotencyKey: true,
+    requiresIfMatch: true,
+  }),
+
+  /**
+   * Routes are READ-ONLY here, and the omission is the decision.
+   *
+   * `POST /api/v1/admin/routes` exists and is deliberately unregistered:
+   * migration `0005` seeds the `general` route, and the create operation
+   * documents no `409` for a duplicate `route_key`. A console that offered
+   * "create route" would let an operator land a second `general`, after which
+   * routing has two candidate definitions and no documented rule for choosing.
+   * Reading the seeded row and binding policies to it is the whole of what the
+   * settings page needs.
+   */
+  listRoutes: op({
+    id: "list_route_definitions",
+    method: "GET",
+    path: "/api/v1/admin/routes",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: false,
+  }),
+  getRoute: op({
+    id: "get_route_definition",
+    method: "GET",
+    path: "/api/v1/admin/routes/{id}",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: false,
+  }),
+
+  listRoutingPolicies: op({
+    id: "list_routing_policies",
+    method: "GET",
+    path: "/api/v1/admin/routing-policies",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: false,
+  }),
+  createRoutingPolicy: op({
+    id: "create_routing_policy",
+    method: "POST",
+    path: "/api/v1/admin/routing-policies",
+    credential: "admin",
+    declaresIdempotencyKey: true,
+    requiresIfMatch: false,
+  }),
+  patchRoutingPolicy: op({
+    id: "patch_routing_policy",
+    method: "PATCH",
+    path: "/api/v1/admin/routing-policies/{id}",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: true,
+  }),
+  enableRoutingPolicy: op({
+    id: "enable_routing_policy",
+    method: "POST",
+    path: "/api/v1/admin/routing-policies/{id}/enable",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: true,
+  }),
+  disableRoutingPolicy: op({
+    id: "disable_routing_policy",
+    method: "POST",
+    path: "/api/v1/admin/routing-policies/{id}/disable",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: true,
+  }),
 } as const;
 
 export type MoiraOperationName = keyof typeof MOIRA_OPERATIONS;
@@ -405,6 +657,74 @@ export const AUTH_PROVIDER_OPERATION_NAMES = [
   "enableAuthProvider",
   "disableAuthProvider",
 ] as const satisfies readonly MoiraOperationName[];
+
+/**
+ * The collection segment — the fourth path segment of `/api/v1/admin/<here>` —
+ * of every family that makes up LLM runtime configuration.
+ *
+ * Compared as a WHOLE SEGMENT rather than as a string prefix. `providers` and
+ * `provider-models` are different families whose names share a prefix, and
+ * `/api/v1/admin/auth/providers` is a different surface entirely that a naive
+ * `startsWith` on `/api/v1/admin/provider` would swallow.
+ */
+const LLM_CONFIG_COLLECTIONS: ReadonlySet<string> = new Set([
+  "providers",
+  "provider-models",
+  "provider-credentials",
+  "routes",
+  "routing-policies",
+]);
+
+/** The collection segment of a spec path, or `""` if it has none. */
+function collectionSegmentOf(path: string): string {
+  // ["", "api", "v1", "admin", "<collection>", …]
+  const segments = path.split("/");
+  if (segments[1] !== "api" || segments[2] !== "v1" || segments[3] !== "admin") return "";
+  return segments[4] ?? "";
+}
+
+/**
+ * The LLM runtime-configuration surface: the operations an LLM settings page may
+ * reach, named so a test can assert properties of the SET rather than of each
+ * entry — "all of them require a credential", "the routes family is read-only".
+ *
+ * ============================================================================
+ * DERIVED FROM THE REGISTRY, NOT TRANSCRIBED FROM IT (issue #113)
+ * ============================================================================
+ *
+ * This was a hand-maintained array of twenty-two names. It was exact when it was
+ * written and nothing made it stay exact: registering a twenty-third operation
+ * under one of these families left the list silently short, and every set-level
+ * assertion built on it — "every LLM operation requires a credential", in this
+ * file AND in `tests/contract/openapi-contract.test.ts` — then passed by not
+ * looking at the new entry. A list that shrinks its own coverage without failing
+ * is worse than no list.
+ *
+ * Deriving it removes the drift instead of detecting it: membership is now a
+ * consequence of the path an operation is registered at, so a new operation on
+ * one of these families joins the set the moment it exists and inherits every
+ * assertion.
+ *
+ * WHAT REMAINS DELIBERATE, AND WHERE IT IS NOW PINNED. The absences were the
+ * hand-written list's real content, and they are absences from `MOIRA_OPERATIONS`
+ * itself — not from this array — so deriving preserves every one of them:
+ *
+ *   `POST /api/v1/admin/routes`     unregistered; pinned by the "routes family is
+ *                                   READ-ONLY" assertions in the unit and
+ *                                   contract suites, which count GET/GET.
+ *   `DELETE` on every family        unregistered; the console disables instead.
+ *   `PUT .../runtime-policy`        unregistered, and worth naming: it is the one
+ *                                   mutation in Moira's whole admin surface with
+ *                                   an OPTIONAL `If-Match`, which `requiresIfMatch`
+ *                                   cannot express. Pinned by name in
+ *                                   `openapi-contract.test.ts`.
+ *
+ * The type is `readonly MoiraOperationName[]` rather than a literal tuple: a
+ * derived value has no literal type, and the names were never used as literals.
+ */
+export const LLM_CONFIG_OPERATION_NAMES: readonly MoiraOperationName[] = (
+  Object.keys(MOIRA_OPERATIONS) as MoiraOperationName[]
+).filter((name) => LLM_CONFIG_COLLECTIONS.has(collectionSegmentOf(MOIRA_OPERATIONS[name].path)));
 
 /* -------------------------------------------------------------------------- */
 /* Contract errors — the console built a request it is forbidden to build      */
@@ -503,6 +823,255 @@ export function assertTrustedIssuerCreateIsSafe(body: Record<string, unknown>): 
     throw new MoiraClientContractError(
       "the console's trusted JWT issuer must not declare `claim_mapping` — it can carry a scopes mapping",
     );
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* LLM runtime-configuration guards (issue #73)                                */
+/* -------------------------------------------------------------------------- */
+
+/** `ProviderType` values, as a runtime set. Mirrors `#/components/schemas/ProviderType`. */
+const PROVIDER_TYPES: readonly string[] = [
+  "open_ai_compatible",
+  "open_ai",
+  "anthropic",
+  "gemini",
+  "deep_seek",
+  "azure_open_ai",
+  "local",
+  "custom",
+];
+
+/** Provider types whose whole purpose is a caller-supplied endpoint. */
+const BASE_URL_REQUIRED_PROVIDER_TYPES: readonly string[] = ["open_ai_compatible", "local"];
+
+/**
+ * `POST /api/v1/admin/providers` guard.
+ *
+ * - `provider_type` must be one of the eight enum values. It is also IMMUTABLE:
+ *   `ProviderPatchRequest` does not declare it, so a wrong value cannot be
+ *   corrected — only replaced by a new provider and a re-pointed policy.
+ * - `display_name` is schema-required; omitting it is a 400.
+ * - `open_ai_compatible` and `local` REQUIRE a non-empty `base_url`. This is the
+ *   one check here that is not a restatement of the schema, and it is the
+ *   dangerous case: the compatible arm with no base URL does not fail, it falls
+ *   back to the vendor default, so an operator who meant to point at a machine on
+ *   their own network sends prompts to a third party instead. Silent, correct-
+ *   looking, and only visible in someone else's logs.
+ */
+export function assertLlmProviderCreateIsSafe(body: Record<string, unknown>): void {
+  const providerType = body["provider_type"];
+  if (typeof providerType !== "string" || !PROVIDER_TYPES.includes(providerType)) {
+    throw new MoiraClientContractError(
+      "provider create body requires a `provider_type` from the documented enum; it is also " +
+        "immutable (absent from ProviderPatchRequest), so a wrong value cannot be patched later",
+    );
+  }
+  if (typeof body["display_name"] !== "string" || body["display_name"].length === 0) {
+    throw new MoiraClientContractError(
+      "provider create body requires a non-empty `display_name` (schema-required; omitting it is a 400)",
+    );
+  }
+  if (BASE_URL_REQUIRED_PROVIDER_TYPES.includes(providerType)) {
+    const baseUrl = body["base_url"];
+    if (typeof baseUrl !== "string" || baseUrl.length === 0) {
+      throw new MoiraClientContractError(
+        `provider_type \`${providerType}\` requires a non-empty \`base_url\`: without one the ` +
+          "provider silently falls back to the vendor's public API, so a run the operator " +
+          "believed was local leaves their network",
+      );
+    }
+  }
+}
+
+/**
+ * `PATCH /api/v1/admin/providers/{id}` guard.
+ *
+ * `provider_type` is refused here rather than sent. `ProviderPatchRequest` is
+ * `additionalProperties: false` and does not declare the field, so Moira answers
+ * a flat `400` that names nothing — the operator would be shown a generic
+ * validation failure for a request that is not invalid but IMPOSSIBLE.
+ */
+export function assertLlmProviderPatchIsSafe(body: Record<string, unknown>): void {
+  if ("provider_type" in body) {
+    throw new MoiraClientContractError(
+      "`provider_type` is immutable: it is absent from ProviderPatchRequest, and with " +
+        "additionalProperties:false the request is a 400 that names no field. Create a new " +
+        "provider and re-point the routing policy instead.",
+    );
+  }
+}
+
+/**
+ * `POST /api/v1/admin/providers/{provider_id}/models` guard.
+ *
+ * `capabilities` IS OPTIONAL IN THE SCHEMA AND MUST NOT BE OMITTED — the single
+ * most expensive omission on this surface. Absent, it is stored as SQL `null`;
+ * routing's capability filter then matches the row against nothing and the first
+ * completion fails `no_eligible_model`, an error that names neither the model nor
+ * the missing column. `null` is refused for the same reason as absence.
+ *
+ * `model_key` must be non-empty: it is what the provider is actually asked for,
+ * and an empty one produces a 404 from the provider rather than a 400 from Moira.
+ */
+export function assertProviderModelCreateIsSafe(body: Record<string, unknown>): void {
+  if (typeof body["model_key"] !== "string" || body["model_key"].length === 0) {
+    throw new MoiraClientContractError(
+      "provider model create body requires a non-empty `model_key` (schema-required)",
+    );
+  }
+  if (!("capabilities" in body) || body["capabilities"] === null) {
+    throw new MoiraClientContractError(
+      "provider model create body must send `capabilities` explicitly: an omitted or null value " +
+        "is stored as null, matches no capability filter, and surfaces later as an opaque " +
+        "`no_eligible_model` that names neither the model nor the missing field",
+    );
+  }
+}
+
+/**
+ * Build the `api_key` arm of `CredentialSecret` — the ONLY sanctioned way to
+ * construct one.
+ *
+ * ============================================================================
+ * `endpoint` MUST BE ABSENT, NOT NULL (the untagged-union trap)
+ * ============================================================================
+ *
+ * `CredentialSecret` is `#[serde(untagged)]` and two of its arms start with a
+ * required `api_key`: `{ api_key }` and `{ api_key, endpoint? }`. A body of
+ * `{ "api_key": "…", "endpoint": null }` satisfies BOTH, so `oneOf` matches
+ * twice and the request is refused — with a schema-level rejection that names no
+ * field. Sending `endpoint: null` "to be explicit" is therefore the easiest way
+ * to make this endpoint permanently unusable, and it is why this returns a fresh
+ * object literal rather than spreading anything a caller hands in.
+ *
+ * ============================================================================
+ * AN EMPTY KEY IS REFUSED EVEN FOR A KEYLESS ENDPOINT
+ * ============================================================================
+ *
+ * A local vLLM ignores the `Authorization` header entirely, which makes "leave
+ * the key blank" look reasonable. It is not: routing resolves a credential ROW
+ * before it builds any request, and a provider with no active credential fails
+ * `credential_not_found` — an error that reads as "your key is wrong" when the
+ * truth is "there is no key at all". Any non-empty placeholder works; nothing
+ * does not.
+ */
+export function apiKeyCredentialSecret(apiKey: string): ApiKeyCredentialSecret {
+  if (typeof apiKey !== "string" || apiKey.length === 0) {
+    throw new MoiraClientContractError(
+      "the credential secret requires a non-empty `api_key`, including against a keyless " +
+        "endpoint: routing resolves a credential row before it builds a request, and a provider " +
+        "without one fails `credential_not_found`",
+    );
+  }
+  return { api_key: apiKey };
+}
+
+/**
+ * `POST /api/v1/admin/provider-credentials` guard.
+ *
+ * The two properties that are not restatements of the schema:
+ *
+ *   1. `credential_type: "api_key"` REQUIRES the secret to be EXACTLY
+ *      `{ api_key }`. An `endpoint` key — present, even as `null` — makes the
+ *      untagged union ambiguous with the azure arm; see
+ *      `apiKeyCredentialSecret`.
+ *   2. `provider_id` must be a non-empty string that the CALLER has already
+ *      resolved and verified server-side. Nothing here can check that, and
+ *      saying so is the point: a `provider_id` taken straight from a request
+ *      body lets whoever sent it attach a credential to a provider they were
+ *      never shown.
+ */
+export function assertCredentialCreateIsSafe(body: Record<string, unknown>): void {
+  if (typeof body["provider_id"] !== "string" || body["provider_id"].length === 0) {
+    throw new MoiraClientContractError(
+      "credential create body requires a non-empty `provider_id`, resolved and verified " +
+        "server-side — never taken from a request body unchecked",
+    );
+  }
+  const scope = body["scope"];
+  if (typeof scope !== "object" || scope === null || typeof (scope as { type?: unknown }).type !== "string") {
+    throw new MoiraClientContractError(
+      "credential create body requires a `scope` carrying a `type` discriminator " +
+        "(global | tenant | application | user)",
+    );
+  }
+  const credentialType = body["credential_type"];
+  const secret = body["secret"];
+  if (typeof secret !== "object" || secret === null) {
+    throw new MoiraClientContractError("credential create body requires a `secret` object");
+  }
+  if (credentialType === "api_key") {
+    const keys = Object.keys(secret as Record<string, unknown>).sort();
+    if (keys.length !== 1 || keys[0] !== "api_key") {
+      throw new MoiraClientContractError(
+        "an `api_key` credential secret must be exactly `{ api_key }`: CredentialSecret is " +
+          "serde-untagged and `{ api_key, endpoint }` — including `endpoint: null` — matches the " +
+          "azure arm as well, so the request is refused as ambiguous with no field named. " +
+          `Received keys: ${keys.join(", ")}`,
+      );
+    }
+    const apiKey = (secret as { api_key?: unknown }).api_key;
+    if (typeof apiKey !== "string" || apiKey.length === 0) {
+      throw new MoiraClientContractError(
+        "the credential secret requires a non-empty `api_key`, including against a keyless " +
+          "endpoint: a provider with no credential row fails `credential_not_found`",
+      );
+    }
+  }
+}
+
+/**
+ * `POST .../provider-credentials/{id}/rotate` guard — the same secret rules as
+ * create, applied to the replacement key.
+ *
+ * Written as its own function rather than reusing the create guard: the rotate
+ * body has ONE field and carries no `credential_type`, so the arm is inferred
+ * from the secret's own shape. A body with `endpoint` alongside `api_key` is
+ * legitimate here only when the row it rotates is an azure credential, and the
+ * caller — which read that row to obtain the `If-Match` version — is the only
+ * party that knows.
+ */
+export function assertCredentialRotateIsSafe(body: Record<string, unknown>): void {
+  const secret = body["secret"];
+  if (typeof secret !== "object" || secret === null) {
+    throw new MoiraClientContractError("rotate body requires a `secret` object");
+  }
+  const apiKey = (secret as { api_key?: unknown }).api_key;
+  if (apiKey !== undefined && (typeof apiKey !== "string" || apiKey.length === 0)) {
+    throw new MoiraClientContractError(
+      "rotate body requires a non-empty `api_key` when the secret carries one",
+    );
+  }
+  if ("endpoint" in secret && (secret as { endpoint?: unknown }).endpoint === null) {
+    throw new MoiraClientContractError(
+      "`endpoint: null` makes the untagged CredentialSecret ambiguous between the api_key and " +
+        "azure arms — omit the key entirely rather than sending null",
+    );
+  }
+}
+
+/**
+ * `POST /api/v1/admin/routing-policies` guard.
+ *
+ * All three foreign keys are schema-required, and all three decide WHICH
+ * provider live traffic reaches. They must be resolved server-side before this
+ * body is built — the caller's obligation, restated on `createRoutingPolicy`,
+ * because no client-side check can distinguish a verified id from one that
+ * arrived in a request body.
+ *
+ * The operation documents NO 409, so two identical policies on one route are
+ * both stored and both eligible. Deduplicate by listing first.
+ */
+export function assertRoutingPolicyCreateIsSafe(body: Record<string, unknown>): void {
+  for (const field of ["route_id", "provider_id", "provider_model_id"] as const) {
+    const value = body[field];
+    if (typeof value !== "string" || value.length === 0) {
+      throw new MoiraClientContractError(
+        `routing policy create body requires a non-empty \`${field}\`, resolved and verified ` +
+          "server-side: it selects which provider live traffic reaches",
+      );
+    }
   }
 }
 
@@ -874,6 +1443,336 @@ export class MoiraClient {
     return this.#request<AdminIdentityRecord>("deleteAdminIdentity", {
       pathParams: { id },
       idempotencyKey: options.idempotencyKey,
+    });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* LLM providers (issue #73)                                              */
+  /* ---------------------------------------------------------------------- */
+
+  async listProviders(
+    options: {
+      readonly limit?: number;
+      readonly cursor?: string;
+      readonly status?: string;
+      readonly search?: string;
+    } = {},
+  ): Promise<ListResponse<ProviderRecord>> {
+    return this.#request<ListResponse<ProviderRecord>>("listProviders", {
+      query: {
+        limit: options.limit,
+        cursor: options.cursor,
+        status: options.status,
+        search: options.search,
+      },
+    });
+  }
+
+  /**
+   * `POST /api/v1/admin/providers`.
+   *
+   * `idempotencyKey` should be derived from the provider's own identity — its
+   * `(provider_type, base_url)` pair — so a double-submit replays instead of
+   * landing two providers that routing then has to choose between. The operation
+   * documents a 409, unlike routes and routing policies.
+   */
+  async createProvider(
+    body: ProviderCreateRequest,
+    options: { readonly idempotencyKey?: string } = {},
+  ): Promise<ProviderRecord> {
+    assertLlmProviderCreateIsSafe(body as unknown as Record<string, unknown>);
+    return this.#request<ProviderRecord>("createProvider", {
+      body,
+      idempotencyKey: options.idempotencyKey,
+    });
+  }
+
+  async getProvider(id: string): Promise<ProviderRecord> {
+    return this.#request<ProviderRecord>("getProvider", { pathParams: { id } });
+  }
+
+  /** `PATCH .../providers/{id}`. `If-Match` required; `provider_type` refused. */
+  async patchProvider(
+    id: string,
+    body: ProviderPatchRequest,
+    ifMatch: string,
+  ): Promise<ProviderRecord> {
+    assertLlmProviderPatchIsSafe(body as unknown as Record<string, unknown>);
+    return this.#request<ProviderRecord>("patchProvider", {
+      pathParams: { id },
+      body,
+      ifMatch,
+    });
+  }
+
+  /**
+   * `POST .../providers/{id}/enable` — the commit point for a provider.
+   *
+   * `If-Match` and NO `Idempotency-Key`: the spec declares no key here, exactly
+   * as on the auth-provider surface, so retry safety is the precondition plus
+   * `enable` being naturally idempotent. Use `ifMatchFor(record)` — a fabricated
+   * version defeats the only thing stopping this from racing a concurrent patch.
+   */
+  async enableProvider(id: string, ifMatch: string): Promise<ProviderRecord> {
+    return this.#request<ProviderRecord>("enableProvider", { pathParams: { id }, ifMatch });
+  }
+
+  async disableProvider(id: string, ifMatch: string): Promise<ProviderRecord> {
+    return this.#request<ProviderRecord>("disableProvider", { pathParams: { id }, ifMatch });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* Provider models                                                        */
+  /* ---------------------------------------------------------------------- */
+
+  /** `GET .../providers/{provider_id}/models` — nested under the provider. */
+  async listProviderModels(
+    providerId: string,
+    options: { readonly limit?: number; readonly cursor?: string; readonly status?: string } = {},
+  ): Promise<ListResponse<ProviderModelRecord>> {
+    return this.#request<ListResponse<ProviderModelRecord>>("listProviderModels", {
+      pathParams: { provider_id: providerId },
+      query: { limit: options.limit, cursor: options.cursor, status: options.status },
+    });
+  }
+
+  /**
+   * `POST .../providers/{provider_id}/models`.
+   *
+   * The body type requires `capabilities`; the runtime guard re-checks it for
+   * callers that reached here through `any`. Omitting it is the
+   * `no_eligible_model` defect described on `assertProviderModelCreateIsSafe`.
+   */
+  async createProviderModel(
+    providerId: string,
+    body: ConsoleProviderModelCreateRequest,
+    options: { readonly idempotencyKey?: string } = {},
+  ): Promise<ProviderModelRecord> {
+    assertProviderModelCreateIsSafe(body as unknown as Record<string, unknown>);
+    return this.#request<ProviderModelRecord>("createProviderModel", {
+      pathParams: { provider_id: providerId },
+      body,
+      idempotencyKey: options.idempotencyKey,
+    });
+  }
+
+  /** `POST /api/v1/admin/provider-models/{id}/enable` — FLAT, not nested. */
+  async enableProviderModel(id: string, ifMatch: string): Promise<ProviderModelRecord> {
+    return this.#request<ProviderModelRecord>("enableProviderModel", {
+      pathParams: { id },
+      ifMatch,
+    });
+  }
+
+  async disableProviderModel(id: string, ifMatch: string): Promise<ProviderModelRecord> {
+    return this.#request<ProviderModelRecord>("disableProviderModel", {
+      pathParams: { id },
+      ifMatch,
+    });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* Provider credentials — WRITE-ONLY SECRETS                              */
+  /* ---------------------------------------------------------------------- */
+  //
+  // Nothing on this surface returns a raw key: Moira answers with
+  // `CredentialRecord`, whose `masked_secret` is a redaction and whose
+  // `secret_fingerprint` is a hash. The rule that matters is on the way IN — the
+  // plaintext exists on this server for the duration of one request and must not
+  // be logged, echoed into an error, cached, or reflected into a form's default
+  // value. `#request` never logs a body, and these methods add nothing that
+  // would.
+  //
+  // The DTOs live in `lib/moira-credential-types.ts`, which is server-only, so a
+  // client component cannot even name the shapes.
+
+  /**
+   * `GET /api/v1/admin/provider-credentials`, optionally filtered by provider.
+   *
+   * `provider_id` is a documented query parameter on this operation — filtering
+   * server-side rather than listing everything and matching in the console keeps
+   * other providers' credential rows out of this process entirely.
+   */
+  async listProviderCredentials(
+    options: {
+      readonly providerId?: string;
+      readonly limit?: number;
+      readonly cursor?: string;
+      readonly status?: string;
+    } = {},
+  ): Promise<ListResponse<CredentialRecord>> {
+    return this.#request<ListResponse<CredentialRecord>>("listProviderCredentials", {
+      query: {
+        provider_id: options.providerId,
+        limit: options.limit,
+        cursor: options.cursor,
+        status: options.status,
+      },
+    });
+  }
+
+  /**
+   * `POST /api/v1/admin/provider-credentials`.
+   *
+   * CALLER'S OBLIGATION: `body.provider_id` must be an identifier the caller
+   * resolved and verified on the server — never one lifted from a request body.
+   * A privileged write whose target is chosen by the browser is a privileged
+   * write the browser controls, and no check inside this client can tell a
+   * verified id from an unverified one.
+   *
+   * Build `body.secret` with `apiKeyCredentialSecret()`. Assembling the object
+   * by hand is how `endpoint: null` gets in, which makes the untagged union
+   * ambiguous and the request permanently refused.
+   */
+  async createProviderCredential(
+    body: ConsoleApiKeyCredentialCreateRequest,
+    options: { readonly idempotencyKey?: string } = {},
+  ): Promise<CredentialRecord> {
+    assertCredentialCreateIsSafe(body as unknown as Record<string, unknown>);
+    return this.#request<CredentialRecord>("createProviderCredential", {
+      body,
+      idempotencyKey: options.idempotencyKey,
+    });
+  }
+
+  async enableProviderCredential(id: string, ifMatch: string): Promise<CredentialRecord> {
+    return this.#request<CredentialRecord>("enableProviderCredential", {
+      pathParams: { id },
+      ifMatch,
+    });
+  }
+
+  async disableProviderCredential(id: string, ifMatch: string): Promise<CredentialRecord> {
+    return this.#request<CredentialRecord>("disableProviderCredential", {
+      pathParams: { id },
+      ifMatch,
+    });
+  }
+
+  /**
+   * `POST .../provider-credentials/{id}/rotate` — replace the stored key in
+   * place, keeping the row id and every policy bound to it.
+   *
+   * The only operation here that carries BOTH a required `If-Match` and an
+   * optional `Idempotency-Key`, and both are used: the precondition refuses a
+   * rotation onto a row that changed under the operator, and the key stops a
+   * retry from installing a second replacement whose value nothing reported.
+   */
+  async rotateProviderCredential(
+    id: string,
+    body: RotateCredentialRequest,
+    ifMatch: string,
+    options: { readonly idempotencyKey?: string } = {},
+  ): Promise<CredentialRecord> {
+    assertCredentialRotateIsSafe(body as unknown as Record<string, unknown>);
+    return this.#request<CredentialRecord>("rotateProviderCredential", {
+      pathParams: { id },
+      body,
+      ifMatch,
+      idempotencyKey: options.idempotencyKey,
+    });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* Routes — READ ONLY                                                     */
+  /* ---------------------------------------------------------------------- */
+
+  async listRoutes(
+    options: { readonly limit?: number; readonly cursor?: string; readonly status?: string } = {},
+  ): Promise<ListResponse<RouteDefinitionRecord>> {
+    return this.#request<ListResponse<RouteDefinitionRecord>>("listRoutes", {
+      query: { limit: options.limit, cursor: options.cursor, status: options.status },
+    });
+  }
+
+  async getRoute(id: string): Promise<RouteDefinitionRecord> {
+    return this.#request<RouteDefinitionRecord>("getRoute", { pathParams: { id } });
+  }
+
+  /**
+   * Exact-match lookup by `route_key`, paging the list.
+   *
+   * The same shape as `findTrustedJwtIssuerByIssuer`, and for the same reason:
+   * `?search=` has matching semantics that are not part of this console's
+   * contract, and binding a routing policy to a prefix-matched route would look
+   * like it worked. The `general` route is seeded by migration `0005`, so this
+   * returning `null` means the deployment is not migrated — not that the console
+   * should create one.
+   */
+  async findRouteByKey(routeKey: string): Promise<RouteDefinitionRecord | null> {
+    let cursor: string | undefined;
+    // Bounded so a paging bug cannot spin forever behind a settings page.
+    for (let page = 0; page < 50; page += 1) {
+      const response: ListResponse<RouteDefinitionRecord> = await this.listRoutes(
+        cursor === undefined ? { limit: 100 } : { limit: 100, cursor },
+      );
+      const match = response.data.find((row) => row.route_key === routeKey);
+      if (match !== undefined) return match;
+      if (!response.pagination.has_more) return null;
+      const next = response.pagination.next_cursor;
+      if (next === null || next === undefined || next === "") return null;
+      cursor = next;
+    }
+    return null;
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* Routing policies                                                       */
+  /* ---------------------------------------------------------------------- */
+
+  async listRoutingPolicies(
+    options: { readonly limit?: number; readonly cursor?: string; readonly status?: string } = {},
+  ): Promise<ListResponse<RoutingPolicyRecord>> {
+    return this.#request<ListResponse<RoutingPolicyRecord>>("listRoutingPolicies", {
+      query: { limit: options.limit, cursor: options.cursor, status: options.status },
+    });
+  }
+
+  /**
+   * `POST /api/v1/admin/routing-policies`.
+   *
+   * CALLER'S OBLIGATION, as on `createProviderCredential`: `route_id`,
+   * `provider_id` and `provider_model_id` must all be server-resolved. Together
+   * they decide which provider live traffic reaches.
+   *
+   * NO DOCUMENTED 409. Two identical policies on one route are both stored and
+   * both eligible, so dedupe by listing first — there is no uniqueness
+   * constraint to lean on and no error to catch.
+   */
+  async createRoutingPolicy(
+    body: RoutingPolicyCreateRequest,
+    options: { readonly idempotencyKey?: string } = {},
+  ): Promise<RoutingPolicyRecord> {
+    assertRoutingPolicyCreateIsSafe(body as unknown as Record<string, unknown>);
+    return this.#request<RoutingPolicyRecord>("createRoutingPolicy", {
+      body,
+      idempotencyKey: options.idempotencyKey,
+    });
+  }
+
+  async patchRoutingPolicy(
+    id: string,
+    body: RoutingPolicyPatchRequest,
+    ifMatch: string,
+  ): Promise<RoutingPolicyRecord> {
+    return this.#request<RoutingPolicyRecord>("patchRoutingPolicy", {
+      pathParams: { id },
+      body,
+      ifMatch,
+    });
+  }
+
+  async enableRoutingPolicy(id: string, ifMatch: string): Promise<RoutingPolicyRecord> {
+    return this.#request<RoutingPolicyRecord>("enableRoutingPolicy", {
+      pathParams: { id },
+      ifMatch,
+    });
+  }
+
+  async disableRoutingPolicy(id: string, ifMatch: string): Promise<RoutingPolicyRecord> {
+    return this.#request<RoutingPolicyRecord>("disableRoutingPolicy", {
+      pathParams: { id },
+      ifMatch,
     });
   }
 

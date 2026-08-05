@@ -45,6 +45,7 @@
 //   console.expiry.*  invitation lifetimes (the ExpiryPicker molecule)
 //   console.admins.*  the /admins screen — grants, invitations, ownership
 //   console.invite.*  the public /invite/[token] redemption page
+//   console.llm.*     the /settings/llm screen — providers, models, routing
 
 /* -------------------------------------------------------------------------- */
 /* The table                                                                  */
@@ -84,8 +85,35 @@ export const CONSOLE_MESSAGE_KEYS = {
   /* --- lib/setup-flow.ts -------------------------------------------------- */
   trusted_jwt_issuer_registration_failed: "console.error.trusted_jwt_issuer_registration_failed",
   auth_provider_create_failed: "console.error.auth_provider_create_failed",
+  auth_provider_update_failed: "console.error.auth_provider_update_failed",
   auth_provider_secret_write_failed: "console.error.auth_provider_secret_write_failed",
   auth_provider_enable_failed: "console.error.auth_provider_enable_failed",
+
+  /* --- lib/setup-window.ts + app/api/setup/route.ts (the BFF setup door) ---
+         Refusals the CONSOLE decided, before or instead of a Moira request.
+         Wizard UI copy is NOT here — it belongs to the setup-wizard-ui item. */
+  setup_system_key_absent: "console.error.setup_system_key_absent",
+  setup_already_claimed: "console.error.setup_already_claimed",
+  setup_request_body_invalid: "console.error.setup_request_body_invalid",
+  setup_action_unknown: "console.error.setup_action_unknown",
+  setup_method_unsupported: "console.error.setup_method_unsupported",
+  setup_display_name_required: "console.error.setup_display_name_required",
+  setup_client_id_required: "console.error.setup_client_id_required",
+  setup_client_secret_required: "console.error.setup_client_secret_required",
+  setup_issuer_or_discovery_required: "console.error.setup_issuer_or_discovery_required",
+  setup_allowed_email_domains_required: "console.error.setup_allowed_email_domains_required",
+  setup_provider_slug_invalid: "console.error.setup_provider_slug_invalid",
+  setup_resume_state_invalid: "console.error.setup_resume_state_invalid",
+  setup_resume_state_conflict: "console.error.setup_resume_state_conflict",
+  setup_ordering_violated: "console.error.setup_ordering_violated",
+  setup_claim_step_unreachable: "console.error.setup_claim_step_unreachable",
+  setup_email_not_verified: "console.error.setup_email_not_verified",
+  setup_claim_domain_not_allowed: "console.error.setup_claim_domain_not_allowed",
+  setup_claim_issuer_mismatch: "console.error.setup_claim_issuer_mismatch",
+  setup_enabled_provider_requires_session: "console.error.setup_enabled_provider_requires_session",
+  setup_enabled_provider_session_mismatch: "console.error.setup_enabled_provider_session_mismatch",
+  setup_single_enabled_provider_only: "console.error.setup_single_enabled_provider_only",
+  setup_provider_enabled_mid_save: "console.error.setup_provider_enabled_mid_save",
 
   /* --- accessibility ------------------------------------------------------ */
   a11y_loading: "console.a11y.loading",
@@ -206,6 +234,61 @@ export const CONSOLE_MESSAGE_KEYS = {
   invite_domain_not_allowed: "console.invite.domain_not_allowed",
   invite_already_claimed: "console.invite.already_claimed",
 
+  /* --- the /setup wizard (modules/setup/** + app/setup/**) -----------------
+         The ONE item that owns the `console.setup.*` namespace. The BFF setup
+         door owns only `console.error.setup_*` above — wizard UI copy is here. */
+  setup_page_title: "console.setup.page_title",
+  setup_unavailable_heading: "console.setup.unavailable_heading",
+  setup_steps_label: "console.setup.steps_label",
+  setup_step_welcome: "console.setup.step_welcome",
+  setup_step_auth_settings: "console.setup.step_auth_settings",
+  setup_step_sign_in: "console.setup.step_sign_in",
+  setup_step_claim: "console.setup.step_claim",
+  setup_step_done: "console.setup.step_done",
+  setup_welcome_heading: "console.setup.welcome_heading",
+  setup_welcome_claim_once: "console.setup.welcome_claim_once",
+  setup_welcome_provider_first: "console.setup.welcome_provider_first",
+  setup_welcome_continue: "console.setup.welcome_continue",
+  setup_auth_heading: "console.setup.auth_heading",
+  setup_auth_existing_heading: "console.setup.auth_existing_heading",
+  setup_auth_existing_configured: "console.setup.auth_existing_configured",
+  setup_auth_method_label: "console.setup.auth_method_label",
+  setup_auth_method_google: "console.setup.auth_method_google",
+  setup_auth_method_generic: "console.setup.auth_method_generic",
+  setup_auth_slug_label: "console.setup.auth_slug_label",
+  setup_auth_slug_hint: "console.setup.auth_slug_hint",
+  setup_auth_display_name_label: "console.setup.auth_display_name_label",
+  setup_auth_client_id_label: "console.setup.auth_client_id_label",
+  setup_auth_client_secret_label: "console.setup.auth_client_secret_label",
+  setup_auth_client_secret_hint: "console.setup.auth_client_secret_hint",
+  setup_auth_discovery_url_label: "console.setup.auth_discovery_url_label",
+  setup_auth_issuer_label: "console.setup.auth_issuer_label",
+  setup_auth_authorization_url_label: "console.setup.auth_authorization_url_label",
+  setup_auth_token_url_label: "console.setup.auth_token_url_label",
+  setup_auth_allowed_domains_label: "console.setup.auth_allowed_domains_label",
+  setup_auth_allowed_domains_hint: "console.setup.auth_allowed_domains_hint",
+  setup_auth_form_incomplete: "console.setup.auth_form_incomplete",
+  setup_auth_submit: "console.setup.auth_submit",
+  setup_auth_pending: "console.setup.auth_pending",
+  setup_auth_retry: "console.setup.auth_retry",
+  setup_auth_discard: "console.setup.auth_discard",
+  setup_auth_failure_region: "console.setup.auth_failure_region",
+  setup_auth_not_complete: "console.setup.auth_not_complete",
+  setup_request_unreachable: "console.setup.request_unreachable",
+  setup_sign_in_heading: "console.setup.sign_in_heading",
+  setup_sign_in_intro: "console.setup.sign_in_intro",
+  setup_sign_in_edit_settings: "console.setup.sign_in_edit_settings",
+  setup_claim_heading: "console.setup.claim_heading",
+  setup_claim_button: "console.setup.claim_button",
+  setup_claim_pending: "console.setup.claim_pending",
+  setup_claim_signed_in_as: "console.setup.claim_signed_in_as",
+  setup_domain_not_allowed_title: "console.setup.domain_not_allowed.title",
+  setup_domain_not_allowed_body: "console.setup.domain_not_allowed.body",
+  setup_domain_not_allowed_action: "console.setup.domain_not_allowed.action",
+  setup_done_heading: "console.setup.done_heading",
+  setup_done_admin_email: "console.setup.done_admin_email",
+  setup_done_open_console: "console.setup.done_open_console",
+
   /* --- the once-only secret surface --------------------------------------- */
   secret_modal_heading: "console.secret.modal_heading",
   secret_shown_once: "console.secret.shown_once",
@@ -214,6 +297,108 @@ export const CONSOLE_MESSAGE_KEYS = {
   secret_dismiss: "console.secret.dismiss",
   secret_already_shown: "console.secret.already_shown",
   secret_expires_at: "console.secret.expires_at",
+
+  /* --- the /settings/llm screen (issue #74) ------------------------------- */
+  //
+  // A NAMESPACE OF ITS OWN. `console.setup.*` belongs to the first-run wizard and
+  // is being rewritten on another branch; LLM configuration is ordinary
+  // administration that happens long after setup, so it takes `console.llm.*`
+  // and the two catalogs never touch the same lines.
+
+  /* --- the page itself --------------------------------------------------- */
+  llm_page_title: "console.llm.page_title",
+  llm_page_intro: "console.llm.page_intro",
+  llm_load_failed: "console.llm.load_failed",
+  llm_request_failed: "console.llm.request_failed",
+  llm_request_body_invalid: "console.llm.request_body_invalid",
+  llm_action_unknown: "console.llm.action_unknown",
+  llm_general_route_missing: "console.llm.general_route_missing",
+  llm_list_truncated: "console.llm.list_truncated",
+
+  /* --- the provider list ------------------------------------------------- */
+  llm_providers_heading: "console.llm.providers_heading",
+  llm_providers_empty: "console.llm.providers_empty",
+  llm_status_active: "console.llm.status_active",
+  llm_status_disabled: "console.llm.status_disabled",
+  llm_models_heading: "console.llm.models_heading",
+  llm_models_empty: "console.llm.models_empty",
+  llm_key_rows_heading: "console.llm.key_rows_heading",
+  llm_key_row_present: "console.llm.key_row_present",
+  llm_key_row_missing: "console.llm.key_row_missing",
+  llm_routing_heading: "console.llm.routing_heading",
+  llm_policy_present: "console.llm.policy_present",
+  llm_policy_missing: "console.llm.policy_missing",
+  llm_disable_provider: "console.llm.disable_provider",
+  llm_disable_model: "console.llm.disable_model",
+  llm_disable_key_row: "console.llm.disable_key_row",
+  llm_disable_policy: "console.llm.disable_policy",
+  llm_enable_model: "console.llm.enable_model",
+  llm_enable_key_row: "console.llm.enable_key_row",
+  llm_enable_policy: "console.llm.enable_policy",
+
+  /* --- adding a provider by hand ----------------------------------------- */
+  llm_add_provider_heading: "console.llm.add_provider_heading",
+  llm_provider_name_label: "console.llm.provider_name_label",
+  llm_provider_name_hint: "console.llm.provider_name_hint",
+  llm_provider_base_url_label: "console.llm.provider_base_url_label",
+  llm_provider_base_url_hint: "console.llm.provider_base_url_hint",
+  llm_add_provider_submit: "console.llm.add_provider_submit",
+  llm_provider_created: "console.llm.provider_created",
+  llm_display_name_required: "console.llm.display_name_required",
+  llm_base_url_required: "console.llm.base_url_required",
+  llm_base_url_invalid: "console.llm.base_url_invalid",
+  llm_base_url_scheme_unsupported: "console.llm.base_url_scheme_unsupported",
+  llm_base_url_userinfo_rejected: "console.llm.base_url_userinfo_rejected",
+
+  /* --- finishing the chain: model, credential row, routing --------------- */
+  llm_chain_heading: "console.llm.chain_heading",
+  llm_chain_complete: "console.llm.chain_complete",
+  llm_chain_incomplete: "console.llm.chain_incomplete",
+  llm_step_model_missing: "console.llm.step_model_missing",
+  llm_step_enable_missing: "console.llm.step_enable_missing",
+  llm_add_model_label: "console.llm.add_model_label",
+  llm_add_model_hint: "console.llm.add_model_hint",
+  llm_add_model_submit: "console.llm.add_model_submit",
+  llm_model_key_required: "console.llm.model_key_required",
+  llm_model_required: "console.llm.model_required",
+  llm_model_not_found: "console.llm.model_not_found",
+  llm_model_not_selectable: "console.llm.model_not_selectable",
+  llm_key_label: "console.llm.key_label",
+  llm_add_key_row_hint: "console.llm.add_key_row_hint",
+  llm_add_key_row_submit: "console.llm.add_key_row_submit",
+  llm_key_row_not_found: "console.llm.key_row_not_found",
+  llm_bind_routing_model_label: "console.llm.bind_routing_model_label",
+  llm_bind_routing_no_model: "console.llm.bind_routing_no_model",
+  llm_bind_routing_submit: "console.llm.bind_routing_submit",
+  llm_policy_not_found: "console.llm.policy_not_found",
+
+  /* --- the Connect-local-endpoint shortcut ------------------------------- */
+  llm_connect_heading: "console.llm.connect_heading",
+  llm_connect_intro: "console.llm.connect_intro",
+  llm_connect_endpoint_label: "console.llm.connect_endpoint_label",
+  llm_connect_discover_submit: "console.llm.connect_discover_submit",
+  llm_connect_discovered_heading: "console.llm.connect_discovered_heading",
+  llm_connect_submit: "console.llm.connect_submit",
+  llm_connect_pending: "console.llm.connect_pending",
+  llm_connect_done: "console.llm.connect_done",
+  llm_connect_step_failed: "console.llm.connect_step_failed",
+  llm_discovery_unreachable: "console.llm.discovery_unreachable",
+  llm_discovery_refused: "console.llm.discovery_refused",
+  llm_discovery_response_too_large: "console.llm.discovery_response_too_large",
+  llm_discovery_invalid_response: "console.llm.discovery_invalid_response",
+
+  /* --- the chain trace --------------------------------------------------- */
+  llm_trace_heading: "console.llm.trace_heading",
+  llm_step_provider: "console.llm.step_provider",
+  llm_step_provider_model: "console.llm.step_provider_model",
+  llm_step_provider_credential: "console.llm.step_provider_credential",
+  llm_step_provider_enable: "console.llm.step_provider_enable",
+  llm_step_routing_policy: "console.llm.step_routing_policy",
+  llm_step_unknown: "console.llm.step_unknown",
+  llm_outcome_created: "console.llm.outcome_created",
+  llm_outcome_reused: "console.llm.outcome_reused",
+  llm_outcome_enabled: "console.llm.outcome_enabled",
+  llm_outcome_skipped: "console.llm.outcome_skipped",
 } as const;
 
 /** Every console-originated key, as a union of string literals. */

@@ -83,24 +83,47 @@ Do not enable those provider URL relaxations in production.
 
 ## Run Locally
 
-Run the API:
+```bash
+make setup    # env files, console deps, containers, schema, system key
+make start    # containers, migrations, API in the foreground
+```
+
+Then, in a second shell, `make seed` gives the router a provider to route to and
+`make smoke` executes a real prompt through it. `make` with no target lists
+everything.
+
+**A bare `cargo run` is not equivalent.** `Settings::load` reads
+`config/default.toml`, `config/local.toml` and the process environment — never a
+`.env` file, because nothing in the dependency tree does dotenv loading. Run
+outside `make`, the process starts on defaults: no database, `allow_insecure_dev_key`,
+`allow_insecure_dev_pepper`. It looks healthy and is not the one you configured.
+Source the file first if you must:
 
 ```bash
-cargo run
+set -a; . ./.env; set +a
 ```
 
 Development applies migrations during startup by default. Production requires
 `MOIRA_DATABASE__MIGRATE_ON_STARTUP=false`; run `cargo run -- migrate` as a
-controlled release step before starting the API. The default listener is
-`http://127.0.0.1:8080`.
+controlled release step before starting the API.
+
+The listener is `config/default.toml`'s `127.0.0.1:8080` unless `.env` says
+otherwise, and on a developer machine it usually does: `scripts/dev-env.sh` picks
+the first free port from 8080, 8100, 8101, 8102, 8103, because a port already
+serving something else answers probes with a stranger's 404. The `8080` in the
+examples below is that default — `make health`, `make openapi` and `make docs`
+read the real value back from `.env`.
 
 Smoke-check the process:
 
 ```bash
-curl http://127.0.0.1:8080/health/live
-curl http://127.0.0.1:8080/health/ready
-curl http://127.0.0.1:8080/openapi.json
+make health
+make smoke     # also asserts the contract and a real completion
 ```
+
+[docs/local-testing.md](docs/local-testing.md) covers the whole local loop: what
+`make seed` creates and why, the four failures a first execution hits, what this
+configuration leaves open, and what still blocks the console's sign-in.
 
 ## API Documentation
 
@@ -110,7 +133,13 @@ Open `http://127.0.0.1:8080/docs` for the interactive Scalar reference, or fetch
 curl http://127.0.0.1:8080/openapi.json
 ```
 
-Moira generates the contract from the same annotated handlers registered through `utoipa_axum::OpenApiRouter`. The document covers all 130 operations across health, readiness, Prometheus metrics, documentation, native and streaming responses, execution and usage history, discovery, OpenAI compatibility, conversations, messages, memory, policies, RAG, and administration.
+Moira generates the contract from the same annotated handlers registered through `utoipa_axum::OpenApiRouter`. The full contract is 152 operations across 100 paths — health, readiness, Prometheus metrics, documentation, native and streaming responses, execution and usage history, discovery, OpenAI compatibility, conversations, messages, memory, policies, RAG, and administration.
+
+What that `curl` actually returns depends on `docs.expose_admin`, which ships `false` (`config/default.toml`). In that mode `/openapi.json` is public and serves the document with every `/api/v1/admin/` path stripped: 30 operations across 23 paths. Set `MOIRA_DOCS__EXPOSE_ADMIN=true` to serve all 152 — the document then requires admin authentication itself:
+
+```bash
+curl -H "X-Moira-System-Key: $MOIRA_SYSTEM_KEY" http://127.0.0.1:8080/openapi.json
+```
 
 The generated operations include:
 
@@ -180,12 +209,37 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-Validate database migrations against the local pgvector Postgres container when database behavior changes:
+### The test database
+
+`cargo test` needs PostgreSQL. `MOIRA_TEST_DATABASE_URL` names the **cluster** the test
+harnesses work on, and its role needs `CREATEDB`:
 
 ```bash
 export MOIRA_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/moira
+```
+
+Nothing is written to the database that URL names. Every integration fixture clones a
+private database from a migrated template and drops it again, and the library's own
+`#[cfg(test)]` modules create one private database per test process
+(`src/test_support.rs`). That isolation is why an unmerged migration in one checkout no
+longer breaks every other checkout's tests.
+
+**A missing database is a failure, not a skip.** Database-backed suites used to return
+early and report `ok`, so a whole gate run could pass having proven nothing. They now
+panic with an explanation. If you genuinely want to run without one — knowing it removes
+almost all of Moira's coverage — set `MOIRA_TEST_ALLOW_NO_DATABASE=1`; it is ignored when
+`CI=true`, and the skip line it prints still reds `scripts/gates.sh`.
+
+Validate database migrations against the local pgvector Postgres container when database behavior changes:
+
+```bash
 cargo test security_foundation_migration_creates_contract_tables_when_configured
 ```
+
+That suite creates and drops a database of its own. On a runner whose role cannot create
+databases, provision one **empty, disposable** database out of band and point
+`MOIRA_TEST_MIGRATION_DATABASE_URL` at it instead — the suite then migrates and mutates
+that database in place, over the same code path, and refuses to start if it is not empty.
 
 Mutation-test the code a change touches — a passing test proves it ran, not that it would have failed had the code been wrong:
 

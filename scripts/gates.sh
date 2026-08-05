@@ -15,6 +15,13 @@
 
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The two test-phase assertions below (completeness, no-skips) live in one file shared
+# with CI's `scripts/ci-shard-run.sh` and `scripts/ci-assert-union.sh`, so the local
+# gate and the CI gate cannot drift. Two copies of a guard is two chances to loosen one.
+# shellcheck source=scripts/test-log-lib.sh
+. "$ROOT/scripts/test-log-lib.sh"
+
 : "${MOIRA_TEST_DATABASE_URL:=postgres://postgres:postgres@127.0.0.1:5432/moira}"
 export MOIRA_TEST_DATABASE_URL
 
@@ -59,24 +66,30 @@ fi
 #
 # So the log's completeness is asserted against the filesystem, which is an independent source:
 # every `tests/*.rs` is one integration target (`tests/support/` is a directory and is not matched).
-expected_targets=$(ls tests/*.rs 2>/dev/null | wc -l | tr -d ' ')
-logged_targets=$(grep -c '^ *Running tests/' "$log" || true)
-if [ "$logged_targets" -ne "$expected_targets" ]; then
-    printf '   FAILED — log holds %s of %s integration targets: the capture is incomplete, so the\n' \
-        "$logged_targets" "$expected_targets"
-    printf '            count and the skip assertion below are both reading a partial log\n'
-    failures+=("test:incomplete-log")
-fi
-
-# A skipped DB suite reports green. That has invalidated a round of results in this project before,
-# so the absence of skip lines is asserted rather than assumed. `grep -c` exits 1 on zero matches,
-# which is the *good* case — hence `|| true`.
-skips=$(grep -ci 'skipping database\|set MOIRA_TEST_DATABASE_URL' "$log" || true)
-if [ "$skips" -ne 0 ]; then
-    printf '   FAILED — %s skip lines: DB-backed suites did not run\n' "$skips"
-    failures+=("test:skipped-db-suites")
-fi
-rm -f "$log"
+#
+# THREE THINGS CHANGED HERE, all strengthening:
+#
+#   1. The parsing moved into `scripts/test-log-lib.sh`, shared verbatim with the CI shards. The
+#      local gate and the CI gate now assert the same property with the same code.
+#   2. It is a set diff, not a count. `logged_targets -ne expected_targets` was satisfied by any
+#      48 `Running` lines — including 47 real ones plus a duplicate. The diff NAMES the target.
+#   3. `__lib__`, `__bins__` and `__doc__` are now asserted. The lib binary holds
+#      `generated_openapi_covers_every_registered_route`, the whole-route-table pin and
+#      `committed_openapi_matches_the_generated_document`, and until now it was counted by
+#      nothing: a runner change that stopped running it would have gone green.
+#
+# ANSI is stripped first. Locally cargo emits none into a redirect, so this is a no-op — but the
+# same function runs in CI under `CARGO_TERM_COLOR: always`, where the raw log matches
+# `Running tests/` ZERO times (the reset lands between the two words). Measured, not guessed.
+plain=$(mktemp)
+labels=$(mktemp)
+tl_strip_ansi "$log" "$plain"
+tl_assert_complete "$ROOT" "$plain" "$labels" || true
+tl_assert_no_skips "$plain" "$labels" || true
+while IFS= read -r label; do
+    [ -n "$label" ] && failures+=("$label")
+done < "$labels"
+rm -f "$log" "$plain" "$labels"
 
 if [ "$FAST" -eq 0 ]; then
     run "release"     cargo build --release --locked

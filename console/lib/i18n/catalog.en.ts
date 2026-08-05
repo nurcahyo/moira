@@ -284,6 +284,17 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "`trusted_jwt_issuers_issuer_active_unique`, which is not mapped to a 409 and surfaces as " +
       "an opaque 500 database_error. Reuse-first provisioning is what avoids it.",
   },
+  [K.auth_provider_update_failed]: {
+    key: K.auth_provider_update_failed,
+    message:
+      "Saving the changes to the existing sign-in provider failed. Nothing was lost — the " +
+      "provider is unchanged; retry the save.",
+    description:
+      "`SetupProvisioningError` at step `update_auth_provider` — a re-save of a provider row " +
+      "that already exists (a resumed partial attempt, or the domain-refusal remedy's 'add the " +
+      "domain and save again'). The row is PATCHED rather than re-created, so a retry replays " +
+      "the same update safely and can never mint a duplicate row.",
+  },
   [K.auth_provider_secret_write_failed]: {
     key: K.auth_provider_secret_write_failed,
     message:
@@ -303,6 +314,226 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "`SetupProvisioningError` at step `enable_auth_provider` — the dual write's commit point. " +
       "Retry safety comes from `If-Match` plus `enable` being naturally idempotent; the " +
       "operation declares no `Idempotency-Key`.",
+  },
+
+  /* --- the BFF setup door (lib/setup-window.ts, app/api/setup/route.ts) ----
+   *
+   * Every entry here is a refusal the CONSOLE decided. None of them is a Moira
+   * error passed through: those already carry their own `message_key`, and
+   * `lib/errors.ts` maps them to a remedy. The one apparent exception,
+   * `setup_claim_domain_not_allowed`, is deliberately the console's own key —
+   * Moira's envelope for that code does not name the offending domain, and this
+   * is the one screen on which the operator can still change it. */
+  [K.setup_system_key_absent]: {
+    key: K.setup_system_key_absent,
+    message:
+      "First-run setup is not available on this deployment: it holds no bootstrap credential.",
+    description:
+      "`withSetupWindow` refused with 404 because the console has no bootstrap system key. Either " +
+      "it was never configured, or the operator removed it after finishing setup — which is what " +
+      "they are told to do, so this is the normal steady state rather than a fault.",
+  },
+  [K.setup_already_claimed]: {
+    key: K.setup_already_claimed,
+    message: "Setup is already complete for this deployment. Sign in instead.",
+    description:
+      "`withSetupWindow` refused with 409: Moira's claim-status says an admin identity already " +
+      "exists. Read from Moira on every request, never cached — retrying will not change it.",
+  },
+  [K.setup_request_body_invalid]: {
+    key: K.setup_request_body_invalid,
+    message: "The setup request could not be read. Send it again.",
+    description:
+      "`POST /api/setup` received a body that was absent, not JSON, or not a JSON object. Kept " +
+      "distinct from a rejected FIELD so the wizard can tell a transport problem from a " +
+      "validation one.",
+  },
+  [K.setup_action_unknown]: {
+    key: K.setup_action_unknown,
+    message: "That setup step is not one this console performs.",
+    description:
+      "`POST /api/setup` was sent an `action` other than `provision` or `claim`. Reachable only " +
+      "from a client this console did not ship, so it is refused rather than guessed at.",
+  },
+  [K.setup_method_unsupported]: {
+    key: K.setup_method_unsupported,
+    message: "Choose a sign-in method the console can offer a button for.",
+    description:
+      "The submitted `method` is absent, unknown, or non-interactive (`jwks` is a bearer-token " +
+      "trust method with no OAuth client). Provisioning one would create a provider row that can " +
+      "never be offered at sign-in.",
+  },
+  [K.setup_display_name_required]: {
+    key: K.setup_display_name_required,
+    message: "Give the sign-in provider a name to show on the sign-in button.",
+    description:
+      "`display_name` was empty. Schema-required by Moira — omitting it is a 400 there — and it " +
+      "is the string operators actually see, so it is refused here before any write.",
+  },
+  [K.setup_client_id_required]: {
+    key: K.setup_client_id_required,
+    message: "Enter the OAuth client ID issued by your identity provider.",
+    description:
+      "`client_id` was empty. Without it there is nothing for the console to seal its client " +
+      "secret against: the encryption binds `(provider id, client id)` as additional data.",
+  },
+  [K.setup_client_secret_required]: {
+    key: K.setup_client_secret_required,
+    message: "Enter the OAuth client secret issued by your identity provider.",
+    description:
+      "`client_secret` was empty. The console stores it encrypted in its own database and never " +
+      "sends it to Moira, so an empty value is a sign-in that cannot complete its code exchange.",
+  },
+  [K.setup_issuer_or_discovery_required]: {
+    key: K.setup_issuer_or_discovery_required,
+    message:
+      "Supply a discovery document, or the issuer with its authorization and token endpoints.",
+    description:
+      "Neither a discovery URL nor a complete manual endpoint set was submitted. Moira refuses the " +
+      "same shape as `auth_provider_method_config_incomplete` one write later; refusing here leaves " +
+      "no orphan trusted-issuer row behind.",
+  },
+  [K.setup_allowed_email_domains_required]: {
+    key: K.setup_allowed_email_domains_required,
+    message: "List at least one email domain that may become an administrator.",
+    description:
+      "`allowed_email_domains` was empty. The policy is deny-by-default with no first-claim " +
+      "exemption, so an empty list would refuse every claim — including the operator's own, on the " +
+      "very next step.",
+  },
+  [K.setup_provider_slug_invalid]: {
+    key: K.setup_provider_slug_invalid,
+    message:
+      "Use a short lower-case name, letters and digits separated by hyphens, for this provider.",
+    description:
+      "The submitted `slug` is not a usable provider slug. It becomes a URL path segment in the " +
+      "OAuth redirect and part of the issuer string Moira pins tokens to, neither of which can be " +
+      "changed after the first sign-in.",
+  },
+  [K.setup_resume_state_invalid]: {
+    key: K.setup_resume_state_invalid,
+    message:
+      "The console could not read what the previous attempt completed. Start this step again.",
+    description:
+      "A `resume`/`state` payload did not narrow back to a provisioning state. Refused rather than " +
+      "treated as a fresh start: restarting re-registers the trusted JWT issuer and hits a unique " +
+      "index Moira reports as an opaque server error.",
+  },
+  [K.setup_resume_state_conflict]: {
+    key: K.setup_resume_state_conflict,
+    message:
+      "This attempt no longer matches what has actually been configured. Reload the page and " +
+      "save again.",
+    description:
+      "The submitted `resume` hint named a provider row, a trusted issuer, or a stored-secret " +
+      "state that disagrees with the one the console derived from Moira's own records. The hint " +
+      "is never the authority for which row a privileged write may touch, so a disagreement is " +
+      "refused rather than resolved in the caller's favour.",
+  },
+  [K.setup_ordering_violated]: {
+    key: K.setup_ordering_violated,
+    message:
+      "This deployment's identity configuration must be corrected before setup can continue.",
+    description:
+      "`SetupOrderingError` escaped provisioning — a trusted issuer that asserts scopes, a deleted " +
+      "one being reused, or a provider row that came back without its issuer binding. A retry " +
+      "cannot differ until the configuration changes.",
+  },
+  [K.setup_claim_step_unreachable]: {
+    key: K.setup_claim_step_unreachable,
+    message: "Finish configuring the sign-in provider before claiming administrator access.",
+    description:
+      "`assertClaimStepIsReachable` refused: the provisioning gate is not complete, so the claim " +
+      "would be a request Moira is guaranteed to deny. Navigation state, not advice.",
+  },
+  [K.setup_email_not_verified]: {
+    key: K.setup_email_not_verified,
+    message:
+      "Your identity provider has not verified this address. Sign in with a verified account.",
+    description:
+      "`claimAdminIdentity` refused before the request left the process because the session " +
+      "reported an unverified address. Moira refuses the same claim with " +
+      "`admin_claim_email_not_verified`; this is the defence in depth in front of it.",
+  },
+  [K.setup_claim_domain_not_allowed]: {
+    key: K.setup_claim_domain_not_allowed,
+    message:
+      "Moira refused this claim: the domain {domain} is not on this deployment's allow-list.",
+    description:
+      "Moira answered `403 admin_claim_domain_not_allowed`. Re-keyed by the console so the offending " +
+      "domain is named — Moira's own envelope does not carry it, and this is the last screen on " +
+      "which the allow-list can still be changed.",
+  },
+  [K.setup_claim_issuer_mismatch]: {
+    key: K.setup_claim_issuer_mismatch,
+    message:
+      "This claim names a different sign-in provider from the one you signed in through. Sign in " +
+      "through that provider first.",
+    description:
+      "The claim body's `slug` resolved to a console issuer that is not the one the session was " +
+      "established through (`SessionCheck.consoleIssuer`). The slug selects the " +
+      "`admin_identities` namespace the grant is written into, so accepting a mismatch would " +
+      "grant admin in a namespace this identity never authenticated against. Refused 403 with " +
+      "nothing written.",
+  },
+  [K.setup_enabled_provider_requires_session]: {
+    key: K.setup_enabled_provider_requires_session,
+    message:
+      "This sign-in provider is already enabled. Sign in through it first, then save your changes.",
+    description:
+      "Provisioning tried to re-save an ENABLED provider row with NO SESSION AT ALL behind the " +
+      "request — a 401, and the one refusal for which 'sign in first' is the whole remedy. An " +
+      "enabled row is a live authenticator, so rewriting its client id and endpoint URLs " +
+      "re-points sign-in at another identity provider, and while the deployment is unclaimed " +
+      "there is no admin grant yet to refuse that. A session established through that same " +
+      "provider is the only proof of operatorship the setup window can ask for. Deliberately NOT " +
+      "used for a caller who does hold a session and was refused for another reason: an " +
+      "unverified address, a domain outside the allow-list and an unresolvable provider each " +
+      "keep their own key, because each has already done what this sentence tells them to do.",
+  },
+  [K.setup_single_enabled_provider_only]: {
+    key: K.setup_single_enabled_provider_only,
+    message:
+      "This console supports one enabled sign-in provider at a time, and this deployment already " +
+      "has one. Disable the current provider through Moira's admin API using the bootstrap " +
+      "system key, then save here again.",
+    description:
+      "Provisioning would have ENABLED a second provider on a deployment that already has one, " +
+      "and the console cannot render sign-in for either of them afterwards: `ambiguityGuard` " +
+      "(`lib/auth-config.ts`) refuses EVERY resolution once more than one provider is enabled, " +
+      "so the next cold resolve produces no sign-in button, `consoleRuntime` is not ok, and " +
+      "session resolution answers 'no session' forever. That is a lockout, not an escalation, " +
+      "and it is refused for every caller alike — an operator holding a session through the " +
+      "enabled provider satisfies no proof that makes the outcome survivable, so proof is not " +
+      "what is asked for. A 409, because it is a conflict with the deployment's current state " +
+      "rather than anything about the caller. The count is deployment-wide, taken with " +
+      "`ambiguityGuard`'s own predicate, so naming a provider slug this console does not own " +
+      "cannot shrink it. Refused with nothing written.",
+  },
+  [K.setup_provider_enabled_mid_save]: {
+    key: K.setup_provider_enabled_mid_save,
+    message:
+      "This sign-in provider was enabled while your changes were being saved. Reload the page and " +
+      "save again.",
+    description:
+      "The stale-derivation race, and the only outcome of it that is NOT a session refusal: the " +
+      "console derived the row as disabled (so it asked for no proof of an operator), " +
+      "`runSetupProvisioning` read it back ENABLED and refused the write, and re-resolving the " +
+      "session afterwards shows the caller could have proved operatorship all along. Nothing is " +
+      "wrong with them or with the configuration — the console's copy of the state was stale, so " +
+      "this is a 409 for the same reason `setup_resume_state_conflict` is one, and a reload " +
+      "re-derives the truth.",
+  },
+  [K.setup_enabled_provider_session_mismatch]: {
+    key: K.setup_enabled_provider_session_mismatch,
+    message:
+      "You are signed in through a different sign-in provider. Sign in through the one you are " +
+      "changing before saving it.",
+    description:
+      "Same refusal as the requires-session one, for a caller who DOES hold a valid session but " +
+      "established it through another provider row (`SessionCheck.moiraProviderId` does not " +
+      "match the derived row). Separated because the remedy differs: sign out and back in " +
+      "through the provider being edited, rather than merely sign in.",
   },
 
   /* --- accessibility ------------------------------------------------------ */
@@ -447,6 +678,368 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
     description:
       "`POST /api/auth/sign-in/oauth2` answered 200 with no `url` field. Distinguished from a " +
       "plain failure because it means the configuration resolved but produced no authorization URL.",
+  },
+
+  /* --- the /setup wizard --------------------------------------------------- */
+  [K.setup_page_title]: {
+    key: K.setup_page_title,
+    message: "Set up this deployment",
+    description:
+      "The `<h1>` of the public `/setup` route. Distinct from every step heading inside the " +
+      "wizard, which name the step rather than the page.",
+  },
+  [K.setup_unavailable_heading]: {
+    key: K.setup_unavailable_heading,
+    message: "Setup is not available",
+    description:
+      "Heading over the refusal state on `/setup` when `GET /api/setup` answered with anything " +
+      "other than an open setup window — no bootstrap credential, or Moira unreachable. The keyed " +
+      "reason renders beside it through `t()`.",
+  },
+  [K.setup_steps_label]: {
+    key: K.setup_steps_label,
+    message: "Setup progress",
+    description:
+      "Accessible name of the wizard's step list `<nav>`. `no-hardcoded-copy` forbids a literal " +
+      "`aria-label`, so the landmark name is a catalog key.",
+  },
+  [K.setup_step_welcome]: {
+    key: K.setup_step_welcome,
+    message: "Welcome",
+    description: "Step-list label for the informational first step of the setup wizard.",
+  },
+  [K.setup_step_auth_settings]: {
+    key: K.setup_step_auth_settings,
+    message: "Sign-in settings",
+    description:
+      "Step-list label for the provider-configuration step, whose gate is " +
+      "`isProvisioningComplete`.",
+  },
+  [K.setup_step_sign_in]: {
+    key: K.setup_step_sign_in,
+    message: "Operator sign-in",
+    description:
+      "Step-list label for the step where the operator authenticates through the provider they " +
+      "just configured. Deliberately not the same English as `console.page.login_title`.",
+  },
+  [K.setup_step_claim]: {
+    key: K.setup_step_claim,
+    message: "Claim admin",
+    description:
+      "Step-list label for the once-only claim step. Unreachable while `reachableSetupStep` " +
+      "says the provisioning gate is not complete.",
+  },
+  [K.setup_step_done]: {
+    key: K.setup_step_done,
+    message: "Finished",
+    description: "Step-list label for the wizard's terminal confirmation step.",
+  },
+  [K.setup_welcome_heading]: {
+    key: K.setup_welcome_heading,
+    message: "Welcome to the Moira console",
+    description: "Heading of the wizard's welcome step, shown before any configuration exists.",
+  },
+  [K.setup_welcome_claim_once]: {
+    key: K.setup_welcome_claim_once,
+    message:
+      "The first administrator is claimed exactly once. After that this wizard closes for good, " +
+      "and access is managed from inside the console.",
+    description:
+      "Welcome-step copy explaining the once-only nature of the claim: Moira's claim-status gate " +
+      "answers 409 forever after the first successful claim.",
+  },
+  [K.setup_welcome_provider_first]: {
+    key: K.setup_welcome_provider_first,
+    message:
+      "Configure a sign-in provider before claiming. This deployment denies every email domain " +
+      "until you allow yours, so the claim step stays locked until the provider is enabled.",
+    description:
+      "Welcome-step copy explaining the provider-first ordering: the admission policy is " +
+      "deny-by-default with no first-claim exemption, so claiming before provisioning is a " +
+      "guaranteed 403.",
+  },
+  [K.setup_welcome_continue]: {
+    key: K.setup_welcome_continue,
+    message: "Start configuration",
+    description: "The control that advances from the welcome step to the auth-settings step.",
+  },
+  [K.setup_auth_heading]: {
+    key: K.setup_auth_heading,
+    message: "Configure the sign-in provider",
+    description: "Heading and accessible name of the auth-settings step's form region.",
+  },
+  [K.setup_auth_existing_heading]: {
+    key: K.setup_auth_existing_heading,
+    message: "Already configured in Moira",
+    description:
+      "Heading of the revisit block listing provider rows Moira already holds, rendered from the " +
+      "display-safe `GET /api/setup` projection.",
+  },
+  [K.setup_auth_existing_configured]: {
+    key: K.setup_auth_existing_configured,
+    message: "Configured",
+    description:
+      "The masked value shown for an existing provider row's credential. Derived from the " +
+      "PRESENCE of the row, never from any secret value — the console cannot read the secret " +
+      "back, and must not try.",
+  },
+  [K.setup_auth_method_label]: {
+    key: K.setup_auth_method_label,
+    message: "Sign-in method",
+    description: "Label of the method selector on the auth-settings form.",
+  },
+  [K.setup_auth_method_google]: {
+    key: K.setup_auth_method_google,
+    message: "Google OAuth",
+    description: "Option label for `AuthMethod.google_oauth`.",
+  },
+  [K.setup_auth_method_generic]: {
+    key: K.setup_auth_method_generic,
+    message: "Generic OpenID Connect",
+    description: "Option label for `AuthMethod.generic_oidc`.",
+  },
+  [K.setup_auth_slug_label]: {
+    key: K.setup_auth_slug_label,
+    message: "Provider slug",
+    description:
+      "Label of the provider-slug field. The slug picks the console-issuer namespace this " +
+      "provider is registered under, and a new slug means a new trusted issuer and a new " +
+      "provider row rather than a rewrite of the incumbent. What it does NOT pick is whether " +
+      "the write is allowed: the enabled-provider count that decides that is deployment-wide.",
+  },
+  [K.setup_auth_slug_hint]: {
+    key: K.setup_auth_slug_hint,
+    message:
+      "Leave empty for the default provider. Enter a short name — lower-case letters, digits and " +
+      "hyphens — to register this provider under its own name instead. It becomes part of the " +
+      "sign-in URL and cannot be changed afterwards. Only one sign-in provider can be enabled " +
+      "at a time, so a new name here does not add a second one beside an enabled provider.",
+    description:
+      "Hint under the provider-slug field. Says what the slug is for (choosing the " +
+      "console-issuer namespace this provider is registered under), what it costs (permanent — " +
+      "it is a URL path segment and part of the issuer string Moira pins tokens to), and the " +
+      "limit that bounds it. It deliberately does NOT offer the slug as a remedy for a provider " +
+      "enabled with credentials nobody can sign in with: a second enabled provider is refused " +
+      "outright (`setup_single_enabled_provider_only`), because the console cannot resolve " +
+      "sign-in for either of them once two are enabled. That repair runs through Moira's admin " +
+      "API with the bootstrap system key — see `docs/console-architecture.md`.",
+  },
+  [K.setup_auth_display_name_label]: {
+    key: K.setup_auth_display_name_label,
+    message: "Provider display name",
+    description:
+      "Label of the display-name field. Schema-required by Moira and rendered on every sign-in " +
+      "button, so it is refused empty before any write.",
+  },
+  [K.setup_auth_client_id_label]: {
+    key: K.setup_auth_client_id_label,
+    message: "OAuth client ID",
+    description: "Label of the client-id field on the auth-settings form.",
+  },
+  [K.setup_auth_client_secret_label]: {
+    key: K.setup_auth_client_secret_label,
+    message: "OAuth client secret",
+    description:
+      "Label of the client-secret field. The field is write-only: never pre-filled, never echoed " +
+      "into any response, and stored encrypted in the console's own database (decision D7).",
+  },
+  [K.setup_auth_client_secret_hint]: {
+    key: K.setup_auth_client_secret_hint,
+    message: "Write-only. Stored encrypted by this console and never shown again.",
+    description:
+      "Hint under the client-secret field stating the D7 contract: Moira never stores the " +
+      "secret, and the console has no read-back path for it.",
+  },
+  [K.setup_auth_discovery_url_label]: {
+    key: K.setup_auth_discovery_url_label,
+    message: "Discovery URL",
+    description: "Label of the OIDC discovery-document field.",
+  },
+  [K.setup_auth_issuer_label]: {
+    key: K.setup_auth_issuer_label,
+    message: "Issuer URL",
+    description:
+      "Label of the IdP issuer field — the IDENTITY PROVIDER's issuer, never the console's own.",
+  },
+  [K.setup_auth_authorization_url_label]: {
+    key: K.setup_auth_authorization_url_label,
+    // Deliberately not the OAuth spec's own capitalised word for this endpoint:
+    // this catalog is a CLIENT-SAFE module and `server-only-guards.test.ts`
+    // forbids the credential-header literal in any client-safe module's code,
+    // string literals included.
+    message: "Authorize endpoint URL",
+    description: "Label of the manual authorize-endpoint field, used when discovery is absent.",
+  },
+  [K.setup_auth_token_url_label]: {
+    key: K.setup_auth_token_url_label,
+    message: "Token endpoint",
+    description: "Label of the manual token-endpoint field, used when discovery is absent.",
+  },
+  [K.setup_auth_allowed_domains_label]: {
+    key: K.setup_auth_allowed_domains_label,
+    message: "Allowed email domains",
+    description:
+      "Label of the allow-list field. The admission policy is deny-by-default (plan 07 decision " +
+      "D3), so this list decides who can ever claim or hold admin access.",
+  },
+  [K.setup_auth_allowed_domains_hint]: {
+    key: K.setup_auth_allowed_domains_hint,
+    message:
+      "Comma-separated. Only these domains may become administrators — an empty list would lock " +
+      "everyone out, including you.",
+    description:
+      "Hint under the allow-list field. States the deny-by-default consequence because there is " +
+      "no first-claim exemption: an empty list denies the operator's own claim on the next step.",
+  },
+  [K.setup_auth_form_incomplete]: {
+    key: K.setup_auth_form_incomplete,
+    message: "Fill in the required fields before saving.",
+    description:
+      "Client-side refusal announced when the auth-settings form is submitted with a required " +
+      "field empty. Nothing is sent: the same shapes would be keyed 400s from the BFF one round " +
+      "trip later.",
+  },
+  [K.setup_auth_submit]: {
+    key: K.setup_auth_submit,
+    message: "Save and enable provider",
+    description:
+      "Submit control of the auth-settings form. One submission drives the whole ordered " +
+      "sequence: trusted issuer, provider, console-side secret, enable.",
+  },
+  [K.setup_auth_pending]: {
+    key: K.setup_auth_pending,
+    message: "Provisioning the sign-in provider",
+    description: "Announced while the provision request is in flight.",
+  },
+  [K.setup_auth_retry]: {
+    key: K.setup_auth_retry,
+    message: "Retry",
+    description:
+      "The control that resumes a partial provisioning attempt. It re-sends the SAME submission " +
+      "with the recorded `resume` state, so the retry replays rather than duplicates.",
+  },
+  [K.setup_auth_discard]: {
+    key: K.setup_auth_discard,
+    message: "Discard and start over",
+    description:
+      "Offered on the `retry_or_discard_provider` remedy: abandons the recorded partial state " +
+      "and starts a fresh submission instead of resuming the failed one.",
+  },
+  [K.setup_auth_failure_region]: {
+    key: K.setup_auth_failure_region,
+    message: "Provisioning problem",
+    description:
+      "Accessible name of the region that renders a `SetupProvisioningError`'s keyed remedy, " +
+      "its retry controls, and the recorded partial state's consequences.",
+  },
+  [K.setup_auth_not_complete]: {
+    key: K.setup_auth_not_complete,
+    message: "The provider is saved but not fully enabled yet. Retry to finish the remaining steps.",
+    description:
+      "Rendered when a provision response reports a state that fails `isProvisioningComplete` — " +
+      "one of the four conditions (Moira row, console secret, enable, allow-list) is still " +
+      "unconfirmed, so the wizard refuses to advance.",
+  },
+  [K.setup_request_unreachable]: {
+    key: K.setup_request_unreachable,
+    message: "This step did not reach the console. Check your connection and try again.",
+    description:
+      "The browser could not complete a call to the console's own `/api/setup` route. The thrown " +
+      "cause is never echoed. Distinct copy from the admins and invite variants because two keys " +
+      "may not share one English string.",
+  },
+  [K.setup_sign_in_heading]: {
+    key: K.setup_sign_in_heading,
+    message: "Sign in with the new provider",
+    description: "Heading and accessible name of the wizard's combined sign-in-and-claim region.",
+  },
+  [K.setup_sign_in_intro]: {
+    key: K.setup_sign_in_intro,
+    message:
+      "Use the provider you just configured to prove the identity that will become the first " +
+      "administrator.",
+    description:
+      "Intro copy on the sign-in step. The buttons drive the same Better Auth flow as `/login`, " +
+      "returning to `/setup` afterwards.",
+  },
+  [K.setup_sign_in_edit_settings]: {
+    key: K.setup_sign_in_edit_settings,
+    message: "Change the sign-in provider settings",
+    description:
+      "Returns the operator from the sign-in/claim step to the auth-settings form. Without it a " +
+      "completed provision is a one-way door: a mistyped discovery URL, client id, or client " +
+      "secret leaves the operator on a sign-in button that can never succeed. The re-save goes " +
+      "back through the same server-derived provisioning path, so the control is navigation and " +
+      "never a second way to choose which row is written.",
+  },
+  [K.setup_claim_heading]: {
+    key: K.setup_claim_heading,
+    message: "Claim administrator access",
+    description:
+      "Heading of the claim step. Rendered only when `reachableSetupStep` returns `claim` — " +
+      "provisioning complete and a signed-in identity present.",
+  },
+  [K.setup_claim_button]: {
+    key: K.setup_claim_button,
+    message: "Claim admin access",
+    description:
+      "The control that sends `POST /api/setup {action: \"claim\"}`. Enabled only on the claim " +
+      "step, so it can never fire a request the gate guarantees Moira will refuse.",
+  },
+  [K.setup_claim_pending]: {
+    key: K.setup_claim_pending,
+    message: "Claiming administrator access",
+    description: "Announced while the claim request is in flight.",
+  },
+  [K.setup_claim_signed_in_as]: {
+    key: K.setup_claim_signed_in_as,
+    message: "Signed in as {email}.",
+    description:
+      "Shown above the claim control, naming the identity the claim will bind. `{email}` comes " +
+      "from the console's own session probe, never from Moira.",
+  },
+  [K.setup_domain_not_allowed_title]: {
+    key: K.setup_domain_not_allowed_title,
+    message: "That email domain is not allowed yet",
+    description:
+      "Title of the actionable instruction rendered when the claim came back " +
+      "`403 admin_claim_domain_not_allowed`. Never a generic error banner: the operator is sent " +
+      "back to the auth-settings step where the allow-list can still be changed.",
+  },
+  [K.setup_domain_not_allowed_body]: {
+    key: K.setup_domain_not_allowed_body,
+    message:
+      "Moira refused the claim because {domain} is not in the provider's allowed email domains. " +
+      "Add {domain} below, save the provider again, then retry the claim.",
+    description:
+      "Body of the domain-refusal instruction. `{domain}` is the offending domain from the BFF's " +
+      "re-keyed `message_args`; Moira's own envelope does not carry it.",
+  },
+  [K.setup_domain_not_allowed_action]: {
+    key: K.setup_domain_not_allowed_action,
+    message: "Add the domain and save",
+    description:
+      "Names the next action on the domain-refusal instruction, beside the focused allow-list " +
+      "field on the auth-settings step.",
+  },
+  [K.setup_done_heading]: {
+    key: K.setup_done_heading,
+    message: "Setup is complete",
+    description: "Heading of the wizard's terminal step, after a successful claim.",
+  },
+  [K.setup_done_admin_email]: {
+    key: K.setup_done_admin_email,
+    message: "Administrator access is granted to {email}.",
+    description:
+      "Confirmation line on the done step. `{email}` is the claimed identity's email from the " +
+      "claim response.",
+  },
+  [K.setup_done_open_console]: {
+    key: K.setup_done_open_console,
+    message: "Open the console",
+    description:
+      "Link from the done step to the authenticated home route, where the new administrator's " +
+      "session now has somewhere to go.",
   },
 
   /* --- generic actions ---------------------------------------------------- */
@@ -1038,6 +1631,604 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "of that grant may be somebody else entirely.",
   },
 
+  /* ------------------------------------------------------------------------ */
+  /* The /settings/llm screen (issue #74)                                     */
+  /* ------------------------------------------------------------------------ */
+  [K.llm_page_title]: {
+    key: K.llm_page_title,
+    message: "Language model providers",
+    description:
+      "Heading of `/settings/llm`, the screen where an operator registers the endpoints " +
+      "Moira sends prompts to.",
+  },
+  [K.llm_page_intro]: {
+    key: K.llm_page_intro,
+    message:
+      "A provider needs four things before a prompt can reach it: the provider itself, at " +
+      "least one model, a credential row, and routing pointed at it. Each one is listed " +
+      "below with whatever is still missing.",
+    description:
+      "Rendered under the page heading. It states the chain because both of its failure " +
+      "modes are reported by the backend in terms that name none of these four rows.",
+  },
+  [K.llm_load_failed]: {
+    key: K.llm_load_failed,
+    message: "The console could not read the provider configuration from the backend.",
+    description:
+      "Rendered instead of the whole screen when the server-side read throws. The page " +
+      "still answers with a 2xx, because the accessibility walker asserts every route " +
+      "answers below 400 and a backend outage must not take that gate red.",
+  },
+  [K.llm_request_failed]: {
+    key: K.llm_request_failed,
+    message: "That request did not complete. Nothing was changed.",
+    description:
+      "The browser-side fallback when a call to one of this screen's own route handlers " +
+      "produced no readable keyed refusal - an offline browser, or a proxy that answered " +
+      "with something that is not JSON.",
+  },
+  [K.llm_request_body_invalid]: {
+    key: K.llm_request_body_invalid,
+    message:
+      "The console sent a request it could not build correctly. This is a fault in the " +
+      "console, not in what you typed.",
+    description:
+      "A route handler could not read its own request body, or read one with no usable " +
+      "fields. It is reachable only through a console bug or a hand-made request, so the " +
+      "copy says so rather than asking the operator to correct an input.",
+  },
+  [K.llm_action_unknown]: {
+    key: K.llm_action_unknown,
+    message: "That is not an action this screen offers.",
+    description:
+      "The shortcut endpoint received a stage discriminator it does not implement. Distinct " +
+      "from a malformed body: the body was readable and named something real-looking.",
+  },
+  [K.llm_general_route_missing]: {
+    key: K.llm_general_route_missing,
+    message:
+      "This deployment has no default route, so routing cannot be pointed anywhere. Re-run " +
+      "the database migrations and reload this page.",
+    description:
+      "The seeded default route could not be found. The console deliberately does not " +
+      "create one: the create operation documents no conflict for a duplicate route key, so " +
+      "a second one would leave routing with two candidates and no documented rule for " +
+      "choosing.",
+  },
+  [K.llm_list_truncated]: {
+    key: K.llm_list_truncated,
+    message:
+      "There are more rows than one page can show, so the console cannot tell whether this " +
+      "already exists. Remove some rows before trying again.",
+    description:
+      "A reuse-first lookup ran out of page before it found a match. Refusing is " +
+      "deliberate: creating the row anyway is how a duplicate provider or a second eligible " +
+      "routing policy gets made.",
+  },
+  [K.llm_providers_heading]: {
+    key: K.llm_providers_heading,
+    message: "Configured providers",
+    description:
+      "Heading of the section listing every provider row, with its models, credential rows " +
+      "and routing.",
+  },
+  [K.llm_providers_empty]: {
+    key: K.llm_providers_empty,
+    message: "No provider is configured yet.",
+    description:
+      "The empty state for the provider list. Rendered on a freshly migrated deployment, " +
+      "where it is the expected state rather than a problem.",
+  },
+  [K.llm_status_active]: {
+    key: K.llm_status_active,
+    message: "Enabled",
+    description:
+      "Badge text for a row the backend reports as active. Paired with a tone, never colour " +
+      "alone.",
+  },
+  [K.llm_status_disabled]: {
+    key: K.llm_status_disabled,
+    message: "Disabled",
+    description:
+      "Badge text for any row that is not active. Covers disabled and deleted alike, " +
+      "because the difference does not change what an operator can do next from this " +
+      "screen.",
+  },
+  [K.llm_models_heading]: {
+    key: K.llm_models_heading,
+    message: "Models",
+    description: "Sub-heading above the models registered against one provider.",
+  },
+  [K.llm_models_empty]: {
+    key: K.llm_models_empty,
+    message: "No model is registered for this provider.",
+    description:
+      "Empty state for one provider's model list. A provider with no model is never " +
+      "selected by routing, and nothing reports that at request time.",
+  },
+  [K.llm_key_rows_heading]: {
+    key: K.llm_key_rows_heading,
+    message: "Credential rows",
+    description:
+      "Sub-heading above the credential rows attached to one provider. Rows, not keys: no " +
+      "key value is ever sent to the browser.",
+  },
+  [K.llm_key_row_present]: {
+    key: K.llm_key_row_present,
+    message: "A stored credential",
+    description:
+      "Label for one credential row. It deliberately describes the row and not its contents " +
+      "- the value, its mask and its fingerprint are all withheld by the server.",
+  },
+  [K.llm_key_row_missing]: {
+    key: K.llm_key_row_missing,
+    message:
+      "No credential row exists. A prompt is refused before it reaches the endpoint, even " +
+      "when the endpoint needs no key.",
+    description:
+      "Both the empty state for one provider's credential rows and the missing-step line in " +
+      "the readiness list. It states the surprising half of the rule, because the backend " +
+      "reports this as a missing-credential error that reads as though a key were wrong.",
+  },
+  [K.llm_routing_heading]: {
+    key: K.llm_routing_heading,
+    message: "Routing entries",
+    description: "Sub-heading above the routing policies pointing at one provider.",
+  },
+  [K.llm_policy_present]: {
+    key: K.llm_policy_present,
+    message: "Bound to a route",
+    description:
+      "Fallback label for a routing policy whose route key the console could not resolve - " +
+      "the policy exists and points somewhere, and saying so beats rendering an opaque " +
+      "identifier.",
+  },
+  [K.llm_policy_missing]: {
+    key: K.llm_policy_missing,
+    message: "Routing does not point at this provider yet.",
+    description:
+      "Both the empty state for one provider's routing policies and the missing-step line " +
+      "in the readiness list. A provider with no policy is simply never selected, with no " +
+      "error at all until a completion picks something else.",
+  },
+  [K.llm_disable_provider]: {
+    key: K.llm_disable_provider,
+    message: "Disable this provider",
+    description:
+      "The undo for having created a provider. It disables rather than deletes: nothing on " +
+      "this surface is destroyed, and a disabled row stays readable.",
+  },
+  [K.llm_disable_model]: {
+    key: K.llm_disable_model,
+    message: "Disable this model",
+    description: "The undo for having registered a model.",
+  },
+  [K.llm_disable_key_row]: {
+    key: K.llm_disable_key_row,
+    message: "Disable this credential",
+    description:
+      "The undo for having created a credential row. Disabling it makes the provider " +
+      "ineligible again, which is the same state as never having created it.",
+  },
+  [K.llm_disable_policy]: {
+    key: K.llm_disable_policy,
+    message: "Stop routing here",
+    description:
+      "The undo for having pointed routing at this provider. It is the step that moves live " +
+      "traffic, so its label says what stops rather than which row is edited.",
+  },
+  [K.llm_enable_model]: {
+    key: K.llm_enable_model,
+    message: "Enable this model",
+    description:
+      "Shown in place of the disable control on a model that is not active. Routing accepts " +
+      "only active models, and re-adding the same identifier collides with the row that is " +
+      "already there, so this is the only way back.",
+  },
+  [K.llm_enable_key_row]: {
+    key: K.llm_enable_key_row,
+    message: "Enable this credential",
+    description:
+      "Shown in place of the disable control on a credential row that is not active. A " +
+      "disabled row fails a completion with the same error a missing one does.",
+  },
+  [K.llm_enable_policy]: {
+    key: K.llm_enable_policy,
+    message: "Route here again",
+    description:
+      "Shown in place of the stop-routing control on a policy that is not active. It moves " +
+      "live traffic back, so its label says what resumes rather than which row is edited.",
+  },
+  [K.llm_add_provider_heading]: {
+    key: K.llm_add_provider_heading,
+    message: "Add a provider by hand",
+    description:
+      "Heading of the manual provider form - the long way round the shortcut, for an " +
+      "endpoint that is not reachable from this deployment right now.",
+  },
+  [K.llm_provider_name_label]: {
+    key: K.llm_provider_name_label,
+    message: "Display name",
+    description: "Label of the provider's name field.",
+  },
+  [K.llm_provider_name_hint]: {
+    key: K.llm_provider_name_hint,
+    message: "How this provider is named on this screen. It is never sent to the endpoint.",
+    description:
+      "Hint under the name field, so the operator does not try to make it match something " +
+      "the endpoint expects.",
+  },
+  [K.llm_provider_base_url_label]: {
+    key: K.llm_provider_base_url_label,
+    message: "Endpoint address",
+    description:
+      "Label of the field holding the OpenAI-compatible base address of a provider.",
+  },
+  [K.llm_provider_base_url_hint]: {
+    key: K.llm_provider_base_url_hint,
+    message:
+      "The base address of an OpenAI-compatible server. The version segment is added for " +
+      "you when it is missing.",
+    description:
+      "Hint under every endpoint field on this screen. It states the canonicalisation, " +
+      "because a provider row created from a bare origin fails much later, at request time, " +
+      "with a message that names none of this.",
+  },
+  [K.llm_add_provider_submit]: {
+    key: K.llm_add_provider_submit,
+    message: "Add provider",
+    description: "Submit control of the manual provider form.",
+  },
+  [K.llm_provider_created]: {
+    key: K.llm_provider_created,
+    message: "Provider added. Finish the remaining steps below.",
+    description:
+      "Confirmation after the manual form succeeded. It points at the rest of the chain, " +
+      "because creating the provider alone leaves the deployment no closer to running a " +
+      "prompt.",
+  },
+  [K.llm_display_name_required]: {
+    key: K.llm_display_name_required,
+    message: "Enter a display name.",
+    description:
+      "The console refused a provider create or patch with a blank name, before any request " +
+      "left.",
+  },
+  [K.llm_base_url_required]: {
+    key: K.llm_base_url_required,
+    message: "Enter the address of the endpoint.",
+    description: "The console refused an endpoint field that was empty.",
+  },
+  [K.llm_base_url_invalid]: {
+    key: K.llm_base_url_invalid,
+    message: "That is not an address the console can read.",
+    description: "The endpoint field did not parse as an address at all.",
+  },
+  [K.llm_base_url_scheme_unsupported]: {
+    key: K.llm_base_url_scheme_unsupported,
+    message: "Only web addresses are accepted here.",
+    description:
+      "The endpoint address parsed but named a scheme this console will not fetch. The " +
+      "console makes this call itself, so the set of schemes it will follow is narrowed " +
+      "deliberately.",
+  },
+  [K.llm_base_url_userinfo_rejected]: {
+    key: K.llm_base_url_userinfo_rejected,
+    message:
+      "Remove the sign-in details from the address, and store a key as a credential " +
+      "instead.",
+    description:
+      "The endpoint address carried a user name or password. Accepting it would write a " +
+      "secret into a provider row, and from there into every list response this screen " +
+      "renders.",
+  },
+  [K.llm_chain_heading]: {
+    key: K.llm_chain_heading,
+    message: "Finish setting this provider up",
+    description:
+      "Heading of the panel holding the three steps that come after a provider row exists.",
+  },
+  [K.llm_chain_complete]: {
+    key: K.llm_chain_complete,
+    message: "Ready: a prompt can reach this provider.",
+    description:
+      "Rendered when all four parts of the chain are present and active. It is derived from " +
+      "the server-rendered data rather than from what the panel believes it just did.",
+  },
+  [K.llm_chain_incomplete]: {
+    key: K.llm_chain_incomplete,
+    message: "Not ready yet.",
+    description:
+      "Rendered when any part of the chain is missing. The missing parts are listed under " +
+      "it.",
+  },
+  [K.llm_step_model_missing]: {
+    key: K.llm_step_model_missing,
+    message: "Register a model, or enable one that is disabled.",
+    description:
+      "Readiness line for a provider with no model routing would accept. Names both causes " +
+      "because they are indistinguishable from the failure: routing joins on an active " +
+      "model, so a provider whose only model is disabled has none as far as a prompt is " +
+      "concerned.",
+  },
+  [K.llm_step_enable_missing]: {
+    key: K.llm_step_enable_missing,
+    message: "Enable the provider.",
+    description:
+      "Readiness line for a provider row that is not active. Reachable after an operator " +
+      "disables one and then wants it back.",
+  },
+  [K.llm_add_model_label]: {
+    key: K.llm_add_model_label,
+    message: "Model identifier",
+    description:
+      "Label of the field holding the identifier the endpoint itself uses for a model.",
+  },
+  [K.llm_add_model_hint]: {
+    key: K.llm_add_model_hint,
+    message: "Exactly as the endpoint reports it. This is the value sent on every request.",
+    description:
+      "Hint under the model field. A near-miss here is answered by the endpoint rather than " +
+      "by the backend, which makes it hard to attribute.",
+  },
+  [K.llm_add_model_submit]: {
+    key: K.llm_add_model_submit,
+    message: "Add model",
+    description: "Submit control of the add-model field.",
+  },
+  [K.llm_model_key_required]: {
+    key: K.llm_model_key_required,
+    message: "Enter the identifier the endpoint uses for this model.",
+    description:
+      "The console refused a model create with a blank identifier, before any request left.",
+  },
+  [K.llm_model_required]: {
+    key: K.llm_model_required,
+    message: "Select at least one model.",
+    description:
+      "The shortcut was asked to register a provider with no model selected. A provider " +
+      "with no model is never selected by routing.",
+  },
+  [K.llm_model_not_found]: {
+    key: K.llm_model_not_found,
+    message: "That model does not belong to this provider.",
+    description:
+      "The console refused to act on a model identifier that does not appear among the " +
+      "named provider's models. The backend's own disable operation takes no provider, so " +
+      "this check exists only here.",
+  },
+  [K.llm_model_not_selectable]: {
+    key: K.llm_model_not_selectable,
+    message:
+      "That model is not active, so routing would never select it. Enable the model first, " +
+      "then point routing at it.",
+    description:
+      "Routing was asked to bind a policy to a model whose status is not active. The " +
+      "backend stores such a policy and then never selects it, because routing joins the " +
+      "model table on an active status — so the deployment would read as configured and " +
+      "every completion would still fail.",
+  },
+  [K.llm_key_label]: {
+    key: K.llm_key_label,
+    message: "Key",
+    description:
+      "Label of the write-only field holding a provider key. Nothing populates it and " +
+      "nothing reads it back.",
+  },
+  [K.llm_add_key_row_hint]: {
+    key: K.llm_add_key_row_hint,
+    message:
+      "Leave this blank for an endpoint that needs no key. The row itself is what the " +
+      "backend requires, not its contents.",
+    description:
+      "Hint under the key field. Blank is the ordinary case for an endpoint on the " +
+      "operator's own network, and the console generates the stored placeholder itself.",
+  },
+  [K.llm_add_key_row_submit]: {
+    key: K.llm_add_key_row_submit,
+    message: "Create credential row",
+    description: "Submit control of the credential form.",
+  },
+  [K.llm_key_row_not_found]: {
+    key: K.llm_key_row_not_found,
+    message: "That credential does not belong to this provider.",
+    description:
+      "The console refused to act on a credential identifier that does not appear among the " +
+      "named provider's rows.",
+  },
+  [K.llm_bind_routing_model_label]: {
+    key: K.llm_bind_routing_model_label,
+    message: "Model to route to",
+    description:
+      "Label of the selector choosing which of a provider's models the default route should " +
+      "send prompts to.",
+  },
+  [K.llm_bind_routing_no_model]: {
+    key: K.llm_bind_routing_no_model,
+    message: "Choose a model",
+    description:
+      "The unselected option of that selector. Chosen over a blank entry so the control " +
+      "announces what it is for.",
+  },
+  [K.llm_bind_routing_submit]: {
+    key: K.llm_bind_routing_submit,
+    message: "Point routing here",
+    description:
+      "Submit control that binds the default route to the selected provider and model.",
+  },
+  [K.llm_policy_not_found]: {
+    key: K.llm_policy_not_found,
+    message: "That routing entry does not belong to this provider.",
+    description:
+      "The console refused to act on a routing identifier that does not point at the named " +
+      "provider.",
+  },
+  [K.llm_connect_heading]: {
+    key: K.llm_connect_heading,
+    message: "Connect a local endpoint",
+    description:
+      "Heading of the shortcut panel, which asks an endpoint what it serves and then " +
+      "registers everything a prompt needs.",
+  },
+  [K.llm_connect_intro]: {
+    key: K.llm_connect_intro,
+    message:
+      "Ask the endpoint what it serves, then register it in one step. The console makes " +
+      "that call itself; your browser never contacts the endpoint.",
+    description:
+      "Rendered under the shortcut heading. It states where the outbound call is made from, " +
+      "because that is a deliberate boundary and not an implementation detail: the endpoint " +
+      "is on the operator's own network.",
+  },
+  [K.llm_connect_endpoint_label]: {
+    key: K.llm_connect_endpoint_label,
+    message: "Local endpoint address",
+    description:
+      "Label of the shortcut's address field, pre-filled with this deployment's usual local " +
+      "endpoint. The address itself is a constant in the code, never catalogue copy.",
+  },
+  [K.llm_connect_discover_submit]: {
+    key: K.llm_connect_discover_submit,
+    message: "Ask the endpoint",
+    description:
+      "The first of the shortcut's two controls. It writes nothing - a mistyped address " +
+      "must not leave a provider row behind.",
+  },
+  [K.llm_connect_discovered_heading]: {
+    key: K.llm_connect_discovered_heading,
+    message: "Models this endpoint reports",
+    description:
+      "Legend above the list of model identifiers the endpoint returned, offered for " +
+      "selection so nobody has to type one.",
+  },
+  [K.llm_connect_submit]: {
+    key: K.llm_connect_submit,
+    message: "Register the selected models",
+    description: "The second of the shortcut's two controls. This is the one that writes.",
+  },
+  [K.llm_connect_pending]: {
+    key: K.llm_connect_pending,
+    message: "Working...",
+    description: "Announced politely while either of the shortcut's two calls is in flight.",
+  },
+  [K.llm_connect_done]: {
+    key: K.llm_connect_done,
+    message: "Done. The provider, its models, a credential row and routing all exist.",
+    description:
+      "Announced after the whole chain completed. It names all four rows, because that " +
+      "conjunction is the thing the operator came to this screen to achieve.",
+  },
+  [K.llm_connect_step_failed]: {
+    key: K.llm_connect_step_failed,
+    message:
+      "Registration stopped part-way. What was already created is listed below, and trying " +
+      "again continues from there rather than duplicating it.",
+    description:
+      "The chain failed at a step. Everything written up to that point is reported with it: " +
+      "a retry made blind is how a second eligible routing policy gets created, since none " +
+      "of these operations reports a conflict for a duplicate.",
+  },
+  [K.llm_discovery_unreachable]: {
+    key: K.llm_discovery_unreachable,
+    message:
+      "The console could not reach that endpoint. Check that it is running, and that this " +
+      "deployment can route to it.",
+    description:
+      "The outbound probe never produced a response - name resolution, a refused " +
+      "connection, a certificate, or the timeout. Ordinary rather than exceptional: a " +
+      "laptop with its tunnel down reaches this every time.",
+  },
+  [K.llm_discovery_refused]: {
+    key: K.llm_discovery_refused,
+    message: "The endpoint answered, but would not list its models.",
+    description:
+      "The probe got an HTTP response with a failure status. Distinct from unreachable, " +
+      "because the remedy is different: something is listening and it said no.",
+  },
+  [K.llm_discovery_response_too_large]: {
+    key: K.llm_discovery_response_too_large,
+    message: "The endpoint's answer was too large for the console to read.",
+    description:
+      "The probe's read cap was passed. The read is bounded so that a hostile or hung " +
+      "endpoint cannot hold a request handler open.",
+  },
+  [K.llm_discovery_invalid_response]: {
+    key: K.llm_discovery_invalid_response,
+    message: "The endpoint's answer was not a model listing the console recognises.",
+    description:
+      "The probe's response parsed but did not match the shape a model listing must have. " +
+      "Nothing from an unvalidated response is rendered.",
+  },
+  [K.llm_trace_heading]: {
+    key: K.llm_trace_heading,
+    message: "What was written",
+    description:
+      "Heading of the per-step record the shortcut returns, shown after a success and after " +
+      "a partial failure alike.",
+  },
+  [K.llm_step_provider]: {
+    key: K.llm_step_provider,
+    message: "Provider",
+    description: "Names the first step of the registration chain in the trace.",
+  },
+  [K.llm_step_provider_model]: {
+    key: K.llm_step_provider_model,
+    message: "Model",
+    description: "Names the second step of the registration chain in the trace.",
+  },
+  [K.llm_step_provider_credential]: {
+    key: K.llm_step_provider_credential,
+    message: "Credential row",
+    description:
+      "Names the third step of the registration chain in the trace - the one a keyless " +
+      "endpoint still needs.",
+  },
+  [K.llm_step_provider_enable]: {
+    key: K.llm_step_provider_enable,
+    message: "Enable",
+    description:
+      "Names the fourth step of the registration chain in the trace. It is skipped when the " +
+      "provider is already active, which is the ordinary case.",
+  },
+  [K.llm_step_routing_policy]: {
+    key: K.llm_step_routing_policy,
+    message: "Routing",
+    description: "Names the last step of the registration chain in the trace.",
+  },
+  [K.llm_step_unknown]: {
+    key: K.llm_step_unknown,
+    message: "Step",
+    description:
+      "Fallback name for a trace step the console does not have a label for, so an added " +
+      "step degrades to something readable instead of rendering its own identifier.",
+  },
+  [K.llm_outcome_created]: {
+    key: K.llm_outcome_created,
+    message: "created",
+    description: "Trace outcome for a row this run wrote.",
+  },
+  [K.llm_outcome_reused]: {
+    key: K.llm_outcome_reused,
+    message: "reused",
+    description:
+      "Trace outcome for a row that already existed and was matched rather than duplicated.",
+  },
+  [K.llm_outcome_enabled]: {
+    key: K.llm_outcome_enabled,
+    message: "enabled",
+    description:
+      "Trace outcome for a row that already existed but was disabled, and was turned back " +
+      "on. Kept apart from 'reused' because routing accepts only active rows: a step that " +
+      "reported 'reused' for a disabled row would be announcing a working deployment no " +
+      "prompt could reach.",
+  },
+  [K.llm_outcome_skipped]: {
+    key: K.llm_outcome_skipped,
+    message: "already done",
+    description:
+      "Trace outcome for a step that had nothing to do - in practice, enabling a provider " +
+      "that was already active.",
+  },
 };
 
 /** Every entry, as a plain array. */
