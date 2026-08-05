@@ -253,3 +253,54 @@ export function badRequest(messageKey: string): Response {
 export function notFound(messageKey: string): Response {
   return keyed(404, "not_found", messageKey);
 }
+
+/* -------------------------------------------------------------------------- */
+/* "NOT ON PAGE ONE" IS NOT "DOES NOT EXIST" (issue #117)                      */
+/* -------------------------------------------------------------------------- */
+
+/** The shape of any Moira list response, structurally — no import edge needed. */
+interface PagedResponse<T> {
+  readonly data: readonly T[];
+  readonly pagination: { readonly has_more: boolean };
+}
+
+/**
+ * The outcome of looking one row up in a single listed page.
+ *
+ * Three cases, because two of them are not the same answer. `absent` means the
+ * whole list was seen and the row is not in it; `truncated` means the page ran
+ * out first and NOTHING IS KNOWN about the row.
+ */
+export type PageLookup<T> =
+  | { readonly kind: "found"; readonly row: T }
+  | { readonly kind: "absent" }
+  | { readonly kind: "truncated" };
+
+/**
+ * Find one row on a single page, distinguishing a truncated page from an absent
+ * row.
+ *
+ * ============================================================================
+ * WHY THE THIRD CASE EXISTS (issue #117)
+ * ============================================================================
+ *
+ * The ownership lookups behind enable/disable each listed with `LIST_PAGE_LIMIT`
+ * and took `.find(...) ?? null`, so a row on page two was reported as
+ * `not found` — a 404 saying "this model does not belong to this provider" about
+ * a model that does. Fail-closed, and the operator is told something untrue
+ * about their own deployment, on the screen whose entire job is to explain it.
+ *
+ * `lib/llm-settings.ts`'s `findOnPage` already draws this distinction for the
+ * connect chain, and throws to carry the partial progress a chain has made. A
+ * route handler has no progress to carry, so this returns the distinction
+ * instead and each handler chooses its own keyed refusal.
+ *
+ * The right answer to `truncated` is never "act anyway" and never "say it does
+ * not exist" — it is `llm_list_truncated`, which tells the operator the list
+ * outgrew one page.
+ */
+export function lookupOnPage<T>(page: PagedResponse<T>, match: (row: T) => boolean): PageLookup<T> {
+  const hit = page.data.find(match);
+  if (hit !== undefined) return { kind: "found", row: hit };
+  return page.pagination.has_more ? { kind: "truncated" } : { kind: "absent" };
+}

@@ -1542,6 +1542,17 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "named provider's models. The backend's own disable operation takes no provider, so " +
       "this check exists only here.",
   },
+  [K.llm_model_not_selectable]: {
+    key: K.llm_model_not_selectable,
+    message:
+      "That model is not active, so routing would never select it. Enable the model first, " +
+      "then point routing at it.",
+    description:
+      "Routing was asked to bind a policy to a model whose status is not active. The " +
+      "backend stores such a policy and then never selects it, because routing joins the " +
+      "model table on an active status — so the deployment would read as configured and " +
+      "every completion would still fail.",
+  },
   [K.llm_key_label]: {
     key: K.llm_key_label,
     message: "Key",

@@ -403,10 +403,15 @@ export function narrowModelKey(raw: unknown): string | null {
   const trimmed = raw.trim();
   if (trimmed === "") return null;
   if (trimmed.length > DISCOVERY_MAX_MODEL_KEY_LENGTH) return null;
-    // A control character in a model id would travel into a provider row, a URL
-    // and a rendered table. There is no legitimate one. Written as escapes
-    // rather than as raw bytes so the range stays readable in a diff.
-    if (/[\u0000-\u001f\u007f]/.test(trimmed)) return null;
+  // A control character in a model id would travel into a provider row, a URL
+  // and a rendered table. There is no legitimate one. Written as escapes rather
+  // than as raw bytes so the range stays readable in a diff.
+  //
+  // Issue #117: this branch was indented four spaces deeper than its block, which
+  // read as a guard nested inside the length check above it. It is not nested; it
+  // is the fourth of four flat refusals. `package.json` exposes `format` only as
+  // `prettier --write`, with no check variant in any gate, so nothing caught it.
+  if (/[\u0000-\u001f\u007f]/.test(trimmed)) return null;
   return trimmed;
 }
 

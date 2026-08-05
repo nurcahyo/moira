@@ -34,7 +34,13 @@
 //
 // Re-checks the session itself — `app/api/**` is outside every route group.
 
-import { notFound, withConsoleSession } from "@/lib/console-api";
+import {
+  badRequest,
+  lookupOnPage,
+  notFound,
+  withConsoleSession,
+  type PageLookup,
+} from "@/lib/console-api";
 import { CONSOLE_MESSAGE_KEYS } from "@/lib/i18n/keys";
 import { LIST_PAGE_LIMIT } from "@/lib/llm-settings";
 import { ifMatchFor, type MoiraClient } from "@/lib/moira-client";
@@ -45,15 +51,30 @@ export const dynamic = "force-dynamic";
 
 const NO_STORE = { "cache-control": "no-store" } as const;
 
-/** The model, only if it belongs to the provider named in the path. */
+/**
+ * The model, only if it belongs to the provider named in the path.
+ *
+ * Issue #117: this returns a three-case lookup rather than `record | null`. The
+ * `?? null` it used to end with read a TRUNCATED page as "does not belong to
+ * this provider" — a 404 stating something false about a model that does belong
+ * to it, on the one screen built to explain the deployment. Fail-closed either
+ * way; only one of the two is honest.
+ */
 async function ownedModel(
   client: MoiraClient,
   providerId: string,
   modelId: string,
-): Promise<ProviderModelRecord | null> {
+): Promise<PageLookup<ProviderModelRecord>> {
   const provider = await client.getProvider(providerId);
   const page = await client.listProviderModels(provider.id, { limit: LIST_PAGE_LIMIT });
-  return page.data.find((row) => row.id === modelId) ?? null;
+  return lookupOnPage(page, (row) => row.id === modelId);
+}
+
+/** The refusal for a lookup that did not find its row. */
+function refuse(lookup: PageLookup<unknown>): Response {
+  return lookup.kind === "truncated"
+    ? badRequest(CONSOLE_MESSAGE_KEYS.llm_list_truncated)
+    : notFound(CONSOLE_MESSAGE_KEYS.llm_model_not_found);
 }
 
 export async function DELETE(
@@ -62,8 +83,9 @@ export async function DELETE(
 ): Promise<Response> {
   const { id, modelId } = await context.params;
   return withConsoleSession(request, async ({ client }) => {
-    const model = await ownedModel(client, id, modelId);
-    if (model === null) return notFound(CONSOLE_MESSAGE_KEYS.llm_model_not_found);
+    const lookup = await ownedModel(client, id, modelId);
+    if (lookup.kind !== "found") return refuse(lookup);
+    const model = lookup.row;
 
     const record = await client.disableProviderModel(model.id, ifMatchFor(model));
     return Response.json({ id: record.id }, { headers: NO_STORE });
@@ -76,8 +98,9 @@ export async function POST(
 ): Promise<Response> {
   const { id, modelId } = await context.params;
   return withConsoleSession(request, async ({ client }) => {
-    const model = await ownedModel(client, id, modelId);
-    if (model === null) return notFound(CONSOLE_MESSAGE_KEYS.llm_model_not_found);
+    const lookup = await ownedModel(client, id, modelId);
+    if (lookup.kind !== "found") return refuse(lookup);
+    const model = lookup.row;
 
     // Already active: answer with the row rather than writing. Enabling an
     // active row would burn a version for nothing and turn a double-click into a

@@ -300,6 +300,7 @@ export const CONSOLE_MESSAGE_KEYS = {
   llm_model_key_required: "console.llm.model_key_required",
   llm_model_required: "console.llm.model_required",
   llm_model_not_found: "console.llm.model_not_found",
+  llm_model_not_selectable: "console.llm.model_not_selectable",
   llm_key_label: "console.llm.key_label",
   llm_add_key_row_hint: "console.llm.add_key_row_hint",
   llm_add_key_row_submit: "console.llm.add_key_row_submit",

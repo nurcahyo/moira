@@ -25,7 +25,13 @@
 //
 // Re-checks the session itself — `app/api/**` is outside every route group.
 
-import { notFound, withConsoleSession } from "@/lib/console-api";
+import {
+  badRequest,
+  lookupOnPage,
+  notFound,
+  withConsoleSession,
+  type PageLookup,
+} from "@/lib/console-api";
 import { CONSOLE_MESSAGE_KEYS } from "@/lib/i18n/keys";
 import { LIST_PAGE_LIMIT } from "@/lib/llm-settings";
 import { ifMatchFor, type MoiraClient } from "@/lib/moira-client";
@@ -36,19 +42,33 @@ export const dynamic = "force-dynamic";
 
 const NO_STORE = { "cache-control": "no-store" } as const;
 
-/** The policy, only if it points at the provider named in the path. */
+/**
+ * The policy, only if it points at the provider named in the path.
+ *
+ * Issue #117: three-case, not `record | null`. `routing_policies` is listed
+ * UNFILTERED — the operation takes no `provider_id` query parameter — so this is
+ * the lookup on this surface most likely to outgrow one page, and the one where
+ * "not on page one" reported as 404 would tell an operator their live routing
+ * policy does not exist.
+ */
 async function ownedPolicy(
   client: MoiraClient,
   providerId: string,
   policyId: string,
-): Promise<RoutingPolicyRecord | null> {
+): Promise<PageLookup<RoutingPolicyRecord>> {
   const provider = await client.getProvider(providerId);
   const page = await client.listRoutingPolicies({ limit: LIST_PAGE_LIMIT });
-  return (
-    page.data.find(
-      (candidate) => candidate.id === policyId && candidate.provider_id === provider.id,
-    ) ?? null
+  return lookupOnPage(
+    page,
+    (candidate) => candidate.id === policyId && candidate.provider_id === provider.id,
   );
+}
+
+/** The refusal for a lookup that did not find its row. */
+function refuse(lookup: PageLookup<unknown>): Response {
+  return lookup.kind === "truncated"
+    ? badRequest(CONSOLE_MESSAGE_KEYS.llm_list_truncated)
+    : notFound(CONSOLE_MESSAGE_KEYS.llm_policy_not_found);
 }
 
 export async function DELETE(
@@ -57,8 +77,9 @@ export async function DELETE(
 ): Promise<Response> {
   const { id, policyId } = await context.params;
   return withConsoleSession(request, async ({ client }) => {
-    const policy = await ownedPolicy(client, id, policyId);
-    if (policy === null) return notFound(CONSOLE_MESSAGE_KEYS.llm_policy_not_found);
+    const lookup = await ownedPolicy(client, id, policyId);
+    if (lookup.kind !== "found") return refuse(lookup);
+    const policy = lookup.row;
 
     const record = await client.disableRoutingPolicy(policy.id, ifMatchFor(policy));
     return Response.json({ id: record.id }, { headers: NO_STORE });
@@ -71,8 +92,9 @@ export async function POST(
 ): Promise<Response> {
   const { id, policyId } = await context.params;
   return withConsoleSession(request, async ({ client }) => {
-    const policy = await ownedPolicy(client, id, policyId);
-    if (policy === null) return notFound(CONSOLE_MESSAGE_KEYS.llm_policy_not_found);
+    const lookup = await ownedPolicy(client, id, policyId);
+    if (lookup.kind !== "found") return refuse(lookup);
+    const policy = lookup.row;
 
     // Already active: answer with the row rather than burning a version on a
     // write that changes nothing.
