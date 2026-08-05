@@ -330,87 +330,273 @@ fn embedded_ipv4_addresses(ip: Ipv6Addr) -> Vec<Ipv4Addr> {
     found
 }
 
-/// Parses and validates a JWKS URL without fetching it.
+/// Why the shared address-space guard ([`validate_outbound_url`]) refused a URL.
 ///
-/// Order matters: scheme first (cheap, no I/O), then host classification. A hostname
-/// is resolved with [`tokio::net::lookup_host`] and **every** returned address is
-/// classified — a hostname can resolve to several, and a single denied address is
-/// enough to refuse the whole URL.
+/// Deliberately narrower than [`JwksDenialReason`]: this enum covers only the decisions
+/// that can be made *about a URL*, before and without a request. Everything a response
+/// can be wrong about — status, content type, size, redirect — is absent because those
+/// are not properties of a URL, and a caller that never issues the request (see
+/// [`OutboundUrlPolicy`]) can never observe them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundDenialReason {
+    /// Not a parseable absolute URL.
+    Url,
+    /// Scheme was not `https`.
+    Scheme,
+    /// The URL embeds a username or password.
+    Credentials,
+    /// The URL carries no host component at all.
+    Host,
+    /// DNS resolution failed or returned no addresses.
+    Resolution,
+    /// A resolved address, or an IP literal, falls inside a denied range.
+    IpRange,
+    /// An egress allow-list is configured and the host is not on it.
+    HostNotAllowed,
+    /// Resolution exceeded the configured DNS budget.
+    Timeout,
+}
+
+impl OutboundDenialReason {
+    /// Stable, machine-filterable token for audit metadata and log fields.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Url => "url",
+            Self::Scheme => "scheme",
+            Self::Credentials => "credentials",
+            Self::Host => "host",
+            Self::Resolution => "resolution",
+            Self::IpRange => "ip_range",
+            Self::HostNotAllowed => "host_not_allowed",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+
+/// A refused URL. `detail` is **server-side only** — it can name the resolved internal
+/// address, which is exactly what must not reach a caller.
+#[derive(Debug, Clone)]
+pub struct OutboundUrlDenial {
+    reason: OutboundDenialReason,
+    detail: String,
+}
+
+impl OutboundUrlDenial {
+    fn new(reason: OutboundDenialReason, detail: impl Into<String>) -> Self {
+        Self {
+            reason,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn reason(&self) -> OutboundDenialReason {
+        self.reason
+    }
+
+    /// Server-side detail. Log it, audit it, never serialise it into a response.
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+impl fmt::Display for OutboundUrlDenial {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.reason.as_str(), self.detail)
+    }
+}
+
+/// The address-space policy [`validate_outbound_url`] applies.
 ///
-/// When `allow_insecure_dev_urls` is set the rejections are skipped entirely and a
-/// `WARN` event is emitted so it is visible in logs that the protection is off.
-pub async fn validate_jwks_url(
+/// This struct is the reason the image path and the JWKS path share one implementation
+/// instead of two. Every field exists because the two callers genuinely differ; the
+/// differences are enumerated here rather than left implicit in a forked copy.
+#[derive(Debug, Clone)]
+pub struct OutboundUrlPolicy {
+    /// Label used in the server-side `detail` strings (`"jwks url"`, `"image url"`), so
+    /// one shared implementation still produces logs that name the offending subsystem.
+    pub subject: &'static str,
+    /// Budget for a single hostname resolution.
+    ///
+    /// **Why per-caller rather than one constant.** For JWKS this is the fetch budget:
+    /// one admin-configured URL, resolved behind a singleflight lock and then cached, so
+    /// the cost is paid roughly once per issuer per TTL. The image path resolves up to
+    /// `public_api.maximum_image_count` *caller-supplied* hosts on every request with no
+    /// cache in front of it, so it needs its own, tighter number — and a total budget
+    /// across the request on top (see `validate_image_urls`).
+    pub dns_timeout: Duration,
+    /// Optional egress allow-list of exact lowercase hostnames. Empty means "no
+    /// allow-list"; the address-range rules still apply either way.
+    ///
+    /// **Why only the image path sets this.** The JWKS path performs its own fetch, so it
+    /// closes the redirect hole directly — `redirect::Policy::none()` plus a final-URL
+    /// equality check ([`fetch_jwks_hardened`]). The image path hands the URL to a
+    /// provider and never sees the response, so a redirect from a validated public host
+    /// into private space is invisible to Moira and unblockable after the fact. An
+    /// allow-list is the only control on that path that still binds after a redirect,
+    /// because it constrains the origin the provider is willing to be sent to at all.
+    pub allowed_hosts: Vec<String>,
+    /// Refuse a URL that embeds a username or password.
+    ///
+    /// **Why this is a parameter and not simply always on.** The image path has always
+    /// refused embedded credentials and must keep doing so — the host those credentials
+    /// would be sent to is chosen by the caller. The JWKS path has always *accepted* them,
+    /// and turning that into a refusal here would revoke a URL shape some IdP deployments
+    /// legitimately configure, as an unannounced side effect of an unrelated change. The
+    /// two callers differ, so the difference is stated rather than silently resolved in
+    /// one direction; tightening JWKS is a decision for whoever owns that surface.
+    pub reject_credentials: bool,
+    /// Skip every rejection and log a `WARN`. Dev-only.
+    ///
+    /// **Why each caller owns its own flag.** These are separate trust surfaces:
+    /// `jwks_url` is admin-configured, an image URL arrives in an ordinary public request
+    /// body. An operator who loosens JWKS to point at a local IdP during development must
+    /// not thereby open the public image path to the same private space, so the two flags
+    /// are never read from one another.
+    pub allow_insecure: bool,
+}
+
+/// How a hostname becomes a set of addresses.
+///
+/// A seam, not an abstraction for its own sake: the security-relevant behaviour of
+/// [`validate_outbound_url`] is *what it does with a multi-address answer*, and that is
+/// not testable against the real resolver, which returns whatever the host's `/etc/hosts`
+/// and nameserver happen to say. Tests substitute a resolver with a fixed answer so the
+/// "one denied address among several refuses the whole URL" rule can be proved
+/// deterministically and without a network.
+pub trait HostResolver {
+    fn resolve(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> impl Future<Output = std::io::Result<Vec<SocketAddr>>> + Send;
+}
+
+/// The production resolver: the OS resolver via [`tokio::net::lookup_host`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemResolver;
+
+impl HostResolver for SystemResolver {
+    async fn resolve(&self, host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+        Ok(lookup_host((host.to_owned(), port)).await?.collect())
+    }
+}
+
+/// The shared address-space guard: everything that can be decided about an outbound URL
+/// without issuing a request.
+///
+/// Order matters and is part of the contract: parse, then the checks that need no I/O
+/// (scheme, embedded credentials, allow-list, IP literals), and only then DNS. A URL that
+/// is refusable for free is never allowed to cost a resolution — that ordering is what
+/// stops a caller from using the guard itself as a way to make Moira perform arbitrary
+/// lookups.
+///
+/// Every resolved address is classified, not just the first. A hostname routinely resolves
+/// to several addresses and a rebinding answer typically mixes a public one with a private
+/// one; a single denied address refuses the whole URL.
+pub async fn validate_outbound_url<R: HostResolver>(
     raw_url: &str,
-    settings: &JwksFetchSettings,
-) -> Result<Url, JwksFetchError> {
+    policy: &OutboundUrlPolicy,
+    resolver: &R,
+) -> Result<Url, OutboundUrlDenial> {
+    let subject = policy.subject;
     let url = Url::parse(raw_url).map_err(|err| {
-        JwksFetchError::new(
-            JwksDenialReason::Url,
-            format!("jwks url is not a valid absolute url: {err}"),
+        OutboundUrlDenial::new(
+            OutboundDenialReason::Url,
+            format!("{subject} is not a valid absolute url: {err}"),
         )
     })?;
 
-    if settings.allow_insecure_dev_urls {
+    if policy.allow_insecure {
         tracing::warn!(
-            jwks_url = %url,
-            "JWKS SSRF protection is disabled by auth.jwks.allow_insecure_dev_urls; \
-             scheme and address-range checks were skipped"
+            url = %url,
+            subject,
+            "outbound SSRF protection is disabled by configuration; scheme, allow-list \
+             and address-range checks were skipped"
         );
         return Ok(url);
     }
 
     if url.scheme() != "https" {
-        return Err(JwksFetchError::new(
-            JwksDenialReason::Scheme,
-            format!("jwks url scheme '{}' is not https", url.scheme()),
+        return Err(OutboundUrlDenial::new(
+            OutboundDenialReason::Scheme,
+            format!("{subject} scheme '{}' is not https", url.scheme()),
+        ));
+    }
+
+    // Credentials in an outbound URL are sent to whoever the host turns out to be, and on
+    // the image path that host is chosen by the caller.
+    if policy.reject_credentials && (url.username() != "" || url.password().is_some()) {
+        return Err(OutboundUrlDenial::new(
+            OutboundDenialReason::Credentials,
+            format!("{subject} embeds credentials"),
         ));
     }
 
     let host = url.host().ok_or_else(|| {
-        JwksFetchError::new(JwksDenialReason::Host, "jwks url has no host component")
+        OutboundUrlDenial::new(
+            OutboundDenialReason::Host,
+            format!("{subject} has no host component"),
+        )
     })?;
+
+    // The allow-list is checked before DNS: it is a pure string comparison, and a host
+    // that is not on the list must not be worth a lookup.
+    if !policy.allowed_hosts.is_empty() {
+        let host_text = match &host {
+            Host::Domain(domain) => domain.to_ascii_lowercase(),
+            Host::Ipv4(v4) => v4.to_string(),
+            Host::Ipv6(v6) => v6.to_string(),
+        };
+        if !policy
+            .allowed_hosts
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(&host_text))
+        {
+            return Err(OutboundUrlDenial::new(
+                OutboundDenialReason::HostNotAllowed,
+                format!("{subject} host '{host_text}' is not on the egress allow-list"),
+            ));
+        }
+    }
 
     match host {
         // The `url` crate parses spec-compliant IPv4 literals — including the
         // decimal (`2130706433`) and hex (`0x7f.0.0.1`) forms — into `Host::Ipv4`,
         // so those bypasses are classified here rather than falling through to DNS.
-        Host::Ipv4(v4) => reject_if_denied(IpAddr::V4(v4))?,
-        Host::Ipv6(v6) => reject_if_denied(IpAddr::V6(v6))?,
+        Host::Ipv4(v4) => reject_if_denied(subject, IpAddr::V4(v4))?,
+        Host::Ipv6(v6) => reject_if_denied(subject, IpAddr::V6(v6))?,
         Host::Domain(domain) => {
             let port = url.port_or_known_default().unwrap_or(443);
-            // `lookup_host` runs on the blocking pool and honours the *OS* resolver
-            // timeout (10-40 s under glibc), not Moira's. Left unbounded it would sit
-            // outside `timeout_ms` entirely and — because the singleflight mutex in
-            // `JwksCache::load` is held across this call — park every concurrent
-            // authentication for the issuer behind one blackholed nameserver.
-            let dns_budget = Duration::from_millis(settings.timeout_ms.max(1));
-            let resolved: Vec<SocketAddr> =
-                tokio::time::timeout(dns_budget, lookup_host((domain, port)))
-                    .await
-                    .map_err(|_| {
-                        JwksFetchError::new(
-                            JwksDenialReason::Timeout,
-                            format!(
-                                "jwks host '{domain}' did not resolve within {} ms",
-                                settings.timeout_ms
-                            ),
-                        )
-                    })?
-                    .map_err(|err| {
-                        JwksFetchError::new(
-                            JwksDenialReason::Resolution,
-                            format!("jwks host '{domain}' could not be resolved: {err}"),
-                        )
-                    })?
-                    .collect();
+            // The OS resolver honours its *own* timeout (10-40 s under glibc), not
+            // Moira's. Left unbounded a blackholed nameserver stalls the caller far past
+            // any budget it thinks it has — and on the JWKS path the singleflight mutex
+            // in `JwksCache::load` is held across this call, so it would park every
+            // concurrent authentication for the issuer behind that one lookup.
+            let resolved = tokio::time::timeout(policy.dns_timeout, resolver.resolve(domain, port))
+                .await
+                .map_err(|_| {
+                    OutboundUrlDenial::new(
+                        OutboundDenialReason::Timeout,
+                        format!(
+                            "{subject} host '{domain}' did not resolve within {} ms",
+                            policy.dns_timeout.as_millis()
+                        ),
+                    )
+                })?
+                .map_err(|err| {
+                    OutboundUrlDenial::new(
+                        OutboundDenialReason::Resolution,
+                        format!("{subject} host '{domain}' could not be resolved: {err}"),
+                    )
+                })?;
             if resolved.is_empty() {
-                return Err(JwksFetchError::new(
-                    JwksDenialReason::Resolution,
-                    format!("jwks host '{domain}' resolved to no addresses"),
+                return Err(OutboundUrlDenial::new(
+                    OutboundDenialReason::Resolution,
+                    format!("{subject} host '{domain}' resolved to no addresses"),
                 ));
             }
             for address in resolved {
-                reject_if_denied(address.ip())?;
+                reject_if_denied(subject, address.ip())?;
             }
         }
     }
@@ -418,11 +604,55 @@ pub async fn validate_jwks_url(
     Ok(url)
 }
 
-fn reject_if_denied(ip: IpAddr) -> Result<(), JwksFetchError> {
+/// Parses and validates a JWKS URL without fetching it.
+///
+/// A thin adapter over the shared [`validate_outbound_url`] guard: this path's only
+/// distinct behaviour is that its denial reasons are recorded under
+/// [`JwksDenialReason`], whose tokens are an audited, asserted-on surface.
+///
+/// When `allow_insecure_dev_urls` is set the rejections are skipped entirely and a
+/// `WARN` event is emitted so it is visible in logs that the protection is off.
+pub async fn validate_jwks_url(
+    raw_url: &str,
+    settings: &JwksFetchSettings,
+) -> Result<Url, JwksFetchError> {
+    let policy = OutboundUrlPolicy {
+        subject: "jwks url",
+        dns_timeout: Duration::from_millis(settings.timeout_ms.max(1)),
+        // The JWKS fetch is Moira's own, so it closes the redirect hole at the transport
+        // rather than by constraining the set of reachable origins. See
+        // `OutboundUrlPolicy::allowed_hosts`.
+        allowed_hosts: Vec::new(),
+        // Unchanged from before this guard was shared: see `reject_credentials`.
+        reject_credentials: false,
+        allow_insecure: settings.allow_insecure_dev_urls,
+    };
+    validate_outbound_url(raw_url, &policy, &SystemResolver)
+        .await
+        .map_err(|denial| {
+            let reason = match denial.reason() {
+                OutboundDenialReason::Url => JwksDenialReason::Url,
+                OutboundDenialReason::Scheme => JwksDenialReason::Scheme,
+                // Unreachable while `reject_credentials` is false on this path; mapped
+                // rather than `unreachable!()` so enabling the flag cannot panic.
+                OutboundDenialReason::Credentials | OutboundDenialReason::Host => {
+                    JwksDenialReason::Host
+                }
+                OutboundDenialReason::Resolution => JwksDenialReason::Resolution,
+                OutboundDenialReason::IpRange | OutboundDenialReason::HostNotAllowed => {
+                    JwksDenialReason::IpRange
+                }
+                OutboundDenialReason::Timeout => JwksDenialReason::Timeout,
+            };
+            JwksFetchError::new(reason, denial.detail().to_string())
+        })
+}
+
+fn reject_if_denied(subject: &str, ip: IpAddr) -> Result<(), OutboundUrlDenial> {
     if is_denied_ip(ip) {
-        return Err(JwksFetchError::new(
-            JwksDenialReason::IpRange,
-            format!("jwks url resolves to denied address {ip}"),
+        return Err(OutboundUrlDenial::new(
+            OutboundDenialReason::IpRange,
+            format!("{subject} resolves to denied address {ip}"),
         ));
     }
     Ok(())
@@ -1213,6 +1443,331 @@ mod tests {
         assert!(
             !body.contains("169.254.169.254"),
             "the resolved address must not reach the admin either: {body}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The shared address-space guard (issue #89)
+    //
+    // These drive `validate_outbound_url` through a scripted resolver. The rules
+    // worth testing are the ones about *what the guard does with an answer* —
+    // a real resolver returns whatever the build host's `/etc/hosts` says, which
+    // cannot express "one public address and one private one in this order".
+    // -----------------------------------------------------------------------
+
+    /// A resolver with a scripted answer, an optional delay, and a call counter.
+    struct ScriptedResolver {
+        answer: Vec<SocketAddr>,
+        delay: Option<Duration>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ScriptedResolver {
+        fn returning(addresses: &[&str]) -> Self {
+            Self {
+                answer: addresses
+                    .iter()
+                    .map(|address| SocketAddr::new(ip(address), 443))
+                    .collect(),
+                delay: None,
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        fn slow(delay: Duration) -> Self {
+            Self {
+                answer: vec![SocketAddr::new(ip("93.184.216.34"), 443)],
+                delay: Some(delay),
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl HostResolver for ScriptedResolver {
+        async fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<SocketAddr>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(delay) = self.delay {
+                tokio::time::sleep(delay).await;
+            }
+            Ok(self.answer.clone())
+        }
+    }
+
+    fn image_policy() -> OutboundUrlPolicy {
+        OutboundUrlPolicy {
+            subject: "image url",
+            dns_timeout: Duration::from_millis(1_000),
+            allowed_hosts: Vec::new(),
+            reject_credentials: true,
+            allow_insecure: false,
+        }
+    }
+
+    /// The credential rule is opt-in, and the JWKS path deliberately leaves it off so this
+    /// change does not revoke a URL shape it previously accepted. Pinned so that flipping
+    /// either caller's setting is a visible decision rather than a silent drift.
+    #[tokio::test]
+    async fn the_credential_rule_is_per_caller() {
+        let credentialed = "https://user:pass@idp.example.com/jwks";
+        let resolver = ScriptedResolver::returning(&["93.184.216.34"]);
+
+        let permissive = OutboundUrlPolicy {
+            reject_credentials: false,
+            ..image_policy()
+        };
+        validate_outbound_url(credentialed, &permissive, &resolver)
+            .await
+            .expect("with the rule off, embedded credentials are not the reason to refuse");
+
+        assert_eq!(
+            validate_outbound_url(credentialed, &image_policy(), &resolver)
+                .await
+                .expect_err("with the rule on, they are")
+                .reason(),
+            OutboundDenialReason::Credentials
+        );
+    }
+
+    async fn deny(url: &str, policy: &OutboundUrlPolicy) -> OutboundDenialReason {
+        let resolver = ScriptedResolver::returning(&["93.184.216.34"]);
+        validate_outbound_url(url, policy, &resolver)
+            .await
+            .expect_err("the guard must refuse this URL")
+            .reason()
+    }
+
+    #[tokio::test]
+    async fn the_guard_refuses_a_non_https_scheme() {
+        assert_eq!(
+            deny("http://images.example.com/a.png", &image_policy()).await,
+            OutboundDenialReason::Scheme
+        );
+    }
+
+    #[tokio::test]
+    async fn the_guard_refuses_embedded_credentials() {
+        assert_eq!(
+            deny(
+                "https://user:pass@images.example.com/a.png",
+                &image_policy()
+            )
+            .await,
+            OutboundDenialReason::Credentials
+        );
+    }
+
+    /// The literal forms. The decimal and hexadecimal spellings are the ones a
+    /// string-comparison check misses, which is the defect issue #89 is about:
+    /// none of these is the text `127.0.0.1`, and every one of them is loopback.
+    #[tokio::test]
+    async fn the_guard_refuses_denied_address_literals_in_every_spelling() {
+        for literal in [
+            "https://127.0.0.1/a.png",
+            "https://2130706433/a.png",
+            "https://0x7f.0.0.1/a.png",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://10.0.0.5/a.png",
+            "https://192.168.1.1/a.png",
+            "https://[::1]/a.png",
+            "https://[::ffff:169.254.169.254]/a.png",
+            "https://[64:ff9b::a9fe:a9fe]/a.png",
+        ] {
+            assert_eq!(
+                deny(literal, &image_policy()).await,
+                OutboundDenialReason::IpRange,
+                "{literal} must be refused as a denied address"
+            );
+        }
+    }
+
+    /// The rule that a naive "check the first answer" implementation gets wrong, and
+    /// the one that matters against a rebinding nameserver: the denied address is
+    /// **second**, so a guard that inspects only `resolved.first()` lets this through.
+    #[tokio::test]
+    async fn one_denied_address_anywhere_in_the_answer_refuses_the_whole_url() {
+        let resolver = ScriptedResolver::returning(&["93.184.216.34", "169.254.169.254"]);
+        let denial = validate_outbound_url(
+            "https://images.example.com/a.png",
+            &image_policy(),
+            &resolver,
+        )
+        .await
+        .expect_err("a denied address in second position must still refuse the URL");
+        assert_eq!(denial.reason(), OutboundDenialReason::IpRange);
+        assert!(
+            denial.detail().contains("169.254.169.254"),
+            "the server-side detail names the offending address: {}",
+            denial.detail()
+        );
+    }
+
+    /// The same answer in the other order, so the test above cannot be satisfied by a
+    /// guard that happens to inspect only the *last* address either.
+    #[tokio::test]
+    async fn a_denied_address_in_first_position_also_refuses_the_url() {
+        let resolver = ScriptedResolver::returning(&["10.1.2.3", "93.184.216.34"]);
+        assert_eq!(
+            validate_outbound_url(
+                "https://images.example.com/a.png",
+                &image_policy(),
+                &resolver
+            )
+            .await
+            .expect_err("a denied address in first position must refuse the URL")
+            .reason(),
+            OutboundDenialReason::IpRange
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wholly_public_answer_is_accepted() {
+        let resolver = ScriptedResolver::returning(&["93.184.216.34", "1.1.1.1"]);
+        validate_outbound_url(
+            "https://images.example.com/a.png",
+            &image_policy(),
+            &resolver,
+        )
+        .await
+        .expect("a public host must remain usable");
+        assert_eq!(resolver.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_empty_resolution_is_refused_rather_than_treated_as_no_denied_address() {
+        let resolver = ScriptedResolver::returning(&[]);
+        assert_eq!(
+            validate_outbound_url(
+                "https://images.example.com/a.png",
+                &image_policy(),
+                &resolver
+            )
+            .await
+            .expect_err("an empty answer must not pass the loop vacuously")
+            .reason(),
+            OutboundDenialReason::Resolution
+        );
+    }
+
+    /// The allow-list is a pure string comparison, so a host that is not on it must cost
+    /// no lookup at all. The call counter is the assertion that matters: moving the
+    /// allow-list check to *after* resolution would still refuse the URL and would still
+    /// leave a reason-only test green.
+    #[tokio::test]
+    async fn the_allow_list_is_applied_before_any_resolution() {
+        let policy = OutboundUrlPolicy {
+            allowed_hosts: vec!["images.example.com".to_string()],
+            ..image_policy()
+        };
+        let resolver = ScriptedResolver::returning(&["93.184.216.34"]);
+        let denial = validate_outbound_url("https://evil.example.net/a.png", &policy, &resolver)
+            .await
+            .expect_err("a host off the allow-list must be refused");
+        assert_eq!(denial.reason(), OutboundDenialReason::HostNotAllowed);
+        assert_eq!(
+            resolver.calls(),
+            0,
+            "a host that is not on the allow-list must not buy a DNS lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_allow_listed_host_still_has_its_addresses_classified() {
+        let policy = OutboundUrlPolicy {
+            allowed_hosts: vec!["images.example.com".to_string()],
+            ..image_policy()
+        };
+        // On the allow-list *and* resolving into private space. The allow-list is an
+        // additional constraint, never a bypass of the address rules.
+        let resolver = ScriptedResolver::returning(&["10.0.0.7"]);
+        assert_eq!(
+            validate_outbound_url("https://images.example.com/a.png", &policy, &resolver)
+                .await
+                .expect_err("an allow-listed host must still be address-checked")
+                .reason(),
+            OutboundDenialReason::IpRange
+        );
+    }
+
+    #[tokio::test]
+    async fn an_allow_listed_host_is_accepted() {
+        let policy = OutboundUrlPolicy {
+            allowed_hosts: vec!["Images.Example.COM".to_string()],
+            ..image_policy()
+        };
+        let resolver = ScriptedResolver::returning(&["93.184.216.34"]);
+        validate_outbound_url("https://images.example.com/a.png", &policy, &resolver)
+            .await
+            .expect("allow-list matching is case-insensitive on the hostname");
+    }
+
+    /// Without the `tokio::time::timeout` wrapper this test does not fail — it hangs,
+    /// which the harness reports as a failure just the same.
+    #[tokio::test]
+    async fn a_slow_resolver_is_abandoned_at_the_dns_budget() {
+        let policy = OutboundUrlPolicy {
+            dns_timeout: Duration::from_millis(50),
+            ..image_policy()
+        };
+        let resolver = ScriptedResolver::slow(Duration::from_secs(30));
+        let started = std::time::Instant::now();
+        assert_eq!(
+            validate_outbound_url("https://images.example.com/a.png", &policy, &resolver)
+                .await
+                .expect_err("a stalled lookup must be abandoned")
+                .reason(),
+            OutboundDenialReason::Timeout
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the guard must give up at its own budget, not the resolver's"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_insecure_override_skips_the_checks_it_says_it_skips() {
+        let policy = OutboundUrlPolicy {
+            allow_insecure: true,
+            ..image_policy()
+        };
+        let resolver = ScriptedResolver::returning(&["127.0.0.1"]);
+        validate_outbound_url("http://127.0.0.1:6379/a.png", &policy, &resolver)
+            .await
+            .expect("the dev override disables the guard wholesale");
+    }
+
+    /// The JWKS wrapper must keep reporting the audited reason tokens it always did —
+    /// `jwks_hardening.rs` asserts on those exact strings and the audit rows are a
+    /// stored, queryable surface.
+    #[tokio::test]
+    async fn the_jwks_wrapper_preserves_its_audited_reason_tokens() {
+        let settings = hardened();
+        assert_eq!(
+            validate_jwks_url("http://idp.example.com/jwks", &settings)
+                .await
+                .expect_err("http must be refused")
+                .reason()
+                .as_str(),
+            "scheme"
+        );
+        assert_eq!(
+            validate_jwks_url("https://169.254.169.254/jwks", &settings)
+                .await
+                .expect_err("the metadata endpoint must be refused")
+                .reason()
+                .as_str(),
+            "ip_range"
+        );
+        assert_eq!(
+            validate_jwks_url("not-a-url", &settings)
+                .await
+                .expect_err("a malformed url must be refused")
+                .reason()
+                .as_str(),
+            "url"
         );
     }
 }

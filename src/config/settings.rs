@@ -333,6 +333,71 @@ pub struct PublicApiSettings {
     pub maximum_schema_bytes: usize,
     pub heartbeat_seconds: u64,
     pub rate_limiter_max_entries: usize,
+    /// SSRF policy for caller-supplied image URLs.
+    ///
+    /// `#[serde(default)]` on [`ImageUrlSettings`] itself, so a config file written
+    /// before this section existed still deserializes into the hardened defaults.
+    #[serde(default)]
+    pub image_urls: ImageUrlSettings,
+}
+
+/// SSRF policy applied to every `input_image.image_url` in a public request.
+///
+/// **This path validates a URL it does not fetch.** The image URL is handed to the
+/// provider (`UserContent::image_url`), and the provider is what performs the request.
+/// That makes the guard *admission control*, not a fetch policy, and it is why this
+/// section has no content-type or response-size knob: there is no response for Moira to
+/// inspect. The controls that survive the hand-off are the address-space rules and the
+/// allow-list.
+///
+/// `#[serde(default)]` on the container so an operator may override one knob without
+/// restating the others.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ImageUrlSettings {
+    /// Budget for resolving a single image hostname.
+    ///
+    /// Tighter than the JWKS budget by default and deliberately so: a JWKS URL is
+    /// admin-configured, resolved behind a singleflight lock and cached, whereas these
+    /// are caller-supplied, uncached, and there can be `maximum_image_count` of them in
+    /// one request.
+    pub dns_timeout_ms: u64,
+    /// Ceiling on the time spent resolving *all* image hosts in one request.
+    ///
+    /// Without it the worst case is `maximum_image_count * dns_timeout_ms`, which turns a
+    /// single request into a cheap way to occupy a connection and a blocking-pool thread
+    /// per image. The JWKS path needs no equivalent because it validates exactly one URL.
+    pub total_validation_timeout_ms: u64,
+    /// Optional egress allow-list of exact hostnames. Empty (the default) means any host
+    /// that passes the address-range rules is accepted.
+    ///
+    /// A deployment that knows which origins its images come from should set this: it is
+    /// the only control that still binds when the provider follows a redirect Moira never
+    /// sees. See `OutboundUrlPolicy::allowed_hosts`.
+    ///
+    /// Matching is on the host alone — not the port or path — and against the URL crate's
+    /// normalised host, so an internationalised domain must be listed in its punycode form
+    /// (`xn--mnchen-3ya.example`, not `münchen.example`). Case is ignored. A subdomain is
+    /// **not** implied by its parent: list every host you intend to permit.
+    pub allowed_hosts: Vec<String>,
+    /// Dev-only escape hatch permitting `http://` and private/loopback/link-local image
+    /// URLs. MUST stay `false` outside development; `Settings::validate` hard-fails
+    /// production when it is `true`.
+    ///
+    /// Separate from `auth.jwks.allow_insecure_dev_urls` on purpose — see
+    /// `OutboundUrlPolicy::allow_insecure`.
+    pub allow_insecure_dev_urls: bool,
+}
+
+impl Default for ImageUrlSettings {
+    fn default() -> Self {
+        Self {
+            dns_timeout_ms: 1_000,
+            total_validation_timeout_ms: 3_000,
+            allowed_hosts: Vec::new(),
+            allow_insecure_dev_urls: false,
+        }
+    }
 }
 
 /// The optional Redis coordination client's configuration.
@@ -588,6 +653,9 @@ impl Settings {
         if self.auth.jwks.allow_insecure_dev_urls {
             features.push("insecure_jwks_urls");
         }
+        if self.public_api.image_urls.allow_insecure_dev_urls {
+            features.push("insecure_image_urls");
+        }
         if self.provider_security.allow_http_provider_urls {
             features.push("http_provider_urls");
         }
@@ -768,6 +836,12 @@ impl Settings {
         if self.auth.jwks.allow_insecure_dev_urls {
             violations
                 .push("auth.jwks.allow_insecure_dev_urls must be false in production".to_string());
+        }
+        if self.public_api.image_urls.allow_insecure_dev_urls {
+            violations.push(
+                "public_api.image_urls.allow_insecure_dev_urls must be false in production"
+                    .to_string(),
+            );
         }
         if self.workers.enabled {
             violations.push("workers.enabled must be false until workers are implemented".into());
@@ -1152,6 +1226,7 @@ impl Default for PublicApiSettings {
             maximum_schema_bytes: 64 * 1024,
             heartbeat_seconds: 15,
             rate_limiter_max_entries: 10_000,
+            image_urls: ImageUrlSettings::default(),
         }
     }
 }
@@ -1601,6 +1676,52 @@ mod tests {
         assert!(
             error.contains("auth.jwks.allow_insecure_dev_urls must be false in production"),
             "unexpected error: {error}"
+        );
+    }
+
+    /// The image-URL escape hatch is a *separate* flag from the JWKS one on purpose, so
+    /// production must refuse it on its own account. If the two were ever collapsed into
+    /// one knob this fails, which is the point.
+    #[test]
+    fn production_rejects_allow_insecure_dev_image_urls() {
+        let mut settings = valid_production_settings();
+        settings.public_api.image_urls.allow_insecure_dev_urls = true;
+        assert!(
+            !settings.auth.jwks.allow_insecure_dev_urls,
+            "the JWKS flag stays off, so only the image flag can produce the violation"
+        );
+
+        let error = settings
+            .validate(ProcessMode::Serve)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "public_api.image_urls.allow_insecure_dev_urls must be false in production"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn image_url_settings_defaults_fail_closed() {
+        let settings = ImageUrlSettings::default();
+
+        assert!(
+            !settings.allow_insecure_dev_urls,
+            "the SSRF escape hatch must default to disabled"
+        );
+        assert!(
+            settings.allowed_hosts.is_empty(),
+            "the egress allow-list is opt-in; the address rules carry the default posture"
+        );
+        assert!(
+            settings.dns_timeout_ms > 0 && settings.total_validation_timeout_ms > 0,
+            "a zero budget would make every image URL fail closed on timing alone"
+        );
+        assert!(
+            settings.total_validation_timeout_ms >= settings.dns_timeout_ms,
+            "a request-wide budget below the per-host one would cut short the first lookup"
         );
     }
 
