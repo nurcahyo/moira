@@ -93,11 +93,12 @@ impl Case {
     ///
     /// Built from the fixture's own settings so nothing but the pepper differs — a rotated
     /// state that also changed, say, the retrieval policy would not be a rotation.
-    fn rotated_state(&self) -> AppState {
+    async fn rotated_state(&self) -> AppState {
         let mut settings = (*self.fixture.state.settings).clone();
         settings.idempotency.pepper_base64 = Some(STANDARD.encode(ROTATED_PEPPER));
         settings.idempotency.pepper_version = ROTATED_VERSION.to_string();
         let state = AppState::new(settings, Some(self.fixture.pool.clone()))
+            .await
             .expect("an app state on the rotated pepper");
         assert_ne!(
             state.idempotency_hasher.hash(b"probe"),
@@ -263,7 +264,7 @@ async fn memory_content_hash_still_matches_after_an_idempotency_pepper_rotation(
     );
 
     // --- rotate --------------------------------------------------------------------------
-    let rotated_state = case.rotated_state();
+    let rotated_state = case.rotated_state().await;
     let after = ConversationService::new(&rotated_state).expect("rotated conversation service");
 
     // --- the same content, hashed by the rotated process ---------------------------------
@@ -363,7 +364,7 @@ async fn conversation_message_content_hash_stays_peppered_and_changes_on_rotatio
     );
 
     // --- rotate, and write the identical content again ------------------------------------
-    let rotated_state = case.rotated_state();
+    let rotated_state = case.rotated_state().await;
     let after = ConversationService::new(&rotated_state).expect("rotated conversation service");
     let (second_id, second_returned) = case.create_message(&after, &content).await;
     let second_stored = case.stored_message_hash(&second_id).await;

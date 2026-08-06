@@ -2784,9 +2784,11 @@ mod tests {
         assert_eq!(pipeline.names().last().copied(), Some("AuditInterceptor"));
     }
 
-    #[test]
-    fn metadata_rejects_secret_like_keys() {
-        let state = AppState::new(crate::config::Settings::default(), None).unwrap();
+    #[tokio::test]
+    async fn metadata_rejects_secret_like_keys() {
+        let state = AppState::new(crate::config::Settings::default(), None)
+            .await
+            .unwrap();
         let metadata = json!({ "api_key": "sk-test" });
         assert!(validate_metadata(&state, &metadata).is_err());
     }

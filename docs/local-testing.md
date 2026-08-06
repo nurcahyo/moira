@@ -191,15 +191,51 @@ WARN moira: unsafe development configuration is active
 ## Rotating keys
 
 `make env-force` rewrites the layout of both env files and **keeps** the master
-key, both peppers and the console secrets. That is deliberate:
+key, both peppers, the content-encryption key and the console secrets. That is
+deliberate:
 
 - `MOIRA_SECRETS__MASTER_KEY_BASE64` seals every `provider_credentials` row
 - `MOIRA_API_KEYS__PEPPER_BASE64` peppers every live API key hash
+- `MOIRA_CONTENT_ENCRYPTION__KEYS` wraps every content data key
 - `BETTER_AUTH_SECRET` encrypts the console's stored ES256 signing key
 
 Minting new ones does not fail and does not warn. The old rows simply stop being
 readable, at use time, one endpoint at a time. `make env-rotate` does rotate them,
 and asks first.
+
+### Rotating the content-encryption master key
+
+`MOIRA_CONTENT_ENCRYPTION__KEYS` is a **list**, and that is the whole point — it is
+what makes a rotation something other than a data-loss event:
+
+```
+MOIRA_CONTENT_ENCRYPTION__KEYS=local-dev:<old-base64>,local-2026-08:<new-base64>
+MOIRA_CONTENT_ENCRYPTION__ACTIVE_KEY_ID=local-2026-08
+```
+
+Add the new key, leave the old one in place, then move `ACTIVE_KEY_ID`. New data
+keys are wrapped under the new master key; anything already wrapped under the old
+one keeps opening, with nothing re-encrypted. Removing an id that something is
+still sealed under is what breaks it, and the failure is loud rather than silent:
+the custody refuses by name, saying which id it wanted.
+
+Two guards you will meet if you get it wrong:
+
+- Setting `ACTIVE_KEY_ID` to an id that is not in the list is a **startup refusal**
+  that names the ids that are configured.
+- Pasting the built-in development sentinel into `KEYS` is refused in *every*
+  environment, not only production. It is reachable only through
+  `MOIRA_CONTENT_ENCRYPTION__ALLOW_INSECURE_DEV_KEY=true` with `KEYS` empty, which
+  is what `unsafe_development_features` reports as
+  `insecure_content_encryption_key` in the startup WARN.
+
+`scripts/dev-env.sh` generates real random material for this, never the sentinel,
+and carries it across `make env-force` exactly like the other secrets.
+
+Nothing reads or writes an encrypted column yet — this release ships the
+configuration surface and the boot validation one release ahead of the behaviour,
+so the variable can be in place before it is required. See
+[`decision-encryption-at-rest.md`](decision-encryption-at-rest.md).
 
 ## The console
 

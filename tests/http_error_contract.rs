@@ -50,7 +50,9 @@ async fn get_json(router: &Router, uri: &str, request_id: &str) -> (StatusCode, 
 
 #[tokio::test]
 async fn error_response_body_includes_i18n_fields_and_request_id() {
-    let state = AppState::new(Settings::default(), None).expect("app state");
+    let state = AppState::new(Settings::default(), None)
+        .await
+        .expect("app state");
     let app = build_router(state).expect("router");
 
     let request_id = "contract-request-id";

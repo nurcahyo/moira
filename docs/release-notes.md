@@ -8,6 +8,57 @@ changelog.
 
 ## Unreleased
 
+### Breaking: production requires `MOIRA_CONTENT_ENCRYPTION__KEYS`, and will not start without it
+
+Closes [#135](https://github.com/nurcahyo/moira/issues/135), the first step of the
+envelope-encryption-at-rest train decided in
+[`decision-encryption-at-rest.md`](decision-encryption-at-rest.md).
+
+**Every production deployment fails to boot after upgrading until this variable is set.** The
+refusal happens in `AppState::new`, before the listener binds, so the pod never becomes Ready —
+it does not start degraded and it does not fail later on a request.
+
+**Set this before upgrading:**
+
+```
+MOIRA_CONTENT_ENCRYPTION__CUSTODY=environment
+MOIRA_CONTENT_ENCRYPTION__KEYS=content-v1:$(openssl rand -base64 32)
+MOIRA_CONTENT_ENCRYPTION__ACTIVE_KEY_ID=content-v1
+MOIRA_CONTENT_ENCRYPTION__ALLOW_INSECURE_DEV_KEY=false
+```
+
+On the Helm chart the key bytes belong in the operator-supplied `moira-secrets` Secret, exactly
+like the three existing 32-byte secrets; `CUSTODY`, `ACTIVE_KEY_ID` and `ALLOW_INSECURE_DEV_KEY`
+are already in the chart's ConfigMap. `KEYS` is a list — `"<id>:<base64>,<id>:<base64>"` — and
+`ACTIVE_KEY_ID` must name one of its ids.
+
+**Why it is required unconditionally**, even on a deployment where no application stores
+encrypted content. The persistence policy is flippable at runtime through the admin API without
+a restart, so requiring the key only when some policy row selects it would make a boot invariant
+depend on mutable database state: a replica that booted yesterday would fail today because
+someone changed a policy on another replica. That was considered and rejected.
+
+**What this release does *not* do.** Nothing reads or writes an encrypted column yet. No stored
+data changes, no request behaviour changes, no endpoint changes. This ships the configuration
+surface, the pluggable key-custody seam and the boot validation **one full release ahead** of any
+behaviour change, which is the entire mitigation for the break above — the variable can be in
+place before the release that uses it.
+
+**No fallback, deliberately.** Leaving `KEYS` unset does *not* fall back to
+`MOIRA_SECRETS__MASTER_KEY_BASE64`. Provider credentials and user content have different
+retention and different blast radius, and a configuration that looks set while being inert is the
+class of failure this refusal exists to prevent.
+
+**Development is unaffected.** `content_encryption.allow_insecure_dev_key` defaults to `true`
+outside production and substitutes a built-in sentinel, reported in the startup WARN as
+`insecure_content_encryption_key`. Pasting that sentinel into `KEYS` is refused in *every*
+environment. `scripts/dev-env.sh` generates real random material and carries it across
+`make env-force`, so an existing local database keeps working.
+
+**Rotating it later** means adding the new key to the list, leaving the old one there, and then
+moving `ACTIVE_KEY_ID`; nothing is re-encrypted and previously wrapped keys keep opening. See the
+rotation section of [`local-testing.md`](local-testing.md).
+
 ### Breaking: a structured-output reply that is not JSON is now a 422 instead of a null value
 
 Closes [#80](https://github.com/nurcahyo/moira/issues/80) (finding F29's deferred fail-hard flip).

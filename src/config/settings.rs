@@ -1,9 +1,10 @@
-use std::{net::SocketAddr, path::Path};
+use std::{collections::HashMap, net::SocketAddr, path::Path};
 
 use axum::http::HeaderValue;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use config::{Config, Environment, File};
 use serde::Deserialize;
+use zeroize::Zeroizing;
 
 use crate::error::AppError;
 
@@ -17,6 +18,8 @@ pub struct Settings {
     pub database: DatabaseSettings,
     #[serde(default)]
     pub secrets: SecretSettings,
+    #[serde(default)]
+    pub content_encryption: ContentEncryptionSettings,
     #[serde(default)]
     pub auth: AuthSettings,
     #[serde(default)]
@@ -121,6 +124,77 @@ pub struct SecretSettings {
     pub master_key_base64: Option<String>,
     pub key_id: String,
     pub allow_insecure_dev_key: bool,
+}
+
+/// Where the master key that wraps a content data key is held.
+///
+/// `Kms` and `Vault` are deliberately absent rather than present-and-unimplemented: an operator
+/// who sets a variant this build cannot serve gets a deserialisation refusal naming the accepted
+/// values, not a process that boots and then cannot wrap.
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentEncryptionCustody {
+    #[default]
+    Environment,
+}
+
+/// Envelope-encryption configuration for the content columns
+/// (`docs/decision-encryption-at-rest.md` §5).
+///
+/// **A new block, deliberately not reusing `secrets.master_key_base64`.** Provider credentials
+/// and user content have different retention and different blast radius, [`SecretSettings`]
+/// cannot express a key *list*, and changing it would change `provider_credentials` semantics.
+/// **An implicit fallback — "if `keys` is unset, use `secrets.master_key_base64`" — is rejected
+/// outright**: that is the silently-inert-configuration class this release exists to avoid.
+///
+/// `Debug` is hand-written for the same reason [`ApiKeySettings`]'s is: `keys` holds base64
+/// master-key material and this struct is reachable from [`Settings`], which derives `Debug`.
+#[derive(Clone, Deserialize)]
+#[serde(default)]
+pub struct ContentEncryptionSettings {
+    pub custody: ContentEncryptionCustody,
+    /// `"id:base64,id:base64"`. Neither `,` nor `:` is in the base64 alphabet, so
+    /// `split_once(':')` is unambiguous.
+    ///
+    /// Every key an existing row might have been sealed under stays listed here through a
+    /// rotation; that is what makes previously-wrapped data keys readable with no re-encryption.
+    pub keys: String,
+    /// The id new data keys are wrapped under. Must be one of [`Self::keys`].
+    pub active_key_id: String,
+    /// Development-only fallback to the built-in sentinel when [`Self::keys`] is empty.
+    /// Production requires it `false`, and registers as `insecure_content_encryption_key` in
+    /// [`Settings::unsafe_development_features`] while it is on.
+    pub allow_insecure_dev_key: bool,
+    /// How often the keyring is re-read from the database, once there is a keyring to re-read.
+    pub refresh_seconds: u64,
+    /// Floor under [`Self::refresh_seconds`]. It exists to stop a refresh interval being
+    /// configured into a hot loop against `content_data_keys`, and `Settings::validate`
+    /// enforces it — an unenforced floor is an inert setting.
+    pub min_refresh_seconds: u64,
+    /// Age past which the active data key is reported as overdue for rotation.
+    pub data_key_rotation_days: u32,
+}
+
+impl std::fmt::Debug for ContentEncryptionSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The *ids* are rendered and the material never is: which keys are loaded is exactly
+        // what an operator reads a startup line for, and it is not a secret.
+        let key_ids: Vec<&str> = self
+            .keys
+            .split(',')
+            .filter_map(|entry| entry.split_once(':'))
+            .map(|(id, _)| id.trim())
+            .collect();
+        f.debug_struct("ContentEncryptionSettings")
+            .field("custody", &self.custody)
+            .field("key_ids", &key_ids)
+            .field("active_key_id", &self.active_key_id)
+            .field("allow_insecure_dev_key", &self.allow_insecure_dev_key)
+            .field("refresh_seconds", &self.refresh_seconds)
+            .field("min_refresh_seconds", &self.min_refresh_seconds)
+            .field("data_key_rotation_days", &self.data_key_rotation_days)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -670,6 +744,10 @@ impl Settings {
         // be enforced, because the fresh read path never consults it.
         self.validate_jwks_stale_ceiling(&mut violations);
 
+        // Structural, so every environment: a keyring the process cannot assemble is not a
+        // production-hardening question. See the function.
+        self.validate_content_encryption(&mut violations);
+
         // `rag_chunks.chunk_index`, `start_offset` and `end_offset` are all `integer`, and the
         // chunker casts into them. A ceiling at or above `i32::MAX` would make those casts
         // saturate silently, so it is rejected at startup rather than discovered as a chunk
@@ -728,6 +806,12 @@ impl Settings {
         }
         if self.idempotency.allow_insecure_dev_pepper {
             features.push("insecure_idempotency_pepper_fallback");
+        }
+        // Registered here for the reason §15 of the encryption record gives: a switch nobody
+        // could see was inert is precisely what produced the `accept_legacy_hashes` incident,
+        // so leaving this on has to produce a greppable startup WARN naming the feature.
+        if self.content_encryption.allow_insecure_dev_key {
+            features.push("insecure_content_encryption_key");
         }
         if self.auth.jwks.allow_insecure_dev_urls {
             features.push("insecure_jwks_urls");
@@ -815,6 +899,104 @@ impl Settings {
                 "auth.jwks.max_stale_seconds must be at least the JWKS freshness window \
                  ({JWKS_FRESHNESS_SECONDS}s), or the ceiling is unenforceable: a still-fresh \
                  cache entry is served without consulting it, got {ceiling}"
+            ));
+        }
+    }
+
+    /// Structural invariants of the content-encryption keyring, checked in **every**
+    /// environment.
+    ///
+    /// These are not production hardening — they are the difference between a process that can
+    /// assemble a keyring and one that cannot — so they run everywhere, and every one of them
+    /// accumulates into the shared violation list rather than short-circuiting. A configuration
+    /// with three problems has to report three, or an operator fixes one, restarts, and
+    /// discovers the next.
+    ///
+    /// The dev sentinel is rejected here rather than only in production, and that is
+    /// deliberately stricter than the three existing 32-byte secrets: those reach their
+    /// sentinel through an *implicit* fallback that no operator types, whereas
+    /// `content_encryption.keys` has no such path. So the sentinel is reachable only via
+    /// `allow_insecure_dev_key`, never by pasting it, in any environment.
+    fn validate_content_encryption(&self, violations: &mut Vec<String>) {
+        let content = &self.content_encryption;
+        let entries = content.raw_key_entries();
+
+        if entries.is_empty() && !content.allow_insecure_dev_key {
+            violations.push(
+                "content_encryption.keys must be set (MOIRA_CONTENT_ENCRYPTION__KEYS=\
+                 \"<id>:<base64>\"); there is deliberately no fallback to \
+                 secrets.master_key_base64"
+                    .to_string(),
+            );
+        }
+
+        let mut seen: Vec<&str> = Vec::with_capacity(entries.len());
+        for (index, entry) in entries.iter().enumerate() {
+            let Some((id, encoded)) = entry.split_once(':') else {
+                violations.push(format!(
+                    "content_encryption.keys entry {index} is not \"<id>:<base64>\""
+                ));
+                continue;
+            };
+            let id = id.trim();
+
+            if !crate::security::is_valid_master_key_id(id) {
+                violations.push(format!(
+                    "content_encryption.keys entry {index} has key id {id:?}, which must match \
+                     [A-Za-z0-9._-]{{1,{}}}",
+                    crate::security::MASTER_KEY_ID_MAX_LENGTH
+                ));
+                continue;
+            }
+            if seen.contains(&id) {
+                violations.push(format!(
+                    "content_encryption.keys declares key id {id:?} more than once"
+                ));
+                continue;
+            }
+            seen.push(id);
+
+            let field = format!("content_encryption.keys entry {id:?}");
+            if encoded.trim().is_empty() {
+                violations.push(format!("{field} has no key material"));
+                continue;
+            }
+            // The shared 32-byte validator, so this fourth secret is checked by the same code
+            // and reports the same wording as the three that already exist.
+            validate_32_byte_secret(
+                Some(encoded.trim()),
+                CONTENT_ENCRYPTION_DEVELOPMENT_KEY,
+                &field,
+                violations,
+            );
+        }
+
+        if !crate::security::is_valid_master_key_id(content.active_key_id.trim()) {
+            violations.push(format!(
+                "content_encryption.active_key_id {:?} must match [A-Za-z0-9._-]{{1,{}}}",
+                content.active_key_id,
+                crate::security::MASTER_KEY_ID_MAX_LENGTH
+            ));
+        } else if !entries.is_empty() && !seen.contains(&content.active_key_id.trim()) {
+            // Named alongside what *is* configured, because mid-rotation the question an
+            // operator is actually asking is "which ids did this process load?".
+            violations.push(format!(
+                "content_encryption.active_key_id {:?} is not among the configured key ids {:?}",
+                content.active_key_id, seen
+            ));
+        }
+
+        if content.min_refresh_seconds == 0 {
+            violations
+                .push("content_encryption.min_refresh_seconds must be at least 1".to_string());
+        }
+        if content.refresh_seconds == 0 {
+            violations.push("content_encryption.refresh_seconds must be at least 1".to_string());
+        } else if content.refresh_seconds < content.min_refresh_seconds {
+            violations.push(format!(
+                "content_encryption.refresh_seconds ({}) must be at least \
+                 content_encryption.min_refresh_seconds ({})",
+                content.refresh_seconds, content.min_refresh_seconds
             ));
         }
     }
@@ -988,6 +1170,26 @@ impl Settings {
             violations.push("secrets.key_id must be non-empty and non-development".to_string());
         }
 
+        // The master key is required in production **unconditionally**, even where no
+        // application uses `encrypted_content` today, because the persistence policy is
+        // flippable at runtime through the admin API without a restart. Requiring the key only
+        // when some policy row selects it would make a boot invariant depend on mutable
+        // database state, so a replica that booted yesterday would fail today because someone
+        // changed a policy on another replica. See `docs/decision-encryption-at-rest.md` §10.
+        if self.content_encryption.allow_insecure_dev_key {
+            violations.push(
+                "content_encryption.allow_insecure_dev_key must be false in production".to_string(),
+            );
+        }
+        if self.content_encryption.active_key_id.trim().is_empty()
+            || self.content_encryption.active_key_id == DEVELOPMENT_KEY_ID
+        {
+            violations.push(
+                "content_encryption.active_key_id must be non-empty and non-development"
+                    .to_string(),
+            );
+        }
+
         if self.api_keys.allow_insecure_dev_pepper {
             violations
                 .push("api_keys.allow_insecure_dev_pepper must be false in production".to_string());
@@ -1077,6 +1279,18 @@ fn validate_cors_origin(origin: &str) -> Result<HeaderValue, ()> {
     origin.parse().map_err(|_| ())
 }
 
+/// The fourth development sentinel, after `secrets`' `7`, `api_keys`' `11` and `idempotency`'s
+/// `13`.
+///
+/// It exists so that *shipping* a development key is impossible: the value is well known, and
+/// `validate_content_encryption` refuses it whenever it appears in
+/// `MOIRA_CONTENT_ENCRYPTION__KEYS`. A developer's local key, minted by `scripts/dev-env.sh`, is
+/// real and random and is never this.
+pub const CONTENT_ENCRYPTION_DEVELOPMENT_KEY: [u8; 32] = [17; 32];
+
+/// The key id `config/default.toml` ships, and the one production refuses.
+const DEVELOPMENT_KEY_ID: &str = "dev-local";
+
 fn validate_32_byte_secret(
     encoded: Option<&str>,
     development_value: [u8; 32],
@@ -1128,6 +1342,82 @@ impl SecretSettings {
 
         key.try_into()
             .map_err(|_| AppError::Config("master key must decode to 32 bytes".to_string()))
+    }
+}
+
+impl ContentEncryptionSettings {
+    /// The non-empty, whitespace-trimmed entries of [`Self::keys`].
+    ///
+    /// A trailing comma is not a second key, so empty entries are dropped rather than reported:
+    /// `"a:b,"` is what a shell heredoc produces and refusing it teaches nothing.
+    fn raw_key_entries(&self) -> Vec<&str> {
+        self.keys
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .collect()
+    }
+
+    /// The loaded master keys and the resolved active id.
+    ///
+    /// `Settings::validate` has already rejected every shape this can refuse, so an error here
+    /// means the process was built from settings that never went through validation. It is
+    /// still an error rather than a fallback: silently substituting a key is the failure this
+    /// whole subsystem exists to refuse.
+    pub fn master_keys(&self) -> Result<(crate::security::MasterKeyRing, String), AppError> {
+        let entries = self.raw_key_entries();
+        let active = self.active_key_id.trim().to_string();
+
+        if entries.is_empty() {
+            if !self.allow_insecure_dev_key {
+                return Err(AppError::Config(
+                    "MOIRA_CONTENT_ENCRYPTION__KEYS must be set".to_string(),
+                ));
+            }
+            let active = if active.is_empty() {
+                DEVELOPMENT_KEY_ID.to_string()
+            } else {
+                active
+            };
+            // The only path that ever yields the sentinel. It is never reachable by configuring
+            // a key, in any environment — see `validate_content_encryption`.
+            return Ok((
+                HashMap::from([(
+                    active.clone(),
+                    Zeroizing::new(CONTENT_ENCRYPTION_DEVELOPMENT_KEY),
+                )]),
+                active,
+            ));
+        }
+
+        let mut keys = HashMap::with_capacity(entries.len());
+        for entry in entries {
+            let (id, encoded) = entry.split_once(':').ok_or_else(|| {
+                AppError::Config(format!(
+                    "content_encryption.keys entry {entry:?} is not \"<id>:<base64>\""
+                ))
+            })?;
+            let decoded = STANDARD.decode(encoded.trim()).map_err(|_| {
+                AppError::Config(format!(
+                    "content_encryption.keys entry {:?} is not valid base64",
+                    id.trim()
+                ))
+            })?;
+            let decoded: [u8; 32] = decoded.try_into().map_err(|_| {
+                AppError::Config(format!(
+                    "content_encryption.keys entry {:?} must decode to exactly 32 bytes",
+                    id.trim()
+                ))
+            })?;
+            keys.insert(id.trim().to_string(), Zeroizing::new(decoded));
+        }
+
+        if !keys.contains_key(&active) {
+            return Err(AppError::Config(format!(
+                "content_encryption.active_key_id {active:?} is not among the configured key ids"
+            )));
+        }
+        Ok((keys, active))
     }
 }
 
@@ -1195,6 +1485,20 @@ impl Default for SecretSettings {
             master_key_base64: None,
             key_id: "dev-local".to_string(),
             allow_insecure_dev_key: true,
+        }
+    }
+}
+
+impl Default for ContentEncryptionSettings {
+    fn default() -> Self {
+        Self {
+            custody: ContentEncryptionCustody::Environment,
+            keys: String::new(),
+            active_key_id: DEVELOPMENT_KEY_ID.to_string(),
+            allow_insecure_dev_key: true,
+            refresh_seconds: 300,
+            min_refresh_seconds: 5,
+            data_key_rotation_days: 30,
         }
     }
 }
@@ -1451,6 +1755,9 @@ mod tests {
         settings.api_keys.allow_insecure_dev_pepper = false;
         settings.idempotency.pepper_base64 = Some(STANDARD.encode([3; 32]));
         settings.idempotency.allow_insecure_dev_pepper = false;
+        settings.content_encryption.keys = format!("prod-2026-07:{}", STANDARD.encode([4; 32]));
+        settings.content_encryption.active_key_id = "prod-2026-07".to_string();
+        settings.content_encryption.allow_insecure_dev_key = false;
         settings.cors.allowed_origins = vec!["https://admin.example.com".to_string()];
         settings
     }
@@ -1498,11 +1805,199 @@ mod tests {
             "api_keys.pepper_version",
             "idempotency.allow_insecure_dev_pepper",
             "idempotency.pepper_base64",
+            "content_encryption.allow_insecure_dev_key",
+            "content_encryption.active_key_id",
             "cors.allowed_origins",
             "database.migrate_on_startup",
         ] {
             assert!(error.contains(expected), "missing {expected} in {error}");
         }
+    }
+
+    /// Every content-encryption violation is asserted on its **message text**, because the
+    /// remedy string is the deliverable: an operator meets this validator once, at 3 a.m., on a
+    /// deployment that will not boot.
+    #[test]
+    fn content_encryption_accumulates_every_structural_violation_at_once() {
+        let mut settings = Settings::default();
+        settings.content_encryption.keys = format!(
+            "no-colon,bad id:{},dup:{},dup:{},short:{},sentinel:{}",
+            STANDARD.encode([1; 32]),
+            STANDARD.encode([2; 32]),
+            STANDARD.encode([2; 32]),
+            STANDARD.encode([3; 16]),
+            STANDARD.encode(CONTENT_ENCRYPTION_DEVELOPMENT_KEY),
+        );
+        settings.content_encryption.active_key_id = "absent".to_string();
+        settings.content_encryption.refresh_seconds = 0;
+
+        let error = settings
+            .validate(ProcessMode::Serve)
+            .unwrap_err()
+            .to_string();
+
+        // Never first-violation-wins: all seven are present in one message.
+        for expected in [
+            "content_encryption.keys entry 0 is not \"<id>:<base64>\"",
+            "content_encryption.keys entry 1 has key id \"bad id\"",
+            "content_encryption.keys declares key id \"dup\" more than once",
+            "content_encryption.keys entry \"short\" must decode to exactly 32 bytes",
+            "content_encryption.keys entry \"sentinel\" cannot use the development sentinel",
+            "content_encryption.active_key_id \"absent\" is not among the configured key ids",
+            "content_encryption.refresh_seconds must be at least 1",
+        ] {
+            assert!(error.contains(expected), "missing {expected:?} in {error}");
+        }
+        // The configured ids are named alongside the missing one, because mid-rotation the
+        // question an operator is actually asking is "which ids did this process load?".
+        assert!(
+            error.contains(r#"is not among the configured key ids ["dup", "short", "sentinel"]"#),
+            "{error}"
+        );
+    }
+
+    /// The sentinel is refused in **development** too, unlike the three older secrets. It has no
+    /// implicit-fallback path an operator could reach by accident, so typing it is always a
+    /// mistake.
+    #[test]
+    fn the_development_sentinel_is_never_accepted_as_configured_key_material() {
+        let mut settings = Settings::default();
+        settings.content_encryption.keys = format!(
+            "dev-local:{}",
+            STANDARD.encode(CONTENT_ENCRYPTION_DEVELOPMENT_KEY)
+        );
+
+        let error = settings
+            .validate(ProcessMode::Serve)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "content_encryption.keys entry \"dev-local\" cannot use the development sentinel"
+            ),
+            "{error}"
+        );
+
+        // The same bytes reached through `allow_insecure_dev_key` are fine — that is the flag's
+        // entire purpose, and this is what keeps the assertion above about *typing* the value.
+        let dev = Settings::default();
+        dev.validate(ProcessMode::Serve).unwrap();
+        let (keys, active) = dev.content_encryption.master_keys().unwrap();
+        assert_eq!(active, "dev-local");
+        assert_eq!(
+            keys["dev-local"].as_slice(),
+            CONTENT_ENCRYPTION_DEVELOPMENT_KEY.as_slice()
+        );
+    }
+
+    /// There is deliberately no implicit fallback to `secrets.master_key_base64`.
+    #[test]
+    fn missing_keys_without_the_dev_flag_are_refused_and_never_fall_back_to_secrets() {
+        let mut settings = Settings::default();
+        settings.content_encryption.allow_insecure_dev_key = false;
+        settings.secrets.master_key_base64 = Some(STANDARD.encode([99; 32]));
+
+        let error = settings
+            .validate(ProcessMode::Serve)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("content_encryption.keys must be set (MOIRA_CONTENT_ENCRYPTION__KEYS")
+                && error.contains("no fallback to secrets.master_key_base64"),
+            "{error}"
+        );
+        // And the loader agrees with the validator, rather than quietly borrowing the other key.
+        let err = settings.content_encryption.master_keys().unwrap_err();
+        assert!(err.to_string().contains("MOIRA_CONTENT_ENCRYPTION__KEYS"));
+    }
+
+    #[test]
+    fn a_refresh_interval_below_its_own_floor_is_refused() {
+        let mut settings = Settings::default();
+        settings.content_encryption.min_refresh_seconds = 5;
+        settings.content_encryption.refresh_seconds = 4;
+
+        let error = settings
+            .validate(ProcessMode::Serve)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "content_encryption.refresh_seconds (4) must be at least \
+                 content_encryption.min_refresh_seconds (5)"
+            ),
+            "{error}"
+        );
+    }
+
+    /// Old master keys stay loaded through a rotation, and the active one is one of them.
+    #[test]
+    fn a_multi_key_ring_loads_every_key_and_resolves_the_active_id() {
+        let mut settings = Settings::default();
+        settings.content_encryption.keys = format!(
+            "old-2026-06:{},new-2026-08:{}",
+            STANDARD.encode([1; 32]),
+            STANDARD.encode([2; 32])
+        );
+        settings.content_encryption.active_key_id = "new-2026-08".to_string();
+        settings.validate(ProcessMode::Serve).unwrap();
+
+        let (keys, active) = settings.content_encryption.master_keys().unwrap();
+        assert_eq!(active, "new-2026-08");
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys["old-2026-06"].as_slice(), [1u8; 32].as_slice());
+        assert_eq!(keys["new-2026-08"].as_slice(), [2u8; 32].as_slice());
+    }
+
+    /// A `Debug` on `Settings` reaches this block, so the material must never render — the same
+    /// reason `ApiKeySettings` hand-writes its own.
+    #[test]
+    fn content_encryption_debug_renders_ids_and_never_key_material() {
+        let mut settings = Settings::default();
+        let encoded = STANDARD.encode([0xab; 32]);
+        settings.content_encryption.keys = format!("prod-2026-08:{encoded}");
+
+        let rendered = format!("{:?}", settings.content_encryption);
+        assert!(rendered.contains("prod-2026-08"));
+        assert!(!rendered.contains(&encoded), "{rendered}");
+        // The whole `Settings` tree is the surface that actually leaks, so assert there too.
+        assert!(!format!("{settings:?}").contains(&encoded));
+    }
+
+    /// A custody backend this build cannot serve is refused at deserialisation, naming what is
+    /// accepted — rather than booting and failing on the first wrap.
+    #[test]
+    fn an_unimplemented_custody_backend_is_refused_by_name() {
+        serde_json::from_str::<ContentEncryptionSettings>(r#"{"custody":"environment"}"#)
+            .expect("the shipped backend deserializes");
+
+        let error = serde_json::from_str::<ContentEncryptionSettings>(r#"{"custody":"aws_kms"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("aws_kms") && error.contains("environment"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_left_on_dev_key_flag_is_a_named_startup_warning() {
+        // The mechanism whose absence produced the `accept_legacy_hashes` incident: the flag has
+        // to be greppable from a startup line, not merely present in a struct.
+        assert!(
+            Settings::default()
+                .unsafe_development_features(ProcessMode::Serve)
+                .contains(&"insecure_content_encryption_key")
+        );
+
+        let mut off = Settings::default();
+        off.content_encryption.allow_insecure_dev_key = false;
+        off.content_encryption.keys = format!("local:{}", STANDARD.encode([5; 32]));
+        off.content_encryption.active_key_id = "local".to_string();
+        assert!(
+            !off.unsafe_development_features(ProcessMode::Serve)
+                .contains(&"insecure_content_encryption_key")
+        );
     }
 
     #[test]

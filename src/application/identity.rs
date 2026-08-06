@@ -1636,6 +1636,7 @@ mod tests {
         let issuer = format!("https://fresh-{}.invalid", Uuid::now_v7().simple());
         register_issuer(&pool, &issuer).await;
         let state = AppState::new(crate::config::Settings::default(), Some(pool.clone()))
+            .await
             .expect("build app state");
 
         let outcome = AdminIdentityService::new(&state)
@@ -1685,6 +1686,7 @@ mod tests {
         .await
         .expect("configure an enabled provider with no allowed domains");
         let state = AppState::new(crate::config::Settings::default(), Some(pool.clone()))
+            .await
             .expect("build app state");
 
         let outcome = AdminIdentityService::new(&state)
@@ -1725,6 +1727,7 @@ mod tests {
         .await
         .expect("configure an enabled provider with an allow-list");
         let state = AppState::new(crate::config::Settings::default(), Some(pool.clone()))
+            .await
             .expect("build app state");
         let service = AdminIdentityService::new(&state).expect("service");
 
@@ -1775,8 +1778,9 @@ mod tests {
         let Some((pool, _setup_lock)) = migrated_pool().await else {
             return;
         };
-        let state =
-            AppState::new(crate::config::Settings::default(), Some(pool)).expect("build app state");
+        let state = AppState::new(crate::config::Settings::default(), Some(pool))
+            .await
+            .expect("build app state");
         let mut request = claim_request("https://unused.invalid", "sub", "owner@example.com");
         request.setup_token = Some("moira_setup_whatever".to_string());
 
@@ -1799,8 +1803,9 @@ mod tests {
         let Some((pool, _setup_lock)) = migrated_pool().await else {
             return;
         };
-        let state =
-            AppState::new(crate::config::Settings::default(), Some(pool)).expect("build app state");
+        let state = AppState::new(crate::config::Settings::default(), Some(pool))
+            .await
+            .expect("build app state");
         let jwt_actor = Actor {
             actor_type: ActorType::TrustedJwt,
             subject: Some("first-arrival".to_string()),
@@ -1829,8 +1834,9 @@ mod tests {
         let Some((pool, _setup_lock)) = migrated_pool().await else {
             return;
         };
-        let state =
-            AppState::new(crate::config::Settings::default(), Some(pool)).expect("build app state");
+        let state = AppState::new(crate::config::Settings::default(), Some(pool))
+            .await
+            .expect("build app state");
         let mut request = claim_request("https://unused.invalid", "sub", "owner@example.com");
         request.scopes = vec!["moira:not-a-real-scope".to_string()];
 

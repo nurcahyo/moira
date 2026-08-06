@@ -281,7 +281,9 @@ impl JwksFixture {
         settings.auth.jwks.allow_insecure_dev_urls = dev_override;
         settings.auth.jwks.timeout_ms = JWKS_TIMEOUT_MS;
         settings.auth.jwks.max_response_bytes = JWKS_MAX_BYTES;
-        let state = AppState::new(settings, Some(pool.clone())).expect("JWKS test app state");
+        let state = AppState::new(settings, Some(pool.clone()))
+            .await
+            .expect("JWKS test app state");
         let server = MoiraHttpServer::start(state).await;
 
         Some(Self {

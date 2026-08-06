@@ -406,8 +406,8 @@ mod tests {
         "/api/v1/admin/consumer-keys/00000000-0000-0000-0000-000000000000/rotate",
     ];
 
-    fn router_for(settings: Settings) -> Router {
-        build_router(AppState::new(settings, None).unwrap()).unwrap()
+    async fn router_for(settings: Settings) -> Router {
+        build_router(AppState::new(settings, None).await.unwrap()).unwrap()
     }
 
     #[tokio::test]
@@ -416,7 +416,7 @@ mod tests {
         // `metrics_middleware` must read `MatchedPath`, not `req.uri().path()`. Driven
         // through the real router so the assertion covers the actual extension plumbing.
         let application_id = "3f1a5c4e-9d2b-4f7a-8c11-6b0d5e7a2f93";
-        let state = AppState::new(Settings::default(), None).unwrap();
+        let state = AppState::new(Settings::default(), None).await.unwrap();
         let metrics = state.metrics.clone();
         let router = build_router(state).unwrap();
 
@@ -465,27 +465,27 @@ mod tests {
         serde_json::from_slice(&bytes).expect("standard error envelope")
     }
 
-    #[test]
-    fn router_builds_with_phase_one_routes() {
-        let state = AppState::new(Settings::default(), None).unwrap();
+    #[tokio::test]
+    async fn router_builds_with_phase_one_routes() {
+        let state = AppState::new(Settings::default(), None).await.unwrap();
         let _router = build_router(state).unwrap();
     }
 
-    #[test]
-    fn router_still_builds_with_the_full_middleware_stack() {
+    #[tokio::test]
+    async fn router_still_builds_with_the_full_middleware_stack() {
         // Catches layer-ordering/type breakage in the timeout, catch-panic, body-limit
         // and tracing layers at compile+construction time, in both HSTS modes.
-        let _development = router_for(Settings::default());
+        let _development = router_for(Settings::default()).await;
 
         let mut production = Settings::default();
         production.deployment.environment = DeploymentEnvironment::Production;
-        let _production = router_for(production);
+        let _production = router_for(production).await;
     }
 
     #[tokio::test]
     async fn secure_response_headers_include_frame_options_and_csp() {
         let response = send(
-            router_for(Settings::default()),
+            router_for(Settings::default()).await,
             Request::builder()
                 .uri("/health/live")
                 .body(Body::empty())
@@ -514,7 +514,7 @@ mod tests {
             let mut settings = Settings::default();
             settings.deployment.environment = environment;
             let response = send(
-                router_for(settings),
+                router_for(settings).await,
                 Request::builder()
                     .uri("/health/live")
                     .body(Body::empty())
@@ -535,7 +535,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.deployment.environment = DeploymentEnvironment::Production;
         let response = send(
-            router_for(settings),
+            router_for(settings).await,
             Request::builder()
                 .uri("/health/live")
                 .body(Body::empty())
@@ -589,7 +589,7 @@ mod tests {
         let oversized = vec![b'a'; limit + 1];
 
         let response = send(
-            router_for(settings),
+            router_for(settings).await,
             Request::builder()
                 .method(Method::POST)
                 .uri("/api/v1/responses")
@@ -623,7 +623,7 @@ mod tests {
         let at_limit = vec![b'a'; limit];
 
         let response = send(
-            router_for(settings),
+            router_for(settings).await,
             Request::builder()
                 .method(Method::POST)
                 .uri("/api/v1/responses")
@@ -642,7 +642,7 @@ mod tests {
         const { assert!(http::CONVERSATION_BODY_LIMIT_BYTES < http::ADMIN_BODY_LIMIT_BYTES) };
 
         let response = send(
-            router_for(Settings::default()),
+            router_for(Settings::default()).await,
             Request::builder()
                 .method(Method::POST)
                 .uri("/api/v1/conversations")
@@ -666,7 +666,7 @@ mod tests {
         let body = vec![b'a'; limit + 1];
 
         let response = send(
-            router_for(settings),
+            router_for(settings).await,
             Request::builder()
                 .method(Method::POST)
                 .uri("/api/v1/admin/applications")
@@ -684,7 +684,7 @@ mod tests {
         let oversized = vec![b'a'; http::ADMIN_BODY_LIMIT_BYTES + 1];
 
         let response = send(
-            router_for(Settings::default()),
+            router_for(Settings::default()).await,
             Request::builder()
                 .method(Method::POST)
                 .uri("/api/v1/admin/applications")
@@ -938,7 +938,7 @@ mod tests {
     async fn stalled_body_status_line(policy: RouterPolicy, path: &str) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let state = AppState::new(Settings::default(), None).unwrap();
+        let state = AppState::new(Settings::default(), None).await.unwrap();
         let app: Router = http::router(policy).with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1169,7 +1169,7 @@ mod tests {
     /// through the one hole this mapper leaves.
     #[tokio::test]
     async fn router_produced_404_and_405_keep_their_bodyless_shape() {
-        let router = router_for(Settings::default());
+        let router = router_for(Settings::default()).await;
 
         let unmatched = send(
             router.clone(),
@@ -1216,7 +1216,7 @@ mod tests {
         // there is no `CompressionLayer`, and these four routes must never gain one.
         for path in ONCE_ONLY_SECRET_ROUTES {
             let response = send(
-                router_for(Settings::default()),
+                router_for(Settings::default()).await,
                 Request::builder()
                     .method(Method::POST)
                     .uri(path)

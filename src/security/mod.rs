@@ -3,6 +3,7 @@ mod auth;
 mod authz;
 mod crypto;
 mod idempotency;
+mod key_custody;
 mod masking;
 mod ssrf;
 
@@ -24,6 +25,12 @@ pub use crypto::{
     SecretCipher, credential_aad, credential_secret_field,
 };
 pub use idempotency::IdempotencyHasher;
+pub use key_custody::{
+    CUSTODY_BACKEND_ENVIRONMENT, ENVIRONMENT_WRAP_BLOB_LENGTH, ENVIRONMENT_WRAP_FORMAT_V1,
+    EnvironmentMasterKeyCustody, KeyCustodyError, MASTER_KEY_ID_MAX_LENGTH, MasterKeyCustody,
+    MasterKeyRing, WRAP_ALGORITHM_AES_256_GCM, WrappedKey, is_valid_master_key_id,
+    wrapped_data_key_aad,
+};
 pub use masking::{mask_plain_secret, mask_secret_value, request_hash, secret_fingerprint};
 pub use ssrf::{
     HostResolver, JwksDenialReason, JwksFetchError, OutboundDenialReason, OutboundUrlDenial,
