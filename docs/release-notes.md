@@ -180,3 +180,73 @@ contract.
 
 **OpenAPI.** `ExecutionFailureClass` gains two enum values. No operation was added, removed or
 changed: 152 operations across 100 paths, unchanged.
+
+### Breaking: `conversation_content_persistence` now takes effect, and `encrypted_content` is refused
+
+Finding **F32** ([#57](https://github.com/nurcahyo/moira/issues/57)). This entry is written late: the
+change landed earlier in this same unreleased window and was documented in
+`docs/conversation-persistence.md` and the OpenAPI schema, but never announced here. It is announced
+now because the envelope-encryption release train ([#86](https://github.com/nurcahyo/moira/issues/86))
+builds directly on it, and an operator should meet this break on its own terms rather than buried
+inside an encryption release.
+
+**Before.** `conversation_content_persistence` was a setting that read back correctly and changed
+nothing. `add_message` bound the caller's text into `conversation_messages.content_plain`
+unconditionally, and the write path never consulted the policy anywhere. An operator who selected
+`none` or `metadata_only` — deliberately, to keep message bodies out of the database — got full
+plaintext stored anyway, with two source comments asserting the policy was honoured. The setting was
+a data-protection control that protected nothing.
+
+**After.** The policy is enforced at two write points, both of which persist a body derived from
+caller content:
+
+| Value | Message body | Length-revealing metadata |
+| --- | --- | --- |
+| `plain_content` (default) | stored | stored |
+| `metadata_only` | **not stored** | stored |
+| `none` | **not stored** | **not stored** — `content_size_bytes` is `0`, `token_count` is null |
+| `encrypted_content` | **not stored** | stored |
+
+Enforcement lives in `add_message` rather than at its three application-layer callers, deliberately:
+it is the only path into `conversation_messages`, so a fourth writer inherits the policy instead of
+having to remember it. The second point is the summarization write — a summary derived from bodies
+the policy excludes is withheld rather than stored.
+
+**`encrypted_content` is refused on write.** `PUT /api/v1/admin/applications/{application_id}/conversation-policy`
+now returns **422 `conversation_content_persistence_unsupported`** for that value. No cipher is
+wired to any `*_encrypted` column today, so accepting it would promise encryption Moira does not
+perform. Rows that already hold the value keep parsing and keep failing closed — they store no
+plaintext, which is the half of the promise that can be kept — but the value can no longer be set.
+
+**This refusal is temporary in its current form.** PR 5 of the encryption train narrows it rather
+than removing it: once a cipher exists, `encrypted_content` becomes settable and the 422 fires only
+when encryption is configured but unusable at write time. See
+`docs/decision-encryption-at-rest.md` §"`conversation_content_persistence_unsupported` (422) —
+narrows, does not disappear".
+
+**Who is affected.**
+
+- Any deployment or IaC that writes `encrypted_content` on this endpoint. It previously succeeded
+  and now fails with a 422 — this is the break most likely to surface at upgrade, because it fires
+  from configuration management rather than from traffic.
+- Any application already set to `none` or `metadata_only` and silently relying on the plaintext
+  being readable back through the conversation API. Those bodies stop being written.
+
+**Before upgrading**, find the applications whose stored policy is about to start mattering:
+
+```sql
+select application_id, conversation_content_persistence
+from application_conversation_policies
+where conversation_content_persistence is not null
+  and conversation_content_persistence <> 'plain_content';
+```
+
+An empty result means this release changes nothing for you. It is not retroactive: plaintext already
+stored under `plain_content` stays stored and stays readable. Removing it is a retention concern,
+not a persistence-policy one.
+
+**What this does not govern.** `memory_records.content_plain` and `rag_document_versions.content_plain`
+are written under their own policies; this value is scoped to conversation messages and the summaries
+derived from them. `content_hash` is retained under every value — it is an HMAC under a
+deployment-held pepper, not a content address — as is caller-supplied `metadata`, which is the
+caller's own JSON rather than something derived from the message body.
