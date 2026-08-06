@@ -429,7 +429,7 @@ once. Current state of everything above F28:
 | **F50** | **A disabled or soft-deleted agent profile silently degrades every execution on its route** — `get_active_agent_profile` filters on `status='active'`, neither disable nor soft-delete clears the route's FK, and `Ok(None)` is treated as "no profile": preamble, temperature and max_tokens vanish, and the run reports `succeeded` | **OBSERVABLE; the product decision is STILL OPEN.** `fix/f53-f50-silent-degradation` ships a `warn!`, a `RuntimeEventType::AgentProfileUnavailable` runtime event and an `agent_profile.unavailable` audit row. **The request's behaviour is unchanged** — fail-closed vs fail-open is **not** decided here, because silence is a defect under either answer and the observability is the part they share, not half of one. "No profile" and "profile vanished" are distinguished at the call site by reading `route.agent_profile_id` *before* the lookup. *Reversal condition:* the decision makes this "observe and refuse" or leaves it as is; **the observability is not revisited.** The `documents_`-named case is now scoped to the fail-open behaviour alone, so the three observability guards survive either answer. **→ CLOSED 2026-08-06: the decision was taken fail-closed (issue #79) and `feat/agent-profile-fail-closed-79` implements it — `404 agent_profile_not_found` / `409 agent_profile_disabled`, refused before any provider call. The observability was not revisited, as promised** |
 | **F38** | Terminal-persistence-deadline arm discarded a successful provider result | **CLOSED** `fix/f38-deadline-usage` — all three values retained, `"output_committed"` was a hardcoded literal and is now derived. Reversal conditions in the ledger |
 | ~~**F45**~~ | ~~`PublicResponseFormat::JsonSchema { name, strict }` — both accepted, both dropped~~ | **CLOSED** `fix/f42-f45-declared-vs-true`. Premise held; **neither field is expressible in rig-core 0.40 on any provider** (`strict: true` hardcoded and unreachable via `additional_params`; `name` derived from the schema's `title`; Anthropic and Gemini have neither field). Resolved **asymmetrically**: `strict` **refused**, `name` **documented**. **PUBLIC CONTRACT CHANGE** — `strict` is now `Option<bool>` and an explicit `false` is `422` on both endpoints; omitted and `true` are unchanged. That is what makes refusing available at all, and F35 was right to decline it while the field was a defaulting `bool`. `name` cannot be refused (required field) and is not smuggled through `title`. OpenAPI counts **hand-verified, unchanged: 152 / 100 / 183** |
-| ~~**F42**~~ | ~~`moira.error.structured_output_invalid` asserts a model-output-non-conformance path that does not exist~~ | **CLOSED** same branch. Premise held: two emitters, both rejecting the *caller's schema*. The near-miss that made it plausible — `memory_extraction::FAILURE_STRUCTURED_OUTPUT_INVALID`, the same string for the missing case — is never returned to a caller, and the description now says so. Fail-hard variant deliberately **not** shipped; F29 still needs two of its three preconditions |
+| ~~**F42**~~ | ~~`moira.error.structured_output_invalid` asserts a model-output-non-conformance path that does not exist~~ | **CLOSED** same branch. Premise held: two emitters, both rejecting the *caller's schema*. The near-miss that made it plausible — `memory_extraction::FAILURE_STRUCTURED_OUTPUT_INVALID`, the same string for the missing case — is never returned to a caller, and the description now says so. Fail-hard variant deliberately **not** shipped; F29 still needs two of its three preconditions. **→ The variant SHIPPED 2026-08-06 (issue #80, `feat/structured-output-fail-hard-80`): a reply that is not JSON is a `422`, so there are now THREE emitters and the description says which one is about the model's reply. The guard that exists to force that re-read would have stayed green — it collected a set of *files* and the new emitter landed in a file already in it; it now counts emitters per file. See §3.4's fourteenth entry** |
 | ~~**F43**~~ | ~~`ConcurrencyController::acquire` is dead `pub` API; every caller is inside `#[cfg(test)]`~~ | **CLOSED** same branch. **Conclusion refuted, hazard confirmed.** 9 of the 29 callers are in `tests/`, a separate crate, so private/deleted were never available — `pub` in this `publish = false` single-crate workspace means "visible to integration tests", not an external contract. Fixed by removing the *choice*: one `pub acquire`, `is_stream` mandatory, wrapper gone |
 | ~~**F44**~~ | ~~`RuntimeModelHandle::stream` / `RuntimeStreamOutput` are dead `pub` API~~ | **CLOSED** same branch. Premise held exactly; **103 lines deleted**. Not in the finding: that cluster was the sole reason `runtime_factory.rs` imported the runtime-event vocabulary, so deleting it restored the Rig/application boundary |
 | ~~**F54**~~ | ~~A failed extraction cannot be correlated to its execution except through an unenforced `request_id` string convention (`"memory-extraction-{run_id}"`)~~ | **CLOSED** `fix/f54-extraction-correlation`, migration `0025`. **Premise partly REFUTED as it was later summarised:** the failure class is *not* lost from `memory_extraction_runs` — that column has existed since `0007` — so the "persist the failure class" candidate was already shipped, and `response_id` is already a real FK that is already taken (it names the *triggering turn's* response). The real gap was the missing `execution_id`, now a bare indexed uuid **matching `context_plans` and `retrieval_runs`, which solve the identical problem in the same migration**; a FK is impossible because `execution_id` is no table's primary key. Written when the run row is **opened**, not at completion, so the `'running'` row a mid-call death leaves behind keeps its correlation. The barrier is the type: `MemoryExtractionRunInsert.execution_id` is a required `Uuid`. Four mutations; the guard **joins** `execution_attempts` rather than checking the column is populated, because the weakened `is_some()` version was verified **green** against a fresh-uuid mint. Raised **F55** |
@@ -671,6 +671,25 @@ and still lose its control.** When it does, the replacement control has to be an
 positive — here, a control stream that succeeds first and moves the provider's request counter —
 and not a weakened assertion.
 
+**A fourteenth, from `feat/structured-output-fail-hard-80`, and it is the thirteenth one layer in:
+a guard that derives a set of FILES cannot see a second site appearing in a file already in the
+set.**
+
+F42's interlock exists so that a new emitter of `structured_output_invalid` forces the catalog
+description to be re-read. It is derived — it walks `src/` and parses call sites rather than
+matching mentions — which is exactly what F52's rule asks for, and it names the two files the
+description names. **It would have stayed green through issue #80**, whose whole content is a
+third emitter, because that emitter landed in `src/application/execution.rs`, which was already
+one of the two. The guard was bidirectional over files and blind over sites; a set is only as
+sharp as the thing it holds. It now counts emitters **per file** (`{public.rs: 1, execution.rs:
+2}`), and adding a fourth next to an existing one reds it — verified by adding one, not by
+reading.
+
+**The rule: when a derived guard aggregates, ask what the aggregation throws away.** "Which files"
+answers a coarser question than "how many sites", and the coarser question is the one that stays
+true through the change you are guarding against. The same applies to counting rows instead of
+comparing them, or asserting a set is non-empty instead of asserting its contents.
+
 *Two things from the same branch that are not new failures but are worth carrying.* The F43 fix
 was guarded by a test that **already existed and did have teeth** —
 `stream_capacity_is_independent_from_request_capacity` reds alone when the streaming flag stops
@@ -683,7 +702,7 @@ the cheapest edit — collapsing an omitted `strict` back into an explicit `fals
 translation — was a **control** case asserting that the omitted spelling still succeeds. Every
 primary refusal assertion stayed green through it. Controls are not padding.
 
-**A sharpening about *barriers*, from F30 — it is not a fourteenth guard, it is the thing guards
+**A sharpening about *barriers*, from F30 — it is not another numbered entry, it is the thing guards
 are supposed to be protecting.** The standing advice for "two inputs that must be read together" is
 *reconcile in one place in code that every reader must go through*. F30 had that: the
 stricter-of-two-consent-columns rule lived in exactly one function. A second reader appeared anyway,

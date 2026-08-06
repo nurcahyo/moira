@@ -702,8 +702,14 @@ async fn compat_text_format_strict_false_is_refused_over_http() {
     let Some(fixture) = compat_fixture().await else {
         return;
     };
+    // Conforming JSON rather than the `must-not-be-reached` marker the two refusal-only cases
+    // above use. **Issue #80 is why**: this case has a control request that *does* reach the
+    // provider, carrying a schema, so a prose reply would now fail it with `422
+    // structured_output_invalid` — a real refusal, but not the one under test, and the control
+    // exists precisely to prove the fixture can answer. The refused request is still proven not
+    // to reach the provider by `call_count() == 0`, which is what carried that meaning all along.
     let provider = MockOpenAiServer::start([ProviderScript::Completion {
-        text: "must-not-be-reached".to_string(),
+        text: "{\"answer\":\"reached-only-by-the-control\"}".to_string(),
     }])
     .await;
     let bound = fixture

@@ -1809,6 +1809,17 @@ impl EventCollector {
     }
 }
 
+/// The whole of what a caller is told when a schema-carrying request came back as something that
+/// is not JSON — issue #80.
+///
+/// One constant, no interpolation, because this string is copied verbatim into the public error
+/// envelope and into `responses.failure_message`. Naming the provider, the model, the reply's
+/// length or where the parse gave up would either leak deployment topology to a caller who named
+/// only a route, or leak the provider's own bytes into Moira's error surface. What the caller can
+/// act on is here: they asked for a schema, and what came back was not JSON.
+const STRUCTURED_OUTPUT_NOT_JSON: &str = "the model's reply to a schema-constrained request was not JSON, so no structured output \
+     could be produced";
+
 /// Parses a schema-constrained reply into [`ExecutionRunOutput::structured_output`] — finding F29.
 ///
 /// # Why the parse lives here rather than at the Rig boundary
@@ -1838,61 +1849,86 @@ impl EventCollector {
 /// makes re-serialisation safe, because a caller asking for a schema wants the value, not the
 /// bytes.
 ///
-/// # Why a non-conforming reply is `None` rather than `StructuredOutputInvalid`
+/// # A reply that is not JSON is a failure, not a `None` — issue #80, decided 2026-08-06
 ///
-/// Three reasons, each verified against the tree rather than assumed. **All three have since
-/// been discharged** — see "the reversal condition now holds" below. They are kept because they
-/// are the argument the flip has to answer, not a changelog.
+/// **The flip is taken.** A schema-carrying request whose reply does not parse now ends the
+/// execution with [`ExecutionFailureClass::StructuredOutputInvalid`], which `failure_http_status`
+/// maps to **422**. There is no setting that restores the silent `None`, deliberately: a flag
+/// would be a second code path plus a chance to be inert, and this repo has a measured example of
+/// exactly that (`accept_legacy_hashes`).
+///
+/// **What the decision is actually about.** The old behaviour left `structured_output: null` on a
+/// `succeeded` outcome, which is the same document a model that legitimately answered with an
+/// empty value produces — so no consumer of an [`ExecutionOutcome`] could tell "the provider did
+/// not comply" from "the answer was empty", and the cheap reading, *treat null as empty*, is the
+/// wrong one every time. **On the public plane it was worse:** `PublicResponse` carries no
+/// structured-output field at all, so a caller who asked for a schema and received prose got
+/// `200 completed` with no signal whatsoever. After the flip both surfaces agree, and the public
+/// one carries the whole decision: a failure is a 422 and cannot be mistaken for an answer. See
+/// "empty is not a failure" below for the boundary.
+///
+/// **Why this was blocked and no longer is.** Three preconditions, each verified against the tree
+/// rather than assumed, and all three discharged before this change:
 ///
 /// 1. `StructuredOutputInvalid` was in **neither** `is_retryable` nor `is_fallback_eligible` nor
-///    `is_circuit_failure` — by omission, with nothing recording whether that was a decision — so
-///    one non-conforming reply would end the execution with no retry and no fallback.
+///    `is_circuit_failure` — by omission, with nothing recording whether that was a decision.
+///    **Done:** the exclusion is now a recorded disposition in `src/orchestration/controls.rs`,
+///    guarded in both directions by
+///    `every_failure_class_has_a_recorded_retry_fallback_and_circuit_disposition`. The disposition
+///    is unchanged by this flip and was written with this third emitter already in view: a class
+///    carries exactly one disposition, so admitting it to `is_fallback_eligible` for the reply
+///    case would also let one 2 MB caller schema walk the whole fallback chain.
 /// 2. On DeepSeek the schema never reaches the wire — Rig's `SUPPORTS_RESPONSE_FORMAT = false`
-///    drops it — so *every* structured request on that route would hard-fail where it previously
-///    returned 200. Failing loudly is the right end state; it must follow the capability fix
-///    (finding F39), not precede it.
+///    drops it — so *every* structured request on that route would have hard-failed.
+///    **Done:** F39 landed, and a model that cannot carry a schema is no longer routed a
+///    schema-carrying request. What fails here is a model declining to comply, never a provider
+///    structurally unable to.
 /// 3. `ConversationService::run_extraction` detected failure by `output_text` being `None` and
-///    never inspected `execution.status`, so a hard failure would reclassify an unparseable
-///    extraction reply from `structured_output_invalid` to `extraction_call_failed` — losing the
-///    signal that distinguishes "the model did not comply" from "the call did not happen".
+///    never inspected `execution.status`, so a hard failure would have reclassified an
+///    unparseable extraction reply from `structured_output_invalid` to `extraction_call_failed`.
+///    **Done:** `extraction_failure_class` reads the execution's own class, so
+///    `memory_extraction_runs.failure_class` says `structured_output_invalid` before **and**
+///    after the flip — written by `parse_candidates` refusing prose before, by the execution now.
 ///
-/// # The reversal condition now holds, and the flip is still not taken here
+/// # Empty is not a failure, and the two are distinguishable — but only in one direction
 ///
-/// All three preconditions are discharged:
+/// A model that legitimately answers "nothing" under a schema sends `null`, `{}` or `[]`. All
+/// three parse, so all three still succeed and arrive as `structured_output: null`, `{}` or `[]`.
+/// Only bytes that are **not JSON at all** fail.
 ///
-/// 1. **Done.** The absence is now a recorded disposition rather than an omission:
-///    `is_retryable`, `is_fallback_eligible` and `is_circuit_failure` in
-///    `src/orchestration/controls.rs` each carry the reason `StructuredOutputInvalid` is excluded,
-///    and `every_failure_class_has_a_recorded_retry_fallback_and_circuit_disposition` fails on a
-///    change in either direction. The disposition is *stay out of all three*, and the load-bearing
-///    reason is that a class carries exactly one disposition while this class has two emitters —
-///    a caller's unusable schema and (under the flip) a model's non-conforming reply. Admitting it
-///    to `is_fallback_eligible` would let one 2 MB schema walk the whole fallback chain.
-/// 2. **Done.** F39 landed. A model that cannot carry a schema is no longer routed a
-///    schema-carrying request, so the failure the flip introduces is a model declining to comply,
-///    not a provider structurally unable to.
-/// 3. **Done.** `run_extraction` reads `execution.status` and labels the run row with the
-///    execution's own failure class (`extraction_failure_class` in
-///    `src/application/conversation.rs`). A non-conforming reply is recorded as
-///    `structured_output_invalid` **before and after** the flip: today `parse_candidates` writes
-///    it by refusing prose, afterwards the execution writes it. The signal reason 3 was protecting
-///    survives the flip rather than being traded for it.
+/// Two honest limits, stated rather than implied:
 ///
-/// **The flip is deliberately a separate change.** Landing the preconditions and flipping the
-/// behaviour together would bury a blast-radius decision inside enabling work: the flip turns a
-/// silent `None` into a terminal 422 for every caller whose model returns prose, on a class that
-/// by design neither retries nor falls back. What it needs is its own diff, its own tests, and its
-/// own review of that consequence.
+/// - **Moira does not validate against the schema; it parses JSON.** A reply that is valid JSON
+///   but violates the caller's schema still succeeds, exactly as before. Enforcement is the
+///   provider's job (`strict: true` reaches every provider that receives a schema at all), and
+///   Moira has no validator. The failure raised here therefore says "not JSON", which is what was
+///   measured, rather than "does not conform", which was not.
+/// - **`Some(Value::Null)` and `None` serialise identically.** A model answering the JSON literal
+///   `null` is indistinguishable on the wire from a request that carried no schema. That
+///   ambiguity is *why* the flip matters rather than an argument against it: after it, a null
+///   `structured_output` on a `200` can only mean an answer, never a failure, because every
+///   failure is a `422`.
 ///
-/// **What the flip must still do**, none of which is done here:
-/// - Widen the `moira.error.structured_output_invalid` catalog description, which currently states
-///   as fact that the class is never raised for a model's reply, and update
-///   `structured_output_invalid_has_only_the_two_emitters_its_catalog_entry_describes`
-///   (`src/i18n/catalog/mod.rs`), which pins the emitter count at two and *will* go red — that red
-///   is the interlock working, not a broken test.
-/// - Re-read the disposition above with three emitters in view rather than two.
-/// - Replace `a_reply_that_is_not_json_leaves_the_field_null_and_still_succeeds` and its streaming
-///   twin in `tests/structured_output.rs`, which pin the current behaviour on both run paths.
+/// # What a failed parse deliberately does not do
+///
+/// It does not put the provider's bytes in the failure message. `failure.message` is copied
+/// verbatim into the public error envelope by `PublicExecutionService`, so echoing the reply
+/// would hand a caller — and every log that records the envelope — untrusted provider output
+/// under Moira's own error surface. The message is [`STRUCTURED_OUTPUT_NOT_JSON`], a constant.
+/// The prose is dropped with the rest of the outcome by `failed_outcome`, which is the same
+/// reason: a 422 must not return something that reads like an answer.
+///
+/// It also does not retry or fall back. The disposition above is unchanged, so the failure is
+/// terminal on the first non-conforming reply.
+///
+/// **Recorded consequence.** `memory_extraction::strip_code_fence` — the tolerance for a model
+/// that wraps its JSON in a ```` ```json ```` fence — is no longer reachable from an execution:
+/// extraction always sends a schema, so a fenced reply now fails here before `parse_candidates`
+/// is asked. That tolerance is left in place rather than deleted in this change, and it is left
+/// *strict* here rather than duplicated: what counts as a parse is unchanged by the flip, which
+/// is the whole of what was decided. *Reversal condition:* if a real deployment measures fenced
+/// replies from schema-receiving backends, move the fence tolerance to this one site — do not add
+/// a second one.
 ///
 /// # Strict, and deliberately not a scavenger
 ///
@@ -1902,11 +1938,23 @@ impl EventCollector {
 /// is a parser differential waiting to happen") and owns the one real-world tolerance — a
 /// ```` ```json ```` fence — on the `output_text` it already falls back to. Duplicating that
 /// tolerance here would give the tree two parsers with two accept-sets over the same bytes.
-fn structured_output_from_text(wants_structured: bool, text: &str) -> Option<Value> {
+fn structured_output_from_text(
+    wants_structured: bool,
+    text: &str,
+) -> Result<Option<Value>, ExecutionFailure> {
     if !wants_structured {
-        return None;
+        return Ok(None);
     }
-    serde_json::from_str(text.trim()).ok()
+    match serde_json::from_str::<Value>(text.trim()) {
+        Ok(value) => Ok(Some(value)),
+        // The `serde_json::Error` is dropped rather than formatted in. It carries a line and
+        // column into the provider's reply, which is a description of bytes this message must not
+        // describe; the condition is the same one however far into the reply it was detected.
+        Err(_) => Err(ExecutionFailure::new(
+            ExecutionFailureClass::StructuredOutputInvalid,
+            STRUCTURED_OUTPUT_NOT_JSON,
+        )),
+    }
 }
 
 async fn execute_rig_completion(
@@ -1915,7 +1963,7 @@ async fn execute_rig_completion(
 ) -> Result<ExecutionRunOutput, ExecutionFailure> {
     let wants_structured = request.output_schema.is_some();
     let output = handle.completion(request).await?;
-    let structured_output = structured_output_from_text(wants_structured, &output.text);
+    let structured_output = structured_output_from_text(wants_structured, &output.text)?;
     Ok(ExecutionRunOutput {
         text: output.text,
         structured_output,
@@ -2104,7 +2152,11 @@ async fn execute_rig_stream(
         }
     }
 
-    let structured_output = structured_output_from_text(wants_structured, &text);
+    // Issue #80. On this path the caller may already have received every delta, and the failure
+    // is raised anyway: the deltas were text, and the caller asked for a value. `committed` does
+    // not clamp anything here because `StructuredOutputInvalid` is already neither retryable nor
+    // fallback-eligible, so there is no re-run for a committed stream to be protected from.
+    let structured_output = structured_output_from_text(wants_structured, &text)?;
     Ok(ExecutionRunOutput {
         text,
         structured_output,
@@ -3106,12 +3158,13 @@ mod tests {
     /// so the gate cannot become unobservable if a fixture stops being reachable.
     #[test]
     fn structured_output_is_parsed_only_when_a_schema_was_requested() {
+        let parsed = |wants: bool, text: &str| {
+            structured_output_from_text(wants, text).expect("must not fail for this input")
+        };
+
         // The property: identical bytes, opposite results, decided solely by the flag.
-        assert_eq!(
-            structured_output_from_text(true, "{\"a\":1}"),
-            Some(json!({ "a": 1 }))
-        );
-        assert_eq!(structured_output_from_text(false, "{\"a\":1}"), None);
+        assert_eq!(parsed(true, "{\"a\":1}"), Some(json!({ "a": 1 })));
+        assert_eq!(parsed(false, "{\"a\":1}"), None);
 
         // The corruption shape easiest to reach in practice, and the reason the flag is not
         // merely an optimisation: a model that wraps its prose reply in quotes has emitted a
@@ -3119,36 +3172,78 @@ mod tests {
         // any interior escaping, now part of the body and of `summary_hash` with it.
         // Summarization sends no schema, so it takes the second branch.
         assert_eq!(
-            structured_output_from_text(true, "\"a quoted summary\""),
+            parsed(true, "\"a quoted summary\""),
             Some(json!("a quoted summary"))
         );
-        assert_eq!(
-            structured_output_from_text(false, "\"a quoted summary\""),
-            None
-        );
+        assert_eq!(parsed(false, "\"a quoted summary\""), None);
 
         // Whitespace is trimmed before the parse, and only around the document.
-        assert_eq!(
-            structured_output_from_text(true, "  \n{\"a\":1}\n  "),
-            Some(json!({ "a": 1 }))
-        );
+        assert_eq!(parsed(true, "  \n{\"a\":1}\n  "), Some(json!({ "a": 1 })));
 
-        // A non-conforming reply is `None`, never an error: see the doc comment's three
-        // reasons. If this ever becomes a `Result`, `run_extraction`'s failure class flips.
-        assert_eq!(structured_output_from_text(true, "I cannot do that."), None);
-        assert_eq!(structured_output_from_text(true, ""), None);
+        // **The gate is what decides, not the bytes.** With no schema requested, a reply that
+        // could never parse is still `Ok(None)` rather than a failure — summarization sends no
+        // schema and every reply it gets is prose, so a failure here would break every
+        // summarization in the tree.
+        assert_eq!(parsed(false, "I cannot do that."), None);
+    }
 
-        // Strict, not a scavenger. Both of these are what Rig's balanced-brace scan and
-        // `memory_extraction::strip_code_fence` would accept; neither is accepted here, so
-        // they keep flowing to the caller through `output_text` and are handled by the one
-        // parser that documents its tolerance.
+    /// Issue #80 — the flip, stated as a unit fact, and its boundary.
+    ///
+    /// The integration cases in `tests/structured_output.rs` each need a database, a mock
+    /// provider and an HTTP server; this one needs none of them, so the property stays observable
+    /// even if a fixture stops being reachable. It is separate from the gate test above because
+    /// the two answer different questions — "was a schema asked for" and "what happens when the
+    /// reply does not parse" — and a single test that went red would not say which.
+    #[test]
+    fn a_schema_carrying_reply_that_is_not_json_is_a_failure_rather_than_a_none() {
+        for reply in [
+            "I cannot do that.",
+            // Empty is the case worth naming: it is what a model sends when it has nothing to
+            // say, and it is **not** an empty *result*. A schema-carrying request that wants to
+            // answer "nothing" answers `null`, `{}` or `[]` — all three parse, and all three are
+            // asserted below as successes. Zero bytes are not a JSON document at all, so they
+            // fail, which is the same answer the caller would otherwise have had to infer from a
+            // 200 with a null field.
+            "",
+            // Strict, not a scavenger. Both of these are what Rig's balanced-brace scan and
+            // `memory_extraction::strip_code_fence` would accept. Neither is accepted here: what
+            // counts as a parse is exactly what it was before the flip, because the decision was
+            // about what happens on a failed parse, not about widening the accept-set.
+            "here you go: {\"a\":1}",
+            "```json\n{\"a\":1}\n```",
+        ] {
+            let failure = structured_output_from_text(true, reply)
+                .expect_err("a schema-carrying reply that is not JSON must fail");
+            assert_eq!(
+                failure.class,
+                ExecutionFailureClass::StructuredOutputInvalid,
+                "reply {reply:?}"
+            );
+            assert!(
+                !failure.retryable && !failure.fallback_eligible,
+                "the disposition in src/orchestration/controls.rs must reach the failure this \
+                 site constructs: {failure:?}"
+            );
+            assert!(
+                !failure.message.contains(reply.trim()) || reply.trim().is_empty(),
+                "the failure message must not echo the provider's reply: {}",
+                failure.message
+            );
+        }
+
+        // The boundary the decision draws. An *empty answer* is an answer: all three of these
+        // parse, so they still succeed and are reported as values rather than as failures.
         assert_eq!(
-            structured_output_from_text(true, "here you go: {\"a\":1}"),
-            None
+            structured_output_from_text(true, "null").expect("null is a JSON document"),
+            Some(Value::Null)
         );
         assert_eq!(
-            structured_output_from_text(true, "```json\n{\"a\":1}\n```"),
-            None
+            structured_output_from_text(true, "{}").expect("{} is a JSON document"),
+            Some(json!({}))
+        );
+        assert_eq!(
+            structured_output_from_text(true, "[]").expect("[] is a JSON document"),
+            Some(json!([]))
         );
     }
 

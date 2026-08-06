@@ -1051,15 +1051,15 @@ impl ExecutionFailure {
 /// connection reset; it is false of every structured-output failure, in both directions, and the
 /// reasons differ per direction so they are recorded separately:
 ///
-/// **The emitters that exist today are caller errors.** Both of them reject the *caller's
-/// schema* before the model ever sees it — `validate_response_format` over
-/// `public_api.maximum_schema_bytes`, and `build_completion_request` over a schema that is not a
-/// readable `schemars::Schema`. F42 pins that emitter set at exactly two
-/// (`structured_output_invalid_has_only_the_two_emitters_its_catalog_entry_describes`). A schema
-/// that is too large or unreadable is exactly as large and unreadable on the second attempt, so
-/// a retry is a guaranteed-identical failure paid for in latency.
+/// **Two of the three emitters are caller errors.** Both reject the *caller's schema* before the
+/// model ever sees it — `validate_response_format` over `public_api.maximum_schema_bytes`, and
+/// `build_completion_request` over a schema that is not a readable `schemars::Schema`. F42 and
+/// issue #80 pin the emitter set at exactly three
+/// (`structured_output_invalid_has_only_the_three_emitters_its_catalog_entry_describes`). A
+/// schema that is too large or unreadable is exactly as large and unreadable on the second
+/// attempt, so a retry is a guaranteed-identical failure paid for in latency.
 ///
-/// **The emitter the fail-hard variant would add is a model error, and the answer is still no.**
+/// **The third emitter is a model error — issue #80 shipped it, and the answer is still no.**
 /// A reply that did not satisfy the schema *might* satisfy it on a second sample — but Moira
 /// pins `temperature: Some(0.0)` on its own schema-carrying calls (memory extraction), where a
 /// second sample is bit-identical; and where a caller did choose a non-zero temperature, a retry
@@ -1106,7 +1106,7 @@ pub fn is_retryable(class: ExecutionFailureClass) -> bool {
 /// disappointing", and silently answering from a different model because the first was chatty
 /// changes who produced the answer with nothing on the wire to say so.
 ///
-/// **The decisive constraint: a class carries exactly one disposition, and this class has two
+/// **The decisive constraint: a class carries exactly one disposition, and this class has three
 /// emitters.** `is_fallback_eligible` cannot distinguish "the model replied badly" from "the
 /// caller sent a 2 MB schema". Admitting the class would let one caller's malformed schema walk
 /// the entire fallback chain on every request — a caller-triggered amplification against every
@@ -1134,8 +1134,8 @@ pub fn is_fallback_eligible(class: ExecutionFailureClass) -> bool {
 /// connection, it returned a body that is not a completion. A breaker entry is keyed on
 /// `(provider_id, model_id)` and, once open, refuses traffic for **every** caller on that pair.
 ///
-/// A structured-output failure is a statement about the *request* — the caller's schema today,
-/// and a model's reply if the fail-hard variant ships. Admitting it would let a single tenant
+/// A structured-output failure is a statement about the *request* — the caller's schema, or (since
+/// issue #80) a model's reply to it. Admitting it would let a single tenant
 /// posting an unreadable schema in a loop trip `circuit_failure_threshold` and take a healthy
 /// provider offline for everyone routed through it. That is a caller-triggered denial of service
 /// wearing a health check's clothes, and it is the reason this exclusion is the least arguable of
@@ -1211,11 +1211,12 @@ mod tests {
             | C::ProviderAuthenticationFailed
             | C::StreamBackpressureExceeded
             | C::InternalError => (false, false, false),
-            // F29's first precondition. See the three `is_*` doc comments: no retry (the schema
-            // is the same schema; a zero-temperature resample is the same reply), no fallback
-            // (F39 moved the capability question to routing, and the class cannot tell a bad
-            // caller schema from a bad model reply), no breaker (a caller must not be able to
-            // take a healthy provider offline for everyone).
+            // F29's first precondition, and unchanged by issue #80's third emitter — the row was
+            // written with that emitter already in view. See the three `is_*` doc comments: no
+            // retry (the schema is the same schema; a zero-temperature resample is the same
+            // reply), no fallback (F39 moved the capability question to routing, and the class
+            // cannot tell a bad caller schema from a bad model reply), no breaker (a caller must
+            // not be able to take a healthy provider offline for everyone).
             C::StructuredOutputInvalid => (false, false, false),
             // This provider cannot serve the request but another may hold a usable credential.
             C::CredentialNotFound => (false, true, false),
@@ -1291,9 +1292,10 @@ mod tests {
              request-shaped failure must never be able to open one"
         );
         // The disposition is only safe while the emitter set is what the catalog says it is.
-        // `structured_output_invalid_has_only_the_two_emitters_its_catalog_entry_describes`
-        // (src/i18n/catalog/mod.rs) is the interlock: a third emitter goes red there, which is
-        // the prompt to re-read this decision rather than inherit it.
+        // `structured_output_invalid_has_only_the_three_emitters_its_catalog_entry_describes`
+        // (src/i18n/catalog/mod.rs) is the interlock: a fourth emitter goes red there, which is
+        // the prompt to re-read this decision rather than inherit it. Issue #80's third emitter
+        // went through exactly that prompt and left the disposition unchanged.
     }
 
     fn policy(threshold: i32) -> ProviderRuntimePolicyRecord {

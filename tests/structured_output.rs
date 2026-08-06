@@ -24,19 +24,22 @@
 //!    still report `structured_output: null`. This is the case that protects conversation
 //!    summarization, which sends no schema and stores `output_text` as a content-addressed
 //!    body — see `tests/conversation_summarization.rs`.
-//! 4. **No fail-hard.** A schema-carrying request whose reply is prose must still succeed with
-//!    the prose in `output_text`. `StructuredOutputInvalid` is in neither `is_retryable` nor
-//!    `is_fallback_eligible` nor `is_circuit_failure`, so failing here would kill the execution
-//!    with no retry and no fallback — and on DeepSeek, where Rig drops the schema before the
-//!    wire (finding F39), it would fail *every* structured request. See the ledger's F29 entry.
+//! 4. **Fail hard — issue #80, decided 2026-08-06.** A schema-carrying request whose reply is not
+//!    JSON fails the execution with `structured_output_invalid`, which a public caller receives as
+//!    **422**. It used to succeed with `structured_output: null` and the prose in `output_text`,
+//!    which is the same document a legitimately empty answer produces — so a caller could not tell
+//!    "the provider did not comply" from "the answer was empty". Three cases, because the property
+//!    has three surfaces: the completion path, the streaming path, and the public HTTP contract
+//!    that is the whole point of the decision. `StructuredOutputInvalid` is in neither
+//!    `is_retryable` nor `is_fallback_eligible` nor `is_circuit_failure`, so the failure is
+//!    terminal on the first non-conforming reply — asserted here as "the provider was called
+//!    exactly once".
 //!
-//!    **This is now a policy choice rather than a blocked one.** All three of F29's preconditions
-//!    have been discharged — F39 landed, the disposition above is recorded and guarded in
-//!    `src/orchestration/controls.rs` rather than merely true by omission, and `run_extraction`
-//!    reads `execution.status`. The fail-hard variant is deliberately left unshipped so that the
-//!    blast-radius decision gets its own diff; the two cases below (and the streaming twin) are
-//!    what it has to replace when it does. The doc comment on `structured_output_from_text` in
-//!    `src/application/execution.rs` carries the full argument.
+//!    All three of F29's preconditions were discharged first — F39 landed, the disposition is
+//!    recorded and guarded in `src/orchestration/controls.rs` rather than true by omission, and
+//!    `run_extraction` reads `execution.status`. The doc comment on `structured_output_from_text`
+//!    in `src/application/execution.rs` carries the full argument, including the boundary: `null`,
+//!    `{}` and `[]` all parse, so an empty *answer* is still a `200`.
 
 mod support;
 
@@ -316,22 +319,35 @@ async fn a_reply_that_is_json_is_not_parsed_when_no_schema_was_requested() {
     case.shutdown().await;
 }
 
-/// **No fail-hard.** A non-conforming reply leaves the field `null` and changes nothing else.
+/// The reply a non-conforming model sends. Held as a constant because two assertions are about
+/// it: that it does not come back as an answer, and that it does not come back inside the error.
+const NON_CONFORMING_REPLY: &str = "I am afraid I cannot do that.";
+
+/// **Fail hard, issue #80.** A non-conforming reply ends the execution instead of leaving the
+/// field `null` on a `succeeded` outcome.
 ///
-/// The tripwire for anyone who adopts the fail-hard variant without also doing F39: this case
-/// and `an_unparseable_extraction_reply_fails_the_run_and_writes_no_memory` both go red.
+/// Replaces `a_reply_that_is_not_json_leaves_the_field_null_and_still_succeeds`, which asserted
+/// the opposite on the same fixture and whose own failure message named this change as the thing
+/// that would make it wrong. That case was correct for F29 and is wrong from #80 onward; the
+/// catalog description it protected has been widened in the same commit.
 ///
-/// **F42 — this case is also what makes the `moira.error.structured_output_invalid` catalog
-/// entry true.** That entry used to assert a second emitter, "or the model's output does not
-/// conform to it", and there is none: both real emitters reject the *caller's schema*
-/// (`validate_response_format`, `build_completion_request`). The catalog description now says
-/// so, and this is the assertion that would have to change first if it ever stopped being so —
-/// hence the pointer in the failure message below. A prose claim nothing observes is not a
-/// claim; this is the thing that observes it.
+/// **Four assertions, and each one is a different way the flip could be half-done:**
+///
+/// 1. the outcome is `failed` and the class is `structured_output_invalid` — not
+///    `provider_invalid_response`, and not a routing failure;
+/// 2. `output_text` is absent. A 422 that still carried the model's prose would hand the caller
+///    something that reads like an answer next to an error, which is the ambiguity the decision
+///    exists to remove;
+/// 3. the failure message does not contain the reply. `failure.message` is copied verbatim into
+///    the public error envelope, so a message built from the provider's bytes would put untrusted
+///    output under Moira's own error surface;
+/// 4. the provider was called **exactly once**. `StructuredOutputInvalid` is in neither
+///    `is_retryable` nor `is_fallback_eligible`, and a second call here would be the cheapest
+///    silent way to violate that — the disposition is asserted as behaviour, not as membership.
 #[tokio::test]
-async fn a_reply_that_is_not_json_leaves_the_field_null_and_still_succeeds() {
+async fn a_reply_that_is_not_json_fails_the_execution_with_structured_output_invalid() {
     let Some(case) = Case::new(vec![ProviderScript::Completion {
-        text: "I am afraid I cannot do that.".to_string(),
+        text: NON_CONFORMING_REPLY.to_string(),
     }])
     .await
     else {
@@ -341,37 +357,57 @@ async fn a_reply_that_is_not_json_leaves_the_field_null_and_still_succeeds() {
     let (status, body) = case.diagnose(false, Some(trivial_object_schema())).await;
     assert_eq!(status, StatusCode::OK, "diagnose failed: {body}");
     assert_eq!(
-        body["outcome"]["status"], "succeeded",
-        "a non-conforming reply must not fail the execution. If this is now intentional (the \
-         fail-hard variant), widen the moira.error.structured_output_invalid description in \
-         src/i18n/catalog/errors.rs AND docs/i18n-response-catalog.json in the same change — it \
-         currently states that no model-output-non-conformance path exists (F42): {body}"
+        body["outcome"]["status"], "failed",
+        "issue #80: a reply that is not JSON must fail a schema-carrying execution rather than \
+         reporting success with a null value: {body}"
+    );
+    assert_eq!(
+        body["outcome"]["failure"]["class"], "structured_output_invalid",
+        "the failure must name the structured-output contract, not the transport: {body}"
     );
     assert_eq!(body["outcome"]["structured_output"], Value::Null, "{body}");
     assert_eq!(
-        body["outcome"]["output_text"], "I am afraid I cannot do that.",
-        "{body}"
+        body["outcome"]["output_text"],
+        Value::Null,
+        "a failed structured execution must not return the prose as though it were an answer: \
+         {body}"
     );
-    assert_eq!(body["outcome"]["failure"], Value::Null, "{body}");
+    let message = body["outcome"]["failure"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !message.contains(NON_CONFORMING_REPLY),
+        "the failure message is copied verbatim into the public error envelope and must not echo \
+         the provider's reply: {message}"
+    );
+
+    assert_eq!(
+        case.provider().requests().await.len(),
+        1,
+        "the provider must be called exactly once: this class is neither retryable nor \
+         fallback-eligible, so a second call would mean the disposition in \
+         src/orchestration/controls.rs is not what its own guard says"
+    );
 
     case.shutdown().await;
 }
 
-/// **No fail-hard, on the stream.** F42 — added because the suite's own header argues for it and
-/// then did not do it.
+/// **Fail hard on the stream.** The streaming twin, and it guards a distinct failure mode.
 ///
-/// The header says `execute_rig_stream` "is a genuinely separate code path, and a fix applied at
-/// the Rig boundary would cover only case 1". That argument was applied to the *conforming*
-/// reply (case 2) and not to the non-conforming one, which left the cheapest falsifying edit
-/// unguarded: adding the fail-hard variant to the **streaming arm only** leaves all seven
-/// existing cases green — case 2 sends conforming JSON and never reaches the branch, and case 4
-/// never streams. Verified by running it, not by reading.
+/// `execute_rig_stream` never constructs a `RuntimeCompletionOutput` — it accumulates text itself
+/// — so the flip has to be applied there separately, and the cheapest half-done version of this
+/// change is applying it to the completion arm only. Every other case in this file stays green
+/// through that omission: case 2 sends conforming JSON, and the case above never streams.
 ///
-/// This case and the completion twin above are what make the
-/// `moira.error.structured_output_invalid` catalog entry's "no model-output-non-conformance
-/// path exists" true on *both* execution paths rather than on the one that was easy to write.
+/// The deltas are split so the failure is provably raised on the *accumulated* text rather than
+/// on a chunk, which is the same property case 2 pins for the success path.
+///
+/// It also pins the harder half of the decision: the caller has **already received these deltas**
+/// when the failure is raised. Failing anyway is deliberate — the deltas were text, and the
+/// caller asked for a value.
 #[tokio::test]
-async fn a_stream_whose_reply_is_not_json_leaves_the_field_null_and_still_succeeds() {
+async fn a_stream_whose_reply_is_not_json_fails_the_execution_with_structured_output_invalid() {
     let Some(case) = Case::new(vec![ProviderScript::Stream {
         deltas: vec!["I am afraid ".to_string(), "I cannot do that.".to_string()],
     }])
@@ -383,21 +419,144 @@ async fn a_stream_whose_reply_is_not_json_leaves_the_field_null_and_still_succee
     let (status, body) = case.diagnose(true, Some(trivial_object_schema())).await;
     assert_eq!(status, StatusCode::OK, "diagnose failed: {body}");
     assert_eq!(
-        body["outcome"]["status"], "succeeded",
-        "a non-conforming streamed reply must not fail the execution either. If this is now \
-         intentional (the fail-hard variant), widen the moira.error.structured_output_invalid \
-         description in src/i18n/catalog/errors.rs AND docs/i18n-response-catalog.json in the \
-         same change — it currently states that no model-output-non-conformance path exists \
-         (F42): {body}"
+        body["outcome"]["status"], "failed",
+        "issue #80 applies to the streaming path too, and this is the arm a completion-only fix \
+         leaves behind: {body}"
+    );
+    assert_eq!(
+        body["outcome"]["failure"]["class"], "structured_output_invalid",
+        "{body}"
     );
     assert_eq!(body["outcome"]["structured_output"], Value::Null, "{body}");
     assert_eq!(
-        body["outcome"]["output_text"], "I am afraid I cannot do that.",
-        "the accumulated text must survive unchanged: {body}"
+        body["outcome"]["output_text"],
+        Value::Null,
+        "the accumulated prose must not be reported as an answer: {body}"
     );
-    assert_eq!(body["outcome"]["failure"], Value::Null, "{body}");
+
+    assert_eq!(
+        case.provider().requests().await.len(),
+        1,
+        "no retry and no fallback on the streaming path either"
+    );
 
     case.shutdown().await;
+}
+
+/// One `POST /api/v1/responses` carrying a `json_schema` response format, against a fixture wired
+/// for structured output, answered by `reply`.
+///
+/// Returns `(status, raw body, provider call count)`. The body is returned as a string rather than
+/// parsed so a case can assert on the *bytes* the caller received — which is how "the provider's
+/// reply is not echoed anywhere in the envelope" is checked, including in fields a targeted
+/// assertion would not look at.
+///
+/// The count is taken after the response, so "one call" covers the whole request rather than the
+/// part before the failure.
+async fn public_response(reply: &str) -> Option<(StatusCode, String, usize)> {
+    let fixture = LifecycleFixture::new().await?;
+    let provider = MockOpenAiServer::start(vec![ProviderScript::Completion {
+        text: reply.to_string(),
+    }])
+    .await;
+    fixture
+        .add_provider_with_capabilities(
+            provider.base_url(),
+            10,
+            RuntimePolicy::default(),
+            // A schema-carrying public request requires this capability
+            // (`required_capabilities` in `application/public.rs`), so the default
+            // streaming-only model would fail at routing before reaching the provider.
+            json!({ "streaming": true, "structured_output": true }),
+        )
+        .await;
+    let consumer_key = fixture.enable_public_streaming().await;
+    let moira = MoiraHttpServer::start(fixture.state.clone()).await;
+
+    let response = tokio::time::timeout(
+        WAIT,
+        reqwest::Client::new()
+            .post(format!("{}/api/v1/responses", moira.base_url))
+            .header("x-consumer-key", &consumer_key)
+            .header("x-request-id", format!("i80-{}", uuid::Uuid::now_v7()))
+            .json(&json!({
+                "input": [{ "role": "user", "content": [{ "type": "input_text", "text": "return the object" }] }],
+                "route": fixture.route_key,
+                "response_format": {
+                    "type": "json_schema",
+                    "name": "trivial",
+                    "schema": trivial_object_schema()
+                }
+            }))
+            .send(),
+    )
+    .await
+    .expect("public response request timed out")
+    .expect("public response request");
+    let status = response.status();
+    let body = response.text().await.expect("public response body");
+    let calls = provider.call_count().await;
+
+    moira.shutdown().await;
+    provider.shutdown().await;
+    Some((status, body, calls))
+}
+
+/// **The decision itself, where a caller can see it: `422`, not a `200` with a null value.**
+///
+/// The three cases above drive `POST /api/v1/admin/runtime/diagnose`, which answers `200` with an
+/// outcome document whatever the execution did — so it can show that the execution failed, but it
+/// cannot show the status code or the error code the public contract promises. Issue #80 is a
+/// statement about that contract, so it is asserted on the contract.
+///
+/// **The control is in the same test and is not decoration.** "422 and the code is
+/// `structured_output_invalid`" is also what a *schema* rejection produces
+/// (`validate_response_format`, `build_completion_request` — the class's other two emitters), and
+/// a fixture whose model could not be routed a schema at all would fail before any provider call
+/// with the same status. The conforming control proves this fixture reaches the provider and
+/// returns the parsed value, so the refusal is attributable to the reply rather than to the
+/// request or to the wiring — the vacuous-pass shape HANDOFF §2.3 keeps finding.
+#[tokio::test]
+async fn a_public_caller_receives_422_rather_than_a_null_structured_output() {
+    let Some((status, body, calls)) = public_response(NON_CONFORMING_REPLY).await else {
+        return;
+    };
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "issue #80: a reply that is not JSON must reach the caller as 422, got {status}: {body}"
+    );
+    let envelope: Value = serde_json::from_str(&body).expect("coded error envelope");
+    assert_eq!(
+        envelope["error"]["code"], "structured_output_invalid",
+        "the caller must be told which contract failed: {body}"
+    );
+    assert_eq!(
+        envelope["error"]["message_key"], "moira.error.structured_output_invalid",
+        "the code must resolve to its catalog entry, which is what makes the message \
+         translatable: {body}"
+    );
+    assert!(
+        !body.contains(NON_CONFORMING_REPLY),
+        "the error envelope must not carry the provider's reply back to the caller: {body}"
+    );
+    assert_eq!(calls, 1, "exactly one provider call, no retry, no fallback");
+
+    // The control. Same fixture, same schema, same route — a reply that *is* JSON must still be
+    // answered `200` with the parsed value, or the refusal above is unattributable.
+    let Some((status, body, calls)) = public_response("{\"a\":1}").await else {
+        return;
+    };
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the control request must succeed, or the 422 above proves only that the fixture is \
+         broken: {body}"
+    );
+    assert_eq!(
+        calls, 1,
+        "the control request must reach the provider: {body}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
