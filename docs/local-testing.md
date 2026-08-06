@@ -204,9 +204,29 @@ and asks first.
 ## The console
 
 `make console-dev` serves it on <http://localhost:3000>. `/` redirects to `/login`,
-and `/login` renders. **Signing in still does not work from the browser**, but the
-gap is narrower than it was: the write path exists, the screen that drives it does
-not.
+and `/login` renders. **Signing in has never been proven against a real Moira, in
+a browser, on this console.** That gap is narrower than it used to be — the write
+path and the wizard screen that drives it both exist now — but "exists" and
+"proven" are different claims, and this section keeps them separate.
+
+**Proven, first-hand, today:** Moira's own API path, end to end —
+`make setup` / `make start` / `make seed` / `make smoke` / `make execute-test`,
+the last of which produced a real completion. Separately, an operator signed in
+through a browser against a local OIDC provider and got a Moira-routed answer —
+but that was the **commerce-os platform console**, not this one. How that is
+wired, and exactly what was observed, is documented in that repo, not copied
+here: see
+[commerce-os's `DEV-GUIDE.md`](https://github.com/motrait/commerce-os/blob/develop/DEV-GUIDE.md).
+
+**Not proven, here:** this repo's own console has never been driven against a
+real Moira end to end. Its e2e suite (`console/e2e/setup-wizard.e2e.ts`) runs the
+wizard against a **stub** Moira on loopback TLS (`console/e2e/support/moira-setup-stub.ts`)
+and stops on purpose at the `sign_in` step — one test asserts *positively* that
+`claim` is not reached, so the gap stays visible instead of silently closing
+itself once someone assumes it's covered. Reaching `claim`, and any real sign-in,
+needs a completed OAuth round trip through a mock IdP inside the e2e environment;
+that harness does not exist yet (issue #72). It also needs the IdP reachable over
+**https** — see the missing item below.
 
 What has landed — `console/app/api/setup/route.ts`, the single door setup writes
 through:
@@ -227,10 +247,11 @@ through:
 What has landed since — `console/app/setup/` and `console/modules/setup/`: `/setup`
 is a five-step wizard (welcome → auth_settings → sign_in → claim → done) and it
 is the UI caller of `POST /api/setup`. A trusted issuer, an auth provider and the
-first admin no longer have to be created by hand. The page calls its own route
-handler **in process**, so Moira's raw auth-methods response never reaches the
-browser, and it answers < 400 in every window state — the window being closed is
-a configuration fact, not an error.
+first admin no longer have to be created by hand — by the shipped code path, not
+yet by anyone who has actually walked it in a browser against a real Moira (see
+above). The page calls its own route handler **in process**, so Moira's raw
+auth-methods response never reaches the browser, and it answers < 400 in every
+window state — the window being closed is a configuration fact, not an error.
 
 What is still missing:
 
