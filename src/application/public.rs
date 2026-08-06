@@ -2221,9 +2221,14 @@ fn map_runtime_event(
         // A dangling `agent_profile_id` is an operator fault in this deployment's
         // configuration, and its payload names a route and a profile the caller has no
         // relationship with. Putting it on the public SSE contract would leak the shape of
-        // the admin plane to every API consumer and would say nothing they could act on.
-        // The audiences that need it are the diagnostic endpoint (which returns every
-        // `RuntimeEventEnvelope` verbatim), the `warn!` and the audit row.
+        // the admin plane to every API consumer. The audiences that need it are the
+        // diagnostic endpoint (which returns every `RuntimeEventEnvelope` verbatim), the
+        // `warn!` and the audit row.
+        //
+        // Issue #79 did not change this. The caller is now refused, and learns why from the
+        // terminal `response.failed` event's `agent_profile_disabled` /
+        // `agent_profile_not_found` error — which names the profile and the remedy without
+        // exposing the route id or the admin-plane event stream.
         RuntimeEventType::AgentProfileUnavailable => return None,
     };
     Some(public_sse(
@@ -2526,10 +2531,24 @@ fn failure_http_status(class: ExecutionFailureClass) -> axum::http::StatusCode {
         ExecutionFailureClass::RouteForbidden
         | ExecutionFailureClass::ModelForbidden
         | ExecutionFailureClass::CredentialForbidden => StatusCode::FORBIDDEN,
+        // Issue #79. `AgentProfileNotFound` joins the family it belongs to: a runtime reference on
+        // the resolution chain (route → agent profile → model → credential) that does not resolve
+        // is already a `404` for the route and for the credential, and neither of those is named
+        // by the caller either. The status also agrees with what the admin plane says about the
+        // same id — `GET /api/v1/admin/agent-profiles/{id}` answers `404` for a soft-deleted
+        // profile — and two different answers about one row would be worse than either.
         ExecutionFailureClass::NoEligibleModel
         | ExecutionFailureClass::ModelNotFound
         | ExecutionFailureClass::RouteNotFound
+        | ExecutionFailureClass::AgentProfileNotFound
         | ExecutionFailureClass::CredentialNotFound => StatusCode::NOT_FOUND,
+        // Issue #79, and deliberately *not* `404`: the profile exists, it is addressable on the
+        // admin plane, and the operator switched it off. Saying "not found" about a row an
+        // operator can see would send them looking for the wrong thing. `409` is the state
+        // conflict it is — the request cannot be completed while the target resource is in this
+        // state, and retrying is futile until the state changes. It is not `503`, which promises
+        // that waiting helps, and not `502`, which blames a provider none of this contacted.
+        ExecutionFailureClass::AgentProfileDisabled => StatusCode::CONFLICT,
         ExecutionFailureClass::CapacityExhausted => StatusCode::TOO_MANY_REQUESTS,
         ExecutionFailureClass::ProviderTimeout | ExecutionFailureClass::DeadlineExceeded => {
             StatusCode::GATEWAY_TIMEOUT

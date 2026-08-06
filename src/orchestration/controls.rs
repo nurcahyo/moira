@@ -1191,6 +1191,12 @@ mod tests {
             | C::ApplicationUnavailable
             | C::RouteNotFound
             | C::RouteForbidden
+            // Issue #79. A route naming a missing or disabled agent profile is deployment
+            // configuration: the same route resolves to the same unusable profile on the next
+            // attempt, every provider in the chain would be handed the same route, and no
+            // provider was contacted, so there is nothing to say about anyone's health.
+            | C::AgentProfileNotFound
+            | C::AgentProfileDisabled
             | C::ModelNotFound
             | C::ModelForbidden
             | C::ModelCapabilityMismatch

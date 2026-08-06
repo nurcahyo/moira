@@ -1164,6 +1164,8 @@ pub fn execution_failure_class_from_db(value: String) -> Result<ExecutionFailure
         "application_unavailable" => Ok(ExecutionFailureClass::ApplicationUnavailable),
         "route_not_found" => Ok(ExecutionFailureClass::RouteNotFound),
         "route_forbidden" => Ok(ExecutionFailureClass::RouteForbidden),
+        "agent_profile_not_found" => Ok(ExecutionFailureClass::AgentProfileNotFound),
+        "agent_profile_disabled" => Ok(ExecutionFailureClass::AgentProfileDisabled),
         "model_not_found" => Ok(ExecutionFailureClass::ModelNotFound),
         "model_forbidden" => Ok(ExecutionFailureClass::ModelForbidden),
         "model_capability_mismatch" => Ok(ExecutionFailureClass::ModelCapabilityMismatch),

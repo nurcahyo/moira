@@ -49,6 +49,16 @@
       "description": "Used when a create-invitation request asks for a lifetime above the server-side hard cap of 72 hours. The request is refused rather than clamped: an operator who believes they issued a long-lived invitation and silently received a short one would discover the difference at the worst possible moment."
     },
     {
+      "key": "moira.error.agent_profile_disabled",
+      "default_message": "The route requires an agent profile that is currently disabled.",
+      "description": "Used when the selected route's agent_profile_id names an agent profile whose status is disabled. Moira refuses the execution rather than serving it without the profile's preamble (issue #79). Distinct from agent_profile_not_found, which means no live row has that id: the remedy here is to re-enable the profile or point the route at an active one, and the HTTP status is 409 rather than 404 because the profile exists and is visible on the admin plane."
+    },
+    {
+      "key": "moira.error.agent_profile_not_found",
+      "default_message": "The route requires an agent profile that no longer exists.",
+      "description": "Used when the selected route's agent_profile_id names no live agent_profiles row, because the profile was soft-deleted or never existed. Moira refuses the execution rather than serving it without the profile's preamble (issue #79); the English message names the route and the profile id so the deployment can be corrected without reading server logs. Distinct from agent_profile_disabled, where the row is still there: the remedy here is to create a profile and repoint the route."
+    },
+    {
       "key": "moira.error.application_unavailable",
       "default_message": "The application is not available to serve this request.",
       "description": "Used when the request targets an application the caller is not bound to, or one that is not currently active. Retrying will not help until the binding or the application's status is corrected."

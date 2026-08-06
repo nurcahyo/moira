@@ -46,25 +46,35 @@
 //! 5. **`tool_policy` is not forwarded.** The integration counterpart of F48's unit guard —
 //!    see that case's own comment for why it is *not* a substitute for it.
 //! 6. **Finding F50 — the disabled profile is announced.** Disabling an agent profile leaves
-//!    the route pointing at it and degrades every execution on that route to a profile-less
-//!    request. That is now announced as a runtime event, a `warn!` and an audit row, and the
-//!    guard asserts on the event and the row: logs are easy to assert and easy to lose.
+//!    the route pointing at it. That is announced as a runtime event, a `warn!` and an audit
+//!    row, and the guard asserts on the event and the row: logs are easy to assert and easy to
+//!    lose.
 //! 7. **The soft-delete twin of case 6**, because `delete_agent_profile` is a different admin
 //!    method and is the one that could have hard-deleted the row.
 //! 8. **The streaming twin of case 6.** Case 4's justification — "they are separate arms" —
 //!    applies to this property too, and a per-path pairing with an empty cell is HANDOFF
 //!    §3.4's twelfth entry.
 //! 9. **The control for cases 6–8, and it is load-bearing.** A route that never had a
-//!    profile must announce *nothing*. Without it, a fix that fired on `agent_profile_id`
-//!    being `Some` rather than on the lookup failing would satisfy every guard above.
-//! 10. **What F50 still has not decided, and this case DOCUMENTS CURRENT BEHAVIOUR rather
-//!     than guarding it.** The request is still served, unguarded, with a `succeeded`
-//!     status. Whether it should instead be refused is a product decision; read that case's
-//!     comment before changing it.
+//!    profile must announce *nothing* and must keep executing. Without it, a fix that fired on
+//!    `agent_profile_id` being `Some` rather than on the lookup failing would satisfy every
+//!    guard above — and, since issue #79, would refuse every profile-less route in the
+//!    deployment.
+//! 10. **Issue #79 — the execution is refused.** The maintainer took F50's open product
+//!     decision fail-closed on 2026-08-06: a route naming a missing or disabled agent profile
+//!     fails the request rather than serving it without the profile's preamble. This case is
+//!     the replacement for the `documents_` case that pinned the old lenient behaviour.
+//! 11. **`409 agent_profile_disabled`** on `POST /api/v1/responses` — the caller-visible
+//!     contract for a profile the operator switched off.
+//! 12. **`404 agent_profile_not_found`** on the same endpoint for a soft-deleted profile. Cases
+//!     11 and 12 are a pair: either alone is satisfied by an implementation that always answers
+//!     one status, and the distinction is the thing worth guarding.
+//! 13. **The streamed refusal**, which is a terminal `response.failed` event rather than an
+//!     HTTP status, because the response head is written before the execution starts.
 //!
-//! Cases 6–9 survive that decision and case 10 does not, which is why they are separate
-//! cases rather than one — merging them would make the observability guard go red on a
-//! fail-closed fix, the pinned-defect shape HANDOFF §3.4 records twice.
+//! Cases 6–9 are the observability half and survive the fail-closed decision unchanged; cases
+//! 10–13 are the refusal half. Keeping them apart is HANDOFF §3.4's `documents_`/`guards_`
+//! distinction: the observability guards did not go red when the decision landed, which is
+//! exactly what they were split out to achieve.
 
 mod support;
 
@@ -87,6 +97,19 @@ use support::{
 use uuid::Uuid;
 
 const WAIT: Duration = Duration::from_secs(15);
+
+/// The budget for a public-plane request, which is deliberately much larger than [`WAIT`].
+///
+/// These cases each drive two complete end-to-end requests — a successful control and the refusal
+/// — on top of creating an application policy and a consumer key, while every other test in this
+/// binary runs concurrently against the same machine and the same PostgreSQL instance. At `WAIT`
+/// the disabled-profile case failed under that load and passed in 8s when run alone, which is a
+/// timeout measuring the machine rather than the code.
+///
+/// It is not a latency assertion and must not be read as one. Nothing here is allowed to pass
+/// *because* it was slow; the value exists only so a genuine hang fails the test instead of
+/// hanging the suite.
+const PUBLIC_WAIT: Duration = Duration::from_secs(120);
 
 /// Deliberately unlike anything else the request could carry, so an assertion that finds it can
 /// only have found the profile's copy of it.
@@ -272,6 +295,79 @@ impl Case {
              this indistinguishable from the no-profile control, and would mean F50's \
              premise is wrong for the delete path"
         );
+    }
+
+    /// How many requests have reached the mock provider so far.
+    ///
+    /// The refusal cases assert this *does not move* across the request under test, having first
+    /// moved it with a request that succeeded. "Zero requests arrived" on its own is what a
+    /// broken fixture looks like too — a provider that was never wired, a route that never
+    /// resolved — so the count is taken before and after and the before is non-zero.
+    async fn provider_request_count(&self) -> usize {
+        self.provider.requests().await.len()
+    }
+
+    /// Enables the public plane for this fixture's application and returns a consumer key.
+    ///
+    /// The refusal has to be observed where a *caller* sees it, not only through the admin
+    /// diagnostic endpoint: the diagnostic endpoint answers `200` with an outcome document
+    /// whatever the execution did, so it can show that the execution failed but it cannot show
+    /// the HTTP status or the error code the public contract promises.
+    async fn public_key(&self) -> String {
+        self.fixture.enable_public_streaming().await
+    }
+
+    /// `POST /api/v1/responses` — the non-streaming public path.
+    async fn create_public_response(&self, key: &str) -> (StatusCode, Value) {
+        let response = tokio::time::timeout(
+            PUBLIC_WAIT,
+            self.client
+                .post(format!("{}/api/v1/responses", self.moira.base_url))
+                .header("x-consumer-key", key)
+                .header("x-request-id", format!("f50-{}", Uuid::now_v7()))
+                .json(&support::public_response_request(&self.fixture.route_key))
+                .send(),
+        )
+        .await
+        .expect("public response request timed out")
+        .expect("public response request");
+        let status = response.status();
+        let body = response.text().await.expect("public response body");
+        (
+            status,
+            serde_json::from_str(&body).unwrap_or(Value::String(body)),
+        )
+    }
+
+    /// `POST /api/v1/responses/stream` — the public SSE path, drained to its terminal event.
+    ///
+    /// Returns the transport status and every `data:` envelope. A refusal raised inside the
+    /// execution arrives *on* the stream rather than as an HTTP status, because the response head
+    /// is written before the execution starts; that is the contract this returns both halves of.
+    async fn stream_public_response(&self, key: &str) -> (StatusCode, Vec<Value>) {
+        let response = tokio::time::timeout(
+            PUBLIC_WAIT,
+            self.client
+                .post(format!("{}/api/v1/responses/stream", self.moira.base_url))
+                .header("x-consumer-key", key)
+                .header("x-request-id", format!("f50-stream-{}", Uuid::now_v7()))
+                .json(&support::public_response_request(&self.fixture.route_key))
+                .send(),
+        )
+        .await
+        .expect("public stream request timed out")
+        .expect("public stream request");
+        let status = response.status();
+        let body = tokio::time::timeout(PUBLIC_WAIT, response.text())
+            .await
+            .expect("public stream body timed out")
+            .expect("public stream body");
+        let envelopes = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+            .collect();
+        (status, envelopes)
     }
 
     /// Every audit row this execution wrote, as `(action, result)`.
@@ -867,26 +963,50 @@ async fn guards_a_soft_deleted_agent_profile_is_announced_too() {
 /// property the suite tests, not just the one that prompted it — a per-path pairing is a
 /// matrix and this one had a hole in it.
 ///
-/// The announcement is currently made in `execute_inner`, *before* the two arms diverge, and
-/// `get_active_agent_profile` has exactly one call site in `src/`. So this case cannot fail
-/// today for a reason the disable case would not also catch. It exists so that the day
-/// something moves the lookup, or the streaming task grows its own resolution, the hole is
-/// already covered — which is precisely the shape of the F49 fixture hole that made the whole
-/// branch untested for as long as it did.
+/// The announcement is made in `execute_inner`, *before* the two arms diverge, and the profile
+/// lookup has exactly one call site in `src/`. So this case cannot fail today for a reason the
+/// disable case would not also catch. It exists so that the day something moves the lookup, or
+/// the streaming task grows its own resolution, the hole is already covered — which is precisely
+/// the shape of the F49 fixture hole that made the whole branch untested for as long as it did.
+///
+/// **Changed by issue #79.** It used to assert that this execution reached the provider with
+/// `"stream": true`, as proof that it had not silently taken the non-streaming path. That
+/// evidence is gone by construction: the refusal now happens before either arm is chosen, so a
+/// streamed request that names a dangling profile contacts nobody. The replacement premise is
+/// the first script never being consumed, plus the control run below that proves this fixture
+/// *can* stream — without which "no provider request" would be satisfied by a fixture that could
+/// not have made one anyway.
 #[tokio::test]
-async fn guards_the_streaming_arm_announces_a_dangling_agent_profile_too() {
+async fn guards_the_streaming_arm_announces_and_refuses_a_dangling_agent_profile_too() {
     let Some(case) = Case::new(
         Profile::Attached,
-        vec![ProviderScript::Stream {
-            deltas: vec!["ok".to_string()],
-        }],
+        vec![
+            ProviderScript::Stream {
+                deltas: vec!["ok".to_string()],
+            },
+            ProviderScript::Stream {
+                deltas: vec!["unreachable".to_string()],
+            },
+        ],
     )
     .await
     else {
         return;
     };
-    case.disable_profile().await;
 
+    // Control: the streaming arm works on this fixture and really does stream.
+    let (status, healthy) = case.diagnose(true, ExecutionOptions::default()).await;
+    assert_eq!(status, StatusCode::OK, "diagnose failed: {healthy}");
+    assert_eq!(healthy["outcome"]["status"], "succeeded", "{healthy}");
+    let streamed = case.only_provider_body().await;
+    assert_eq!(
+        streamed["stream"], true,
+        "the control must actually stream, or this case is the non-streaming one with extra \
+         steps: {streamed}"
+    );
+    let before = case.provider_request_count().await;
+
+    case.disable_profile().await;
     let (status, body) = case.diagnose(true, ExecutionOptions::default()).await;
     assert_eq!(status, StatusCode::OK, "diagnose failed: {body}");
     let execution_id = body["outcome"]["execution_id"]
@@ -894,18 +1014,26 @@ async fn guards_the_streaming_arm_announces_a_dangling_agent_profile_too() {
         .unwrap_or_else(|| panic!("no execution id: {body}"))
         .to_string();
 
-    // The case cannot pass by silently having taken the non-streaming path, for the same
-    // reason case 4 asserts this.
-    let wire = case.only_provider_body().await;
     assert_eq!(
-        wire["stream"], true,
-        "this case must actually stream, or it is case 6 with extra steps: {wire}"
+        body["outcome"]["status"], "failed",
+        "the streaming arm must refuse a dangling agent profile exactly as the non-streaming \
+         one does: {body}"
+    );
+    assert_eq!(
+        body["outcome"]["failure"]["class"], "agent_profile_disabled",
+        "{body}"
+    );
+    assert_eq!(
+        case.provider_request_count().await,
+        before,
+        "the streaming arm reached the provider after the refusal; the second scripted stream \
+         must never be consumed"
     );
 
     assert_eq!(
         events_of_type(&body, UNAVAILABLE_EVENT).len(),
         1,
-        "the streaming arm dropped the same profile just as silently: {body}"
+        "the streaming arm dropped the same profile without announcing it: {body}"
     );
     let audit = case.audit_actions(&execution_id).await;
     assert!(
@@ -978,68 +1106,338 @@ async fn guards_a_route_with_no_agent_profile_announces_nothing() {
     case.shutdown().await;
 }
 
-/// **F50 — DOCUMENTS CURRENT BEHAVIOUR. This is not a guard and it is expected to go red when
-/// the product decision lands.**
+/// **Issue #79, case 10 — the refusal itself, at the execution kernel.**
 ///
-/// What is *not* yet decided is whether Moira should refuse a request whose route points at a
-/// profile that no longer resolves. Today it serves it: `succeeded`, no failure, and a wire
-/// body with no preamble, no temperature and no max_tokens — an unguarded model answering
-/// production traffic, which is why the finding is worth a decision rather than a shrug.
+/// This replaces `documents_current_behaviour_a_dangling_agent_profile_still_serves_the_request`,
+/// which asserted the opposite: `succeeded`, no failure, and a wire body with no preamble. That
+/// case was named `documents_` and carried its own reversal condition — "when fail-closed vs
+/// fail-open is decided, this case is wrong under the fail-closed answer". The maintainer decided
+/// fail-closed on 2026-08-06, so it is wrong, and it is replaced rather than deleted because the
+/// property it observed — *what happens to the request* — is exactly the property that changed and
+/// still needs a guard, now pointing the other way.
 ///
-/// It is named `documents_` and not `guards_` for the reason HANDOFF §3.4 gives twice: a test
-/// that pins current behaviour can hold a defect in place as firmly as a guard holds a
-/// property. Its predecessor was named
-/// `documents_current_behaviour_a_disabled_agent_profile_is_silently_ignored`, and that name
-/// stopped being true the moment the announcement shipped — the condition is observed now, it
-/// is simply not refused.
+/// # Why this asserts at the diagnostic endpoint and the two below assert over HTTP
 ///
-/// **Reversal condition:** when fail-closed vs fail-open is decided, this case is wrong under
-/// the fail-closed answer (it reds at `outcome.status`) and is simply redundant under the
-/// fail-open one. Delete or rewrite it then. The observability asserted by
-/// [`guards_a_disabled_agent_profile_is_announced_rather_than_silently_ignored`] is **not**
-/// revisited by that decision, which is why the two are separate cases.
+/// They are different claims. This one says the *execution* refuses: no provider is contacted,
+/// the outcome is `failed`, and the failure class is the one that names the condition. That is
+/// the claim every caller-facing surface inherits, and it is the one a future entry point (a
+/// worker, a summarization run, another API) inherits too without being listed here. The public
+/// cases below say the *contract* a caller sees is the promised one — status and code — which the
+/// diagnostic endpoint structurally cannot show, because it answers `200` with an outcome
+/// document however the execution ended.
+///
+/// # The control is the whole test
+///
+/// The first execution succeeds against the same route, the same provider and the same active
+/// profile, and it moves the provider's request counter. Without it, "the provider was not
+/// contacted" is also what a mis-wired fixture produces, and this case would pass against a Moira
+/// that refused everything.
 #[tokio::test]
-async fn documents_current_behaviour_a_dangling_agent_profile_still_serves_the_request() {
+async fn guards_a_disabled_agent_profile_fails_the_execution_before_any_provider_call() {
     let Some(case) = Case::new(
         Profile::Attached,
-        vec![ProviderScript::Completion {
-            text: "ok".to_string(),
-        }],
+        vec![
+            ProviderScript::Completion {
+                text: "ok".to_string(),
+            },
+            ProviderScript::Completion {
+                text: "this script must never be consumed".to_string(),
+            },
+        ],
     )
     .await
     else {
         return;
     };
-    case.disable_profile().await;
 
+    let (status, healthy) = case.diagnose(false, ExecutionOptions::default()).await;
+    assert_eq!(status, StatusCode::OK, "diagnose failed: {healthy}");
+    assert_eq!(
+        healthy["outcome"]["status"], "succeeded",
+        "control: the same route must serve a request while its profile is active, or the \
+         refusal below is not evidence about the profile: {healthy}"
+    );
+    let before = case.provider_request_count().await;
+    assert_eq!(
+        before, 1,
+        "control: the successful execution must have reached the mock provider, or the \
+         'no provider call' assertion below is vacuous"
+    );
+
+    case.disable_profile().await;
     let (status, body) = case.diagnose(false, ExecutionOptions::default()).await;
     assert_eq!(status, StatusCode::OK, "diagnose failed: {body}");
     assert_eq!(
-        body["outcome"]["status"], "succeeded",
-        "today a dangling agent_profile_id does not fail the execution — if this is now \
-         `failed`, the F50 decision has been taken fail-closed and this case must be \
-         deleted: {body}"
+        body["outcome"]["status"], "failed",
+        "issue #79 decided fail-closed: a route whose agent profile is disabled must refuse \
+         the request rather than serve it without the profile's preamble: {body}"
     );
     assert_eq!(
-        body["outcome"]["failure"],
-        Value::Null,
-        "no failure is reported either: {body}"
+        body["outcome"]["failure"]["class"], "agent_profile_disabled",
+        "the failure must name the condition, and specifically must not be the generic \
+         internal_error or the route's own not-found class: {body}"
+    );
+    let message = body["outcome"]["failure"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no failure message: {body}"));
+    let profile = case.profile.as_ref().expect("attached profile");
+    assert!(
+        message.contains(&profile.profile_key) && message.contains(&profile.id.to_string()),
+        "the message must name the profile by key and by id — whoever receives this has to be \
+         able to fix the deployment without reading the server's logs: {message}"
+    );
+    assert!(
+        message.contains(&case.fixture.route_key),
+        "and the route that requires it, because the caller named a route and has never heard \
+         of the profile: {message}"
+    );
+    assert!(
+        !message.contains(PROFILE_PREAMBLE),
+        "the preamble is the one field on an agent profile that can carry sensitive prompt \
+         content; naming the profile must not mean quoting it: {message}"
     );
 
-    let wire = case.only_provider_body().await;
     assert_eq!(
-        wire["messages"].as_array().map(Vec::len),
-        Some(1),
-        "the disabled profile's preamble is dropped and the request proceeds without it: \
-         {wire}"
+        case.provider_request_count().await,
+        before,
+        "the refusal must happen before any provider is contacted: the second scripted \
+         completion was consumed, so tokens were spent on a request Moira had already decided \
+         to reject"
+    );
+
+    case.shutdown().await;
+}
+
+/// **Issue #79 — the public contract for a disabled profile: `409 agent_profile_disabled`.**
+///
+/// `409` and not `404`, and the difference is the point of the case: the profile exists, an
+/// operator can see it on the admin plane, and the remedy is to switch it back on. A `404` here
+/// would send whoever received it looking for a row that is right there. `409` is also already
+/// declared on this operation, so the OpenAPI surface does not move.
+///
+/// The paired case below asserts the *other* status for the *other* condition. Neither is worth
+/// much alone: a single-status implementation ("always 409", "always 404") satisfies exactly one
+/// of them, and the pair is what makes the distinction a property rather than a coincidence.
+#[tokio::test]
+async fn guards_the_public_plane_refuses_a_disabled_agent_profile_with_409_and_a_code() {
+    let Some(case) = Case::new(
+        Profile::Attached,
+        vec![
+            ProviderScript::Completion {
+                text: "ok".to_string(),
+            },
+            ProviderScript::Completion {
+                text: "this script must never be consumed".to_string(),
+            },
+        ],
+    )
+    .await
+    else {
+        return;
+    };
+    let key = case.public_key().await;
+
+    let (status, healthy) = case.create_public_response(&key).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "control: the public plane must serve this route while the profile is active: {healthy}"
+    );
+    let before = case.provider_request_count().await;
+    assert_eq!(
+        before, 1,
+        "control: the successful POST reached the provider"
+    );
+
+    case.disable_profile().await;
+    let (status, body) = case.create_public_response(&key).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a route naming a disabled agent profile is a state conflict, not a missing resource \
+         and not a provider failure: {body}"
+    );
+    assert_eq!(body["error"]["code"], "agent_profile_disabled", "{body}");
+    assert_eq!(
+        body["error"]["message_key"], "moira.error.agent_profile_disabled",
+        "the code must resolve to a catalogued message key, or the caller gets a bare key with \
+         no English fallback: {body}"
+    );
+    let message = body["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no error message: {body}"));
+    let profile = case.profile.as_ref().expect("attached profile");
+    assert!(
+        message.contains(&profile.profile_key) && message.contains(&profile.id.to_string()),
+        "the caller's error must name the profile that has to be re-enabled: {message}"
+    );
+    assert_eq!(
+        case.provider_request_count().await,
+        before,
+        "the public plane reached the provider for a request it then refused"
+    );
+
+    case.shutdown().await;
+}
+
+/// **Issue #79 — the public contract for a deleted profile: `404 agent_profile_not_found`.**
+///
+/// Soft-deleting is the other way to leave `route_definitions.agent_profile_id` dangling, and it
+/// is a genuinely different remedy: the row cannot be re-enabled, because every admin write
+/// filters `deleted_at is null` and `GET /api/v1/admin/agent-profiles/{id}` already answers `404`
+/// for this id. Moira's answer to the caller agrees with the admin plane's answer about the same
+/// row — two different statuses for one id would be worse than either.
+///
+/// `soft_delete_profile` asserts the route's reference survives the delete before the execution
+/// runs, so this case cannot pass by the FK's `on delete set null` having quietly turned it into
+/// the no-profile control.
+#[tokio::test]
+async fn guards_the_public_plane_refuses_a_deleted_agent_profile_with_404_and_a_code() {
+    let Some(case) = Case::new(
+        Profile::Attached,
+        vec![
+            ProviderScript::Completion {
+                text: "ok".to_string(),
+            },
+            ProviderScript::Completion {
+                text: "this script must never be consumed".to_string(),
+            },
+        ],
+    )
+    .await
+    else {
+        return;
+    };
+    let key = case.public_key().await;
+
+    let (status, healthy) = case.create_public_response(&key).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "control: the public plane must serve this route while the profile is active: {healthy}"
+    );
+    let before = case.provider_request_count().await;
+    assert_eq!(
+        before, 1,
+        "control: the successful POST reached the provider"
+    );
+
+    case.soft_delete_profile().await;
+    let (status, body) = case.create_public_response(&key).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a soft-deleted profile is gone, not switched off; 409 would promise a state the \
+         operator can flip back: {body}"
+    );
+    assert_eq!(body["error"]["code"], "agent_profile_not_found", "{body}");
+    assert_eq!(
+        body["error"]["message_key"], "moira.error.agent_profile_not_found",
+        "{body}"
+    );
+    let message = body["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no error message: {body}"));
+    let profile = case.profile.as_ref().expect("attached profile");
+    assert!(
+        message.contains(&profile.id.to_string()),
+        "the id is the only handle left once the row is gone, so it must be in the message: \
+         {message}"
+    );
+    assert_eq!(
+        case.provider_request_count().await,
+        before,
+        "the public plane reached the provider for a request it then refused"
+    );
+
+    case.shutdown().await;
+}
+
+/// **Issue #79 — the refusal on the public *stream*, where it cannot be an HTTP status.**
+///
+/// The response head is written before the execution starts, so a streamed request that names a
+/// dangling profile gets `200` on the transport and the refusal as the terminal `response.failed`
+/// event. That is the existing contract for every mid-stream failure; this case pins that the new
+/// refusal uses it rather than, say, hanging, ending the stream with no terminal event, or
+/// reporting `response.completed` with no output.
+///
+/// The `200` is asserted deliberately, not overlooked: a reader who sees only "status 200" in a
+/// fail-closed test should be able to find here why that is the right answer and where the actual
+/// refusal is.
+#[tokio::test]
+async fn guards_the_public_stream_refuses_a_dangling_agent_profile_in_its_terminal_event() {
+    let Some(case) = Case::new(
+        Profile::Attached,
+        vec![
+            ProviderScript::Stream {
+                deltas: vec!["ok".to_string()],
+            },
+            ProviderScript::Stream {
+                deltas: vec!["this script must never be consumed".to_string()],
+            },
+        ],
+    )
+    .await
+    else {
+        return;
+    };
+    let key = case.public_key().await;
+
+    let (status, healthy) = case.stream_public_response(&key).await;
+    assert_eq!(status, StatusCode::OK, "control: the stream must open");
+    assert!(
+        healthy
+            .iter()
+            .any(|event| event["type"] == "response.completed"),
+        "control: the same route must complete a stream while its profile is active, or the \
+         refusal below is not evidence about the profile: {healthy:?}"
+    );
+    let before = case.provider_request_count().await;
+    assert_eq!(
+        before, 1,
+        "control: the successful stream reached the provider"
+    );
+
+    case.disable_profile().await;
+    let (status, events) = case.stream_public_response(&key).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the transport still succeeds: the head is written before the execution starts, so the \
+         refusal has to arrive on the stream"
+    );
+    let failed: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["type"] == "response.failed")
+        .collect();
+    assert_eq!(
+        failed.len(),
+        1,
+        "a refused stream must end with exactly one response.failed event: {events:?}"
+    );
+    assert_eq!(
+        failed[0]["payload"]["error"]["code"], "agent_profile_disabled",
+        "and it must carry the same code the non-streaming path returns: {:?}",
+        failed[0]
     );
     assert!(
-        wire.get("temperature").is_none(),
-        "and its temperature with it: {wire}"
+        !events
+            .iter()
+            .any(|event| event["type"] == "response.completed"),
+        "a refused stream must not also report completion: {events:?}"
     );
     assert!(
-        wire.get("max_tokens").is_none(),
-        "and its max_tokens: {wire}"
+        !events
+            .iter()
+            .any(|event| event["type"] == UNAVAILABLE_EVENT),
+        "the operator-side agent_profile_unavailable event must stay off the caller's stream; \
+         its payload names the route's internals and the caller has already been told what it \
+         needs by the terminal error: {events:?}"
+    );
+    assert_eq!(
+        case.provider_request_count().await,
+        before,
+        "the streaming public path reached the provider for a request it then refused"
     );
 
     case.shutdown().await;

@@ -442,6 +442,16 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         description: "Used when the requested route does not exist or is not visible to the caller. Retrying will not help until a matching route is configured.",
     },
     I18nEntry {
+        key: "moira.error.agent_profile_not_found",
+        default_message: "The route requires an agent profile that no longer exists.",
+        description: "Used when the selected route's agent_profile_id names no live agent_profiles row, because the profile was soft-deleted or never existed. Moira refuses the execution rather than serving it without the profile's preamble (issue #79); the English message names the route and the profile id so the deployment can be corrected without reading server logs. Distinct from agent_profile_disabled, where the row is still there: the remedy here is to create a profile and repoint the route.",
+    },
+    I18nEntry {
+        key: "moira.error.agent_profile_disabled",
+        default_message: "The route requires an agent profile that is currently disabled.",
+        description: "Used when the selected route's agent_profile_id names an agent profile whose status is disabled. Moira refuses the execution rather than serving it without the profile's preamble (issue #79). Distinct from agent_profile_not_found, which means no live row has that id: the remedy here is to re-enable the profile or point the route at an active one, and the HTTP status is 409 rather than 404 because the profile exists and is visible on the admin plane.",
+    },
+    I18nEntry {
         key: "moira.error.route_forbidden",
         default_message: "You are not allowed to use this route.",
         description: "Used when the route resolves but the caller's credentials or scopes do not permit its use. Distinct from route_not_found, which means no route resolved at all.",
