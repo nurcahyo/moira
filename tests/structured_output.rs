@@ -46,6 +46,15 @@
 //!    `run_extraction` reads `execution.status`. The doc comment on `structured_output_from_text`
 //!    in `src/application/execution.rs` carries the full argument, including the boundary: `null`,
 //!    `{}` and `[]` all parse, so an empty *answer* is still a `200`.
+//! 6. **The negative control for the metering guard — issue #155 A2.** Case 5 says a refused
+//!    reply *is* metered; on its own that does not pin the `if` that keeps every *other* failure
+//!    from being metered, and deleting it succeeds silently because migration `0005` makes all
+//!    five token columns nullable. So an ordinary provider 500 is driven too, and asserted to
+//!    write **no** `usage_records` row at all.
+//! 7. **The empty controls — issue #155 A3.** The `null`/`{}`/`[]` boundary was pinned only by a
+//!    unit test calling `structured_output_from_text` directly, so an edit anywhere else on the
+//!    path could have turned an empty answer into a `422` with the tree green. All three now ride
+//!    as public controls inside case 4's public case.
 
 mod support;
 
@@ -171,6 +180,24 @@ impl Case {
         output_schema: Option<Value>,
         required_capabilities: Vec<String>,
     ) -> (StatusCode, Value) {
+        self.diagnose_with(
+            stream,
+            ExecutionOptions {
+                output_schema,
+                required_capabilities,
+                ..ExecutionOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// As [`Self::diagnose`], with the whole `ExecutionOptions` under the caller's control.
+    ///
+    /// `timeout_ms` and `stream` are still forced, because they have to agree with the `stream`
+    /// argument and with this suite's budget. Everything else is the caller's — which is what
+    /// lets a case pin `max_retries: 0` and so assert on an *exact* number of attempts rather
+    /// than on whatever `maximum_retries_per_candidate` happens to be configured to.
+    async fn diagnose_with(&self, stream: bool, options: ExecutionOptions) -> (StatusCode, Value) {
         let request = DiagnosticExecutionRequest {
             application_id: Some(self.fixture.application_id),
             external_tenant_id: None,
@@ -184,9 +211,7 @@ impl Case {
             options: ExecutionOptions {
                 timeout_ms: Some(5_000),
                 stream,
-                output_schema,
-                required_capabilities,
-                ..ExecutionOptions::default()
+                ..options
             },
             metadata: json!({ "test_fixture": true }),
         };
@@ -581,6 +606,127 @@ async fn a_refused_reply_is_still_metered_for_the_tokens_the_provider_billed() {
     }
 }
 
+/// The error body the mock returns with its `500`.
+///
+/// Deliberately not a JSON document and not a token count: the point of the case below is a
+/// failure the provider reported *nothing* measurable about, which is the input
+/// `usage_was_reported` reads.
+const PROVIDER_FAILURE_BODY: &str = "the provider fell over";
+
+/// **The negative control for the metering guard — issue #155 A2.**
+///
+/// The case above proves a *refused* reply is metered. On its own that is only half a property:
+/// the mechanism that keeps it from metering **every** failure is a single `if` —
+/// `usage_was_reported(&usage)` in the attempt loop's failure arm — and deleting it succeeds
+/// silently. Migration `0005` makes all five token columns nullable, so an ordinary provider
+/// failure would write an all-`NULL` `usage_records` row instead of erroring, and no test in the
+/// tree went red. That edit inverts what the table means: `usage_records` has only ever held
+/// attempts that were billed, and a billing job that counts rows rather than summing tokens would
+/// start charging for every 500 the deployment absorbs.
+///
+/// The two `usage_records is empty` assertions in `tests/execution_lifecycle.rs` are not this
+/// guard. They are about the terminal-persistence deadline — a *successful* execution whose
+/// writes were cut short — and they run on a path that never reaches this arm.
+///
+/// # The three controls, and what each one rules out
+///
+/// 1. **The provider was called exactly once.** "No usage row" is also what a request refused at
+///    admission produces — `no_eligible_model`, a bad credential, a route that does not resolve —
+///    and such a request never reaches the arm this case is about. One call proves it did.
+/// 2. **Exactly one `execution_attempts` row, and its status is `failed`.** The attempt row is
+///    written by `complete_failed_attempt`, immediately above the `if` under test, so its
+///    presence is what makes the absence below meaningful: the arm ran, and chose not to meter.
+/// 3. **That row's `total_tokens` is `NULL`.** This is the reading `usage_was_reported` acts on —
+///    all-`None` is *unknown*, not zero — stated as a fact about this fixture rather than assumed.
+///    If the mock ever started reporting counts on an error response, the property under test
+///    would change meaning and this assertion is what would say so.
+///
+/// `max_retries: 0` is set so "exactly one" is exact: with the default retry budget a retryable
+/// class would produce several attempts, and the case would have to assert a count it does not
+/// control. `allow_fallback: false` does the same for the candidate list.
+#[tokio::test]
+async fn a_plain_provider_failure_writes_no_usage_record_at_all() {
+    let Some(case) = Case::new(vec![ProviderScript::HttpError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        body: PROVIDER_FAILURE_BODY.to_string(),
+    }])
+    .await
+    else {
+        return;
+    };
+
+    let (status, body) = case
+        .diagnose_with(
+            false,
+            ExecutionOptions {
+                max_retries: Some(0),
+                max_fallbacks: Some(0),
+                allow_fallback: false,
+                ..ExecutionOptions::default()
+            },
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "diagnose failed: {body}");
+    assert_eq!(
+        body["outcome"]["status"], "failed",
+        "control: this case is about an ordinary provider failure, so the execution must have \
+         failed: {body}"
+    );
+    assert_eq!(
+        body["outcome"]["failure"]["class"], "provider_unavailable",
+        "control: a 5xx from the provider, not a structured-output refusal — those are metered, \
+         and confusing the two would make this case assert the opposite of what it means: {body}"
+    );
+    let execution_id: uuid::Uuid = body["outcome"]["execution_id"]
+        .as_str()
+        .expect("execution id")
+        .parse()
+        .expect("execution id is a uuid");
+
+    assert_eq!(
+        case.provider().requests().await.len(),
+        1,
+        "control: the provider must actually have been called, or 'no usage row' is just what a \
+         request refused before any attempt looks like: {body}"
+    );
+
+    let attempts: Vec<(String, Option<i64>)> = sqlx::query_as(
+        "select status, total_tokens from execution_attempts where execution_id = $1",
+    )
+    .bind(execution_id)
+    .fetch_all(&case.fixture.pool)
+    .await
+    .expect("read execution_attempts");
+    assert_eq!(
+        attempts.len(),
+        1,
+        "control: exactly one attempt, so the absence below is about one trip through the \
+         failure arm rather than an execution that never made one: {attempts:?}"
+    );
+    assert_eq!(attempts[0].0, "failed", "{attempts:?}");
+    assert_eq!(
+        attempts[0].1, None,
+        "control: the provider reported no counts, which is the input usage_was_reported reads; \
+         a mock that started reporting them on an error would change what this case tests"
+    );
+
+    let metered: i64 =
+        sqlx::query_scalar("select count(*) from usage_records where execution_id = $1")
+            .bind(execution_id)
+            .fetch_one(&case.fixture.pool)
+            .await
+            .expect("count usage_records");
+    assert_eq!(
+        metered, 0,
+        "a provider failure that billed nothing must be metered nowhere: an all-NULL row here is \
+         a billing record asserting zero tokens for a call that never completed, and it inverts \
+         what usage_records has always meant — see issue #155 A2 and usage_was_reported in \
+         src/application/execution.rs"
+    );
+
+    case.shutdown().await;
+}
+
 /// One schema-carrying public request, answered by `script`, against a fixture wired for
 /// structured output.
 ///
@@ -668,6 +814,22 @@ async fn public_response(reply: &str) -> Option<(StatusCode, String, usize)> {
 /// provider's own document in the output text, since `PublicResponse` has no structured-output
 /// field to read the parsed value from. The refusal is therefore attributable to the reply rather
 /// than to the request or to the wiring — the vacuous-pass shape HANDOFF §2.3 keeps finding.
+///
+/// # The empty controls — issue #155 A3
+///
+/// The half of issue #80 most worth protecting is the boundary: `null`, `{}` and `[]` are all
+/// valid JSON, so an *empty answer* is still a `200`. Until issue #155 that was pinned only by
+/// `a_schema_carrying_reply_that_is_not_json_is_a_failure_rather_than_a_none`, a unit test that
+/// calls `structured_output_from_text` directly — so any edit **outside** that function would have
+/// turned legitimately empty answers into `422`s with the whole tree green. The one-line version
+/// is `if structured_output.as_ref().is_none_or(Value::is_null) { return Err(..) }` in
+/// `execute_rig_completion`, which reads like a tightening of exactly the decision this file is
+/// about and is wrong.
+///
+/// All three documented empties are driven rather than one, because the plausible edits do not
+/// all catch the same value: a null check misses `{}`, an emptiness check on objects misses
+/// `null`, and a truthiness check catches all three. Each is a complete public request against a
+/// fresh fixture, which is the cost of asserting this where a caller can see it.
 #[tokio::test]
 async fn a_public_caller_receives_422_rather_than_a_null_structured_output() {
     let Some((status, body, calls)) = public_response(NON_CONFORMING_REPLY).await else {
@@ -725,6 +887,36 @@ async fn a_public_caller_receives_422_rather_than_a_null_structured_output() {
         "the control must return the provider's own reply, or 'this fixture reaches the provider \
          and its reply is accepted' is asserted only by the status code: {body}"
     );
+
+    // The empty controls. An answer with nothing in it is still an answer: these three are the
+    // exact values `structured_output_from_text`'s doc comment names as the boundary of the
+    // decision, and each one must come back as a `200` carrying itself.
+    for empty_reply in ["{}", "null", "[]"] {
+        let Some((status, body, calls)) = public_response(empty_reply).await else {
+            return;
+        };
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "issue #80 refuses replies that are not JSON, not replies that are empty; `{empty_reply}` \
+             is valid JSON and must still be a 200: {body}"
+        );
+        assert_eq!(
+            calls, 1,
+            "the empty control must reach the provider (reply={empty_reply}): {body}"
+        );
+        let empty: Value = serde_json::from_str(&body).expect("public response envelope");
+        assert_eq!(
+            empty["status"], "completed",
+            "an empty answer completes; a 200 that is not `completed` would mean the request was \
+             refused somewhere the status code cannot show (reply={empty_reply}): {body}"
+        );
+        assert_eq!(
+            empty["output"][0]["content"][0]["text"], empty_reply,
+            "and it must carry the provider's own document, so this cannot pass against a \
+             response that succeeded with the answer discarded (reply={empty_reply}): {body}"
+        );
+    }
 }
 
 /// **The other half of the published contract: on the stream the refusal is an event, not a
