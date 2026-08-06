@@ -575,7 +575,7 @@ impl MoiraExecutionService {
                 let bounded_by_total_deadline =
                     attempt_timeout < Duration::from_millis(runtime_policy.timeout_ms);
                 let result = tokio::select! {
-                    _ = cancellation.cancelled() => Ok(Err(cancelled_failure())),
+                    _ = cancellation.cancelled() => Ok(Err(cancelled_failure().into())),
                     result = tokio::time::timeout(attempt_timeout, execution) => result,
                 };
                 drop(permits);
@@ -847,7 +847,7 @@ impl MoiraExecutionService {
                             failure: None,
                         });
                     }
-                    Ok(Err(failure)) => {
+                    Ok(Err(FailedAttempt { failure, usage })) => {
                         self.state
                             .circuits
                             .on_failure(
@@ -873,11 +873,51 @@ impl MoiraExecutionService {
                             attempt_id,
                             started,
                             &failure,
-                            UsageSummary::default(),
+                            usage.clone(),
                             None,
                             json!({}),
                         )
                         .await?;
+                        // **A billed provider call is metered even when its reply is refused
+                        // (issue #80 review).** `usage` is all-`None` for every failure raised
+                        // before or instead of a complete reply, and the row is skipped then —
+                        // the shape this arm has always had. It is populated only where the
+                        // provider answered, was charged for answering, and Moira then refused
+                        // the answer: without this row that request burns provider tokens with
+                        // nothing in `usage_records`, on a path a caller reaches by sending a
+                        // schema to a backend that does not honour it. Before the flip the same
+                        // request succeeded and was metered here-equivalent by the success arm,
+                        // so this restores the row rather than adding one.
+                        //
+                        // Written *after* the attempt row is completed, so the foreign key it
+                        // carries always resolves, and unbounded like the neighbouring writes in
+                        // this arm rather than under the success arm's terminal-persistence
+                        // budget: there is no committed output to protect here.
+                        if usage_was_reported(&usage) {
+                            self.runtime_repo
+                                .insert_usage_record(&UsageRecordInsert {
+                                    id: Uuid::now_v7(),
+                                    request_id: command.request_id.clone(),
+                                    execution_id: command.execution_id,
+                                    attempt_id,
+                                    application_id: command.application_id,
+                                    external_tenant_id: command.external_tenant_id.clone(),
+                                    external_user_id: command.external_user_id.clone(),
+                                    provider_id: candidate.provider_id,
+                                    provider_model_id: candidate.provider_model_id,
+                                    credential_id: credential.credential.credential_id,
+                                    usage: usage.clone(),
+                                    // The failure class travels with the row so a billing job
+                                    // can tell a metered refusal from a metered answer without
+                                    // joining back to `execution_attempts`.
+                                    metadata: json!({
+                                        "cost_estimation": "unavailable",
+                                        "attempt_outcome": "failed",
+                                        "failure_class": failure.class
+                                    }),
+                                })
+                                .await?;
+                        }
                         attempts.push(attempt_summary(
                             attempt_id,
                             attempt_number,
@@ -885,7 +925,7 @@ impl MoiraExecutionService {
                             credential.credential.credential_id,
                             Some(failure.class),
                             started,
-                            UsageSummary::default(),
+                            usage,
                         ));
                         events.push(
                             RuntimeEventType::ProviderAttemptFailed,
@@ -1957,13 +1997,71 @@ fn structured_output_from_text(
     }
 }
 
+/// A failed provider attempt, carrying whatever the provider reported spending before it failed.
+///
+/// # Why the usage travels with the failure
+///
+/// Issue #80 introduced the first failure that is raised **after** a complete, billed provider
+/// reply: the model answered, the provider charged for the answer, and Moira refuses it because
+/// it is not JSON. Before the flip that same request succeeded, so it wrote an
+/// `execution_attempts.usage` and a `usage_records` row through the success arm. Returning a bare
+/// [`ExecutionFailure`] would have dropped both — provider tokens spent with nothing metered,
+/// on a path a caller can steer traffic onto by sending a schema to a backend that does not
+/// honour it (`openai_compatible` and `local` are admitted unverified — see
+/// `docs/openai-compatibility.md` — and route, provider and model are caller-supplied). That is
+/// a revenue and quota hole rather than a reporting nicety, which is why the tokens are carried
+/// rather than recorded as a known cost.
+///
+/// [`UsageSummary::default()`] is all-`None`, i.e. **unknown, not zero** — the reading
+/// `insert_usage_record` is skipped on. Every failure raised before or instead of a complete
+/// reply keeps that default through the [`From`] impl below, so `?` still means "no reply, so
+/// nothing measured" and only a site with real counts in hand has to say so.
+struct FailedAttempt {
+    failure: ExecutionFailure,
+    usage: UsageSummary,
+}
+
+impl From<ExecutionFailure> for FailedAttempt {
+    fn from(failure: ExecutionFailure) -> Self {
+        Self {
+            failure,
+            usage: UsageSummary::default(),
+        }
+    }
+}
+
+/// Whether the provider reported any token counts at all.
+///
+/// The distinction is `UsageSummary`'s own: every field is an `Option`, and all-`None` means the
+/// provider said nothing rather than that it charged nothing. A `usage_records` row built from
+/// all-`None` would be a billing row asserting zero tokens for a call that certainly used some,
+/// which is worse than the absence it replaces.
+fn usage_was_reported(usage: &UsageSummary) -> bool {
+    usage.input_tokens.is_some()
+        || usage.output_tokens.is_some()
+        || usage.cached_input_tokens.is_some()
+        || usage.reasoning_tokens.is_some()
+        || usage.total_tokens.is_some()
+}
+
 async fn execute_rig_completion(
     handle: Arc<RuntimeModelHandle>,
     request: CompletionRequest,
-) -> Result<ExecutionRunOutput, ExecutionFailure> {
+) -> Result<ExecutionRunOutput, FailedAttempt> {
     let wants_structured = request.output_schema.is_some();
     let output = handle.completion(request).await?;
-    let structured_output = structured_output_from_text(wants_structured, &output.text)?;
+    let structured_output = match structured_output_from_text(wants_structured, &output.text) {
+        Ok(structured_output) => structured_output,
+        // The provider answered and billed for the answer; only the shape was refused. The
+        // counts are in hand at exactly this statement, and this is the one place they can be
+        // kept without the attempt loop having to guess.
+        Err(failure) => {
+            return Err(FailedAttempt {
+                failure,
+                usage: output.usage,
+            });
+        }
+    };
     Ok(ExecutionRunOutput {
         text: output.text,
         structured_output,
@@ -2026,15 +2124,15 @@ async fn execute_rig_stream(
     events: &mut EventCollector,
     idle_timeout: Duration,
     stream_metrics: StreamMetricsContext<'_>,
-) -> Result<ExecutionRunOutput, ExecutionFailure> {
+) -> Result<ExecutionRunOutput, FailedAttempt> {
     if let Some(failure) = events.delivery_failure() {
-        return Err(failure);
+        return Err(failure.into());
     }
     // Captured before `request` is moved into `start_stream` below.
     let wants_structured = request.output_schema.is_some();
     let cancellation = events.cancellation();
     let mut stream = tokio::select! {
-        _ = cancellation.cancelled() => return Err(cancelled_failure()),
+        _ = cancellation.cancelled() => return Err(cancelled_failure().into()),
         result = handle.start_stream(request) => result?,
     };
     let mut text = String::new();
@@ -2048,7 +2146,7 @@ async fn execute_rig_stream(
 
     loop {
         let item = tokio::select! {
-            _ = cancellation.cancelled() => return Err(cancelled_failure()),
+            _ = cancellation.cancelled() => return Err(cancelled_failure().into()),
             result = tokio::time::timeout(idle_timeout, stream.next()) => {
                 match result {
                     Ok(item) => item,
@@ -2061,7 +2159,7 @@ async fn execute_rig_stream(
                             failure.retryable = false;
                             failure.fallback_eligible = false;
                         }
-                        return Err(failure);
+                        return Err(failure.into());
                     }
                 }
             }
@@ -2077,7 +2175,14 @@ async fn execute_rig_stream(
                     failure.retryable = false;
                     failure.fallback_eligible = false;
                 }
-                return Err(failure);
+                // Deliberately **not** carrying `usage` here, unlike the structured-output site
+                // below. A stream that breaks mid-flight was never a metered success — it failed
+                // this way before issue #80 as well, so no metering is being lost — and this
+                // failure *is* retryable and fallback-eligible, so the counts a retry reports
+                // would be added to a partial figure whose relationship to the provider's own
+                // invoice nothing here can establish. Widening it is a separate decision with a
+                // separate blast radius.
+                return Err(failure.into());
             }
         };
         match item {
@@ -2156,7 +2261,15 @@ async fn execute_rig_stream(
     // is raised anyway: the deltas were text, and the caller asked for a value. `committed` does
     // not clamp anything here because `StructuredOutputInvalid` is already neither retryable nor
     // fallback-eligible, so there is no re-run for a committed stream to be protected from.
-    let structured_output = structured_output_from_text(wants_structured, &text)?;
+    //
+    // The stream ran to completion, so `usage` holds whatever the provider's final usage chunk
+    // reported: the same counts the success arm two lines below would have metered. They travel
+    // with the failure for the same reason they would have been metered — the provider will
+    // invoice for this call either way.
+    let structured_output = match structured_output_from_text(wants_structured, &text) {
+        Ok(structured_output) => structured_output,
+        Err(failure) => return Err(FailedAttempt { failure, usage }),
+    };
     Ok(ExecutionRunOutput {
         text,
         structured_output,
@@ -2226,12 +2339,34 @@ fn failed_outcome(
         status: execution_status_for_failure(failure.class),
         output_text: None,
         structured_output: None,
-        usage: UsageSummary::default(),
+        usage: usage_reported_by(&attempts),
         route,
         model,
         attempts,
         failure: Some(failure),
     }
+}
+
+/// What a failed outcome reports as its usage: whatever its own attempts reported.
+///
+/// **Derived rather than passed in, so the two cannot disagree.** Finding F38 was exactly that
+/// asymmetry in the other direction — an outcome hardcoding `UsageSummary::default()` next to an
+/// `attempts` array that carried the real counts, inside one serialised document. Since the issue
+/// #80 review a *failed* attempt can carry counts too (a billed reply Moira refused), so the
+/// hardcoded default would have re-created the contradiction on the new path. Reading the array
+/// makes it impossible to state a total the document itself contradicts.
+///
+/// The last attempt that reported anything, not a sum: `ExecutionOutcome.usage` is the same
+/// "what this execution's answering call cost" figure the success arm sets from a single
+/// attempt, and every earlier attempt already has its own `usage_records` row. All-`None` when
+/// no attempt reported anything — unknown, which is what it has always meant here.
+fn usage_reported_by(attempts: &[ProviderAttemptSummary]) -> UsageSummary {
+    attempts
+        .iter()
+        .rev()
+        .find(|attempt| usage_was_reported(&attempt.usage))
+        .map(|attempt| attempt.usage.clone())
+        .unwrap_or_default()
 }
 
 /// The refusal a route with an unusable agent profile produces — F50, decided fail-closed on

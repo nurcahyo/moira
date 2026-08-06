@@ -820,6 +820,80 @@ async fn an_unparseable_extraction_reply_fails_the_run_and_writes_no_memory() {
     case.shutdown().await;
 }
 
+/// **The one behaviour issue #80 took away, pinned so it cannot be taken away again by accident.**
+///
+/// A fenced reply — ```` ```json ```` around the envelope — **used to produce memories**. The
+/// execution succeeded with `structured_output: null`, `run_extraction` fell back to
+/// `execution.output_text`, and `parse_candidates` stripped the fence before deserialising. Since
+/// issue #80 the execution carries a schema and so fails on the fence first, the reply is dropped
+/// with the rest of the failed outcome, and the run ends `failed` / `structured_output_invalid`
+/// with nothing written.
+///
+/// This case exists because that regression was, until it was written, **unobserved in either
+/// direction**: no case asserted the old acceptance and none asserted the new refusal, so the
+/// only evidence an operator had was `docs/release-notes.md`. `parse_candidates`' own fence unit
+/// test still passes — it calls the parser directly, so it says nothing about whether an
+/// execution can still reach it.
+///
+/// Fencing is not a hypothetical: `memory_extraction.rs` documents it as what providers that
+/// ignore `output_schema` "commonly" do — and extraction sets no `required_capabilities`, so it
+/// can be routed to a model that never claimed to honour a schema in the first place, which makes
+/// the exposed population wider than the release note's SQL. If this ever needs reversing, the
+/// fence tolerance moves to
+/// `structured_output_from_text` in `src/application/execution.rs` — the reversal condition
+/// recorded there — and this case is the one that must flip with it.
+///
+/// The control is the payload: the identical envelope **without** the fence is asserted to write
+/// its memory in `a_consenting_application_writes_an_active_memory_and_records_the_run`, so the
+/// refusal here is attributable to the fence and not to the fixture.
+#[tokio::test]
+async fn a_fenced_extraction_reply_fails_the_run_since_the_execution_parses_it_first() {
+    let envelope = json!({ "memories": [memory("preference", MEMORY_BODY, 0.95, "normal")] });
+    let Some(case) = Case::consenting(vec![
+        ProviderScript::Completion {
+            text: ASSISTANT_REPLY.to_string(),
+        },
+        ProviderScript::Completion {
+            text: format!("```json\n{envelope}\n```"),
+        },
+    ])
+    .await
+    else {
+        return;
+    };
+    let (status, body) = case.respond(USER_TURN).await;
+    // Extraction stays fail-open: the caller cannot tell, which is exactly why the release note
+    // has to say this out loud.
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "completed");
+    assert_eq!(
+        body["output"][0]["content"][0]["text"], ASSISTANT_REPLY,
+        "the caller's own answer must be untouched by an extraction failure: {body}"
+    );
+    assert_eq!(
+        case.completion.call_count().await,
+        2,
+        "extraction must have issued its own completion call, or the empty result below would \
+         prove nothing"
+    );
+
+    assert!(
+        case.memories().await.is_empty(),
+        "a fenced reply used to be un-fenced by parse_candidates and written; since issue #80 \
+         the execution refuses it first and nothing is written"
+    );
+    let runs = case.runs().await;
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0].status, "failed", "{runs:?}");
+    assert_eq!(
+        runs[0].failure_class.as_deref(),
+        Some("structured_output_invalid"),
+        "the run row must name the execution's own class"
+    );
+    assert!(runs[0].completed);
+    case.shutdown().await;
+}
+
 /// The extractor being unreachable must not disturb the caller's response — **and the run row
 /// must say what actually went wrong**.
 ///

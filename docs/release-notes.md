@@ -83,11 +83,51 @@ caller must never be able to open a circuit breaker that refuses traffic for eve
 that provider. The failure is terminal on the first non-conforming reply, and exactly one provider
 call is made.
 
-**One knock-on inside Moira.** Memory extraction sends its own schema, so a model that wraps its
-JSON in a ```` ```json ```` fence now fails the extraction run instead of being un-fenced by
-`parse_candidates`. The run row says `structured_output_invalid` either way, the caller's response
-is unaffected as always, and no memory is written in either case — the visible difference is that
-a fenced reply used to be accepted.
+**One knock-on inside Moira, and it is a regression: fenced extraction replies stop working.**
+Memory extraction sends its own schema, so it is subject to this change like any other caller.
+A model that wraps its JSON in a ```` ```json ```` fence **used to produce memories** — the
+execution succeeded with `structured_output: null`, extraction fell back to the raw text, and
+`parse_candidates` stripped the fence before deserialising the envelope. As of this release the
+execution fails first, the reply is discarded with the rest of the failed outcome, and the run
+ends as `failed` / `structured_output_invalid` with **no memories written**. Fencing is what a
+provider that ignores `output_schema` commonly does — and whether a backend ignores it is exactly
+what Moira cannot check for the `openai_compatible` and `local` types.
+
+**The exposure here is wider than the query above**, which lists models *claiming* the
+`structured_output` capability. Extraction sets no `required_capabilities`, so it can be routed to
+any active model on the route it uses — including one that never claimed to honour a schema.
+Treat every extraction-enabled application as affected until its run rows say otherwise.
+
+There is no caller-visible symptom to alert you: extraction is fail-open by design, so the
+response is unaffected, no error is returned, and this release note is the notice. Check for it
+directly — the run rows carry the answer:
+
+```sql
+select date_trunc('hour', started_at) as hour, status, failure_class, count(*)
+from memory_extraction_runs
+where started_at > now() - interval '24 hours'
+group by 1, 2, 3
+order by 1 desc;
+```
+
+A run population that turns from `completed` to `failed` / `structured_output_invalid` at the
+upgrade is this condition and not a provider outage. The fence tolerance in `parse_candidates` is
+left in the code but is no longer reachable from an execution, and the reversal condition is
+recorded on `structured_output_from_text` in `src/application/execution.rs`: if a deployment
+measures fenced replies from schema-receiving backends, the tolerance moves to that one site
+rather than being duplicated.
+
+**Provider tokens spent on a refused reply are still metered.** The provider answered and will
+invoice for the answer, so the refused attempt records the real counts on `execution_attempts` and
+writes its `usage_records` row exactly as the same request did while it still succeeded. Totals
+per request are therefore unchanged by this release, and a caller cannot obtain unmetered provider
+work by pointing a schema at a backend that does not honour it.
+
+What *is* new is that `usage_records` can now contain a row for an attempt whose status is
+`failed` — until this release every row belonged to a successful one. The row carries
+`metadata.attempt_outcome = "failed"` and `metadata.failure_class`, so a job that must distinguish
+them can, without joining back to `execution_attempts`. `GET /api/v1/usage` does not expose
+`metadata` and its output is unaffected. See `docs/execution-attempts-and-usage.md`.
 
 **OpenAPI.** Unchanged: no new error code, no new enum value, no new operation — 152 operations
 across 100 paths and 183 schemas, identical to the previous release. `structured_output_invalid`
