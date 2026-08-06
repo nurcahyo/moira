@@ -70,7 +70,10 @@ provider ──┬── provider_model ──┐
 
 `routing_policy` has three NOT NULL foreign keys — `route_id`, `provider_id`,
 `provider_model_id` — which fixes the order. `make seed` creates all of it, plus an
-application and a consumer key, and reuses anything that already matches.
+application and a consumer key. Re-running reuses a row only when it already
+matches what you asked for this run; a provider's `base_url` or a routing
+policy's `provider_model_id` that has drifted from `MOIRA_SEED_BASE_URL` /
+`MOIRA_SEED_MODEL` is PATCHed back into agreement, not silently left alone.
 
 By default it targets `http://127.0.0.1:8000/v1` and asks that endpoint which
 models it serves. Point it elsewhere:
