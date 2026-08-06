@@ -62,6 +62,11 @@ export MOIRA_SECRETS__MASTER_KEY_BASE64="$(openssl rand -base64 32)"
 export MOIRA_SECRETS__KEY_ID=local-dev
 export MOIRA_API_KEYS__PEPPER_BASE64="$(openssl rand -base64 32)"
 export MOIRA_API_KEYS__PEPPER_VERSION=local-dev
+# Content encryption at rest. Required in production — the process refuses to start without it,
+# and there is no fallback to MOIRA_SECRETS__MASTER_KEY_BASE64. The value is an
+# "<id>:<base64>" list; keep every key an existing row may have been sealed under listed.
+export MOIRA_CONTENT_ENCRYPTION__KEYS="local-dev:$(openssl rand -base64 32)"
+export MOIRA_CONTENT_ENCRYPTION__ACTIVE_KEY_ID=local-dev
 ```
 
 `.env.example` lists the supported local environment variables for shells, containers, and process managers. The Moira binary does not load `.env` automatically; if you use one, export it before running the process:

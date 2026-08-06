@@ -508,13 +508,15 @@ fn with_idempotency_key(mut headers: HeaderMap, key: &str) -> HeaderMap {
 /// repository builds. This state is used by one test, drives every request that test
 /// makes, and therefore owns every counter that test reads — the recorder is per-`AppState`,
 /// so the counts cannot be contaminated by a neighbouring fixture.
-fn observable_state(pool: &PgPool) -> AppState {
+async fn observable_state(pool: &PgPool) -> AppState {
     let mut settings = Settings::default();
     // The stub IdP lives on `http://127.0.0.1:0`, which the JWKS SSRF policy denies by
     // design; the same dev-only escape hatch `LifecycleFixture` uses.
     settings.auth.jwks.allow_insecure_dev_urls = true;
     settings.telemetry.prometheus_enabled = true;
-    AppState::new(settings, Some(pool.clone())).expect("observable app state")
+    AppState::new(settings, Some(pool.clone()))
+        .await
+        .expect("observable app state")
 }
 
 async fn scrape_metrics(router: Router) -> String {
@@ -1355,7 +1357,7 @@ async fn every_refused_redemption_increments_a_bounded_counter_and_no_preview_do
         return;
     };
     let issuer = ConsoleIssuer::start(&fixture.pool).await;
-    let router = moira::build_router(observable_state(&fixture.pool)).expect("router");
+    let router = moira::build_router(observable_state(&fixture.pool).await).expect("router");
     let (provider_id, _) = configure_and_enable_policy(
         &router,
         PolicyBinding::ByIssuerString {
@@ -2041,7 +2043,7 @@ async fn transferring_ownership_moves_the_flag_rather_than_adding_a_second_owner
         return;
     };
     let issuer = ConsoleIssuer::start(&fixture.pool).await;
-    let router = moira::build_router(observable_state(&fixture.pool)).expect("router");
+    let router = moira::build_router(observable_state(&fixture.pool).await).expect("router");
     let (provider_id, _) = configure_and_enable_policy(
         &router,
         PolicyBinding::ByIssuerString {
@@ -2166,7 +2168,7 @@ async fn a_replayed_revocation_does_not_count_a_second_one() {
         return;
     };
     let issuer = ConsoleIssuer::start(&fixture.pool).await;
-    let router = moira::build_router(observable_state(&fixture.pool)).expect("router");
+    let router = moira::build_router(observable_state(&fixture.pool).await).expect("router");
     let (provider_id, _) = configure_and_enable_policy(
         &router,
         PolicyBinding::ByIssuerString {
@@ -2325,7 +2327,7 @@ async fn an_idempotent_replay_does_not_count_a_second_invitation_or_redemption()
         return;
     };
     let issuer = ConsoleIssuer::start(&fixture.pool).await;
-    let router = moira::build_router(observable_state(&fixture.pool)).expect("router");
+    let router = moira::build_router(observable_state(&fixture.pool).await).expect("router");
     let (provider_id, _) = configure_and_enable_policy(
         &router,
         PolicyBinding::ByIssuerString {

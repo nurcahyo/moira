@@ -4,8 +4,9 @@
 # cargo capture. Uploaded as a CI artifact; a local shard reproduction leaves it here.
 /shard-out
 
-# Local configuration. `scripts/dev-env.sh` writes a real 32-byte master key and
-# API-key pepper into `.env`, and `config/local.toml` is the TOML equivalent —
+# Local configuration. `scripts/dev-env.sh` writes a real 32-byte master key, an
+# API-key pepper and a content-encryption master key (`MOIRA_CONTENT_ENCRYPTION__KEYS`,
+# an "id:base64" list) into `.env`, and `config/local.toml` is the TOML equivalent —
 # neither was ignored before that generator existed.
 /.env
 /.env.bak

@@ -164,7 +164,9 @@ impl LifecycleFixture {
         settings.runtime.external_user_execution_concurrency = 64;
         settings.runtime.internal_stream_queue_capacity = 64;
         customize(&mut settings);
-        let state = AppState::new(settings, Some(pool.clone())).expect("test app state");
+        let state = AppState::new(settings, Some(pool.clone()))
+            .await
+            .expect("test app state");
         let actor = admin_actor();
         let suffix = Uuid::now_v7().simple().to_string();
         let ctx = request_context();

@@ -89,6 +89,21 @@ config:
   MOIRA_DATABASE__MIGRATE_ON_STARTUP: "false"
   MOIRA_SECRETS__KEY_ID: "production-v1"
   MOIRA_SECRETS__ALLOW_INSECURE_DEV_KEY: "false"
+  # Content encryption at rest. The non-secret half lives here; the key bytes go into the
+  # operator-supplied `moira-secrets` Secret as MOIRA_CONTENT_ENCRYPTION__KEYS, exactly like
+  # the three existing 32-byte secrets — the value is an "<id>:<base64>" list and must never
+  # be written into this ConfigMap.
+  #
+  # **The pod will not start until that Secret carries it.** The key is required
+  # unconditionally, even on a release where no application stores encrypted content, because
+  # the persistence policy is flippable at runtime through the admin API without a restart.
+  # There is no fallback to MOIRA_SECRETS__MASTER_KEY_BASE64.
+  #
+  # ACTIVE_KEY_ID must name one of the ids in that list. During a master-key rotation both the
+  # old and the new key stay in the Secret and only this value moves.
+  MOIRA_CONTENT_ENCRYPTION__CUSTODY: "environment"
+  MOIRA_CONTENT_ENCRYPTION__ACTIVE_KEY_ID: "content-v1"
+  MOIRA_CONTENT_ENCRYPTION__ALLOW_INSECURE_DEV_KEY: "false"
   MOIRA_AUTH__ADMIN__ENABLED: "true"
   MOIRA_AUTH__CALLER__DEV_TRUST_HEADERS: "false"
   MOIRA_API_KEYS__PEPPER_VERSION: "production-v1"
@@ -136,6 +151,18 @@ config:
   MOIRA_TELEMETRY__PROMETHEUS_ENABLED: "true"
   MOIRA_TELEMETRY__OTEL_ENABLED: "false"
 
+# Operator-supplied, and `create: false` by default so key material never has to pass through a
+# values file. The Deployment mounts it with `envFrom`, so every key in it becomes an
+# environment variable. It must carry, at minimum:
+#
+#   MOIRA_DATABASE__URL
+#   MOIRA_SECRETS__MASTER_KEY_BASE64          32 bytes, base64
+#   MOIRA_API_KEYS__PEPPER_BASE64             32 bytes, base64
+#   MOIRA_IDEMPOTENCY__PEPPER_BASE64          32 bytes, base64
+#   MOIRA_CONTENT_ENCRYPTION__KEYS            "<id>:<base64>,<id>:<base64>"
+#
+# The last one is new, and the pod refuses to start without it. Its ids must include
+# config.MOIRA_CONTENT_ENCRYPTION__ACTIVE_KEY_ID above.
 secret:
   create: false
   name: moira-secrets

@@ -544,7 +544,9 @@ mod tests {
     /// codes would silently drop the specific key plan 08 binds to.
     #[tokio::test]
     async fn credential_resolution_refuses_an_uncredentialed_and_a_token_only_claim() {
-        let state = AppState::new(crate::config::Settings::default(), None).expect("app state");
+        let state = AppState::new(crate::config::Settings::default(), None)
+            .await
+            .expect("app state");
         let mut request = ClaimAdminIdentityRequest {
             issuer: "https://issuer.example".to_string(),
             subject: "sub-1".to_string(),

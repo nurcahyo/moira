@@ -89,6 +89,10 @@ utoipa = { version = "5", features = ["chrono", "uuid"] }
 utoipa-axum = "0.2"
 url = "2"
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
+# Already in the tree transitively (aes-gcm, secrecy); made direct because
+# `src/security/key_custody.rs` holds master-key material as `Zeroizing<[u8; 32]>` and a
+# transitive version is not a version this crate may rely on.
+zeroize = "1"
 
 # Build-time profile tuning. Not about the shipped artifact — `--release` is untouched — but about
 # how long the edit/check/test loop takes and how much disk it costs.

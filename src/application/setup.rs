@@ -121,14 +121,21 @@ fn check(ready: bool) -> SetupCheckState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::LazyLock;
 
     use crate::infra::repositories::InMemorySetupRepository;
 
     /// Pool-less: `SetupService::with_repository` never calls `state.pool()`, which is exactly
     /// what makes these tests Postgres-free.
-    static STATE: LazyLock<AppState> =
-        LazyLock::new(|| AppState::new(crate::config::Settings::default(), None).unwrap());
+    ///
+    /// A `LazyLock` no longer fits: `AppState::new` is `async` since it preflights the content
+    /// encryption custody, and a `LazyLock` initialiser cannot await. Building one per test is
+    /// the cheaper of the two remaining options — the state holds no pool and the preflight is
+    /// a single in-process AES wrap/unwrap.
+    async fn state() -> AppState {
+        AppState::new(crate::config::Settings::default(), None)
+            .await
+            .unwrap()
+    }
 
     fn actor(actor_type: ActorType, scopes: &[&str]) -> Actor {
         Actor {
@@ -205,8 +212,9 @@ mod tests {
     /// so it had no unit coverage whatsoever.
     #[tokio::test]
     async fn status_is_setup_required_without_a_root_system_key() {
+        let state = state().await;
         let service = SetupService::with_repository(
-            &STATE,
+            &state,
             Arc::new(InMemorySetupRepository::new(
                 SetupReadinessSnapshot::default(),
             )),
@@ -222,8 +230,9 @@ mod tests {
 
     #[tokio::test]
     async fn status_is_ready_when_an_executable_path_exists() {
+        let state = state().await;
         let service = SetupService::with_repository(
-            &STATE,
+            &state,
             Arc::new(InMemorySetupRepository::new(SetupReadinessSnapshot {
                 root_system_key: true,
                 application: true,
@@ -248,8 +257,9 @@ mod tests {
     /// about deployment readiness.
     #[tokio::test]
     async fn status_rejects_a_consumer_key_before_touching_the_repository() {
+        let state = state().await;
         let service = SetupService::with_repository(
-            &STATE,
+            &state,
             Arc::new(InMemorySetupRepository::new(
                 SetupReadinessSnapshot::default(),
             )),

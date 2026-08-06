@@ -97,7 +97,7 @@ async fn run(mode: ProcessMode, settings: Settings) -> anyhow::Result<()> {
     }
 
     let addr: SocketAddr = settings.server.bind_addr()?;
-    let state = AppState::new(settings, pool)?;
+    let state = AppState::new(settings, pool).await?;
 
     // Before the listener binds and before any worker starts: a replica that the
     // cluster will not admit must not serve a single request, and must not run a
@@ -170,7 +170,7 @@ async fn bootstrap_system_key(settings: Settings) -> anyhow::Result<()> {
         .context("database url is required for bootstrap-system-key")?;
     db::migrate(&pool).await?;
 
-    let state = AppState::new(settings, Some(pool))?;
+    let state = AppState::new(settings, Some(pool)).await?;
     let actor = Actor {
         actor_type: ActorType::DevAdmin,
         subject: Some("bootstrap-cli".to_string()),
@@ -215,7 +215,7 @@ async fn execute_test(settings: Settings) -> anyhow::Result<()> {
         .context("database url is required for execute-test")?;
     db::migrate(&pool).await?;
 
-    let state = AppState::new(settings, Some(pool))?;
+    let state = AppState::new(settings, Some(pool)).await?;
     let actor = Actor {
         actor_type: ActorType::DevAdmin,
         subject: Some("execute-test-cli".to_string()),

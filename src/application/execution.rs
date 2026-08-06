@@ -3447,9 +3447,9 @@ mod tests {
         assert!(budget <= Duration::from_secs(30));
     }
 
-    #[test]
-    fn router_builds_without_database_for_type_checking() {
-        let state = AppState::new(Settings::default(), None).unwrap();
+    #[tokio::test]
+    async fn router_builds_without_database_for_type_checking() {
+        let state = AppState::new(Settings::default(), None).await.unwrap();
         assert!(MoiraExecutionService::new(state).is_err());
     }
 }

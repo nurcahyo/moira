@@ -107,7 +107,9 @@ impl MiddlewareFixture {
         let settings = Settings::default();
         let public_limit = usize::try_from(settings.public_api.maximum_request_bytes)
             .expect("maximum_request_bytes fits usize");
-        let state = AppState::new(settings, Some(pool.clone())).expect("middleware app state");
+        let state = AppState::new(settings, Some(pool.clone()))
+            .await
+            .expect("middleware app state");
         let server = MoiraHttpServer::start(state).await;
 
         Some(Self {
@@ -404,7 +406,9 @@ async fn hsts_is_present_only_under_a_production_deployment() {
     let mut settings = Settings::default();
     settings.deployment.environment = moira::config::DeploymentEnvironment::Production;
     let production = MoiraHttpServer::start(
-        AppState::new(settings, Some(fixture.pool.clone())).expect("production app state"),
+        AppState::new(settings, Some(fixture.pool.clone()))
+            .await
+            .expect("production app state"),
     )
     .await;
 

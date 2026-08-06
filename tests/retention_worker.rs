@@ -664,7 +664,9 @@ async fn a_running_supervisor_dispatches_a_retention_sweep() {
     // bounds a *retry*, not the first sweep.
     settings.workers.retention_interval_seconds = 1;
 
-    let state = AppState::new(settings, Some(pool.clone())).expect("supervisor app state");
+    let state = AppState::new(settings, Some(pool.clone()))
+        .await
+        .expect("supervisor app state");
     // Guards against the test silently arming nothing: if the retention spec ever
     // stops being configured by default, the assertions below would pass or fail
     // for reasons unrelated to dispatch.

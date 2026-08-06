@@ -883,7 +883,9 @@ impl SecretScenario {
 
         // 503 `database_unavailable` needs a state with no pool, so it gets its
         // own throwaway router rather than being faked on this one.
-        let poolless = AppState::new(Settings::default(), None).expect("pool-less app state");
+        let poolless = AppState::new(Settings::default(), None)
+            .await
+            .expect("pool-less app state");
         let poolless_router = moira::build_router(poolless).expect("pool-less router");
         let unavailable = drive(
             &poolless_router,

@@ -3766,9 +3766,11 @@ mod tests {
         assert!(validate_metadata(&json!({ "ticket": "MOIRA-5" })).is_ok());
     }
 
-    #[test]
-    fn only_system_and_development_admin_actors_can_read_all_context() {
-        let state = AppState::new(crate::config::Settings::default(), None).unwrap();
+    #[tokio::test]
+    async fn only_system_and_development_admin_actors_can_read_all_context() {
+        let state = AppState::new(crate::config::Settings::default(), None)
+            .await
+            .unwrap();
         for actor_type in [ActorType::SystemKey, ActorType::DevAdmin] {
             let actor = Actor {
                 actor_type,
