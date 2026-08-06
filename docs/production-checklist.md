@@ -17,3 +17,14 @@
 - Backup and restore drill completed.
 - Load and chaos tests executed against a staging environment.
 - Security scans and dependency audits are clean or explicitly accepted.
+
+Admin console:
+
+- Console chart left at `replicaCount: 1`, with `autoscaling` and
+  `podDisruptionBudget` disabled, until the `auth-runtime.ts` snapshot is shared.
+- Exactly one enabled `auth_provider_settings` row, and it is bound to a trusted
+  JWT issuer with a non-empty `allowed_email_domains`.
+- After any Stage 4A rollout: migration `0020` recorded successful, the partial
+  unique index `auth_provider_settings_one_enabled_per_trusted_issuer` present,
+  and the `ambiguous_enabled_providers` guard still in place until both are
+  verified — [console-multi-provider-rollout.md](console-multi-provider-rollout.md).

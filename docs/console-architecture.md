@@ -333,11 +333,22 @@ test forbids `components/atoms/**` and `components/molecules/**` from calling
 matching `/(^|[/-])auth([/-]|$)|better-auth|next-auth/i`. It is also the first
 `"use client"` file in the repository.
 
-**At most one button, by construction.** `resolveAuthConfig` returns
-`ambiguous_enabled_providers` when more than one provider is enabled, and
-`loadAuthConfig` will not even read a secret in that case. A provider picker is
-not "unbuilt" — it is wrong until the ownership question behind multi-provider is
-decided.
+**One button per RESOLVED provider — and today that is at most one.** The
+resolution below the panel is N-capable: `resolveAuthConfigs` resolves every
+enabled row independently and reports the ones that failed as `problems` rather
+than as a whole-deployment failure, so a drifted GitHub row cannot take OIDC
+sign-in down. The panel renders a button only for a provider the server fully
+resolved, never for one it merely knows about.
+
+What is not switched on is the *gate above it*. `ambiguityGuard`, applied by
+`loadAuthConfigs` in `lib/auth-config.ts`, still refuses every resolution once
+more than one row is enabled and `active` — so on today's deployments this
+renders one button. The guard comes down only after Stage 4A is deployed, not
+merely merged; the sequence and its verification are in
+[console-multi-provider-rollout.md](console-multi-provider-rollout.md). The write
+side agrees: `provisioningAdmissionFor` in `app/api/setup/route.ts` refuses a
+provisioning run that would take the enabled count above one, with
+`409 setup_single_enabled_provider_only`.
 
 **The refusal states are resolved server-side.** The anonymous
 `GET /api/v1/admin/setup/sign-in-methods` projection is enough to RENDER a button
