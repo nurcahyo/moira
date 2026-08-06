@@ -195,6 +195,7 @@
 //              buys a 409 and nothing is written.
 
 import { consoleProviderIdFor, isInteractiveMethod, isProviderSlug } from "@/lib/auth-config";
+import { invalidateAuthConfig } from "@/lib/auth-runtime";
 import { readJsonBody } from "@/lib/console-api";
 import { isMoiraRequestError } from "@/lib/errors";
 import { CONSOLE_MESSAGE_KEYS } from "@/lib/i18n/keys";
@@ -941,6 +942,30 @@ async function provision(
       );
     }
     throw error;
+  } finally {
+    // ----------------------------------------------------------------------
+    // ISSUE #152 — the console's own half of `docs/runtime-cache-invalidation.md`.
+    // ----------------------------------------------------------------------
+    //
+    // A provisioning run is the one auth-configuration write this deployment
+    // makes THROUGH the console, so it is the one place the console can do what
+    // Moira's `moira_runtime_config` NOTIFY trigger does for Moira's own caches:
+    // invalidate at the write rather than wait for a TTL. Without it, an
+    // operator who re-points the provider here keeps being served the previous
+    // one — which is exactly how #152 was met, and the endpoint that
+    // configuration named was refusing connections.
+    //
+    // IN `finally`, NOT ON THE SUCCESS PATH. `runSetupProvisioning` is a
+    // four-step chain that can fail after it has written: the resume remedies
+    // exist precisely because a run can leave a created trusted issuer, a
+    // created or PATCHed provider row, or a sealed secret behind. A snapshot
+    // held across a partial write is stale in the same way a snapshot held
+    // across a complete one is.
+    //
+    // Cheap on purpose: it drops one object. The next `consoleRuntime()` pays
+    // for the re-read, and only the requests that actually need a configuration
+    // do.
+    invalidateAuthConfig();
   }
 }
 

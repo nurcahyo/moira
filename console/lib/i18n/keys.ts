@@ -74,6 +74,10 @@ export const CONSOLE_MESSAGE_KEYS = {
 
   /* --- lib/auth-runtime.ts ------------------------------------------------ */
   auth_config_unavailable: "console.error.auth_config_unavailable",
+  auth_config_stale: "console.error.auth_config_stale",
+
+  /* --- app/api/auth/[...all]/route.ts -------------------------------------- */
+  auth_provider_unreachable: "console.error.auth_provider_unreachable",
 
   /* --- lib/moira-session.ts ----------------------------------------------- */
   session_required: "console.error.session_required",

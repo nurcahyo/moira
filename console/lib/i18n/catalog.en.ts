@@ -218,6 +218,32 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "process has not yet snapshotted a configuration — typically a fresh replica after a " +
       "restart.",
   },
+  [K.auth_config_stale]: {
+    key: K.auth_config_stale,
+    message:
+      "The console is serving a sign-in configuration it can no longer re-read from Moira, so a " +
+      "provider changed since it was read will not take effect until Moira is reachable again " +
+      "or this console is restarted.",
+    description:
+      "The snapshot in lib/auth-runtime.ts is past AUTH_CONFIG_SNAPSHOT_TTL_MS and the refresh " +
+      "could not run: no MOIRA_SYSTEM_KEY to re-read with, or Moira is unreachable. The " +
+      "configuration is still served — it is the only one anybody could sign in with — but " +
+      "issue #152 was about the SILENCE, so this is what /login renders instead of nothing.",
+  },
+
+  /* --- app/api/auth/[...all]/route.ts -------------------------------------- */
+  [K.auth_provider_unreachable]: {
+    key: K.auth_provider_unreachable,
+    message:
+      "The console could not reach the identity provider named in its sign-in configuration. " +
+      "Check that the provider's endpoints are correct and reachable from the console.",
+    description:
+      "A network-level failure escaping Better Auth's own handler — the console dialled the " +
+      "configured discovery, authorization, token or userinfo URL and got no HTTP response at " +
+      "all (ECONNREFUSED, DNS failure, connect timeout). Emitted by app/api/auth/[...all]/" +
+      "route.ts. Before issue #152 this reached the operator as a bare `TypeError: fetch " +
+      "failed` 500, which names neither configuration nor the provider as the cause.",
+  },
 
   /* --- lib/moira-session.ts ----------------------------------------------- */
   [K.session_required]: {

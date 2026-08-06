@@ -20,6 +20,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 import { GET, POST } from "@/app/api/setup/route";
+import { consoleRuntime, resetConsoleRuntime } from "@/lib/auth-runtime";
+import { InMemoryConsoleSecretStore } from "@/lib/console-secrets";
 import { readConsoleEnv, type ConsoleEnv, type EnvSource } from "@/lib/env";
 import { CONSOLE_CATALOG, t } from "@/lib/i18n";
 import { CONSOLE_MESSAGE_KEYS } from "@/lib/i18n/keys";
@@ -2228,5 +2230,155 @@ describe("every key this route emits is real English", () => {
       expect(/MOIRA_[A-Z_]+|CONSOLE_[A-Z_]+/.test(message), key).toBe(false);
       expect(/https?:\/\//.test(message), key).toBe(false);
     }
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* ISSUE #152 — the write invalidates the configuration the console SERVES     */
+/* -------------------------------------------------------------------------- */
+//
+// `lib/auth-runtime.ts` keeps a per-process snapshot of the resolved auth
+// configuration, and a provisioning run is the one auth-configuration write this
+// deployment makes THROUGH the console. Until #152 nothing connected the two: an
+// operator re-pointed the provider here, the wizard answered 201, and sign-in
+// kept using the endpoints of the configuration that had just been replaced —
+// until somebody restarted the process. What that looked like in practice was
+// `POST /api/auth/sign-in/oauth2 500` with an `ECONNREFUSED` inside it, blaming
+// an identity provider that was not the one in play.
+//
+// `invalidateAuthConfig()` in the route's `finally` is the fix, and this is the
+// test that fails if it is deleted. An invalidation function with no caller is
+// the F25 shape, and the issue says so in as many words: "a cache that is
+// refreshed only by a code path no test exercises is the same defect wearing a
+// different hat".
+
+describe("a provisioning run invalidates the console's auth snapshot", () => {
+  const RUNTIME_SECRET_KEY = Buffer.alloc(32, 0x2a);
+  const DISCOVERY_URL = "https://accounts.google.com/.well-known/openid-configuration";
+
+  /** The enabled, bound row — with endpoints, or it cannot RESOLVE at all. */
+  const resolvableProviderList: StubHandler = () => ({
+    status: 200,
+    body: {
+      data: [providerRecord({ enabled: true, version: 2, discovery_url: DISCOVERY_URL })],
+      pagination: { has_more: false, next_cursor: null },
+    },
+  });
+
+  const liveProvider = () =>
+    providerRecord({ enabled: true, version: 2, discovery_url: DISCOVERY_URL });
+
+  /** The domain-refusal remedy: add a domain to the LIVE provider and re-save. */
+  const RE_SAVE = {
+    ...PROVISION_BODY,
+    client_secret: "",
+    allowed_email_domains: ["example.com", "gmail.com"],
+  };
+
+  /** How many times the configuration has been read out of Moira. */
+  const configReads = () => stub.requestsFor(PROVIDER_LIST_ROUTE).length;
+
+  /**
+   * A deployment with a LIVE, resolvable provider, plus a runtime secret store
+   * the resolution can actually reveal from.
+   *
+   * `patch` is the handler for the re-save, so one fixture serves both the
+   * committed and the part-way-failed run.
+   */
+  async function installLiveDeployment(patch: StubHandler): Promise<ConsoleEnv> {
+    const env = envWith();
+    install({
+      env,
+      handlers: handlers({
+        [ISSUER_LIST_ROUTE]: populatedIssuerList,
+        [PROVIDER_LIST_ROUTE]: resolvableProviderList,
+        [PROVIDER_GET_ROUTE]: () => ({ status: 200, body: liveProvider() }),
+        [PROVIDER_PATCH_ROUTE]: patch,
+      }),
+      // An ENABLED row is a live authenticator: only somebody signed in THROUGH
+      // it may re-save it. `SIGNED_IN.moiraProviderId === PROVIDER_ID`.
+      session: SIGNED_IN,
+    });
+    store.sealedIds.add(PROVIDER_ID);
+
+    // The runtime's own store, a different singleton from the setup window's:
+    // `consoleRuntime` has to REVEAL the secret, and `RecordingSecretStore`
+    // deliberately cannot.
+    const runtimeStore = new InMemoryConsoleSecretStore(RUNTIME_SECRET_KEY);
+    await runtimeStore.put(PROVIDER_ID, CLIENT_ID, CLIENT_SECRET);
+    resetConsoleRuntime({ store: runtimeStore });
+    return env;
+  }
+
+  /**
+   * Drive one provisioning run against a live deployment and report how the
+   * snapshot behaved around it.
+   *
+   * `consoleRuntime` builds its own Moira client, which captures the global
+   * `fetch` — so substituting the global is what points it at the stub.
+   * Substituting a client instead would be substituting the code path under
+   * test.
+   */
+  async function reReadsAfterProvisioning(
+    patch: StubHandler,
+  ): Promise<{ readonly status: number; readonly reReadAfterWrite: boolean }> {
+    const env = await installLiveDeployment(patch);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = stub.fetch;
+    try {
+      const before = await consoleRuntime(env);
+      expect(before.ok, "the fixture must RESOLVE, or there is no snapshot to invalidate").toBe(
+        true,
+      );
+
+      // The control. A second resolve inside the TTL is served from memory, so
+      // the assertion after the write is about the write and not about the TTL.
+      const afterFirstResolve = configReads();
+      await consoleRuntime(env);
+      expect(configReads(), "the snapshot is not being cached at all").toBe(afterFirstResolve);
+
+      const response = await POST(post(RE_SAVE));
+      const afterProvision = configReads();
+      await consoleRuntime(env);
+      return { status: response.status, reReadAfterWrite: configReads() > afterProvision };
+    } finally {
+      globalThis.fetch = originalFetch;
+      resetConsoleRuntime();
+    }
+  }
+
+  test("the snapshot serving sign-in is dropped when the wizard re-saves the provider", async () => {
+    const outcome = await reReadsAfterProvisioning(() => ({
+      status: 200,
+      body: providerRecord({
+        enabled: true,
+        version: 3,
+        discovery_url: DISCOVERY_URL,
+        allowed_email_domains: ["example.com", "gmail.com"],
+      }),
+    }));
+
+    expect(outcome.status).toBe(201);
+    expect(
+      outcome.reReadAfterWrite,
+      "the wizard wrote and the console went on serving its cached configuration — this is " +
+        "issue #152, and the sign-in that follows dials the endpoints of the provider that was " +
+        "just replaced",
+    ).toBe(true);
+  });
+
+  test("a provisioning run that FAILS part-way invalidates too", async () => {
+    // `runSetupProvisioning` is a four-step chain that can fail after it has
+    // written — the whole resume-remedy vocabulary exists because of that. A
+    // snapshot held across a partial write is stale in exactly the way a
+    // snapshot held across a complete one is, which is why the call sits in
+    // `finally` rather than on the success path.
+    const outcome = await reReadsAfterProvisioning(() => ({
+      status: 500,
+      body: errorEnvelope("database_error"),
+    }));
+
+    expect(outcome.status).toBeGreaterThanOrEqual(400);
+    expect(outcome.reReadAfterWrite).toBe(true);
   });
 });
