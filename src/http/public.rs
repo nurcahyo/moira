@@ -50,6 +50,20 @@ async fn public_actor(
         (status = 400, description = "Malformed request", body = ErrorResponse),
         (status = 401, description = "Authentication failed", body = ErrorResponse),
         (status = 403, description = "Operation is not permitted", body = ErrorResponse),
+        // A reference on the resolution chain — route, agent profile, model, credential —
+        // that does not resolve. None of these is named by the caller, so this is a
+        // configuration answer rather than a "you asked for a thing that isn't there":
+        // `route_not_found`, `agent_profile_not_found`, `model_not_found`,
+        // `no_eligible_model`, `credential_not_found`, per `failure_http_status`.
+        //
+        // Undeclared until now. `route_not_found` has returned `404` here since long
+        // before #79 added `agent_profile_not_found` to the same family, and
+        // `tests/openapi_drift.rs` could never have caught it: it compares the served
+        // document to the committed one, and both were generated from this same
+        // annotation. A status a handler returns but never declares is invisible to
+        // every generated client, which is what makes this the one gap in the set worth
+        // fixing rather than only recording.
+        (status = 404, description = "A route, agent profile, model or credential on the resolution chain does not exist", body = ErrorResponse),
         (status = 409, description = "Idempotency or execution conflict", body = ErrorResponse),
         (status = 422, description = "Request violates execution policy", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
@@ -96,6 +110,18 @@ pub async fn create_response(
         (status = 400, description = "Malformed request", body = ErrorResponse),
         (status = 401, description = "Authentication failed", body = ErrorResponse),
         (status = 403, description = "Operation is not permitted", body = ErrorResponse),
+        // No `404` and no `409` here, and the asymmetry with `POST /api/v1/responses` is
+        // real rather than an oversight. Execution failures on this operation do not
+        // reach the caller as a status at all: the stream has already opened `200` by the
+        // time the resolution chain is walked, so the refusal arrives as the terminal
+        // `response.failed` event carrying the same code. Pinned by
+        // `guards_the_public_stream_refuses_a_dangling_agent_profile_in_its_terminal_event`
+        // in `tests/agent_profile_wire.rs`, which asserts `200` on the transport and reads
+        // the code out of the last event.
+        //
+        // The statuses that remain below are the ones raised *before* the stream opens —
+        // authentication, authorization, the streaming-disabled policy check, the rate
+        // limit, and request validation.
         (status = 422, description = "Request violates execution policy", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
         (status = 502, description = "Upstream provider failed", body = ErrorResponse),
