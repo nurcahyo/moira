@@ -1,6 +1,7 @@
 mod api_keys;
 mod auth;
 mod authz;
+mod content_envelope;
 mod crypto;
 mod idempotency;
 mod key_custody;
@@ -20,6 +21,12 @@ pub use auth::{
     TrustedJwtIdentity,
 };
 pub use authz::AuthorizationService;
+pub use content_envelope::{
+    AAD_SEPARATOR, ALGORITHM_AES_256_GCM, AadProfile, ContentCipher, ContentEnvelopeError,
+    ContentIdentity, ENVELOPE_HEADER_LEN, ENVELOPE_MAGIC, ENVELOPE_NONCE_LEN, ENVELOPE_TAG_LEN,
+    EnvelopeHeader, FORMAT_VERSION_V1, IDENTITY_PREFIX, KEY_MODE_WRAPPED_DEK, MIN_ENVELOPE_LEN,
+    envelope_aad,
+};
 pub use crypto::{
     CredentialAadParts, ENVELOPE_VERSION_V1, EncryptedSecret, LOCAL_AES_256_GCM, LocalSecretCipher,
     SecretCipher, credential_aad, credential_secret_field,
