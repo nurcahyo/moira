@@ -272,15 +272,21 @@ as its issuer; do not give it a slug.
 | what to look at | it worked | it is broken |
 | --- | --- | --- |
 | `/login` | **two** sign-in buttons, one per provider | **Zero buttons** and a keyed message. `no_enabled_auth_provider` means neither row is enabled and `active`. `console_secret_unavailable` means the console has no `console_provider_secret` row for that provider, or the stored `client_id` has drifted from Moira's. `trusted_jwt_issuer_not_resolvable` means the trusted issuer's `issuer` string is outside `<bffIssuerUrl>/idp/*`, so no stable `providerId` can be derived from it. **`ambiguous_enabled_auth_providers` means the guard is still deployed** — you are running the old console image. |
-| **one** button when you expected two | the second row resolved as a *problem*, not a failure. This is correct behaviour: a drifted second provider must not take the first one's sign-in down. Read `consoleRuntime()`'s `problems` list for which row and why. |
 | sign in through each in turn | each completes and lands in the console | an `error=` query parameter on a redirect hop. `invalid_client` is the client secret; `user_info_is_missing` is a `github_oauth` row with no `userinfo_url`. |
 | the minted token for each session | the two `iss` values **differ**, and each equals its own trusted issuer's registered string | **both tokens carry the same `iss`** — that is finding F24 live. `admin_identities` is keyed `(issuer, subject)`, so two IdPs returning the same `sub` collapse to **one** admin grant. Roll back the console immediately. |
 | `admin_identities` after two humans, one per provider | two grants, distinct `(issuer, subject)` | one grant, or a grant whose `issuer` is the incumbent's for both. Same failure as above. |
 
-The last two rows are the ones with teeth. "Both buttons work" is true under the
-defect as well — there is one ES256 key pair and one `kid`, and `iss` is not part
-of the signature, so both tokens verify against the JWKS either way. Verifying
-the signature proves nothing here. **Compare the two `iss` values.**
+**One button rather than zero or two is a third outcome, and it is not a
+failure.** It means the second row resolved as a *problem* rather than taking the
+whole resolution down — which is correct: a drifted second provider must not stop
+the first one's sign-in. Read `consoleRuntime()`'s `problems` list for which row
+and why, using the same message keys as the `/login` row above.
+
+The last two rows of the table are the ones with teeth. "Both buttons work" is
+true under the defect as well — there is one ES256 key pair and one `kid`, and
+`iss` is not part of the signature, so both tokens verify against the JWKS either
+way. Verifying the signature proves nothing here. **Compare the two `iss`
+values.**
 
 ## If verification fails
 
