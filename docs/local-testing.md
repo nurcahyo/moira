@@ -218,15 +218,34 @@ wired, and exactly what was observed, is documented in that repo, not copied
 here: see
 [commerce-os's `DEV-GUIDE.md`](https://github.com/motrait/commerce-os/blob/develop/DEV-GUIDE.md).
 
-**Not proven, here:** this repo's own console has never been driven against a
-real Moira end to end. Its e2e suite (`console/e2e/setup-wizard.e2e.ts`) runs the
-wizard against a **stub** Moira on loopback TLS (`console/e2e/support/moira-setup-stub.ts`)
-and stops on purpose at the `sign_in` step — one test asserts *positively* that
-`claim` is not reached, so the gap stays visible instead of silently closing
-itself once someone assumes it's covered. Reaching `claim`, and any real sign-in,
-needs a completed OAuth round trip through a mock IdP inside the e2e environment;
-that harness does not exist yet (issue #72). It also needs the IdP reachable over
-**https** — see the missing item below.
+**Not proven, here:** this repo's own console has never signed in against a
+real (non-mocked) Moira end to end. Two narrower facts sit under that one
+sentence, and collapsing them into "no real sign-in exists" would be wrong.
+
+A real sign-in, in a real browser, is proven — just not through the wizard.
+`console/e2e/authenticated-session.e2e.ts:46` drives an actual browser through
+`/login` → the mock IdP's `/authorize` → an authorization-code exchange with
+PKCE → a Better Auth session, and asserts the `(console)` home heading renders,
+not just a redirect landing on `/`. The harness behind it is
+`console/e2e/support/authenticated-stack.ts`, which imports `startMockIdp` from
+`tests/support/mock-idp` (line 66) and starts it (line 285);
+`console/playwright.config.ts:187-188` runs the spec as its own
+`authenticated-setup` project. That harness landed under issue #75.
+
+The wizard's own `claim` step is still not reached. Its e2e suite
+(`console/e2e/setup-wizard.e2e.ts`) runs against
+`console/e2e/support/setup-fixture.ts`, and that fixture wires no IdP at all —
+its `discoveryUrl` is the placeholder `https://idp.fixture.invalid` (line 130).
+So one test there still asserts *positively* that `claim` is not reached, and
+the gap stays visible on purpose instead of silently closing itself once
+someone assumes it's covered. That is issue #72, and it is still open.
+
+And neither path has run against a real Moira: `authenticated-stack.ts` also
+mocks Moira's HTTP surface (`console/e2e/support/moira-fixture.ts`), the same
+as the wizard's stub. So the honest remaining gap is narrower than "any real
+sign-in is unproven" — it is "the wizard's own sign-in is unproven, and
+nothing here has run past a mocked Moira." It also needs the IdP reachable
+over **https** for the wizard's own scenario — see the missing item below.
 
 What has landed — `console/app/api/setup/route.ts`, the single door setup writes
 through:
@@ -286,7 +305,10 @@ deployed. See [console-multi-provider-rollout.md](console-multi-provider-rollout
 
 So the honest answer has two halves: **the multi-provider machinery does run on a
 laptop, through the test harness. It does not run in a browser, and the thing
-stopping it is the guard, not your setup.**
+stopping it is the guard, not your setup.** (A single-provider sign-in *does* run
+in a browser now — see [above](#the-console) — but nobody has driven two enabled
+providers through a browser at once; only `multi-provider.test.ts`, below,
+exercises that.)
 
 #### 1. Run the multi-provider suite — this is the real thing
 
