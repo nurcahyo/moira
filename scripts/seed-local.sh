@@ -91,7 +91,25 @@ fi
 step "1. provider  ($BASE_URL)"
 PROVIDER_ID=$(curl -fsS "${H[@]}" "$B/api/v1/admin/providers?$PAGE" | find_by display_name "$NAME")
 if [ -n "$PROVIDER_ID" ]; then
-    printf '   reuse  %s\n' "$PROVIDER_ID"
+    # Reuse-by-name is not reuse-by-value: MOIRA_SEED_BASE_URL is what the
+    # operator asked for *this run*, and a same-named row from an earlier run
+    # can point anywhere. Read the row back (the same GET-and-parse pattern
+    # `find_by` already uses on the list) and compare before trusting it.
+    PROVIDER=$(curl -fsS "${H[@]}" "$B/api/v1/admin/providers/$PROVIDER_ID")
+    CURRENT_BASE_URL=$(printf '%s' "$PROVIDER" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("base_url") or "")')
+    if [ "$CURRENT_BASE_URL" = "$BASE_URL" ]; then
+        printf '   reuse  %s\n' "$PROVIDER_ID"
+    else
+        # The variable the operator set wins. PATCH is version-checked
+        # (If-Match), so read the version off the same row rather than
+        # guessing it; a concurrent edit fails the precondition and this
+        # script aborts (set -e) instead of clobbering it.
+        CURRENT_VERSION=$(printf '%s' "$PROVIDER" | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')
+        curl -fsS -X PATCH "${H[@]}" -H "If-Match: $CURRENT_VERSION" \
+            "$B/api/v1/admin/providers/$PROVIDER_ID" \
+            -d "$(python3 -c 'import json,sys; print(json.dumps({"base_url": sys.argv[1]}))' "$BASE_URL")" >/dev/null
+        printf '   update %s  base_url: %s -> %s\n' "$PROVIDER_ID" "$CURRENT_BASE_URL" "$BASE_URL"
+    fi
 else
     PROVIDER_ID=$(curl -fsS -X POST "${H[@]}" "$B/api/v1/admin/providers" \
         -d "$(python3 -c 'import json,sys; print(json.dumps({
@@ -101,6 +119,13 @@ else
     printf '   create %s\n' "$PROVIDER_ID"
 fi
 
+# A provider's base_url changing does not make its provider_model rows wrong:
+# `provider_model` keys on (provider_id, model_key) and stores no URL, so a
+# base_url update above cannot dangle or misdirect it. Whether the model_key
+# itself is still *served* by the new endpoint is exactly what step 2 already
+# checks — MOIRA_SEED_MODEL unset re-discovers against the current $BASE_URL
+# every run, and a pinned MOIRA_SEED_MODEL is trusted the same way it always
+# was. No extra handling needed here.
 step "2. provider model  ($MODEL)"
 MODEL_ID=$(curl -fsS "${H[@]}" "$B/api/v1/admin/providers/$PROVIDER_ID/models?$PAGE" | find_by model_key "$MODEL")
 if [ -n "$MODEL_ID" ]; then
