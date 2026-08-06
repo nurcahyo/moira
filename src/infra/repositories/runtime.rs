@@ -241,7 +241,15 @@ pub trait RuntimeRepository: Send + Sync {
 
     async fn get_agent_profile(&self, id: Uuid) -> Result<AgentProfileRecord, AppError>;
 
-    async fn get_active_agent_profile(
+    /// The row a route's `agent_profile_id` names, **unfiltered by `status` and `deleted_at`**.
+    ///
+    /// This replaced `get_active_agent_profile`, which filtered
+    /// `status = 'active' and deleted_at is null` and so answered `None` for both "the operator
+    /// switched it off" and "it is gone". Those have different remedies and, since issue #79,
+    /// different refusals — see [`crate::domain::AgentProfileResolution`], which is the only
+    /// thing allowed to interpret this row. Filtering here again would put the decision back in
+    /// SQL where no caller can see it.
+    async fn find_agent_profile_reference(
         &self,
         id: Uuid,
     ) -> Result<Option<AgentProfileRecord>, AppError>;
@@ -805,16 +813,15 @@ impl RuntimeRepository for PgRuntimeRepository {
         agent_profile_record_from_row(&row)
     }
 
-    async fn get_active_agent_profile(
+    async fn find_agent_profile_reference(
         &self,
         id: Uuid,
     ) -> Result<Option<AgentProfileRecord>, AppError> {
-        let row = sqlx::query(&agent_profile_select(
-            "where id = $1 and status = 'active' and deleted_at is null",
-        ))
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
+        // No `status` and no `deleted_at` predicate, deliberately: see the trait's doc comment.
+        let row = sqlx::query(&agent_profile_select("where id = $1"))
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
         row.as_ref().map(agent_profile_record_from_row).transpose()
     }
 
@@ -1539,6 +1546,8 @@ pub fn execution_failure_class_to_db(class: ExecutionFailureClass) -> &'static s
         ExecutionFailureClass::ApplicationUnavailable => "application_unavailable",
         ExecutionFailureClass::RouteNotFound => "route_not_found",
         ExecutionFailureClass::RouteForbidden => "route_forbidden",
+        ExecutionFailureClass::AgentProfileNotFound => "agent_profile_not_found",
+        ExecutionFailureClass::AgentProfileDisabled => "agent_profile_disabled",
         ExecutionFailureClass::ModelNotFound => "model_not_found",
         ExecutionFailureClass::ModelForbidden => "model_forbidden",
         ExecutionFailureClass::ModelCapabilityMismatch => "model_capability_mismatch",
@@ -2197,11 +2206,11 @@ impl RuntimeRepository for InMemoryRuntimeRepository {
         Err(not_stubbed("get_agent_profile"))
     }
 
-    async fn get_active_agent_profile(
+    async fn find_agent_profile_reference(
         &self,
         _id: Uuid,
     ) -> Result<Option<AgentProfileRecord>, AppError> {
-        Err(not_stubbed("get_active_agent_profile"))
+        Err(not_stubbed("find_agent_profile_reference"))
     }
 
     async fn patch_agent_profile(

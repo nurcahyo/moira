@@ -1123,6 +1123,8 @@ fn failure_class_label(class: ExecutionFailureClass) -> &'static str {
         ExecutionFailureClass::ApplicationUnavailable => "application_unavailable",
         ExecutionFailureClass::RouteNotFound => "route_not_found",
         ExecutionFailureClass::RouteForbidden => "route_forbidden",
+        ExecutionFailureClass::AgentProfileNotFound => "agent_profile_not_found",
+        ExecutionFailureClass::AgentProfileDisabled => "agent_profile_disabled",
         ExecutionFailureClass::ModelNotFound => "model_not_found",
         ExecutionFailureClass::ModelForbidden => "model_forbidden",
         ExecutionFailureClass::ModelCapabilityMismatch => "model_capability_mismatch",

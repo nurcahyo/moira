@@ -2613,7 +2613,7 @@ question being investigated. That clause has now out-produced the questions them
 | ~~**F51**~~ | ~~**The runtime-config invalidation channel is wired to per-request data tables, and `apply_invalidation` ignores its own scope for three of the four things it clears.**~~ **CLOSED** `fix/f51-f52-invalidation-scope` `f97d4f1`. **Premise held in full, and every count in it was right** — 24 tables when counted by trigger *function* (`auth_provider_settings`'s trigger really is named `auth_provider_settings_notify`, so a name-based query returns 23), `conversations` and `memory_records` really do fire on every `INSERT`/`UPDATE`/`DELETE`, and the three `invalidate_all()` calls really were unconditional while only the breaker reset was scoped. **Both candidate fixes taken, because they are independent barriers and the brief was right that they are not exclusive.** (1) `invalidation_plan` now returns an `InvalidationPlan { caches, circuits }` from one parse, and `RUNTIME_DATA_RESOURCE_TYPES` names the resource types that clear no cache; the narrowing is one-way, so an unparseable payload, a non-uuid id or an unrecognised `resource_type` still clears everything and resets every breaker. (2) Migration `0022` drops the trigger from both data tables. **Nothing depends on those two tables notifying**, established three ways: `docs/runtime-cache-invalidation.md` enumerates the invalidation-producing resources and lists neither — the schema drifted from the documented design in `0007`, not the other way round; **no cache in the process is keyed by a conversation or a memory record** (there is no `ConversationCache`/`MemoryCache` anywhere in `src/`), and the three the listener clears hold provider configuration, built provider clients and the enabled auth methods; and `src/infra/db.rs` is the **only** listener on the channel, so there is no other subscriber whose behaviour could change. **The most expensive consequence was under-stated by the original entry's own framing**: the standing justification in `apply_invalidation`'s doc comment was that the caches "rebuild on the next read, so re-reading them costs a query" — true of `RuntimeConfigCache` and `AuthProviderSettingsCache`, **false of `ProviderRuntimeCache`**, which holds built Rig clients with their connection pools and is keyed by a tuple that already contains every version number, so the config-write case it was defending never needed the wipe either. **Five mutations, each reverted.** Reverting the scoping reds the integration guard; **honouring the plan for `cache` but not `runtime_handles`/`auth_settings` — the cheapest edit that preserves the defect — reds it on the handles assertion specifically**, which is why the guard seeds a real `RuntimeModelHandle` and observes all three caches rather than the one that is easy to observe; leaving the trigger attached reds the trigger guard (and showed all three of INSERT/UPDATE/DELETE firing, which is why the test does all three); eating the fail-safe on the unknown arm reds the unit guard. **Under mutation 1 the unit guard stayed green and only the integration guard fired** — the correct-predicate/wrong-wiring split of F16's shape, and the reason both exist. *Reversal condition:* re-attaching either trigger requires deleting that table from `RUNTIME_DATA_RESOURCE_TYPES` in the same change, because a table that has become configuration must not stay classified as data — `every_triggered_table_has_a_scope` asserts `plan.caches` for every triggered table and reds if it is. | **closed** |
 | ~~**F52**~~ | ~~**Three triggered tables are unclassified … and the guard that exists to prevent exactly this is a retyped list that has already drifted.**~~ **CLOSED** `fix/f51-f52-invalidation-scope` `9f243a6`. **Premise held in full and every specific was verified against the live catalogue**: `pg_trigger` returns exactly 24 tables for `notify_moira_runtime_config_change`, the three `legacy_*` tables are among them, their triggers still carry their *pre-rename* names (`legacy_providers`'s trigger is `providers_runtime_config_notify`) — so a name-based query mis-attributes them as well as missing `auth_provider_settings` — and the test's array really did hold 21 hand-typed names. **The fix is the shape the entry named**: `TRIGGERED_RESOURCE_TYPES` is now a real constant and `tests/runtime_notify_inventory.rs` pins it against `pg_trigger` **in both directions**, counted by trigger *function* and excluding `tgisinternal`, with a `MINIMUM_TRIGGERED_TABLES` floor against the empty-set failure a derived list is most exposed to. **The three legacy tables lose their triggers** (migration `0023`) rather than being classified: the finding's claim that nothing in `src/` reads or writes them is **correct and stronger than stated** — the only references anywhere in the tree are inside `0003_security_foundation.sql` itself, as a one-time backfill source guarded by `to_regclass(…) is not null`. The tables themselves are kept; they are an operator's record of the pre-0003 world and dropping them is irreversible. `legacy_applications` is renamed by the same migration and correctly absent — `0002` only ever attached the trigger to three tables. **Four mutations, each reverted, and the two halves interlock.** Leaving one legacy trigger attached reds both new tests — *the exact original defect, where the old guard was green*. **Attaching the trigger to a brand-new table (`responses`) reds the inventory test — the forward drift the retyped list could never detect, which is the whole property.** Then the cheapest edit: **"fix" that red by adding `responses` to `TRIGGERED_RESOURCE_TYPES` and nothing else — the inventory test goes green and the unit guard goes red**, because it iterates the constant and asserts the scope; and classifying it as `RUNTIME_DATA_RESOURCE_TYPES` instead leaves the scope assertion satisfied and reds the new `plan.caches` assertion. There is no way to satisfy one half without the other. *Reversal condition:* it re-opens if the inventory is ever satisfied by editing the constant alone — i.e. if `every_triggered_table_has_a_scope` stops iterating `TRIGGERED_RESOURCE_TYPES`, or if `tests/runtime_notify_inventory.rs` stops reading `pg_trigger`. | **closed** |
 | ~~**F53**~~ | ~~**The same defect class F51 closed, one table over and at admin rate rather than request rate: `rag_documents` and `rag_collections` are content, not configuration, and every write to one wipes every replica's cache.**~~ **CLOSED** `fix/f53-f50-silent-degradation` `31a23a2`. **Premise held in full**, and the gating question it was recorded with has one answer for both tables — reached, as instructed, before choosing the fix. **Neither table's configuration is read through any cache the listener clears, and for `rag_collections` the reason is stronger than the entry expected: it carries no runtime configuration at all.** Its columns are `collection_key`, `display_name`, `description`, `status`, `visibility`, `metadata` and the lifecycle fields; the embedding model, dimension, batch size and timeout the entry guessed might live there live in `application_embedding_policies`, keyed by `application_id`, and `find_document_ingestion_context`/`find_collection_ingestion_context` join the collection **only** to reach `application_id`. That policy table is configuration, keeps its trigger and keeps `caches: true`. The three caches make the answer type-level rather than argumentative: `RuntimeConfigCache` is `HashMap<Uuid, ProviderConfig>`, `AuthProviderSettingsCache` is one `Vec<PublicAuthMethod>`, `ProviderRuntimeCache` is keyed by `RuntimeCacheKey` (provider/model/credential/runtime-policy ids and versions) — none can hold either row, and no `RuntimeCacheKey` field derives from either table. Every read of both, including the `visibility`/`status` predicates that carry tenant isolation, goes to PostgreSQL on the spot, so dropping the trigger cannot make an authorization decision stale either. **So both lose the trigger, and both barriers are taken as under F51**: migration `0024` drops them, and `RUNTIME_DATA_RESOURCE_TYPES` gains both names while `TRIGGERED_RESOURCE_TYPES` loses them. **Five mutations, each reverted.** Honouring the plan for `runtime_cache` only and still wiping `runtime_handles`/`auth_settings` reds the new integration guard **on the handles assertion**, which is why it seeds a real `RuntimeModelHandle`. Reverting the classifier for `rag_documents` alone, and separately for `rag_collections` alone, each red only its own leg — **and every unit test stayed green through both**, so the integration guard is the only thing that sees them. Re-attaching the `rag_documents` trigger reds the trigger guard (showing all three of INSERT/UPDATE/DELETE) *and* the `pg_trigger` inventory; then "fixing" the inventory the lazy way — adding the name back to `TRIGGERED_RESOURCE_TYPES` — turns the inventory green and reds `every_triggered_table_has_a_scope` on its `caches` half, so F52's interlock holds for these tables too. **Two corrections to the entry.** Its claim that `docs/runtime-cache-invalidation.md` "does not list either table" was true when written and **false by the time it was committed**: the F51/F52 commit added *"and the RAG collection and document tables"* to that paragraph while making it match `TRIGGERED_RESOURCE_TYPES`. And "its embedding model, its dimensions" describes columns `rag_collections` does not have. *Reversal condition:* if a collection ever acquires configuration a cache holds, re-create its trigger and delete its name from `RUNTIME_DATA_RESOURCE_TYPES` in the same change. | **closed** |
-| **F50** | **A disabled or soft-deleted agent profile silently degrades every execution on its route.** `execution.rs:191` resolves the profile with `get_active_agent_profile`, which filters `status = 'active' and deleted_at is null`. Neither operation clears the route's reference: the FK is `on delete set null` and `soft_delete_agent_profile` only writes `status='deleted', deleted_at=now()`, never a `DELETE`. The lookup returns `Ok(None)` and the match arm treats it identically to "this route has no profile" — **no failure, no `warn!`, no runtime event, no audit row.** Every subsequent request loses its `preamble`, `temperature` and `max_tokens` and reports `succeeded`. A preamble is where guardrails live, so the failure mode is an unguarded model answering production traffic. The agent profile is the **only** runtime reference on this path whose disappearance is silent — an unresolvable route is a `RouteNotFound` failure. **Recorded, not fixed: the fix is a product decision.** Fail-closed is safer but breaks any deployment that disables a profile expecting its routes to keep serving; observable fail-open (`warn!` + runtime event) is cheaper but still serves the unguarded request. **Reversal condition:** decide fail-closed vs observable fail-open; on either decision `documents_current_behaviour_a_disabled_agent_profile_is_silently_ignored` in `tests/agent_profile_wire.rs` is wrong and must be rewritten — it is named `documents_` and not `guards_` because it pins current behaviour and would otherwise hold the defect in place (HANDOFF §3.4). Found by F49's new coverage. **ID allocated against `origin/main` at `779104d`, whose highest was F49.** **→ THE SILENCE IS FIXED; THE PRODUCT DECISION IS STILL OPEN.** See the F50 section below (`fix/f53-f50-silent-degradation` `da8a936`). | **OBSERVABLE — product decision open** |
+| **F50** | **A disabled or soft-deleted agent profile silently degrades every execution on its route.** `execution.rs:191` resolves the profile with `get_active_agent_profile`, which filters `status = 'active' and deleted_at is null`. Neither operation clears the route's reference: the FK is `on delete set null` and `soft_delete_agent_profile` only writes `status='deleted', deleted_at=now()`, never a `DELETE`. The lookup returns `Ok(None)` and the match arm treats it identically to "this route has no profile" — **no failure, no `warn!`, no runtime event, no audit row.** Every subsequent request loses its `preamble`, `temperature` and `max_tokens` and reports `succeeded`. A preamble is where guardrails live, so the failure mode is an unguarded model answering production traffic. The agent profile is the **only** runtime reference on this path whose disappearance is silent — an unresolvable route is a `RouteNotFound` failure. **Recorded, not fixed: the fix is a product decision.** Fail-closed is safer but breaks any deployment that disables a profile expecting its routes to keep serving; observable fail-open (`warn!` + runtime event) is cheaper but still serves the unguarded request. **Reversal condition:** decide fail-closed vs observable fail-open; on either decision `documents_current_behaviour_a_disabled_agent_profile_is_silently_ignored` in `tests/agent_profile_wire.rs` is wrong and must be rewritten — it is named `documents_` and not `guards_` because it pins current behaviour and would otherwise hold the defect in place (HANDOFF §3.4). Found by F49's new coverage. **ID allocated against `origin/main` at `779104d`, whose highest was F49.** **→ CLOSED.** The silence was fixed by `fix/f53-f50-silent-degradation` (`da8a936`); the product decision was taken **fail-closed** by the maintainer on 2026-08-06 (issue #79) and implemented by `feat/agent-profile-fail-closed-79`. `documents_current_behaviour_a_dangling_agent_profile_still_serves_the_request` was replaced by a guard asserting the refusal, exactly as its own reversal condition required, and the four observability guards were untouched by it. See both F50 sections below. | **closed** |
 
 ### F35 — CLOSED: `text.format` is now honoured for `json_schema`, refused for the rest
 
@@ -5759,3 +5759,90 @@ mitigation, and a `3D000` from here on genuinely warrants suspicion rather than 
 **A transitional window exists while other checkouts are still on the old code.** A neighbour
 running the pre-#77 sweep still drops every foreign template on sight. Nothing on this branch can
 prevent that; `clone_template`'s single retry is what covers it until the change is everywhere.
+
+---
+
+## F50 CLOSED — fail-closed, `feat/agent-profile-fail-closed-79`, 2026-08-06
+
+**The product decision F50 was waiting on has been taken by the maintainer: fail-closed.** A route
+naming an agent profile the runtime cannot use refuses the request. Issue #79.
+
+| Finding | Verdict |
+| --- | --- |
+| **F50** | **closed.** The silence was fixed in `8d983aa`; the request is now refused as well. Nothing about the observability changed, which is what splitting it out in the first place was for |
+
+### What shipped
+
+`get_active_agent_profile` is **gone**, not bypassed. It filtered
+`status = 'active' and deleted_at is null` and answered `Ok(None)` for two different conditions, so
+no caller of it could have distinguished them. Its replacement,
+`find_agent_profile_reference`, selects `where id = $1` and nothing else;
+`domain::AgentProfileResolution::classify` is the only thing that interprets the row. That the old
+method no longer exists is deliberate: the cheapest way to un-fix this would have been to call the
+lenient lookup again, and it is not there to call.
+
+Two failure classes, because the two conditions have different remedies:
+
+| Condition | Class | HTTP | Remedy |
+| --- | --- | --- | --- |
+| `status = 'disabled'` | `AgentProfileDisabled` | `409` | re-enable it |
+| no row / `deleted_at` set / `status = 'deleted'` | `AgentProfileNotFound` | `404` | create one and repoint the route |
+
+`404` joins the existing `route_not_found` / `model_not_found` / `credential_not_found` arm — the
+same shape of failure, a reference on the resolution chain that does not resolve, and the caller
+names none of them either. `409` is chosen against three alternatives and the reasons are recorded
+in `failure_http_status`: `404` would deny a row an operator can see on the admin plane, `503`
+would promise that waiting helps, and `502` — where `CredentialDisabled` sits today, via the
+wildcard arm — would blame a provider that was never contacted. `CredentialDisabled` was left
+alone; it is the same wart on a different resource and not this issue's to move.
+
+The refusal happens at the single resolution site in `execute_inner`, **before** model selection,
+credential decryption, the circuit breaker and any attempt row. Both arms inherit it, because they
+diverge after it.
+
+### The test that had to change, and it is the one that said so
+
+`documents_current_behaviour_a_dangling_agent_profile_still_serves_the_request` asserted
+`succeeded`, no failure, and a wire body with no preamble. It carried its own reversal condition —
+*"this case is wrong under the fail-closed answer"* — and it is now replaced by a guard asserting
+the opposite. This is the `documents_`/`guards_` split doing exactly what §3.4 asks of it: the four
+observability guards next to it did **not** go red, because they were deliberately written to
+survive either answer.
+
+`guards_the_streaming_arm_announces_a_dangling_agent_profile_too` also changed, and its comment
+records why: it asserted `"stream": true` on the body that reached the provider, as proof it had
+not silently taken the non-streaming path. Under fail-closed no body reaches the provider at all,
+so that evidence cannot exist. The replacement premise is a control stream that succeeds first —
+without it, "no provider request" is also what a broken fixture produces.
+
+### Mutation answers
+
+Each new case was checked against the cheapest edit that would remove the refusal:
+
+* **Return `None` instead of refusing** (restore the fail-open arm) — all four refusal cases red.
+* **Re-add `and status = 'active'` to the SQL** — the disabled cases go `404` instead of `409`; the
+  `409` case red. This is the mutation the missing/disabled *pair* exists for: with only one of the
+  two statuses guarded, moving the filter back into SQL is invisible.
+* **Classify `Disabled` as `Active`** — the disabled cases serve the request; red at status.
+* **Swap the two classes** — both public cases red, in both directions.
+* **Move the refusal after the provider call** — the provider-request counter assertions red.
+* **Drop the announcement, keep the refusal** — the four F50 observability guards red.
+
+Every refusal case's "nothing was executed against a provider" assertion is paired with a
+*successful* control request on the same fixture that moves the provider's request counter first.
+Without it, "zero provider requests" is satisfied by a fixture that could never have made one, and
+by a Moira that refuses everything.
+
+### Elsewhere
+
+`ExecutionFailureClass::ALL` is 30. The `expected_disposition` table in `orchestration/controls.rs`
+gains both classes as `(false, false, false)` — deployment configuration is identical on the next
+attempt, identical at the next provider, and says nothing about anyone's health. The i18n catalog
+and its `docs/` mirror gain both codes; the `const` gate would not have compiled otherwise.
+`docs/openapi.json` gains two enum values and **no operations**: still 152 / 100 paths / 183
+schemas. `docs/release-notes.md` is new — the maintainer asked for the change to be written into
+release notes, and there was no such file; it carries the SQL an operator runs *before* upgrading
+to find the routes this will start refusing.
+
+No migration. `failure_class` is `varchar(128)` with no check constraint in all four tables that
+hold one.

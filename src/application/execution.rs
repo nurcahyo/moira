@@ -17,13 +17,14 @@ use crate::{
     app::AppState,
     application::RequestContext,
     domain::{
-        AgentProfileRecord, AttemptStatus, AuditLogInsert, AuditResult, CallerRuntimeIdentity,
-        CredentialDecision, DiagnosticExecutionRequest, DiagnosticExecutionResponse, DomainMessage,
-        EffectiveExecutionPolicy, ExecutionCommand, ExecutionFailure, ExecutionFailureClass,
-        ExecutionOutcome, ExecutionStatus, ExecutionStreamHandle, ModelCandidate, ModelDecision,
-        ModelSelectionReason, ProviderAttemptSummary, ProviderRuntimePolicyRecord, ProviderType,
-        ResolvedCredential, ResolvedProviderConfiguration, RouteDecision, RouteSelectionReason,
-        RuntimeEventEnvelope, RuntimeEventType, UsageSummary,
+        AgentProfileRecord, AgentProfileResolution, AttemptStatus, AuditLogInsert, AuditResult,
+        CallerRuntimeIdentity, CredentialDecision, DiagnosticExecutionRequest,
+        DiagnosticExecutionResponse, DomainMessage, EffectiveExecutionPolicy, ExecutionCommand,
+        ExecutionFailure, ExecutionFailureClass, ExecutionOutcome, ExecutionStatus,
+        ExecutionStreamHandle, ModelCandidate, ModelDecision, ModelSelectionReason,
+        ProviderAttemptSummary, ProviderRuntimePolicyRecord, ProviderType, ResolvedCredential,
+        ResolvedProviderConfiguration, RouteDecision, RouteSelectionReason, RuntimeEventEnvelope,
+        RuntimeEventType, UsageSummary,
     },
     error::AppError,
     infra::{
@@ -188,14 +189,43 @@ impl MoiraExecutionService {
         )
         .await?;
 
+        // F50, decided fail-closed on issue #79. A route that names an agent profile the
+        // runtime cannot use is refused here, before any provider is chosen, any credential is
+        // decrypted and any attempt row is written — see `agent_profile_failure` for the
+        // reasoning and for why the two answers carry different codes.
         let agent_profile = match route.agent_profile_id {
             Some(id) => {
-                let resolved = self.runtime_repo.get_active_agent_profile(id).await?;
-                if resolved.is_none() {
-                    self.announce_dangling_agent_profile(&command, &route, id, events)
+                let resolution = AgentProfileResolution::classify(
+                    self.runtime_repo.find_agent_profile_reference(id).await?,
+                );
+                match resolution {
+                    AgentProfileResolution::Active(profile) => Some(*profile),
+                    unusable => {
+                        let failure = agent_profile_failure(&route, id, &unusable);
+                        self.announce_dangling_agent_profile(
+                            &command, &route, id, &unusable, events,
+                        )
                         .await?;
+                        self.audit_execution(
+                            &command,
+                            "execution.failed",
+                            AuditResult::Failed,
+                            &failure,
+                        )
+                        .await?;
+                        events.push(
+                            RuntimeEventType::ExecutionFailed,
+                            json!({ "failure_class": failure.class }),
+                        );
+                        return Ok(failed_outcome(
+                            command,
+                            Some(route),
+                            None,
+                            attempts,
+                            failure,
+                        ));
+                    }
                 }
-                resolved
             }
             None => None,
         };
@@ -1226,38 +1256,30 @@ impl MoiraExecutionService {
 
     /// F50 — the route names an agent profile that no longer resolves.
     ///
-    /// # What this does and, just as deliberately, what it does not
+    /// # What this does, and what now happens after it
     ///
-    /// `get_active_agent_profile` filters `status = 'active' and deleted_at is null`.
-    /// Disabling a profile or soft-deleting it leaves `route_definitions.agent_profile_id`
+    /// [`AgentProfileResolution::classify`] reads the row without a `status`/`deleted_at`
+    /// filter. Disabling a profile or soft-deleting it leaves `route_definitions.agent_profile_id`
     /// pointing at the row — the FK is `on delete set null` and `soft_delete_agent_profile`
-    /// only writes `status = 'deleted', deleted_at = now()`, never a `DELETE` — so the
-    /// lookup returns `Ok(None)` and the caller's request proceeds without the profile's
-    /// `preamble`, `temperature` and `max_tokens`, reporting `succeeded`. A preamble is
-    /// where guardrails live, so the failure mode is an unguarded model answering
-    /// production traffic.
+    /// only writes `status = 'deleted', deleted_at = now()`, never a `DELETE` — so the route
+    /// keeps naming a profile the runtime will not use. Before the observability shipped there
+    /// was **no failure, no `warn!`, no runtime event and no audit row**: the request simply
+    /// proceeded without the profile's `preamble`, `temperature` and `max_tokens` and reported
+    /// `succeeded`. A preamble is where guardrails live, so the failure mode was an unguarded
+    /// model answering production traffic.
     ///
-    /// Until this function existed there was **no failure, no `warn!`, no runtime event and
-    /// no audit row** — the agent profile was the only runtime reference on this path whose
-    /// disappearance was silent, where an unresolvable *route* is a `RouteNotFound` failure.
-    ///
-    /// **The request's behaviour is unchanged.** Whether Moira should also *refuse* is a
-    /// product decision that has not been taken: fail-closed is safer but breaks any
-    /// deployment that disables a profile expecting its routes to keep serving, and
-    /// observable fail-open still serves the unguarded request. Silence, however, is a
-    /// defect under *either* answer — both require the operator to be told, and they differ
-    /// only in whether the request is also refused. So the observability is not half of one
-    /// option; it is the part both options share, and it ships first.
-    ///
-    /// *Reversal condition:* when that decision is taken this becomes "observe and refuse"
-    /// or stays as it is. The observability itself is not revisited.
+    /// **Issue #79 decided that fail-closed, so the caller is now also refused** — see
+    /// [`agent_profile_failure`]. This function is unchanged in purpose: it is the *operator's*
+    /// half, and it still runs on the refusal path because the caller's error is neither durable
+    /// nor allowed to name the route's internals.
     ///
     /// # It cannot fire for a route that has no profile
     ///
     /// Called only from the `Some(id)` arm above, so "this route was never given a profile"
     /// — the normal case, and the one every fixture in the tree exercises — stays exactly as
-    /// silent as it was. The two are distinguishable because `route.agent_profile_id` is the
-    /// thing that differs, and it is read before the lookup rather than inferred from it.
+    /// silent as it was, and keeps executing. The two are distinguishable because
+    /// `route.agent_profile_id` is the thing that differs, and it is read before the lookup
+    /// rather than inferred from it.
     ///
     /// # Three signals, because they have three different consumers
     ///
@@ -1266,24 +1288,33 @@ impl MoiraExecutionService {
     /// deliberately *not* mapped onto the public SSE contract, see `map_runtime_event`. The
     /// audit row is the durable one: it survives log rotation and is queryable by
     /// `resource_id = execution_id` alongside `execution.started`.
+    ///
+    /// All three carry `reason`, which is the same distinction the caller's error code makes:
+    /// an operator reading `agent_profile.unavailable` and a caller reading
+    /// `agent_profile_disabled` must be looking at the same fact.
     async fn announce_dangling_agent_profile(
         &self,
         command: &ExecutionCommand,
         route: &RouteDecision,
         agent_profile_id: Uuid,
+        resolution: &AgentProfileResolution,
         events: &mut EventCollector,
     ) -> Result<(), AppError> {
+        let reason = agent_profile_reason(resolution);
         warn!(
             execution_id = %command.execution_id,
             request_id = %command.request_id,
             route_id = %route.route_id,
             route_key = %route.route_key,
             %agent_profile_id,
-            "route references an agent profile that is disabled or deleted; the execution \
-             proceeds without its preamble, temperature and max_tokens"
+            reason,
+            "route references an agent profile that is disabled or deleted; the execution is \
+             refused"
         );
         let detail = json!({
             "agent_profile_id": agent_profile_id,
+            "agent_profile_key": agent_profile_key(resolution),
+            "reason": reason,
             "route_id": route.route_id,
             "route_key": route.route_key,
         });
@@ -2148,6 +2179,82 @@ fn failed_outcome(
         model,
         attempts,
         failure: Some(failure),
+    }
+}
+
+/// The refusal a route with an unusable agent profile produces — F50, decided fail-closed on
+/// issue #79.
+///
+/// # Why two classes and not one
+///
+/// "The operator switched this profile off" and "no live row has this id" are different
+/// conditions with different remedies — re-enable versus re-create — and a single
+/// `agent_profile_unavailable` code would force whoever received it to go and look. They also get
+/// different HTTP statuses (`404` and `409`, see `failure_http_status`), so a client can branch
+/// on the status alone without parsing anything.
+///
+/// # What the message must contain
+///
+/// The id, always: it is the value written in `route_definitions.agent_profile_id` and the one
+/// thing that identifies the profile when the row is gone. The `profile_key` too whenever a row
+/// exists, because that is what an operator recognises in the console. And the route key, because
+/// the caller named a route, not a profile — without it the error names something the caller has
+/// never heard of. **The point of this text is that whoever receives it can fix the deployment
+/// without being given access to the server's logs.** None of it is a secret: these are
+/// configuration identifiers already visible on the admin plane, and the profile's `preamble` —
+/// the one field that could carry sensitive prompt content — is deliberately not here.
+fn agent_profile_failure(
+    route: &RouteDecision,
+    agent_profile_id: Uuid,
+    resolution: &AgentProfileResolution,
+) -> ExecutionFailure {
+    match resolution {
+        // Not constructible: the caller only reaches this for a non-`Active` resolution. Kept as
+        // a real arm rather than an `unreachable!` so a future reshuffle degrades into the safe
+        // answer — refusing an active profile is a visible bug, serving an unusable one is not.
+        AgentProfileResolution::Active(profile) => ExecutionFailure::new(
+            ExecutionFailureClass::AgentProfileNotFound,
+            format!(
+                "route '{}' resolved agent profile '{}' ({agent_profile_id}) but the execution \
+                 refused it; this is a bug in Moira, not in your configuration",
+                route.route_key, profile.profile_key
+            ),
+        ),
+        AgentProfileResolution::Disabled(profile) => ExecutionFailure::new(
+            ExecutionFailureClass::AgentProfileDisabled,
+            format!(
+                "route '{}' requires agent profile '{}' ({agent_profile_id}), which is disabled; \
+                 re-enable that profile or point the route at an active one",
+                route.route_key, profile.profile_key
+            ),
+        ),
+        AgentProfileResolution::Missing => ExecutionFailure::new(
+            ExecutionFailureClass::AgentProfileNotFound,
+            format!(
+                "route '{}' requires agent profile {agent_profile_id}, which no longer exists; \
+                 create the profile or point the route at an existing one",
+                route.route_key
+            ),
+        ),
+    }
+}
+
+/// The `reason` the operator-side signals carry, matching the caller's error code.
+fn agent_profile_reason(resolution: &AgentProfileResolution) -> &'static str {
+    match resolution {
+        AgentProfileResolution::Active(_) => "active",
+        AgentProfileResolution::Disabled(_) => "disabled",
+        AgentProfileResolution::Missing => "missing",
+    }
+}
+
+/// The profile's key when a row still exists, so the operator signal names what the console shows.
+fn agent_profile_key(resolution: &AgentProfileResolution) -> Option<&str> {
+    match resolution {
+        AgentProfileResolution::Active(profile) | AgentProfileResolution::Disabled(profile) => {
+            Some(profile.profile_key.as_str())
+        }
+        AgentProfileResolution::Missing => None,
     }
 }
 

@@ -2715,6 +2715,8 @@
           "application_unavailable",
           "route_not_found",
           "route_forbidden",
+          "agent_profile_not_found",
+          "agent_profile_disabled",
           "model_not_found",
           "model_forbidden",
           "model_capability_mismatch",

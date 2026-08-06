@@ -154,6 +154,52 @@ pub struct AgentProfileRecord {
     pub version: i64,
 }
 
+/// What a route's `agent_profile_id` actually resolves to — F50, fail-closed (issue #79).
+///
+/// The lookup behind this deliberately does **not** filter on `status` or `deleted_at`, because
+/// the three answers below have three different remedies and a filtered query collapses two of
+/// them into `None`:
+///
+/// * [`Self::Active`] — use it.
+/// * [`Self::Disabled`] — the row is there and the operator switched it off. Remedy: re-enable it
+///   (`POST /api/v1/admin/agent-profiles/{id}/enable`) or point the route at another profile.
+/// * [`Self::Missing`] — no live row has that id, either because it was soft-deleted
+///   (`status = 'deleted'`, `deleted_at` set) or because nothing was ever there. Re-enabling is
+///   not available: every admin write filters `deleted_at is null`, so `GET
+///   /api/v1/admin/agent-profiles/{id}` answers `404` for exactly this state. Remedy: create a
+///   profile and repoint the route.
+///
+/// Keeping the distinction is the whole point of this type. Moira's answer to the caller must
+/// agree with what the admin plane says about the same id, and "switched off" versus "gone" is
+/// the difference between a one-field fix and a re-creation.
+#[derive(Debug, Clone)]
+pub enum AgentProfileResolution {
+    Active(Box<AgentProfileRecord>),
+    Disabled(Box<AgentProfileRecord>),
+    Missing,
+}
+
+impl AgentProfileResolution {
+    /// Classifies the unfiltered row a route's `agent_profile_id` names.
+    ///
+    /// A pure function on purpose: it is the one place that decides which of the two refusals a
+    /// caller gets, and it is unit-testable without a database. `deleted_at` is checked
+    /// independently of `status` rather than trusting the two to agree — `soft_delete_agent_profile`
+    /// writes both, but a row that carries only one of them is still gone, and the safe reading of
+    /// a half-written row is the one that does not serve traffic.
+    pub fn classify(row: Option<AgentProfileRecord>) -> Self {
+        match row {
+            None => Self::Missing,
+            Some(record) if record.deleted_at.is_some() => Self::Missing,
+            Some(record) => match record.status {
+                ResourceStatus::Active => Self::Active(Box::new(record)),
+                ResourceStatus::Disabled => Self::Disabled(Box::new(record)),
+                ResourceStatus::Deleted => Self::Missing,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentProfileCreateRequest {
@@ -446,6 +492,10 @@ pub enum ExecutionFailureClass {
     ApplicationUnavailable,
     RouteNotFound,
     RouteForbidden,
+    /// F50 / issue #79 — the selected route names an agent profile with no live row.
+    AgentProfileNotFound,
+    /// F50 / issue #79 — the selected route names an agent profile the operator disabled.
+    AgentProfileDisabled,
     ModelNotFound,
     ModelForbidden,
     ModelCapabilityMismatch,
@@ -485,11 +535,13 @@ impl ExecutionFailureClass {
     /// has a code; being listed here means it then fails the catalog test until it has a string.
     /// **Add new variants to this array** — a variant omitted here is invisible to the gate, which
     /// is the one way this can still rot.
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 30] = [
         Self::InvalidExecutionRequest,
         Self::ApplicationUnavailable,
         Self::RouteNotFound,
         Self::RouteForbidden,
+        Self::AgentProfileNotFound,
+        Self::AgentProfileDisabled,
         Self::ModelNotFound,
         Self::ModelForbidden,
         Self::ModelCapabilityMismatch,
@@ -527,6 +579,8 @@ impl ExecutionFailureClass {
             Self::ApplicationUnavailable => "application_unavailable",
             Self::RouteNotFound => "route_not_found",
             Self::RouteForbidden => "route_forbidden",
+            Self::AgentProfileNotFound => "agent_profile_not_found",
+            Self::AgentProfileDisabled => "agent_profile_disabled",
             Self::ModelNotFound => "model_not_found",
             Self::ModelForbidden => "model_forbidden",
             Self::ModelCapabilityMismatch => "model_capability_mismatch",
@@ -605,19 +659,21 @@ pub enum RuntimeEventType {
     /// F50 — the selected route names an agent profile that no longer resolves.
     ///
     /// Emitted when `route_definitions.agent_profile_id` is `Some` and
-    /// `get_active_agent_profile` returns `None`, which happens whenever the profile has
-    /// been disabled or soft-deleted: neither operation clears the route's reference (the
-    /// FK is `on delete set null` and `soft_delete_agent_profile` never issues a `DELETE`),
-    /// so the route keeps pointing at a row the runtime will not use.
+    /// [`AgentProfileResolution::classify`] answers anything other than `Active`, which happens
+    /// whenever the profile has been disabled or soft-deleted: neither operation clears the
+    /// route's reference (the FK is `on delete set null` and `soft_delete_agent_profile` never
+    /// issues a `DELETE`), so the route keeps pointing at a row the runtime will not use.
     ///
     /// **It is not emitted for a route that simply has no profile.** That is the normal
     /// case and stays silent; the two are distinguishable at the call site because
     /// `agent_profile_id` is `None` in the first and `Some(id)` in the second.
     ///
-    /// The execution continues — see `src/application/execution.rs` for why observability
-    /// shipped ahead of the fail-closed/fail-open decision — so this event is the operator's
-    /// only structured notice that every request on the route is running without the
-    /// profile's `preamble`, `temperature` and `max_tokens`.
+    /// **Since issue #79 the execution is also refused.** The payload's `reason` says which
+    /// refusal the caller got — `"missing"` for [`ExecutionFailureClass::AgentProfileNotFound`],
+    /// `"disabled"` for [`ExecutionFailureClass::AgentProfileDisabled`] — so the operator signal
+    /// and the caller's error name the same condition. The event still exists because the
+    /// caller's error is not durable and does not carry the route: this one is written to the
+    /// audit log and returned by `POST /api/v1/admin/runtime/diagnose`.
     AgentProfileUnavailable,
     ModelSelected,
     ProviderAttemptStarted,
@@ -745,5 +801,80 @@ mod tests {
         let debug = format!("{credential:?}");
         assert!(!debug.contains("sk-test-secret"));
         assert!(debug.contains("<redacted>"));
+    }
+
+    fn agent_profile_row(status: ResourceStatus, deleted: bool) -> AgentProfileRecord {
+        let now = Utc::now();
+        AgentProfileRecord {
+            id: Uuid::now_v7(),
+            profile_key: "support".to_string(),
+            display_name: "Support".to_string(),
+            preamble: Some("never quote a price".to_string()),
+            temperature: None,
+            max_tokens: None,
+            tool_policy: Value::Null,
+            context_policy: Value::Null,
+            memory_policy: Value::Null,
+            status,
+            metadata: Value::Null,
+            created_at: now,
+            updated_at: now,
+            deleted_at: deleted.then_some(now),
+            version: 1,
+        }
+    }
+
+    /// Issue #79 — the classification the two refusals are derived from, including the row
+    /// shapes no end-to-end test can produce.
+    ///
+    /// The 404/409 split is pinned end to end in `tests/agent_profile_wire.rs`, but only for the
+    /// two states the admin plane can actually write. The `deleted_at`-without-`Deleted`-status
+    /// row is the one this adds: it is unreachable through `RuntimeAdminService`, which writes
+    /// both fields together, and it exists here because "the two always agree" is an assumption
+    /// about a `UPDATE`, not an invariant the database enforces. A row carrying only `deleted_at`
+    /// must still be treated as gone — the safe reading of a half-written row is the one that
+    /// does not serve traffic.
+    #[test]
+    fn agent_profile_resolution_separates_a_disabled_profile_from_a_missing_one() {
+        assert!(matches!(
+            AgentProfileResolution::classify(Some(agent_profile_row(
+                ResourceStatus::Active,
+                false
+            ))),
+            AgentProfileResolution::Active(_)
+        ));
+        assert!(
+            matches!(
+                AgentProfileResolution::classify(Some(agent_profile_row(
+                    ResourceStatus::Disabled,
+                    false
+                ))),
+                AgentProfileResolution::Disabled(_)
+            ),
+            "a disabled profile must stay distinguishable from a deleted one: the remedy is to \
+             re-enable it, and the caller is told so by agent_profile_disabled / 409"
+        );
+        assert!(matches!(
+            AgentProfileResolution::classify(Some(agent_profile_row(
+                ResourceStatus::Deleted,
+                true
+            ))),
+            AgentProfileResolution::Missing
+        ));
+        assert!(
+            matches!(
+                AgentProfileResolution::classify(Some(agent_profile_row(
+                    ResourceStatus::Active,
+                    true
+                ))),
+                AgentProfileResolution::Missing
+            ),
+            "a row with deleted_at set is gone whatever its status column says; reading the two \
+             fields independently is the point"
+        );
+        assert!(matches!(
+            AgentProfileResolution::classify(None),
+            AgentProfileResolution::Missing
+        ));
     }
 }
