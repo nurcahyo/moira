@@ -2372,9 +2372,12 @@ of the execution API receives, which deserves its own change and its own tests.
 **The fail-hard variant F29 chose *not* to adopt has its own three preconditions, and all three now
 hold** — F39 landed; `StructuredOutputInvalid` has a recorded, guarded disposition (in none of
 `is_retryable`, `is_fallback_eligible`, `is_circuit_failure`); and `run_extraction` reads
-`execution.status`. The last two landed on `fix/f30-consent-columns` (2026-08-03). **The flip is
-still deliberately unshipped**; see "F30 CLOSED (partly refuted) · F29's last two preconditions
-LANDED" below and the doc comment on `structured_output_from_text`.
+`execution.status`. The last two landed on `fix/f30-consent-columns` (2026-08-03). ~~**The flip is
+still deliberately unshipped**~~ **→ SHIPPED.** The maintainer took the decision on 2026-08-06
+(issue #80): a reply that is not JSON is a **422**, not a silent `None`. Implemented by
+`feat/structured-output-fail-hard-80`; see the section at the end of this file, the doc comment on
+`structured_output_from_text`, and "F30 CLOSED (partly refuted) · F29's last two preconditions
+LANDED" below for the preconditions.
 
 ### F30 — there are TWO memory-consent columns, and nothing makes them agree — **CLOSED, premise partly REFUTED**, see "F30 CLOSED (partly refuted)" below
 
@@ -5846,3 +5849,140 @@ to find the routes this will start refusing.
 
 No migration. `failure_class` is `varchar(128)` with no check constraint in all four tables that
 hold one.
+
+---
+
+## F29's FAIL-HARD FLIP SHIPPED — issue #80, `feat/structured-output-fail-hard-80`, 2026-08-06
+
+The one thing F29 deliberately left undone is done. A schema-carrying request whose reply is not
+JSON now fails the execution with `structured_output_invalid` — **422** to a public caller —
+instead of returning `200` with `structured_output: null` and the model's prose.
+
+**No feature flag, and the reason is in this tree rather than in principle.** The maintainer
+rejected a staged flag explicitly. On the same day, `idempotency.accept_legacy_hashes` — a
+pre-existing switch with an operational procedure written out over sixteen lines of doc comment —
+was confirmed **never to have been wired**: nothing outside the tests calls
+`AdminCommandRunner::accepting_legacy_hashes`, so no production runner can close that window
+(issue #125). A flag is not free safety; it is a second code path plus a chance to be silently
+inert.
+
+**The decision was the work; the code is nine lines.** `structured_output_from_text` returns
+`Result<Option<Value>, ExecutionFailure>` instead of `Option<Value>`, and its two call sites — one
+per run path — gained a `?`. Everything else in the diff is the argument, the guards and the
+consequences.
+
+### What the flip is actually about, which is not "strictness"
+
+The old behaviour did not merely under-report. `structured_output: null` on a `succeeded` outcome
+is **byte-for-byte the document a model that legitimately answered "nothing" produces**, so the two
+were indistinguishable, and the cheap reading — treat `null` as empty — is wrong every time.
+
+**On the public plane it was worse than that.** `PublicResponse` carries no structured-output field
+at all — which is why `tests/structured_output.rs` drives the diagnostic endpoint — so a caller who
+asked for a schema and got prose received `200 completed` with **no signal whatsoever**: the null
+field they could at least have noticed does not exist on their surface. After the flip a failure is
+a `422` and a `200` can only be an answer.
+
+**The boundary, stated because it is the part a reader will get wrong.** Moira **parses JSON**
+here; it does **not** validate against the schema — there is no validator in the tree, and
+enforcement is the provider's under the `strict: true` every schema-carrying request is sent with.
+So a reply that is valid JSON and violates the caller's schema still succeeds, exactly as before,
+and `null`, `{}` and `[]` all parse and are answers. Only bytes that are not a JSON document at all
+fail. The failure message says "not JSON", which is what was measured, rather than "does not
+conform", which was not. `a_schema_carrying_reply_that_is_not_json_is_a_failure_rather_than_a_none`
+asserts both halves in one test.
+
+**One residual ambiguity, and it is why the flip helps rather than an argument against it.**
+`Some(Value::Null)` and `None` serialise identically, so a model answering the JSON literal `null`
+still looks like a request that carried no schema. What changed is that neither can any longer be a
+failure.
+
+### Where the failure is raised, and what that costs
+
+In the two run functions, so it lands on the attempt loop's `Ok(Err(failure))` arm. **Known cost,
+recorded rather than discovered later:** that arm records the attempt with
+`UsageSummary::default()` and writes no `usage_records` row, so the tokens the provider spent on a
+non-conforming reply are not counted — the same treatment every other unusable-reply failure gets
+(`ProviderInvalidResponse`, and any mid-stream failure after a `UsageUpdated` chunk). It is the
+opposite trade from F38, which retained usage on a failure *after* terminal persistence. *Reversal
+condition:* if `usage_records` under-counting on this class ever becomes material to billing, the
+failure has to move into the success arm — after `insert_usage_record`, before
+`audit_execution_success` — rather than being raised from the run function.
+
+**The streaming path fails after the caller has already received the deltas.** Deliberate: the
+deltas were text and the caller asked for a value. No clamp was needed, because the class is
+already neither retryable nor fallback-eligible.
+
+### The disposition was re-read with three emitters in view, and did not move
+
+`StructuredOutputInvalid` stays out of all three of `is_retryable`, `is_fallback_eligible` and
+`is_circuit_failure`. The reasons were written when the third emitter was hypothetical and hold
+now that it is real: a zero-temperature resample is the same reply; F39 moved the capability
+question to routing, so another provider is a different answerer rather than a fix; and a
+request-shaped failure must never open a breaker that refuses traffic for every other tenant on
+that provider. The tests assert it as **behaviour** — "the provider was called exactly once" — and
+not only as membership.
+
+### The interlock worked, and then turned out to be one-directional in a second way
+
+F42's guard exists so that a new emitter forces the catalog description to be re-read. It did:
+`structured_output_invalid_has_only_the_two_emitters_its_catalog_entry_describes` is now
+`..._three_emitters_...`, and the description says two emitters are about the caller's schema and
+one about the model's reply.
+
+**But it would have stayed green through this change.** It collected a *set of files*, and the new
+emitter landed in `src/application/execution.rs`, which was already in that set. HANDOFF §3.4's
+shape again, one layer in: the guard was bidirectional on files and blind on sites. It now counts
+emitters **per file** — `{public.rs: 1, execution.rs: 2}` — and a fourth emitter next to an
+existing one reds it. Verified by adding one and watching it fail, not by reading.
+
+### Two behaviours changed that a test had pinned, both stated rather than quiet
+
+* **`a_reply_that_is_not_json_leaves_the_field_null_and_still_succeeds` and its streaming twin are
+  replaced** by `a_reply_that_is_not_json_fails_the_execution_with_structured_output_invalid` and
+  `a_stream_whose_reply_is_not_json_fails_the_execution_with_structured_output_invalid`. Both old
+  cases carried failure messages naming this change as the thing that would make them wrong, and
+  both were correct for F29.
+* **`compat_text_format_strict_false_is_refused_over_http` changed its provider script** from
+  `"must-not-be-reached"` prose to a conforming document. Its *control* request — the one proving
+  the fixture can answer at all — carries a schema, so a prose reply now 422s on the
+  structured-output contract instead of returning `200`. No assertion changed; the refused request
+  is still proven not to reach the provider by `call_count() == 0`, which is what carried that
+  meaning all along.
+
+### A new case for the thing the decision is actually about
+
+The three diagnose-driven cases can show that the execution failed; they cannot show the status
+code. `a_public_caller_receives_422_rather_than_a_null_structured_output` drives
+`POST /api/v1/responses` and asserts `422`, the code, the `message_key`, that the provider's reply
+appears **nowhere** in the response bytes, and one provider call — with a conforming control on the
+same fixture, because "422 with this code" is also what a *schema* rejection produces and a fixture
+that could not route a schema at all would fail the same way.
+
+**Mutations checked, each reverted.** Reverting the completion arm alone reds the completion case
+and the public case and leaves the streaming case green; reverting the streaming arm alone reds
+only the streaming case — which is why the streaming twin exists. Adding a fourth emitter to a file
+already in the emitter set reds the strengthened i18n guard, and would not have red the previous
+one.
+
+### The consequence inside Moira, recorded because it is invisible from outside
+
+Memory extraction sends its own schema, so `memory_extraction::strip_code_fence` — the tolerance
+for a model that wraps its JSON in a fence — **is no longer reachable from an execution**: a fenced
+reply now fails before `parse_candidates` is asked. The run row says `structured_output_invalid`
+either way (F29's third precondition, doing exactly what it was for), the caller's response is
+untouched, and no memory is written in either case; the visible difference is that a fenced reply
+used to be accepted. The tolerance is left in place and the parse is left **strict**, because what
+counts as a parse is not what was decided. *Reversal condition:* if fenced replies are measured
+from schema-receiving backends, move the fence tolerance to `structured_output_from_text` — the one
+parse site — and do not add a second one.
+
+### Elsewhere
+
+No new error code, so no new catalog key: `structured_output_invalid` was already declared,
+already mapped to `422` by `failure_http_status`, and already reachable. Its `description` and
+`default_message` are widened on **both** sides of the mirror (`src/i18n/catalog/errors.rs`,
+`docs/i18n-response-catalog.json`) — the old `default_message` said "The structured output schema
+is invalid", which is now wrong for one emitter in three. **`docs/openapi.json` is byte-identical**:
+152 operations, 100 paths, 183 schemas. No migration. `docs/release-notes.md` carries the operator
+entry with the SQL that finds the self-hosted backends this exposes.

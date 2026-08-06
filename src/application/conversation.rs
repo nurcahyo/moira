@@ -225,8 +225,8 @@ fn failed_extraction(failure_class: &'static str) -> MemoryExtractionRunOutcome 
 /// `run_extraction` used to answer this question with the constant
 /// [`FAILURE_EXTRACTION_CALL_FAILED`], which made every failed execution look the same on
 /// `memory_extraction_runs.failure_class`: a route that resolves to nothing, a provider returning
-/// 500, and — once the structured-output fail-hard variant ships — a model that did not comply
-/// were all recorded as *"the call did not happen"*. Recording the execution's own class instead
+/// 500, and — since the structured-output fail-hard flip shipped (issue #80) — a model that did
+/// not comply were all recorded as *"the call did not happen"*. Recording the execution's own class instead
 /// keeps the distinction the run row exists to make, and gives
 /// [`FAILURE_EXTRACTION_CALL_FAILED`] back its literal meaning: it is now written **only** when
 /// there was no execution to ask — no pool, no service, or `execute` itself returned `Err`.
@@ -234,16 +234,19 @@ fn failed_extraction(failure_class: &'static str) -> MemoryExtractionRunOutcome 
 /// **Why the general form rather than one arm for `StructuredOutputInvalid`.** A special case for
 /// that one class would be code no test in this tree can reach: extraction builds its own schema
 /// from [`extraction_output_schema`], which is always readable, and never crosses
-/// `validate_response_format`, so neither of the class's two live emitters is on this path. An
-/// arm that cannot be executed is not a guard, it is a promise. Recording whatever the execution
-/// reports is reachable today — `a_failed_extraction_call_leaves_the_response_untouched` drives a
-/// real provider 500 through it — and it produces the right answer for the fail-hard variant
-/// without a second edit.
+/// `validate_response_format`, so neither of the class's two *request* emitters is on this path.
+/// An arm that cannot be executed is not a guard, it is a promise. Recording whatever the
+/// execution reports is reachable — `a_failed_extraction_call_leaves_the_response_untouched`
+/// drives a real provider 500 through it — and it produced the right answer for the fail-hard
+/// flip without a second edit, which is what happened: issue #80 added the class's third emitter
+/// and this function needed no change.
 ///
-/// **The consequence worth stating: the flip becomes invisible here.** A non-conforming reply is
-/// recorded as `structured_output_invalid` today, by `parse_candidates` refusing prose. Under the
-/// fail-hard variant the same string arrives from the execution instead. The run row says the
-/// same thing before and after, which is exactly what F29's doc comment was worried about losing.
+/// **The consequence worth stating: the flip is invisible here, and that was the point.** A
+/// non-conforming reply was recorded as `structured_output_invalid` before the flip, by
+/// `parse_candidates` refusing prose. Since the flip the same string arrives from the execution
+/// instead — the reply never reaches `parse_candidates`, because the execution failed. The run
+/// row says the same thing before and after, which is exactly what F29's doc comment was worried
+/// about losing.
 ///
 /// # This does **not** re-open F38
 ///
@@ -1402,8 +1405,12 @@ impl ConversationService {
         };
         // `structured_output` is populated by the execution kernel since F29
         // (`structured_output_from_text`, gated on the request carrying an `output_schema`),
-        // which this call does. It falls back to `output_text` for a reply that is not valid
-        // JSON, which F29 deliberately does not fail hard on.
+        // which this call does. **Since issue #80 a reply that is not JSON fails the execution
+        // instead of arriving here as `None`**, so on this path the `.or(output_text)` fallback
+        // is reached only when there is no reply at all: extraction always sends a schema, so a
+        // successful execution always carries a parsed value. What that costs is recorded at
+        // `structured_output_from_text` — `parse_candidates`' ```json fence tolerance is no
+        // longer reachable from an execution.
         //
         // **Whether to proceed is still inferred from these two fields rather than from
         // `execution.status`** (finding F38's second reversal condition; the other site is
