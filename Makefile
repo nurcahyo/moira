@@ -42,7 +42,7 @@ PROMPT ?= Hello
 ROUTE ?= general
 
 .PHONY: help setup start env env-force env-rotate up down reset logs ps psql redis \
-        build migrate run serve release bootstrap-key seed smoke execute-test health openapi docs \
+        build migrate run serve release bootstrap-key seed test-seed-local smoke execute-test health openapi docs \
         console-install console-db console-dev console-build console-start console-check \
         fmt fmt-check clippy test gates gates-fast check doctor clean
 
@@ -142,6 +142,9 @@ seed: ## Register a provider/model/credential/policy so a prompt has somewhere t
 	@# nothing else, so `POST /api/v1/responses` answers 404 credential_not_found
 	@# until this has run. Override the target with MOIRA_SEED_BASE_URL / _MODEL.
 	$(ENV) scripts/seed-local.sh
+
+test-seed-local: ## Unit-test scripts/seed-local.sh's pure logic — no server, no database
+	python3 -m unittest discover -s scripts -p 'seed_local_lib_test.py' -v
 
 smoke: ## End-to-end check: health, contract, and a real completion with real tokens
 	$(ENV) scripts/smoke.sh

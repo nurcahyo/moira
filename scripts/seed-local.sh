@@ -13,7 +13,10 @@
 #         own authorisation. Omit it and default routing picks the same route.
 #
 # This script creates: provider -> provider_model -> credential -> routing_policy,
-# all bound to the `general` route. Re-running reuses whatever already matches.
+# all bound to the `general` route. Re-running reuses a row only when it already
+# matches what you asked for this run: a provider whose base_url has drifted from
+# MOIRA_SEED_BASE_URL, or a routing policy whose provider_model_id has drifted from
+# the model this run resolved, is PATCHed back into agreement instead of left alone.
 #
 # Configuration (all optional):
 #   MOIRA_SEED_BASE_URL   OpenAI-compatible base, default http://127.0.0.1:8000/v1
@@ -25,7 +28,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-BASE_URL="${MOIRA_SEED_BASE_URL:-http://127.0.0.1:8000/v1}"
+# Normalised the same way the server stores it
+# (`value.trim().trim_end_matches('/')` in validate_provider_base_url,
+# src/application/admin/shared.rs). Comparing the raw env value against what
+# GET returns would never converge to `reuse` for a URL differing only by
+# whitespace or a trailing slash — it would PATCH every run instead.
+BASE_URL=$(python3 scripts/seed_local_lib.py normalize-base-url \
+    "${MOIRA_SEED_BASE_URL:-http://127.0.0.1:8000/v1}")
 NAME="${MOIRA_SEED_NAME:-Local OpenAI-compatible}"
 PORT="${MOIRA_SERVER__PORT:-8080}"
 HOST="${MOIRA_SERVER__HOST:-127.0.0.1}"
@@ -125,7 +134,17 @@ fi
 # itself is still *served* by the new endpoint is exactly what step 2 already
 # checks — MOIRA_SEED_MODEL unset re-discovers against the current $BASE_URL
 # every run, and a pinned MOIRA_SEED_MODEL is trusted the same way it always
-# was. No extra handling needed here.
+# was.
+#
+# That does NOT make a base_url change safe end to end. A routing policy
+# (step 5) is matched on (route_id, provider_id) ALONE and pins its own
+# provider_model_id — execution resolves the model from THAT column, joining
+# `provider_models pm on pm.id = rp.provider_model_id` alongside `p.base_url`
+# (src/infra/repositories/runtime.rs). A policy created before this run can
+# still point at the OLD model_key while the provider row above now points
+# at the NEW endpoint, and nothing here would notice: step 1 prints `update`,
+# step 2 resolves the right provider_model row, and step 5 would `reuse` the
+# stale policy unless it checks for exactly this. It does — see step 5 below.
 step "2. provider model  ($MODEL)"
 MODEL_ID=$(curl -fsS "${H[@]}" "$B/api/v1/admin/providers/$PROVIDER_ID/models?$PAGE" | find_by model_key "$MODEL")
 if [ -n "$MODEL_ID" ]; then
@@ -169,24 +188,26 @@ fi
 printf '   %s\n' "$ROUTE_ID"
 
 step "5. routing policy"
-# Two fields, so `find_by` does not fit — but the truncation rule is the same one.
-POLICY_ID=$(curl -fsS "${H[@]}" "$B/api/v1/admin/routing-policies?$PAGE" | python3 -c 'import json,sys
-route, provider = sys.argv[1], sys.argv[2]
-d = json.load(sys.stdin)
-hit = [r for r in d["data"]
-       if r.get("route_id") == route and r.get("provider_id") == provider]
-if hit:
-    print(hit[0]["id"])
-elif (d.get("pagination") or {}).get("has_more"):
-    sys.stderr.write(
-        "   routing-policies truncated at %d rows; cannot tell whether a policy for\n"
-        "   this route and provider already exists. Seeding again could duplicate it.\n"
-        % len(d["data"]))
-    raise SystemExit(3)
-else:
-    print("")' "$ROUTE_ID" "$PROVIDER_ID")
+# Two fields, so `find_by` does not fit — but the truncation rule is the same
+# one (scripts/seed_local_lib.py: find_routing_policy). A hit also carries
+# provider_model_id and version, so a stale policy — one that matched on
+# (route_id, provider_id) but still pins the OLD provider_model_id after a
+# model or base_url change above — can be PATCHed the same way step 1
+# PATCHes a stale base_url, instead of silently reused.
+POLICY=$(curl -fsS "${H[@]}" "$B/api/v1/admin/routing-policies?$PAGE" \
+    | python3 scripts/seed_local_lib.py find-routing-policy "$ROUTE_ID" "$PROVIDER_ID")
+POLICY_ID=$(printf '%s' "$POLICY" | cut -f1)
 if [ -n "$POLICY_ID" ]; then
-    printf '   reuse  %s\n' "$POLICY_ID"
+    CURRENT_MODEL_ID=$(printf '%s' "$POLICY" | cut -f2)
+    if [ "$CURRENT_MODEL_ID" = "$MODEL_ID" ]; then
+        printf '   reuse  %s\n' "$POLICY_ID"
+    else
+        CURRENT_VERSION=$(printf '%s' "$POLICY" | cut -f3)
+        curl -fsS -X PATCH "${H[@]}" -H "If-Match: $CURRENT_VERSION" \
+            "$B/api/v1/admin/routing-policies/$POLICY_ID" \
+            -d "$(python3 -c 'import json,sys; print(json.dumps({"provider_model_id": sys.argv[1]}))' "$MODEL_ID")" >/dev/null
+        printf '   update %s  provider_model_id: %s -> %s\n' "$POLICY_ID" "$CURRENT_MODEL_ID" "$MODEL_ID"
+    fi
 else
     POLICY_ID=$(curl -fsS -X POST "${H[@]}" "$B/api/v1/admin/routing-policies" \
         -d "$(python3 -c 'import json,sys; print(json.dumps({
