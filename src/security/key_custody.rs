@@ -201,6 +201,63 @@ pub trait MasterKeyCustody: Send + Sync + std::fmt::Debug {
     async fn preflight(&self) -> Result<(), KeyCustodyError>;
 }
 
+/// **A private module, and the privacy is the entire mechanism.**
+///
+/// [`PreflightedCustody`]'s field is visible only in here, and the only thing in here that
+/// produces one is [`PreflightedCustody::preflight`], which cannot return without having awaited
+/// [`MasterKeyCustody::preflight`]. Nothing outside this module — not the rest of this file, not
+/// `app::state`, not a test — can write the struct literal. That is what makes "the boot probe
+/// ran" a fact the type carries rather than a call site somebody has to remember.
+///
+/// Do not add a `From<Arc<dyn MasterKeyCustody>>`, a `pub` field, or a second constructor: each
+/// of those reopens the gap this module exists to close (issue #161).
+mod preflighted {
+    use std::sync::Arc;
+
+    use super::{KeyCustodyError, MasterKeyCustody};
+
+    /// A custody backend whose boot probe has *already run and passed*.
+    ///
+    /// Held by `AppState` and produced by `app::state::build_content_custody` so that skipping
+    /// the probe is a compile error rather than a silent behaviour change — the failure mode
+    /// being a deployment that boots happily and only discovers its master key is unusable at
+    /// the first write.
+    #[derive(Clone, Debug)]
+    pub struct PreflightedCustody(Arc<dyn MasterKeyCustody>);
+
+    impl PreflightedCustody {
+        /// Runs [`MasterKeyCustody::preflight`] and, only on success, hands back the proof.
+        ///
+        /// The sole constructor. It takes the `Arc` by value rather than by reference so the
+        /// unproven handle is consumed at the call site.
+        pub async fn preflight(
+            custody: Arc<dyn MasterKeyCustody>,
+        ) -> Result<Self, KeyCustodyError> {
+            custody.preflight().await?;
+            Ok(Self(custody))
+        }
+
+        /// The handle underneath, for the callers that need an `Arc<dyn MasterKeyCustody>` —
+        /// `ContentKeyring::load` and `KeyringAdmin::new`.
+        ///
+        /// Extraction is deliberately unrestricted: the invariant is about *how a custody
+        /// reaches the running process*, not about hiding it afterwards.
+        pub fn custody(&self) -> Arc<dyn MasterKeyCustody> {
+            self.0.clone()
+        }
+    }
+
+    impl std::ops::Deref for PreflightedCustody {
+        type Target = dyn MasterKeyCustody;
+
+        fn deref(&self) -> &Self::Target {
+            self.0.as_ref()
+        }
+    }
+}
+
+pub use preflighted::PreflightedCustody;
+
 /// Additional authenticated data binding a wrapped data key to its identity.
 ///
 /// Semicolon-joined, matching the `credential_aad` house style in [`crate::security::crypto`].
@@ -692,6 +749,33 @@ mod tests {
         };
         assert_eq!(
             custody.preflight().await.unwrap_err(),
+            KeyCustodyError::UnknownMasterKey {
+                master_key_id: "absent".to_string()
+            }
+        );
+    }
+
+    /// The failing probe hands back an error and *nothing else*: there is no second way to
+    /// obtain a [`PreflightedCustody`], which is what makes the boot probe unskippable rather
+    /// than merely conventional (#161).
+    #[tokio::test]
+    async fn a_preflighted_custody_exists_only_after_a_passing_probe() {
+        let proven =
+            PreflightedCustody::preflight(std::sync::Arc::new(custody(&[("k1", 1)], "k1")))
+                .await
+                .expect("a usable backend preflights");
+        assert_eq!(proven.backend_name(), CUSTODY_BACKEND_ENVIRONMENT);
+        assert_eq!(proven.custody().active_master_key_id(), "k1");
+
+        let refused =
+            PreflightedCustody::preflight(std::sync::Arc::new(EnvironmentMasterKeyCustody {
+                keys: HashMap::new(),
+                active_master_key_id: "absent".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused,
             KeyCustodyError::UnknownMasterKey {
                 master_key_id: "absent".to_string()
             }
