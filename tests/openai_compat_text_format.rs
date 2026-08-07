@@ -19,7 +19,15 @@
 
 mod support;
 
-use moira::{application::RuntimeAdminService, domain::RoutingPolicyCreateRequest};
+use moira::{
+    app::AppState,
+    application::RuntimeAdminService,
+    config::Settings,
+    domain::{
+        AgentProfileCreateRequest, AgentProfileRecord, RouteDefinitionPatchRequest,
+        RoutingPolicyCreateRequest,
+    },
+};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use support::{
@@ -43,12 +51,7 @@ async fn bind_provider_to_the_default_route(
     fixture: &LifecycleFixture,
     provider: &ProviderFixture,
 ) {
-    let route_id: Uuid = sqlx::query_scalar(
-        "select id from route_definitions where route_key = 'general' and deleted_at is null",
-    )
-    .fetch_one(&fixture.pool)
-    .await
-    .expect("migration 0005 seeds the 'general' route");
+    let route_id = default_route_id(fixture).await;
     RuntimeAdminService::new(&fixture.state)
         .expect("runtime admin service")
         .create_routing_policy(
@@ -77,6 +80,16 @@ async fn bind_provider_to_the_default_route(
         )
         .await
         .expect("bind the default route to the mock provider");
+}
+
+/// The `general` route seeded by migration `0005` — the only route a compat request can reach.
+async fn default_route_id(fixture: &LifecycleFixture) -> Uuid {
+    sqlx::query_scalar(
+        "select id from route_definitions where route_key = 'general' and deleted_at is null",
+    )
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("migration 0005 seeds the 'general' route")
 }
 
 async fn compat_fixture() -> Option<LifecycleFixture> {
@@ -786,4 +799,266 @@ async fn compat_text_format_strict_false_is_refused_over_http() {
 
     moira.shutdown().await;
     provider.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Issue #157 item 2, and item C2 of issue #155 — the compat endpoint's published error contract,
+// driven rather than read.
+//
+// #155's C2 records the shape of the gap precisely: `POST /v1/responses` publishes an error
+// contract that *no* test drives, and the argument for every status in it is "compat shares
+// `failure_http_status`". That is an argument from shared code, and this endpoint is exactly the
+// place where such an argument is weakest: it owns `compat_response_format`, a translation layer
+// the native path does not run, and it resolves its route by falling through to
+// `get_default_route` rather than by honouring a caller's hint. #157 then proposed *adding* two
+// more statuses to that unguarded contract, which would have compounded the problem — declaring
+// a status an endpoint cannot return is the same defect as omitting one it can.
+//
+// So the two statuses #157 adds are asserted here on the socket before they are declared.
+// ---------------------------------------------------------------------------------------------
+
+/// Creates an active agent profile and points the seeded default route at it.
+///
+/// The default route rather than the fixture's own: `POST /v1/responses` carries no route field,
+/// so `general` is the only route it can resolve to (see
+/// [`bind_provider_to_the_default_route`]). Attaching the profile anywhere else would leave the
+/// case below driving a route with no profile at all, which is the vacuous-pass shape #155 is
+/// about — hence the read-back assertion.
+async fn attach_agent_profile_to_the_default_route(
+    fixture: &LifecycleFixture,
+) -> AgentProfileRecord {
+    let admin = RuntimeAdminService::new(&fixture.state).expect("runtime admin service");
+    let profile = admin
+        .create_agent_profile(
+            &fixture.actor,
+            &support::request_context(),
+            AgentProfileCreateRequest {
+                profile_key: format!("compat-409-{}", Uuid::now_v7().simple()),
+                display_name: "compat 409 profile".to_string(),
+                preamble: Some(
+                    "This preamble exists only to make the profile non-trivial.".to_string(),
+                ),
+                temperature: None,
+                max_tokens: None,
+                tool_policy: json!({}),
+                context_policy: json!({}),
+                memory_policy: json!({}),
+                metadata: json!({ "test_fixture": true }),
+            },
+        )
+        .await
+        .expect("create agent profile");
+
+    let route_id = default_route_id(fixture).await;
+    // Read the version back rather than assuming `1`: `bind_provider_to_the_default_route` and
+    // the migrations both touch this row, and an assumed version fails as a `409` from the
+    // optimistic-concurrency check — which would look exactly like the status under test.
+    let version: i64 = sqlx::query_scalar("select version from route_definitions where id = $1")
+        .bind(route_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("read the default route version");
+    admin
+        .patch_route_definition(
+            &fixture.actor,
+            &support::request_context(),
+            route_id,
+            version,
+            RouteDefinitionPatchRequest {
+                agent_profile_id: Some(profile.id),
+                ..RouteDefinitionPatchRequest::default()
+            },
+        )
+        .await
+        .expect("attach the agent profile to the default route");
+
+    let attached: Option<Uuid> =
+        sqlx::query_scalar("select agent_profile_id from route_definitions where id = $1")
+            .bind(route_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("read the default route's agent_profile_id");
+    assert_eq!(
+        attached,
+        Some(profile.id),
+        "the default route must actually carry the profile, or the case below drives a route \
+         with no profile and asserts nothing"
+    );
+    profile
+}
+
+/// **#157 / #155 C2 — `409 agent_profile_disabled` is reachable on `POST /v1/responses`.**
+///
+/// The control comes first and is load-bearing twice over. `409` with `call_count() == 0` is
+/// satisfiable by a fixture that could never reach the provider at all, and a compat fixture has
+/// two extra ways to be broken that the native one does not: the default route may carry no
+/// routing policy, and `compat_response_format` may refuse the request before routing is even
+/// consulted. A `200` that reaches the provider on the *same* fixture, over the *same* endpoint,
+/// with the *only* difference being `status = 'disabled'` on the profile, is what makes the
+/// refusal attributable to the profile rather than to the fixture.
+///
+/// The answer to #155 C2's open question — does the compat DTO's translation layer change the
+/// failure behaviour? — is **no**: `openai_compat_to_public` runs *before* dispatch and produces
+/// a `PublicResponseRequest`, after which `create_response` is the native path exactly. The
+/// status, the code and the message key below are the same three
+/// `guards_the_public_plane_refuses_a_disabled_agent_profile_with_409_and_a_code`
+/// (`tests/agent_profile_wire.rs`) asserts on `POST /api/v1/responses`, which is the symmetry
+/// the new declaration rests on.
+#[tokio::test]
+async fn compat_refuses_a_disabled_agent_profile_with_409_exactly_as_the_native_path_does() {
+    let Some(fixture) = compat_fixture().await else {
+        return;
+    };
+    let provider = MockOpenAiServer::start([
+        ProviderScript::Completion {
+            text: "reached only by the control".to_string(),
+        },
+        ProviderScript::Completion {
+            text: "this script must never be consumed".to_string(),
+        },
+    ])
+    .await;
+    let bound = fixture
+        .add_provider(provider.base_url(), 10, RuntimePolicy::default())
+        .await;
+    bind_provider_to_the_default_route(&fixture, &bound).await;
+    let profile = attach_agent_profile_to_the_default_route(&fixture).await;
+    let consumer_key = fixture.enable_public_streaming().await;
+    let moira = MoiraHttpServer::start(fixture.state.clone()).await;
+    let client = reqwest::Client::new();
+
+    let control = client
+        .post(format!("{}/v1/responses", moira.base_url))
+        .header("x-consumer-key", &consumer_key)
+        .json(&json!({ "input": "answer me" }))
+        .send()
+        .await
+        .expect("send the compat control request");
+    let status = control.status();
+    let body = control.text().await.expect("compat control body");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "control: the compat endpoint must serve the default route while the profile is active, \
+         or the refusal below is unattributable: {body}"
+    );
+    let before = provider.call_count().await;
+    assert_eq!(
+        before, 1,
+        "control: the request reached the provider: {body}"
+    );
+
+    RuntimeAdminService::new(&fixture.state)
+        .expect("runtime admin service")
+        .set_agent_profile_enabled(
+            &fixture.actor,
+            &support::request_context(),
+            profile.id,
+            profile.version,
+            false,
+        )
+        .await
+        .expect("disable the agent profile");
+
+    let refused = client
+        .post(format!("{}/v1/responses", moira.base_url))
+        .header("x-consumer-key", &consumer_key)
+        .json(&json!({ "input": "answer me" }))
+        .send()
+        .await
+        .expect("send the compat request against the disabled profile");
+    let status = refused.status();
+    let body = refused.text().await.expect("compat refusal body");
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "the compat endpoint must answer a disabled agent profile with the same 409 the native \
+         path does — this is the status #157 declares on the operation, got {status}: {body}"
+    );
+    let envelope: Value = serde_json::from_str(&body).expect("coded error envelope");
+    assert_eq!(
+        envelope["error"]["code"], "agent_profile_disabled",
+        "the 409 must be the profile one, not an idempotency or optimistic-concurrency conflict \
+         — a 409 for the wrong reason would make the declaration true by accident: {body}"
+    );
+    assert_eq!(
+        envelope["error"]["message_key"], "moira.error.agent_profile_disabled",
+        "{body}"
+    );
+    assert_eq!(
+        provider.call_count().await,
+        before,
+        "a refused compat request must not reach the provider or be billed: {body}"
+    );
+
+    moira.shutdown().await;
+    provider.shutdown().await;
+}
+
+/// **#157 — `503` is reachable on `POST /v1/responses`.**
+///
+/// `503` was declared on both native response operations and absent here for no stated reason.
+/// Rather than adding it on the symmetry argument alone, this drives it: `public_actor` asks for
+/// `state.pool()` before it does anything else, and `AppError::DatabaseUnavailable` is a `503`,
+/// so an `AppState` built with no pool answers `503` on this operation for a reason that has
+/// nothing to do with the caller's request.
+///
+/// No database, deliberately — this is the one case in this file that runs in every environment,
+/// and #155 E1 is about exactly the guards that green-SKIP without Postgres.
+///
+/// The `404` control is the half that stops this passing for the wrong reason. `503` is only
+/// reachable *after* the feature-flag check, so a run with the flag left off would answer `404`
+/// and never reach `public_actor` at all; asserting both over equally poolless states proves the
+/// flag was on and that the `503` came from the pool.
+#[tokio::test]
+async fn compat_answers_503_when_the_database_is_unavailable() {
+    let mut settings = Settings::default();
+    settings.public_api.openai_responses_compat_enabled = true;
+    let state = AppState::new(settings, None)
+        .await
+        .expect("poolless app state");
+    let moira = MoiraHttpServer::start(state).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("{}/v1/responses", moira.base_url))
+        .json(&json!({ "input": "answer me" }))
+        .send()
+        .await
+        .expect("send the compat request against a poolless state");
+    let status = response.status();
+    let body = response.text().await.expect("compat 503 body");
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the compat endpoint must answer 503 when the database it needs to authenticate the \
+         caller is absent — this is the status #157 declares on the operation, got {status}: \
+         {body}"
+    );
+
+    // The control: with the flag off the handler refuses before it ever asks for the pool, so
+    // the 503 above cannot have come from a disabled endpoint.
+    let mut disabled = Settings::default();
+    disabled.public_api.openai_responses_compat_enabled = false;
+    let disabled_state = AppState::new(disabled, None)
+        .await
+        .expect("poolless app state with compat off");
+    let disabled_moira = MoiraHttpServer::start(disabled_state).await;
+    let response = client
+        .post(format!("{}/v1/responses", disabled_moira.base_url))
+        .json(&json!({ "input": "answer me" }))
+        .send()
+        .await
+        .expect("send the compat request against a disabled endpoint");
+    let status = response.status();
+    let body = response.text().await.expect("compat 404 body");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "control: a disabled compatibility endpoint must still answer 404, which is the other \
+         meaning #157 adds to that status's description, got {status}: {body}"
+    );
+
+    disabled_moira.shutdown().await;
+    moira.shutdown().await;
 }

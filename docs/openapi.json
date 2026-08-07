@@ -10197,6 +10197,24 @@
                 }
               }
             }
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The request exceeded a server-side deadline. Raised for every route by the middleware response-head timeout (`request_timeout`), and additionally by execution operations when the upstream provider or the execution deadline expires (`provider_timeout`, `deadline_exceeded`).",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "tags": [
@@ -23838,6 +23856,24 @@
                 }
               }
             }
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The request exceeded a server-side deadline. Raised for every route by the middleware response-head timeout (`request_timeout`), and additionally by execution operations when the upstream provider or the execution deadline expires (`provider_timeout`, `deadline_exceeded`).",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -24034,6 +24070,24 @@
                 }
               }
             }
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The request exceeded a server-side deadline. Raised for every route by the middleware response-head timeout (`request_timeout`), and additionally by execution operations when the upstream provider or the execution deadline expires (`provider_timeout`, `deadline_exceeded`).",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -24096,6 +24150,24 @@
                 }
               }
             }
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The request exceeded a server-side deadline. Raised for every route by the middleware response-head timeout (`request_timeout`), and additionally by execution operations when the upstream provider or the execution deadline expires (`provider_timeout`, `deadline_exceeded`).",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "tags": [
@@ -24146,6 +24218,24 @@
               }
             },
             "description": "PostgreSQL is unavailable",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The request exceeded a server-side deadline. Raised for every route by the middleware response-head timeout (`request_timeout`), and additionally by execution operations when the upstream provider or the execution deadline expires (`provider_timeout`, `deadline_exceeded`).",
             "headers": {
               "X-Request-Id": {
                 "description": "Request correlation identifier",
@@ -24257,6 +24347,24 @@
               }
             },
             "description": "PostgreSQL is unavailable",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The request exceeded a server-side deadline. Raised for every route by the middleware response-head timeout (`request_timeout`), and additionally by execution operations when the upstream provider or the execution deadline expires (`provider_timeout`, `deadline_exceeded`).",
             "headers": {
               "X-Request-Id": {
                 "description": "Request correlation identifier",
@@ -25749,6 +25857,24 @@
                 }
               }
             }
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The request exceeded a server-side deadline. Raised for every route by the middleware response-head timeout (`request_timeout`), and additionally by execution operations when the upstream provider or the execution deadline expires (`provider_timeout`, `deadline_exceeded`).",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -26989,6 +27115,24 @@
                 }
               }
             }
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The request exceeded a server-side deadline. Raised for every route by the middleware response-head timeout (`request_timeout`), and additionally by execution operations when the upstream provider or the execution deadline expires (`provider_timeout`, `deadline_exceeded`).",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -27130,6 +27274,24 @@
               }
             },
             "description": "Internal server error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The request exceeded a server-side deadline. Raised for every route by the middleware response-head timeout (`request_timeout`), and additionally by execution operations when the upstream provider or the execution deadline expires (`provider_timeout`, `deadline_exceeded`).",
             "headers": {
               "X-Request-Id": {
                 "description": "Request correlation identifier",
@@ -27789,6 +27951,24 @@
                 }
               }
             }
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The request exceeded a server-side deadline. Raised for every route by the middleware response-head timeout (`request_timeout`), and additionally by execution operations when the upstream provider or the execution deadline expires (`provider_timeout`, `deadline_exceeded`).",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -28044,6 +28224,24 @@
                 }
               }
             }
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The request exceeded a server-side deadline. Raised for every route by the middleware response-head timeout (`request_timeout`), and additionally by execution operations when the upstream provider or the execution deadline expires (`provider_timeout`, `deadline_exceeded`).",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -28251,6 +28449,24 @@
                 }
               }
             }
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The request exceeded a server-side deadline. Raised for every route by the middleware response-head timeout (`request_timeout`), and additionally by execution operations when the upstream provider or the execution deadline expires (`provider_timeout`, `deadline_exceeded`).",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -28400,6 +28616,24 @@
                 }
               }
             }
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The request exceeded a server-side deadline. Raised for every route by the middleware response-head timeout (`request_timeout`), and additionally by execution operations when the upstream provider or the execution deadline expires (`provider_timeout`, `deadline_exceeded`).",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -28533,6 +28767,24 @@
               }
             },
             "description": "Internal server error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The request exceeded a server-side deadline. Raised for every route by the middleware response-head timeout (`request_timeout`), and additionally by execution operations when the upstream provider or the execution deadline expires (`provider_timeout`, `deadline_exceeded`).",
             "headers": {
               "X-Request-Id": {
                 "description": "Request correlation identifier",
@@ -28752,6 +29004,24 @@
                 }
               }
             }
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The request exceeded a server-side deadline. Raised for every route by the middleware response-head timeout (`request_timeout`), and additionally by execution operations when the upstream provider or the execution deadline expires (`provider_timeout`, `deadline_exceeded`).",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -28802,6 +29072,24 @@
                 }
               }
             }
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The request exceeded a server-side deadline. Raised for every route by the middleware response-head timeout (`request_timeout`), and additionally by execution operations when the upstream provider or the execution deadline expires (`provider_timeout`, `deadline_exceeded`).",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "tags": [
@@ -28833,6 +29121,24 @@
               }
             },
             "description": "Service is live",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The request exceeded a server-side deadline. Raised for every route by the middleware response-head timeout (`request_timeout`), and additionally by execution operations when the upstream provider or the execution deadline expires (`provider_timeout`, `deadline_exceeded`).",
             "headers": {
               "X-Request-Id": {
                 "description": "Request correlation identifier",
@@ -28916,6 +29222,24 @@
                 }
               }
             }
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The request exceeded a server-side deadline. Raised for every route by the middleware response-head timeout (`request_timeout`), and additionally by execution operations when the upstream provider or the execution deadline expires (`provider_timeout`, `deadline_exceeded`).",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "tags": [
@@ -28983,6 +29307,24 @@
               }
             },
             "description": "Metrics rendering failed",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The request exceeded a server-side deadline. Raised for every route by the middleware response-head timeout (`request_timeout`), and additionally by execution operations when the upstream provider or the execution deadline expires (`provider_timeout`, `deadline_exceeded`).",
             "headers": {
               "X-Request-Id": {
                 "description": "Request correlation identifier",
@@ -29090,6 +29432,24 @@
               }
             },
             "description": "Database required for admin documentation authentication is unavailable",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The request exceeded a server-side deadline. Raised for every route by the middleware response-head timeout (`request_timeout`), and additionally by execution operations when the upstream provider or the execution deadline expires (`provider_timeout`, `deadline_exceeded`).",
             "headers": {
               "X-Request-Id": {
                 "description": "Request correlation identifier",
@@ -29216,7 +29576,25 @@
                 }
               }
             },
-            "description": "Compatibility endpoint is disabled",
+            "description": "Compatibility endpoint is disabled, or a route, agent profile, model or credential on the resolution chain does not exist",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Execution conflict; the resolved route names a disabled agent profile",
             "headers": {
               "X-Request-Id": {
                 "description": "Request correlation identifier",
@@ -29289,6 +29667,42 @@
               }
             },
             "description": "Upstream provider failed",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Required infrastructure is unavailable",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The request exceeded a server-side deadline. Raised for every route by the middleware response-head timeout (`request_timeout`), and additionally by execution operations when the upstream provider or the execution deadline expires (`provider_timeout`, `deadline_exceeded`).",
             "headers": {
               "X-Request-Id": {
                 "description": "Request correlation identifier",

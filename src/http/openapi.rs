@@ -5,7 +5,7 @@ use serde_json::Value;
 use utoipa::{
     Modify, OpenApi,
     openapi::{
-        OpenApi as OpenApiDocument, RefOr, Required,
+        ContentBuilder, OpenApi as OpenApiDocument, Ref, RefOr, Required, ResponseBuilder,
         header::Header,
         path::{Operation, ParameterBuilder, ParameterIn},
         schema::{Object, Type},
@@ -178,9 +178,71 @@ pub(crate) fn finalize_document(document: &mut OpenApiDocument) {
         .into_iter()
         .flatten()
         {
+            // Order matters: the `504` is added first so `document_request_id` then stamps
+            // the correlation header onto it like every other response. Reversing these two
+            // would ship one response object in the whole document without `X-Request-Id`.
+            document_gateway_timeout(operation);
             document_request_id(operation);
         }
     }
+}
+
+/// Description of the global `504`, naming **both** conditions that produce it.
+///
+/// One status, two meanings, so the description says both — the same rule this commit applies
+/// to `POST /v1/responses`'s `404`. A caller separates them by `error.code`, not by status:
+/// the middleware timeout is normalised to `request_timeout` by
+/// `normalize_infrastructure_error` (`src/lib.rs`), and the execution timeouts keep their own
+/// `provider_timeout` / `deadline_exceeded` codes because that mapper leaves an
+/// `application/json` body alone.
+const GATEWAY_TIMEOUT_DESCRIPTION: &str = "The request exceeded a server-side deadline. Raised for every route by the middleware \
+     response-head timeout (`request_timeout`), and additionally by execution operations when \
+     the upstream provider or the execution deadline expires (`provider_timeout`, \
+     `deadline_exceeded`).";
+
+/// Issue #157, item 1: `504` was reachable and declared nowhere.
+///
+/// **Why here and not on the two execution operations.** `504` is reachable two ways —
+/// globally, because `documented_router` layers `TimeoutLayer::with_status_code(GATEWAY_TIMEOUT,
+/// ..)` onto *every* route group (`src/http/mod.rs`), and per-operation, because
+/// `failure_http_status` maps `ProviderTimeout | DeadlineExceeded` to it
+/// (`src/application/public.rs`). Declaring it on the execution operations alone would leave
+/// the other 150 operations missing a status they can all return, which is the inconsistent
+/// half-measure #157 warned about. `.agents/skills/moira-openapi/SKILL.md` puts cross-cutting
+/// enrichment here and forbids duplicating it per-operation, which is already how the
+/// `X-Request-Id` parameter and response header are handled — so this reuses that shape rather
+/// than inventing a second one, down to the "only if the operation does not already say
+/// something" guard.
+///
+/// **Why some operations are skipped.** An operation that already declares `504`, or a `5XX`
+/// range, or a `default` response, has already told a generated client what to expect for this
+/// status. Adding an explicit `504` next to a `5XX` that covers it would be duplication, not
+/// coverage — and it would let an operation that deliberately describes its own timeout be
+/// silently overwritten by this generic text. The 131 admin operations declare `5XX
+/// Infrastructure or internal error` and are therefore left alone; the 21 operations that
+/// enumerate their statuses explicitly are the ones that genuinely had no shape for a `504`.
+fn document_gateway_timeout(operation: &mut Operation) {
+    let responses = &mut operation.responses.responses;
+    if responses.contains_key("504")
+        || responses.contains_key("5XX")
+        || responses.contains_key("default")
+    {
+        return;
+    }
+    responses.insert(
+        "504".to_string(),
+        RefOr::T(
+            ResponseBuilder::new()
+                .description(GATEWAY_TIMEOUT_DESCRIPTION)
+                .content(
+                    "application/json",
+                    ContentBuilder::new()
+                        .schema(Some(Ref::from_schema_name("ErrorResponse")))
+                        .build(),
+                )
+                .build(),
+        ),
+    );
 }
 
 fn document_request_id(operation: &mut Operation) {
