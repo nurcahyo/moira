@@ -30,7 +30,7 @@ skills/            repo-local agent skills
 - `i18n` is the single registry of `moira.error.*` and `moira.notice.*` keys with their default English strings, mirrored into `docs/i18n-response-catalog.json`. A user-visible string added anywhere else is a bug.
 - `infra` owns external persistence and database decoding, including enum string conversion.
 - `orchestration` owns Moira runtime behavior: the runtime-config and provider-handle caches (`runtime_cache.rs`, `controls.rs`), provider base-URL normalisation (`provider_url.rs`), concurrency, rate limiting and circuit breaking, and the Rig boundary in `runtime_factory.rs`. Credential resolution is not here — it lives in `src/infra/repositories/runtime.rs`.
-- `security` owns trust and secret handling. Plaintext credentials should only exist in short-lived local variables.
+- `security` owns trust and secret handling. Plaintext credentials should only exist in short-lived local variables. It holds no `PgPool` with one deliberate exception: `security/data_keys.rs`, whose rows *are* sealed key material and whose invariant — unwrapped exactly once, at boot, under a custody backend, or the process refuses to start — is a security rule rather than a storage one. Splitting the loader into `infra` would leave neither layer able to enforce it. That module owns the only SQL in `src/security` and touches exactly one table.
 - `config` owns static infrastructure config. Runtime provider config belongs in PostgreSQL.
 
 ## Feature Placement

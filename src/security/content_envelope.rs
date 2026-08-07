@@ -1460,6 +1460,9 @@ mod tests {
         fn can_unwrap(&self, _master_key_id: &str) -> bool {
             panic!("custody was consulted for a blob this build cannot interpret");
         }
+        fn master_key_ids(&self) -> Vec<String> {
+            panic!("custody was consulted for a blob this build cannot interpret");
+        }
         async fn wrap(
             &self,
             _dek: &Zeroizing<[u8; 32]>,
