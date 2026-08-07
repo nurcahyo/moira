@@ -615,12 +615,34 @@ impl ContentKeyring {
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                keyring.refresh_or_serve_on().await;
+                keyring.refresh_gated().await;
             }
         })
     }
 
-    /// One refresh, with the failure absorbed. The unit the background tick runs.
+    /// One refresh behind the single-flight permit. What the background tick runs.
+    ///
+    /// The tick takes the *same* permit an on-demand miss does, so **every** load in the
+    /// process is serialised by it. Without that, a tick and a miss can be in `assemble` at the
+    /// same time, and since each took its generation number before it started, the slower one
+    /// can install its snapshot *after* the faster one — leaving the keyring holding an older
+    /// generation than one it already had, and making the number the single-flight gate
+    /// compares no longer monotonic. The window is milliseconds against a 300-second tick,
+    /// which is exactly why it would never be reproduced and never be found.
+    ///
+    /// Called only from the tick. [`Self::refresh_for_miss`] already holds the permit and must
+    /// not take it again — the semaphore is not reentrant, and doing so would deadlock the
+    /// first miss the process ever sees.
+    async fn refresh_gated(&self) -> Arc<KeyringSnapshot> {
+        let _permit = self
+            .refresh_gate
+            .acquire()
+            .await
+            .expect("the content keyring refresh gate is never closed");
+        self.refresh_or_serve_on().await
+    }
+
+    /// One refresh, with the failure absorbed.
     async fn refresh_or_serve_on(&self) -> Arc<KeyringSnapshot> {
         match self.refresh().await {
             Ok(snapshot) => snapshot,
@@ -1503,6 +1525,56 @@ mod tests {
         // request path, and this is the count that says so — the assertions above would still
         // pass if every task had called custody after a shared load.
         assert_eq!(custody.unwrap_calls() - unwraps_after_boot, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_background_tick_takes_the_same_permit_an_on_demand_miss_does() {
+        let Some(database) = crate::test_support::test_database().await else {
+            return;
+        };
+        let pool = isolated_pool(&database).await;
+        let custody = Arc::new(CountingCustody::new(&[("k1", 1)], "k1"));
+        insert_key(&pool, custody.as_ref(), 1, DataKeyState::Active, 62).await;
+        let keyring = Arc::new(
+            ContentKeyring::load(pool, custody, &settings(), metrics())
+                .await
+                .expect("load"),
+        );
+
+        // Standing in for an on-demand miss that is mid-load: hold the one permit.
+        let held = keyring
+            .refresh_gate
+            .acquire()
+            .await
+            .expect("the gate is open");
+        let before = keyring.database_loads();
+
+        let (started, has_started) = tokio::sync::oneshot::channel();
+        let ticking = {
+            let keyring = Arc::clone(&keyring);
+            tokio::spawn(async move {
+                let _ = started.send(());
+                keyring.refresh_gated().await.generation()
+            })
+        };
+        has_started.await.expect("the tick task started");
+
+        // The wait is deliberately on the side that gives a *wrong* implementation time to
+        // misbehave. A tick that skipped the gate loads in well under a millisecond against a
+        // local database, so it would have loaded several hundred times over by now; a tick
+        // that takes the permit cannot load at all, however slow the machine. So a slow runner
+        // makes this more reliable, not less — measured: with the `acquire` removed from
+        // `refresh_gated`, this assertion fails.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            keyring.database_loads(),
+            before,
+            "the tick loaded while the single-flight permit was held"
+        );
+
+        drop(held);
+        assert!(ticking.await.expect("join") > 0);
+        assert_eq!(keyring.database_loads(), before + 1);
     }
 
     // ---------------------------------------------------------------------------------
