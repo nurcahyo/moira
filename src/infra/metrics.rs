@@ -197,6 +197,27 @@ const ADMIN_IDENTITY_GRANT_EVENTS_TOTAL: &str = "moira_admin_identity_grant_even
 const CONTENT_KEYRING_REFRESH_FAILED_TOTAL: &str = "moira_content_keyring_refresh_failed_total";
 const CONTENT_KEYRING_AGE_SECONDS: &str = "moira_content_keyring_age_seconds";
 
+// How many data keys this replica holds, per lifecycle state. Written by the keyring on every
+// successful load, which is the only moment the answer can change for this process.
+//
+// It is what makes a rotation observable without a shell on the pod: `add` moves a key into
+// `pending`, `promote` moves one into `active` and one into `retiring`, and `abandon` moves one
+// into `abandoned` — so the four series together are a live picture of `moira keyring status`
+// across the fleet, including the two conditions worth alerting on. `active == 0` means no
+// replica can seal new content; `abandoned > 0` means somebody acknowledged permanent data
+// loss, which should never pass unnoticed.
+//
+// `retired` is deliberately absent from the label domain rather than seeded at zero: a retired
+// key is not loaded, so this process has nothing to count and a permanent `0` would invite the
+// reading that none exist.
+//
+// The three envelope counters `docs/decision-encryption-at-rest.md` names alongside this one —
+// seal, open, and open-failed — are NOT here. They belong to the write and read paths, which
+// have no call sites until a later PR of the train, and a counter wired to nothing is the
+// silently-inert shape (#125) this whole release exists to avoid. They arrive with their
+// callers.
+const CONTENT_KEYRING_KEYS: &str = "moira_content_keyring_keys";
+
 /// The closed `outcome` label domain for `moira_admin_invite_outcomes_total`.
 ///
 /// `created` and `redeemed` are the two successes; everything else is a denial reason
@@ -845,6 +866,22 @@ impl MetricsRegistry {
     pub fn set_content_keyring_age_seconds(&self, age_seconds: f64) {
         with_local_recorder(&self.inner.recorder, || {
             gauge!(CONTENT_KEYRING_AGE_SECONDS).set(age_seconds);
+        });
+    }
+
+    /// Sets `moira_content_keyring_keys{state}` from a freshly loaded snapshot.
+    ///
+    /// Takes the **whole** distribution, not one `(state, count)` pair, and that is what makes
+    /// it correct: a state that dropped to zero has to be *written* as zero, because a gauge
+    /// nobody updates keeps its last value forever. A caller that only reported the states it
+    /// found would leave `pending 1` standing after the promotion that emptied it — and the
+    /// series an operator watches during a rotation would be the one that lies.
+    pub fn set_content_keyring_keys(&self, counts: &[(&'static str, usize)]) {
+        with_local_recorder(&self.inner.recorder, || {
+            for (state, count) in counts {
+                #[allow(clippy::cast_precision_loss)]
+                gauge!(CONTENT_KEYRING_KEYS, "state" => *state).set(*count as f64);
+            }
         });
     }
 

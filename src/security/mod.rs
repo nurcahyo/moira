@@ -6,6 +6,7 @@ mod crypto;
 mod data_keys;
 mod idempotency;
 mod key_custody;
+mod keyring_admin;
 mod masking;
 mod ssrf;
 
@@ -42,6 +43,10 @@ pub use key_custody::{
     EnvironmentMasterKeyCustody, KeyCustodyError, MASTER_KEY_ID_MAX_LENGTH, MasterKeyCustody,
     MasterKeyRing, WRAP_ALGORITHM_AES_256_GCM, WrappedKey, is_valid_master_key_id,
     wrapped_data_key_aad,
+};
+pub use keyring_admin::{
+    Abandonment, AddedKey, KeyStatus, KeyUsage, KeyringAdmin, KeyringAdminError, KeyringStatus,
+    Promotion, ResealOptions, ResealReport, Retirement, RewrapReport, envelope_data_key_id,
 };
 pub use masking::{mask_plain_secret, mask_secret_value, request_hash, secret_fingerprint};
 pub use ssrf::{

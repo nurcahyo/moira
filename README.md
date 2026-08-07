@@ -206,6 +206,27 @@ After configuring providers, models, credentials, routes, and routing policies, 
 cargo run -- execute-test -- --prompt "Hello" --route general
 ```
 
+## Content key rotation
+
+`moira keyring` is the operator surface for the content-encryption keyring — a process
+mode, deliberately not an admin endpoint. `cargo run -- keyring` prints the verbs.
+
+```bash
+cargo run -- keyring status                                  # ids, states, master keys, row counts
+cargo run -- keyring add                                     # mint a data key, 'pending'
+cargo run -- keyring promote <id>                            # R1: rotate the DATA key. No restart,
+                                                             #     nothing re-encrypted.
+cargo run -- keyring rewrap --to <master-key-id>             # R2/R3: rotate the MASTER key. No row
+                                                             #        of user data is read or written.
+cargo run -- keyring abandon <id> --confirm --reason "<text>" # acknowledge a permanently lost
+                                                             # master key. Irreversible data loss.
+```
+
+The full four-step master-key procedure, and why the order is enforced rather than merely
+documented, is [`docs/decision-encryption-at-rest.md`](docs/decision-encryption-at-rest.md) §9.
+`make rotate-keys` performs a real R1 **and** a real R2 against your local database, so the
+path is exercised routinely rather than for the first time on the day it is needed.
+
 Run the standard quality checks before handoff:
 
 ```bash
@@ -234,6 +255,17 @@ early and report `ok`, so a whole gate run could pass having proven nothing. The
 panic with an explanation. If you genuinely want to run without one — knowing it removes
 almost all of Moira's coverage — set `MOIRA_TEST_ALLOW_NO_DATABASE=1`; it is ignored when
 `CI=true`, and the skip line it prints still reds `scripts/gates.sh`.
+
+**The keyring-rotation gate does not honour that opt-out at all.** The rotation suite
+(`src/security/keyring_admin/tests.rs`) takes its database from
+`test_support::rotation_gate_database`, which returns a database or panics — so there is
+no early-return form for one of those tests to be written with, and no configuration in
+which they report success without having run. `scripts/rotation-gate.sh` (`make
+rotation-gate`, and the `rotation-gate` CI job) additionally asserts that a non-zero
+number of them **executed**, checked against the count declared in the source: deleting
+the module or renaming it out of the filter reds the gate rather than quietly removing
+the only proof that master-key rotation works. The reasoning is
+[`docs/decision-encryption-at-rest.md`](docs/decision-encryption-at-rest.md) §12.
 
 Validate database migrations against the local pgvector Postgres container when database behavior changes:
 

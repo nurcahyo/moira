@@ -243,6 +243,64 @@ jobs:
           security_foundation_migration_creates_contract_tables_when_configured
           -- --exact --nocapture
 
+  # ── The keyring-rotation gate, issue #138 ────────────────────────────────────────
+  #
+  # A job of its own, and NOT wired into the `rust` aggregator's `needs` — same
+  # reasoning the file already applies to `secret-scan` and `sast`. `rust` means "every
+  # Rust target ran and passed"; this means something narrower and more specific, and
+  # collapsing the two would make a red `rust` stop saying which.
+  #
+  # WHY IT IS NOT REDUNDANT WITH `rust-shard`. The shard that owns `__lib__` does run
+  # these tests. What it cannot do is notice that they DID NOT RUN.
+  # `docs/decision-encryption-at-rest.md` §12 names the largest risk to the whole
+  # envelope-encryption plan and it is not a missing test — it is a skipped one: a wrong
+  # or absent `MOIRA_TEST_DATABASE_URL` makes database-backed tests skip while reporting
+  # green, and the rotation tests are exactly the ones that would then never run. Delete
+  # the rotation module entirely and `rust-shard` stays green; `scripts/rotation-gate.sh`
+  # asserts a non-zero count of EXECUTED rotation tests against the count declared in the
+  # source, so it goes red.
+  #
+  # NOTE for branch protection: require `rotation-gate` as its own check. The name is
+  # stable and this is not a matrix job.
+  #
+  # No Redis service. These are lib tests over one table plus the five content tables;
+  # nothing here builds an `AppState`, and a service container nothing connects to is
+  # one more thing that can fail for a reason unrelated to what is being gated.
+  rotation-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: moira
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d moira"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # The role needs CREATEDB: the library harness migrates a private database per test
+      # process and never touches the one this URL names. `postgres` has it by default.
+      MOIRA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/moira
+      MOIRA_SECRETS__ALLOW_INSECURE_DEV_KEY: true
+      MOIRA_API_KEYS__ALLOW_INSECURE_DEV_PEPPER: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-test
+          # Reader only, like `rust-migrations`: this job builds one target and letting it
+          # save would publish a `target/` far thinner than the shards'.
+          save-if: false
+      # A script file, not an inline `cargo` line — same reason `ci-shard-run.sh` is one.
+      - run: scripts/rotation-gate.sh
+
   # The aggregator. Named `rust` because that is today's check name and the name the
   # EXECUTION-LEDGER's standing authority uses, and because it is invariant under
   # re-sharding: a future branch-protection rule can be written against it without
