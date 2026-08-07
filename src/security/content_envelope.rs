@@ -268,6 +268,26 @@ impl AadProfile {
         Self::ALL.into_iter().find(|profile| profile.id() == id)
     }
 
+    /// The `profile` label value on the three `moira_content_envelope_*` metric families.
+    ///
+    /// A name of its own rather than [`Self::table`] or [`Self::column`], and the reason is that
+    /// neither of those identifies a profile. `column` is not unique — three profiles are called
+    /// `content_encrypted` — and `table` is already a label key with a different closed domain
+    /// (the retention tables), so borrowing it would put two unrelated value sets behind one key.
+    ///
+    /// The domain is closed at five by [`Self::ALL`] and this `match` is exhaustive, so a sixth
+    /// encrypted column cannot widen the label set without someone naming it here. That is the
+    /// whole cardinality argument for `{profile}`: it is a compile-checked enum, not a string.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ConversationMessageContent => "conversation_message_content",
+            Self::ConversationSummaryText => "conversation_summary_text",
+            Self::MemoryRecordContent => "memory_record_content",
+            Self::RagDocumentVersionContent => "rag_document_version_content",
+            Self::RagChunkText => "rag_chunk_text",
+        }
+    }
+
     /// The table this profile's column lives in.
     pub const fn table(self) -> &'static str {
         match self {

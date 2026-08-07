@@ -53,6 +53,7 @@ use metrics_exporter_prometheus::{
     Matcher, PrometheusBuilder, PrometheusHandle, PrometheusRecorder,
 };
 use sqlx::PgPool;
+use uuid::Uuid;
 
 use crate::{
     domain::{ExecutionFailureClass, ExecutionStatus, ProviderType},
@@ -60,6 +61,7 @@ use crate::{
         LEADER_GATED_WORKERS, WORKER_JOB_NAMES,
         retention::{TABLE_IDEMPOTENCY_RECORDS, TABLE_RESPONSES},
     },
+    security::AadProfile,
 };
 
 // ---------------------------------------------------------------------------------------
@@ -211,21 +213,132 @@ const CONTENT_KEYRING_AGE_SECONDS: &str = "moira_content_keyring_age_seconds";
 // key is not loaded, so this process has nothing to count and a permanent `0` would invite the
 // reading that none exist.
 //
-// The three envelope counters `docs/decision-encryption-at-rest.md` names alongside this one —
-// seal, open, and open-failed — are NOT here. They were deferred because a counter wired to
-// nothing is the silently-inert shape (#125) this whole release exists to avoid, and were to
-// "arrive with their callers".
-//
-// **Their callers have now arrived and they have not.** The write and read paths for all five
-// sealed columns landed in issues #139, #140 and #141; no seal, open or open-failed counter was
-// added with them. So this is no longer a scheduling note, it is a disclosed observability gap:
-// a deployment can seal and open content today and see nothing but `moira_content_keyring_keys`.
-// The failure paths are not silent — every refusal emits a coded WARN and a coded error
-// (`src/security/content_access.rs`) — but there is no rate, and an operator cannot alert on
-// "opens started failing" without parsing logs. Closing it is a metrics-design change (three
-// counters, their label domains, and the cardinality argument for each) and belongs to its own
-// review, not to a write-path PR that would have added it as an afterthought.
+// The three envelope counters `docs/decision-encryption-at-rest.md` and #138 name alongside this
+// one — seal, open, and open-failed — follow immediately below. They were deferred in #138
+// because a counter wired to nothing is the silently-inert shape (#125) this whole release exists
+// to avoid, and were to "arrive with their callers"; the callers landed in #139, #140 and #141
+// and the counters did not, which is the gap #170 disclosed here and #171 closed.
 const CONTENT_KEYRING_KEYS: &str = "moira_content_keyring_keys";
+
+// The three content-envelope families (#171).
+//
+// Every one is incremented inside `src/security/content_access.rs`, which is the single seam
+// every repository seal and open passes through — not at a wrapper. `content_envelope.rs` itself
+// stays pure by construction (no I/O, no registry, nothing but bytes), so the counters live one
+// layer out, at the only place that knows both the profile and the keyring.
+//
+// What they add over the logs, stated precisely: a **rate**. Every refusal already emits a coded
+// WARN and a coded error, so no failure is silent — but "opens started failing" could not be
+// alerted on without parsing logs, and "has anything opened under key A recently" could only be
+// answered by `moira keyring usage <id>`, a sequential scan per table.
+
+/// `moira_content_envelope_seal_total{profile}` — envelopes successfully sealed.
+///
+/// `{profile}` is the five-variant [`AadProfile`] domain rendered by `AadProfile::label`,
+/// compile-checked and closed at five. All five are seeded at zero, so "content stopped being
+/// sealed" alerts on the condition rather than on a series vanishing.
+///
+/// Counts **successful** seals only, and there is deliberately no `..._seal_failed_total`
+/// alongside it. A seal is refused only when this process holds no writable content key, which
+/// is a keyring condition the `moira_content_keyring_*` families already carry in full; a second
+/// family for it would be a worse-resolved copy of `moira_content_keyring_keys{state="active"}`.
+const CONTENT_ENVELOPE_SEAL_TOTAL: &str = "moira_content_envelope_seal_total";
+
+/// `moira_content_envelope_open_total{profile,data_key_id}` — envelopes opened end to end.
+///
+/// Incremented only when the open **fully** succeeded: framing accepted, key resolved, tag
+/// verified, and the plaintext valid UTF-8. It and
+/// [`CONTENT_ENVELOPE_OPEN_FAILED_TOTAL`] are disjoint and exhaustive over every attempted open
+/// that reached a keyring — exactly one of the two moves per call, never both and never neither.
+/// A counter that ticked on the failure path too would look meaningful and would not be.
+///
+/// # `{data_key_id}` — the cardinality decision, stated rather than assumed
+///
+/// **The bound is enforced structurally, not documented and hoped for.** The value is
+/// `EnvelopeHeader::data_key_id` for an open that succeeded, and an open cannot succeed unless
+/// that id was found in the loaded `KeyringSnapshot` and yielded a content cipher. So the label
+/// domain is a subset of the key ids this process has carried in a snapshot — never a value read
+/// out of a blob.
+///
+/// That distinction is the security-relevant half. An envelope naming an unknown key is refused
+/// at `unknown_data_key` **before** this counter is touched, and that refusal is counted on the
+/// failure family, which carries no `data_key_id` label at all. Without that ordering, anyone
+/// holding database write access could mint a million random UUIDs into `*_encrypted` columns and
+/// turn the scrape path into the memory-exhaustion vector this module's header describes.
+///
+/// **What the bound actually is.** A snapshot carries every non-retired content key
+/// (`DataKeyState::is_carried_in_snapshot`), so the instantaneous domain is the size of the
+/// operator's live keyring — typically two during a rotation, one otherwise. Across the life of
+/// one process the series accumulate: a key retired at 10:00 keeps its series until restart,
+/// because a Prometheus counter is never withdrawn. The growth rate is therefore the rotation
+/// rate — one key per `data_key_rotation_days`, default **30** — and it is operator-controlled,
+/// not traffic-controlled. A process would have to run for years to reach two digits.
+///
+/// **Why a `data_key_id` label is admissible here when `application_id` is not.** A key id is
+/// minted by rotation, i.e. it is administrative configuration in the same class as `model_key`;
+/// an application id is caller-facing and grows with the tenant count. The header's rule is about
+/// where the value comes from, and these two come from opposite places.
+///
+/// Not seeded, for the same reason histograms are not: there is no key id at process start, and
+/// any seed would have to invent one. The first successful open creates the series — which is
+/// also precisely the signal the family exists to carry.
+const CONTENT_ENVELOPE_OPEN_TOTAL: &str = "moira_content_envelope_open_total";
+
+/// `moira_content_envelope_open_failed_total{profile,reason}` — opens that were refused.
+///
+/// # `{reason}` carries header discriminants and one opaque AEAD value, and nothing else
+///
+/// `/metrics` is closer to the wire than to the log. `src/security/content_access.rs` splits the
+/// two deliberately: a framing failure is decided from bytes anyone holding the ciphertext can
+/// already read, so its discriminant is safe to name; a tag failure gets **one** word, because
+/// distinguishing "wrong key" from "doctored blob" is an oracle. This family inherits that split
+/// verbatim — the values come from `envelope_error_discriminant` and the existing WARN
+/// literals, not from a taxonomy invented here — so `aead_open_failed` is the single terminal
+/// value for every AEAD refusal and nothing downstream of a failing `decrypt` reaches a label.
+///
+/// Nothing here is derived from ciphertext: `too_short` and `body_length_mismatch` are buffer
+/// lengths, the rest are fixed header fields, and `plaintext_not_utf8` is decided *after* the tag
+/// verified, so reaching it already required the key.
+///
+/// The domain is closed by [`CONTENT_ENVELOPE_OPEN_FAILURE_REASONS`]; an unrecognised string is
+/// folded into `other` rather than opening the label set at runtime.
+const CONTENT_ENVELOPE_OPEN_FAILED_TOTAL: &str = "moira_content_envelope_open_failed_total";
+
+/// The closed `reason` domain for `moira_content_envelope_open_failed_total`.
+///
+/// Public so `src/security/content_access.rs` can assert against it that every discriminant its
+/// read path can emit is admitted here — the one guard against this list and
+/// `envelope_error_discriminant` drifting apart, which would silently fold a new refusal into
+/// `other` and make it look like an unrecognised string.
+///
+/// The first eleven are the `ContentEnvelopeError` variants reachable while *opening*;
+/// `plaintext_too_large` and `aead_seal_failed` are absent because they are seal-only. The next
+/// four are keyring conditions decided before the cipher is reached, and they are named with the
+/// same strings their WARN lines already use. `other` is the terminal bucket.
+///
+/// `keyring_not_loaded` is deliberately **not** here, and the omission is disclosed rather than
+/// hidden: that refusal happens in a process with no keyring, which is a process with no
+/// `MetricsRegistry` reachable from the content seam and no database to hold sealed rows in the
+/// first place. It is counted nowhere; it is also unreachable in any deployment that has ever
+/// sealed anything.
+pub const CONTENT_ENVELOPE_OPEN_FAILURE_REASONS: &[&str] = &[
+    "too_short",
+    "bad_magic",
+    "unsupported_format_version",
+    "unsupported_algorithm",
+    "unsupported_key_mode",
+    "reserved_not_zero",
+    "unknown_aad_profile",
+    "body_length_mismatch",
+    "profile_mismatch",
+    "data_key_mismatch",
+    "aead_open_failed",
+    "unknown_data_key",
+    "wrong_purpose_data_key",
+    "abandoned_data_key",
+    "plaintext_not_utf8",
+    "other",
+];
 
 /// The closed `outcome` label domain for `moira_admin_invite_outcomes_total`.
 ///
@@ -552,6 +665,30 @@ impl MetricsRegistry {
                  counter: it is also the family that grows when the refresh task has died \
                  outright and is therefore raising nothing at all."
             );
+            describe_counter!(
+                CONTENT_ENVELOPE_SEAL_TOTAL,
+                "Content envelopes sealed, by AAD profile — one profile per encrypted column. \
+                 Successes only; a seal is refused only when this process holds no writable \
+                 content key, which the moira_content_keyring_* families already carry."
+            );
+            describe_counter!(
+                CONTENT_ENVELOPE_OPEN_TOTAL,
+                "Content envelopes opened end to end, by AAD profile and the data key that \
+                 protected them. This is how an operator watches an old key fall to zero before \
+                 retiring it, without the sequential scan `moira keyring usage` costs. The key id \
+                 comes from a header that already resolved against the loaded keyring, never from \
+                 an unrecognised blob, so the label domain is the live keyring rather than \
+                 anything an attacker can write."
+            );
+            describe_counter!(
+                CONTENT_ENVELOPE_OPEN_FAILED_TOTAL,
+                "Content envelopes refused on the read path, by AAD profile and a bounded reason. \
+                 The reason names a header discriminant, which is decided from bytes anyone \
+                 holding the ciphertext can already read; every AEAD failure collapses into the \
+                 single value aead_open_failed, because saying more would make this endpoint the \
+                 oracle the wire format refuses to be. Carries no data key id and no fragment of \
+                 the row."
+            );
 
             gauge!(DB_POOL_CONNECTIONS, "state" => "total").set(0.0);
             gauge!(DB_POOL_CONNECTIONS, "state" => "idle").set(0.0);
@@ -594,6 +731,22 @@ impl MetricsRegistry {
             }
             for event in ADMIN_IDENTITY_GRANT_EVENTS {
                 counter!(ADMIN_IDENTITY_GRANT_EVENTS_TOTAL, "event" => *event).increment(0);
+            }
+            // Both envelope families that *can* be seeded are, across their full closed domains:
+            // five profiles for seals, and five profiles times sixteen reasons for refusals. The
+            // eighty refusal series are the price of "opens started failing" being an alert on a
+            // rate rather than on a series appearing. `..._open_total` is absent from this loop on
+            // purpose — see its declaration; there is no key id to seed with.
+            for profile in AadProfile::ALL {
+                counter!(CONTENT_ENVELOPE_SEAL_TOTAL, "profile" => profile.label()).increment(0);
+                for reason in CONTENT_ENVELOPE_OPEN_FAILURE_REASONS {
+                    counter!(
+                        CONTENT_ENVELOPE_OPEN_FAILED_TOTAL,
+                        "profile" => profile.label(),
+                        "reason" => *reason
+                    )
+                    .increment(0);
+                }
             }
         });
     }
@@ -891,6 +1044,70 @@ impl MetricsRegistry {
                 #[allow(clippy::cast_precision_loss)]
                 gauge!(CONTENT_KEYRING_KEYS, "state" => *state).set(*count as f64);
             }
+        });
+    }
+
+    /// Counts one content envelope successfully sealed for `profile`.
+    ///
+    /// Takes the [`AadProfile`] rather than a string, so the label domain is the enum and no call
+    /// site can widen it. Called from `ContentSealer::seal_content` after the cipher returned the
+    /// bytes — a refusal counts nothing, because there is no seal-failure family and inflating
+    /// this one would make "content is being sealed" true on a deployment that sealed nothing.
+    pub fn record_content_envelope_seal(&self, profile: AadProfile) {
+        let profile = profile.label();
+        with_local_recorder(&self.inner.recorder, || {
+            counter!(CONTENT_ENVELOPE_SEAL_TOTAL, "profile" => profile).increment(1);
+        });
+    }
+
+    /// Counts one content envelope opened end to end, under the key that protected it.
+    ///
+    /// `data_key_id` **must** be the id of a key the caller resolved out of a loaded
+    /// [`KeyringSnapshot`](crate::security::KeyringSnapshot) — which, on the one call site, is
+    /// guaranteed by the open having succeeded through that snapshot's entry. Passing an id read
+    /// straight out of an unvalidated header would be the cardinality leak the family's
+    /// declaration explains at length; `Uuid` rather than `&str` is the type-level half of that
+    /// rule, the call-site ordering is the other half.
+    ///
+    /// Never called on a failure path. [`Self::record_content_envelope_open_failed`] is the other
+    /// half, and the two are mutually exclusive by construction.
+    pub fn record_content_envelope_open(&self, profile: AadProfile, data_key_id: Uuid) {
+        let profile = profile.label();
+        let data_key_id = data_key_id.to_string();
+        with_local_recorder(&self.inner.recorder, || {
+            counter!(
+                CONTENT_ENVELOPE_OPEN_TOTAL,
+                "profile" => profile,
+                "data_key_id" => data_key_id
+            )
+            .increment(1);
+        });
+    }
+
+    /// Counts one refused open, by `profile` and a bounded `reason`.
+    ///
+    /// `reason` is matched against [`CONTENT_ENVELOPE_OPEN_FAILURE_REASONS`] and anything else is
+    /// folded into `other`. Folding rather than dropping is deliberate: a refusal that vanished
+    /// entirely would make the failure rate read low for the one condition nobody anticipated.
+    ///
+    /// There is deliberately **no `data_key_id` here**. The failing blob's header names a key, and
+    /// the header is attacker-writable, so labelling with it would hand an unbounded value set to
+    /// the scrape path and would also publish which key a refused row claims — neither of which
+    /// the success counter's bound survives.
+    pub fn record_content_envelope_open_failed(&self, profile: AadProfile, reason: &str) {
+        let profile = profile.label();
+        let reason = CONTENT_ENVELOPE_OPEN_FAILURE_REASONS
+            .iter()
+            .find(|candidate| **candidate == reason)
+            .copied()
+            .unwrap_or("other");
+        with_local_recorder(&self.inner.recorder, || {
+            counter!(
+                CONTENT_ENVELOPE_OPEN_FAILED_TOTAL,
+                "profile" => profile,
+                "reason" => reason
+            )
+            .increment(1);
         });
     }
 
@@ -1303,6 +1520,21 @@ mod tests {
         // outcome of anything, and folding it into `outcome` would put two unrelated
         // domains behind one label key.
         "event",
+        // #171 — the three content-envelope families. Each is closed in code:
+        //
+        // * `profile` is `AadProfile::label`, a `const fn` over a five-variant enum.
+        // * `reason` is checked against `CONTENT_ENVELOPE_OPEN_FAILURE_REASONS` in
+        //   `record_content_envelope_open_failed`, with `other` as the terminal bucket.
+        // * `data_key_id` is the **only** identifier-shaped value on this list, and it is here on
+        //   a narrower argument than the rest: it is administrative configuration minted by
+        //   rotation (one per `data_key_rotation_days`, default 30), in the same class as
+        //   `model_key`, and the call site can only reach it through a key already resolved out of
+        //   the loaded keyring snapshot. It appears on `..._open_total` and nowhere else — never
+        //   on the failure family, whose blobs are attacker-writable. `application_id` remains
+        //   forbidden below and this does not soften that: the test asserting it is unchanged.
+        "profile",
+        "reason",
+        "data_key_id",
         "le",
         "quantile",
     ];
@@ -1993,6 +2225,116 @@ mod tests {
         assert!(rendered.contains(&format!(
             "{RUNTIME_INVALIDATIONS_TOTAL}{{service=\"moira-test\",channel=\"redis\"}} 0"
         )));
+    }
+
+    /// The three envelope families' label keys and values, checked at the registry.
+    ///
+    /// The *wiring* is asserted end to end in `tests/content_envelope_metrics.rs`, against a real
+    /// keyring; this covers the two properties that are the registry's own and would otherwise
+    /// need a database to reach: an unrecognised reason must fold into `other` rather than open
+    /// the label set, and `data_key_id` must appear on the success family and nowhere else.
+    #[test]
+    fn the_envelope_families_keep_their_label_domains_closed() {
+        let metrics = registry();
+        let key_id = "018f6b1e-0000-7000-8000-0000000000ff";
+        let data_key_id = Uuid::parse_str(key_id).expect("a valid uuid");
+
+        metrics.record_content_envelope_seal(AadProfile::ConversationMessageContent);
+        metrics.record_content_envelope_open(AadProfile::MemoryRecordContent, data_key_id);
+        metrics.record_content_envelope_open_failed(AadProfile::RagChunkText, "aead_open_failed");
+        // The shape of an invented reason: a rendered `Display` of the error, which carries the
+        // declared and actual body lengths. Exactly the sort of string a future call site would
+        // reach for, and exactly the sort that must not become a series.
+        metrics.record_content_envelope_open_failed(
+            AadProfile::RagChunkText,
+            "content envelope declares a 4096-byte body but carries 4095",
+        );
+
+        let rendered = metrics.render_prometheus("moira-test", true, true);
+        for key in label_keys(&rendered) {
+            assert!(
+                ALLOWED_LABEL_KEYS.contains(&key.as_str()),
+                "unexpected label key {key:?}:\n{rendered}"
+            );
+        }
+        assert!(
+            !rendered.contains("4096-byte"),
+            "an unrecognised reason must not reach a label value:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "{CONTENT_ENVELOPE_OPEN_FAILED_TOTAL}{{service=\"moira-test\",\
+                 profile=\"rag_chunk_text\",reason=\"other\"}} 1"
+            )),
+            "an unrecognised reason must be folded into `other`, not dropped:\n{rendered}"
+        );
+
+        // `data_key_id` belongs to the success family alone. The failure family's blobs are
+        // attacker-writable, so a key id there is an unbounded series set on the scrape path.
+        for line in rendered
+            .lines()
+            .filter(|line| line.contains("data_key_id="))
+        {
+            assert!(
+                line.starts_with(CONTENT_ENVELOPE_OPEN_TOTAL),
+                "data_key_id may only label {CONTENT_ENVELOPE_OPEN_TOTAL}: {line}"
+            );
+        }
+        assert!(
+            rendered.contains(&format!("data_key_id=\"{key_id}\"")),
+            "the open counter must carry the key that protected the row:\n{rendered}"
+        );
+
+        // Both seedable families are present from process start across their whole domain, so an
+        // alert on "seals stopped" or "opens started failing" fires on the condition rather than
+        // on a series that has not appeared yet.
+        for profile in AadProfile::ALL {
+            assert!(
+                rendered.contains(&format!(
+                    "{CONTENT_ENVELOPE_SEAL_TOTAL}{{service=\"moira-test\",\
+                     profile=\"{}\"}}",
+                    profile.label()
+                )),
+                "{} is missing its seeded seal series:\n{rendered}",
+                profile.label()
+            );
+            for reason in CONTENT_ENVELOPE_OPEN_FAILURE_REASONS {
+                assert!(
+                    rendered.contains(&format!(
+                        "{CONTENT_ENVELOPE_OPEN_FAILED_TOTAL}{{service=\"moira-test\",\
+                         profile=\"{}\",reason=\"{reason}\"}}",
+                        profile.label()
+                    )),
+                    "{}/{reason} is missing its seeded failure series:\n{rendered}",
+                    profile.label()
+                );
+            }
+        }
+    }
+
+    /// The five profile labels are distinct, which is what makes `{profile}` a partition rather
+    /// than an overlapping set. Two profiles sharing a label would merge two columns' rates.
+    #[test]
+    fn every_aad_profile_has_a_distinct_metric_label() {
+        let mut labels: Vec<&str> = AadProfile::ALL.iter().map(|p| p.label()).collect();
+        assert_eq!(labels.len(), 5, "the profile domain is closed at five");
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(
+            labels.len(),
+            5,
+            "two AadProfile variants share a metric label, so their series would merge"
+        );
+        // `column()` is *not* usable as this label — three profiles answer `content_encrypted` —
+        // which is why `label()` exists at all. Pinned so nobody simplifies it away.
+        let mut columns: Vec<&str> = AadProfile::ALL.iter().map(|p| p.column()).collect();
+        columns.sort_unstable();
+        columns.dedup();
+        assert!(
+            columns.len() < 5,
+            "if column names became unique, this test's premise changed; re-read why label() \
+             exists before collapsing the two"
+        );
     }
 
     /// The label keys the new families introduce must pass the cardinality gate.
