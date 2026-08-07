@@ -2850,12 +2850,15 @@ fn history_message_from_row(
 
 /// The conversation's row id and the active summary that covers it, if any.
 ///
-/// `conversation_summaries` has no writer yet — summarization is Sub-Phase E, deliberately not
-/// in this wave. The read is here anyway rather than stubbed to `None`, because the planner's
-/// drop-priority order places the summary *above* retrieved content, and wiring that ordering
-/// only once a writer exists would mean the ordering shipped untested. Today this reliably
-/// returns `None`, and the planner's summary branch is exercised by a fixture that inserts a
-/// row directly.
+/// This comment used to say `conversation_summaries` had no writer and that the read reliably
+/// returned `None`. That stopped being true when Sub-Phase E landed
+/// [`insert_conversation_summary`], and issue #139 makes it wrong a second way: the body it
+/// returns may have come out of `summary_text_encrypted` rather than `summary_text_plain`.
+///
+/// The lateral join is a `left` join, so a conversation with no summary yields NULL for every
+/// `s.*` column — including the two the AAD needs. The opener is therefore gated on `summary_id`
+/// being present rather than on the ciphertext being non-null: reading `covers_through_sequence`
+/// out of a summary-less row would be a decode error on an entirely ordinary conversation.
 pub(crate) async fn find_conversation_context_anchor(
     pool: &PgPool,
     opener: &dyn ContentOpener,
