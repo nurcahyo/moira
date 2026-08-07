@@ -1,35 +1,54 @@
-//! `memory_records` under `conversation_content_persistence = 'encrypted_content'`, and the
-//! `content_hash` oracle that sealing the body would otherwise leave wide open — issue #140.
+//! `memory_records` under every `conversation_content_persistence` value, and the `content_hash`
+//! guessing oracle — issue #140, widened to all four policy values by issue #168.
 //!
 //! # The hole this file exists to prove closed
 //!
-//! Since migration `0021`, `memory_records.content_hash` has been an **unkeyed SHA-256 of the
+//! Since migration `0021`, `memory_records.content_hash` was an **unkeyed SHA-256 of the
 //! plaintext**. Memory bodies are short, low-entropy and highly guessable — "user prefers dark
-//! mode", "user's timezone is Asia/Jakarta". Sealing `content_plain` while leaving an unkeyed
-//! digest of that same plaintext **in the same row** does not half-encrypt the memory; it does
-//! not encrypt it at all. A database dump plus a wordlist recovers every body without touching a
-//! key.
+//! mode", "user's timezone is Asia/Jakarta" — so that digest is an offline verifier: a database
+//! dump plus a wordlist recovers the body for free.
+//!
+//! #140 closed that for `encrypted_content`, where the digest sat beside its own ciphertext and
+//! undid the encryption outright. It **named the residual it left**: under `none` and
+//! `metadata_only` the row stores no body and still stored the unkeyed digest, so the operator who
+//! picked the strongest privacy value got the weakest outcome. #168 took that decision and keyed
+//! the digest under **all four** values, so there is no branch left that can select an unkeyed
+//! one.
 //!
 //! So `an_encrypted_memory_leaves_no_plaintext_in_the_raw_column` is necessary but nowhere near
 //! sufficient here, and that is the difference between this file and
-//! `tests/conversation_content_encryption.rs`. The load-bearing case is
-//! `a_sealed_memory_hash_is_keyed_and_is_not_the_digest_of_its_own_plaintext`.
+//! `tests/conversation_content_encryption.rs`. The load-bearing cases are
+//! `a_sealed_memory_hash_is_keyed_and_is_not_the_digest_of_its_own_plaintext` and
+//! `no_memory_row_carries_an_unkeyed_digest_under_any_policy`.
 //!
-//! # The two claims the design rests on, tested rather than asserted in prose
+//! # The claims the design rests on, tested rather than asserted in prose
 //!
 //! **`d1:` is unambiguous.** A `request_hash` value is unpadded base64url over a fixed 32-byte
-//! digest, so it can never contain `:` — migration `0021`'s own rule. The two forms therefore
-//! **miss, never falsely match**, and
-//! `a_plaintext_era_hash_and_a_sealed_era_hash_never_match_in_either_direction` drives both
-//! directions rather than reasoning about one.
+//! digest, so it can never contain `:` — migration `0021`'s own rule. A row written before the
+//! change and one written after it therefore **miss, never falsely match**, and
+//! `a_pre_change_unkeyed_hash_never_matches_a_keyed_hash_under_any_policy` drives both directions
+//! under every policy value rather than reasoning from one.
+//!
+//! **Dedupe still works where no body is stored.** `dedupe_still_matches_under_none_and_metadata_only`
+//! is the feature #168 put a key dependency on; if keying those arms had broken them, the honest
+//! answer would have been the issue's option 2 (drop the digest) rather than this.
 //!
 //! **The dedupe key rides master-key rotation.** It is a `content_data_keys` row wrapped by the
 //! master key, so a rotation re-wraps the envelope and the 32 bytes inside never change.
 //! `memory_dedupe_hashes_survive_a_master_key_rotation` performs a real rotation — rewrap, then
 //! a fresh `AppState` holding **only** the new master key — and asserts every stored
-//! `content_hash` is byte-identical afterwards. That is what dissolves F14's objection to a
-//! keyed hash on a table with no retention, and a test that never rotates would prove none of
-//! it.
+//! `content_hash` is byte-identical afterwards, over rows written under **all four** policies
+//! rather than trusting the sealed-only version of that test to generalise. That is what
+//! dissolves F14's objection to a keyed hash on a table with no retention, and a test that never
+//! rotates would prove none of it.
+//!
+//! # What #168 costs, and where that shows up here
+//!
+//! Keying every arm makes dedupe under `none` and `metadata_only` depend on a key those
+//! deployments have no other use for.
+//! `a_memory_write_with_no_keyring_is_refused_under_every_policy` is where that cost is visible as
+//! behaviour: a write that cannot key its digest is refused rather than falling back, under a
+//! policy that stores no body at all.
 
 mod support;
 
@@ -256,18 +275,82 @@ impl Case {
             .await
             .expect("count memories")
     }
+
+    /// `content_hash` straight out of the column, with no record type, no `StoredMemory` and no
+    /// repository function in the way.
+    ///
+    /// `read_row` would do, and that is exactly why this exists: the property #168 closes is
+    /// about **what is on disk**, so the assertion that proves it must not be able to be satisfied
+    /// by a wrapper that normalises, prefixes or re-derives anything on the way out.
+    async fn raw_stored_hash(&self, public_id: &str) -> String {
+        sqlx::query_scalar::<_, String>(
+            "select content_hash from memory_records where public_id = $1",
+        )
+        .bind(public_id)
+        .fetch_one(&self.fixture.pool)
+        .await
+        .expect("read content_hash as a raw column value")
+    }
+
+    /// How many rows of this application carry exactly `hash`. Used to ask "does the unkeyed
+    /// digest of this body appear **anywhere**", which is a stronger question than "is this row's
+    /// hash unkeyed".
+    async fn rows_with_hash(&self, hash: &str) -> i64 {
+        sqlx::query_scalar(
+            "select count(*) from memory_records where application_id = $1 and content_hash = $2",
+        )
+        .bind(self.fixture.application_id)
+        .bind(hash)
+        .fetch_one(&self.fixture.pool)
+        .await
+        .expect("count rows by hash")
+    }
+
+    /// A row in the form every memory carried before #168 — body in the clear, digest unkeyed —
+    /// inserted straight into the table because no writer in this build can produce one any more.
+    ///
+    /// That is the point. The cross-era assertions need a genuine pre-change value, and a value
+    /// produced by the current writer would prove nothing about the corpus already on disk.
+    async fn seed_pre_change_row(&self, content: &str) -> String {
+        let id = Uuid::now_v7();
+        let public_id = format!("mem_{id}");
+        sqlx::query(
+            "insert into memory_records \
+             (id, public_id, application_id, memory_scope, memory_type, content_plain, \
+              content_hash) \
+             values ($1, $2, $3, 'application', 'fact', $4, $5)",
+        )
+        .bind(id)
+        .bind(&public_id)
+        .bind(self.fixture.application_id)
+        .bind(content)
+        .bind(request_hash(content.as_bytes()))
+        .execute(&self.fixture.pool)
+        .await
+        .expect("seed a pre-#168 memory row");
+        public_id
+    }
 }
+
+/// Every value of the policy, written once so the tests that walk it cannot drift apart and
+/// quietly end up covering three. A fifth value has to be added here by hand — `ContentWrite`'s
+/// exhaustive matches are what make it a compile error in `src`, not this array.
+const EVERY_PERSISTENCE: [ConversationContentPersistence; 4] = [
+    ConversationContentPersistence::None,
+    ConversationContentPersistence::MetadataOnly,
+    ConversationContentPersistence::PlainContent,
+    ConversationContentPersistence::EncryptedContent,
+];
 
 // ---------------------------------------------------------------------------
 // Storage form
 // ---------------------------------------------------------------------------
 
 /// The premise. Every "no plaintext anywhere" assertion below passes trivially against a build
-/// that stores nothing at all, so the file needs one case proving the writer works — and one
-/// proving the *unsealed* digest is still the content address `0021` established, because
-/// changing that would orphan every existing row.
+/// that stores nothing at all, so the file needs one case proving the writer works — and, since
+/// #168, one proving the digest is keyed even where the body is *not* sealed.
 #[tokio::test]
-async fn plain_content_memories_keep_the_unkeyed_content_address() {
+async fn a_plain_content_memory_stores_its_body_and_still_keys_the_digest() {
     let Some(case) = Case::new().await else {
         return;
     };
@@ -283,17 +366,17 @@ async fn plain_content_memories_keep_the_unkeyed_content_address() {
         "plain_content must not also write the encrypted column; migration 0027's CHECK forbids \
          holding both"
     );
-    assert_eq!(
+    assert!(
+        stored.content_hash.starts_with(MEMORY_DEDUPE_HASH_PREFIX),
+        "since #168 the digest is keyed under every policy value, `plain_content` included — one \
+         rule with no branch, because a three-of-four rule leaves the arm a later edit widens \
+         back into an oracle. Got {}",
+        stored.content_hash
+    );
+    assert_ne!(
         stored.content_hash,
         request_hash(BODY.as_bytes()),
-        "an unsealed memory must keep the unkeyed content address; moving it would orphan every \
-         row already stored on a table that has no retention — finding F14 exactly"
-    );
-    assert!(
-        !stored.content_hash.contains(':'),
-        "a content address is base64url and can never contain `:`; the whole `d1:` argument \
-         rests on that, and this is where it is checked against a real stored value: {}",
-        stored.content_hash
+        "the stored digest is the unkeyed content address of its own body"
     );
 }
 
@@ -471,50 +554,175 @@ async fn dedupe_still_matches_between_two_sealed_memories_with_the_same_body() {
     assert_ne!(case.read_row(&unrelated.id).await.content_hash, first_hash);
 }
 
-/// **Both directions.** A plaintext-era hash must never find a sealed row, and a sealed-era hash
-/// must never find a plaintext row.
+/// **Both directions, under every policy value.** A pre-#168 unkeyed hash must never find a row
+/// this build wrote, and a hash this build wrote must never find a pre-#168 row — whichever
+/// policy that row was written under.
 ///
-/// One direction is not enough: a build that keyed *both* arms would pass "plaintext hash finds
-/// no sealed row" while breaking every stored value on the unsealed corpus.
+/// One direction is not enough: a build that had quietly gone *back* to the unkeyed address for
+/// some arm would pass "the old hash finds no new row" for the arms it did not touch while
+/// falsely matching on the one it did. Walking all four is what turns this from a claim about
+/// `encrypted_content` into the claim #168 actually makes.
+///
+/// The old-era row is seeded straight into the table because **no writer in this build can
+/// produce one**, which is the whole point: the corpus on a real deployment predates the change
+/// and nothing rewrites it.
 #[tokio::test]
-async fn a_plaintext_era_hash_and_a_sealed_era_hash_never_match_in_either_direction() {
+async fn a_pre_change_unkeyed_hash_never_matches_a_keyed_hash_under_any_policy() {
     let Some(case) = Case::new().await else {
         return;
     };
 
-    case.set_policy(ConversationContentPersistence::PlainContent)
-        .await;
-    let plain = case.create(BODY).await;
-    let plain_hash = case.read_row(&plain.id).await.content_hash;
+    for persistence in EVERY_PERSISTENCE {
+        // A distinct body per policy, so a match found below can only have come from this
+        // iteration's two rows and not from a neighbour's.
+        let body = format!("{BODY}-cross-era-{persistence:?}");
+        let unkeyed = request_hash(body.as_bytes());
+        let legacy = case.seed_pre_change_row(&body).await;
 
-    case.set_policy(ConversationContentPersistence::EncryptedContent)
-        .await;
-    let sealed = case.create(BODY).await;
-    let sealed_hash = case.read_row(&sealed.id).await.content_hash;
+        case.set_policy(persistence).await;
+        let fresh = case.create(&body).await;
+        let keyed = case.raw_stored_hash(&fresh.id).await;
 
-    assert_ne!(
-        plain_hash, sealed_hash,
-        "the two eras produced the same value for the same body, so one of them is not doing \
-         what it claims"
-    );
+        assert_ne!(
+            keyed, unkeyed,
+            "{persistence:?}: this build wrote the unkeyed content address of the body — the \
+             oracle #168 closed, reopened for this policy value"
+        );
+        assert!(
+            keyed.starts_with(MEMORY_DEDUPE_HASH_PREFIX),
+            "{persistence:?}: a keyed digest must carry the `d1:` marker so a reader can tell the \
+             eras apart, got {keyed}"
+        );
+        assert!(
+            !unkeyed.contains(':'),
+            "the `d1:` argument rests on a content address never containing `:`, and this is \
+             where that is checked against a real stored value: {unkeyed}"
+        );
 
-    // Direction one: the plaintext-era value finds the plaintext row and nothing else.
-    assert_eq!(
-        case.memories_matching(&plain_hash).await,
-        vec![plain.id.clone()],
-        "a plaintext-era hash matched a sealed row"
-    );
-    // Direction two: the sealed-era value finds the sealed row and nothing else.
-    assert_eq!(
-        case.memories_matching(&sealed_hash).await,
-        vec![sealed.id.clone()],
-        "a sealed-era hash matched a plaintext row"
-    );
+        // Direction one: the pre-change value finds the pre-change row and nothing else.
+        assert_eq!(
+            case.memories_matching(&unkeyed).await,
+            vec![legacy.clone()],
+            "{persistence:?}: a pre-#168 hash matched a row written after the change"
+        );
+        // Direction two: this build's value finds this build's row and nothing else.
+        assert_eq!(
+            case.memories_matching(&keyed).await,
+            vec![fresh.id.clone()],
+            "{persistence:?}: a keyed hash matched a pre-#168 row"
+        );
+    }
+}
 
-    // A **miss, never a false match** — which is only unambiguous because `:` cannot occur in a
-    // content address. Checked against the real stored values rather than restated.
-    assert!(sealed_hash.starts_with(MEMORY_DEDUPE_HASH_PREFIX));
-    assert!(!plain_hash.contains(':'));
+/// **The property issue #168 exists to establish: no unkeyed digest of memory content survives
+/// anywhere, under any policy.**
+///
+/// Every other case in this file could pass while one arm still wrote `request_hash`. This one
+/// asks the database directly — for each of the four values, is the body's unkeyed content
+/// address present in *any* row of this application — and asserts against the **raw column**
+/// through `raw_stored_hash`, not through `MemoryRecord` or any other wrapper that could
+/// normalise the answer.
+///
+/// It is deliberately the weakest-looking and hardest-to-fake assertion in the file: a build
+/// that keyed three arms and left one is red here and green almost everywhere else.
+#[tokio::test]
+async fn no_memory_row_carries_an_unkeyed_digest_under_any_policy() {
+    let Some(case) = Case::new().await else {
+        return;
+    };
+
+    for persistence in EVERY_PERSISTENCE {
+        let body = format!("{BODY}-no-oracle-{persistence:?}");
+        case.set_policy(persistence).await;
+        let record = case.create(&body).await;
+
+        let stored = case.raw_stored_hash(&record.id).await;
+        assert!(
+            stored.starts_with(MEMORY_DEDUPE_HASH_PREFIX),
+            "{persistence:?}: the raw stored digest is not keyed, got {stored}"
+        );
+        assert_ne!(
+            stored,
+            request_hash(body.as_bytes()),
+            "{persistence:?}: the raw stored digest is the unkeyed content address of the body. \
+             A memory body is short and guessable, so this single value is a dictionary attack \
+             on content the row may not even hold"
+        );
+        assert_eq!(
+            case.rows_with_hash(&request_hash(body.as_bytes())).await,
+            0,
+            "{persistence:?}: the unkeyed content address of this body appears in some row of \
+             this application. It does not matter which row wrote it — its presence anywhere is \
+             the oracle"
+        );
+
+        // And under the two values that store nothing, nothing is stored: the digest is the only
+        // thing left, which is exactly why keying it was the whole issue.
+        if !matches!(
+            persistence,
+            ConversationContentPersistence::PlainContent
+                | ConversationContentPersistence::EncryptedContent
+        ) {
+            let row = case.read_row(&record.id).await;
+            assert_eq!(row.content_plain, None, "{persistence:?} stored a body");
+            assert_eq!(
+                row.content_encrypted, None,
+                "{persistence:?} stored a sealed body"
+            );
+        }
+    }
+}
+
+/// Dedupe under `none` and `metadata_only` — the function #168 put a key dependency on.
+///
+/// If keying those arms had broken dedupe for them, the honest resolution would have been the
+/// issue's option 2 (drop the digest entirely there) rather than a key dependency bought for
+/// nothing. So this is not a nice-to-have alongside the security property; it is the thing that
+/// makes the security property's price worth paying, and it asserts the resubmission actually
+/// matches rather than merely hashing to something opaque.
+#[tokio::test]
+async fn dedupe_still_matches_under_none_and_metadata_only() {
+    let Some(case) = Case::new().await else {
+        return;
+    };
+
+    for persistence in [
+        ConversationContentPersistence::None,
+        ConversationContentPersistence::MetadataOnly,
+    ] {
+        let body = format!("{BODY}-bodyless-dedupe-{persistence:?}");
+        case.set_policy(persistence).await;
+
+        let first = case.create(&body).await;
+        let second = case.create(&body).await;
+        let first_hash = case.raw_stored_hash(&first.id).await;
+
+        assert_eq!(
+            first_hash,
+            case.raw_stored_hash(&second.id).await,
+            "{persistence:?}: the same body written twice produced two different digests, so \
+             exact dedupe cannot work at all for an application that stores no bodies"
+        );
+        let matched = case.memories_matching(&first_hash).await;
+        assert_eq!(
+            matched.len(),
+            2,
+            "{persistence:?}: the application-scoped exact-match lookup must find both rows; it \
+             found {matched:?}"
+        );
+        assert!(matched.contains(&first.id) && matched.contains(&second.id));
+
+        // The stored row really is bodyless, so this is dedupe over content the row does not
+        // hold — the shape the issue called close to a contradiction, kept working on purpose.
+        let row = case.read_row(&first.id).await;
+        assert_eq!(row.content_plain, None);
+        assert_eq!(row.content_encrypted, None);
+
+        // And a different body still does not match, so the equality above is content-dependent
+        // rather than a constant every bodyless row shares.
+        let other = case.create(&format!("{body}-different")).await;
+        assert_ne!(case.raw_stored_hash(&other.id).await, first_hash);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -536,6 +744,12 @@ async fn a_plaintext_era_hash_and_a_sealed_era_hash_never_match_in_either_direct
 ///    or not the rewrap did anything.
 ///
 /// A test that skipped step 2 would pass against a `rewrap` that was a no-op.
+///
+/// **Widened for #168.** The #140 version wrote sealed rows plus one plaintext row, and the
+/// plaintext row's hash was unkeyed — so it proved the rotation property for `encrypted_content`
+/// and merely proved the unkeyed arm was untouched for the rest. Now every policy value writes a
+/// keyed hash, so every policy value has something to lose in a rotation, and this walks all four
+/// rather than assuming the sealed case generalises.
 #[tokio::test]
 async fn memory_dedupe_hashes_survive_a_master_key_rotation() {
     let both = [("m-old", MASTER_A), ("m-new", MASTER_B)];
@@ -547,18 +761,32 @@ async fn memory_dedupe_hashes_survive_a_master_key_rotation() {
 
     let sealed = case.create(BODY).await;
     let second = case.create(SECOND_BODY).await;
+    // One row per remaining policy value, so a rotation that moved the digest for any of them
+    // fails here and names which. Under `none` and `metadata_only` the digest is the *only*
+    // content-derived thing the row holds, which makes orphaning it the whole loss rather than
+    // part of one.
     case.set_policy(ConversationContentPersistence::PlainContent)
         .await;
-    // A plaintext-era row too, so the assertion covers *every* hash in the table rather than
-    // only the keyed ones — a rotation that broke the unkeyed arm would be just as fatal.
     let plain = case.create("a memory stored in the clear").await;
+    case.set_policy(ConversationContentPersistence::None).await;
+    let bodyless = case.create("a memory whose body is not stored").await;
+    case.set_policy(ConversationContentPersistence::MetadataOnly)
+        .await;
+    let metadata_only = case.create("a memory kept as metadata only").await;
+
     let before = case.every_stored_hash().await;
-    assert_eq!(before.len(), 3, "premise: three rows to compare");
+    assert_eq!(
+        before.len(),
+        5,
+        "premise: one row per policy value plus a second sealed one, to compare"
+    );
     assert!(
         before
             .iter()
-            .any(|(_, hash)| hash.starts_with(MEMORY_DEDUPE_HASH_PREFIX)),
-        "premise: at least one keyed hash, or this test rotates past nothing"
+            .all(|(_, hash)| hash.starts_with(MEMORY_DEDUPE_HASH_PREFIX)),
+        "premise: since #168 every one of these is keyed, so every one of them has something a \
+         rotation could break. If any is unkeyed this test is rotating past the arm it is \
+         supposed to cover: {before:?}"
     );
 
     // --- the rotation -------------------------------------------------------------------
@@ -635,23 +863,24 @@ async fn memory_dedupe_hashes_survive_a_master_key_rotation() {
         .expect("a pre-rotation sealed memory must still read");
     assert_eq!(reread.content.as_deref(), Some(BODY));
 
-    // The other two rows are named so a failure says which one moved.
-    assert_eq!(
-        case.read_row(&second.id).await.content_hash,
-        before
-            .iter()
-            .find(|(id, _)| id == &second.id)
-            .expect("second row")
-            .1
-    );
-    assert_eq!(
-        case.read_row(&plain.id).await.content_hash,
-        before
-            .iter()
-            .find(|(id, _)| id == &plain.id)
-            .expect("plain row")
-            .1
-    );
+    // The other rows are named individually so a failure says which policy value moved, rather
+    // than only that the vectors differ.
+    for (label, id) in [
+        ("second sealed", &second.id),
+        ("plain_content", &plain.id),
+        ("none", &bodyless.id),
+        ("metadata_only", &metadata_only.id),
+    ] {
+        assert_eq!(
+            case.raw_stored_hash(id).await,
+            before
+                .iter()
+                .find(|(row_id, _)| row_id == id)
+                .unwrap_or_else(|| panic!("{label} row"))
+                .1,
+            "the {label} row's content_hash moved across the master-key rotation"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -677,7 +906,11 @@ async fn patch_memory_reseals_and_rewrites_the_hash_in_both_directions() {
     let record = case.create(BODY).await;
     let before = case.read_row(&record.id).await;
     assert_eq!(before.content_plain.as_deref(), Some(BODY));
-    assert!(!before.content_hash.contains(':'));
+    assert!(
+        before.content_hash.starts_with(MEMORY_DEDUPE_HASH_PREFIX),
+        "since #168 even a plain_content row is keyed, got {}",
+        before.content_hash
+    );
 
     case.set_policy(ConversationContentPersistence::EncryptedContent)
         .await;
@@ -727,15 +960,17 @@ async fn patch_memory_reseals_and_rewrites_the_hash_in_both_directions() {
         back.content_encrypted, None,
         "patching back to plaintext left the old ciphertext in place"
     );
-    assert_eq!(
+    assert_ne!(
         back.content_hash,
         request_hash(BODY.as_bytes()),
-        "a patch back to plaintext must restore the unkeyed content address, or the row stops \
-         deduping against every other plaintext row holding the same body"
+        "a patch back to plaintext dropped to the unkeyed content address. The body being in the \
+         clear again does not make its digest safe to hand out — since #168 there is no policy \
+         value that writes one"
     );
     assert_eq!(
         back.content_hash, before.content_hash,
-        "the round trip must land on exactly the value the row started with"
+        "the round trip must land on exactly the value the row started with, or a patched row \
+         stops deduping against every other row holding the same body"
     );
 }
 
@@ -743,12 +978,19 @@ async fn patch_memory_reseals_and_rewrites_the_hash_in_both_directions() {
 // Refusal
 // ---------------------------------------------------------------------------
 
-/// No usable key means **no row**, not a row with an unkeyed digest.
+/// No usable key means **no row**, not a row with an unkeyed digest — under every storage form,
+/// including the one that stores no body at all.
 ///
 /// The count is the assertion, not the error: an error *plus* a row would be strictly worse than
 /// either alone, and only counting can tell them apart.
+///
+/// **The `Omitted` case is #168's cost, made visible as behaviour.** Before #168 that write
+/// succeeded on a keyring-less process, because its digest needed no key. It now refuses, which
+/// is the honest consequence of the row's digest depending on one — and the reason
+/// `docs/security.md` states the key-loss dependency for `none` and `metadata_only` rather than
+/// leaving it to be discovered here.
 #[tokio::test]
-async fn a_sealed_memory_write_with_no_keyring_is_refused_and_writes_no_row() {
+async fn a_memory_write_with_no_keyring_is_refused_under_every_policy() {
     let Some(case) = Case::new().await else {
         return;
     };
@@ -760,61 +1002,86 @@ async fn a_sealed_memory_write_with_no_keyring_is_refused_and_writes_no_row() {
     let before = case.memory_count().await;
     assert_eq!(before, 1);
 
-    // A repository with no content keyring is a real constructor arm, not a test hook:
-    // `AppState` passes `None` whenever there is no database.
-    let repo = PgConversationRepository::new(case.fixture.pool.clone(), None);
-    let id = Uuid::now_v7();
-    let public_id = format!("mem_{id}");
-    let request = MemoryCreateRequest {
-        memory_type: MemoryType::Fact,
-        content: SECOND_BODY.to_string(),
-        importance: None,
-        confidence: None,
-        valid_until: None,
-        metadata: json!({}),
-    };
-    let error = repo
-        .create_memory(&MemoryInsert {
-            id,
-            public_id: &public_id,
-            application_id: case.fixture.application_id,
-            external_tenant_id: Some("tenant-140"),
-            external_user_id: Some("user-140"),
-            scope: moira::domain::MemoryScope::UserApplication,
-            request: &request,
-            content: ContentWrite::Encrypt(Zeroizing::new(SECOND_BODY.to_string())),
-        })
-        .await
-        .expect_err("a sealed memory write with no usable key must be refused");
+    // Every storage form a policy value can produce. `Plain` is included for the same reason the
+    // digest is keyed for it: leaving one arm untested is how one arm gets a fallback.
+    for (label, stored) in [
+        (
+            "Encrypt (encrypted_content)",
+            ContentWrite::Encrypt(Zeroizing::new(SECOND_BODY.to_string())),
+        ),
+        (
+            "Plain (plain_content)",
+            ContentWrite::Plain(SECOND_BODY.to_string()),
+        ),
+        ("Omitted (none / metadata_only)", ContentWrite::Omitted),
+    ] {
+        // A repository with no content keyring is a real constructor arm, not a test hook:
+        // `AppState` passes `None` whenever there is no database.
+        let repo = PgConversationRepository::new(case.fixture.pool.clone(), None);
+        let id = Uuid::now_v7();
+        let public_id = format!("mem_{id}");
+        let request = MemoryCreateRequest {
+            memory_type: MemoryType::Fact,
+            content: SECOND_BODY.to_string(),
+            importance: None,
+            confidence: None,
+            valid_until: None,
+            metadata: json!({}),
+        };
+        let outcome = repo
+            .create_memory(&MemoryInsert {
+                id,
+                public_id: &public_id,
+                application_id: case.fixture.application_id,
+                external_tenant_id: Some("tenant-140"),
+                external_user_id: Some("user-140"),
+                scope: moira::domain::MemoryScope::UserApplication,
+                request: &request,
+                content: stored,
+            })
+            .await;
+        let error = match outcome {
+            Ok(record) => panic!(
+                "{label}: a memory write with no usable dedupe key must be refused, but it wrote \
+                 {}",
+                record.id
+            ),
+            Err(error) => error,
+        };
 
-    assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        error.error_response(None).error.code,
-        "content_key_unavailable"
-    );
-    assert_eq!(
-        case.memory_count().await,
-        before,
-        "the refused write inserted a row anyway"
-    );
-    let leaked: i64 =
-        sqlx::query_scalar("select count(*) from memory_records where content_plain = $1")
-            .bind(SECOND_BODY)
-            .fetch_one(&case.fixture.pool)
-            .await
-            .expect("count leaked plaintext");
-    assert_eq!(leaked, 0, "the refused body was written as plaintext");
-    let addressed: i64 =
-        sqlx::query_scalar("select count(*) from memory_records where content_hash = $1")
-            .bind(request_hash(SECOND_BODY.as_bytes()))
-            .fetch_one(&case.fixture.pool)
-            .await
-            .expect("count leaked digests");
-    assert_eq!(
-        addressed, 0,
-        "the refused write left an unkeyed digest of its body behind — the body itself was not \
-         stored, but the digest alone is the guessing oracle this design closes"
-    );
+        assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE, "{label}");
+        assert_eq!(
+            error.error_response(None).error.code,
+            "content_key_unavailable",
+            "{label}"
+        );
+        assert_eq!(
+            case.memory_count().await,
+            before,
+            "{label}: the refused write inserted a row anyway"
+        );
+        let leaked: i64 =
+            sqlx::query_scalar("select count(*) from memory_records where content_plain = $1")
+                .bind(SECOND_BODY)
+                .fetch_one(&case.fixture.pool)
+                .await
+                .expect("count leaked plaintext");
+        assert_eq!(
+            leaked, 0,
+            "{label}: the refused body was written as plaintext"
+        );
+        let addressed: i64 =
+            sqlx::query_scalar("select count(*) from memory_records where content_hash = $1")
+                .bind(request_hash(SECOND_BODY.as_bytes()))
+                .fetch_one(&case.fixture.pool)
+                .await
+                .expect("count leaked digests");
+        assert_eq!(
+            addressed, 0,
+            "{label}: the refused write left an unkeyed digest of its body behind — the body \
+             itself was not stored, but the digest alone is the guessing oracle this design closes"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

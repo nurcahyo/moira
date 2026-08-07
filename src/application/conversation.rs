@@ -1513,20 +1513,21 @@ impl ConversationService {
                     continue;
                 }
             };
-            // The storage form is decided *before* the dedupe lookup, because it decides which
-            // digest that lookup compares. Computing the hash first and the form afterwards
-            // would let an encrypted-policy application dedupe against the unkeyed address and
-            // then store the keyed one — two formats in one table, silently.
+            // The storage form and the digest are now independent — since issue #168 the digest
+            // is keyed under every policy value, so there is one format in this table and no
+            // ordering hazard between deciding the column and computing the hash. Both are still
+            // computed from the same `candidate.content`, which is what keeps the value the
+            // lookup below compares equal to the value the insert stores.
             let stored = ContentWrite::under_policy(persistence, candidate.content.clone());
             let content_hash = match self
                 .state
                 .content_access()
-                .memory_content_hash(&stored, &candidate.content)
+                .memory_content_hash(&candidate.content)
             {
                 Ok(hash) => hash,
-                // No usable dedupe key under an encrypted policy. Rejected rather than written:
-                // the alternative is an unkeyed digest of a short, guessable body sitting beside
-                // its own ciphertext, which is the whole hole this key closes.
+                // No usable dedupe key. Rejected rather than written under any policy: the
+                // alternative is an unkeyed digest of a short, guessable body, which is a
+                // dictionary-attack oracle whether or not the row also holds that body.
                 Err(_) => {
                     rejected += 1;
                     *rejections.entry("dedupe_key_unavailable").or_default() += 1;

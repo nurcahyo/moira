@@ -1254,11 +1254,12 @@ async fn an_exact_repeat_is_deduped_with_no_embedding_to_fall_back_on() {
 ///
 /// # Why this is not covered by the case above
 ///
-/// Under `encrypted_content` the dedupe compares a *different value*: a keyed HMAC prefixed
-/// `d1:`, not the unkeyed content address. The two are computed on different branches of
-/// `ContentSealer::memory_content_hash`, and the lookup happens **before** the insert, so a
-/// build that hashed one way for the lookup and another way for the row would write a duplicate
-/// every single turn while every plaintext case in this file stayed green.
+/// The value compared is the keyed HMAC prefixed `d1:` — under every policy since issue #168,
+/// so this no longer differs from the plaintext case in *which* digest it compares. What it
+/// still adds is the sealed row itself: the lookup happens **before** the insert, and only a
+/// case that seals proves the body reached the extractor at all (`find_recent_messages` has to
+/// open the sealed transcript first). A build that failed there would write no memory rather
+/// than a duplicate, and "one row" below would quietly mean "zero writes".
 ///
 /// Embeddings are off for the same reason the case above turns them off: with the near-duplicate
 /// path available, a broken exact check is invisible.

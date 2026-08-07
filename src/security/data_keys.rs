@@ -102,7 +102,8 @@ pub(super) const KEYRING_BOOTSTRAP_LOCK_KEY: i64 = i64::from_be_bytes(*b"moiraky
 /// The `purpose` new content writes are sealed under.
 const PURPOSE_CONTENT: &str = "content";
 
-/// The `purpose` of the one key that keys `memory_records.content_hash` for sealed rows.
+/// The `purpose` of the one key that keys `memory_records.content_hash` — for every row since
+/// issue #168, for sealed rows only before it.
 const PURPOSE_MEMORY_DEDUPE: &str = "memory_dedupe";
 
 /// `key_check_value = HMAC-SHA256(dek, KEY_CHECK_VALUE_LABEL)[..8]`.
@@ -176,17 +177,24 @@ impl DataKeyPurpose {
 /// equality comparison. There is no third value either could take that makes them collide.
 pub const MEMORY_DEDUPE_HASH_PREFIX: &str = "d1:";
 
-/// Keys `memory_records.content_hash` for rows whose body is sealed.
+/// Keys `memory_records.content_hash` — under every content-persistence policy since issue #168,
+/// and for sealed rows only between #140 and #168.
 ///
 /// # Why this exists at all
 ///
-/// `memory_records.content_hash` is an **unkeyed** SHA-256 of the memory body (migration
+/// `memory_records.content_hash` was an **unkeyed** SHA-256 of the memory body (migration
 /// `0021`). Memory records are short, low-entropy and highly guessable — "user prefers dark
-/// mode", "user's timezone is Asia/Jakarta". Sealing `content_plain` while leaving an unkeyed
-/// digest of that same plaintext **in the same row** defeats the encryption completely: a
-/// database dump plus a wordlist recovers the content without touching a key. This is the
-/// argument `crate::security::idempotency`'s module doc already makes for a sibling column, and
-/// the one `0021` anticipated when it refused to recompute hashes for encrypted rows.
+/// mode", "user's timezone is Asia/Jakarta" — so that digest is an offline verifier: a database
+/// dump plus a wordlist recovers the content without touching a key. Beside a sealed body it
+/// defeated the encryption completely, which is what #140 closed. Beside **no body at all** —
+/// policy `none` or `metadata_only` — it was an oracle for content the operator had explicitly
+/// chosen not to store, which is what #168 closed. This is the argument
+/// `crate::security::idempotency`'s module doc already makes for a sibling column, and the one
+/// `0021` anticipated when it refused to recompute hashes for encrypted rows.
+///
+/// The widening has a price, and it is named here rather than only in `docs/security.md`: every
+/// deployment now depends on this key for dedupe, including ones that keep no bodies. See
+/// [`crate::security::ContentSealer::memory_content_hash`].
 ///
 /// # Why the key is a keyring row and not a pepper
 ///
@@ -417,7 +425,7 @@ pub struct KeyringSnapshot {
     /// cipher already carries its `data_key_id` and stamps it into every envelope it seals, so a
     /// separate copy of the id would be a second source of truth that can only ever be wrong.
     active_content: Arc<ContentCipher>,
-    /// The key that digests `memory_records.content_hash` for sealed rows.
+    /// The key that digests `memory_records.content_hash` for every memory row.
     ///
     /// `Option`, where [`Self::active_content`] is not, and the asymmetry is deliberate. A
     /// keyring with no writable content key cannot store anything and is a boot refusal
@@ -447,8 +455,8 @@ impl KeyringSnapshot {
         self.active_content.data_key_id()
     }
 
-    /// The hasher keyed `memory_records.content_hash` for sealed rows, if this keyring carries
-    /// one. See [`MemoryDedupeHasher`] for why it is never rotated.
+    /// The hasher that keys `memory_records.content_hash` for every memory row, if this keyring
+    /// carries one. See [`MemoryDedupeHasher`] for why it is never rotated.
     pub fn active_memory_dedupe(&self) -> Option<Arc<MemoryDedupeHasher>> {
         self.active_memory_dedupe.clone()
     }
@@ -768,7 +776,7 @@ impl ContentKeyring {
         self.snapshot().active_content()
     }
 
-    /// The hasher that keys `memory_records.content_hash` for sealed rows.
+    /// The hasher that keys `memory_records.content_hash` for every memory row.
     pub fn active_memory_dedupe(&self) -> Option<Arc<MemoryDedupeHasher>> {
         self.snapshot().active_memory_dedupe()
     }
@@ -1187,8 +1195,9 @@ impl ContentKeyring {
             custody_backend = custody.backend_name(),
             master_key_id = custody.active_master_key_id(),
             key_check_value = %format_key_check_value(&check_value),
-            "minted the memory dedupe key. It keys `memory_records.content_hash` for rows whose \
-             body is sealed, and it is NOT ROTATED BY DESIGN: master-key rotation re-wraps this \
+            "minted the memory dedupe key. It keys `memory_records.content_hash` for every \
+             memory row under every content-persistence policy, and it is NOT ROTATED BY \
+             DESIGN: master-key rotation re-wraps this \
              envelope and leaves every stored hash byte-identical, which is the property that \
              makes a keyed hash safe on a table with no retention. Rotating this key instead \
              would cost a one-time, permanent loss of dedupe across the rotation boundary — a \

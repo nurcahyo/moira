@@ -44,12 +44,11 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::{
-    domain::ContentWrite,
     error::AppError,
     infra::metrics::MetricsRegistry,
     security::{
         ContentCipher, ContentEnvelopeError, ContentIdentity, ContentKeyring, KeyringError,
-        KeyringSnapshot, request_hash,
+        KeyringSnapshot,
     },
 };
 use tracing::warn;
@@ -79,65 +78,78 @@ pub trait ContentSealer: Send + Sync {
         plaintext: &str,
     ) -> Result<Vec<u8>, AppError>;
 
-    /// The `memory_records.content_hash` a row must carry, given the form its body is stored in.
+    /// The `memory_records.content_hash` a row must carry. **Keyed, under every policy value.**
     ///
-    /// # Why this lives on the sealer and takes a [`ContentWrite`]
+    /// # Why this takes no storage form — issue #168
     ///
-    /// The hash and the body are **one decision**. A row whose body is sealed but whose hash is
-    /// the unkeyed content address is not a partially-encrypted row, it is an unencrypted one
-    /// with extra steps: memory bodies are short and guessable, so a dump plus a wordlist
-    /// recovers them from the digest alone. Putting the choice behind the same object that seals,
-    /// keyed off the same value that decided the column, is what makes the two unable to
-    /// disagree.
+    /// It used to take a [`ContentWrite`](crate::domain::ContentWrite) and branch on it: keyed
+    /// under `encrypted_content`, the unkeyed content address under everything else. Issue #140
+    /// closed the oracle for sealed rows and **named the residual it left**; issue #168 is the
+    /// decision that closed the rest of it.
     ///
-    /// The `match` on [`ContentWrite`] is exhaustive with no catch-all, so a fourth variant does
-    /// not compile until somebody says which digest it gets — the same property
-    /// [`ContentWrite::under_policy`] buys at the write sites.
+    /// The residual was this. A memory body is short, low-entropy and highly guessable — "user
+    /// prefers dark mode", "user's timezone is Asia/Jakarta". An unkeyed digest of such a body is
+    /// an offline verifier: a database dump plus a wordlist recovers the content for free. Under
+    /// `none` and `metadata_only` the row stores **no body at all** and still stored that digest,
+    /// so an operator who selected the strongest privacy value got a *weaker* outcome than one who
+    /// selected `encrypted_content`, and nothing told them.
     ///
-    /// # `Omitted` and `Plain` keep the unkeyed content address — finding F14, still standing
+    /// So there is no longer a parameter that could select an unkeyed digest, because there is no
+    /// longer a branch. That is deliberate and is the strongest available form of the property:
+    /// the cheapest edit that reopens the oracle is now replacing this call with
+    /// [`request_hash`](crate::security::request_hash) outright, which no reader mistakes for a
+    /// refactor.
     ///
-    /// `migrations/0021` moved this column off `IdempotencyHasher` for a reason that has not
-    /// changed. That hasher verifies only against the *active* pepper, and justifies the
-    /// narrowness with a retention argument: every `idempotency_records` row expires within 24
-    /// hours. **`memory_records` has no retention** — a nullable `valid_until`, a `status` that
-    /// stays `'active'` indefinitely — so a rotation there would not open a bounded window, it
-    /// would permanently orphan every stored hash and exact-match dedupe would stop matching
-    /// with no error and no log line. Keying the unsealed arms would re-create that, and gain
-    /// nothing: a row whose body is already in the clear is not protected by hiding its digest.
+    /// `plain_content` is keyed too, one step past what #168 strictly asked. A row whose body sits
+    /// in the clear in the adjacent column is not *protected* by keying its digest — but a
+    /// three-of-four rule leaves a branch, a branch is where the next unkeyed arm gets added back,
+    /// and "the memory digest is keyed, always" is a sentence an operator can hold. The cost is
+    /// paid in full below rather than netted off.
     ///
-    /// The three-clause admitting rule plan 11 wrote for `rag_chunks.chunk_hash` still holds for
-    /// the unkeyed arms, and is applied **per table**, which is `0021`'s own words:
+    /// # What this costs, stated rather than implied
     ///
-    /// * **(a) not caller-visible.** [`crate::domain::MemoryRecord`] has no `content_hash` field
-    ///   and no schema in `docs/openapi.json` carries one for a memory. `ConversationMessageRecord`
-    ///   does, which is why *that* column stays peppered.
-    /// * **(b) never a caller-supplied lookup key.** `MemoryCreateRequest`, `MemoryPatchRequest`
-    ///   and `MemoryQuery` all carry `deny_unknown_fields` and none has a hash field.
-    /// * **(c) never a cross-application comparison.** Every `memory_records` read is bound by
-    ///   `application_id` through `MEMORY_SCOPE_PREDICATE`, which
-    ///   `every_memory_read_shares_the_isolation_predicate` asserts against the emitted SQL.
+    /// **Every deployment now depends on the `memory_dedupe` key for dedupe to keep working** —
+    /// including `none` and `metadata_only` deployments, on rows whose bodies they deliberately do
+    /// not keep. If that key is lost (the keyring's `abandon` path), exact-match dedupe breaks for
+    /// those rows too, even though no plaintext was ever at risk because none was stored. Memories
+    /// then accumulate one duplicate per distinct body. `docs/security.md` states this at the same
+    /// volume; it is a real trade, taken knowingly.
     ///
-    /// # Why `Encrypt` is the exception
+    /// It costs less than F14 feared, and the reason is the key's custody rather than an argument
+    /// about likelihood. F14 rejected a *peppered* hash here because `memory_records` has **no
+    /// retention** — a nullable `valid_until`, a `status` that stays `'active'` indefinitely — so a
+    /// pepper rotation permanently orphans every stored digest with no error and no log line. A
+    /// `content_data_keys` row is different in kind: it is wrapped by the master key, so a
+    /// master-key rotation re-wraps the envelope and the 32 bytes inside are unchanged. Every
+    /// stored `content_hash` stays byte-identical.
+    /// `memory_dedupe_hashes_survive_a_master_key_rotation` proves that against a real database,
+    /// across more than one policy value, rather than trusting that #140's single-policy version
+    /// generalises.
     ///
-    /// Clause (a) is about who holds the digest. Encryption changes the question: a **database
-    /// dump** now holds the digest and the ciphertext, and a memory body is short and
-    /// low-entropy — "user prefers dark mode". The unkeyed address is then a complete bypass of
-    /// the encryption, no key required. `0021` anticipated exactly this and refused to recompute
-    /// hashes for encrypted rows; this is the reversal it anticipated, restricted to the rows
-    /// that need it so the unsealed corpus keeps matching.
+    /// # What did not change
+    ///
+    /// The `d1:` prefix, its collision-safety argument, and the two-era behaviour. A
+    /// `request_hash` value is unpadded base64url over a fixed 32-byte digest and can never
+    /// contain `:` — migration `0021`'s own rule — so a row written before this change and a row
+    /// written after it **miss, never falsely match**. No rewrite of existing rows is required;
+    /// what is required is announcing that unsealed applications get one duplicate per re-stated
+    /// memory across the boundary, exactly as sealed ones did at #140.
+    ///
+    /// Also unchanged: `content_size_bytes`, `token_count`, and whether a body is stored at all.
+    /// This is a decision about the digest and nothing else.
     ///
     /// # Reversal condition
     ///
-    /// Move the unsealed arms to a keyed digest too — and pair that with a re-hash-on-rotation
-    /// procedure, because the lifetime problem does not go away — the moment any one of the
-    /// three clauses stops holding: `content_hash` appears on a caller-visible DTO, a lookup
-    /// accepts a caller-supplied hash, or a dedupe query drops the `application_id` predicate.
+    /// Drop the digest entirely under `none` and `metadata_only` — the issue's option 2 — if the
+    /// key-loss dependency ever proves worse than losing dedupe for applications that store no
+    /// body. That is a coherent position: a stable digest of a body you refused to store is close
+    /// to a contradiction. It was not taken because dedupe under those policies is a working
+    /// feature today and removing it is the larger behaviour change of the two.
     ///
-    /// Refuses with `content_key_unavailable` when a sealed body has no dedupe key to hash
-    /// under. **There is no arm that falls back to the unkeyed address**; that fallback is the
-    /// hole this function exists to close.
-    fn memory_content_hash(&self, stored: &ContentWrite, content: &str)
-    -> Result<String, AppError>;
+    /// Refuses with `content_key_unavailable` when there is no active `memory_dedupe` key.
+    /// **There is no arm that falls back to the unkeyed address**; that fallback is the hole this
+    /// function exists to close.
+    fn memory_content_hash(&self, content: &str) -> Result<String, AppError>;
 }
 
 /// A [`ContentOpener`] and [`ContentSealer`] backed by a live [`ContentKeyring`].
@@ -276,31 +288,21 @@ impl ContentSealer for KeyringContentAccess {
         Ok(sealed)
     }
 
-    fn memory_content_hash(
-        &self,
-        stored: &ContentWrite,
-        content: &str,
-    ) -> Result<String, AppError> {
-        match stored {
-            ContentWrite::Omitted | ContentWrite::Plain(_) => Ok(request_hash(content.as_bytes())),
-            ContentWrite::Encrypt(_) => {
-                let hasher = self
-                    .keyring
-                    .as_ref()
-                    .and_then(|keyring| keyring.active_memory_dedupe())
-                    .ok_or_else(|| {
-                        warn!(
-                            reason = "no_active_memory_dedupe_key",
-                            "refusing to store a sealed memory: this keyring carries no active \
-                             `memory_dedupe` key, and writing the unkeyed content address beside \
-                             a sealed body would make the ciphertext recoverable from a database \
-                             dump plus a wordlist"
-                        );
-                        content_key_unavailable()
-                    })?;
-                Ok(hasher.hash(content.as_bytes()))
-            }
-        }
+    fn memory_content_hash(&self, content: &str) -> Result<String, AppError> {
+        let hasher = self
+            .keyring
+            .as_ref()
+            .and_then(|keyring| keyring.active_memory_dedupe())
+            .ok_or_else(|| {
+                warn!(
+                    reason = "no_active_memory_dedupe_key",
+                    "refusing to store a memory: this keyring carries no active `memory_dedupe` \
+                     key, and the unkeyed content address of a short, guessable memory body is a \
+                     dictionary-attack oracle against content this row may not even hold"
+                );
+                content_key_unavailable()
+            })?;
+        Ok(hasher.hash(content.as_bytes()))
     }
 }
 

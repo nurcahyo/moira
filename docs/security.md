@@ -214,7 +214,8 @@ Also not protected, and each for its own recorded reason:
 - **`rag_document_versions.content_hash` and `rag_chunks.chunk_hash`** are unkeyed digests. A
   whole document or a thousand-character chunk is not a guessable-plaintext oracle, so this is a
   decision rather than an oversight; see the next section for the per-table reasoning, including
-  the two columns where it goes the other way.
+  the two columns where it goes the other way — `conversation_messages.content_hash`, which is
+  peppered, and `memory_records.content_hash`, which is keyed under every policy value.
 - **Caller-supplied `metadata`** is the caller's own JSON, not something derived from the body,
   and is retained under every policy value.
 - **Provider credentials** are not on this key hierarchy. They use `LocalSecretCipher` and
@@ -248,17 +249,18 @@ plaintext comes from a short list.
 | Column | Construction | Why |
 |---|---|---|
 | `conversation_messages.content_hash` | **peppered** — `IdempotencyHasher`, `"{pepper_version}:{base64url}"` | It is **returned to callers** on `ConversationMessageRecord`. An unkeyed digest handed out over the API is an offline verifier for content the schema expects to be able to hold encrypted, and every holder gets one. Migration `0021` deliberately left it alone for exactly this reason. |
-| `memory_records.content_hash`, rows stored **encrypted** | **keyed** — `"d1:" + base64url(HMAC-SHA256(K_dedupe, content))` | Memory bodies are short, low-entropy and highly guessable ("user prefers dark mode", "user's timezone is Asia/Jakarta"). Sealing the body while leaving an unkeyed digest of that same body **in the same row** defeats the encryption completely: a database dump plus a wordlist recovers it without touching a key. |
-| `memory_records.content_hash`, rows stored **plain** or **omitted** | **unkeyed** — `request_hash`, a bare SHA-256 as base64url | Nothing is protected by hiding the digest of a body that is already in the clear in the adjacent column. And keying it would re-create finding F14: `memory_records` has no retention, so a key change orphans every stored digest permanently and exact-match dedupe stops matching with no error and no log line. |
+| `memory_records.content_hash`, **under all four persistence values** | **keyed** — `"d1:" + base64url(HMAC-SHA256(K_dedupe, content))` | Memory bodies are short, low-entropy and highly guessable ("user prefers dark mode", "user's timezone is Asia/Jakarta"), so an unkeyed digest of one is a dictionary-attack oracle whatever the row stores. Beside a sealed body it defeated the encryption outright. Beside **no body at all** — `none`, `metadata_only` — it was an oracle for content the operator had explicitly chosen not to keep, which made the strongest privacy value the weakest outcome. Issue #140 keyed the first case; issue #168 keyed the rest. |
 | `rag_document_versions.content_hash`, `rag_chunks.chunk_hash` | **unkeyed** | A whole document, or a thousand-character chunk, is not a guessable-plaintext oracle. There is no wordlist for it. These are also write-only fingerprints today — nothing recomputes and compares them. They now sit **beside a sealed body** (issue #141), which is the condition that flipped the memory column to a keyed digest; the entropy argument is what makes the answer different here, and it is the thing to re-check if chunking ever produces short, formulaic chunks. |
 
 Two consequences worth stating plainly:
 
-- **The two memory forms can only miss, never falsely match.** `d1:` contains a `:`, and a
+- **A memory row written before its era's change can only miss, never falsely match.** `d1:`
+  contains a `:`, and a
   `request_hash` value is unpadded base64url over a fixed 32-byte digest — alphabet `A-Za-z0-9-_`,
-  43 characters, no `:`, which is migration `0021`'s own rule. An application that switches its
-  persistence policy therefore accumulates at most one duplicate per re-stated memory across the
-  boundary; it never dedupes a sealed memory onto an unsealed one or the reverse.
+  43 characters, no `:`, which is migration `0021`'s own rule. Rows written before their era's
+  change kept their unkeyed value and are not rewritten, so an application whose corpus straddles
+  the boundary accumulates at most one duplicate per re-stated memory; it never dedupes an
+  old-form row onto a new-form one or the reverse.
 - **The dedupe key rides master-key rotation.** It is a `content_data_keys` row with
   `purpose = 'memory_dedupe'`, wrapped by the master key like every content key. Rotating the
   master key re-wraps the envelope; the 32 bytes inside are unchanged, so every stored
@@ -268,10 +270,40 @@ Two consequences worth stating plainly:
   consequence is a documented one-time loss of cross-era dedupe — duplicates, not errors — and
   nothing will report it.
 
-One residual is recorded rather than hidden: under `none` and `metadata_only` no body is stored
-but the unkeyed digest still is, so those rows remain a guessing oracle for the memory content
-they no longer hold. Closing it means keying those arms too, which costs the F14 property above;
-it is a separate decision and has not been taken.
+### What keying every arm costs (issue #168)
+
+The residual this section used to record — under `none` and `metadata_only` no body was stored but
+the unkeyed digest still was, so those rows stayed a guessing oracle for content they no longer
+held — is closed. It was closed by widening the keyed digest to every policy value, and that
+purchase has a price which is written here rather than left implicit:
+
+> **`none` and `metadata_only` deployments now depend on the `memory_dedupe` key surviving, for
+> the dedupe function to keep working on rows whose bodies they deliberately do not keep.** If
+> that key is ever lost — the keyring's `abandon` path — exact-match dedupe breaks for those rows
+> too, even though no plaintext was ever at risk, because none was stored. Memories then
+> accumulate one duplicate per distinct body. `plain_content` deployments take the same
+> dependency; they were keyed as well, so that no policy value is left with a branch that a later
+> edit could widen back into an oracle.
+
+Three things bound that cost, and none of them removes it:
+
+- The key is a wrapped keyring row, not a deployment pepper, so the routine operation — master-key
+  rotation — leaves every stored `content_hash` byte-identical. This is the property F14's
+  objection turned on, it is why "keyed" is affordable here at all, and it is proved against a real
+  database across more than one policy value rather than assumed to generalise from the sealed
+  case.
+- Nothing rotates the dedupe key. Losing it requires losing the master key that wraps it and
+  acknowledging that loss with `keyring abandon`.
+- A write that cannot key its digest is **refused** (`content_key_unavailable`, 503) rather than
+  falling back to the unkeyed address. Under `none` and `metadata_only` that refusal is now
+  reachable where it was not before — the honest consequence of the row's digest depending on a
+  key.
+
+The alternative that was not taken: dropping the digest entirely under `none` and `metadata_only`.
+It is coherent — a stable digest of a body you refused to store is close to a contradiction, and it
+carries no key dependency at all — but it removes a working feature from those applications, which
+is the larger behaviour change of the two. It stays the reversal condition if the key-loss
+dependency ever proves worse than losing dedupe there.
 
 ## How long a verification key survives its issuer
 

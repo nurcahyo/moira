@@ -577,10 +577,17 @@ wordlist recovers them. Migration `0021` anticipated exactly this and refuses to
 for encrypted rows — but the reversal it anticipated was never built.
 
 **Resolution.** Mint one HMAC key as a keyring row with `purpose = 'memory_dedupe'`, wrapped by the
-master key exactly like every content key. Encrypted rows store a prefixed, keyed digest instead of
-the bare content address. The prefix is unambiguous against the existing base64url content address,
-which can never contain the prefix separator — migration `0021`'s own rule, reused — so a
-plaintext-era hash and an encrypted-era hash produce a **miss, never a false match**.
+master key exactly like every content key. Rows store a prefixed, keyed digest instead of the bare
+content address. The prefix is unambiguous against the existing base64url content address, which
+can never contain the prefix separator — migration `0021`'s own rule, reused — so an older hash and
+a keyed one produce a **miss, never a false match**.
+
+**Widened by issue #168.** As shipped for #140 this covered `encrypted_content` alone, and that
+left `none` and `metadata_only` storing an unkeyed digest of a body they store nothing else of —
+an oracle on content the operator had explicitly chosen not to keep, and a *weaker* outcome for
+the stronger privacy setting. #168 keyed every policy value, so there is no arm left that can
+select an unkeyed digest. What it buys and what it costs are both in `docs/security.md`; the cost
+is that dedupe under every policy now depends on the `memory_dedupe` key surviving.
 
 Because the dedupe key is itself a wrapped envelope, **master-key rotation re-wraps it and the
 stored hashes never change**. That dissolves the objection that killed the peppered approach in

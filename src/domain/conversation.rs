@@ -92,12 +92,13 @@ pub enum ConversationMessageType {
 ///   `metadata_only` stores no body at all and reads back with `content: null`, which is a
 ///   **behaviour change** for such applications — before #140 memory bodies were stored in the
 ///   clear whatever the policy said, which is finding F32's shape one table over.
-/// * **`memory_records.content_hash` is retained under every value, but its *form* follows this
-///   setting.** Under `encrypted_content` it is a keyed digest under the keyring's
-///   `memory_dedupe` key; otherwise it is the unkeyed content address migration `0021`
-///   established. See [`crate::security::ContentSealer::memory_content_hash`] — an unkeyed
-///   digest of a short, guessable memory body stored beside that body's ciphertext would defeat
-///   the encryption outright.
+/// * **`memory_records.content_hash` is retained under every value, and its form no longer
+///   follows this setting.** Since issue #168 it is a digest keyed by the keyring's
+///   `memory_dedupe` key under **all four** values, where #140 keyed only `encrypted_content`.
+///   See [`crate::security::ContentSealer::memory_content_hash`]: a memory body is short and
+///   guessable, so an unkeyed digest is a dictionary-attack oracle — under `encrypted_content` it
+///   defeated the encryption outright, and under `none` and `metadata_only` it was an oracle for
+///   content the row deliberately does not hold.
 /// * **It governs RAG bodies on the sealing axis only, since issue #141.**
 ///   `rag_document_versions.content_plain` and `rag_chunks.chunk_text_plain` are wired to their
 ///   `*_encrypted` columns through [`ContentWrite::under_policy_for_rag`], which seals under
