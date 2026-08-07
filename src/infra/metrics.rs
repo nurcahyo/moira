@@ -185,8 +185,15 @@ const ADMIN_IDENTITY_GRANT_EVENTS_TOTAL: &str = "moira_admin_identity_grant_even
 // Tuesday; the gauge alone cannot say whether staleness is because refreshes are failing or
 // because nothing has changed. Alert on the gauge, diagnose with the counter.
 //
-// The gauge is set to zero on every successful refresh rather than being derived at scrape
-// time, so a process whose refresh task died stops updating it and the value visibly ages.
+// **What the gauge cannot see, stated plainly.** It is written by the refresh path — zero on
+// success, the previous snapshot's age on failure — and is *not* recomputed at scrape time,
+// because the keyring holds the registry rather than the other way round. So a process whose
+// refresh task died outright stops writing it and the value **freezes** rather than growing.
+// It detects a refresh that keeps failing, which is the common case; it does not detect a tick
+// that stopped ticking. Deriving it at scrape time would fix that and would mean the registry
+// holding a handle to the thing that holds it, which is a cycle this module will not take on
+// for one gauge. The honest companion signal is a process restart or a missing series, not a
+// wider reading of this one.
 const CONTENT_KEYRING_REFRESH_FAILED_TOTAL: &str = "moira_content_keyring_refresh_failed_total";
 const CONTENT_KEYRING_AGE_SECONDS: &str = "moira_content_keyring_age_seconds";
 
