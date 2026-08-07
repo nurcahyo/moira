@@ -421,8 +421,12 @@ impl MasterKeyCustody for FakeKmsCustody {
 // =======================================================================================
 // Seeding and reading content rows
 //
-// The only raw SQL in this file that is not an assertion. It stands in for the write path,
-// which arrives in a later PR of the train.
+// The only raw SQL in this file that is not an assertion, and it stays raw on purpose now that
+// the production write path exists (#139, #140, #141). `reseal` has to be handed pre-existing
+// envelopes to move, under keys this suite chose; routing the fixture through the repositories
+// would make the rotation tests depend on the repositories' policy lookups and would be testing
+// those instead. This is the one function on the `SEALED_COLUMN_SQL_SITES` allowlist that is not
+// a production writer, and it says so there.
 // =======================================================================================
 
 /// One seeded content row, with everything needed to re-open it.

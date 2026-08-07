@@ -27,10 +27,20 @@
 //! # What writes an `*_encrypted` column here
 //!
 //! Only [`KeyringAdmin::reseal`], and only ever by replacing an envelope that is **already** in
-//! the column with the same plaintext sealed under a newer data key. No path in this module
-//! turns plaintext into ciphertext; the write path arrives in a later PR of the train. That
-//! distinction is what keeps this diff inside the "no production writer of a sealed column"
-//! bound while still shipping R4 — a `retire` that can never be reached is not a verb.
+//! the column with the same plaintext sealed under a newer data key. **No path in this module
+//! turns plaintext into ciphertext** — that is the production write path, which now exists in
+//! `src/infra/repositories/conversation.rs` for all five columns (issues #139, #140, #141) and
+//! is not reachable from here.
+//!
+//! Note what `reseal` does *not* do, because the two are easy to conflate: it does not seal a
+//! plaintext row. A row still holding `content_plain` is invisible to it. Sealing existing
+//! plaintext history is `seal-existing`, which is designed and deferred
+//! (`docs/decision-encryption-at-rest.md` §16).
+//!
+//! `reseal` also never spells a column name. It builds its statement from
+//! [`AadProfile::column`], so the registry in `src/security/content_envelope.rs` is the single
+//! source of the identifier — which is why this module is deliberately absent from
+//! `SEALED_COLUMN_SQL_SITES`, and is the shape a new sealed-column site should copy.
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
