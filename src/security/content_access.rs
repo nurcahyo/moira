@@ -485,11 +485,19 @@ fn content_decryption_failed() -> AppError {
 
 /// The impossible-by-CHECK-constraint case: a row holding **both** a plaintext and a ciphertext.
 ///
-/// `migrations/0027_content_encryption_keyring.sql` adds
-/// `check (content_plain is null or content_encrypted is null)` to all four tables, so this is
-/// unreachable through the constraint. It is `not valid`, though, so pre-existing rows were never
-/// checked — and a row that somehow holds both is ambiguous rather than merely odd. Encrypted
-/// wins (it is the stricter of the two intentions) and exactly one WARN naming the row is logged.
+/// `migrations/0027_content_encryption_keyring.sql` adds a `plain is null or encrypted is null`
+/// CHECK to **all five** tables — `conversation_messages`, `memory_records` and
+/// `rag_document_versions` on `(content_plain, content_encrypted)`, `conversation_summaries` on
+/// its `summary_text_*` pair, and `rag_chunks` on its `chunk_text_*` pair — so this is
+/// unreachable through the constraint. It is `not valid`, though, so
+/// pre-existing rows were never checked — and a row that somehow holds both is ambiguous rather
+/// than merely odd. Encrypted wins (it is the stricter of the two intentions) and exactly one
+/// WARN naming the row is logged.
+///
+/// `the_five_content_exclusivity_constraints_exist_and_are_validated` in
+/// `tests/rag_content_encryption.rs` asserts all five against `pg_constraint`, including that
+/// each is still `convalidated`, because everything above is a promise about the schema that
+/// nothing in Rust can enforce.
 pub fn warn_content_storage_ambiguous(table: &'static str, row_id: Uuid) {
     warn!(
         code = "content_storage_ambiguous",

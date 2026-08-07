@@ -212,10 +212,19 @@ const CONTENT_KEYRING_AGE_SECONDS: &str = "moira_content_keyring_age_seconds";
 // reading that none exist.
 //
 // The three envelope counters `docs/decision-encryption-at-rest.md` names alongside this one —
-// seal, open, and open-failed — are NOT here. They belong to the write and read paths, which
-// have no call sites until a later PR of the train, and a counter wired to nothing is the
-// silently-inert shape (#125) this whole release exists to avoid. They arrive with their
-// callers.
+// seal, open, and open-failed — are NOT here. They were deferred because a counter wired to
+// nothing is the silently-inert shape (#125) this whole release exists to avoid, and were to
+// "arrive with their callers".
+//
+// **Their callers have now arrived and they have not.** The write and read paths for all five
+// sealed columns landed in issues #139, #140 and #141; no seal, open or open-failed counter was
+// added with them. So this is no longer a scheduling note, it is a disclosed observability gap:
+// a deployment can seal and open content today and see nothing but `moira_content_keyring_keys`.
+// The failure paths are not silent — every refusal emits a coded WARN and a coded error
+// (`src/security/content_access.rs`) — but there is no rate, and an operator cannot alert on
+// "opens started failing" without parsing logs. Closing it is a metrics-design change (three
+// counters, their label domains, and the cardinality argument for each) and belongs to its own
+// review, not to a write-path PR that would have added it as an afterthought.
 const CONTENT_KEYRING_KEYS: &str = "moira_content_keyring_keys";
 
 /// The closed `outcome` label domain for `moira_admin_invite_outcomes_total`.
