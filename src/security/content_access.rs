@@ -88,54 +88,89 @@ impl KeyringContentAccess {
         Self { keyring }
     }
 
-    /// Whether this access can seal at all, without attempting to.
+    /// Whether this access can seal, **asked the same way a write asks it**.
     ///
-    /// Read by the admin API's narrowed `conversation_content_persistence_unsupported` refusal:
-    /// an operator selecting `encrypted_content` on a process that cannot seal deserves the
-    /// refusal at policy-write time rather than on their users' next message.
+    /// Read by the admin API's narrowed `conversation_content_persistence_unsupported` refusal: an
+    /// operator selecting `encrypted_content` on a process that cannot seal deserves the refusal
+    /// at policy-write time rather than on their users' next message.
+    ///
+    /// It delegates to [`Self::resolve_active_cipher`] rather than testing `keyring.is_some()`,
+    /// and that is the whole point. A cheaper predicate here would be a *second, narrower*
+    /// definition of "can seal": the 422 would accept a policy the very next `add_message` refuses
+    /// with a `503`. Two answers about one condition is exactly the drift this subsystem keeps
+    /// being bitten by, so there is one function and both callers ask it.
+    ///
+    /// The `Err` is dropped rather than logged: this is a question, not an attempt, and a WARN per
+    /// policy read would be noise. The write path logs when it actually refuses a write.
     pub fn can_seal(&self) -> bool {
-        self.keyring.is_some()
+        self.resolve_active_cipher().is_ok()
     }
 
-    /// The cipher new content is sealed under, or a refusal.
+    /// The cipher new content is sealed under, or the reason there is none.
     ///
-    /// The state re-check is not redundant with [`ContentKeyring::load`], which selects
-    /// `active_content` from the row whose state is `active`. It is here because
-    /// [`KeyringSnapshot::active_content`] is infallible by type, and "the write path cannot
-    /// express a refusal" is precisely how a fallback gets added later by someone who needs one.
-    fn active_cipher(&self) -> Result<Arc<ContentCipher>, AppError> {
+    /// Returns the discriminant rather than an `AppError` so [`Self::can_seal`] can ask without
+    /// logging and [`Self::active_cipher`] can log a specific reason. The state re-check is not
+    /// redundant with [`ContentKeyring::load`], which selects `active_content` from the row whose
+    /// state is `active`: it is here because [`KeyringSnapshot::active_content`] is infallible by
+    /// type, and "the write path cannot express a refusal" is precisely how a fallback gets added
+    /// later by someone who needs one.
+    fn resolve_active_cipher(&self) -> Result<Arc<ContentCipher>, UnsealableReason> {
         let Some(keyring) = self.keyring.as_ref() else {
-            warn!(
-                reason = "keyring_not_loaded",
-                "refusing to store content under an encrypted persistence policy: this process \
-                 has no content keyring"
-            );
-            return Err(content_key_unavailable());
+            return Err(UnsealableReason::KeyringNotLoaded);
         };
         let snapshot = keyring.snapshot();
         let cipher = snapshot.active_content();
         let data_key_id = cipher.data_key_id();
         match snapshot.entry(data_key_id) {
             Some(entry) if entry.state.is_writable() => Ok(cipher),
-            Some(entry) => {
-                warn!(
+            Some(entry) => Err(UnsealableReason::ActiveKeyNotWritable {
+                data_key_id,
+                state: entry.state.as_str(),
+            }),
+            None => Err(UnsealableReason::ActiveKeyAbsentFromSnapshot { data_key_id }),
+        }
+    }
+
+    /// [`Self::resolve_active_cipher`], with the refusal logged and mapped to the wire.
+    fn active_cipher(&self) -> Result<Arc<ContentCipher>, AppError> {
+        self.resolve_active_cipher().map_err(|reason| {
+            match reason {
+                UnsealableReason::KeyringNotLoaded => warn!(
+                    reason = "keyring_not_loaded",
+                    "refusing to store content under an encrypted persistence policy: this \
+                     process has no content keyring"
+                ),
+                UnsealableReason::ActiveKeyNotWritable { data_key_id, state } => warn!(
                     reason = "active_key_not_writable",
                     %data_key_id,
-                    state = entry.state.as_str(),
+                    state,
                     "refusing to store content under an encrypted persistence policy"
-                );
-                Err(content_key_unavailable())
-            }
-            None => {
-                warn!(
+                ),
+                UnsealableReason::ActiveKeyAbsentFromSnapshot { data_key_id } => warn!(
                     reason = "active_key_absent_from_snapshot",
                     %data_key_id,
                     "refusing to store content under an encrypted persistence policy"
-                );
-                Err(content_key_unavailable())
+                ),
             }
-        }
+            content_key_unavailable()
+        })
     }
+}
+
+/// Why this process cannot seal. Log-only; every variant reaches the wire as the one
+/// `content_key_unavailable` code.
+#[derive(Debug, Clone, Copy)]
+enum UnsealableReason {
+    /// No keyring at all — a process with no database.
+    KeyringNotLoaded,
+    /// The snapshot's active key is not in a state new content may be written under.
+    ActiveKeyNotWritable {
+        data_key_id: Uuid,
+        state: &'static str,
+    },
+    /// The snapshot names an active cipher whose entry it does not carry. A wiring bug in
+    /// keyring assembly rather than an operator condition, which is why it has its own name.
+    ActiveKeyAbsentFromSnapshot { data_key_id: Uuid },
 }
 
 impl ContentSealer for KeyringContentAccess {
@@ -384,6 +419,41 @@ mod tests {
             conversation_id: Uuid::nil(),
             sequence_number: 1,
         }
+    }
+
+    /// `can_seal()` and the write path must answer the same question.
+    ///
+    /// **This is the assertion behind the narrowed 422.** If `can_seal` were a cheaper predicate
+    /// than the one `seal_content` applies, the admin API would accept a policy that the very
+    /// next `add_message` refuses with a `503` — an operator told "yes" and then told "no", with
+    /// nothing between the two to explain it. One function answers both, and this pins that they
+    /// stay pinned to each other.
+    ///
+    /// A keyring-less access is the arm reachable without a database, which is why it is the one
+    /// asserted here; the two key-state arms need a live keyring and are covered from
+    /// `tests/conversation_content_encryption.rs`.
+    #[test]
+    fn can_seal_agrees_with_what_sealing_actually_does() {
+        let access = KeyringContentAccess::new(None);
+        assert!(
+            !access.can_seal(),
+            "a process with no keyring must not report that it can seal; the admin API's 422 \
+             reads this"
+        );
+        let error = access
+            .seal_content(&message_identity(), "body")
+            .expect_err("a keyring-less access must refuse to seal");
+        assert_eq!(
+            error.error_response(None).error.code,
+            "content_key_unavailable"
+        );
+        assert_eq!(error.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            access.can_seal(),
+            access.seal_content(&message_identity(), "body").is_ok(),
+            "can_seal and seal_content disagree, so the 422 and the 503 are answering two \
+             different questions"
+        );
     }
 
     /// The wire must not distinguish an AEAD failure from anything, and must not carry any part
