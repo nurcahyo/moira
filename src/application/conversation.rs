@@ -18,13 +18,14 @@ use crate::{
     },
     domain::{
         AuditLogInsert, AuditResult, CallerRuntimeIdentity, ContentWrite,
-        ConversationCreateRequest, ConversationMessageCreateRequest, ConversationMessageQuery,
-        ConversationMessageRecord, ConversationMessageRole, ConversationMessageType,
-        ConversationPatchRequest, ConversationPolicyPutRequest, ConversationPolicyRecord,
-        ConversationQuery, ConversationRecord, ConversationStatus, ConversationSummaryRecord,
-        CursorScope, DomainMessage, EmbeddingPolicyPutRequest, EmbeddingPolicyRecord,
-        ExecutionCommand, ExecutionOptions, ExecutionOutcome, ExecutionStatus, HistoryStrategy,
-        ListCursor, ListResponse, MemoryConsentMode, MemoryCreateRequest, MemoryPatchRequest,
+        ConversationContentPersistence, ConversationCreateRequest,
+        ConversationMessageCreateRequest, ConversationMessageQuery, ConversationMessageRecord,
+        ConversationMessageRole, ConversationMessageType, ConversationPatchRequest,
+        ConversationPolicyPutRequest, ConversationPolicyRecord, ConversationQuery,
+        ConversationRecord, ConversationStatus, ConversationSummaryRecord, CursorScope,
+        DomainMessage, EmbeddingPolicyPutRequest, EmbeddingPolicyRecord, ExecutionCommand,
+        ExecutionOptions, ExecutionOutcome, ExecutionStatus, HistoryStrategy, ListCursor,
+        ListResponse, MemoryConsentMode, MemoryCreateRequest, MemoryPatchRequest,
         MemoryPolicyPutRequest, MemoryPolicyRecord, MemoryQuery, MemoryRecord, MemoryScope,
         MemoryStatus, Pagination, PublicCitation, PublicContentPart, PublicInputMessage,
         RagCollectionCreateRequest, RagCollectionPatchRequest, RagCollectionQuery,
@@ -58,7 +59,7 @@ use crate::{
         SUPPORTED_EMBEDDING_DIMENSION, Scored, embed_texts, encode_vector_literal, prepare_chunks,
         provider_type_supports_embeddings, rank_chunks, rank_memories,
     },
-    security::{Actor, ActorType, request_hash},
+    security::{Actor, ActorType, ContentSealer, request_hash},
 };
 
 /// What `POST /api/v1/conversations/{id}/summarize` did — plan 11 Sub-Phase E.
@@ -958,9 +959,10 @@ impl ConversationService {
 
         if want_memory {
             let limit = candidate_limit(policy.maximum_memory_results);
-            let candidates = find_memory_candidates(pool, &scope, &encoded, limit)
-                .await
-                .map_err(|_| FAILURE_RETRIEVAL_BACKEND)?;
+            let candidates =
+                find_memory_candidates(pool, &self.state.content_access(), &scope, &encoded, limit)
+                    .await
+                    .map_err(|_| FAILURE_RETRIEVAL_BACKEND)?;
             outcome.memory_candidate_count = candidates.len() as i32;
             outcome.memories = rank_memories(
                 query,
@@ -1266,10 +1268,16 @@ impl ConversationService {
             })
             .collect();
         if turns.is_empty() {
-            // A conversation persisting no plaintext (`conversation_content_persistence` of
-            // `'none'`/`'metadata_only'`/`'encrypted_content'`) has nothing to extract from.
-            // Returning here rather than calling a model with an empty transcript is both the
-            // cheaper and the more honest answer.
+            // A conversation persisting no body at all (`conversation_content_persistence` of
+            // `'none'` or `'metadata_only'`) has nothing to extract from. Returning here rather
+            // than calling a model with an empty transcript is both the cheaper and the more
+            // honest answer.
+            //
+            // **`'encrypted_content'` is no longer on that list.** It was, and correctly, while
+            // `content_encrypted` had no reader: `find_recent_messages` opens it since issue
+            // #139, so a sealed conversation yields a full transcript here and extraction runs
+            // on it normally. The memories it produces are themselves sealed — issue #140 routes
+            // all three memory writers through the same policy — so nothing lands in the clear.
             //
             // **This is a consequence, not the guard.** The policy is enforced in `add_message`
             // — that is what makes `content_plain` null and this branch reachable. Until F32 was
@@ -1318,6 +1326,7 @@ impl ConversationService {
                 execution_id,
                 status,
                 &memory_policy,
+                conversation_policy.conversation_content_persistence,
                 &turns,
                 link.route_hint.clone(),
             )
@@ -1367,6 +1376,11 @@ impl ConversationService {
         execution_id: Uuid,
         status: MemoryStatus,
         policy: &MemoryPolicyRecord,
+        // `persistence` is the application's content-persistence policy, read once by
+        // `extract_memories` alongside the consent columns. Passed rather than re-read so a run
+        // cannot store its memories under a policy from a different instant than the one that
+        // admitted the transcript it extracted them from.
+        persistence: ConversationContentPersistence,
         turns: &[(String, String)],
         route_hint: Option<String>,
     ) -> MemoryExtractionRunOutcome {
@@ -1498,7 +1512,26 @@ impl ConversationService {
                     continue;
                 }
             };
-            let content_hash = memory_content_hash(&candidate.content);
+            // The storage form is decided *before* the dedupe lookup, because it decides which
+            // digest that lookup compares. Computing the hash first and the form afterwards
+            // would let an encrypted-policy application dedupe against the unkeyed address and
+            // then store the keyed one — two formats in one table, silently.
+            let stored = ContentWrite::under_policy(persistence, candidate.content.clone());
+            let content_hash = match self
+                .state
+                .content_access()
+                .memory_content_hash(&stored, &candidate.content)
+            {
+                Ok(hash) => hash,
+                // No usable dedupe key under an encrypted policy. Rejected rather than written:
+                // the alternative is an unkeyed digest of a short, guessable body sitting beside
+                // its own ciphertext, which is the whole hole this key closes.
+                Err(_) => {
+                    rejected += 1;
+                    *rejections.entry("dedupe_key_unavailable").or_default() += 1;
+                    continue;
+                }
+            };
 
             // Exact dedupe first: it needs no embedding, so an application with embeddings off
             // still gets duplicate suppression.
@@ -1559,7 +1592,7 @@ impl ConversationService {
                 scope: memory_scope,
                 memory_type: candidate.memory_type,
                 memory_key: candidate.memory_key.as_deref(),
-                content: &candidate.content,
+                content: stored,
                 content_hash: &content_hash,
                 confidence: candidate.confidence,
                 sensitivity: candidate.sensitivity,
@@ -1570,7 +1603,10 @@ impl ConversationService {
                 contradicts_memory_id: contradicts,
                 resolution_status: contradicts.map(|_| CONTRADICTION_UNRESOLVED),
             };
-            if insert_extracted_memory(pool, &insert).await.is_err() {
+            if insert_extracted_memory(pool, &self.state.content_access(), &insert)
+                .await
+                .is_err()
+            {
                 rejected += 1;
                 *rejections.entry("insert_failed").or_default() += 1;
                 continue;
@@ -2144,11 +2180,25 @@ impl ConversationService {
         }
         validate_content(&request.content)?;
         validate_metadata(&request.metadata)?;
+        // Minted here, and the AAD binds it — so the id the envelope authenticates is the id the
+        // row is stored under. `public_id` is derived from the same value on the next line;
+        // there is no second `now_v7()` anywhere on this path.
         let id = Uuid::now_v7();
         let public_id = format!("mem_{id}");
         let external_tenant_id = effective_tenant(actor);
         let external_user_id = effective_user(actor);
-        let content_hash = memory_content_hash(&request.content);
+        // Memory bodies obey `conversation_content_persistence` since issue #140. It is the
+        // application's one content-persistence setting — `application_memory_policies` has no
+        // column of its own — and a memory is caller content in exactly the sense the policy
+        // names. Read here rather than in the repository because `create_memory` has one caller
+        // and this is it; `add_message` re-derives instead because it has three.
+        let content = ContentWrite::under_policy(
+            self.repo
+                .get_or_create_conversation_policy(application_id)
+                .await?
+                .conversation_content_persistence,
+            request.content.clone(),
+        );
         let record = self
             .repo
             .create_memory(&MemoryInsert {
@@ -2159,7 +2209,7 @@ impl ConversationService {
                 external_user_id: external_user_id.as_deref(),
                 scope: MemoryScope::UserApplication,
                 request: &request,
-                content_hash: &content_hash,
+                content,
             })
             .await?;
         // Embed the memory so it can actually be retrieved.
@@ -2273,15 +2323,24 @@ impl ConversationService {
         if let Some(metadata) = &request.metadata {
             validate_metadata(metadata)?;
         }
-        // Same content address `create_memory` writes — see `memory_content_hash`. A patch that
-        // wrote a different *kind* of digest would leave one table holding two incomparable
-        // formats, which is F14's silent-mismatch failure re-created from a format split
-        // instead of a pepper rotation.
-        let hash = request.content.as_deref().map(memory_content_hash);
-        let record = self
-            .repo
-            .patch_memory(memory_id, &request, hash.as_deref())
-            .await?;
+        // The same storage form `create_memory` chooses, from the same policy. A patch that
+        // wrote a different *kind* of digest — or a plaintext body under an encrypted policy —
+        // would leave one table holding two incomparable formats, which is F14's silent-mismatch
+        // failure re-created from a format split instead of a pepper rotation.
+        //
+        // The digest itself is derived inside `patch_memory` from this value, so the two cannot
+        // be chosen independently.
+        let content = match request.content.as_deref() {
+            Some(content) => Some(ContentWrite::under_policy(
+                self.repo
+                    .get_or_create_conversation_policy(required_application_id(actor)?)
+                    .await?
+                    .conversation_content_persistence,
+                content.to_string(),
+            )),
+            None => None,
+        };
+        let record = self.repo.patch_memory(memory_id, &request, content).await?;
         self.audit(
             actor,
             ctx,
@@ -3197,59 +3256,6 @@ pub(crate) fn conversation_audit(
         user_agent: ctx.user_agent.clone(),
         metadata,
     }
-}
-
-/// The content address stored in `memory_records.content_hash`.
-///
-/// **Decision (finding F14).** This is [`crate::security::request_hash`] — a plain, unkeyed
-/// SHA-256 aliasing `secret_fingerprint` — and deliberately **not**
-/// `IdempotencyHasher::hash`, which is what it used to be and what the neighbouring
-/// `conversation_messages.content_hash` still is.
-///
-/// # Why the two tables diverge
-///
-/// `IdempotencyHasher`'s rotation contract (`src/security/idempotency.rs`) accepts only the
-/// *active* pepper, and justifies that narrowness with a retention argument: every
-/// `idempotency_records` row expires within 24 hours, so old-pepper rows age out on their own.
-/// **`memory_records` has no such retention.** Its rows are long-lived by design — a nullable
-/// `valid_until` and a `status` that stays `'active'` indefinitely — so a pepper rotation would
-/// not produce a bounded window, it would permanently orphan every stored hash. Exact-match
-/// memory dedupe would then stop matching, silently, with no error and no log line. The hasher
-/// is right for its namesake table and was reused for one with a fundamentally different
-/// lifetime.
-///
-/// The same admitting rule plan 11 wrote for `rag_chunks.chunk_hash`
-/// (`src/orchestration/ingestion.rs`) is applied here per *table*, and `memory_records` passes
-/// all three clauses where `conversation_messages` fails the first:
-///
-/// * **(a) not caller-visible.** [`MemoryRecord`] has no `content_hash` field and no schema in
-///   `docs/openapi.json` carries one for a memory. `ConversationMessageRecord` does, which is
-///   why *that* column stays peppered: an unkeyed digest of message content, handed to the
-///   caller, is an offline verifier for content the schema otherwise expects to hold encrypted.
-/// * **(b) never a caller-supplied lookup key.** `MemoryCreateRequest`, `MemoryPatchRequest`
-///   and `MemoryQuery` all carry `deny_unknown_fields` and none of them has a hash field; the
-///   only caller-supplied memory lookup key is the `mem_…` public id.
-/// * **(c) never a cross-application comparison.** Every `memory_records` read is bound by
-///   `application_id` — `find_memory_authorized`, `list_memories_authorized` and
-///   `find_memory_candidates` all require it in every arm — so a dedupe built on this value
-///   cannot become an existence oracle over another application's memories.
-///
-///   **Plan 11 Sub-Phase F built that dedupe, so clause (c) now has a second set of call
-///   sites.** `find_memory_by_content_hash` compares this exact value across rows, and
-///   `find_nearest_memory`/`find_memory_by_key` compare content by other means; all three go
-///   through `MEMORY_SCOPE_PREDICATE` in `src/infra/repositories/conversation.rs`, which binds
-///   `application_id` in every arm, and `every_memory_read_shares_the_isolation_predicate`
-///   asserts it against the emitted SQL rather than against behaviour.
-///
-/// # Reversal condition
-///
-/// Go back to a keyed hash — and pair it with a re-hash-on-rotation procedure, because the
-/// lifetime problem above does not go away — the moment any one of those three clauses stops
-/// holding: `content_hash` appears on `MemoryRecord` or any other caller-visible DTO, a filter
-/// or lookup accepts a caller-supplied hash, or a dedupe/similarity query drops the
-/// `application_id` predicate.
-fn memory_content_hash(content: &str) -> String {
-    request_hash(content.as_bytes())
 }
 
 fn required_application_id(actor: &Actor) -> Result<Uuid, AppError> {

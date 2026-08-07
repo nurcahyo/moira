@@ -49,13 +49,22 @@
 //! bounded window.
 //!
 //! `memory_records.content_hash` used to be written here too and no longer is: plan 11
-//! Sub-Phase F intends to compare it (exact-match memory dedupe), and a comparison over a
-//! long-lived row is exactly what this contract cannot serve. It moved to the unkeyed
-//! [`crate::security::request_hash`] — see `memory_content_hash` in
-//! `src/application/conversation.rs` for the decision and its reversal condition. The
-//! remaining three are **write-only fingerprints**: no code path recomputes and compares them,
-//! so an orphaned value costs nothing. Before adding a read that compares any `content_hash`
-//! written by this hasher, move that column to a content address first.
+//! Sub-Phase F compares it (exact-match memory dedupe), and a comparison over a long-lived row
+//! is exactly what this contract cannot serve. It moved to
+//! [`crate::security::ContentSealer::memory_content_hash`], which writes the unkeyed
+//! [`crate::security::request_hash`] for rows stored in the clear and — since issue #140 — a
+//! digest keyed by the keyring's `memory_dedupe` data key for rows whose body is sealed.
+//!
+//! **That second form is keyed, and it does not reopen the problem this section describes**,
+//! because the key is a wrapped keyring row rather than a deployment pepper: a master-key
+//! rotation re-wraps the envelope and the 32 bytes inside it never change, so every stored
+//! digest stays byte-identical. That is the property this hasher cannot offer and the reason
+//! the dedupe key lives in the keyring instead of beside this pepper.
+//!
+//! The remaining three columns written here are **write-only fingerprints**: no code path
+//! recomputes and compares them, so an orphaned value costs nothing. Before adding a read that
+//! compares any `content_hash` written by this hasher, move that column to a content address
+//! first.
 //!
 //! ## Rotation changes a value the API returns (finding F14)
 //!

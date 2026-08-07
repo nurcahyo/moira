@@ -85,13 +85,14 @@ use crate::{
     },
     error::AppError,
     infra::pg_rows::{
-        conversation_content_persistence_from_db, conversation_content_persistence_to_db,
-        conversation_message_record_from_row, conversation_message_role_to_db,
-        conversation_message_type_to_db, conversation_policy_record_from_row,
-        conversation_record_from_row, conversation_status_to_db, embedding_policy_record_from_row,
-        history_strategy_to_db, memory_consent_mode_to_db, memory_policy_record_from_row,
-        memory_record_from_row, memory_scope_to_db, memory_sensitivity_to_db, memory_status_to_db,
-        memory_type_to_db, rag_collection_record_from_row, rag_collection_status_to_db,
+        conversation_content_from_row, conversation_content_persistence_from_db,
+        conversation_content_persistence_to_db, conversation_message_record_from_row,
+        conversation_message_role_to_db, conversation_message_type_to_db,
+        conversation_policy_record_from_row, conversation_record_from_row,
+        conversation_status_to_db, embedding_policy_record_from_row, history_strategy_to_db,
+        memory_consent_mode_to_db, memory_policy_record_from_row, memory_record_from_row,
+        memory_scope_to_db, memory_sensitivity_to_db, memory_status_to_db, memory_type_to_db,
+        rag_collection_record_from_row, rag_collection_status_to_db,
         rag_collection_visibility_to_db, rag_document_record_from_row, rag_ingestion_status_to_db,
         retrieval_policy_record_from_row,
     },
@@ -166,6 +167,12 @@ pub struct ConversationInsert<'a> {
 
 #[derive(Debug, Clone)]
 pub struct MemoryInsert<'a> {
+    /// Minted by the caller **before** this struct is built, and bound into the AAD.
+    ///
+    /// [`ContentIdentity`] admits only values that are final at encrypt time, and this one is:
+    /// `ConversationService::create_memory` calls `Uuid::now_v7()` and derives `public_id` from
+    /// it in the same breath, so the id the envelope authenticates is the id the row is stored
+    /// under. Generating it here instead would be a second uuid.
     pub id: Uuid,
     pub public_id: &'a str,
     pub application_id: Uuid,
@@ -173,7 +180,15 @@ pub struct MemoryInsert<'a> {
     pub external_user_id: Option<&'a str>,
     pub scope: MemoryScope,
     pub request: &'a MemoryCreateRequest,
-    pub content_hash: &'a str,
+    /// What to store for the memory body — **replacing** the former direct read of
+    /// `request.content`, for the reasons [`ContentWrite`] gives.
+    ///
+    /// Resolved by the single caller, which has already read the application's persistence
+    /// policy; the same shape [`ConversationSummaryInsert::summary_text`] uses and for the same
+    /// reason. `content_hash` is deliberately **not** a field beside it: the hash's form is
+    /// decided by this value, and a caller able to supply them independently is a caller able to
+    /// put an unkeyed digest of a plaintext next to that plaintext's ciphertext.
+    pub content: ContentWrite,
 }
 
 // ---------------------------------------------------------------------------
@@ -453,11 +468,18 @@ pub trait ConversationRepository: Send + Sync {
         limit: i64,
     ) -> Result<Vec<(MemoryRecord, ListCursor)>, AppError>;
 
+    /// Patches a memory, resealing its body when the patch replaces it.
+    ///
+    /// `content` is `Some` exactly when `request.content` is: it is the same body, already
+    /// resolved against the application's persistence policy by the caller. The `content_hash`
+    /// that used to be the third parameter is gone — it is now derived inside, from this value,
+    /// so a patch cannot write a keyed digest beside a plaintext body or an unkeyed one beside a
+    /// ciphertext.
     async fn patch_memory(
         &self,
         public_id: &str,
         request: &MemoryPatchRequest,
-        content_hash: Option<&str>,
+        content: Option<ContentWrite>,
     ) -> Result<MemoryRecord, AppError>;
 
     async fn delete_memory(&self, public_id: &str) -> Result<(), AppError>;
@@ -1258,16 +1280,38 @@ impl ConversationRepository for PgConversationRepository {
     }
 
     async fn create_memory(&self, insert: &MemoryInsert<'_>) -> Result<MemoryRecord, AppError> {
+        let access = self.content_access();
+        let scope = memory_scope_to_db(insert.scope);
+        // Every field the AAD binds is final: `id` was minted by the caller before this struct
+        // existed, `application_id` comes from the actor, and `memory_scope` is chosen once at
+        // creation and never patched (`patch_memory` does not offer it). Nothing here can move
+        // under the ciphertext later, which is the rule `ContentIdentity` states.
+        let identity = ContentIdentity::MemoryRecord {
+            memory_id: insert.id,
+            application_id: insert.application_id,
+            memory_scope: scope,
+        };
+        // Exhaustive, no catch-all — the same shape as `add_message`. The `?` is the refusal: a
+        // memory that cannot be sealed is not written in the clear, it is not written.
+        let (content_plain, content_encrypted): (Option<&str>, Option<Vec<u8>>) =
+            match &insert.content {
+                ContentWrite::Omitted => (None, None),
+                ContentWrite::Plain(text) => (Some(text.as_str()), None),
+                ContentWrite::Encrypt(text) => (None, Some(access.seal_content(&identity, text)?)),
+            };
+        // Computed here, from the same value that chose the column above, so the body and its
+        // digest cannot disagree about whether this row is sealed.
+        let content_hash = access.memory_content_hash(&insert.content, &insert.request.content)?;
         let row = sqlx::query(&memory_select(
             r#"
             insert into memory_records (
                 id, public_id, application_id, external_tenant_id, external_user_id,
-                memory_scope, memory_type, content_plain, content_hash, importance,
-                confidence, sensitivity, status, valid_until, metadata
+                memory_scope, memory_type, content_plain, content_encrypted, content_hash,
+                importance, confidence, sensitivity, status, valid_until, metadata
             )
             values (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9,
-                coalesce($10, 0.5), coalesce($11, 1.0), 'normal', 'active', $12, $13
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                coalesce($11, 0.5), coalesce($12, 1.0), 'normal', 'active', $13, $14
             )
             returning *
             "#,
@@ -1277,17 +1321,18 @@ impl ConversationRepository for PgConversationRepository {
         .bind(insert.application_id)
         .bind(insert.external_tenant_id)
         .bind(insert.external_user_id)
-        .bind(memory_scope_to_db(insert.scope))
+        .bind(scope)
         .bind(memory_type_to_db(insert.request.memory_type))
-        .bind(&insert.request.content)
-        .bind(insert.content_hash)
+        .bind(content_plain)
+        .bind(content_encrypted)
+        .bind(&content_hash)
         .bind(insert.request.importance)
         .bind(insert.request.confidence)
         .bind(insert.request.valid_until)
         .bind(&insert.request.metadata)
         .fetch_one(&self.pool)
         .await?;
-        memory_record_from_row(&row)
+        memory_record_from_row(&row, &access)
     }
 
     async fn find_memory_authorized(
@@ -1321,7 +1366,7 @@ impl ConversationRepository for PgConversationRepository {
                 "memory not found",
             )
         })?;
-        memory_record_from_row(&row)
+        memory_record_from_row(&row, &self.content_access())
     }
 
     async fn list_memories_authorized(
@@ -1343,9 +1388,12 @@ impl ConversationRepository for PgConversationRepository {
             .bind(limit)
             .fetch_all(&self.pool)
             .await?;
+        // One access object for the whole page, for the reason `list_messages` gives: a page of
+        // memories must not touch the keyring once per row.
+        let opener = self.content_access();
         rows.iter()
             .map(|row| {
-                let record = memory_record_from_row(row)?;
+                let record = memory_record_from_row(row, &opener)?;
                 let key = ListCursor::new(record.updated_at, row.try_get("id")?);
                 Ok((record, key))
             })
@@ -1356,12 +1404,82 @@ impl ConversationRepository for PgConversationRepository {
         &self,
         public_id: &str,
         request: &MemoryPatchRequest,
-        content_hash: Option<&str>,
+        content: Option<ContentWrite>,
     ) -> Result<MemoryRecord, AppError> {
+        let access = self.content_access();
+        // **The one write site whose AAD inputs are not already in hand.** `create_memory` and
+        // `insert_extracted_memory` are handed a freshly minted id; a patch is addressed by
+        // `public_id` alone, so the three columns the AAD binds have to be read — and read
+        // *under a row lock*, in the same transaction as the update, or a concurrent write could
+        // move `memory_scope` between the seal and the store and leave a row whose ciphertext
+        // authenticates against an identity the row no longer has.
+        //
+        // `memory_scope` is not patchable today, which is exactly why the lock is written down
+        // rather than skipped: the day it becomes patchable, this is already correct.
+        let mut tx = self.pool.begin().await?;
+        let existing = sqlx::query(
+            r#"
+            select id, application_id, memory_scope
+            from memory_records
+            where public_id = $1 and deleted_at is null
+            for update
+            "#,
+        )
+        .bind(public_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            AppError::coded(
+                axum::http::StatusCode::NOT_FOUND,
+                "memory_not_found",
+                "memory not found",
+            )
+        })?;
+        let memory_id: Uuid = existing.try_get("id")?;
+        let application_id: Uuid = existing.try_get("application_id")?;
+        let memory_scope: String = existing.try_get("memory_scope")?;
+        let identity = ContentIdentity::MemoryRecord {
+            memory_id,
+            application_id,
+            memory_scope: &memory_scope,
+        };
+
+        // `replaces_content` is what makes the update able to *clear* the other column. A pair of
+        // `coalesce`s cannot: patching a plaintext row under an encrypted policy would leave the
+        // old `content_plain` standing beside the new ciphertext, which the CHECK constraint from
+        // migration 0027 refuses outright — and on a row predating that constraint would be a
+        // sealed body serving its own plaintext.
+        let replaces_content = content.is_some();
+        let (content_plain, content_encrypted, content_hash): (
+            Option<&str>,
+            Option<Vec<u8>>,
+            Option<String>,
+        ) = match (&content, request.content.as_deref()) {
+            (None, _) => (None, None, None),
+            (Some(stored), plaintext) => {
+                // `request.content` is `Some` whenever `content` is — the caller derives one
+                // from the other — but the hash needs the body even under `Omitted`, where
+                // `ContentWrite` carries none. Fall back to what `ContentWrite` does carry so
+                // the two can never be hashed over different bytes.
+                let plaintext = plaintext.or_else(|| stored.plaintext()).unwrap_or_default();
+                let hash = access.memory_content_hash(stored, plaintext)?;
+                match stored {
+                    ContentWrite::Omitted => (None, None, Some(hash)),
+                    ContentWrite::Plain(text) => (Some(text.as_str()), None, Some(hash)),
+                    ContentWrite::Encrypt(text) => (
+                        None,
+                        Some(access.seal_content(&identity, text)?),
+                        Some(hash),
+                    ),
+                }
+            }
+        };
+
         let row = sqlx::query(&memory_select(
             r#"
             update memory_records
-            set content_plain = coalesce($2, content_plain),
+            set content_plain = case when $8 then $2 else content_plain end,
+                content_encrypted = case when $8 then $9 else content_encrypted end,
                 content_hash = coalesce($3, content_hash),
                 importance = coalesce($4, importance),
                 valid_until = coalesce($5, valid_until),
@@ -1372,13 +1490,15 @@ impl ConversationRepository for PgConversationRepository {
             "#,
         ))
         .bind(public_id)
-        .bind(&request.content)
+        .bind(content_plain)
         .bind(content_hash)
         .bind(request.importance)
         .bind(request.valid_until)
         .bind(request.status.map(memory_status_to_db))
         .bind(&request.metadata)
-        .fetch_optional(&self.pool)
+        .bind(replaces_content)
+        .bind(content_encrypted)
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| {
             AppError::coded(
@@ -1387,7 +1507,8 @@ impl ConversationRepository for PgConversationRepository {
                 "memory not found",
             )
         })?;
-        memory_record_from_row(&row)
+        tx.commit().await?;
+        memory_record_from_row(&row, &access)
     }
 
     async fn delete_memory(&self, public_id: &str) -> Result<(), AppError> {
@@ -2094,11 +2215,12 @@ pub struct RetrievalScope {
 /// asserts every builder below embeds it.
 ///
 /// It also carries F14's third clause. `memory_records.content_hash` is an **unkeyed content
-/// address** (`memory_content_hash`, `src/application/conversation.rs`), and that decision holds
-/// only while the hash is never compared across applications. The `m.application_id = $2` line
-/// here is what makes that true for the extraction dedupe. A query that stops using this
-/// constant, or an edit that removes that line from it, is exactly the condition that reverses
-/// F14 and puts the peppered hasher back.
+/// address** for every row whose body is not sealed
+/// ([`crate::security::ContentSealer::memory_content_hash`]), and that decision holds only while
+/// the hash is never compared across applications. The `m.application_id = $2` line here is what
+/// makes that true for the extraction dedupe. A query that stops using this constant, or an edit
+/// that removes that line from it, is exactly the condition that reverses F14 and puts a keyed
+/// hasher back on the unsealed rows too.
 const MEMORY_SCOPE_PREDICATE: &str = r#"
               m.application_id = $2
               and (
@@ -2127,7 +2249,13 @@ fn memory_candidates_sql() -> String {
                    m.public_id,
                    m.memory_type,
                    m.memory_key,
+                   -- `application_id` and `memory_scope` are not decoration: with `m.id` they
+                   -- are AAD profile 3's identity, and `memory_candidate_from_row` cannot open
+                   -- `content_encrypted` without them.
+                   m.application_id,
+                   m.memory_scope,
                    m.content_plain,
+                   m.content_encrypted,
                    m.importance,
                    (e.embedding <=> $1::vector) as distance,
                    -- `extract` returns `numeric` on PostgreSQL 14+, which sqlx will not decode as
@@ -2176,6 +2304,7 @@ fn memory_candidates_sql() -> String {
 /// rather than left meaning nothing.
 pub(crate) async fn find_memory_candidates(
     pool: &PgPool,
+    opener: &dyn ContentOpener,
     scope: &RetrievalScope,
     query_vector: &str,
     limit: i64,
@@ -2188,16 +2317,39 @@ pub(crate) async fn find_memory_candidates(
         .bind(limit)
         .fetch_all(pool)
         .await?;
-    rows.iter().map(memory_candidate_from_row).collect()
+    rows.iter()
+        .map(|row| memory_candidate_from_row(row, opener))
+        .collect()
 }
 
-fn memory_candidate_from_row(row: &sqlx::postgres::PgRow) -> Result<MemoryCandidate, AppError> {
+fn memory_candidate_from_row(
+    row: &sqlx::postgres::PgRow,
+    opener: &dyn ContentOpener,
+) -> Result<MemoryCandidate, AppError> {
+    let memory_id: Uuid = row.try_get("memory_uuid")?;
+    let memory_scope: String = row.try_get("memory_scope")?;
     Ok(MemoryCandidate {
-        memory_uuid: row.try_get("memory_uuid")?,
+        memory_uuid: memory_id,
         public_id: row.try_get("public_id")?,
         memory_type: row.try_get("memory_type")?,
         memory_key: row.try_get("memory_key")?,
-        content: row.try_get("content_plain")?,
+        // Retrieval is a read path like any other, and it is the one that puts a memory in front
+        // of a model. A candidate reader that kept looking only at `content_plain` would render
+        // every sealed memory as absent — the application would appear to have silently lost its
+        // memories the moment an operator turned encryption on.
+        content: conversation_content_from_row(
+            row,
+            opener,
+            "content_plain",
+            "content_encrypted",
+            "memory_records",
+            memory_id,
+            ContentIdentity::MemoryRecord {
+                memory_id,
+                application_id: row.try_get("application_id")?,
+                memory_scope: &memory_scope,
+            },
+        )?,
         importance: row.try_get("importance")?,
         distance: row.try_get("distance")?,
         age_seconds: row.try_get::<Option<f64>, _>("age_seconds")?.unwrap_or(0.0),
@@ -2507,10 +2659,17 @@ fn memory_by_content_hash_sql() -> String {
 
 /// The oldest in-scope memory whose content address equals `content_hash`.
 ///
-/// Exact dedupe. `content_hash` here is the **unkeyed** content address F14 established, so
-/// identical text produces an identical value indefinitely and this lookup keeps working across
-/// a pepper rotation. The `application_id` binding is what keeps that safe — see
-/// [`MEMORY_SCOPE_PREDICATE`].
+/// Exact dedupe. `content_hash` here is whichever of the **two** stable forms
+/// [`crate::security::ContentSealer::memory_content_hash`] produced for the caller's storage
+/// policy, so identical text produces an identical value indefinitely and this lookup keeps
+/// working across a pepper rotation *and* across a master-key rotation. The `application_id`
+/// binding is what keeps the unkeyed form safe — see [`MEMORY_SCOPE_PREDICATE`].
+///
+/// **The two forms never collide, only miss.** The keyed form is prefixed
+/// [`crate::security::MEMORY_DEDUPE_HASH_PREFIX`], whose `:` cannot occur in the base64url
+/// content address — migration `0021`'s own rule, reused. So an application that flips its
+/// persistence policy gets one duplicate per re-stated memory, never a false match onto a row
+/// stored in the other form.
 pub(crate) async fn find_memory_by_content_hash(
     pool: &PgPool,
     scope: &RetrievalScope,
@@ -2641,6 +2800,9 @@ pub(crate) async fn confirm_memory(pool: &PgPool, memory_uuid: Uuid) -> Result<(
 /// One extracted memory, ready to insert.
 #[derive(Debug, Clone)]
 pub struct ExtractedMemoryInsert<'a> {
+    /// Minted by the extraction loop immediately before this struct is built, and bound into the
+    /// AAD. Verified rather than assumed: `run_extraction` calls `Uuid::now_v7()` per accepted
+    /// candidate and derives `public_id` from it on the next line.
     pub id: Uuid,
     pub public_id: &'a str,
     pub application_id: Uuid,
@@ -2650,7 +2812,18 @@ pub struct ExtractedMemoryInsert<'a> {
     pub scope: MemoryScope,
     pub memory_type: MemoryType,
     pub memory_key: Option<&'a str>,
-    pub content: &'a str,
+    /// What to store for the body, resolved against the application's persistence policy by the
+    /// one caller — the same shape [`MemoryInsert::content`] uses.
+    pub content: ContentWrite,
+    /// The digest, computed by the caller **from `content`** through
+    /// [`ContentSealer::memory_content_hash`].
+    ///
+    /// The one place in this file where the hash is not derived at the write site, and the reason
+    /// is structural rather than convenient: extraction must perform its exact-dedupe lookup
+    /// (`find_memory_by_content_hash`) with this value *before* deciding to insert at all.
+    /// Recomputing it here would be a second computation able to disagree with the one the
+    /// lookup used, which is a dedupe that silently stops matching — F14's failure mode, from a
+    /// new direction.
     pub content_hash: &'a str,
     pub confidence: f64,
     pub sensitivity: MemorySensitivity,
@@ -2671,8 +2844,24 @@ pub struct ExtractedMemoryInsert<'a> {
 /// on the caller-facing path to serve a use case it does not have.
 pub(crate) async fn insert_extracted_memory(
     pool: &PgPool,
+    access: &impl ContentSealer,
     insert: &ExtractedMemoryInsert<'_>,
 ) -> Result<(), AppError> {
+    let scope = memory_scope_to_db(insert.scope);
+    let identity = ContentIdentity::MemoryRecord {
+        memory_id: insert.id,
+        application_id: insert.application_id,
+        memory_scope: scope,
+    };
+    // Exhaustive, no catch-all, and the `?` is the refusal: an extracted memory that cannot be
+    // sealed is dropped by the caller's `insert_failed` rejection rather than written in the
+    // clear under a policy named for encryption.
+    let (content_plain, content_encrypted): (Option<&str>, Option<Vec<u8>>) = match &insert.content
+    {
+        ContentWrite::Omitted => (None, None),
+        ContentWrite::Plain(text) => (Some(text.as_str()), None),
+        ContentWrite::Encrypt(text) => (None, Some(access.seal_content(&identity, text)?)),
+    };
     sqlx::query(
         r#"
             insert into memory_records (
@@ -2680,12 +2869,12 @@ pub(crate) async fn insert_extracted_memory(
                 conversation_id, memory_scope, memory_type, memory_key, content_plain,
                 content_hash, confidence, sensitivity, status, source_message_ids,
                 source_response_id, source_extraction_run_id, contradicts_memory_id,
-                resolution_status, metadata
+                resolution_status, metadata, content_encrypted
             )
             values (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                 $11, $12, $13, $14, $15, $16, $17, $18, $19,
-                jsonb_build_object('source', 'automatic_extraction')
+                jsonb_build_object('source', 'automatic_extraction'), $20
             )
             "#,
     )
@@ -2695,10 +2884,10 @@ pub(crate) async fn insert_extracted_memory(
     .bind(insert.external_tenant_id)
     .bind(insert.external_user_id)
     .bind(insert.conversation_uuid)
-    .bind(memory_scope_to_db(insert.scope))
+    .bind(scope)
     .bind(memory_type_to_db(insert.memory_type))
     .bind(insert.memory_key)
-    .bind(insert.content)
+    .bind(content_plain)
     .bind(insert.content_hash)
     .bind(insert.confidence)
     .bind(memory_sensitivity_to_db(insert.sensitivity))
@@ -2708,6 +2897,7 @@ pub(crate) async fn insert_extracted_memory(
     .bind(insert.source_extraction_run_id)
     .bind(insert.contradicts_memory_id)
     .bind(insert.resolution_status)
+    .bind(content_encrypted)
     .execute(pool)
     .await?;
     Ok(())
@@ -4193,7 +4383,7 @@ impl ConversationRepository for InMemoryConversationRepository {
         &self,
         _public_id: &str,
         _request: &MemoryPatchRequest,
-        _content_hash: Option<&str>,
+        _content: Option<ContentWrite>,
     ) -> Result<MemoryRecord, AppError> {
         Err(not_stubbed("patch_memory"))
     }
