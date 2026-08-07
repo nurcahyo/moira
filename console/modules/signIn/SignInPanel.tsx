@@ -132,6 +132,17 @@ export type SignInPanelState =
        * empty list, because an empty list renders a panel with no way out of it.
        */
       readonly providers: readonly SignInPanelProvider[];
+      /**
+       * A condition the operator must know about, alongside working buttons
+       * (issue #152).
+       *
+       * Distinct from `unavailable`, and the distinction is the point: the
+       * console IS serving a sign-in configuration and these buttons DO work —
+       * it just cannot prove the configuration is still the one Moira holds.
+       * Collapsing that onto `unavailable` would remove the buttons of a console
+       * whose only remaining way in is those buttons.
+       */
+      readonly noticeKey?: string;
     }
   | {
       readonly kind: "unavailable";
@@ -236,6 +247,14 @@ export function SignInPanel({ state, fetchImpl, navigate }: SignInPanelProps) {
 
   return (
     <section className={styles.panel} aria-label={t(CONSOLE_MESSAGE_KEYS.sign_in_heading)}>
+      {/* `role="status"`, not `role="alert"`: this is a standing condition the
+          operator should read, not an interruption. The refusal state below uses
+          `alert` because there the panel has nothing else in it. */}
+      {state.noticeKey !== undefined && (
+        <p className={styles.problem} role="status">
+          {t(state.noticeKey)}
+        </p>
+      )}
       {providers.map((provider) => (
         <Button
           key={provider.providerId}

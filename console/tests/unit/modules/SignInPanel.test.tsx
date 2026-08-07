@@ -327,3 +327,39 @@ describe("the sign-in request uses the wire format the integration test drives",
     expect(alert.textContent).not.toContain("ECONNREFUSED");
   });
 });
+
+/* -------------------------------------------------------------------------- */
+/* The staleness notice (issue #152)                                          */
+/* -------------------------------------------------------------------------- */
+
+describe("a stale configuration is announced WITHOUT removing the way in", () => {
+  const STALE: SignInPanelState = {
+    ...(READY as Extract<SignInPanelState, { kind: "ready" }>),
+    noticeKey: CONSOLE_MESSAGE_KEYS.auth_config_stale,
+  };
+
+  test("the notice renders and the button still does", () => {
+    // THE MUTATION THIS EXISTS FOR: fold staleness onto the `unavailable` state.
+    // That is one line, it reads as caution, and it takes away the only
+    // remaining way into a console whose snapshot cannot be refreshed — the
+    // buttons for the configuration it is still serving.
+    render(<SignInPanel state={STALE} />);
+    expect(screen.getByRole("status")).toHaveTextContent(
+      copy(CONSOLE_MESSAGE_KEYS.auth_config_stale),
+    );
+    expect(screen.getAllByRole("button")).toHaveLength(1);
+  });
+
+  test("a ready state with nothing to announce renders no notice", () => {
+    // A notice that is always there is a notice nobody reads.
+    render(<SignInPanel state={READY} />);
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  test("the notice is a status, not an alert — the refusal keeps `alert`", () => {
+    // Two different urgencies on the same surface. `alert` interrupts a screen
+    // reader; a standing condition beside working buttons must not.
+    render(<SignInPanel state={STALE} />);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+});

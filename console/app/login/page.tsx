@@ -119,6 +119,12 @@ async function resolveSignInState(): Promise<SignInPanelState> {
       providerId: config.providerId,
       displayName: names.get(config.moiraProviderId) ?? null,
     })),
+    // ISSUE #152. The console is past its snapshot TTL and could not re-read the
+    // configuration — no bootstrap credential, or Moira is unreachable. The
+    // buttons stay, because this configuration is the only one anybody could
+    // sign in with; what changes is that the operator is TOLD, rather than
+    // discovering it as a fetch error against an endpoint that moved.
+    ...(runtimeState.stale ? { noticeKey: CONSOLE_MESSAGE_KEYS.auth_config_stale } : {}),
   };
 }
 

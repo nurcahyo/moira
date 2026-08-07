@@ -78,6 +78,48 @@ snapshot and refreshes on any request that carries an operator credential. The
 snapshot is per process, which is why `charts/moira-console` still pins
 `replicaCount: 1`.
 
+### That snapshot has a lifetime (issue #152)
+
+The snapshot used to be written once per process and never again, so a provider
+changed in Moira kept being served — with no upper bound and nothing saying so —
+until somebody restarted the console. The observable symptom was a sign-in that
+failed `ECONNREFUSED` against an endpoint that had been decommissioned, which
+reads as "the identity provider is down".
+
+It is invalidated the same way Moira invalidates its own runtime caches
+(`docs/runtime-cache-invalidation.md`): **explicit invalidation first, a bounded
+TTL as the backstop**.
+
+- **Explicit.** `invalidateAuthConfig()` is called by the one auth-configuration
+  writer the console owns — `app/api/setup/route.ts`, in the `finally` of a
+  provisioning run, so a partial write invalidates as surely as a complete one.
+  A provider re-pointed through the wizard is in effect on the next request.
+- **TTL.** `AUTH_CONFIG_SNAPSHOT_TTL_MS` (60s) bounds every change the console
+  cannot observe: a write through Moira's admin API, or by another replica. It
+  is shorter than Moira's own 300s equivalent because there the TTL sits behind
+  a `NOTIFY` listener that sees every write and here nothing does.
+  `AUTH_CONFIG_REFRESH_RETRY_MS` (10s) stops a Moira outage turning every
+  request into another doomed round trip.
+
+Re-resolving on every request was rejected: `consoleRuntime()` is on the hot path
+of every authenticated request, every page render and every `/api/auth/*` call,
+and `loadAuthConfigs` is two Moira calls plus a secret-store read per provider.
+
+**A configuration that cannot be refreshed says so.** A process with no
+`MOIRA_SYSTEM_KEY` cannot re-read at all, and a Moira outage cannot either. Both
+keep serving what they have — the alternative is taking sign-in down over a
+backend blip, and on the credential-less path the old configuration is the only
+one anybody could sign in with — but `ConsoleRuntime.stale` is set and `/login`
+renders `console.error.auth_config_stale` beside the working buttons. Silence was
+as much the defect as the staleness.
+
+**And a provider it cannot reach is named as such.** `betterAuth` is configured
+with `onAPIError: { throw: true }`, which hands non-API errors back to
+`app/api/auth/[...all]/route.ts` instead of answering with an empty 500; that
+route turns a network-level failure into a keyed `503 auth_provider_unreachable`
+and re-raises everything else, so a genuine console bug is still loud rather than
+reported as somebody else's endpoint being down.
+
 **The sign-in screen reads that configuration without a credential.** "Read
 by the console at boot" must not be taken to mean the console always holds a
 Moira credential when it needs to render a login page — it does not, and

@@ -510,6 +510,36 @@ export function createConsoleAuth(deps: ConsoleAuthDeps) {
 
     trustedOrigins: [env.consoleOrigin],
 
+    // ------------------------------------------------------------------------
+    // ISSUE #152 — hand a NON-API error back to the route that mounted us.
+    // ------------------------------------------------------------------------
+    //
+    // Without this, `better-call`'s router catches everything Better Auth's own
+    // `onError` does not classify and answers `new Response(null, {status: 500})`
+    // — an empty body, no code, no key — after printing `# SERVER_ERROR` with a
+    // stack. That is exactly what #152's operator saw when the console dialled a
+    // provider endpoint that had been decommissioned: a 500 and a `fetch failed`
+    // stack, naming neither configuration nor the provider.
+    //
+    // `throw: true` changes that for NON-API errors only. `dist/api/index.mjs`'s
+    // `onError` re-raises before it logs, and `better-call`'s inner catch then
+    // does `if (isAPIError(error)) return toResponse(error); throw error;` — so
+    // every ordinary Better Auth refusal (400/401/403, and the `FOUND` redirect,
+    // which returns even earlier) still becomes its normal response, and only the
+    // errors Better Auth had no answer for reach the mount point.
+    //
+    // `app/api/auth/[...all]/route.ts` is the one place that can classify them:
+    // it turns "the configured identity provider could not be reached" into a
+    // keyed 503 and re-raises everything else, so a genuine console bug is still
+    // a loud 500 rather than a soothing message about somebody else's endpoints.
+    //
+    // NOT `onAPIError.onError`, which cannot influence the response: it is called
+    // for its side effects and its return value is discarded. Recording the
+    // verdict there for the route to read back would be a module-level variable
+    // shared by concurrent requests — one request's classification answering
+    // another's.
+    onAPIError: { throw: true },
+
     session: {
       // Short, because the console holds admin authority over Moira. The Moira-
       // bound JWT is shorter still (`MOIRA_JWT_LIFETIME`); this is the outer
