@@ -684,13 +684,36 @@ pub fn embedding_policy_record_from_row(
     })
 }
 
-pub fn memory_record_from_row(row: &sqlx::postgres::PgRow) -> Result<MemoryRecord, AppError> {
+/// One `memory_records` row as the API exposes it.
+///
+/// Takes an `opener` for the reason [`conversation_message_record_from_row`] gives, and the row
+/// must therefore project `content_encrypted`, `id`, `application_id` and `memory_scope` — the
+/// last three are AAD profile 3's identity. `memory_select` does, through `memory_rows.*`.
+pub fn memory_record_from_row(
+    row: &sqlx::postgres::PgRow,
+    opener: &dyn ContentOpener,
+) -> Result<MemoryRecord, AppError> {
+    let memory_id: uuid::Uuid = row.try_get("id")?;
+    let memory_scope: String = row.try_get("memory_scope")?;
+    let content = conversation_content_from_row(
+        row,
+        opener,
+        "content_plain",
+        "content_encrypted",
+        "memory_records",
+        memory_id,
+        ContentIdentity::MemoryRecord {
+            memory_id,
+            application_id: row.try_get("application_id")?,
+            memory_scope: &memory_scope,
+        },
+    )?;
     Ok(MemoryRecord {
         id: row.try_get("public_id")?,
         object: "memory".to_string(),
         memory_type: memory_type_from_db(row.try_get::<String, _>("memory_type")?)?,
-        scope: memory_scope_from_db(row.try_get::<String, _>("memory_scope")?)?,
-        content: row.try_get("content_plain")?,
+        scope: memory_scope_from_db(memory_scope.clone())?,
+        content,
         importance: row.try_get("importance")?,
         confidence: row.try_get("confidence")?,
         sensitivity: memory_sensitivity_from_db(row.try_get::<String, _>("sensitivity")?)?,

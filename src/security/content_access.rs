@@ -35,9 +35,11 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::{
+    domain::ContentWrite,
     error::AppError,
     security::{
-        ContentCipher, ContentEnvelopeError, ContentIdentity, ContentKeyring, KeyringSnapshot,
+        ContentCipher, ContentEnvelopeError, ContentIdentity, ContentKeyring, KeyringError,
+        KeyringSnapshot, request_hash,
     },
 };
 use tracing::warn;
@@ -66,6 +68,66 @@ pub trait ContentSealer: Send + Sync {
         identity: &ContentIdentity<'_>,
         plaintext: &str,
     ) -> Result<Vec<u8>, AppError>;
+
+    /// The `memory_records.content_hash` a row must carry, given the form its body is stored in.
+    ///
+    /// # Why this lives on the sealer and takes a [`ContentWrite`]
+    ///
+    /// The hash and the body are **one decision**. A row whose body is sealed but whose hash is
+    /// the unkeyed content address is not a partially-encrypted row, it is an unencrypted one
+    /// with extra steps: memory bodies are short and guessable, so a dump plus a wordlist
+    /// recovers them from the digest alone. Putting the choice behind the same object that seals,
+    /// keyed off the same value that decided the column, is what makes the two unable to
+    /// disagree.
+    ///
+    /// The `match` on [`ContentWrite`] is exhaustive with no catch-all, so a fourth variant does
+    /// not compile until somebody says which digest it gets — the same property
+    /// [`ContentWrite::under_policy`] buys at the write sites.
+    ///
+    /// # `Omitted` and `Plain` keep the unkeyed content address — finding F14, still standing
+    ///
+    /// `migrations/0021` moved this column off `IdempotencyHasher` for a reason that has not
+    /// changed. That hasher verifies only against the *active* pepper, and justifies the
+    /// narrowness with a retention argument: every `idempotency_records` row expires within 24
+    /// hours. **`memory_records` has no retention** — a nullable `valid_until`, a `status` that
+    /// stays `'active'` indefinitely — so a rotation there would not open a bounded window, it
+    /// would permanently orphan every stored hash and exact-match dedupe would stop matching
+    /// with no error and no log line. Keying the unsealed arms would re-create that, and gain
+    /// nothing: a row whose body is already in the clear is not protected by hiding its digest.
+    ///
+    /// The three-clause admitting rule plan 11 wrote for `rag_chunks.chunk_hash` still holds for
+    /// the unkeyed arms, and is applied **per table**, which is `0021`'s own words:
+    ///
+    /// * **(a) not caller-visible.** [`crate::domain::MemoryRecord`] has no `content_hash` field
+    ///   and no schema in `docs/openapi.json` carries one for a memory. `ConversationMessageRecord`
+    ///   does, which is why *that* column stays peppered.
+    /// * **(b) never a caller-supplied lookup key.** `MemoryCreateRequest`, `MemoryPatchRequest`
+    ///   and `MemoryQuery` all carry `deny_unknown_fields` and none has a hash field.
+    /// * **(c) never a cross-application comparison.** Every `memory_records` read is bound by
+    ///   `application_id` through `MEMORY_SCOPE_PREDICATE`, which
+    ///   `every_memory_read_shares_the_isolation_predicate` asserts against the emitted SQL.
+    ///
+    /// # Why `Encrypt` is the exception
+    ///
+    /// Clause (a) is about who holds the digest. Encryption changes the question: a **database
+    /// dump** now holds the digest and the ciphertext, and a memory body is short and
+    /// low-entropy — "user prefers dark mode". The unkeyed address is then a complete bypass of
+    /// the encryption, no key required. `0021` anticipated exactly this and refused to recompute
+    /// hashes for encrypted rows; this is the reversal it anticipated, restricted to the rows
+    /// that need it so the unsealed corpus keeps matching.
+    ///
+    /// # Reversal condition
+    ///
+    /// Move the unsealed arms to a keyed digest too — and pair that with a re-hash-on-rotation
+    /// procedure, because the lifetime problem does not go away — the moment any one of the
+    /// three clauses stops holding: `content_hash` appears on a caller-visible DTO, a lookup
+    /// accepts a caller-supplied hash, or a dedupe query drops the `application_id` predicate.
+    ///
+    /// Refuses with `content_key_unavailable` when a sealed body has no dedupe key to hash
+    /// under. **There is no arm that falls back to the unkeyed address**; that fallback is the
+    /// hole this function exists to close.
+    fn memory_content_hash(&self, stored: &ContentWrite, content: &str)
+    -> Result<String, AppError>;
 }
 
 /// A [`ContentOpener`] and [`ContentSealer`] backed by a live [`ContentKeyring`].
@@ -184,6 +246,33 @@ impl ContentSealer for KeyringContentAccess {
             .seal(identity, plaintext.as_bytes())
             .map_err(|error| seal_failed(error, identity))
     }
+
+    fn memory_content_hash(
+        &self,
+        stored: &ContentWrite,
+        content: &str,
+    ) -> Result<String, AppError> {
+        match stored {
+            ContentWrite::Omitted | ContentWrite::Plain(_) => Ok(request_hash(content.as_bytes())),
+            ContentWrite::Encrypt(_) => {
+                let hasher = self
+                    .keyring
+                    .as_ref()
+                    .and_then(|keyring| keyring.active_memory_dedupe())
+                    .ok_or_else(|| {
+                        warn!(
+                            reason = "no_active_memory_dedupe_key",
+                            "refusing to store a sealed memory: this keyring carries no active \
+                             `memory_dedupe` key, and writing the unkeyed content address beside \
+                             a sealed body would make the ciphertext recoverable from a database \
+                             dump plus a wordlist"
+                        );
+                        content_key_unavailable()
+                    })?;
+                Ok(hasher.hash(content.as_bytes()))
+            }
+        }
+    }
 }
 
 impl ContentOpener for KeyringContentAccess {
@@ -251,20 +340,37 @@ fn open_with_snapshot(
         );
         return Err(content_key_unavailable());
     };
-    let cipher = entry.cipher().map_err(|_| {
-        warn!(
-            reason = "abandoned_data_key",
-            data_key_id = %header.data_key_id,
-            table = identity.profile().table(),
-            column = identity.profile().column(),
-            "cannot open sealed content: this data key was abandoned, so rows sealed under it \
-             are permanently unreadable"
-        );
-        AppError::coded(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "content_key_abandoned",
-            "the key that protects this content was abandoned and the content cannot be read",
-        )
+    // Two conditions, two answers. Folding them would send an operator chasing a lost master key
+    // for an envelope that names a key which was never a content key in the first place.
+    let cipher = entry.cipher().map_err(|error| match error {
+        KeyringError::WrongPurposeDataKey { purpose, .. } => {
+            warn!(
+                reason = "wrong_purpose_data_key",
+                data_key_id = %header.data_key_id,
+                key_purpose = purpose,
+                table = identity.profile().table(),
+                column = identity.profile().column(),
+                "cannot open sealed content: the envelope names a data key whose purpose is not \
+                 content encryption. Nothing in this build seals under such a key, so the row \
+                 was written by something else"
+            );
+            content_decryption_failed()
+        }
+        _ => {
+            warn!(
+                reason = "abandoned_data_key",
+                data_key_id = %header.data_key_id,
+                table = identity.profile().table(),
+                column = identity.profile().column(),
+                "cannot open sealed content: this data key was abandoned, so rows sealed under \
+                 it are permanently unreadable"
+            );
+            AppError::coded(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "content_key_abandoned",
+                "the key that protects this content was abandoned and the content cannot be read",
+            )
+        }
     })?;
 
     let plaintext = cipher

@@ -40,7 +40,8 @@ pub use crypto::{
 };
 pub use data_keys::{
     ContentKeyring, DataKeyPurpose, DataKeyState, KEY_CHECK_VALUE_LABEL, KEY_CHECK_VALUE_LEN,
-    KeyEntry, KeyringError, KeyringSnapshot, format_key_check_value, key_check_value,
+    KeyEntry, KeyringError, KeyringSnapshot, MEMORY_DEDUPE_HASH_PREFIX, MemoryDedupeHasher,
+    format_key_check_value, key_check_value,
 };
 pub use idempotency::IdempotencyHasher;
 pub use key_custody::{

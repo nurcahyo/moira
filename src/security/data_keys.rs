@@ -53,6 +53,7 @@ use std::{
 };
 
 use aes_gcm::{Aes256Gcm, aead::KeyInit, aead::OsRng};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -101,6 +102,9 @@ pub(super) const KEYRING_BOOTSTRAP_LOCK_KEY: i64 = i64::from_be_bytes(*b"moiraky
 /// The `purpose` new content writes are sealed under.
 const PURPOSE_CONTENT: &str = "content";
 
+/// The `purpose` of the one key that keys `memory_records.content_hash` for sealed rows.
+const PURPOSE_MEMORY_DEDUPE: &str = "memory_dedupe";
+
 /// `key_check_value = HMAC-SHA256(dek, KEY_CHECK_VALUE_LABEL)[..8]`.
 ///
 /// It proves a successful unwrap produced the *right* key rather than merely *a* key. Without
@@ -146,7 +150,7 @@ impl DataKeyPurpose {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Content => PURPOSE_CONTENT,
-            Self::MemoryDedupe => "memory_dedupe",
+            Self::MemoryDedupe => PURPOSE_MEMORY_DEDUPE,
         }
     }
 
@@ -155,6 +159,104 @@ impl DataKeyPurpose {
     /// under a key reserved for something else.
     pub fn from_db(value: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|it| it.as_str() == value)
+    }
+}
+
+/// The marker a keyed memory dedupe digest carries, and the reason it can never be mistaken for
+/// the unkeyed content address `migrations/0021` established.
+///
+/// `d` for dedupe, `1` for the construction's version, and a `:` that a content address
+/// **cannot contain**. That last clause is not a convention anybody has to remember: a value
+/// produced by [`crate::security::request_hash`] is unpadded base64url over a fixed 32-byte
+/// digest, whose alphabet is `A-Za-z0-9-_` — `0021`'s own words are "43 characters, no `:`", and
+/// `secret_fingerprint_is_stable_and_does_not_embed_the_input` in
+/// `crate::security::masking` pins the width, the alphabet and the absence of padding.
+///
+/// So a plaintext-era row and an encrypted-era row can only ever **miss** each other on an
+/// equality comparison. There is no third value either could take that makes them collide.
+pub const MEMORY_DEDUPE_HASH_PREFIX: &str = "d1:";
+
+/// Keys `memory_records.content_hash` for rows whose body is sealed.
+///
+/// # Why this exists at all
+///
+/// `memory_records.content_hash` is an **unkeyed** SHA-256 of the memory body (migration
+/// `0021`). Memory records are short, low-entropy and highly guessable — "user prefers dark
+/// mode", "user's timezone is Asia/Jakarta". Sealing `content_plain` while leaving an unkeyed
+/// digest of that same plaintext **in the same row** defeats the encryption completely: a
+/// database dump plus a wordlist recovers the content without touching a key. This is the
+/// argument `crate::security::idempotency`'s module doc already makes for a sibling column, and
+/// the one `0021` anticipated when it refused to recompute hashes for encrypted rows.
+///
+/// # Why the key is a keyring row and not a pepper
+///
+/// F14 rejected a peppered hash here for a reason that has not gone away: `memory_records` has
+/// **no retention** — a nullable `valid_until` and a `status` that stays `'active'` indefinitely
+/// — so a pepper rotation does not open a bounded window, it permanently orphans every stored
+/// digest, and exact-match dedupe stops matching with no error and no log line.
+///
+/// A `content_data_keys` row dissolves that objection rather than arguing with it. The key is
+/// **wrapped by the master key**, so a master-key rotation re-wraps the envelope and the 32 bytes
+/// inside it are unchanged — every stored `content_hash` stays byte-identical, and every dedupe
+/// lookup written before the rotation still matches after it.
+/// `memory_dedupe_hashes_survive_a_master_key_rotation` proves that against a real database
+/// rather than asserting it here.
+///
+/// # This key is deliberately not rotated
+///
+/// Rotating it is the one operation that *would* re-create F14. Nothing rotates it: the keyring
+/// mints exactly one `memory_dedupe` row, [`ContentKeyring::ensure_memory_dedupe_key`] is a
+/// no-op ever after, and `moira keyring rotation-gate` treats the purpose separately from
+/// `content`. If it ever must be rotated — a key genuinely believed compromised — the
+/// consequence is a **documented one-time loss of cross-era dedupe**, not an error: rows hashed
+/// under the old key keep their value, rows hashed under the new one get a different value, both
+/// carry the same `d1:` marker, and a lookup across the boundary misses. Memories then
+/// accumulate one duplicate per distinct pre-rotation body. That is a data-quality cost an
+/// operator can accept knowingly; it is not a failure, and nothing will report it as one.
+///
+/// # `Debug` prints the key id and nothing else
+///
+/// The same rule [`KeyEntry`] follows. A derived `Debug` would render 32 bytes of HMAC key into
+/// any stray `{:?}`, and that key is an offline verifier for every memory in the deployment.
+#[derive(Clone)]
+pub struct MemoryDedupeHasher {
+    data_key_id: Uuid,
+    key: Zeroizing<[u8; 32]>,
+}
+
+impl MemoryDedupeHasher {
+    pub fn new(data_key_id: Uuid, key: &Zeroizing<[u8; 32]>) -> Self {
+        Self {
+            data_key_id,
+            key: Zeroizing::new(**key),
+        }
+    }
+
+    pub fn data_key_id(&self) -> Uuid {
+        self.data_key_id
+    }
+
+    /// `"d1:" || base64url_no_pad(HMAC-SHA256(K_dedupe, content))`.
+    ///
+    /// **This value is stored.** Changing the prefix, the MAC, or the encoding orphans every
+    /// `content_hash` already written under it, with exactly the silence F14 described. Pinned by
+    /// `memory_dedupe_hash_has_the_pinned_shape`.
+    pub fn hash(&self, content: &[u8]) -> String {
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(self.key.as_slice())
+            .expect("HMAC accepts a key of any length");
+        mac.update(content);
+        format!(
+            "{MEMORY_DEDUPE_HASH_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+        )
+    }
+}
+
+impl std::fmt::Debug for MemoryDedupeHasher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryDedupeHasher")
+            .field("data_key_id", &self.data_key_id)
+            .finish_non_exhaustive()
     }
 }
 
@@ -220,6 +322,18 @@ impl DataKeyState {
     }
 }
 
+/// The opened form of a data key, chosen by its [`DataKeyPurpose`].
+///
+/// One enum rather than two `Option` fields, for the reason this subsystem keeps restating: two
+/// options can disagree about the same key, and the disagreement is silent. The variant *is* the
+/// purpose, resolved once at load, so no later caller can ask a `memory_dedupe` key to decrypt a
+/// row or a `content` key to key a digest.
+#[derive(Clone)]
+enum OpenedKey {
+    Content(Arc<ContentCipher>),
+    MemoryDedupe(Arc<MemoryDedupeHasher>),
+}
+
 /// One keyring row, as the snapshot holds it.
 ///
 /// `Debug` is hand-written and prints ids, states and the key check value only. A derived one
@@ -238,15 +352,38 @@ pub struct KeyEntry {
     /// Present for every state in [`DataKeyState::is_unwrapped_at_load`], `None` for
     /// `abandoned`. The `Option` *is* the abandonment marker: there is no second flag that could
     /// disagree with it.
-    cipher: Option<Arc<ContentCipher>>,
+    opened: Option<OpenedKey>,
 }
 
 impl KeyEntry {
-    /// The cipher, or the typed refusal an abandoned key earns.
+    /// The cipher, or the typed refusal this key earns.
+    ///
+    /// Two refusals, not one. `None` is abandonment. A `memory_dedupe` key reached through here
+    /// is a **different** condition — an envelope naming a key that was never a content key —
+    /// and reporting it as abandonment would send an operator to `keyring abandon`'s remedy for
+    /// a fault that has nothing to do with a lost master key.
     pub fn cipher(&self) -> Result<Arc<ContentCipher>, KeyringError> {
-        self.cipher
-            .clone()
-            .ok_or(KeyringError::AbandonedDataKey { id: self.id })
+        match &self.opened {
+            None => Err(KeyringError::AbandonedDataKey { id: self.id }),
+            Some(OpenedKey::Content(cipher)) => Ok(cipher.clone()),
+            Some(OpenedKey::MemoryDedupe(_)) => Err(KeyringError::WrongPurposeDataKey {
+                id: self.id,
+                purpose: self.purpose.as_str(),
+                wanted: PURPOSE_CONTENT,
+            }),
+        }
+    }
+
+    /// The dedupe hasher, when this entry is a loaded `memory_dedupe` key.
+    ///
+    /// `None` for a content key rather than an error: asking "is this the dedupe key?" is a
+    /// question, and the caller that asks it ([`KeyringSnapshot`] assembly, and the tests that
+    /// pin purpose separation) has a next thing to try.
+    pub fn memory_dedupe_hasher(&self) -> Option<Arc<MemoryDedupeHasher>> {
+        match &self.opened {
+            Some(OpenedKey::MemoryDedupe(hasher)) => Some(hasher.clone()),
+            _ => None,
+        }
     }
 }
 
@@ -263,7 +400,7 @@ impl std::fmt::Debug for KeyEntry {
                 "key_check_value",
                 &format_key_check_value(&self.key_check_value),
             )
-            .field("loaded", &self.cipher.is_some())
+            .field("loaded", &self.opened.is_some())
             .finish()
     }
 }
@@ -280,6 +417,20 @@ pub struct KeyringSnapshot {
     /// cipher already carries its `data_key_id` and stamps it into every envelope it seals, so a
     /// separate copy of the id would be a second source of truth that can only ever be wrong.
     active_content: Arc<ContentCipher>,
+    /// The key that digests `memory_records.content_hash` for sealed rows.
+    ///
+    /// `Option`, where [`Self::active_content`] is not, and the asymmetry is deliberate. A
+    /// keyring with no writable content key cannot store anything and is a boot refusal
+    /// ([`KeyringError::NoActiveKey`]). A keyring with no `memory_dedupe` key is a keyring that
+    /// simply has not had one minted yet — the state every deployment upgrading through this
+    /// release is in for the few milliseconds between reading the rows and
+    /// [`ContentKeyring::ensure_memory_dedupe_key`] writing one. Making it infallible by type
+    /// would mean either refusing to boot on that state or minting a key inside `assemble`,
+    /// which is a pure function over rows and must stay one.
+    ///
+    /// A memory write that needs it and does not find it is a **refusal**, never a fallback to
+    /// the unkeyed address — that fallback is the oracle this whole key exists to close.
+    active_memory_dedupe: Option<Arc<MemoryDedupeHasher>>,
     /// Every non-retired key, abandoned ones included and marked.
     by_id: HashMap<Uuid, KeyEntry>,
     generation: u64,
@@ -294,6 +445,12 @@ impl KeyringSnapshot {
 
     pub fn active_content_key_id(&self) -> Uuid {
         self.active_content.data_key_id()
+    }
+
+    /// The hasher keyed `memory_records.content_hash` for sealed rows, if this keyring carries
+    /// one. See [`MemoryDedupeHasher`] for why it is never rotated.
+    pub fn active_memory_dedupe(&self) -> Option<Arc<MemoryDedupeHasher>> {
+        self.active_memory_dedupe.clone()
     }
 
     /// Monotonic across the life of one [`ContentKeyring`]. The single-flight gate compares it to
@@ -447,6 +604,19 @@ pub enum KeyringError {
     )]
     AbandonedDataKey { id: Uuid },
 
+    /// A key asked to do the job of a different purpose. Not an operator condition: the only way
+    /// to reach it is a stored envelope naming a key that was never a content key, or a caller
+    /// asking a content key to produce a dedupe digest. Both are wiring faults, and both deserve
+    /// to say so rather than borrow [`Self::AbandonedDataKey`]'s remedy.
+    #[error(
+        "content data key {id} has purpose {purpose:?}, but was asked to act as a {wanted:?} key"
+    )]
+    WrongPurposeDataKey {
+        id: Uuid,
+        purpose: &'static str,
+        wanted: &'static str,
+    },
+
     #[error("content key custody failed: {0}")]
     Custody(#[from] KeyCustodyError),
 }
@@ -540,8 +710,26 @@ impl ContentKeyring {
             Self::bootstrap_if_empty(&pool, custody.as_ref()).await?;
             rows = Self::fetch_rows(&pool, &database_loads).await?;
         }
+        let mut snapshot = Self::assemble(rows, custody.as_ref(), 0).await?;
 
-        let snapshot = Self::assemble(rows, custody.as_ref(), 0).await?;
+        // Step 3b, and it is deliberately **after** the assemble rather than beside the
+        // bootstrap. Three properties fall out of that ordering and none of them survives moving
+        // it earlier:
+        //
+        // * a keyring this process cannot open reaches its refusal having written nothing — a
+        //   refused boot is a refusal, not a repair, which is bootstrap's own posture;
+        // * the condition is read from the assembled snapshot rather than from a second query,
+        //   so it cannot disagree with what the snapshot actually holds;
+        // * a deployment that already has its dedupe key — every boot after the first — pays
+        //   **zero** extra queries, because the `is_none()` short-circuits before the lock.
+        //
+        // The second `assemble` costs one extra load, once in the life of a deployment.
+        if snapshot.active_memory_dedupe.is_none()
+            && Self::ensure_memory_dedupe_key(&pool, custody.as_ref()).await?
+        {
+            let rows = Self::fetch_rows(&pool, &database_loads).await?;
+            snapshot = Self::assemble(rows, custody.as_ref(), 0).await?;
+        }
 
         let keyring = Self {
             snapshot: RwLock::new(Arc::new(snapshot)),
@@ -578,6 +766,11 @@ impl ContentKeyring {
     /// The cipher new content is sealed under.
     pub fn active_content_cipher(&self) -> Arc<ContentCipher> {
         self.snapshot().active_content()
+    }
+
+    /// The hasher that keys `memory_records.content_hash` for sealed rows.
+    pub fn active_memory_dedupe(&self) -> Option<Arc<MemoryDedupeHasher>> {
+        self.snapshot().active_memory_dedupe()
     }
 
     /// Queries against `content_data_keys` issued by this process, boot included.
@@ -869,6 +1062,129 @@ impl ContentKeyring {
         Ok(true)
     }
 
+    /// Mint the one `memory_dedupe` key, if and only if the keyring holds no row of that purpose
+    /// at all. Returns whether a row was written.
+    ///
+    /// # Why this is not folded into [`Self::bootstrap_if_empty`]
+    ///
+    /// That function is bounded to a **strictly empty table**, and that bound is what makes it
+    /// safe: an existing deployment booted against the wrong master key has rows, so it reaches
+    /// the refusal in [`Self::assemble`] instead of silently acquiring a second content keyring.
+    /// Every deployment that already ran a release from this train has a content key and would
+    /// therefore never reach the bootstrap again — and would never get a dedupe key, leaving
+    /// every encrypted memory write refusing forever.
+    ///
+    /// Relaxing the bound is safe **for this purpose and no other**, for three reasons that do
+    /// not hold for `content`:
+    ///
+    /// 1. It runs after [`Self::fetch_rows`] and before [`Self::assemble`], so a keyring that
+    ///    cannot be opened still reaches its refusal. This adds a row; it never rescues a boot.
+    /// 2. A `memory_dedupe` key protects **nothing that already exists**. A second content key
+    ///    would split stored ciphertext across two keyrings; a second dedupe key can only ever
+    ///    exist where the first one never did, so there is no corpus for it to orphan.
+    /// 3. The condition is "no row of this purpose in any state", not "no *active* row". A
+    ///    deployment whose dedupe key is `retiring`, `retired` or `abandoned` gets **nothing**
+    ///    minted and a WARN: that state is an operator decision, and quietly minting a
+    ///    replacement is precisely the rotation [`MemoryDedupeHasher`] documents as the one
+    ///    operation that re-creates F14. Encrypted memory writes then refuse with
+    ///    `content_key_unavailable`, loudly, until an operator says what they meant.
+    ///
+    /// The advisory lock is [`KEYRING_BOOTSTRAP_LOCK_KEY`] — the same one bootstrap and
+    /// `keyring add` take — because this also allocates `max(key_version) + 1` on a `unique`
+    /// column, and a second lock key would leave three writers racing for no reason.
+    async fn ensure_memory_dedupe_key(
+        pool: &PgPool,
+        custody: &dyn MasterKeyCustody,
+    ) -> Result<bool, KeyringError> {
+        let mut tx = pool.begin().await?;
+        sqlx::query("select pg_advisory_xact_lock($1)")
+            .bind(KEYRING_BOOTSTRAP_LOCK_KEY)
+            .execute(&mut *tx)
+            .await?;
+
+        let existing: Vec<String> =
+            sqlx::query_scalar("select state from content_data_keys where purpose = $1")
+                .bind(PURPOSE_MEMORY_DEDUPE)
+                .fetch_all(&mut *tx)
+                .await?;
+        if !existing.is_empty() {
+            tx.rollback().await?;
+            if !existing
+                .iter()
+                .any(|state| state == DataKeyState::Active.as_str())
+            {
+                warn!(
+                    states = ?existing,
+                    "the memory dedupe key exists but none of its rows is 'active'; memory \
+                     writes under an encrypted persistence policy will be refused until one is. \
+                     Promote the existing key rather than adding another — a second dedupe key \
+                     is a rotation, and rotating this key costs a one-time loss of cross-era \
+                     memory dedupe"
+                );
+            }
+            return Ok(false);
+        }
+
+        let id = Uuid::now_v7();
+        let mut data_key = Zeroizing::new([0u8; 32]);
+        data_key.copy_from_slice(Aes256Gcm::generate_key(&mut OsRng).as_slice());
+        let check_value = key_check_value(&data_key);
+
+        let aad = wrapped_data_key_aad(
+            id,
+            custody.active_master_key_id(),
+            WRAP_ALGORITHM_AES_256_GCM,
+        );
+        let wrapped = custody.wrap(&data_key, aad.as_bytes()).await?;
+        if wrapped.wrap_algorithm != WRAP_ALGORITHM_AES_256_GCM {
+            return Err(KeyringError::UnreadableRow {
+                data_key_id: id,
+                detail: format!(
+                    "custody backend {:?} wrapped the memory dedupe key with algorithm {:?}, but \
+                     the wrap AAD was built for {WRAP_ALGORITHM_AES_256_GCM:?}",
+                    custody.backend_name(),
+                    wrapped.wrap_algorithm,
+                ),
+            });
+        }
+
+        sqlx::query(
+            "insert into content_data_keys (
+                 id, key_version, purpose, state, custody_backend, master_key_id,
+                 wrap_algorithm, wrap_nonce, wrapped_key, key_check_value, activated_at
+             ) values (
+                 $1,
+                 (select coalesce(max(key_version), 0) + 1 from content_data_keys),
+                 $2, 'active', $3, $4, $5, $6, $7, $8, now()
+             )",
+        )
+        .bind(id)
+        .bind(PURPOSE_MEMORY_DEDUPE)
+        .bind(custody.backend_name())
+        .bind(&wrapped.master_key_id)
+        .bind(&wrapped.wrap_algorithm)
+        .bind(&wrapped.nonce)
+        .bind(&wrapped.wrapped)
+        .bind(check_value.as_slice())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        info!(
+            data_key_id = %id,
+            custody_backend = custody.backend_name(),
+            master_key_id = custody.active_master_key_id(),
+            key_check_value = %format_key_check_value(&check_value),
+            "minted the memory dedupe key. It keys `memory_records.content_hash` for rows whose \
+             body is sealed, and it is NOT ROTATED BY DESIGN: master-key rotation re-wraps this \
+             envelope and leaves every stored hash byte-identical, which is the property that \
+             makes a keyed hash safe on a table with no retention. Rotating this key instead \
+             would cost a one-time, permanent loss of dedupe across the rotation boundary — a \
+             documented data-quality cost, not an error, and nothing will report it as one"
+        );
+        Ok(true)
+    }
+
     async fn fetch_rows(pool: &PgPool, loads: &AtomicU64) -> Result<Vec<KeyringRow>, sqlx::Error> {
         loads.fetch_add(1, Ordering::SeqCst);
         sqlx::query_as::<_, KeyringRow>(
@@ -893,6 +1209,7 @@ impl ContentKeyring {
     ) -> Result<KeyringSnapshot, KeyringError> {
         let mut by_id = HashMap::with_capacity(rows.len());
         let mut active_content: Option<Arc<ContentCipher>> = None;
+        let mut active_memory_dedupe: Option<Arc<MemoryDedupeHasher>> = None;
 
         for row in rows {
             let purpose = DataKeyPurpose::from_db(&row.purpose).ok_or_else(|| {
@@ -920,7 +1237,7 @@ impl ContentKeyring {
                     }
                 })?;
 
-            let cipher = if state.is_unwrapped_at_load() {
+            let opened = if state.is_unwrapped_at_load() {
                 let aad = wrapped_data_key_aad(row.id, &row.master_key_id, &row.wrap_algorithm);
                 let wrapped = WrappedKey {
                     master_key_id: row.master_key_id.clone(),
@@ -950,13 +1267,30 @@ impl ContentKeyring {
                         computed: format_key_check_value(&computed),
                     });
                 }
-                Some(Arc::new(ContentCipher::new(row.id, &data_key)))
+                // The purpose decides what the 32 bytes become, once, here. A `memory_dedupe`
+                // key deliberately never becomes a `ContentCipher`: building one "just in case"
+                // would put an AES cipher over the digest key into every snapshot for nothing to
+                // use, and would make `KeyEntry::cipher` unable to tell the two apart.
+                Some(match purpose {
+                    DataKeyPurpose::Content => {
+                        OpenedKey::Content(Arc::new(ContentCipher::new(row.id, &data_key)))
+                    }
+                    DataKeyPurpose::MemoryDedupe => OpenedKey::MemoryDedupe(Arc::new(
+                        MemoryDedupeHasher::new(row.id, &data_key),
+                    )),
+                })
             } else {
                 None
             };
 
-            if purpose == DataKeyPurpose::Content && state.is_writable() {
-                active_content.clone_from(&cipher);
+            if state.is_writable() {
+                match &opened {
+                    Some(OpenedKey::Content(cipher)) => active_content = Some(cipher.clone()),
+                    Some(OpenedKey::MemoryDedupe(hasher)) => {
+                        active_memory_dedupe = Some(hasher.clone());
+                    }
+                    None => {}
+                }
             }
 
             by_id.insert(
@@ -970,7 +1304,7 @@ impl ContentKeyring {
                     master_key_id: row.master_key_id,
                     key_check_value: stored_check_value,
                     created_at: row.created_at,
-                    cipher,
+                    opened,
                 },
             );
         }
@@ -982,6 +1316,7 @@ impl ContentKeyring {
 
         Ok(KeyringSnapshot {
             active_content,
+            active_memory_dedupe,
             by_id,
             generation,
             loaded_at: Instant::now(),
@@ -1173,6 +1508,30 @@ mod tests {
         state: DataKeyState,
         dek_byte: u8,
     ) -> Uuid {
+        insert_key_for(
+            pool,
+            sealer,
+            DataKeyPurpose::Content,
+            version,
+            state,
+            dek_byte,
+        )
+        .await
+    }
+
+    /// [`insert_key`], for a chosen purpose.
+    ///
+    /// Most cases below seed a `memory_dedupe` key alongside their content keys, so that boot
+    /// finds one and `ensure_memory_dedupe_key` does not mint a second — which would add both a
+    /// row and a whole extra `assemble` to every unwrap count in this file.
+    async fn insert_key_for(
+        pool: &PgPool,
+        sealer: &dyn MasterKeyCustody,
+        purpose: DataKeyPurpose,
+        version: i32,
+        state: DataKeyState,
+        dek_byte: u8,
+    ) -> Uuid {
         let id = Uuid::now_v7();
         let data_key = Zeroizing::new([dek_byte; 32]);
         let check_value = key_check_value(&data_key);
@@ -1187,10 +1546,11 @@ mod tests {
             "insert into content_data_keys (
                  id, key_version, purpose, state, custody_backend, master_key_id,
                  wrap_algorithm, wrap_nonce, wrapped_key, key_check_value, activated_at
-             ) values ($1, $2, 'content', $3, 'environment', $4, $5, $6, $7, $8, now())",
+             ) values ($1, $2, $3, $4, 'environment', $5, $6, $7, $8, $9, now())",
         )
         .bind(id)
         .bind(version)
+        .bind(purpose.as_str())
         .bind(state.as_str())
         .bind(&wrapped.master_key_id)
         .bind(&wrapped.wrap_algorithm)
@@ -1230,6 +1590,17 @@ mod tests {
         let retiring = insert_key(&pool, &previous, 3, DataKeyState::Retiring, 12).await;
         let retired = insert_key(&pool, &current, 4, DataKeyState::Retired, 13).await;
         let abandoned = insert_key(&pool, &current, 5, DataKeyState::Abandoned, 14).await;
+        // Seeded, not minted: this case is about which *states* get unwrapped, and letting boot
+        // mint the dedupe key would add a second `assemble` and double every count below.
+        let dedupe = insert_key_for(
+            &pool,
+            &current,
+            DataKeyPurpose::MemoryDedupe,
+            6,
+            DataKeyState::Active,
+            15,
+        )
+        .await;
 
         let custody = Arc::new(CountingCustody::new(&[("k1", 1), ("old", 2)], "k1"));
         let keyring = ContentKeyring::load(pool, custody.clone(), &settings(), metrics())
@@ -1237,16 +1608,17 @@ mod tests {
             .expect("load");
         let snapshot = keyring.snapshot();
 
-        // Four carried, one dropped. A `retired` key is absent, which is what makes a row naming
+        // Five carried, one dropped. A `retired` key is absent, which is what makes a row naming
         // it fail cleanly rather than decrypt.
-        assert_eq!(snapshot.len(), 4);
+        assert_eq!(snapshot.len(), 5);
         assert!(snapshot.entry(retired).is_none());
         assert_eq!(snapshot.active_content_key_id(), active);
 
-        // Three unwrapped, and exactly three: `abandoned` is carried without ever being handed to
-        // custody, and `retired` is not read at all. The count *is* the assertion — a keyring that
-        // also tried to unwrap the abandoned key would still have produced a usable snapshot.
-        assert_eq!(custody.unwrap_calls(), 3);
+        // Four unwrapped, and exactly four: the three loadable content keys and the dedupe key.
+        // `abandoned` is carried without ever being handed to custody, and `retired` is not read
+        // at all. The count *is* the assertion — a keyring that also tried to unwrap the
+        // abandoned key would still have produced a usable snapshot.
+        assert_eq!(custody.unwrap_calls(), 4);
         for id in [pending, active, retiring] {
             assert!(snapshot.entry(id).expect("entry").cipher().is_ok());
         }
@@ -1254,6 +1626,31 @@ mod tests {
             snapshot.entry(abandoned).expect("entry").cipher(),
             Err(KeyringError::AbandonedDataKey { id }) if id == abandoned
         ));
+
+        // Purpose separation, resolved once at load and not re-derivable afterwards. The dedupe
+        // key is **not** a cipher, and asking it to be one is its own refusal rather than the
+        // abandonment message — the two remedies have nothing to do with each other.
+        let dedupe_entry = snapshot.entry(dedupe).expect("entry");
+        assert!(dedupe_entry.memory_dedupe_hasher().is_some());
+        assert!(matches!(
+            dedupe_entry.cipher(),
+            Err(KeyringError::WrongPurposeDataKey { id, .. }) if id == dedupe
+        ));
+        assert!(
+            snapshot
+                .entry(active)
+                .expect("entry")
+                .memory_dedupe_hasher()
+                .is_none(),
+            "a content key must never double as the dedupe key: one keyring row, one job"
+        );
+        assert_eq!(
+            snapshot
+                .active_memory_dedupe()
+                .expect("the seeded dedupe key is active")
+                .data_key_id(),
+            dedupe
+        );
 
         // The unwrap produced the *right* key, not merely a key: seal with the cipher the keyring
         // resolved, and open it with one built from the DEK the fixture wrote.
@@ -1346,6 +1743,17 @@ mod tests {
         let pool = isolated_pool(&database).await;
         let custody = Arc::new(CountingCustody::new(&[("k1", 1)], "k1"));
         insert_key(&pool, custody.as_ref(), 1, DataKeyState::Active, 40).await;
+        // Seeded so boot mints nothing: `ensure_memory_dedupe_key` would otherwise take
+        // `key_version` 2 and cost a second `fetch_rows`, which is exactly the count below.
+        insert_key_for(
+            &pool,
+            custody.as_ref(),
+            DataKeyPurpose::MemoryDedupe,
+            2,
+            DataKeyState::Active,
+            42,
+        )
+        .await;
 
         let keyring = ContentKeyring::load(pool.clone(), custody.clone(), &settings(), metrics())
             .await
@@ -1354,7 +1762,7 @@ mod tests {
 
         // A key that arrived after this process booted — a rotation, seen from the replica that
         // did not perform it.
-        let latecomer = insert_key(&pool, custody.as_ref(), 2, DataKeyState::Retiring, 41).await;
+        let latecomer = insert_key(&pool, custody.as_ref(), 3, DataKeyState::Retiring, 41).await;
         assert!(keyring.snapshot().entry(latecomer).is_none());
 
         let cipher = keyring.cipher_for(latecomer).await.expect("resolved");
@@ -1520,6 +1928,16 @@ mod tests {
         let pool = isolated_pool(&database).await;
         let custody = Arc::new(CountingCustody::new(&[("k1", 1)], "k1"));
         insert_key(&pool, custody.as_ref(), 1, DataKeyState::Active, 60).await;
+        // Seeded so boot mints nothing — see `an_unknown_key_id_triggers_exactly_one_refresh…`.
+        insert_key_for(
+            &pool,
+            custody.as_ref(),
+            DataKeyPurpose::MemoryDedupe,
+            2,
+            DataKeyState::Active,
+            62,
+        )
+        .await;
 
         let keyring = Arc::new(
             ContentKeyring::load(pool.clone(), custody.clone(), &settings(), metrics())
@@ -1531,7 +1949,7 @@ mod tests {
 
         // A real latecomer, so the hundred misses end in a *success*. A test where every task
         // fails would pass just as happily against a keyring that never reloaded at all.
-        let latecomer = insert_key(&pool, custody.as_ref(), 2, DataKeyState::Retiring, 61).await;
+        let latecomer = insert_key(&pool, custody.as_ref(), 3, DataKeyState::Retiring, 61).await;
 
         // All hundred released at once, so they genuinely queue on the same permit rather than
         // arriving one after another and being collapsed by the floor instead — which would make
@@ -1575,10 +1993,11 @@ mod tests {
             "no miss observed the concurrent load; this did not exercise single flight"
         );
 
-        // The load unwrapped two keys once, not two hundred times. Custody is never on the
-        // request path, and this is the count that says so — the assertions above would still
-        // pass if every task had called custody after a shared load.
-        assert_eq!(custody.unwrap_calls() - unwraps_after_boot, 2);
+        // The load unwrapped three keys once — the original content key, the latecomer, and the
+        // seeded dedupe key — not three hundred times. Custody is never on the request path, and
+        // this is the count that says so; the assertions above would still pass if every task
+        // had called custody after a shared load.
+        assert_eq!(custody.unwrap_calls() - unwraps_after_boot, 3);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1746,7 +2165,11 @@ mod tests {
         let keyring = ContentKeyring::load(pool.clone(), custody.clone(), &settings(), metrics())
             .await
             .expect("bootstrap");
-        assert_eq!(key_count(&pool).await, 1);
+        // **Two** rows, and they are different keys for different jobs: the content key the
+        // bootstrap mints, and the `memory_dedupe` key `ensure_memory_dedupe_key` mints because
+        // this table held none. Sharing one key between sealing and digesting would hand anyone
+        // who holds it both an offline verifier and a decryption key.
+        assert_eq!(key_count(&pool).await, 2);
 
         let snapshot = keyring.snapshot();
         let entry = snapshot
@@ -1757,6 +2180,20 @@ mod tests {
         assert_eq!(entry.key_version, 1);
         assert_eq!(entry.master_key_id, "k1");
         assert_eq!(entry.custody_backend, "environment");
+
+        let dedupe = snapshot
+            .active_memory_dedupe()
+            .expect("a strictly empty table must come up with a dedupe key too");
+        assert_ne!(
+            dedupe.data_key_id(),
+            entry.id,
+            "the dedupe key must be its own row, never the content key wearing two hats"
+        );
+        let dedupe_entry = snapshot.entry(dedupe.data_key_id()).expect("dedupe entry");
+        assert_eq!(dedupe_entry.purpose, DataKeyPurpose::MemoryDedupe);
+        assert_eq!(dedupe_entry.state, DataKeyState::Active);
+        assert_eq!(dedupe_entry.key_version, 2);
+        assert_eq!(dedupe_entry.master_key_id, "k1");
 
         // The minted key is real: drawn from `OsRng`, wrapped, stored, read back, unwrapped, and
         // the check value the loader computed matched the one the mint stored — that last part is
@@ -1779,12 +2216,76 @@ mod tests {
             b"minted"
         );
 
-        // A second boot against the same table adds nothing and adopts the same key.
+        // A second boot against the same table adds nothing and adopts the same keys. The dedupe
+        // clause is the load-bearing half: a mint that fired on every boot would be a silent
+        // rotation of the one key this design says is never rotated, and every `content_hash`
+        // written before it would stop matching.
         let again = ContentKeyring::load(pool.clone(), custody, &settings(), metrics())
             .await
             .expect("second boot");
-        assert_eq!(key_count(&pool).await, 1);
+        assert_eq!(key_count(&pool).await, 2);
         assert_eq!(again.snapshot().active_content_key_id(), entry.id);
+        assert_eq!(
+            again
+                .snapshot()
+                .active_memory_dedupe()
+                .expect("dedupe key")
+                .data_key_id(),
+            dedupe.data_key_id()
+        );
+        // And it hashes identically, which is the property callers actually depend on.
+        assert_eq!(
+            again
+                .snapshot()
+                .active_memory_dedupe()
+                .expect("dedupe key")
+                .hash(b"user prefers dark mode"),
+            dedupe.hash(b"user prefers dark mode")
+        );
+    }
+
+    /// A `memory_dedupe` row that exists but is not `active` is an **operator decision**, and
+    /// minting a replacement would silently rotate the one key that must not be rotated.
+    ///
+    /// Without this case the cheapest wrong implementation — "mint when no *active* dedupe key"
+    /// — passes every other test in this file, and reveals itself only as memories that stopped
+    /// deduplicating on some deployment months later.
+    #[tokio::test]
+    async fn a_non_active_dedupe_key_is_never_replaced_by_a_second_one() {
+        let Some(database) = crate::test_support::test_database().await else {
+            return;
+        };
+        let pool = isolated_pool(&database).await;
+        let custody = Arc::new(CountingCustody::new(&[("k1", 1)], "k1"));
+        insert_key(&pool, custody.as_ref(), 1, DataKeyState::Active, 70).await;
+        let retiring = insert_key_for(
+            &pool,
+            custody.as_ref(),
+            DataKeyPurpose::MemoryDedupe,
+            2,
+            DataKeyState::Retiring,
+            71,
+        )
+        .await;
+
+        let keyring = ContentKeyring::load(pool.clone(), custody, &settings(), metrics())
+            .await
+            .expect("load");
+
+        assert_eq!(
+            key_count(&pool).await,
+            2,
+            "boot must not mint a second memory_dedupe key beside a non-active one"
+        );
+        assert!(
+            keyring.snapshot().active_memory_dedupe().is_none(),
+            "a retiring dedupe key is not writable, so there is no active hasher and encrypted \
+             memory writes must refuse rather than silently use a different key"
+        );
+        assert_eq!(
+            keyring.snapshot().entry(retiring).expect("entry").purpose,
+            DataKeyPurpose::MemoryDedupe
+        );
     }
 
     #[tokio::test]
@@ -2065,10 +2566,10 @@ mod tests {
             master_key_id: "k1".to_string(),
             key_check_value: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
             created_at: Utc::now(),
-            cipher: Some(Arc::new(ContentCipher::new(
+            opened: Some(OpenedKey::Content(Arc::new(ContentCipher::new(
                 Uuid::from_u128(1),
                 &Zeroizing::new([0xbeu8; 32]),
-            ))),
+            )))),
         };
         let rendered = format!("{entry:?}");
 

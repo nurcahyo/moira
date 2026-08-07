@@ -140,6 +140,25 @@ fn admin(fixture: &Fixture, custody: Arc<dyn MasterKeyCustody>) -> KeyringAdmin 
     KeyringAdmin::new(fixture.pool.clone(), custody)
 }
 
+/// Mints and promotes the `memory_dedupe` key under `custody`'s **active** master key.
+///
+/// `ContentKeyring::load` mints one itself when it finds none, wrapped by whichever master key is
+/// active at that moment. A case that goes on to *lose* a master key therefore has to choose
+/// which one seals the dedupe key, or the loss it is describing quietly takes that key with it
+/// and the test stops being about the thing it names.
+async fn seed_memory_dedupe_key(fixture: &Fixture, custody: Arc<dyn MasterKeyCustody>) -> Uuid {
+    let admin = admin(fixture, custody);
+    let added = admin
+        .add(DataKeyPurpose::MemoryDedupe)
+        .await
+        .expect("add the dedupe key");
+    admin
+        .promote(added.id)
+        .await
+        .expect("promote the dedupe key");
+    added.id
+}
+
 async fn keyring(fixture: &Fixture, custody: Arc<dyn MasterKeyCustody>) -> Arc<ContentKeyring> {
     Arc::new(
         ContentKeyring::load(fixture.pool.clone(), custody, &settings(), metrics())
@@ -956,7 +975,10 @@ async fn r2_rewrap_changes_every_wrapping_and_not_one_byte_of_ciphertext() {
             "{column} holds no rows, so byte-identity across it would assert nothing"
         );
     }
-    assert_eq!(before_wrappings.len(), 2);
+    // Three: content keys A and B, and the `memory_dedupe` key boot minted. All three are
+    // rewrapped below, which is what keeps every stored `content_hash` valid across the
+    // rotation.
+    assert_eq!(before_wrappings.len(), 3);
 
     // Step 1 of the rotation: both master keys held, ACTIVE_KEY_ID deliberately untouched.
     // This is why `wrap_under` exists — the target is held and is *not* the active key.
@@ -965,7 +987,10 @@ async fn r2_rewrap_changes_every_wrapping_and_not_one_byte_of_ciphertext() {
         .rewrap("master-new")
         .await
         .expect("rewrap");
-    assert_eq!(report.rewrapped.len(), 2);
+    // All three: content keys A and B, and the `memory_dedupe` key. The dedupe key being in
+    // this set is what keeps every stored `memory_records.content_hash` valid across the
+    // rotation — its wrapping changes, its 32 bytes do not.
+    assert_eq!(report.rewrapped.len(), 3);
     assert!(report.left_alone.is_empty());
 
     let after_columns = column_fingerprints(&fixture.pool).await;
@@ -993,7 +1018,12 @@ async fn r2_rewrap_changes_every_wrapping_and_not_one_byte_of_ciphertext() {
     // written before the rotation.
     let only_new = env_custody(&[("master-new", 0x22)], "master-new");
     let after_rotation = keyring(&fixture, only_new).await;
-    assert_eq!(after_rotation.snapshot().len(), 2);
+    assert_eq!(after_rotation.snapshot().len(), 3);
+    // The dedupe key opened too, under the new master key alone, and hashes the same bytes to
+    // the same value. That is the whole claim `memory_dedupe_hashes_survive_a_master_key_rotation`
+    // makes end to end; asserting it here as well means the keyring layer cannot lose it
+    // silently and leave the integration test to notice.
+    assert!(after_rotation.snapshot().active_memory_dedupe().is_some());
     for row in &rows {
         assert_eq!(
             read_through_keyring(&fixture.pool, &after_rotation, row)
@@ -1073,13 +1103,15 @@ async fn an_omitted_rewrap_refuses_to_boot_and_names_the_missing_master_key_and_
         assert!(text.contains(&needle), "the refusal omits {why}: {text}");
     }
 
-    // A refusal, not a repair: nothing was minted beside the key it could not open, and not
-    // one row was touched.
+    // A refusal, not a repair: nothing was minted beside the keys it could not open, and not
+    // one row was touched. Two, because a healthy boot leaves a content key and a
+    // `memory_dedupe` key — and the count is what says the refused boot added neither a third
+    // content key nor a second dedupe key.
     let keys: i64 = sqlx::query_scalar("select count(*) from content_data_keys")
         .fetch_one(&fixture.pool)
         .await
         .expect("count");
-    assert_eq!(keys, 1);
+    assert_eq!(keys, 2);
     for (column, (count, _)) in column_fingerprints(&fixture.pool).await {
         assert_eq!(count, 1, "{column} changed during a refused boot");
     }
@@ -1250,7 +1282,10 @@ async fn r3_rewrapping_onto_a_backend_that_never_releases_key_bytes() {
         .rewrap_with(kms.clone(), "arn:aws:kms:eu-west-1:1:key/abc")
         .await
         .expect("rewrap onto the KMS backend");
-    assert_eq!(report.rewrapped.len(), 1);
+    // Two: the content key, and the `memory_dedupe` key. A custody swap that moved only the
+    // content key would leave the dedupe key wrapped by a backend the deployment no longer
+    // uses, and the next boot would refuse on it.
+    assert_eq!(report.rewrapped.len(), 2);
     assert_eq!(report.target_backend, "fake_kms");
 
     let after_wrappings = wrappings(&fixture.pool).await;
@@ -1281,10 +1316,11 @@ async fn r3_rewrapping_onto_a_backend_that_never_releases_key_bytes() {
             row.plaintext
         );
     }
-    // Boot unwrapped once per key and never again. Under environment custody a regression
-    // here costs microseconds; under a real KMS it is a network round trip per row.
-    assert_eq!(kms.unwraps.load(Ordering::SeqCst), 1);
-    assert_eq!(kms.wraps.load(Ordering::SeqCst), 1);
+    // Boot unwrapped once per key and never again — twice in total, for the content key and
+    // the `memory_dedupe` key, not once per row. Under environment custody a regression here
+    // costs microseconds; under a real KMS it is a network round trip per row.
+    assert_eq!(kms.unwraps.load(Ordering::SeqCst), 2);
+    assert_eq!(kms.wraps.load(Ordering::SeqCst), 2);
 }
 
 // =======================================================================================
@@ -1298,8 +1334,26 @@ async fn abandoning_a_lost_key_lets_the_process_start_and_confines_the_loss_to_i
     let fixture = fixture().await;
     // Key A under a master key that survives; key B under one that will be lost.
     let both = env_custody(&[("kept", 0x66), ("lost", 0x77)], "lost");
+    // Both keys are placed by hand rather than by bootstrap, because they must be sealed under
+    // *different* master keys. Boot mints the dedupe key under whichever master key happens to
+    // be active, and a dedupe key that went down with `lost` would make the later boot refuse
+    // for a second reason and hide the one this case is about — a loss confined to key B's rows.
+    let key_b = {
+        let admin = admin(&fixture, both.clone());
+        let added = admin
+            .add(DataKeyPurpose::Content)
+            .await
+            .expect("add key B under `lost`");
+        admin.promote(added.id).await.expect("promote key B");
+        added.id
+    };
+    let dedupe = seed_memory_dedupe_key(
+        &fixture,
+        env_custody(&[("kept", 0x66), ("lost", 0x77)], "kept"),
+    )
+    .await;
     let first = keyring(&fixture, both.clone()).await;
-    let key_b = first.snapshot().active_content_key_id();
+    assert_eq!(first.snapshot().active_content_key_id(), key_b);
     let doomed = seed_all_five(
         &fixture.pool,
         &first.active_content_cipher(),
@@ -1400,7 +1454,12 @@ async fn abandoning_a_lost_key_lets_the_process_start_and_confines_the_loss_to_i
         .rewrap("rotated")
         .await
         .expect("a rewrap must not be blocked by an abandoned key");
-    assert_eq!(report.rewrapped, vec![key_a]);
+    // The `memory_dedupe` key is in this list, and that is not incidental — it is the property
+    // the whole dedupe design rests on. A master-key rotation re-wraps it like any other key,
+    // so the 32 bytes inside never change and every `memory_records.content_hash` written under
+    // it stays byte-identical. A rewrap that skipped it would leave it wrapped by a master key
+    // the operator is about to destroy.
+    assert_eq!(report.rewrapped, vec![dedupe, key_a]);
     assert_eq!(report.left_alone, vec![(key_b, "abandoned".to_string())]);
     // Reported, not silent: an operator about to destroy `kept` has to see what still names
     // a master key this rewrap did not move.
@@ -1634,6 +1693,21 @@ async fn reseal_stopped_half_way_converges_when_it_is_run_again() {
 /// writer's row would be silently replaced with a re-seal of the *stale* plaintext.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_row_rewritten_mid_reseal_is_skipped_and_the_concurrent_write_survives() {
+    a_row_rewritten_mid_reseal_is_skipped(AadProfile::ConversationMessageContent).await;
+}
+
+/// The same property over `memory_records`, which acquired a sealed column in issue #140.
+///
+/// A separate case rather than a loop inside one, because each half needs its own fixture and
+/// its own blocked-lock wait, and a failure has to name which table lost the concurrent write.
+/// It matters here in a way it does not for messages: a memory row is *updated* in place by
+/// `patch_memory`, so "a live write during a reseal" is a routine event rather than a corner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_memory_row_rewritten_mid_reseal_is_skipped_and_the_concurrent_write_survives() {
+    a_row_rewritten_mid_reseal_is_skipped(AadProfile::MemoryRecordContent).await;
+}
+
+async fn a_row_rewritten_mid_reseal_is_skipped(profile: AadProfile) {
     let fixture = fixture().await;
     let custody = env_custody(&[("k1", 1)], "k1");
     let instance = keyring(&fixture, custody.clone()).await;
@@ -1641,7 +1715,7 @@ async fn a_row_rewritten_mid_reseal_is_skipped_and_the_concurrent_write_survives
     let row = seed(
         &fixture.pool,
         &instance.active_content_cipher(),
-        AadProfile::ConversationMessageContent,
+        profile,
         b"the original content",
     )
     .await;
@@ -1662,12 +1736,16 @@ async fn a_row_rewritten_mid_reseal_is_skipped_and_the_concurrent_write_survives
         .fetch_one(&mut *blocking)
         .await
         .expect("the competing writer's backend pid");
-    sqlx::query("update conversation_messages set content_encrypted = $1 where id = $2")
-        .bind(&competitor)
-        .bind(row.id)
-        .execute(&mut *blocking)
-        .await
-        .expect("the competing write takes the row lock");
+    sqlx::query(&format!(
+        "update {} set {} = $1 where id = $2",
+        profile.table(),
+        profile.column()
+    ))
+    .bind(&competitor)
+    .bind(row.id)
+    .execute(&mut *blocking)
+    .await
+    .expect("the competing write takes the row lock");
 
     // The reseal now reads the *committed* (old) value and blocks on the update.
     let resealing = {
@@ -1799,7 +1877,7 @@ async fn two_simultaneous_promotions_produce_one_winner_and_one_database_refusal
     let active: Vec<&KeyStatus> = status
         .keys
         .iter()
-        .filter(|key| key.state == "active")
+        .filter(|key| key.state == "active" && key.purpose == "content")
         .collect();
     assert_eq!(active.len(), 1, "exactly one key may be active per purpose");
     assert_eq!(active[0].id, winner);
@@ -1840,9 +1918,24 @@ async fn status_counts_every_sealed_column_and_says_which_master_keys_are_held()
     assert_eq!(status.backend, CUSTODY_BACKEND_ENVIRONMENT);
     assert_eq!(status.active_master_key_id, "present");
     assert_eq!(status.configured_master_key_ids, ["present"]);
-    assert_eq!(status.keys.len(), 1);
+    // Two: the content key and the `memory_dedupe` key boot minted. `status` lists every key,
+    // whatever its purpose, because "is any row still sealed under X" has to be answerable for
+    // all of them before an operator dares destroy a master key.
+    assert_eq!(status.keys.len(), 2);
+    assert_eq!(
+        status
+            .keys
+            .iter()
+            .filter(|key| key.purpose == "memory_dedupe")
+            .count(),
+        1
+    );
 
-    let key = &status.keys[0];
+    let key = status
+        .keys
+        .iter()
+        .find(|key| key.purpose == "content")
+        .expect("the content key");
     assert_eq!(key.id, key_a);
     assert_eq!(key.state, "active");
     assert_eq!(key.purpose, "content");
@@ -2043,9 +2136,11 @@ async fn the_keyring_state_gauge_reports_the_states_it_has_none_of() {
         snapshot.state_counts().into_iter().collect()
     };
 
-    // Bootstrap: one active, and an explicit zero for every other carried state.
+    // Bootstrap: two active — the content key and the `memory_dedupe` key, which are `active`
+    // independently because the single-active index is per *purpose* — and an explicit zero for
+    // every other carried state.
     let at_boot = counts(&instance.snapshot());
-    assert_eq!(at_boot["active"], 1);
+    assert_eq!(at_boot["active"], 2);
     assert_eq!(at_boot["pending"], 0);
     assert_eq!(at_boot["retiring"], 0);
     assert_eq!(at_boot["abandoned"], 0);
@@ -2059,13 +2154,15 @@ async fn the_keyring_state_gauge_reports_the_states_it_has_none_of() {
     let added = admin.add(DataKeyPurpose::Content).await.expect("add");
     let after_add = counts(&instance.refresh().await.expect("refresh"));
     assert_eq!(after_add["pending"], 1);
-    assert_eq!(after_add["active"], 1);
+    assert_eq!(after_add["active"], 2);
 
     admin.promote(added.id).await.expect("promote");
     let after_promote = counts(&instance.refresh().await.expect("refresh"));
     // The whole point: `pending` went back to zero and was WRITTEN as zero.
     assert_eq!(after_promote["pending"], 0);
-    assert_eq!(after_promote["active"], 1);
+    // Still two: promoting a *content* key demotes only the other content key. The dedupe key
+    // is untouched, which is the per-purpose half of the single-active rule.
+    assert_eq!(after_promote["active"], 2);
     assert_eq!(after_promote["retiring"], 1);
 
     // The label domain is closed over the states the snapshot carries — a sixth state could

@@ -42,6 +42,45 @@ The dev escape hatches (`auth.jwks.allow_insecure_dev_urls`,
 one trust surface for local development does not silently loosen the other. Production
 start-up refuses to come up while either is true.
 
+## Why the four `content_hash` columns are not hashed the same way
+
+Four tables carry a digest of caller content, and they use three different constructions. The
+asymmetry is deliberate, it is decided **per table**, and it is written down here because an
+asymmetry with no recorded reason gets "fixed" by the next reader.
+
+The question each column has to answer is not "is this content secret" but **who holds the
+digest, and how guessable is the thing it digests**. A digest is an offline verifier: whoever
+holds it can test a guess for free. That is harmless when guessing is hopeless and fatal when the
+plaintext comes from a short list.
+
+| Column | Construction | Why |
+|---|---|---|
+| `conversation_messages.content_hash` | **peppered** — `IdempotencyHasher`, `"{pepper_version}:{base64url}"` | It is **returned to callers** on `ConversationMessageRecord`. An unkeyed digest handed out over the API is an offline verifier for content the schema expects to be able to hold encrypted, and every holder gets one. Migration `0021` deliberately left it alone for exactly this reason. |
+| `memory_records.content_hash`, rows stored **encrypted** | **keyed** — `"d1:" + base64url(HMAC-SHA256(K_dedupe, content))` | Memory bodies are short, low-entropy and highly guessable ("user prefers dark mode", "user's timezone is Asia/Jakarta"). Sealing the body while leaving an unkeyed digest of that same body **in the same row** defeats the encryption completely: a database dump plus a wordlist recovers it without touching a key. |
+| `memory_records.content_hash`, rows stored **plain** or **omitted** | **unkeyed** — `request_hash`, a bare SHA-256 as base64url | Nothing is protected by hiding the digest of a body that is already in the clear in the adjacent column. And keying it would re-create finding F14: `memory_records` has no retention, so a key change orphans every stored digest permanently and exact-match dedupe stops matching with no error and no log line. |
+| `rag_document_versions.content_hash`, `rag_chunks.chunk_hash` | **unkeyed** | A whole document, or a thousand-character chunk, is not a guessable-plaintext oracle. There is no wordlist for it. These are also write-only fingerprints today — nothing recomputes and compares them. |
+
+Two consequences worth stating plainly:
+
+- **The two memory forms can only miss, never falsely match.** `d1:` contains a `:`, and a
+  `request_hash` value is unpadded base64url over a fixed 32-byte digest — alphabet `A-Za-z0-9-_`,
+  43 characters, no `:`, which is migration `0021`'s own rule. An application that switches its
+  persistence policy therefore accumulates at most one duplicate per re-stated memory across the
+  boundary; it never dedupes a sealed memory onto an unsealed one or the reverse.
+- **The dedupe key rides master-key rotation.** It is a `content_data_keys` row with
+  `purpose = 'memory_dedupe'`, wrapped by the master key like every content key. Rotating the
+  master key re-wraps the envelope; the 32 bytes inside are unchanged, so every stored
+  `content_hash` stays byte-identical and every dedupe lookup keeps working. That is precisely
+  the property a deployment pepper cannot offer, and it is why F14's objection to a keyed hash
+  here does not apply. **The dedupe key itself is not rotated.** If it ever must be, the
+  consequence is a documented one-time loss of cross-era dedupe — duplicates, not errors — and
+  nothing will report it.
+
+One residual is recorded rather than hidden: under `none` and `metadata_only` no body is stored
+but the unkeyed digest still is, so those rows remain a guessing oracle for the memory content
+they no longer hold. Closing it means keying those arms too, which costs the F14 property above;
+it is a separate decision and has not been taken.
+
 ## How long a verification key survives its issuer
 
 A JWKS document is cached for five minutes. When a refresh fails, the last-known-good copy

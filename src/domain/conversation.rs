@@ -38,12 +38,13 @@ pub enum ConversationMessageType {
 
 /// What an application persists of its conversation content.
 ///
-/// Enforced in exactly two places, both of which write a body derived from caller content:
-/// `add_message` (`conversation_messages`) and the summarization write
-/// (`conversation_summaries`). `add_message` is the choke point every message writer already goes
-/// through, so a new call site inherits the policy rather than having to remember it. Both sites
-/// route the body through [`ContentWrite`], so a fifth value here is a compile error at each of
-/// them rather than a silently defaulted branch.
+/// Enforced at every site that writes a body derived from caller content: `add_message`
+/// (`conversation_messages`), the summarization write (`conversation_summaries`), and — since
+/// issue #140 — all three memory writers (`create_memory`, `insert_extracted_memory`,
+/// `patch_memory`, over `memory_records`). `add_message` is the choke point every message writer
+/// already goes through, so a new message call site inherits the policy rather than having to
+/// remember it. Every site routes the body through [`ContentWrite`], so a fifth value here is a
+/// compile error at each of them rather than a silently defaulted branch.
 ///
 /// # What each value does
 ///
@@ -54,9 +55,9 @@ pub enum ConversationMessageType {
 /// | `none` | **not stored** | **not stored** — `content_size_bytes` is `0`, `token_count` is null |
 /// | `encrypted_content` | **sealed** into `*_encrypted` (AES-256-GCM, per-row nonce, AAD bound to the row's identity) | stored |
 ///
-/// `content_hash` is retained under every value. It is an HMAC under a deployment-held pepper,
-/// not a content address — see `crate::security::idempotency` — so it is a fingerprint of
-/// content rather than content, and dropping it would break the documented
+/// `conversation_messages.content_hash` is retained under every value. It is an HMAC under a
+/// deployment-held pepper, not a content address — see `crate::security::idempotency` — so it is
+/// a fingerprint of content rather than content, and dropping it would break the documented
 /// `"{pepper_version}:{base64url}"` shape the API contract already publishes. Caller-supplied
 /// `metadata` is likewise retained under every value: it is the caller's own JSON, not
 /// something derived from the message body.
@@ -82,12 +83,23 @@ pub enum ConversationMessageType {
 ///   subsequent writes only; already-stored rows keep their storage form and stay readable.
 ///   Removing content is retention's job.
 ///
-/// # What it does NOT do
+/// # What it does and does not govern
 ///
-/// * **It does not govern memories or RAG documents.** `memory_records.content_plain` and
-///   `rag_document_versions.content_plain` are written under their own policies and are not yet
-///   wired to their `*_encrypted` columns. This value is scoped to conversation messages and the
-///   summaries derived from them.
+/// * **It governs memories, since issue #140.** `application_memory_policies` has no
+///   content-persistence column of its own and never had one; this is the application's single
+///   setting for "what do you keep of caller content", and a memory body is caller content in
+///   exactly the sense it names. All four values apply: a memory written under `none` or
+///   `metadata_only` stores no body at all and reads back with `content: null`, which is a
+///   **behaviour change** for such applications — before #140 memory bodies were stored in the
+///   clear whatever the policy said, which is finding F32's shape one table over.
+/// * **`memory_records.content_hash` is retained under every value, but its *form* follows this
+///   setting.** Under `encrypted_content` it is a keyed digest under the keyring's
+///   `memory_dedupe` key; otherwise it is the unkeyed content address migration `0021`
+///   established. See [`crate::security::ContentSealer::memory_content_hash`] — an unkeyed
+///   digest of a short, guessable memory body stored beside that body's ciphertext would defeat
+///   the encryption outright.
+/// * **It does not govern RAG documents.** `rag_document_versions.content_plain` and
+///   `rag_chunks.chunk_text_plain` are not yet wired to their `*_encrypted` columns.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ConversationContentPersistence {
