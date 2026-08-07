@@ -519,6 +519,35 @@ pub enum ExecutionFailureClass {
     DeadlineExceeded,
     StructuredOutputInvalid,
     StreamBackpressureExceeded,
+    /// A stored content envelope did not authenticate under its data key.
+    ///
+    /// Deliberately **one** opaque class for every AEAD outcome. Distinguishing "wrong key" from
+    /// "tampered blob" is an oracle, which is the same posture
+    /// [`Self::CredentialDecryptionFailed`] already takes and the same one
+    /// [`crate::security::ContentEnvelopeError::Decrypt`] takes one layer down.
+    ContentDecryptionFailed,
+    /// A stored content envelope is not a well-formed envelope **this build** can read: bad
+    /// magic, an unknown format version, algorithm or key mode, a non-zero reserved byte, an
+    /// unknown AAD profile, a blob under the length floor, or a `body_len` that disagrees with
+    /// the stored bytes.
+    ///
+    /// Split from [`Self::ContentDecryptionFailed`] on purpose. Every one of these is decided
+    /// **before any key is touched**, from bytes an attacker holding the ciphertext can already
+    /// read, so the log may name the specific discriminant — and "you are running a build that
+    /// predates this format" is a different 3 a.m. remedy from "your key is wrong". The wire
+    /// still gets one generic code.
+    ContentEnvelopeUnsupported,
+    /// Content had to be sealed or opened and no usable content data key was available.
+    ///
+    /// On the write path this is a **refusal, never a fallback**: nothing is written. Writing
+    /// plaintext under a policy named for encryption is finding F32 with extra steps.
+    ContentKeyUnavailable,
+    /// The envelope names a data key an operator has explicitly abandoned.
+    ///
+    /// Distinguished from [`Self::ContentKeyUnavailable`] because the remedy differs in kind:
+    /// the key is not missing from this process, it is gone from the world and that loss was
+    /// recorded on purpose. Rows sealed under it are permanently unreadable.
+    ContentKeyAbandoned,
     InternalError,
 }
 
@@ -535,7 +564,7 @@ impl ExecutionFailureClass {
     /// has a code; being listed here means it then fails the catalog test until it has a string.
     /// **Add new variants to this array** — a variant omitted here is invisible to the gate, which
     /// is the one way this can still rot.
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 34] = [
         Self::InvalidExecutionRequest,
         Self::ApplicationUnavailable,
         Self::RouteNotFound,
@@ -565,6 +594,10 @@ impl ExecutionFailureClass {
         Self::DeadlineExceeded,
         Self::StructuredOutputInvalid,
         Self::StreamBackpressureExceeded,
+        Self::ContentDecryptionFailed,
+        Self::ContentEnvelopeUnsupported,
+        Self::ContentKeyUnavailable,
+        Self::ContentKeyAbandoned,
         Self::InternalError,
     ];
 
@@ -604,6 +637,10 @@ impl ExecutionFailureClass {
             Self::DeadlineExceeded => "deadline_exceeded",
             Self::StructuredOutputInvalid => "structured_output_invalid",
             Self::StreamBackpressureExceeded => "stream_backpressure_exceeded",
+            Self::ContentDecryptionFailed => "content_decryption_failed",
+            Self::ContentEnvelopeUnsupported => "content_envelope_unsupported",
+            Self::ContentKeyUnavailable => "content_key_unavailable",
+            Self::ContentKeyAbandoned => "content_key_abandoned",
             Self::InternalError => "internal_error",
         }
     }

@@ -720,6 +720,31 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         description: "Used when clearing is_primary, or revoking a primary grant, would leave zero active primary admins - locking every remaining admin out of admin management and leaving system-key break-glass as the only re-entry path. Transfer ownership to another identity first. This guard is expressible only because ownership is row state: as a scope it would have been implied by moira:admin and held by everyone, leaving nothing to count.",
     },
     I18nEntry {
+        key: "moira.error.content_decryption_failed",
+        default_message: "The stored content could not be read.",
+        description: "Used when a stored content envelope did not authenticate under its data key - the AES-256-GCM tag did not verify. Deliberately ONE opaque code for every AEAD outcome, and its message is a constant: distinguishing a wrong key from a tampered blob is an oracle, so the wire says nothing beyond the fact of failure and the log line says only aead_open_failed. That is the same posture credential_decryption_failed already takes. The precise reason an operator needs is never absent, it just lives in the log rather than in the response. Contrast content_envelope_unsupported, which covers the failures decided BEFORE any key is touched and therefore may name its discriminant.",
+    },
+    I18nEntry {
+        key: "moira.error.content_envelope_unsupported",
+        default_message: "The stored content is not in a format this version of the service can read.",
+        description: "Used when a stored content envelope is not a well-formed envelope this build can interpret: bad magic, an unknown format version, algorithm id or key mode, a non-zero reserved byte, an unknown AAD profile, a blob under the 58-byte floor, a body_len that disagrees with the stored bytes, or a profile or data-key id that does not match the identity being opened. Every one of these is decided before any key lookup and before any crypto call, from bytes anyone holding the ciphertext can already read, so the LOG names the specific discriminant while the wire stays generic. The usual cause is a rollback: a blob written by a newer build reaching an older one. Split from content_decryption_failed because 'you are running a build that predates this format' and 'your key is wrong' have opposite remedies at three in the morning.",
+    },
+    I18nEntry {
+        key: "moira.error.content_key_unavailable",
+        default_message: "Content encryption is configured but no usable content key is available. Retry shortly.",
+        description: "Used in two places, both of which mean the content keyring cannot serve this operation. On the WRITE path: an application whose conversation_content_persistence is encrypted_content produced a message or summary and no active, writable content data key exists. The write is REFUSED and nothing is stored - writing plaintext under a policy named for encryption would be finding F32 with extra steps, and a test asserts the row count did not increase. On the READ path: the envelope names a data key this replica's keyring snapshot does not carry, which is a key minted after the last refresh, or a retired one. 503 rather than 500 because both conditions are resolved by restoring, promoting or refreshing a key rather than by the caller changing anything.",
+    },
+    I18nEntry {
+        key: "moira.error.content_key_abandoned",
+        default_message: "The key that protects this content was abandoned and the content cannot be read.",
+        description: "Used when a stored envelope names a content data key an operator explicitly abandoned with `moira keyring abandon`. Distinguished from content_key_unavailable because the remedy differs in kind: the key is not missing from this process, it is gone from the world and that loss was deliberately recorded. Rows sealed under it are permanently unreadable and no retry, restart or configuration change recovers them. 500 rather than 503 for exactly that reason - 503 promises that waiting helps.",
+    },
+    I18nEntry {
+        key: "moira.error.content_storage_ambiguous",
+        default_message: "The stored content is ambiguous.",
+        description: "The impossible case, catalogued because it is reachable. A conversation row holding BOTH a plaintext body and a sealed body has two contradictory answers about what it stores. migrations/0027_content_encryption_keyring.sql adds check (content_plain is null or content_encrypted is null) to every affected table, so this cannot be written - but the constraint is NOT VALID, so rows that predate it were never checked. The sealed body wins, because it is the stricter of the two intentions and rendering the plaintext of a row that also carries a ciphertext would quietly serve content an operator believed was encrypted. Exactly one WARN naming the table and row id is logged and the read succeeds; this code is emitted as that log line's `code` field and is NOT returned to a caller, which is why no AppError constructor carries it.",
+    },
+    I18nEntry {
         key: "moira.error.admin_identity_not_primary",
         default_message: "Only a primary admin identity may manage other admin identities.",
         description: "Used when a caller who is not a primary admin attempts an ownership transfer or a grant revocation. Ownership is admin_identities.is_primary, not a scope: AuthorizationService::has_scope grants a moira:admin-holding trusted-JWT actor every scope by implication, so a scope could not express 'not every admin'. System-key callers pass this check, because break-glass remains the documented last resort.",

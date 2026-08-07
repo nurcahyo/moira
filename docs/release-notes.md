@@ -8,6 +8,73 @@ changelog.
 
 ## Unreleased
 
+### Breaking: `encrypted_content` now actually encrypts, and rolling back past this release hides those rows
+
+Closes [#139](https://github.com/nurcahyo/moira/issues/139), the release-train step that turns the
+key custody, envelope format and keyring of the four preceding entries into behaviour. Decided in
+[`decision-encryption-at-rest.md`](decision-encryption-at-rest.md) §8, §13 and §14.
+
+**Run this before upgrading.** It names every application this release changes behaviour for:
+
+```sql
+select application_id from application_conversation_policies
+ where conversation_content_persistence = 'encrypted_content';
+```
+
+Those applications are, **today, silently receiving plaintext** — that is finding F32, and the
+value was accepted before the 422 refusal existed. On upgrade day they begin receiving ciphertext,
+with no further action and no setting to delay it. If that query returns rows, read the rollback
+paragraph below before you deploy.
+
+**Switching an application to `encrypted_content` does not encrypt its existing history.** This is
+the single biggest thing to misread here. The policy governs subsequent writes only. Messages and
+summaries already stored under `plain_content` stay in `content_plain`, stay readable, and stay
+plaintext. Removing them is retention's job, not this policy's. The same holds in reverse:
+switching *away* from `encrypted_content` does not decrypt anything already sealed.
+
+**Rolling the binary back past this release is a data-visibility rollback.** An older build selects
+`content_plain`, sees `NULL`, and renders the content as *absent* rather than erroring —
+silently, for every row written under `encrypted_content` while this build was live. Message reads
+return `null` bodies, summarization refuses with `no_persisted_content`, memory extraction stops,
+and cross-turn history is planned as if those turns carried no text. Nothing logs an error,
+because to an older build the row simply has no body. There is no flag to soften this; that is the
+accepted cost of the no-feature-flag decision, and [#125](https://github.com/nurcahyo/moira/issues/125)
+— a pre-existing switch found never to have been wired to the code that read it — is why the
+decision was taken that way. The data is not lost; a forward roll reads it again.
+
+**What changed, concretely.**
+
+| | before | after |
+|---|---|---|
+| `PUT` conversation policy with `encrypted_content` | `422 conversation_content_persistence_unsupported`, always | accepted, unless this deployment has no usable content keyring |
+| message body under `encrypted_content` | not stored at all | sealed into `conversation_messages.content_encrypted` |
+| summary body under `encrypted_content` | not stored at all | sealed into `conversation_summaries.summary_text_encrypted` |
+| reading either back | `null` | the original string, opened transparently |
+| `content_size_bytes`, `token_count`, the 262,144-byte cap | plaintext | **unchanged — still plaintext** |
+
+**The 422 narrowed rather than disappearing.** `conversation_content_persistence_unsupported` now
+fires only when encryption is configured but unusable at write time. Removing it outright would
+have left no write-time refusal for a key-custody failure, which is a real and permanent
+condition.
+
+**Refusal, never fallback.** A write under `encrypted_content` with no usable active content key
+returns `503 content_key_unavailable` and stores **nothing** — it does not fall back to plaintext.
+Four new error codes accompany it, all catalogued: `content_key_unavailable` (503),
+`content_key_abandoned` (500), `content_envelope_unsupported` (500) and `content_decryption_failed`
+(500). The last two are split deliberately: a framing failure is decided before any key is touched
+and names its discriminant **in the log**, so "you are running a build that predates this format"
+is distinguishable from "your key is wrong"; an AEAD failure gets one opaque code and one opaque
+log line, because saying more is an oracle. No response body carries a key id, a reason or a
+fragment of the row.
+
+**Capacity.** Ciphertext is incompressible, so a sealed row loses TOAST compression and gains a
+42-byte envelope header plus a 16-byte tag. Budget for growth on `conversation_messages` and
+`conversation_summaries` proportional to how much of your traffic runs under `encrypted_content`.
+
+**Rotation is unaffected by any of this.** New writes pick up the active data key at each
+replica's next keyring refresh; rows written under an earlier key stay under it and stay readable
+forever. See `moira keyring status`.
+
 ### Breaking: production requires `MOIRA_CONTENT_ENCRYPTION__KEYS`, and will not start without it
 
 Closes [#135](https://github.com/nurcahyo/moira/issues/135), the first step of the

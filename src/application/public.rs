@@ -2553,6 +2553,20 @@ fn failure_http_status(class: ExecutionFailureClass) -> axum::http::StatusCode {
         ExecutionFailureClass::ProviderTimeout | ExecutionFailureClass::DeadlineExceeded => {
             StatusCode::GATEWAY_TIMEOUT
         }
+        // Issue #139. Spelled out rather than left to the `_` arm below, because these four are
+        // *also* raised as `AppError::coded(...)` from the conversation persistence path with an
+        // explicit status. Two different answers about one condition would be worse than either,
+        // so the statuses here are the same ones
+        // `crate::security::content_access` uses, and the test
+        // `content_failure_classes_agree_with_the_statuses_content_access_raises` compares them.
+        //
+        // `503` for the two key conditions that a restored key or a keyring refresh fixes; `500`
+        // for the two that name damaged or unreadable stored bytes, where waiting does not help
+        // and no provider was involved — which is what `502` would wrongly imply.
+        ExecutionFailureClass::ContentKeyUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+        ExecutionFailureClass::ContentDecryptionFailed
+        | ExecutionFailureClass::ContentEnvelopeUnsupported
+        | ExecutionFailureClass::ContentKeyAbandoned => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::BAD_GATEWAY,
     }
 }

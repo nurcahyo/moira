@@ -4,38 +4,46 @@
 `encrypted_content`. The column and its check constraint come from migration
 `0007_conversations_memory_rag.sql`, which defaults an application to `plain_content`.
 
-Three of those four values are enforced end to end. The fourth is refused at the API.
+All four values are enforced end to end. `encrypted_content` was refused at the API until issue
+[#139](https://github.com/nurcahyo/moira/issues/139) wired a cipher to the `*_encrypted` columns;
+the refusal narrowed rather than disappeared — see below.
 
 ## What each value does
 
 | value | message body | body length / token estimate | accepted by `PUT` policy |
 |---|---|---|---|
-| `plain_content` (default) | stored, bounded | stored | yes |
+| `plain_content` (default) | stored in `content_plain`, bounded | stored | yes |
 | `metadata_only` | withheld | stored | yes |
 | `none` | withheld | zeroed | yes |
-| `encrypted_content` | withheld (fails closed) | withheld | **no — 422** |
+| `encrypted_content` | **sealed** into `content_encrypted` | stored | yes, unless this deployment cannot seal |
 
 `metadata_only` and `none` differ in exactly the length metadata; that is the only thing
 separating them.
 
 ## Where the policy is enforced
 
-Enforcement is at two writes, not at the callers:
+Enforcement is at two writes, not at the callers, and both route the body through the
+`ContentWrite` enum (`src/domain/conversation.rs`), which **replaces** the old
+`content_plain: Option<String>` field rather than sitting beside it. Three consequences: a caller
+cannot supply a plaintext and a ciphertext for one row; `Omitted` is a named state rather than a
+`None` with a comment; and a fifth persistence value is a compile error at every write site
+instead of a silently defaulted branch.
 
-- **`insert_conversation_message` in `src/infra/repositories/conversation.rs`.** This is the
-  only path into `conversation_messages`, so a new writer inherits the policy rather than
-  having to remember it. It reads the persistence value off the conversation row under the
-  same `for update` lock that assigns the sequence number, then nulls `content_plain` unless
-  `persists_plaintext()`, and zeroes the size and token columns unless
-  `persists_content_metadata()`.
-- **`run_summarization` in `src/application/conversation.rs`.** A summary is derived content
-  but still a body of caller text, so the summary body is written only when the policy admits
-  plaintext. `covers_through_sequence` and `summary_hash` are still written: the run genuinely
-  happened and genuinely covers that backlog. This second point is reachable through a policy
-  tightened mid-conversation, where a readable plaintext backlog still exists.
+- **`add_message` in `src/infra/repositories/conversation.rs`.** This is the only path into
+  `conversation_messages`, so a new writer inherits the policy rather than having to remember it.
+  It reads the persistence value off the conversation row under the same `for update` lock that
+  assigns the sequence number, re-derives the storage form with `ContentWrite::under_policy`, and
+  zeroes the size and token columns unless `persists_content_metadata()`. Under
+  `encrypted_content` the body is sealed **inside that transaction**.
+- **`run_summarization` in `src/application/conversation.rs`, writing through
+  `insert_conversation_summary`.** A summary is derived content but still a body of caller text,
+  so it follows the same policy. `covers_through_sequence` and `summary_hash` are still written
+  under every value: the run genuinely happened and genuinely covers that backlog. This second
+  point is reachable through a policy tightened mid-conversation, where a readable plaintext
+  backlog still exists.
 
 Before this was wired, both sites carried comments asserting the policy was honoured while
-`content_plain` was written unconditionally.
+`content_plain` was written unconditionally (finding F32).
 
 ## The consequences under `none` and `metadata_only`
 
@@ -53,37 +61,91 @@ design. Everything downstream reads the same null:
 - **Cross-turn history is not rebuilt.** The context planner skips any history message whose
   content is null, so a later turn is planned as if the earlier ones carried no text.
 
+None of this applies to `encrypted_content`: that value stores a body, so summarization,
+extraction and history all keep working on content that is opened transparently on read.
+
 Tightening the policy does not rewrite history. Rows written earlier under `plain_content`
 keep their bodies; only writes after the change are withheld.
 
-## `encrypted_content` is refused
+## `encrypted_content`
 
-`PUT` of the conversation policy with `conversation_content_persistence: "encrypted_content"`
-returns **422 `conversation_content_persistence_unsupported`**. The `*_encrypted` content
-columns exist on three tables and have no writer anywhere in `src/`, so accepting the value
-would tell an operator with a PII or data-residency obligation that their content is encrypted
-at rest when it is not.
+The body is sealed by `ContentCipher` (`src/security/content_envelope.rs`) under the content
+keyring's **active** data key and written to `content_encrypted` /
+`conversation_summaries.summary_text_encrypted`; the `*_plain` column is left null, and the CHECK
+constraints from `migrations/0027_content_encryption_keyring.sql` make a row holding both a
+database refusal. The AAD binds the row's own identity — message id, conversation id and sequence
+number for a message; summary id, conversation id and coverage boundary for a summary — so a
+ciphertext lifted into another tenant's conversation does not open.
 
-It fails closed on both sides: a row that already holds `encrypted_content` keeps parsing and
-stores no plaintext, so an existing deployment is made safer rather than broken, while no new
-deployment can select the value.
+Reads apply one precedence, defined once in
+`pg_rows::conversation_content_from_row` and used by every reader:
 
-**Reversal condition:** delete this refusal — the `is_enforceable()` check in
-`put_conversation_policy` — the moment a cipher is wired to the `content_encrypted` columns.
-At that point `persists_plaintext()` must stay false for `encrypted_content` and a
-`persists_ciphertext()` arm joins it. Nothing else has to change.
+```
+(_,          Some(bytes)) => open(...)     // encrypted wins
+(Some(text), None)        => plaintext
+(None,       None)        => content absent
+```
+
+Four things that are easy to misread:
+
+- **Counters are computed on the plaintext, before sealing.** `content_size_bytes`, `token_count`
+  and the 262,144-byte content cap all measure what the caller sent. A ciphertext length never
+  reaches a counter something else does arithmetic on, so flipping the policy does not move a
+  limit or shift a metric.
+- **Sealing and opening do no I/O.** Both take an already-unwrapped DEK out of the keyring
+  snapshot, which is what makes it safe to call the cipher inside a write transaction and what
+  keeps a future KMS custody from turning a 24-message history read into 24 network round trips.
+  The cost is stated rather than hidden: a row sealed by another replica under a key minted after
+  this process's last keyring refresh is unreadable here until the next refresh, and surfaces as
+  `503 content_key_unavailable`.
+- **Refusal, never fallback.** A write under this value with no usable content key returns
+  `503 content_key_unavailable` and stores **nothing**. Writing plaintext under a policy named for
+  encryption would be F32 with extra steps.
+- **It is not retroactive in either direction.** Switching *to* `encrypted_content` does not
+  encrypt existing history, and switching away does not decrypt it.
+
+### The 422 narrowed; it did not disappear
+
+`PUT` of the conversation policy with `conversation_content_persistence: "encrypted_content"` no
+longer returns **422 `conversation_content_persistence_unsupported`** for the *value*. It returns
+it when encryption is configured but **unusable at write time** — a deployment whose content
+keyring is not loaded, where accepting the setting would mean refusing every subsequent message.
+
+It is deliberately not removed: that would leave no write-time refusal for a key-custody failure,
+which is a real and permanent condition. It is deliberately not made conditional on "is the
+feature built" either, because a permanently-true branch is the never-taken code this project has
+been bitten by. The refusals for `none` and `metadata_only` are storage policies and are
+unaffected.
+
+### Read-side errors
+
+| code | status | condition |
+|---|---|---|
+| `content_key_unavailable` | 503 | no usable active key on write; or the envelope names a key this replica's snapshot does not carry |
+| `content_key_abandoned` | 500 | the envelope names a key an operator abandoned — permanently unreadable |
+| `content_envelope_unsupported` | 500 | the stored bytes are not a v1 envelope this build can read (bad magic, unknown version/algorithm/key mode, non-zero reserved, unknown profile, short blob, `body_len` mismatch) |
+| `content_decryption_failed` | 500 | the AEAD tag did not verify |
+
+The last two are split on purpose. Every framing failure is decided **before any key is touched**,
+from bytes anyone holding the ciphertext can already read, so the log names the specific
+discriminant. An AEAD failure gets one opaque code and one opaque log line (`aead_open_failed`),
+because saying why a tag did not verify is an oracle. Both reach the caller with a constant
+message carrying no key id, no discriminant and no fragment of the row.
 
 ## Not covered by this policy
 
-- **RAG document versions.** Direct text supplied to a RAG document is stored in
-  `rag_document_versions.content_plain` regardless of `conversation_content_persistence`;
-  that policy governs conversation content only.
+- **Memories and RAG document versions.** `memory_records.content_plain` and
+  `rag_document_versions.content_plain` are written under their own policies and are **not yet**
+  wired to their `*_encrypted` columns; `conversation_content_persistence` governs conversation
+  content only.
 - **Protected internal instructions** are never persisted in conversation messages.
 
 ## Stored metadata and deletion
 
 Stored message metadata includes role, message type, response/execution link, sequence number,
 content hash, size, token estimate, and safe metadata. Under `none` the size and token
-estimate are zeroed; the hash and the structural fields remain.
+estimate are zeroed; the hash and the structural fields remain. `content_hash` is retained under
+every value, `encrypted_content` included: it is an HMAC under a deployment-held pepper, so it is
+a fingerprint of content rather than content.
 
 Deletion is soft by default and preserves audit metadata without message text in audit records.
