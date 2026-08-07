@@ -240,7 +240,7 @@ async fn keyring(settings: Settings) -> anyhow::Result<()> {
         .context("database url is required for keyring")?;
     let custody = build_content_custody(&settings).await?;
 
-    let output = keyring_cli::run(command, &KeyringAdmin::new(pool, custody)).await?;
+    let output = keyring_cli::run(command, &KeyringAdmin::new(pool, custody.custody())).await?;
     print!("{output}");
     Ok(())
 }

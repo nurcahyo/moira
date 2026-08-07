@@ -19,7 +19,7 @@ use crate::{
     security::{
         AdminAuthenticator, ApiKeyHasher, AuthService, AuthorizationService, CallerAuthenticator,
         ContentKeyring, EnvironmentMasterKeyCustody, IdempotencyHasher, JwksCache,
-        KeyringContentAccess, LocalSecretCipher, MasterKeyCustody,
+        KeyringContentAccess, LocalSecretCipher, MasterKeyCustody, PreflightedCustody,
     },
 };
 
@@ -44,10 +44,13 @@ pub struct AppState {
     /// validation ship one full release ahead of any behaviour change so operators can set
     /// `MOIRA_CONTENT_ENCRYPTION__KEYS` before the release that requires it.
     ///
-    /// Behind an `Arc<dyn _>` from the first commit rather than as a concrete type: the whole
-    /// point of the seam is that swapping in AWS KMS or Vault Transit later touches this line
-    /// and nothing else.
-    pub content_custody: Arc<dyn MasterKeyCustody>,
+    /// Typed [`PreflightedCustody`] rather than `Arc<dyn MasterKeyCustody>` so that "the boot
+    /// probe ran" is carried by the type: the only way to obtain one is to await
+    /// [`MasterKeyCustody::preflight`], so a refactor that drops the probe stops compiling
+    /// instead of shipping green (issue #161). It still wraps an `Arc<dyn _>` — the whole point
+    /// of the seam is that swapping in AWS KMS or Vault Transit later touches
+    /// [`build_content_custody`] and nothing else.
+    pub content_custody: PreflightedCustody,
     /// The content keyring, loaded and fully unwrapped before the listener binds.
     ///
     /// `None` only when there is no database at all — the health-and-metrics-only mode
@@ -154,7 +157,7 @@ impl AppState {
             Some(pool) => Some(Arc::new(
                 ContentKeyring::load(
                     pool,
-                    content_custody.clone(),
+                    content_custody.custody(),
                     &settings.content_encryption,
                     metrics.clone(),
                 )
@@ -277,9 +280,11 @@ impl AppState {
 /// against a keyring [`ContentKeyring::load`] refuses — `abandon` is only ever reached after
 /// that refusal — so it cannot go through `AppState::new`, which loads the keyring. Duplicating
 /// the four lines below in the CLI would be a second place for the `Kms` arm to be forgotten.
-pub async fn build_content_custody(
-    settings: &Settings,
-) -> Result<Arc<dyn MasterKeyCustody>, AppError> {
+///
+/// Returns [`PreflightedCustody`], not `Arc<dyn MasterKeyCustody>`, and that is the guard: the
+/// only constructor of that type awaits the probe, so deleting the [`preflighted`] call below
+/// fails to compile rather than silently shipping a process that boots without one (#161).
+pub async fn build_content_custody(settings: &Settings) -> Result<PreflightedCustody, AppError> {
     let (keys, active_key_id) = settings.content_encryption.master_keys()?;
     let custody: Arc<dyn MasterKeyCustody> = match settings.content_encryption.custody {
         ContentEncryptionCustody::Environment => Arc::new(
@@ -298,18 +303,20 @@ pub async fn build_content_custody(
 /// that *can* fail it: the environment backend cannot, because a 32-byte AES key that decoded
 /// and loaded always round-trips. A KMS or Vault backend fails here routinely — wrong IAM
 /// policy, unreachable endpoint, disabled key — which is the case this refusal exists for.
-async fn preflighted(
-    custody: Arc<dyn MasterKeyCustody>,
-) -> Result<Arc<dyn MasterKeyCustody>, AppError> {
-    custody.preflight().await.map_err(|err| {
-        AppError::Config(format!(
-            "content encryption key custody preflight failed for backend {:?} and active key \
-             {:?}: {err}",
-            custody.backend_name(),
-            custody.active_master_key_id()
-        ))
-    })?;
-    Ok(custody)
+///
+/// The `Arc` is cloned rather than moved so the failure message can still name the backend and
+/// the active key id, which are the two facts an operator needs from it.
+async fn preflighted(custody: Arc<dyn MasterKeyCustody>) -> Result<PreflightedCustody, AppError> {
+    PreflightedCustody::preflight(custody.clone())
+        .await
+        .map_err(|err| {
+            AppError::Config(format!(
+                "content encryption key custody preflight failed for backend {:?} and active key \
+                 {:?}: {err}",
+                custody.backend_name(),
+                custody.active_master_key_id()
+            ))
+        })
 }
 
 #[cfg(test)]

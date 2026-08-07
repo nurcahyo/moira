@@ -47,8 +47,8 @@ pub use idempotency::IdempotencyHasher;
 pub use key_custody::{
     CUSTODY_BACKEND_ENVIRONMENT, ENVIRONMENT_WRAP_BLOB_LENGTH, ENVIRONMENT_WRAP_FORMAT_V1,
     EnvironmentMasterKeyCustody, KeyCustodyError, MASTER_KEY_ID_MAX_LENGTH, MasterKeyCustody,
-    MasterKeyRing, WRAP_ALGORITHM_AES_256_GCM, WrappedKey, is_valid_master_key_id,
-    wrapped_data_key_aad,
+    MasterKeyRing, PreflightedCustody, WRAP_ALGORITHM_AES_256_GCM, WrappedKey,
+    is_valid_master_key_id, wrapped_data_key_aad,
 };
 pub use keyring_admin::{
     Abandonment, AddedKey, KeyStatus, KeyUsage, KeyringAdmin, KeyringAdminError, KeyringStatus,

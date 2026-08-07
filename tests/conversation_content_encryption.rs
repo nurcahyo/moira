@@ -898,7 +898,7 @@ async fn reading_history_never_calls_key_custody() {
     // A second keyring over the same rows, behind a counting custody. Same database, same data
     // keys, same envelopes — only the custody is instrumented.
     let custody = Arc::new(CountingCustody::new(
-        case.fixture.state.content_custody.clone(),
+        case.fixture.state.content_custody.custody(),
     ));
     let keyring = Arc::new(
         ContentKeyring::load(
