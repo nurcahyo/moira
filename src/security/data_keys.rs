@@ -91,7 +91,12 @@ pub const KEY_CHECK_VALUE_LEN: usize = 8;
 ///
 /// House style, matching `infra::repositories::identity::OWNERSHIP_LOCK_KEY`: eight ASCII bytes,
 /// so a `pg_locks` row is readable by eye rather than being an opaque integer.
-const KEYRING_BOOTSTRAP_LOCK_KEY: i64 = i64::from_be_bytes(*b"moirakyr");
+///
+/// Shared with [`crate::security::keyring_admin`], whose `add` allocates the next
+/// `key_version` under the same lock. The two are the only writers that *choose* a version, and
+/// serialising them against each other is what makes `max(key_version) + 1` safe; a second lock
+/// key would leave bootstrap and `add` racing on a `unique` column for no reason.
+pub(super) const KEYRING_BOOTSTRAP_LOCK_KEY: i64 = i64::from_be_bytes(*b"moirakyr");
 
 /// The `purpose` new content writes are sealed under.
 const PURPOSE_CONTENT: &str = "content";
@@ -311,6 +316,32 @@ impl KeyringSnapshot {
 
     pub fn entry(&self, id: Uuid) -> Option<&KeyEntry> {
         self.by_id.get(&id)
+    }
+
+    /// How many keys this snapshot carries in each state, **including the states it carries
+    /// none of**.
+    ///
+    /// The zeros are the point. `moira_content_keyring_keys{state}` is a gauge, so a state
+    /// that emptied has to be written as zero or it keeps its last value forever — and
+    /// `pending 1` left standing after the promotion that consumed it is precisely the series
+    /// an operator would be watching during a rotation.
+    ///
+    /// `Retired` is skipped because [`DataKeyState::is_carried_in_snapshot`] says it is not
+    /// here to be counted; reporting `retired 0` would invite the reading that none exist.
+    pub fn state_counts(&self) -> Vec<(&'static str, usize)> {
+        DataKeyState::ALL
+            .into_iter()
+            .filter(|state| state.is_carried_in_snapshot())
+            .map(|state| {
+                (
+                    state.as_str(),
+                    self.by_id
+                        .values()
+                        .filter(|entry| entry.state == state)
+                        .count(),
+                )
+            })
+            .collect()
     }
 
     /// Every entry, ordered by version — for `keyring status`, for `Debug`, and for the tests.
@@ -599,6 +630,12 @@ impl ContentKeyring {
             snapshot.clone();
         self.metrics.record_content_keyring_refresh(true);
         self.metrics.set_content_keyring_age_seconds(0.0);
+        // Only on success. A failed refresh keeps serving the previous snapshot, so the
+        // previous counts are still the true ones — republishing them here would be right but
+        // pointless, and publishing the counts of a snapshot that was never installed would be
+        // wrong.
+        self.metrics
+            .set_content_keyring_keys(&snapshot.state_counts());
         Ok(snapshot)
     }
 
@@ -712,6 +749,12 @@ impl ContentKeyring {
             .expect("the active key is in the snapshot it was chosen from");
         let age = Utc::now().signed_duration_since(entry.created_at);
         let age_days = age.num_days().max(0);
+        // The boot value of `moira_content_keyring_keys{state}`. Set here as well as in
+        // `refresh` so a replica that has not ticked yet still exports the distribution — a
+        // series that only appears after the first background refresh is one an alert cannot
+        // be written against.
+        self.metrics
+            .set_content_keyring_keys(&snapshot.state_counts());
 
         info!(
             custody_backend = self.custody.backend_name(),
@@ -1028,6 +1071,9 @@ mod tests {
         fn can_unwrap(&self, master_key_id: &str) -> bool {
             self.inner.can_unwrap(master_key_id)
         }
+        fn wrap_algorithm(&self) -> &'static str {
+            self.inner.wrap_algorithm()
+        }
         fn master_key_ids(&self) -> Vec<String> {
             self.inner.master_key_ids()
         }
@@ -1037,6 +1083,14 @@ mod tests {
             aad: &[u8],
         ) -> Result<WrappedKey, KeyCustodyError> {
             self.inner.wrap(dek, aad).await
+        }
+        async fn wrap_under(
+            &self,
+            master_key_id: &str,
+            dek: &Zeroizing<[u8; 32]>,
+            aad: &[u8],
+        ) -> Result<WrappedKey, KeyCustodyError> {
+            self.inner.wrap_under(master_key_id, dek, aad).await
         }
         async fn unwrap(
             &self,

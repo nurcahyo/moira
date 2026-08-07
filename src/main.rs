@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use anyhow::Context;
 use moira::{
-    app::{AppState, cluster_lease},
+    app::{AppState, KeyringCommand, build_content_custody, cluster_lease, keyring_cli},
     application::{AdminService, MoiraExecutionService, RequestContext},
     build_router,
     config::{
@@ -11,7 +11,7 @@ use moira::{
     },
     domain::{DiagnosticExecutionRequest, ExecutionOptions, SystemKeyCreateRequest},
     infra::db,
-    security::{Actor, ActorType, ContentKeyring},
+    security::{Actor, ActorType, ContentKeyring, KeyringAdmin},
 };
 use tokio::net::TcpListener;
 use tracing::{info, warn};
@@ -84,6 +84,10 @@ async fn run(mode: ProcessMode, settings: Settings) -> anyhow::Result<()> {
         }
         ProcessMode::ExecuteTest => {
             execute_test(settings).await?;
+            return Ok(());
+        }
+        ProcessMode::Keyring => {
+            keyring(settings).await?;
             return Ok(());
         }
         ProcessMode::Serve => {}
@@ -208,6 +212,36 @@ async fn bootstrap_system_key(settings: Settings) -> anyhow::Result<()> {
         "{}",
         serde_json::to_string_pretty(&response).context("serialize bootstrap key response")?
     );
+    Ok(())
+}
+
+/// `moira keyring <verb> …` — the content data key rotation verbs.
+///
+/// **Deliberately does not build an `AppState` and does not load the keyring.** `abandon` is
+/// reachable only after `ContentKeyring::load` has already refused to start this process, so a
+/// mode that loaded the keyring first would be unable to run the one command that exists to
+/// repair that condition. It takes a pool and a preflighted custody backend, and nothing else.
+///
+/// It also does **not** migrate on entry, unlike `bootstrap-system-key` and `execute-test`. A
+/// rotation verb run against a database whose schema is behind should say so, not quietly
+/// change it: `content_data_keys` arrived in `0027`, and applying migrations as a side effect
+/// of `keyring status` is exactly the kind of surprise an operator mid-incident does not need.
+async fn keyring(settings: Settings) -> anyhow::Result<()> {
+    // Triaged against `rust.lang.security.args.args`, as in `main` above. These are the
+    // arguments of the `keyring` operator subcommand; they choose a verb and a key id. No
+    // security decision is derived from them — the database and the master keys both come
+    // from configuration, and `abandon`'s guards are enforced in `KeyringAdmin`, not here.
+    // nosemgrep: rust.lang.security.args.args
+    let args = std::env::args().skip(2).collect::<Vec<_>>();
+    let command = KeyringCommand::parse(&args)?;
+
+    let pool = db::connect(&settings.database)
+        .await?
+        .context("database url is required for keyring")?;
+    let custody = build_content_custody(&settings).await?;
+
+    let output = keyring_cli::run(command, &KeyringAdmin::new(pool, custody)).await?;
+    print!("{output}");
     Ok(())
 }
 

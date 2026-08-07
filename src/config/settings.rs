@@ -96,6 +96,14 @@ pub enum ProcessMode {
     Migrate,
     BootstrapSystemKey,
     ExecuteTest,
+    /// `moira keyring …` — the content data key rotation verbs
+    /// (`docs/decision-encryption-at-rest.md` §9).
+    ///
+    /// A process mode rather than an admin HTTP route, deliberately: these verbs need the
+    /// database and key custody and nothing else, so an endpoint would add an authorization
+    /// design, an OpenAPI contract and a public error taxonomy to an operation run by a human
+    /// with shell access at a rate of single digits per year.
+    Keyring,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -1257,8 +1265,10 @@ impl ProcessMode {
             Some("migrate") => Ok(Self::Migrate),
             Some("bootstrap-system-key") => Ok(Self::BootstrapSystemKey),
             Some("execute-test") => Ok(Self::ExecuteTest),
+            Some("keyring") => Ok(Self::Keyring),
             Some(other) => Err(AppError::Config(format!(
-                "unknown command {other:?}; expected serve, migrate, bootstrap-system-key, or execute-test"
+                "unknown command {other:?}; expected serve, migrate, bootstrap-system-key, \
+                 execute-test, or keyring"
             ))),
         }
     }

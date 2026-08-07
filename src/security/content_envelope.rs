@@ -1460,11 +1460,22 @@ mod tests {
         fn can_unwrap(&self, _master_key_id: &str) -> bool {
             panic!("custody was consulted for a blob this build cannot interpret");
         }
+        fn wrap_algorithm(&self) -> &'static str {
+            panic!("custody was consulted for a blob this build cannot interpret");
+        }
         fn master_key_ids(&self) -> Vec<String> {
             panic!("custody was consulted for a blob this build cannot interpret");
         }
         async fn wrap(
             &self,
+            _dek: &Zeroizing<[u8; 32]>,
+            _aad: &[u8],
+        ) -> Result<crate::security::WrappedKey, crate::security::KeyCustodyError> {
+            panic!("custody was consulted for a blob this build cannot interpret");
+        }
+        async fn wrap_under(
+            &self,
+            _master_key_id: &str,
             _dek: &Zeroizing<[u8; 32]>,
             _aad: &[u8],
         ) -> Result<crate::security::WrappedKey, crate::security::KeyCustodyError> {

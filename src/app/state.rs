@@ -259,7 +259,14 @@ impl AppState {
 /// Builds the configured custody backend and proves it is *usable*, not merely configured.
 ///
 /// The `match` is the seam: adding `Kms` or `Vault` adds an arm here and changes nothing else.
-async fn build_content_custody(settings: &Settings) -> Result<Arc<dyn MasterKeyCustody>, AppError> {
+///
+/// `pub` because `moira keyring …` needs custody **without** an `AppState`. That mode must run
+/// against a keyring [`ContentKeyring::load`] refuses — `abandon` is only ever reached after
+/// that refusal — so it cannot go through `AppState::new`, which loads the keyring. Duplicating
+/// the four lines below in the CLI would be a second place for the `Kms` arm to be forgotten.
+pub async fn build_content_custody(
+    settings: &Settings,
+) -> Result<Arc<dyn MasterKeyCustody>, AppError> {
     let (keys, active_key_id) = settings.content_encryption.master_keys()?;
     let custody: Arc<dyn MasterKeyCustody> = match settings.content_encryption.custody {
         ContentEncryptionCustody::Environment => Arc::new(
@@ -357,11 +364,22 @@ mod tests {
         fn can_unwrap(&self, _master_key_id: &str) -> bool {
             true
         }
+        fn wrap_algorithm(&self) -> &'static str {
+            "aws-kms:symmetric_default"
+        }
         fn master_key_ids(&self) -> Vec<String> {
             vec!["arn-alias-moira".to_string()]
         }
         async fn wrap(
             &self,
+            _dek: &Zeroizing<[u8; 32]>,
+            _aad: &[u8],
+        ) -> Result<WrappedKey, KeyCustodyError> {
+            Err(KeyCustodyError::Unavailable { backend: "aws_kms" })
+        }
+        async fn wrap_under(
+            &self,
+            _master_key_id: &str,
             _dek: &Zeroizing<[u8; 32]>,
             _aad: &[u8],
         ) -> Result<WrappedKey, KeyCustodyError> {

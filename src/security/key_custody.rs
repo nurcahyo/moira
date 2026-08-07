@@ -130,6 +130,19 @@ pub trait MasterKeyCustody: Send + Sync + std::fmt::Debug {
     /// with no re-encryption.
     fn can_unwrap(&self, master_key_id: &str) -> bool;
 
+    /// The `wrap_algorithm` this backend records on every key it wraps —
+    /// `"AES-256-GCM"` here, `"aws-kms:symmetric_default"` for a KMS backend.
+    ///
+    /// Declared *before* a wrap because the algorithm is part of the wrapped-key AAD (see
+    /// [`wrapped_data_key_aad`]), and an AAD has to be complete before the call it
+    /// authenticates. Without it, a rewrap onto a backend whose algorithm string differs would
+    /// authenticate `wrap_algorithm=AES-256-GCM` and then store a row saying otherwise — a
+    /// blob nothing could ever open, written silently.
+    ///
+    /// It is a declaration, so callers verify it: [`crate::security::KeyringAdmin::rewrap_with`]
+    /// refuses a backend whose [`Self::wrap_under`] returns something other than this.
+    fn wrap_algorithm(&self) -> &'static str;
+
     /// Every master key id this backend is *configured* to open, sorted.
     ///
     /// Not "every key the backend could theoretically reach" — a KMS backend answers with the
@@ -146,6 +159,30 @@ pub trait MasterKeyCustody: Send + Sync + std::fmt::Debug {
 
     async fn wrap(
         &self,
+        dek: &Zeroizing<[u8; 32]>,
+        aad: &[u8],
+    ) -> Result<WrappedKey, KeyCustodyError>;
+
+    /// Wrap under a **named** master key rather than under the active one.
+    ///
+    /// This is what `moira keyring rewrap --to <id>` needs and what [`Self::wrap`] cannot
+    /// express. Step 2 of the master-key rotation in
+    /// `docs/decision-encryption-at-rest.md` §9 is deliberately performed *before*
+    /// `ACTIVE_KEY_ID` moves — the new key is added to `MOIRA_CONTENT_ENCRYPTION__KEYS`, the
+    /// keyring rows are re-wrapped under it, and only then is it promoted. So the one moment
+    /// the target id is needed is precisely the moment it is **not** the active id, and a
+    /// seam that could only wrap under "whatever is active" would force the operator to
+    /// promote first and rewrap second — the ordering that leaves a booting instance unable
+    /// to open rows it must open.
+    ///
+    /// Maps onto every backend the seam was chosen for: KMS `Encrypt` already takes a
+    /// `KeyId`, and Vault Transit already names its key in the path. An implementation must
+    /// refuse an id it does not hold with [`KeyCustodyError::UnknownMasterKey`] rather than
+    /// silently falling back to the active key — that fallback is exactly the
+    /// `LocalSecretCipher` defect this module exists not to reproduce.
+    async fn wrap_under(
+        &self,
+        master_key_id: &str,
         dek: &Zeroizing<[u8; 32]>,
         aad: &[u8],
     ) -> Result<WrappedKey, KeyCustodyError>;
@@ -322,6 +359,10 @@ impl MasterKeyCustody for EnvironmentMasterKeyCustody {
         self.keys.contains_key(master_key_id)
     }
 
+    fn wrap_algorithm(&self) -> &'static str {
+        WRAP_ALGORITHM_AES_256_GCM
+    }
+
     fn master_key_ids(&self) -> Vec<String> {
         // Sorted for the same reason `Debug` sorts: a `HashMap` iteration order that changes
         // per process makes two operators comparing two refusals unable to compare them.
@@ -335,7 +376,21 @@ impl MasterKeyCustody for EnvironmentMasterKeyCustody {
         dek: &Zeroizing<[u8; 32]>,
         aad: &[u8],
     ) -> Result<WrappedKey, KeyCustodyError> {
-        let cipher = self.cipher(&self.active_master_key_id)?;
+        // Defined in terms of `wrap_under` rather than beside it, so "the active key" is a
+        // single argument to one implementation instead of a second copy of the AES-GCM
+        // call that could drift from it.
+        self.wrap_under(&self.active_master_key_id, dek, aad).await
+    }
+
+    async fn wrap_under(
+        &self,
+        master_key_id: &str,
+        dek: &Zeroizing<[u8; 32]>,
+        aad: &[u8],
+    ) -> Result<WrappedKey, KeyCustodyError> {
+        // Selected on the *requested* id. An id this backend does not hold is refused by
+        // name here, never substituted with the active key.
+        let cipher = self.cipher(master_key_id)?;
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
         let wrapped = cipher
             .encrypt(
@@ -350,7 +405,7 @@ impl MasterKeyCustody for EnvironmentMasterKeyCustody {
             })?;
 
         Ok(WrappedKey {
-            master_key_id: self.active_master_key_id.clone(),
+            master_key_id: master_key_id.to_string(),
             wrap_algorithm: WRAP_ALGORITHM_AES_256_GCM.to_string(),
             nonce: nonce.to_vec(),
             wrapped,
@@ -497,6 +552,70 @@ mod tests {
                 .unwrap_err(),
             KeyCustodyError::UnknownMasterKey {
                 master_key_id: "old".to_string()
+            }
+        );
+    }
+
+    /// `rewrap --to <id>` runs while `<id>` is held but **not yet active** — that is the whole
+    /// of step 2 of the master-key rotation. Wrapping under the active key instead would seal
+    /// the keyring under the key the operator is retiring.
+    #[tokio::test]
+    async fn wrap_under_seals_beneath_a_named_key_that_is_not_the_active_one() {
+        // Exactly the R2 step-2 configuration: both keys held, `old` still active.
+        let rotating = custody(&[("old", 1), ("new", 2)], "old");
+        let dek = Zeroizing::new([9u8; 32]);
+
+        let wrapped = rotating
+            .wrap_under("new", &dek, aad("new").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(wrapped.master_key_id, "new");
+
+        // The recorded id is not merely a label: a custody holding *only* `new` opens it, and
+        // one holding only `old` does not. Without both halves this would pass against an
+        // implementation that wrapped under `old` and stamped the row `"new"` — which is the
+        // precise bug that makes step 4 of the rotation unrecoverable.
+        let only_new = custody(&[("new", 2)], "new");
+        assert_eq!(
+            only_new
+                .unwrap(&wrapped, aad("new").as_bytes())
+                .await
+                .unwrap()
+                .as_slice(),
+            dek.as_slice()
+        );
+        let only_old = custody(&[("old", 1)], "old");
+        assert_eq!(
+            only_old
+                .unwrap(&wrapped, aad("new").as_bytes())
+                .await
+                .unwrap_err(),
+            KeyCustodyError::UnknownMasterKey {
+                master_key_id: "new".to_string()
+            }
+        );
+
+        // And `wrap` is still "wrap under the active key" — the two must not have drifted.
+        let active = rotating.wrap(&dek, aad("old").as_bytes()).await.unwrap();
+        assert_eq!(active.master_key_id, "old");
+    }
+
+    #[tokio::test]
+    async fn wrap_under_refuses_an_id_it_does_not_hold_rather_than_using_the_active_key() {
+        let custody = custody(&[("k1", 1)], "k1");
+        // Silently wrapping under `k1` here would write a row claiming `absent` sealed it,
+        // and boot would then refuse for a key that was never used.
+        assert_eq!(
+            custody
+                .wrap_under(
+                    "absent",
+                    &Zeroizing::new([9u8; 32]),
+                    aad("absent").as_bytes()
+                )
+                .await
+                .unwrap_err(),
+            KeyCustodyError::UnknownMasterKey {
+                master_key_id: "absent".to_string()
             }
         );
     }

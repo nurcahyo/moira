@@ -42,7 +42,8 @@ PROMPT ?= Hello
 ROUTE ?= general
 
 .PHONY: help setup start env env-force env-rotate up down reset logs ps psql redis \
-        build migrate run serve release bootstrap-key seed test-seed-local smoke execute-test health openapi docs \
+        build migrate run serve release bootstrap-key seed test-seed-local smoke execute-test \
+        keyring rotate-keys rotation-gate health openapi docs \
         console-install console-db console-dev console-build console-start console-check \
         fmt fmt-check clippy test gates gates-fast check doctor clean
 
@@ -152,6 +153,21 @@ smoke: ## End-to-end check: health, contract, and a real completion with real to
 execute-test: ## Exercise the execution kernel: make execute-test PROMPT="..." ROUTE=general
 	$(ENV) cargo run --quiet -- execute-test -- --prompt "$(PROMPT)" --route "$(ROUTE)"
 
+keyring: ## Inspect or rotate the content keyring: make keyring ARGS="status"
+	$(ENV) cargo run --quiet -- keyring $(ARGS)
+
+rotate-keys: build ## Perform a REAL R1 and R2 against the local database (see scripts/rotate-keys.sh)
+	@# Not a smoke test with a different name. Rotation code is usually broken the first
+	@# time it is needed, because it runs once every few years under pressure on a path
+	@# nothing exercises; the point of a `make` target is that the path gets exercised
+	@# routinely and by humans. `cargo test` proves the functions work — this proves the
+	@# BINARY does: argv, the process mode, settings, custody, and the operator's output.
+	@#
+	@# Neither verb touches a `*_encrypted` column, and the run leaves your keyring
+	@# wrapped under the master key `.env` already configures, so nothing needs editing
+	@# afterwards.
+	$(ENV) scripts/rotate-keys.sh
+
 health: ## Probe /health/live and /health/ready
 	@curl -fsS $(BASE)/health/live >/dev/null && printf 'live   ok\n' || { printf 'live   FAILED — nothing answering on %s\n' "$(BASE)"; exit 1; }
 	@curl -fsS $(BASE)/health/ready >/dev/null && printf 'ready  ok\n' || { printf 'ready  FAILED — process is up but a dependency is not\n'; exit 1; }
@@ -202,6 +218,9 @@ clippy: ## Lint, warnings denied
 
 test: ## Run the test suite against the local database
 	$(ENV) cargo test --workspace --all-features
+
+rotation-gate: ## The keyring-rotation gate — fails when the test database is absent, never skips
+	$(ENV) scripts/rotation-gate.sh
 
 gates: ## The six merge gates (scripts/gates.sh)
 	$(ENV) scripts/gates.sh
