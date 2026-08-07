@@ -2100,10 +2100,32 @@ fn citations_from_link(link: Option<&ConversationExecutionLink>) -> Vec<PublicCi
 /// The literal was previously `"metadata_only_persistence"` unconditionally, which is correct
 /// for the default configuration and **false** for the other three modes — it named a cause
 /// the operator had not configured, sending them to change a setting that was not the reason.
-/// `plain_content` and `encrypted_content` are honoured by nothing in the tree (see
-/// `docs/response-persistence.md`, and F33 for the five unused encryption-at-rest columns), so
-/// the honest answer for those is that content persistence is unimplemented, not that the
-/// application asked for metadata only.
+/// `plain_content` and `encrypted_content` are honoured by nothing in the tree, so the honest
+/// answer for those is that content persistence is unimplemented, not that the application
+/// asked for metadata only.
+///
+/// # Why it is still unimplemented — the reason changed, the answer did not
+///
+/// The old reason was "no cipher is wired to the `*_encrypted` columns". That stopped being
+/// true when the envelope-encryption release train landed (issues #139, #140, #141): all five
+/// of F33's columns now seal and open. Restating it would be prose that is merely stale, which
+/// is worse than none — it points a reader at work that is finished.
+///
+/// **The remaining gap is a schema gap, and it is wider than the encrypted half.**
+/// `migrations/0006_public_execution_api.sql` creates `responses` with no output body column of
+/// *either* form: not `output_text_plain`, not `output_text_encrypted`. What it stores of an
+/// execution's result is `output_summary jsonb`, `usage_summary jsonb`, `failure_class`,
+/// `failure_message` and the `output_persisted` boolean. The only two later migrations to touch
+/// the table add `conversation_id` (`0007`) and `updated_at` (`0008`). So `plain_content` has
+/// nowhere to write either, and the five `*_encrypted` columns this build seals all belong to
+/// `conversation_messages`, `conversation_summaries`, `memory_records`,
+/// `rag_document_versions` and `rag_chunks` — none of them to `responses`.
+///
+/// Implementing either mode therefore needs **new DDL**, not a cipher, which is why
+/// `docs/decision-encryption-at-rest.md` §14 resolves
+/// [#103](https://github.com/nurcahyo/moira/issues/103) toward *refuse with a 422, symmetric
+/// with the conversation side* rather than *implement*. This arm stays exactly as it is until
+/// that decision is taken; it is a finding, not an omission.
 ///
 /// An absent or unrecognised mode falls back to the previous literal: `output_summary` is
 /// always written on the completed path, so the fallback is unreachable, and if it ever became

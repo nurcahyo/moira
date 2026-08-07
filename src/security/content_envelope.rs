@@ -1786,6 +1786,330 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------- the column allowlist
+
+    /// The three distinct identifiers the five sealed columns are spelled with.
+    ///
+    /// Three rather than five because `content_encrypted` names the column on
+    /// `conversation_messages`, `memory_records` **and** `rag_document_versions`. None of the
+    /// three is a substring of another, so counting them cannot double-count.
+    const SEALED_COLUMN_IDENTIFIERS: [&str; 3] = [
+        "content_encrypted",
+        "summary_text_encrypted",
+        "chunk_text_encrypted",
+    ];
+
+    /// **Every function in `src/` that may name a sealed column inside a SQL statement.**
+    ///
+    /// # What this is guarding
+    ///
+    /// A sealed column is a `bytea` that must only ever receive an envelope produced by
+    /// [`ContentCipher::seal`] under the right [`ContentIdentity`], and must only ever be read
+    /// back through [`crate::security::ContentOpener`]. Nothing in the type system says so: the
+    /// column takes any `Vec<u8>`, and `sqlx` will bind one happily. A future PR that writes
+    /// `.bind(some_bytes)` into `chunk_text_encrypted` — a compressed blob, a serialised struct,
+    /// a plaintext body cast to bytes — compiles, passes every round-trip test written against
+    /// it, and produces rows that the whole rest of this subsystem believes are sealed.
+    ///
+    /// So the gate is a **source walk**, in the spirit of the coded-error-literal gate in
+    /// `src/i18n/catalog/mod.rs`: it does not check that a site is correct, only that the set of
+    /// sites has not moved without someone saying so. A red here means "somebody taught a new
+    /// function to name a sealed column in SQL — go and read it".
+    ///
+    /// It is **bidirectional**: a site appearing and a site disappearing both fail, because a
+    /// guard that only counts upward cannot notice a writer being deleted.
+    ///
+    /// # Deliberately not in the list, and why that is the point
+    ///
+    /// `src/security/keyring_admin.rs` performs `reseal`, which is the only code in the tree that
+    /// *updates* a sealed column in place — and it does not appear here, because it never spells
+    /// a column name. It builds the statement from [`AadProfile::column`], so the registry in
+    /// this module is the single source of the identifier. That is the shape a new site should
+    /// copy.
+    const SEALED_COLUMN_SQL_SITES: &[(&str, &str)] = &[
+        // The four conversation- and memory-side writers and readers wired by issues #139/#140.
+        ("src/infra/repositories/conversation.rs", "add_message"),
+        ("src/infra/repositories/conversation.rs", "create_memory"),
+        (
+            "src/infra/repositories/conversation.rs",
+            "find_active_conversation_summary",
+        ),
+        (
+            "src/infra/repositories/conversation.rs",
+            "find_conversation_context_anchor",
+        ),
+        (
+            "src/infra/repositories/conversation.rs",
+            "find_messages_after_sequence",
+        ),
+        (
+            "src/infra/repositories/conversation.rs",
+            "find_recent_messages",
+        ),
+        (
+            "src/infra/repositories/conversation.rs",
+            "insert_conversation_summary",
+        ),
+        (
+            "src/infra/repositories/conversation.rs",
+            "insert_extracted_memory",
+        ),
+        (
+            "src/infra/repositories/conversation.rs",
+            "memory_candidates_sql",
+        ),
+        ("src/infra/repositories/conversation.rs", "patch_memory"),
+        // The RAG pair wired by issue #141: two writers for profile 4, one for profile 5, and
+        // the one reader that opens profile 5.
+        (
+            "src/infra/repositories/conversation.rs",
+            "create_rag_document_with_connection",
+        ),
+        (
+            "src/infra/repositories/conversation.rs",
+            "ingest_rag_document_with_connection",
+        ),
+        (
+            "src/infra/repositories/conversation.rs",
+            "write_rag_ingestion_artifacts",
+        ),
+        (
+            "src/infra/repositories/conversation.rs",
+            "find_rag_chunk_candidates",
+        ),
+        // The rotation suite's row seeder. It writes all five columns directly, on purpose:
+        // `reseal` has to be given pre-existing envelopes to move, and a fixture that went
+        // through the repositories would be testing the repositories.
+        ("src/security/keyring_admin/tests.rs", "seed"),
+    ];
+
+    /// Statements a literal must look like before its column mentions count.
+    ///
+    /// Without this the walk would flag every doc comment, every column-name argument to
+    /// [`crate::infra::pg_rows::conversation_content_from_row`], and the migration text quoted in
+    /// `src/i18n/catalog/errors.rs` — none of which can put bytes in a column. The narrow list is
+    /// what keeps a red here meaning something.
+    const SQL_STATEMENT_MARKERS: [&str; 3] = ["select", "insert into", "update "];
+
+    /// Every `.rs` file under `dir`, sorted, so a failure names the same file on every machine.
+    fn rust_sources_under(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .unwrap_or_else(|error| panic!("read_dir {}: {error}", dir.display()))
+            .map(|entry| entry.expect("directory entry").path())
+            .collect();
+        paths.sort();
+        for path in paths {
+            if path.is_dir() {
+                rust_sources_under(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Every string literal in `source`, paired with the 1-based line it starts on.
+    ///
+    /// Handles raw strings (`r"…"`, `r#"…"#`, and more hashes), ordinary strings with escapes,
+    /// and skips `//` line comments so that prose is never mistaken for a statement. A `//`
+    /// inside a string is not a comment, which is why this walks characters rather than lines.
+    fn string_literals(source: &str) -> Vec<(usize, String)> {
+        let bytes: Vec<char> = source.chars().collect();
+        let mut out = Vec::new();
+        let mut index = 0usize;
+        let mut line = 1usize;
+        while index < bytes.len() {
+            let current = bytes[index];
+            if current == '\n' {
+                line += 1;
+                index += 1;
+                continue;
+            }
+            // A `//` comment, but only outside a string — which is where we are.
+            if current == '/' && bytes.get(index + 1) == Some(&'/') {
+                while index < bytes.len() && bytes[index] != '\n' {
+                    index += 1;
+                }
+                continue;
+            }
+            // A raw string: `r`, some hashes, a quote; terminated by a quote and the same hashes.
+            if current == 'r'
+                && matches!(bytes.get(index + 1), Some('"') | Some('#'))
+                && index
+                    .checked_sub(1)
+                    .is_none_or(|before| !bytes[before].is_alphanumeric() && bytes[before] != '_')
+            {
+                let mut cursor = index + 1;
+                let mut hashes = 0usize;
+                while bytes.get(cursor) == Some(&'#') {
+                    hashes += 1;
+                    cursor += 1;
+                }
+                if bytes.get(cursor) == Some(&'"') {
+                    let start_line = line;
+                    cursor += 1;
+                    let mut body = String::new();
+                    loop {
+                        if cursor >= bytes.len() {
+                            break;
+                        }
+                        if bytes[cursor] == '"'
+                            && (1..=hashes).all(|offset| bytes.get(cursor + offset) == Some(&'#'))
+                        {
+                            cursor += 1 + hashes;
+                            break;
+                        }
+                        if bytes[cursor] == '\n' {
+                            line += 1;
+                        }
+                        body.push(bytes[cursor]);
+                        cursor += 1;
+                    }
+                    out.push((start_line, body));
+                    index = cursor;
+                    continue;
+                }
+            }
+            if current == '"' {
+                let start_line = line;
+                let mut cursor = index + 1;
+                let mut body = String::new();
+                while cursor < bytes.len() {
+                    if bytes[cursor] == '\\' {
+                        cursor += 2;
+                        continue;
+                    }
+                    if bytes[cursor] == '"' {
+                        cursor += 1;
+                        break;
+                    }
+                    if bytes[cursor] == '\n' {
+                        line += 1;
+                    }
+                    body.push(bytes[cursor]);
+                    cursor += 1;
+                }
+                out.push((start_line, body));
+                index = cursor;
+                continue;
+            }
+            index += 1;
+        }
+        out
+    }
+
+    /// The name of the function each 1-based line belongs to, or `"<module level>"`.
+    fn function_at_each_line(source: &str) -> Vec<String> {
+        let mut current = "<module level>".to_string();
+        let mut out = vec![current.clone()];
+        for raw in source.lines() {
+            let trimmed = raw.trim_start();
+            let after_visibility = trimmed
+                .strip_prefix("pub(crate) ")
+                .or_else(|| trimmed.strip_prefix("pub(super) "))
+                .or_else(|| trimmed.strip_prefix("pub "))
+                .unwrap_or(trimmed);
+            let after_async = after_visibility
+                .strip_prefix("async ")
+                .unwrap_or(after_visibility);
+            let after_const = after_async.strip_prefix("const ").unwrap_or(after_async);
+            if let Some(rest) = after_const.strip_prefix("fn ") {
+                let name: String = rest
+                    .chars()
+                    .take_while(|character| character.is_alphanumeric() || *character == '_')
+                    .collect();
+                if !name.is_empty() {
+                    current = name;
+                }
+            }
+            out.push(current.clone());
+        }
+        out
+    }
+
+    /// `--` starts a comment inside a SQL statement. Stripping it means a comment *explaining*
+    /// why a column is projected does not itself count as projecting it.
+    fn without_sql_comments(literal: &str) -> String {
+        literal
+            .lines()
+            .map(|line| line.split("--").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn every_sealed_column_named_in_sql_sits_in_an_allowlisted_function() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        rust_sources_under(&manifest.join("src"), &mut files);
+        assert!(
+            files.len() > 40,
+            "the source walker found only {} files under src/ — it is broken, and a broken \
+             walker asserts nothing",
+            files.len()
+        );
+
+        let mut found: Vec<(String, String)> = Vec::new();
+        for file in &files {
+            let source = std::fs::read_to_string(file)
+                .unwrap_or_else(|error| panic!("read {}: {error}", file.display()));
+            let functions = function_at_each_line(&source);
+            for (line, literal) in string_literals(&source) {
+                let lowered = literal.to_ascii_lowercase();
+                if !SQL_STATEMENT_MARKERS
+                    .iter()
+                    .any(|marker| lowered.contains(marker))
+                {
+                    continue;
+                }
+                let statement = without_sql_comments(&literal);
+                if !SEALED_COLUMN_IDENTIFIERS
+                    .iter()
+                    .any(|column| statement.contains(column))
+                {
+                    continue;
+                }
+                let relative = file
+                    .strip_prefix(manifest)
+                    .unwrap_or(file)
+                    .display()
+                    .to_string()
+                    .replace('\\', "/");
+                let function = functions
+                    .get(line)
+                    .cloned()
+                    .unwrap_or_else(|| "<module level>".to_string());
+                found.push((relative, function));
+            }
+        }
+        found.sort();
+        found.dedup();
+
+        let mut expected: Vec<(String, String)> = SEALED_COLUMN_SQL_SITES
+            .iter()
+            .map(|(file, function)| ((*file).to_string(), (*function).to_string()))
+            .collect();
+        expected.sort();
+        expected.dedup();
+
+        assert!(
+            !found.is_empty(),
+            "the walk found no SQL naming a sealed column at all. Either every writer was \
+             deleted, or the literal scanner stopped working — and a scanner that finds nothing \
+             passes an allowlist that is also empty"
+        );
+        assert_eq!(
+            found, expected,
+            "the set of functions naming a sealed column in SQL has changed.\n\n\
+             These five columns hold AES-256-GCM envelopes and nothing else. A function that \
+             binds raw bytes into one, or reads one without going through a ContentOpener, \
+             produces rows the rest of this subsystem believes are sealed and that nothing can \
+             open. If the new site is correct — it seals through ContentCipher under the right \
+             ContentIdentity, or opens through ContentOpener — add it to \
+             SEALED_COLUMN_SQL_SITES and say why in the same commit. If a site vanished, say \
+             which reader lost its sealed column."
+        );
+    }
+
     // ---------------------------------------------------------------- constants
 
     #[test]
