@@ -19,7 +19,7 @@ use crate::{
     security::{
         AdminAuthenticator, ApiKeyHasher, AuthService, AuthorizationService, CallerAuthenticator,
         ContentKeyring, EnvironmentMasterKeyCustody, IdempotencyHasher, JwksCache,
-        LocalSecretCipher, MasterKeyCustody,
+        KeyringContentAccess, LocalSecretCipher, MasterKeyCustody,
     },
 };
 
@@ -253,6 +253,19 @@ impl AppState {
 
     pub fn pool(&self) -> Result<&PgPool, AppError> {
         self.pool.as_ref().ok_or(AppError::DatabaseUnavailable)
+    }
+
+    /// The seal/open seam for content columns, over this process's keyring.
+    ///
+    /// Cheap enough to build per call — an `Option<Arc<_>>` clone — and deliberately not cached
+    /// on `AppState`: holding a `KeyringContentAccess` would be holding the keyring, which is
+    /// what `content_keyring` already is.
+    ///
+    /// Returns an access that refuses everything when there is no keyring, rather than an
+    /// `Option`: a caller forced to unwrap would eventually write `unwrap_or(plaintext)`, and
+    /// that is the one thing this whole subsystem exists to prevent.
+    pub fn content_access(&self) -> KeyringContentAccess {
+        KeyringContentAccess::new(self.content_keyring.clone())
     }
 }
 

@@ -17,14 +17,14 @@ use crate::{
         parse_summary, render_transcript, summarization_messages,
     },
     domain::{
-        AuditLogInsert, AuditResult, CallerRuntimeIdentity, ConversationCreateRequest,
-        ConversationMessageCreateRequest, ConversationMessageQuery, ConversationMessageRecord,
-        ConversationMessageRole, ConversationMessageType, ConversationPatchRequest,
-        ConversationPolicyPutRequest, ConversationPolicyRecord, ConversationQuery,
-        ConversationRecord, ConversationStatus, ConversationSummaryRecord, CursorScope,
-        DomainMessage, EmbeddingPolicyPutRequest, EmbeddingPolicyRecord, ExecutionCommand,
-        ExecutionOptions, ExecutionOutcome, ExecutionStatus, HistoryStrategy, ListCursor,
-        ListResponse, MemoryConsentMode, MemoryCreateRequest, MemoryPatchRequest,
+        AuditLogInsert, AuditResult, CallerRuntimeIdentity, ContentWrite,
+        ConversationCreateRequest, ConversationMessageCreateRequest, ConversationMessageQuery,
+        ConversationMessageRecord, ConversationMessageRole, ConversationMessageType,
+        ConversationPatchRequest, ConversationPolicyPutRequest, ConversationPolicyRecord,
+        ConversationQuery, ConversationRecord, ConversationStatus, ConversationSummaryRecord,
+        CursorScope, DomainMessage, EmbeddingPolicyPutRequest, EmbeddingPolicyRecord,
+        ExecutionCommand, ExecutionOptions, ExecutionOutcome, ExecutionStatus, HistoryStrategy,
+        ListCursor, ListResponse, MemoryConsentMode, MemoryCreateRequest, MemoryPatchRequest,
         MemoryPolicyPutRequest, MemoryPolicyRecord, MemoryQuery, MemoryRecord, MemoryScope,
         MemoryStatus, Pagination, PublicCitation, PublicContentPart, PublicInputMessage,
         RagCollectionCreateRequest, RagCollectionPatchRequest, RagCollectionQuery,
@@ -346,8 +346,8 @@ impl ConversationService {
     pub fn new(state: &AppState) -> Result<Self, AppError> {
         let pool = state.pool()?.clone();
         Ok(Self {
+            repo: PgConversationRepository::new(pool.clone(), state.content_keyring.clone()),
             state: state.clone(),
-            repo: PgConversationRepository::new(pool.clone()),
             admin_repo: PgAdminRepository::new(pool),
         })
     }
@@ -613,7 +613,9 @@ impl ConversationService {
                 execution_id: None,
                 role: request.role,
                 message_type: ConversationMessageType::Input,
-                content_plain: Some(request.content.clone()),
+                // What the caller has. `add_message` re-derives the storage form from the
+                // application's policy under the row lock — see its doc comment.
+                content: ContentWrite::Plain(request.content.clone()),
                 content_hash,
                 content_size_bytes: request.content.len() as i64,
                 token_count: Some(estimate_tokens(&request.content)),
@@ -688,7 +690,7 @@ impl ConversationService {
                 execution_id: None,
                 role: ConversationMessageRole::User,
                 message_type: ConversationMessageType::Input,
-                content_plain: Some(content.clone()),
+                content: ContentWrite::Plain(content.clone()),
                 content_hash,
                 content_size_bytes: content.len() as i64,
                 token_count: Some(estimate_tokens(&content)),
@@ -770,13 +772,19 @@ impl ConversationService {
             .await?;
 
         let Some((conversation_uuid, summary_id, summary_text, _)) =
-            find_conversation_context_anchor(pool, conversation_public_id).await?
+            find_conversation_context_anchor(
+                pool,
+                &self.state.content_access(),
+                conversation_public_id,
+            )
+            .await?
         else {
             return Ok(PlannedContext::default());
         };
 
         let history = find_recent_messages(
             pool,
+            &self.state.content_access(),
             conversation_public_id,
             current_sequence,
             history_message_limit(&conversation_policy),
@@ -1098,7 +1106,7 @@ impl ConversationService {
                 execution_id: Some(execution_id),
                 role: ConversationMessageRole::Assistant,
                 message_type: ConversationMessageType::Output,
-                content_plain: Some(output.to_string()),
+                content: ContentWrite::Plain(output.to_string()),
                 content_hash,
                 content_size_bytes: output.len() as i64,
                 token_count: Some(estimate_tokens(output)),
@@ -1226,8 +1234,12 @@ impl ConversationService {
             return;
         };
 
-        let Ok(Some((conversation_uuid, _, _, _))) =
-            find_conversation_context_anchor(pool, &link.conversation_id).await
+        let Ok(Some((conversation_uuid, _, _, _))) = find_conversation_context_anchor(
+            pool,
+            &self.state.content_access(),
+            &link.conversation_id,
+        )
+        .await
         else {
             return;
         };
@@ -1235,6 +1247,7 @@ impl ConversationService {
         // the turn that just happened — it is the whole subject of the run.
         let Ok(history) = find_recent_messages(
             pool,
+            &self.state.content_access(),
             &link.conversation_id,
             i64::MAX,
             EXTRACTION_TRANSCRIPT_MESSAGES,
@@ -1717,7 +1730,8 @@ impl ConversationService {
             .await?;
 
         let Some((conversation_uuid, _, _, _)) =
-            find_conversation_context_anchor(pool, &conversation.id).await?
+            find_conversation_context_anchor(pool, &self.state.content_access(), &conversation.id)
+                .await?
         else {
             return Err(AppError::coded(
                 axum::http::StatusCode::NOT_FOUND,
@@ -1824,7 +1838,9 @@ impl ConversationService {
         policy: &ConversationPolicyRecord,
         force: bool,
     ) -> Result<SummarizationPlan, AppError> {
-        let previous = find_active_conversation_summary(pool, conversation_uuid).await?;
+        let previous =
+            find_active_conversation_summary(pool, &self.state.content_access(), conversation_uuid)
+                .await?;
         let boundary = previous
             .as_ref()
             .map(|row| row.covers_through_sequence)
@@ -1837,6 +1853,7 @@ impl ConversationService {
             count_messages_after_sequence(pool, conversation_uuid, boundary).await?;
         let messages = find_messages_after_sequence(
             pool,
+            &self.state.content_access(),
             conversation_uuid,
             boundary,
             SUMMARY_TRANSCRIPT_MESSAGES,
@@ -2019,12 +2036,18 @@ impl ConversationService {
         // genuinely happened and genuinely covers that backlog; recording the boundary without
         // the body is the honest outcome, and is exactly the shape `ConversationSummaryRow`
         // already documents for a null `summary_text`.
-        let summary_text = policy
-            .conversation_content_persistence
-            .persists_plaintext()
-            .then_some(summary.text.as_str());
+        //
+        // Since issue #139 the decision goes through `ContentWrite::under_policy`, which is
+        // exhaustive on the policy: `encrypted_content` now yields a body that
+        // `insert_conversation_summary` seals rather than a `None` that drops it, and a fifth
+        // policy value would not compile until somebody decided which of the three it is.
+        let summary_text = ContentWrite::under_policy(
+            policy.conversation_content_persistence,
+            summary.text.clone(),
+        );
         let row = insert_conversation_summary(
             pool,
+            &self.state.content_access(),
             &ConversationSummaryInsert {
                 conversation_uuid,
                 covers_through_sequence: plan.covers_through_sequence,
@@ -2319,29 +2342,38 @@ impl ConversationService {
             .authz
             .require(actor, "moira:conversation-policies:write")?;
         validate_metadata_option(&request.metadata)?;
-        // Refuse a value Moira cannot honour rather than storing it and behaving as something
-        // else. `encrypted_content` is the only one: the `content_encrypted` columns exist on
-        // three tables and have no writer anywhere in `src/`, so accepting it would tell an
-        // operator with a PII or data-residency obligation that their content is encrypted at
-        // rest when it is not. That was finding F32's sharpest edge — the API was the thing
-        // doing the misleading.
+        // **The refusal narrowed with issue #139; it did not disappear.**
         //
-        // Fail-closed on both sides: a row that already holds `encrypted_content` keeps
-        // parsing and stores no plaintext (`persists_plaintext` is false for it), so an
-        // existing deployment is made safer rather than broken, while no new deployment can
-        // select it.
+        // It used to fire for `encrypted_content` as a *value*, because the `content_encrypted`
+        // columns had no writer anywhere in `src/` and accepting the setting would have told an
+        // operator with a PII or data-residency obligation that their content was encrypted at
+        // rest when it was not. That was finding F32's sharpest edge — the API was the thing
+        // doing the misleading. A cipher is now wired to those columns, so the value is
+        // honourable and is accepted.
         //
-        // **Reversal condition:** delete this check the moment a cipher is wired to the
-        // `content_encrypted` columns. It is deliberately the only thing that has to change.
+        // What remains is the condition, not the value: encryption configured but **unusable at
+        // write time**. Two reasons it is not simply deleted:
+        //
+        // * Deleting it would leave no write-time refusal for a key-custody failure, which is a
+        //   real and permanent condition rather than a transitional one. An operator who selects
+        //   `encrypted_content` on a process that cannot seal deserves the answer here, not on
+        //   their users' next message.
+        // * It is not made conditional on "is the feature built" either. A permanently-true
+        //   branch is the never-taken code this project has been bitten by — `accept_legacy_hashes`
+        //   (#125) is the same shape — so the check reads live state that can genuinely be false.
+        //
+        // The refusals for `none` and `metadata_only` are storage policies and are untouched.
         if let Some(persistence) = request.conversation_content_persistence
-            && !persistence.is_enforceable()
+            && persistence.persists_ciphertext()
+            && !self.state.content_access().can_seal()
         {
             return Err(AppError::coded_with_details(
                 axum::http::StatusCode::UNPROCESSABLE_ENTITY,
                 "conversation_content_persistence_unsupported",
-                "encrypted_content is not implemented: no cipher is wired to the content \
-                 columns, so Moira cannot encrypt conversation content at rest. Use \
-                 metadata_only or none to withhold plaintext.",
+                "encrypted_content cannot be honoured: this deployment has no usable content \
+                 encryption key, so Moira would be unable to store conversation content at all \
+                 under this policy. Restore the content keyring, or use metadata_only or none to \
+                 withhold plaintext.",
                 json!({ "conversation_content_persistence": "encrypted_content" }),
             ));
         }

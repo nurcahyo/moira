@@ -1571,6 +1571,10 @@ pub fn execution_failure_class_to_db(class: ExecutionFailureClass) -> &'static s
         ExecutionFailureClass::DeadlineExceeded => "deadline_exceeded",
         ExecutionFailureClass::StructuredOutputInvalid => "structured_output_invalid",
         ExecutionFailureClass::StreamBackpressureExceeded => "stream_backpressure_exceeded",
+        ExecutionFailureClass::ContentDecryptionFailed => "content_decryption_failed",
+        ExecutionFailureClass::ContentEnvelopeUnsupported => "content_envelope_unsupported",
+        ExecutionFailureClass::ContentKeyUnavailable => "content_key_unavailable",
+        ExecutionFailureClass::ContentKeyAbandoned => "content_key_abandoned",
         ExecutionFailureClass::InternalError => "internal_error",
     }
 }

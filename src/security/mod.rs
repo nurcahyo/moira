@@ -1,6 +1,7 @@
 mod api_keys;
 mod auth;
 mod authz;
+mod content_access;
 mod content_envelope;
 mod crypto;
 mod data_keys;
@@ -23,6 +24,10 @@ pub use auth::{
     TrustedJwtIdentity,
 };
 pub use authz::AuthorizationService;
+pub use content_access::{
+    ContentOpener, ContentSealer, KeyringContentAccess, SnapshotContentOpener,
+    content_key_unavailable, warn_content_storage_ambiguous,
+};
 pub use content_envelope::{
     AAD_SEPARATOR, ALGORITHM_AES_256_GCM, AadProfile, ContentCipher, ContentEnvelopeError,
     ContentIdentity, ENVELOPE_HEADER_LEN, ENVELOPE_MAGIC, ENVELOPE_NONCE_LEN, ENVELOPE_TAG_LEN,

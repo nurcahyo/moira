@@ -1232,6 +1232,26 @@ mod tests {
             // A body that is not a completion is provider health evidence, but replaying the same
             // request at the same provider is not expected to change it.
             C::ProviderInvalidResponse => (false, false, true),
+            // Issue #139. The four content-encryption classes are raised on the conversation
+            // *persistence* path — sealing a message or opening a stored one — and no provider is
+            // contacted on any of them. So all three answers are the same "no", for three
+            // different reasons rather than by default:
+            //
+            // * **No retry.** `ContentDecryptionFailed`, `ContentEnvelopeUnsupported` and
+            //   `ContentKeyAbandoned` describe bytes that are already stored; a second attempt
+            //   reads the same bytes with the same keyring. `ContentKeyUnavailable` *is* resolved
+            //   by waiting, but by a keyring refresh or an operator action on a scale of
+            //   minutes — not by this execution's retry budget, which would burn its attempts in
+            //   milliseconds and report the same thing. The caller gets a `503` and retries.
+            // * **No fallback.** The keyring is process-wide, not per provider. Handing the same
+            //   row to the next provider in the chain changes nothing about whether it opens.
+            // * **No breaker.** None of these says anything about a provider's health, and a
+            //   single application with a damaged row must not be able to take a provider
+            //   offline for every other caller routed through it.
+            C::ContentDecryptionFailed
+            | C::ContentEnvelopeUnsupported
+            | C::ContentKeyUnavailable
+            | C::ContentKeyAbandoned => (false, false, false),
         }
     }
 
