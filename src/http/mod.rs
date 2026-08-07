@@ -999,6 +999,150 @@ mod tests {
         }
     }
 
+    /// Issue #157, item 1 — no operation may be silent about the `504` it can return.
+    ///
+    /// `documented_router` layers `TimeoutLayer::with_status_code(GATEWAY_TIMEOUT, ..)` onto
+    /// **every** route group, so every operation in this document can answer `504`; the
+    /// execution operations can additionally raise it themselves through
+    /// `failure_http_status`. Before this guard the document declared `504` on exactly zero of
+    /// its 152 operations, and `tests/openapi_drift.rs` could not see it — it compares the
+    /// served document to the committed one, and a status that is undeclared in both reads as
+    /// agreement.
+    ///
+    /// "Describes it" means one of two things, which is the shape of the decision recorded on
+    /// [`openapi::finalize_document`]: an explicit `504`, or a `5XX` range that already covers
+    /// it. The admin operations take the second form and are deliberately left alone rather
+    /// than given a duplicate explicit entry.
+    ///
+    /// The cheapest edit this catches is deleting the `document_gateway_timeout` call from
+    /// `finalize_document`, which would leave every other OpenAPI test in this module green.
+    #[test]
+    fn every_operation_describes_the_gateway_timeout_it_can_return() {
+        let value = serde_json::to_value(documented_router(RouterPolicy::default()).into_openapi())
+            .unwrap();
+        let paths = value["paths"].as_object().expect("OpenAPI paths");
+
+        let mut injected = 0usize;
+        let mut covered_by_a_range = 0usize;
+        for (path, item) in paths {
+            for method in HTTP_METHODS {
+                let Some(operation) = item.get(method) else {
+                    continue;
+                };
+                let responses = operation["responses"]
+                    .as_object()
+                    .expect("operation responses");
+                match (
+                    responses.get("504"),
+                    responses.contains_key("5XX") || responses.contains_key("default"),
+                ) {
+                    (Some(response), _) => {
+                        injected += 1;
+                        assert_eq!(
+                            response["content"]["application/json"]["schema"]["$ref"],
+                            "#/components/schemas/ErrorResponse",
+                            "{method} {path} declares a 504 with no error envelope; a caller \
+                             that cannot deserialize the body is no better off than one that \
+                             did not know the status existed"
+                        );
+                        let description = response["description"]
+                            .as_str()
+                            .expect("504 description")
+                            .to_ascii_lowercase();
+                        assert!(
+                            description.contains("request_timeout")
+                                && description.contains("provider_timeout"),
+                            "{method} {path}'s 504 description must name both routes to this \
+                             status — the middleware one and the execution one — because a \
+                             caller separates them by error.code, not by status: {description}"
+                        );
+                    }
+                    (None, true) => covered_by_a_range += 1,
+                    (None, false) => panic!(
+                        "{method} {path} describes no 504, yet TimeoutLayer can produce one on \
+                         every route in this router. Add it in openapi::finalize_document, not \
+                         on the operation."
+                    ),
+                }
+            }
+        }
+
+        // Both forms must actually occur, or this test would pass while proving only one of
+        // the two halves of the decision it exists to pin.
+        assert!(
+            injected > 0 && covered_by_a_range > 0,
+            "expected both explicit 504s and 5XX-covered operations; got {injected} explicit \
+             and {covered_by_a_range} range-covered"
+        );
+
+        // The two execution operations are the ones that can raise a 504 from
+        // `failure_http_status` rather than only from the middleware, and they are where a
+        // reader would first look for it.
+        for path in [
+            "/api/v1/responses",
+            "/api/v1/responses/stream",
+            "/v1/responses",
+        ] {
+            assert!(
+                paths[path]["post"]["responses"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("504"),
+                "POST {path} must declare 504 explicitly"
+            );
+        }
+    }
+
+    /// Issue #157, item 2 — the compat operation's error contract, pinned as an exact set.
+    ///
+    /// The three additions are `409` (`AgentProfileDisabled` → `CONFLICT`, shared with the
+    /// native path through `PublicExecutionService`), `503` (declared on both native response
+    /// operations and absent here for no stated reason), and a `404` description that names
+    /// **both** of that status's meanings: the feature flag being off, which the handler raises
+    /// directly, and the resolution-chain failures `failure_http_status` raises, which since #79
+    /// include `agent_profile_not_found`.
+    ///
+    /// This is a document-level guard and it deliberately does not stand alone. #155's item C2
+    /// is that this endpoint's published contract had nothing driving it, so `409` and `503` are
+    /// also asserted over a real socket by
+    /// `compat_refuses_a_disabled_agent_profile_with_409_exactly_as_the_native_path_does` and
+    /// `compat_answers_503_when_the_database_is_unavailable`
+    /// (`tests/openai_compat_text_format.rs`). A declaration and a behaviour are two different
+    /// facts; this test owns the first one only.
+    #[test]
+    fn compat_responses_operation_declares_the_statuses_it_can_return() {
+        let value = serde_json::to_value(documented_router(RouterPolicy::default()).into_openapi())
+            .unwrap();
+        let operation = &value["paths"]["/v1/responses"]["post"];
+        let responses = operation["responses"].as_object().expect("responses");
+        assert_eq!(
+            responses
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "200", "400", "401", "403", "404", "409", "422", "429", "500", "502", "503", "504"
+            ]),
+            "the compat endpoint's declared statuses must match what it can actually return"
+        );
+
+        let not_found = responses["404"]["description"]
+            .as_str()
+            .expect("404 description")
+            .to_ascii_lowercase();
+        assert!(
+            not_found.contains("disabled"),
+            "the 404 description must still name the feature flag, which the handler raises \
+             directly before authenticating anyone: {not_found}"
+        );
+        assert!(
+            not_found.contains("agent profile") && not_found.contains("credential"),
+            "the 404 description must also name the resolution-chain failures that share this \
+             status; a caller told only 'the endpoint is disabled' cannot tell an off switch \
+             from a misconfigured default route: {not_found}"
+        );
+    }
+
     #[test]
     fn setup_status_contract_is_typed_and_exact() {
         let value = serde_json::to_value(documented_router(RouterPolicy::default()).into_openapi())
@@ -1011,7 +1155,13 @@ mod tests {
                 .keys()
                 .map(String::as_str)
                 .collect::<BTreeSet<_>>(),
-            BTreeSet::from(["200", "401", "403", "500", "503"])
+            // `504` is not declared on this operation's `#[utoipa::path]`. It is added to every
+            // operation that does not already describe one by
+            // `openapi::finalize_document`, because `TimeoutLayer` can produce it on every route
+            // (issue #157). Asserted here rather than filtered out: this test is the exact-set
+            // guard for this operation, and hiding a status the operation really can return
+            // would be the same defect the issue is about.
+            BTreeSet::from(["200", "401", "403", "500", "503", "504"])
         );
         assert_eq!(
             responses["200"]["content"]["application/json"]["schema"]["$ref"],
