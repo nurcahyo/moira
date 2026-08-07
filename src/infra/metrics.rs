@@ -172,6 +172,31 @@ const SUMMARIZATION_INLINE_REASONING_TOTAL: &str = "moira_summarization_inline_r
 const ADMIN_INVITE_OUTCOMES_TOTAL: &str = "moira_admin_invite_outcomes_total";
 const ADMIN_IDENTITY_GRANT_EVENTS_TOTAL: &str = "moira_admin_identity_grant_events_total";
 
+// The content encryption keyring (`src/security/data_keys.rs`).
+//
+// Two label-free families, and the pair is the point. A failed keyring refresh is *not* a
+// failure: the previous snapshot is still correct, merely stale, so the process keeps serving
+// and nothing on the request path changes. That makes it invisible by construction — exactly
+// the shape of problem that is discovered weeks later, at the worst possible moment, when a key
+// rotated on another replica is one this one has never seen.
+//
+// So the counter says "a refresh failed" and the gauge says "and this is how stale I therefore
+// am". The counter alone cannot distinguish one blip from a keyring that has been wedged since
+// Tuesday; the gauge alone cannot say whether staleness is because refreshes are failing or
+// because nothing has changed. Alert on the gauge, diagnose with the counter.
+//
+// **What the gauge cannot see, stated plainly.** It is written by the refresh path — zero on
+// success, the previous snapshot's age on failure — and is *not* recomputed at scrape time,
+// because the keyring holds the registry rather than the other way round. So a process whose
+// refresh task died outright stops writing it and the value **freezes** rather than growing.
+// It detects a refresh that keeps failing, which is the common case; it does not detect a tick
+// that stopped ticking. Deriving it at scrape time would fix that and would mean the registry
+// holding a handle to the thing that holds it, which is a cycle this module will not take on
+// for one gauge. The honest companion signal is a process restart or a missing series, not a
+// wider reading of this one.
+const CONTENT_KEYRING_REFRESH_FAILED_TOTAL: &str = "moira_content_keyring_refresh_failed_total";
+const CONTENT_KEYRING_AGE_SECONDS: &str = "moira_content_keyring_age_seconds";
+
 /// The closed `outcome` label domain for `moira_admin_invite_outcomes_total`.
 ///
 /// `created` and `redeemed` are the two successes; everything else is a denial reason
@@ -484,6 +509,19 @@ impl MetricsRegistry {
                  moira:admin, so a sudden change in this family's rate is the signal an \
                  operator wants first."
             );
+            describe_counter!(
+                CONTENT_KEYRING_REFRESH_FAILED_TOTAL,
+                "Content-keyring refreshes that failed. A failure is not an outage — the \
+                 previous snapshot is still correct, merely stale, and the process keeps \
+                 serving — so this counter and the age gauge are the only places it surfaces."
+            );
+            describe_gauge!(
+                CONTENT_KEYRING_AGE_SECONDS,
+                "Seconds since the in-process content keyring was last loaded successfully. \
+                 Zero after every successful refresh. Alert on this rather than on the failure \
+                 counter: it is also the family that grows when the refresh task has died \
+                 outright and is therefore raising nothing at all."
+            );
 
             gauge!(DB_POOL_CONNECTIONS, "state" => "total").set(0.0);
             gauge!(DB_POOL_CONNECTIONS, "state" => "idle").set(0.0);
@@ -509,6 +547,12 @@ impl MetricsRegistry {
             counter!(MEMORY_EXTRACTION_WRITTEN_TOTAL).increment(0);
             counter!(MEMORY_EXTRACTION_REJECTED_TOTAL).increment(0);
             counter!(SUMMARIZATION_INLINE_REASONING_TOTAL).increment(0);
+            // Seeded so "keyring refreshes started failing" is an alert on a rate, not on the
+            // sudden appearance of a series. The gauge is seeded too: a process that never
+            // reached a keyring — no database configured — reports zero rather than nothing,
+            // which is the honest answer for "how stale is the keyring I am serving from".
+            counter!(CONTENT_KEYRING_REFRESH_FAILED_TOTAL).increment(0);
+            gauge!(CONTENT_KEYRING_AGE_SECONDS).set(0.0);
             for outcome in RAG_INGESTION_OUTCOMES {
                 counter!(RAG_INGESTION_RUNS_TOTAL, "outcome" => *outcome).increment(0);
                 counter!(RETRIEVAL_RUNS_TOTAL, "outcome" => *outcome).increment(0);
@@ -775,6 +819,32 @@ impl MetricsRegistry {
                 "outcome" => outcome
             )
             .increment(1);
+        });
+    }
+
+    /// Records the outcome of one content-keyring refresh.
+    ///
+    /// Only the failure increments. A "refreshes attempted" counter was considered and left
+    /// out: the background tick is a fixed interval, so its rate is a constant that says
+    /// nothing, and the on-demand rate belongs to whatever met an unknown key rather than to
+    /// the keyring.
+    pub fn record_content_keyring_refresh(&self, succeeded: bool) {
+        if succeeded {
+            return;
+        }
+        with_local_recorder(&self.inner.recorder, || {
+            counter!(CONTENT_KEYRING_REFRESH_FAILED_TOTAL).increment(1);
+        });
+    }
+
+    /// Sets how stale the in-process content keyring is, in seconds.
+    ///
+    /// Set by the keyring itself rather than derived at scrape time, and that is deliberate: a
+    /// process whose refresh task has died stops calling this, so the last value it wrote ages
+    /// into the alert instead of being silently recomputed as fresh.
+    pub fn set_content_keyring_age_seconds(&self, age_seconds: f64) {
+        with_local_recorder(&self.inner.recorder, || {
+            gauge!(CONTENT_KEYRING_AGE_SECONDS).set(age_seconds);
         });
     }
 

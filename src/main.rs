@@ -11,7 +11,7 @@ use moira::{
     },
     domain::{DiagnosticExecutionRequest, ExecutionOptions, SystemKeyCreateRequest},
     infra::db,
-    security::{Actor, ActorType},
+    security::{Actor, ActorType, ContentKeyring},
 };
 use tokio::net::TcpListener;
 use tracing::{info, warn};
@@ -111,6 +111,15 @@ async fn run(mode: ProcessMode, settings: Settings) -> anyhow::Result<()> {
     )
     .await
     .context("acquire the cluster admission lease")?;
+
+    // Detached, and deliberately so: the keyring is already fully loaded by the time
+    // `AppState::new` returned, and a tick that never runs again leaves the process serving
+    // correctly from a snapshot that is merely stale. That is the same posture a failed
+    // refresh has, which is why there is nothing here to join on or to fail over.
+    let _content_keyring_refresh = state
+        .content_keyring
+        .as_ref()
+        .map(ContentKeyring::spawn_refresh);
 
     let worker_supervisor = state.workers.spawn_supervisor(state.clone());
     let invalidation_targets = db::RuntimeInvalidationTargets::from_state(&state);

@@ -3,6 +3,7 @@ mod auth;
 mod authz;
 mod content_envelope;
 mod crypto;
+mod data_keys;
 mod idempotency;
 mod key_custody;
 mod masking;
@@ -30,6 +31,10 @@ pub use content_envelope::{
 pub use crypto::{
     CredentialAadParts, ENVELOPE_VERSION_V1, EncryptedSecret, LOCAL_AES_256_GCM, LocalSecretCipher,
     SecretCipher, credential_aad, credential_secret_field,
+};
+pub use data_keys::{
+    ContentKeyring, DataKeyPurpose, DataKeyState, KEY_CHECK_VALUE_LABEL, KEY_CHECK_VALUE_LEN,
+    KeyEntry, KeyringError, KeyringSnapshot, format_key_check_value, key_check_value,
 };
 pub use idempotency::IdempotencyHasher;
 pub use key_custody::{

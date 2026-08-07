@@ -18,8 +18,8 @@ use crate::{
     },
     security::{
         AdminAuthenticator, ApiKeyHasher, AuthService, AuthorizationService, CallerAuthenticator,
-        EnvironmentMasterKeyCustody, IdempotencyHasher, JwksCache, LocalSecretCipher,
-        MasterKeyCustody,
+        ContentKeyring, EnvironmentMasterKeyCustody, IdempotencyHasher, JwksCache,
+        LocalSecretCipher, MasterKeyCustody,
     },
 };
 
@@ -48,6 +48,16 @@ pub struct AppState {
     /// point of the seam is that swapping in AWS KMS or Vault Transit later touches this line
     /// and nothing else.
     pub content_custody: Arc<dyn MasterKeyCustody>,
+    /// The content keyring, loaded and fully unwrapped before the listener binds.
+    ///
+    /// `None` only when there is no database at all — the health-and-metrics-only mode
+    /// [`AppState::pool`] already encodes. There is no keyring to load without one, and there
+    /// is nothing that could read a sealed column either, so the absence is the same absence.
+    /// It is emphatically **not** a lenient fallback: with a pool present, a keyring that
+    /// cannot be fully opened aborts `AppState::new`.
+    ///
+    /// Behind an `Arc` because the background refresh task holds one too.
+    pub content_keyring: Option<Arc<ContentKeyring>>,
     pub key_hasher: ApiKeyHasher,
     pub idempotency_hasher: IdempotencyHasher,
     pub auth: AuthService,
@@ -94,7 +104,8 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// `async` because of [`AppState::content_custody`]'s preflight, and for no other reason.
+    /// `async` because of [`AppState::content_custody`]'s preflight and
+    /// [`AppState::content_keyring`]'s load, and for no other reason.
     ///
     /// It is awaited here — before `main` binds a listener — rather than lazily on first use,
     /// on the same reasoning as the console's Postgres secret store: a bad key must fail at
@@ -136,6 +147,21 @@ impl AppState {
         let authz = AuthorizationService::new();
         let redis = RedisClient::from_settings(&settings.redis)?;
         let metrics = MetricsRegistry::new(&settings.telemetry.service_name, pool.clone());
+        // Boot steps 3 to 5 of `docs/decision-encryption-at-rest.md` §10, before the listener
+        // binds and before any worker starts. A keyring this process cannot fully open aborts
+        // here, with a message naming both remedies; see `ContentKeyring::load`.
+        let content_keyring = match pool.clone() {
+            Some(pool) => Some(Arc::new(
+                ContentKeyring::load(
+                    pool,
+                    content_custody.clone(),
+                    &settings.content_encryption,
+                    metrics.clone(),
+                )
+                .await?,
+            )),
+            None => None,
+        };
         let cluster_lease = ClusterLeaseStatus::not_enforced();
         let workers = WorkerRegistry::new(
             settings.workers.clone(),
@@ -204,6 +230,7 @@ impl AppState {
             http,
             cipher,
             content_custody,
+            content_keyring,
             key_hasher,
             idempotency_hasher,
             auth,
@@ -329,6 +356,9 @@ mod tests {
         }
         fn can_unwrap(&self, _master_key_id: &str) -> bool {
             true
+        }
+        fn master_key_ids(&self) -> Vec<String> {
+            vec!["arn-alias-moira".to_string()]
         }
         async fn wrap(
             &self,

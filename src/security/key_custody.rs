@@ -130,6 +130,20 @@ pub trait MasterKeyCustody: Send + Sync + std::fmt::Debug {
     /// with no re-encryption.
     fn can_unwrap(&self, master_key_id: &str) -> bool;
 
+    /// Every master key id this backend is *configured* to open, sorted.
+    ///
+    /// Not "every key the backend could theoretically reach" — a KMS backend answers with the
+    /// aliases it was configured with, not with an inventory call. The distinction matters
+    /// because of the one thing this method exists for: when a data key cannot be unwrapped,
+    /// the boot refusal has to print the ids that *are* present next to the id that is wanted.
+    /// An operator staring at "master key `prod-2026-06` is not configured" cannot act on it
+    /// without knowing that what they configured was `prod-2026-05` — that one line is the
+    /// difference between a five-minute fix and an outage spent guessing.
+    ///
+    /// There is no default implementation, deliberately: a backend that answered with an empty
+    /// list would silently make that refusal useless.
+    fn master_key_ids(&self) -> Vec<String>;
+
     async fn wrap(
         &self,
         dek: &Zeroizing<[u8; 32]>,
@@ -306,6 +320,14 @@ impl MasterKeyCustody for EnvironmentMasterKeyCustody {
 
     fn can_unwrap(&self, master_key_id: &str) -> bool {
         self.keys.contains_key(master_key_id)
+    }
+
+    fn master_key_ids(&self) -> Vec<String> {
+        // Sorted for the same reason `Debug` sorts: a `HashMap` iteration order that changes
+        // per process makes two operators comparing two refusals unable to compare them.
+        let mut ids: Vec<String> = self.keys.keys().cloned().collect();
+        ids.sort_unstable();
+        ids
     }
 
     async fn wrap(
@@ -648,6 +670,20 @@ mod tests {
         // a sample byte instead would be flaky — a random `0x01` also matches the `12` in
         // `nonce_len` — so assert the shape no byte-vector rendering can avoid.
         assert!(!rendered.contains('['), "custody blob rendered: {rendered}");
+    }
+
+    #[test]
+    fn the_configured_master_key_ids_are_listed_sorted_and_without_material() {
+        let rotating = custody(&[("zulu", 1), ("alpha", 2), ("mike", 3)], "mike");
+        assert_eq!(rotating.master_key_ids(), ["alpha", "mike", "zulu"]);
+        // The list is what the keyring's boot refusal prints, so it has to be stable across
+        // processes; an unsorted `HashMap` walk would make two replicas print two orders for
+        // the same configuration.
+        assert_eq!(rotating.master_key_ids(), rotating.master_key_ids());
+        assert_eq!(
+            custody(&[("only", 1)], "only").master_key_ids(),
+            ["only".to_string()]
+        );
     }
 
     #[test]
