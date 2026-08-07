@@ -773,6 +773,18 @@ impl ContentKeyring {
         self.snapshot().active_memory_dedupe()
     }
 
+    /// The registry this keyring already writes its own families into.
+    ///
+    /// Exposed for [`KeyringContentAccess`](super::KeyringContentAccess), which is built from a
+    /// keyring and must record the three `moira_content_envelope_*` families from the seal and
+    /// open paths. Handing it the keyring's registry rather than taking a second one at
+    /// construction is what stops the envelope counters and the keyring gauges from ever landing
+    /// in two different registries — which, in a test process that builds several `AppState`s,
+    /// would be a real and silent split rather than a theoretical one.
+    pub fn metrics(&self) -> &MetricsRegistry {
+        &self.metrics
+    }
+
     /// Queries against `content_data_keys` issued by this process, boot included.
     pub fn database_loads(&self) -> u64 {
         self.database_loads.load(Ordering::SeqCst)

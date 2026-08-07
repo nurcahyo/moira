@@ -112,6 +112,24 @@ surfaces.
 | `moira_admin_invite_outcomes_total` | counter | `outcome` | `created`, `redeemed`, plus bounded denial reasons and `other`; seeded |
 | `moira_admin_identity_grant_events_total` | counter | `event` | `granted`, `revoked`, `ownership_transferred`; seeded |
 
+### Content envelopes
+
+| Family | Type | Labels | Notes |
+|---|---|---|---|
+| `moira_content_envelope_seal_total` | counter | `profile` | envelopes sealed; seeded per AAD profile |
+| `moira_content_envelope_open_total` | counter | `profile`, `data_key_id` | envelopes opened end to end; **not** seeded — see the cardinality note below |
+| `moira_content_envelope_open_failed_total` | counter | `profile`, `reason` | opens refused at any stage; seeded across `profile` × `reason` |
+
+`open_total` and `open_failed_total` are disjoint: the success counter is written
+after the last fallible step, so no single call moves both. A refused open moves
+only the failure counter.
+
+`reason` is the same `&'static str` the neighbouring WARN line logs, so the log and
+the metric cannot disagree. Every AEAD failure collapses into the single opaque
+`aead_open_failed` — splitting it would turn the scrape endpoint into an oracle for
+whether a guessed key or a doctored blob got closer. The remaining reasons are
+framing facts already readable by anyone holding the ciphertext.
+
 ## Not emitted
 
 No metric exists for these, so nothing can chart or alert on them:
@@ -129,6 +147,18 @@ Labels are the security-relevant property: an unbounded label set is a
 memory-exhaustion vector on the scrape path. Every label value above comes from a
 closed set — a domain enum, an HTTP status class, a matched route template, or an
 admin-configured identifier.
+
+`data_key_id` on `moira_content_envelope_open_total` is the one exception, and it is
+bounded by operator action rather than by a fixed enum. Its growth rate is one value
+per key rotation (`data_key_rotation_days`, default 30), never one per request. The
+bound is enforced structurally: the label is read off the *resolved* `ContentCipher`,
+so a value can only exist if the loaded keyring carries that key. An envelope naming
+an unknown key is refused before the counter, and the failure family carries no
+`data_key_id` at all — without that ordering, anyone with database write access could
+mint arbitrary UUIDs into the `*_encrypted` columns and grow the series set without
+limit. Within one process the series accumulate, because a retired key's series
+survives until restart; the true bound is the number of distinct non-retired content
+keys the process has loaded since boot, which reaches two digits only after years.
 
 Future metrics must never carry raw path parameters, user IDs, prompts, response IDs,
 execution IDs, conversation IDs, application IDs, API-key prefixes, email addresses,

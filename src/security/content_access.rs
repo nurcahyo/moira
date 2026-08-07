@@ -29,6 +29,15 @@
 //! code and **one** opaque log line, matching the `credential decryption failed` posture: saying
 //! why a tag did not verify is an oracle. Both reach the caller as a coded error with a constant
 //! message and no fragment of the row in it.
+//!
+//! # And the metrics follow the wire, not the log (#171)
+//!
+//! The three `moira_content_envelope_*` families are incremented here, because this is the only
+//! seam both seals and opens pass through. A `/metrics` body is scraped, retained and forwarded,
+//! which puts it closer to the wire than to the log — so `{reason}` carries the header
+//! discriminants, which are decided from bytes the ciphertext-holder can already read, and folds
+//! **every** AEAD refusal into the single `aead_open_failed`. The precise log line stays precise;
+//! the exported label set does not inherit that precision.
 
 use std::sync::Arc;
 
@@ -37,6 +46,7 @@ use uuid::Uuid;
 use crate::{
     domain::ContentWrite,
     error::AppError,
+    infra::metrics::MetricsRegistry,
     security::{
         ContentCipher, ContentEnvelopeError, ContentIdentity, ContentKeyring, KeyringError,
         KeyringSnapshot, request_hash,
@@ -168,6 +178,18 @@ impl KeyringContentAccess {
         self.resolve_active_cipher().is_ok()
     }
 
+    /// The registry the three `moira_content_envelope_*` families are written into.
+    ///
+    /// `None` only for the keyring-less process — no database, therefore no sealed row to seal or
+    /// open, therefore nothing to count. Every refusal that arm produces is `keyring_not_loaded`,
+    /// which is why that string is deliberately absent from
+    /// [`CONTENT_ENVELOPE_OPEN_FAILURE_REASONS`](crate::infra::metrics::CONTENT_ENVELOPE_OPEN_FAILURE_REASONS):
+    /// seeding a reason nothing can ever increment would be a permanent zero pretending to be a
+    /// measurement.
+    fn metrics(&self) -> Option<&MetricsRegistry> {
+        self.keyring.as_ref().map(|keyring| keyring.metrics())
+    }
+
     /// The cipher new content is sealed under, or the reason there is none.
     ///
     /// Returns the discriminant rather than an `AppError` so [`Self::can_seal`] can ask without
@@ -242,9 +264,16 @@ impl ContentSealer for KeyringContentAccess {
         plaintext: &str,
     ) -> Result<Vec<u8>, AppError> {
         let cipher = self.active_cipher()?;
-        cipher
+        let sealed = cipher
             .seal(identity, plaintext.as_bytes())
-            .map_err(|error| seal_failed(error, identity))
+            .map_err(|error| seal_failed(error, identity))?;
+        // After the bytes exist, never before: `moira_content_envelope_seal_total` counts
+        // envelopes, not attempts. `active_cipher()` above already returned, so a keyring is
+        // present and its registry is the one every other content family lands in.
+        if let Some(metrics) = self.metrics() {
+            metrics.record_content_envelope_seal(identity.profile());
+        }
+        Ok(sealed)
     }
 
     fn memory_content_hash(
@@ -289,7 +318,7 @@ impl ContentOpener for KeyringContentAccess {
             );
             return Err(content_key_unavailable());
         };
-        open_with_snapshot(&keyring.snapshot(), envelope, identity)
+        open_with_snapshot(&keyring.snapshot(), keyring.metrics(), envelope, identity)
     }
 }
 
@@ -300,11 +329,16 @@ impl ContentOpener for KeyringContentAccess {
 #[derive(Clone, Debug)]
 pub struct SnapshotContentOpener {
     snapshot: Arc<KeyringSnapshot>,
+    /// Required rather than optional, unlike [`KeyringContentAccess::metrics`]. This opener is
+    /// constructed from an already-loaded snapshot, so the keyring-less arm that justifies the
+    /// `Option` there cannot occur here, and an `Option` would only offer a way to build an
+    /// opener that silently counts nothing.
+    metrics: MetricsRegistry,
 }
 
 impl SnapshotContentOpener {
-    pub fn new(snapshot: Arc<KeyringSnapshot>) -> Self {
-        Self { snapshot }
+    pub fn new(snapshot: Arc<KeyringSnapshot>, metrics: MetricsRegistry) -> Self {
+        Self { snapshot, metrics }
     }
 }
 
@@ -314,20 +348,39 @@ impl ContentOpener for SnapshotContentOpener {
         envelope: &[u8],
         identity: &ContentIdentity<'_>,
     ) -> Result<String, AppError> {
-        open_with_snapshot(&self.snapshot, envelope, identity)
+        open_with_snapshot(&self.snapshot, &self.metrics, envelope, identity)
     }
 }
 
 /// The one implementation of the read path, shared by both openers so they cannot drift.
+///
+/// # The metric contract this function is the sole enforcer of
+///
+/// Exactly one of `moira_content_envelope_open_total` and
+/// `moira_content_envelope_open_failed_total` moves per call, and every `return Err` below is
+/// paired with the failure counter while the single `Ok` at the end is paired with the success
+/// counter. The success counter is written *after* the last fallible step rather than after the
+/// AEAD, so the two are disjoint: a counter that ticked on both paths would look meaningful and
+/// would not be, which is the shape #171 exists to avoid rather than to add.
+///
+/// Every `reason` is the same `&'static str` the neighbouring WARN already logs — the log and the
+/// metric cannot disagree about what happened — and `data_key_id` is a label on the success
+/// counter only. See `CONTENT_ENVELOPE_OPEN_FAILURE_REASONS` for why.
 fn open_with_snapshot(
     snapshot: &KeyringSnapshot,
+    metrics: &MetricsRegistry,
     envelope: &[u8],
     identity: &ContentIdentity<'_>,
 ) -> Result<String, AppError> {
     // Framing first, and *before* any key is looked at. A v2 blob on a v1 binary must be refused
     // as an unreadable format, never as a missing key — the remedies are opposite.
-    let header = crate::security::EnvelopeHeader::parse(envelope)
-        .map_err(|error| envelope_refused(error, identity))?;
+    let header = crate::security::EnvelopeHeader::parse(envelope).map_err(|error| {
+        metrics.record_content_envelope_open_failed(
+            identity.profile(),
+            envelope_error_discriminant(&error),
+        );
+        envelope_refused(error, identity)
+    })?;
 
     let Some(entry) = snapshot.entry(header.data_key_id) else {
         warn!(
@@ -338,6 +391,11 @@ fn open_with_snapshot(
             "cannot open sealed content: the keyring snapshot has no such data key. Either it \
              is retired, or it was minted after this replica's last keyring refresh"
         );
+        // No `data_key_id` label here, deliberately. This is the one arm where the header names a
+        // key the keyring has never heard of, so labelling it would let anyone with database write
+        // access mint an unbounded series set on the scrape path — the exact leak the success
+        // counter's bound depends on this arm not opening.
+        metrics.record_content_envelope_open_failed(identity.profile(), "unknown_data_key");
         return Err(content_key_unavailable());
     };
     // Two conditions, two answers. Folding them would send an operator chasing a lost master key
@@ -354,6 +412,8 @@ fn open_with_snapshot(
                  content encryption. Nothing in this build seals under such a key, so the row \
                  was written by something else"
             );
+            metrics
+                .record_content_envelope_open_failed(identity.profile(), "wrong_purpose_data_key");
             content_decryption_failed()
         }
         _ => {
@@ -365,6 +425,7 @@ fn open_with_snapshot(
                 "cannot open sealed content: this data key was abandoned, so rows sealed under \
                  it are permanently unreadable"
             );
+            metrics.record_content_envelope_open_failed(identity.profile(), "abandoned_data_key");
             AppError::coded(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "content_key_abandoned",
@@ -373,12 +434,20 @@ fn open_with_snapshot(
         }
     })?;
 
-    let plaintext = cipher
-        .open(envelope, identity)
-        .map_err(|error| envelope_refused(error, identity))?;
+    let plaintext = cipher.open(envelope, identity).map_err(|error| {
+        // `envelope_error_discriminant` renders every AEAD failure as the single
+        // `aead_open_failed`, so the label set stops exactly where the wire format stops. Nothing
+        // downstream of the failing `decrypt` — not the key, not a byte of the body — is reachable
+        // from here.
+        metrics.record_content_envelope_open_failed(
+            identity.profile(),
+            envelope_error_discriminant(&error),
+        );
+        envelope_refused(error, identity)
+    })?;
     // Post-AEAD, so these bytes are authenticated: this is not an oracle, and it can only mean
     // that something other than this build's writers produced the row.
-    String::from_utf8(plaintext.to_vec()).map_err(|_| {
+    let text = String::from_utf8(plaintext.to_vec()).map_err(|_| {
         warn!(
             reason = "plaintext_not_utf8",
             data_key_id = %header.data_key_id,
@@ -386,8 +455,21 @@ fn open_with_snapshot(
             column = identity.profile().column(),
             "sealed content authenticated but its plaintext is not UTF-8"
         );
+        metrics.record_content_envelope_open_failed(identity.profile(), "plaintext_not_utf8");
         content_decryption_failed()
-    })
+    })?;
+    // The only success arm, and the only place `data_key_id` becomes a label.
+    //
+    // The id is read off `cipher`, never off `header`, and that is the family's whole cardinality
+    // bound. `cipher` exists only because `snapshot.entry(..)` returned `Some` and `entry.cipher()`
+    // succeeded, so its id is by construction one the loaded keyring carries — a caller cannot
+    // label with an id it did not resolve, because it would have to produce a `ContentCipher` to
+    // get one. Reading `header.data_key_id` here would compile and would be equal (`open` refuses
+    // `DataKeyMismatch` above), but it would make the bound a fact about which line precedes which
+    // rather than about where the value came from, and moving one line would silently let anyone
+    // with database write access mint an unbounded series set on the scrape path.
+    metrics.record_content_envelope_open(identity.profile(), cipher.data_key_id());
+    Ok(text)
 }
 
 /// Translate a [`ContentEnvelopeError`] into the public contract.
@@ -457,9 +539,11 @@ fn envelope_error_discriminant(error: &ContentEnvelopeError) -> &'static str {
         ContentEnvelopeError::DataKeyMismatch { .. } => "data_key_mismatch",
         ContentEnvelopeError::PlaintextTooLarge { .. } => "plaintext_too_large",
         ContentEnvelopeError::Encrypt => "aead_seal_failed",
-        // Never rendered — `envelope_refused` short-circuits this variant above so its
-        // discriminant cannot reach a log line. Present because the match is exhaustive and a
-        // `_` arm would let a *new* variant inherit an opaque name by accident.
+        // Never reaches a *log* line — `envelope_refused` short-circuits this variant above and
+        // writes its own. It does reach `moira_content_envelope_open_failed_total{reason}`, and
+        // that is the point: one opaque value for every AEAD refusal, so the metric stops exactly
+        // where the wire format stops. Present in this match rather than as a `_` arm so a new
+        // variant cannot inherit the opaque name by accident.
         ContentEnvelopeError::Decrypt => "aead_open_failed",
     }
 }
@@ -671,6 +755,95 @@ mod tests {
             sorted.len(),
             names.len(),
             "two ContentEnvelopeError variants share a log discriminant: {names:?}"
+        );
+    }
+
+    /// Every `reason` the read path can hand to the metrics registry must be admitted by the
+    /// closed domain there — otherwise it is folded into `other` and the condition disappears
+    /// into a bucket that means "unrecognised".
+    ///
+    /// This is the drift guard between two lists that live in different modules. Adding a
+    /// [`ContentEnvelopeError`] variant already fails to compile in
+    /// [`envelope_error_discriminant`]; without this test, giving it a name there and forgetting
+    /// `CONTENT_ENVELOPE_OPEN_FAILURE_REASONS` would compile, run, and silently mislabel it.
+    ///
+    /// The four keyring reasons are listed as literals rather than derived, because they *are*
+    /// literals at their call sites — the same strings the WARN lines carry. If they were derived
+    /// from a shared constant the test would prove only that a constant equals itself.
+    #[test]
+    fn every_open_refusal_reason_is_admitted_by_the_metric_domain() {
+        use crate::infra::metrics::CONTENT_ENVELOPE_OPEN_FAILURE_REASONS as ADMITTED;
+
+        // Every ContentEnvelopeError the *open* path can produce. `PlaintextTooLarge` and
+        // `Encrypt` are absent because they are seal-only; nothing on the read path can reach
+        // them, and admitting them would seed two reasons that can never move.
+        let open_reachable = [
+            ContentEnvelopeError::TooShort { len: 0 },
+            ContentEnvelopeError::BadMagic { found: [0; 4] },
+            ContentEnvelopeError::UnsupportedFormatVersion { format_version: 2 },
+            ContentEnvelopeError::UnsupportedAlgorithm { algorithm_id: 2 },
+            ContentEnvelopeError::UnsupportedKeyMode { key_mode: 2 },
+            ContentEnvelopeError::ReservedNotZero { reserved: 1 },
+            ContentEnvelopeError::UnknownAadProfile { aad_profile: 99 },
+            ContentEnvelopeError::BodyLengthMismatch {
+                declared: 1,
+                actual: 2,
+            },
+            ContentEnvelopeError::ProfileMismatch {
+                header: AadProfile::ConversationMessageContent,
+                identity: AadProfile::ConversationSummaryText,
+            },
+            ContentEnvelopeError::DataKeyMismatch {
+                header: Uuid::nil(),
+                cipher: Uuid::nil(),
+            },
+            ContentEnvelopeError::Decrypt,
+        ];
+        for error in &open_reachable {
+            let reason = envelope_error_discriminant(error);
+            assert!(
+                ADMITTED.contains(&reason),
+                "{reason:?} can be emitted by the read path but is not in \
+                 CONTENT_ENVELOPE_OPEN_FAILURE_REASONS, so it would be folded into `other`"
+            );
+        }
+        for reason in [
+            "unknown_data_key",
+            "wrong_purpose_data_key",
+            "abandoned_data_key",
+            "plaintext_not_utf8",
+        ] {
+            assert!(
+                ADMITTED.contains(&reason),
+                "{reason:?} is logged and counted by open_with_snapshot but is not admitted"
+            );
+        }
+
+        // The seal-only discriminants must stay out, and `keyring_not_loaded` with them: it is
+        // raised in a process that has no registry to raise it into, so seeding it would render a
+        // permanent zero that looks like a measurement and is not.
+        for absent in [
+            "plaintext_too_large",
+            "aead_seal_failed",
+            "keyring_not_loaded",
+        ] {
+            assert!(
+                !ADMITTED.contains(&absent),
+                "{absent:?} cannot be produced by the read path, so a seeded series for it would \
+                 be a permanent zero pretending to be a measurement"
+            );
+        }
+
+        // The AEAD arm has exactly one value. A second `aead_*` reason would mean somebody split
+        // the tag failure into cases, which is the oracle the wire format refuses to be.
+        let aead: Vec<&&str> = ADMITTED
+            .iter()
+            .filter(|reason| reason.starts_with("aead"))
+            .collect();
+        assert_eq!(
+            aead,
+            vec![&"aead_open_failed"],
+            "every AEAD refusal must collapse into one opaque reason"
         );
     }
 
