@@ -51,11 +51,13 @@
 //! `memory_records.content_hash` used to be written here too and no longer is: plan 11
 //! Sub-Phase F compares it (exact-match memory dedupe), and a comparison over a long-lived row
 //! is exactly what this contract cannot serve. It moved to
-//! [`crate::security::ContentSealer::memory_content_hash`], which writes the unkeyed
-//! [`crate::security::request_hash`] for rows stored in the clear and — since issue #140 — a
-//! digest keyed by the keyring's `memory_dedupe` data key for rows whose body is sealed.
+//! [`crate::security::ContentSealer::memory_content_hash`], which wrote the unkeyed
+//! [`crate::security::request_hash`] for rows stored in the clear until issue #168 — and since
+//! then writes a digest keyed by the keyring's `memory_dedupe` data key under **every** storage
+//! policy, because a memory body is guessable enough that an unkeyed digest of it is a
+//! dictionary-attack oracle even on a row that stores no body.
 //!
-//! **That second form is keyed, and it does not reopen the problem this section describes**,
+//! **That keyed form does not reopen the problem this section describes**,
 //! because the key is a wrapped keyring row rather than a deployment pepper: a master-key
 //! rotation re-wraps the envelope and the 32 bytes inside it never change, so every stored
 //! digest stays byte-identical. That is the property this hasher cannot offer and the reason

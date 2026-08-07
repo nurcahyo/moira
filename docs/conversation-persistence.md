@@ -139,8 +139,10 @@ reaches past conversation messages. All five `*_encrypted` columns are wired to 
 
 - **Memories obey it in full, since issue #140.** All four values apply — a memory written under
   `none` or `metadata_only` stores no body at all. `memory_records.content_hash` is retained under
-  every value, but its *form* follows this setting: keyed under `encrypted_content`, the unkeyed
-  content address otherwise. See `docs/security.md`.
+  every value, and since issue #168 its form no longer follows this setting: it is a digest keyed
+  by the keyring's `memory_dedupe` key under all four values. A memory body is short enough to
+  guess, so an unkeyed digest of one was an oracle even on a row that stores no body. The cost —
+  every deployment now depends on that key for dedupe — is stated in `docs/security.md`.
 - **RAG bodies obey it on the sealing axis only, since issue #141.**
   `rag_document_versions.content_plain` and `rag_chunks.chunk_text_plain` move to their
   `*_encrypted` columns under `encrypted_content`; `none` and `metadata_only` store plaintext

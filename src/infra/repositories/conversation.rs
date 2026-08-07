@@ -1299,9 +1299,11 @@ impl ConversationRepository for PgConversationRepository {
                 ContentWrite::Plain(text) => (Some(text.as_str()), None),
                 ContentWrite::Encrypt(text) => (None, Some(access.seal_content(&identity, text)?)),
             };
-        // Computed here, from the same value that chose the column above, so the body and its
-        // digest cannot disagree about whether this row is sealed.
-        let content_hash = access.memory_content_hash(&insert.content, &insert.request.content)?;
+        // Keyed under every policy value since issue #168, so it takes the plaintext and nothing
+        // else: there is no storage form that selects a different digest, and therefore no way
+        // for the body and its digest to disagree. The `?` is the second refusal on this path —
+        // a memory whose digest cannot be keyed is not written with an unkeyed one.
+        let content_hash = access.memory_content_hash(&insert.request.content)?;
         let row = sqlx::query(&memory_select(
             r#"
             insert into memory_records (
@@ -1462,7 +1464,7 @@ impl ConversationRepository for PgConversationRepository {
                 // `ContentWrite` carries none. Fall back to what `ContentWrite` does carry so
                 // the two can never be hashed over different bytes.
                 let plaintext = plaintext.or_else(|| stored.plaintext()).unwrap_or_default();
-                let hash = access.memory_content_hash(stored, plaintext)?;
+                let hash = access.memory_content_hash(plaintext)?;
                 match stored {
                     ContentWrite::Omitted => (None, None, Some(hash)),
                     ContentWrite::Plain(text) => (Some(text.as_str()), None, Some(hash)),
@@ -2361,13 +2363,14 @@ pub struct RetrievalScope {
 /// a claim about several that a later edit can quietly falsify. `every_memory_read_shares_the_isolation_predicate`
 /// asserts every builder below embeds it.
 ///
-/// It also carries F14's third clause. `memory_records.content_hash` is an **unkeyed content
-/// address** for every row whose body is not sealed
-/// ([`crate::security::ContentSealer::memory_content_hash`]), and that decision holds only while
-/// the hash is never compared across applications. The `m.application_id = $2` line here is what
-/// makes that true for the extraction dedupe. A query that stops using this constant, or an edit
-/// that removes that line from it, is exactly the condition that reverses F14 and puts a keyed
-/// hasher back on the unsealed rows too.
+/// It also carries what is left of F14's third clause. Since issue #168
+/// `memory_records.content_hash` is **keyed under every policy value**
+/// ([`crate::security::ContentSealer::memory_content_hash`]), so the clause no longer holds up an
+/// unkeyed digest — but the predicate still holds up the *scope* of the comparison, and a keyed
+/// digest compared across applications would leak equality of memory bodies between tenants that
+/// share nothing else. The `m.application_id = $2` line here is what makes that true for the
+/// extraction dedupe. Rows written before #168 are still unkeyed and still in this table, so a
+/// query that stops using this constant is also the condition that re-exposes them.
 const MEMORY_SCOPE_PREDICATE: &str = r#"
               m.application_id = $2
               and (
@@ -2838,17 +2841,18 @@ fn memory_by_content_hash_sql() -> String {
 
 /// The oldest in-scope memory whose content address equals `content_hash`.
 ///
-/// Exact dedupe. `content_hash` here is whichever of the **two** stable forms
-/// [`crate::security::ContentSealer::memory_content_hash`] produced for the caller's storage
-/// policy, so identical text produces an identical value indefinitely and this lookup keeps
-/// working across a pepper rotation *and* across a master-key rotation. The `application_id`
-/// binding is what keeps the unkeyed form safe — see [`MEMORY_SCOPE_PREDICATE`].
+/// Exact dedupe. `content_hash` here is the one stable form
+/// [`crate::security::ContentSealer::memory_content_hash`] writes — keyed, under every storage
+/// policy since issue #168 — so identical text produces an identical value indefinitely and this
+/// lookup keeps working across a pepper rotation *and* across a master-key rotation. The
+/// `application_id` binding is what keeps the comparison scoped — see [`MEMORY_SCOPE_PREDICATE`].
 ///
-/// **The two forms never collide, only miss.** The keyed form is prefixed
+/// **A row written before #168 misses; it never falsely matches.** The keyed form is prefixed
 /// [`crate::security::MEMORY_DEDUPE_HASH_PREFIX`], whose `:` cannot occur in the base64url
-/// content address — migration `0021`'s own rule, reused. So an application that flips its
-/// persistence policy gets one duplicate per re-stated memory, never a false match onto a row
-/// stored in the other form.
+/// content address the older rows carry — migration `0021`'s own rule, reused. So an application
+/// whose corpus predates the change gets one duplicate per re-stated memory, never a false match
+/// onto a row stored in the other form. Nothing rewrites those rows; the miss is the announced
+/// cost.
 pub(crate) async fn find_memory_by_content_hash(
     pool: &PgPool,
     scope: &RetrievalScope,

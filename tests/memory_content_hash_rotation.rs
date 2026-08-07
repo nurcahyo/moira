@@ -7,7 +7,13 @@
 //! column was written with `IdempotencyHasher::hash`, whose `verify` accepts **only** the active
 //! pepper. That contract is justified in its own module doc by a retention argument — every
 //! `idempotency_records` row expires within 24 hours — which `memory_records` does not have.
-//! The column moved to the unkeyed `crate::security::request_hash`.
+//! The column moved to the unkeyed `crate::security::request_hash`, and then — issues #140 and
+//! #168, because a memory body is guessable enough that an unkeyed digest of it is an offline
+//! verifier — to a digest keyed by the keyring's `memory_dedupe` data key under every
+//! persistence policy. F14's property survived that move rather than being traded away: the
+//! dedupe key is a master-key-wrapped keyring row, not a deployment pepper, so nothing an
+//! operator rotates changes a stored value. This file still asserts it against the pepper,
+//! because the pepper is what F14 was about.
 //!
 //! **A test that never rotates proves nothing here.** Every assertion about the *shape* of the
 //! stored value — "it has no `:`", "it is 43 characters", "it equals `request_hash(content)`" —
@@ -43,7 +49,7 @@ use moira::{
         ConversationCreateRequest, ConversationMessageCreateRequest, ConversationMessageRole,
         MemoryCreateRequest, MemoryPatchRequest, MemoryType,
     },
-    security::{Actor, IdempotencyHasher, request_hash},
+    security::{Actor, IdempotencyHasher, MEMORY_DEDUPE_HASH_PREFIX, request_hash},
 };
 use serde_json::json;
 use sha2::Digest;
@@ -299,15 +305,31 @@ async fn memory_content_hash_still_matches_after_an_idempotency_pepper_rotation(
         "the lookup returned the wrong rows: {matched:?}"
     );
 
-    // --- and the stored value really is the unkeyed content address -----------------------
-    assert_eq!(
+    // --- and the stored value is off this pepper entirely ---------------------------------
+    //
+    // Since issues #140 and #168 it is a digest keyed by the keyring's `memory_dedupe` data key
+    // under every persistence policy, which is *why* the equalities above hold: the value does
+    // not mention the pepper, so rotating the pepper cannot move it. Asserting the keyed form
+    // here is what keeps this test honest — a build that moved the column back onto
+    // `IdempotencyHasher` would satisfy "no pepper prefix" only by accident, and one that moved
+    // it to the unkeyed address would satisfy every equality above while reopening the guessing
+    // oracle #168 closed.
+    assert!(
+        first_patched_hash.starts_with(MEMORY_DEDUPE_HASH_PREFIX),
+        "the stored value must be the keyed dedupe digest, got {first_patched_hash}"
+    );
+    assert_ne!(
         first_patched_hash,
         request_hash(patched_content.as_bytes()),
-        "the stored value must be `request_hash` over the exact content bytes"
+        "the stored value is the unkeyed content address of a short, guessable memory body — a \
+         dictionary-attack oracle, and the exact residual issue #168 closed"
     );
     assert!(
-        !first_patched_hash.contains(':'),
-        "a content address carries no pepper-version prefix, got {first_patched_hash}"
+        !first_patched_hash.starts_with(&format!(
+            "{}:",
+            case.fixture.state.settings.idempotency.pepper_version
+        )),
+        "the memory column must not be back on the idempotency pepper, got {first_patched_hash}"
     );
     assert!(
         first_patched_hash.len() <= 128,
