@@ -70,11 +70,30 @@
 //!     one status, and the distinction is the thing worth guarding.
 //! 13. **The streamed refusal**, which is a terminal `response.failed` event rather than an
 //!     HTTP status, because the response head is written before the execution starts.
+//! 14. **The global-default route selection arm carries the profile too.** Cases 1–13 all name
+//!     the route explicitly, so they only ever drive `RouteSelectionReason::ExplicitHint`.
+//! 15. **The rule-matched arm carries it too** — the third of the three arms.
 //!
 //! Cases 6–9 are the observability half and survive the fail-closed decision unchanged; cases
 //! 10–13 are the refusal half. Keeping them apart is HANDOFF §3.4's `documents_`/`guards_`
 //! distinction: the observability guards did not go red when the decision landed, which is
 //! exactly what they were split out to achieve.
+//!
+//! # Cases 14 and 15 — issue #155 A1, the arms nothing drove
+//!
+//! `DefaultTaskRouter::select_route` builds a `RouteDecision` in three places, and each one
+//! copies `agent_profile_id: route.agent_profile_id` independently. Until issue #155 every case
+//! in this file passed a `route` in the request body, which takes the first of the three and
+//! returns before the other two are reached — so changing either of the remaining arms to
+//! `agent_profile_id: None` was a one-token edit that made every rule-matched and default-routed
+//! request in the deployment run without its profile's preamble, with this entire suite green.
+//! That is the exact fail-open issue #79 rejected, arrived at from the routing side instead of
+//! the resolution side.
+//!
+//! Both cases assert the `reason` on the `route_selected` event as well as the wire body. The
+//! reason is what makes them arms rather than repetitions of case 1: without it, a change that
+//! quietly routed them back through the explicit-hint arm would keep them green while leaving
+//! the arm they were written for untested again.
 
 mod support;
 
@@ -85,12 +104,13 @@ use moira::{
     application::RuntimeAdminService,
     domain::{
         AgentProfileCreateRequest, AgentProfileRecord, DiagnosticExecutionRequest,
-        ExecutionOptions, RouteDefinitionPatchRequest,
+        ExecutionOptions, RouteDefinitionCreateRequest, RouteDefinitionPatchRequest,
+        RouteSelectionStrategy, RoutingPolicyCreateRequest,
     },
 };
 use serde_json::{Value, json};
 use support::{
-    LifecycleFixture, MoiraHttpServer, RuntimePolicy,
+    LifecycleFixture, MoiraHttpServer, ProviderFixture, RuntimePolicy,
     mock_openai::{MockOpenAiServer, ProviderScript},
     request_context,
 };
@@ -131,6 +151,15 @@ const PROFILE_TOOL_NAME: &str = "f49_lookup";
 
 const PROMPT: &str = "say something";
 
+/// A prompt that trips `DefaultTaskRouter`'s rule-match arm, which matches on the substring
+/// `"code"` in the first message's text. [`PROMPT`] deliberately does not contain it, so every
+/// other case in this file — including the global-default one — cannot take that arm by accident.
+const RULE_MATCHING_PROMPT: &str = "write me some code";
+
+/// The one route key the rule-match arm looks up. Not a name this suite is free to choose:
+/// `select_route` hardcodes it.
+const RULE_MATCHED_ROUTE_KEY: &str = "coding";
+
 /// Whether the fixture attaches an agent profile to its route.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Profile {
@@ -144,13 +173,19 @@ struct Case {
     moira: MoiraHttpServer,
     client: reqwest::Client,
     profile: Option<AgentProfileRecord>,
+    /// The provider, model and credential [`LifecycleFixture::add_provider`] created.
+    ///
+    /// Kept so a case can write a *second* routing policy pointing at the same mock — which is
+    /// what makes a route other than the fixture's own route executable, and therefore what makes
+    /// the rule-matched selection arm reachable at all.
+    provider_fixture: ProviderFixture,
 }
 
 impl Case {
     async fn new(profile: Profile, scripts: Vec<ProviderScript>) -> Option<Self> {
         let fixture = LifecycleFixture::new().await?;
         let provider = MockOpenAiServer::start(scripts).await;
-        fixture
+        let provider_fixture = fixture
             .add_provider(provider.base_url(), 10, RuntimePolicy::default())
             .await;
         let attached = if profile == Profile::Attached {
@@ -179,6 +214,7 @@ impl Case {
             moira,
             client: reqwest::Client::new(),
             profile: attached,
+            provider_fixture,
         })
     }
 
@@ -208,16 +244,39 @@ impl Case {
         );
     }
 
+    /// A diagnostic execution naming this fixture's route — the explicit-hint arm.
     async fn diagnose(&self, stream: bool, options: ExecutionOptions) -> (StatusCode, Value) {
+        self.diagnose_routed(
+            Some(self.fixture.route_key.clone()),
+            PROMPT,
+            stream,
+            options,
+        )
+        .await
+    }
+
+    /// As [`Self::diagnose`], with the route hint and the prompt under the caller's control.
+    ///
+    /// Both are what select the arm of `DefaultTaskRouter::select_route` the request takes:
+    /// `route: None` skips the explicit-hint arm entirely, and the prompt's text is what the
+    /// rule-match arm reads. Nothing else in this file needs either, which is exactly why the
+    /// other two arms went untested until issue #155.
+    async fn diagnose_routed(
+        &self,
+        route: Option<String>,
+        prompt: &str,
+        stream: bool,
+        options: ExecutionOptions,
+    ) -> (StatusCode, Value) {
         let request = DiagnosticExecutionRequest {
             application_id: Some(self.fixture.application_id),
             external_tenant_id: None,
             external_user_id: Some("f49-agent-profile".to_string()),
-            route: Some(self.fixture.route_key.clone()),
+            route,
             provider_id: None,
             provider_model_id: None,
             credential_id: None,
-            prompt: PROMPT.to_string(),
+            prompt: prompt.to_string(),
             stream,
             options: ExecutionOptions {
                 timeout_ms: Some(5_000),
@@ -305,6 +364,126 @@ impl Case {
     /// resolved — so the count is taken before and after and the before is non-zero.
     async fn provider_request_count(&self) -> usize {
         self.provider.requests().await.len()
+    }
+
+    /// Makes this fixture's own route the one `get_default_route` returns, by disabling the
+    /// `general` route migration `0005` seeds.
+    ///
+    /// The seeded route is why a hintless request could not otherwise reach this fixture's
+    /// provider: `get_default_route` sorts `general` ahead of everything else, and no routing
+    /// policy points at it, so a request routed there fails at admission with `no_eligible_model`
+    /// long before anything about agent profiles is decided. Disabling it — rather than pointing
+    /// a second routing policy at it — keeps the route under test the *same* route cases 1–13 use,
+    /// with the same profile and the same provider, so the only thing that differs between case 1
+    /// and case 14 is the selection arm.
+    ///
+    /// The premise is asserted rather than assumed, and deliberately **not** by re-running the
+    /// repository's `order by`: a test that restated production's tie-break would agree with a
+    /// broken one. With exactly one active route left, every possible default-selection rule has
+    /// to return it.
+    async fn make_this_fixtures_route_the_only_default(&self) {
+        let seeded: Option<(Uuid, i64)> = sqlx::query_as(
+            "select id, version from route_definitions where route_key = 'general' \
+             and status = 'active' and deleted_at is null",
+        )
+        .fetch_optional(&self.fixture.pool)
+        .await
+        .expect("read the seeded general route");
+        let (id, version) = seeded.expect(
+            "migration 0005 seeds an active 'general' route, and get_default_route prefers it \
+             over every other; if it is gone this helper is no longer doing anything and the \
+             case below would be silently driving some other route",
+        );
+        RuntimeAdminService::new(&self.fixture.state)
+            .expect("runtime admin service")
+            .set_route_definition_enabled(
+                &self.fixture.actor,
+                &request_context(),
+                id,
+                version,
+                false,
+            )
+            .await
+            .expect("disable the seeded general route");
+
+        let active: Vec<String> = sqlx::query_scalar(
+            "select route_key from route_definitions where status = 'active' \
+             and deleted_at is null",
+        )
+        .fetch_all(&self.fixture.pool)
+        .await
+        .expect("read the active routes");
+        assert_eq!(
+            active,
+            vec![self.fixture.route_key.clone()],
+            "exactly one active route must remain, and it must be the one carrying the agent \
+             profile — otherwise 'the default route' is whichever route the repository's \
+             tie-break happens to pick and this case asserts nothing about the profile"
+        );
+    }
+
+    /// Creates the `coding` route the rule-match arm looks up, carrying this case's profile, and
+    /// gives it a routing policy pointing at the same mock provider.
+    ///
+    /// A second routing policy rather than a moved one: this fixture's original route keeps
+    /// working, so a request that fell back to it would still succeed — and would be caught by
+    /// the `route_key` assertion rather than by a routing failure that could be mistaken for a
+    /// fixture problem.
+    async fn add_a_rule_matched_route_carrying_the_same_profile(&self) -> Uuid {
+        let profile = self
+            .profile
+            .as_ref()
+            .expect("only a case with an attached profile can share one");
+        let admin = RuntimeAdminService::new(&self.fixture.state).expect("runtime admin service");
+        let route = admin
+            .create_route_definition(
+                &self.fixture.actor,
+                &request_context(),
+                RouteDefinitionCreateRequest {
+                    route_key: RULE_MATCHED_ROUTE_KEY.to_string(),
+                    display_name: "F49 rule-matched route".to_string(),
+                    description: None,
+                    selection_strategy: RouteSelectionStrategy::Default,
+                    agent_profile_id: Some(profile.id),
+                    metadata: json!({ "test_fixture": true }),
+                },
+            )
+            .await
+            .expect("create the rule-matched route");
+        assert_eq!(
+            route.agent_profile_id,
+            Some(profile.id),
+            "the rule-matched route must actually carry the profile, or this case degenerates \
+             into the no-profile control with a different route key"
+        );
+        admin
+            .create_routing_policy(
+                &self.fixture.actor,
+                &request_context(),
+                RoutingPolicyCreateRequest {
+                    application_id: Some(self.fixture.application_id),
+                    external_tenant_id: None,
+                    route_id: route.id,
+                    provider_id: self.provider_fixture.provider_id,
+                    provider_model_id: self.provider_fixture.model_id,
+                    priority: 10,
+                    weight: 1,
+                    cost_weight: 0.0,
+                    latency_weight: 0.0,
+                    quality_weight: 0.0,
+                    privacy_class: None,
+                    required_capabilities: Vec::new(),
+                    maximum_cost_per_request: None,
+                    maximum_input_tokens: None,
+                    maximum_output_tokens: None,
+                    timeout_ms: Some(RuntimePolicy::default().request_timeout_ms),
+                    retry_policy: json!({}),
+                    metadata: json!({ "test_fixture": true }),
+                },
+            )
+            .await
+            .expect("point the rule-matched route at the same mock provider");
+        route.id
     }
 
     /// Enables the public plane for this fixture's application and returns a consumer key.
@@ -777,18 +956,27 @@ async fn an_agent_profiles_tool_policy_does_not_become_a_tool_list_on_the_wire()
 /// A preamble is where guardrails live, so the failure mode is an unguarded model answering
 /// production traffic.
 ///
-/// # This guards the observability, not the outcome
+/// # This guards the observability, not the outcome — and that is why it survived the decision
 ///
-/// Whether Moira should also *refuse* is an open product decision — fail-closed is safer but
-/// breaks any deployment that disables a profile expecting its routes to keep serving,
-/// observable fail-open is cheaper but still serves the unguarded request. Silence is a defect
-/// under *either* answer: both require the operator to be told and differ only in whether the
-/// request is also refused. So this case asserts the part both answers share, and it survives
-/// the decision either way. The remaining fail-open behaviour is documented — not guarded — by
-/// [`documents_current_behaviour_a_dangling_agent_profile_still_serves_the_request`], which is
-/// the case that becomes wrong when the decision lands. Keeping them apart is the
-/// `documents_`/`guards_` distinction HANDOFF §3.4 asks for: merging them would make this guard
-/// go red on a fail-closed fix, which is exactly the pinned-defect shape.
+/// Whether Moira should also *refuse* was an open product decision when this case was written.
+/// Issue #79 settled it fail-closed on 2026-08-06: the execution is now failed with
+/// `agent_profile_disabled` before any provider is contacted, which is what
+/// [`guards_a_disabled_agent_profile_fails_the_execution_before_any_provider_call`] asserts.
+///
+/// This case was deliberately written to be silent about that half. Silence from the operator's
+/// side was a defect under *either* answer — both require the operator to be told, and they
+/// differ only in whether the request is also refused — so this asserts the part both answers
+/// share. It therefore did **not** go red when the decision landed, which is exactly what
+/// splitting it out was for; the case that pinned the old fail-open outcome was named
+/// `documents_current_behaviour_a_dangling_agent_profile_still_serves_the_request`, carried its
+/// own reversal condition, and was deleted by the commit that flipped the behaviour. That is the
+/// `documents_`/`guards_` distinction HANDOFF §3.4 asks for: had the two been merged, the
+/// fail-closed fix would have had to edit a guard, which is the pinned-defect shape.
+///
+/// Note what the announcement now means. It is no longer "your traffic is being served
+/// unguarded"; it is "your traffic is being refused, and here is the profile to re-enable or
+/// detach". The event and the audit row are the operator-side half of a refusal the caller only
+/// sees as a `409` or a `404`.
 ///
 /// # Three controls, and each answers a different cheap edit
 ///
@@ -868,8 +1056,9 @@ async fn guards_a_disabled_agent_profile_is_announced_rather_than_silently_ignor
         announced.len(),
         1,
         "F50: a disabled agent profile must announce itself exactly once as a structured \
-         runtime event — the request is now running without the preamble its route \
-         declares: {body}"
+         runtime event — the route still names a profile the runtime cannot use, and since \
+         issue #79 every request on it is refused until an operator re-enables it or detaches \
+         it: {body}"
     );
     let payload = announced[0];
     assert_eq!(
@@ -1439,6 +1628,180 @@ async fn guards_the_public_stream_refuses_a_dangling_agent_profile_in_its_termin
         before,
         "the streaming public path reached the provider for a request it then refused"
     );
+
+    case.shutdown().await;
+}
+
+/// The single `route_selected` payload of a diagnose response.
+///
+/// Exactly one is expected: an execution selects a route once. Asserting the count rather than
+/// taking the first is what keeps "the reason was `global_default`" from being satisfied by a
+/// response that also announced some other selection.
+fn only_route_selection(body: &Value) -> &Value {
+    let selections = events_of_type(body, "route_selected");
+    assert_eq!(
+        selections.len(),
+        1,
+        "an execution selects exactly one route: {body}"
+    );
+    selections[0]
+}
+
+/// Asserts the profile's three fields on a wire body, which is the property cases 14 and 15 share
+/// with case 1 and the only thing that observably distinguishes a route that carried its profile
+/// from one that dropped it.
+fn assert_the_profile_reached_the_wire(wire: &Value, prompt: &str) {
+    let messages = wire["messages"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no messages on the wire: {wire}"));
+    assert_eq!(
+        messages.len(),
+        2,
+        "the profile's preamble must be prepended to the caller's one message: {wire}"
+    );
+    assert_eq!(messages[0]["role"], "system", "{wire}");
+    assert_eq!(
+        message_text(&messages[0]),
+        PROFILE_PREAMBLE,
+        "the agent profile's preamble must reach the provider verbatim: {wire}"
+    );
+    assert_eq!(messages[1]["role"], "user", "{wire}");
+    assert_eq!(message_text(&messages[1]), prompt, "{wire}");
+    assert_eq!(
+        wire["temperature"].as_f64(),
+        Some(PROFILE_TEMPERATURE),
+        "the agent profile's temperature must reach the provider: {wire}"
+    );
+    assert_eq!(
+        wire["max_tokens"].as_u64(),
+        Some(PROFILE_MAX_TOKENS as u64),
+        "the agent profile's max_tokens must reach the provider: {wire}"
+    );
+}
+
+/// **Case 14 — issue #155 A1. The global-default arm carries the route's agent profile.**
+///
+/// The cheapest edit that breaks this property is one token: `agent_profile_id: None` in the
+/// `GlobalDefault` arm of `DefaultTaskRouter::select_route`. Before this case, that edit left
+/// every test in the tree green while making every default-routed request in a deployment run
+/// without its profile's preamble — a preamble is where guardrails live, so the failure mode is
+/// an unguarded model answering production traffic, arrived at from the routing side rather than
+/// the resolution side issue #79 closed.
+///
+/// # What makes it an arm rather than a repetition of case 1
+///
+/// Two things, and both are load-bearing. The request carries **no** `route`, which is the only
+/// way past the explicit-hint arm's early return; and the `reason` on the `route_selected` event
+/// is asserted to be `global_default`, so a change that quietly routed this back through the
+/// explicit-hint arm would go red here rather than passing on case 1's evidence.
+///
+/// `PROMPT` does not contain `"code"`, so the rule-match arm in between cannot claim it — and if
+/// it somehow did, the reason assertion says so.
+///
+/// # Why the seeded route has to go
+///
+/// `get_default_route` sorts the `general` route migration `0005` seeds ahead of every other
+/// route, and nothing points a routing policy at it, so a hintless request would otherwise fail
+/// at admission with `no_eligible_model` — a `failed` outcome that never reaches the profile at
+/// all. `Case::make_this_fixtures_route_the_only_default` disables it and asserts that exactly
+/// one active route is left, so "the default route" cannot be a tie-break this test merely got
+/// lucky with.
+#[tokio::test]
+async fn guards_the_global_default_route_arm_carries_its_agent_profile_to_the_wire() {
+    let Some(case) = Case::new(
+        Profile::Attached,
+        vec![ProviderScript::Completion {
+            text: "ok".to_string(),
+        }],
+    )
+    .await
+    else {
+        return;
+    };
+    case.make_this_fixtures_route_the_only_default().await;
+
+    let (status, body) = case
+        .diagnose_routed(None, PROMPT, false, ExecutionOptions::default())
+        .await;
+    assert_eq!(status, StatusCode::OK, "diagnose failed: {body}");
+    assert_eq!(body["outcome"]["status"], "succeeded", "{body}");
+
+    let selection = only_route_selection(&body);
+    assert_eq!(
+        selection["reason"], "global_default",
+        "this case exists to drive the global-default arm; any other reason means the arm under \
+         test never ran and the assertions below are case 1 again: {selection}"
+    );
+    assert_eq!(
+        selection["route_key"].as_str(),
+        Some(case.fixture.route_key.as_str()),
+        "and it must have defaulted to the route that carries the profile: {selection}"
+    );
+
+    assert_the_profile_reached_the_wire(&case.only_provider_body().await, PROMPT);
+
+    case.shutdown().await;
+}
+
+/// **Case 15 — issue #155 A1. The rule-matched arm carries it too.**
+///
+/// The third of the three `RouteDecision` constructions, and the same one-token edit applies to
+/// it: `agent_profile_id: None` in the `RuleMatch` arm. The arm is reached by a prompt containing
+/// `"code"` and an active route keyed `coding`, both of which this case supplies —
+/// `RULE_MATCHING_PROMPT` and `Case::add_a_rule_matched_route_carrying_the_same_profile`.
+///
+/// # The seeded `general` route is left alone here, on purpose
+///
+/// It is this case's failure-mode detector. If the rule-match arm does not claim the request, the
+/// global-default arm does, and it returns `general` — which has no routing policy, so the
+/// execution fails at admission instead of quietly asserting the same thing case 14 does. The
+/// route key and the reason are asserted anyway, because "it failed" and "it took the wrong arm
+/// and still worked" should not be distinguished only by a coincidence of fixture wiring.
+#[tokio::test]
+async fn guards_the_rule_matched_route_arm_carries_its_agent_profile_to_the_wire() {
+    let Some(case) = Case::new(
+        Profile::Attached,
+        vec![ProviderScript::Completion {
+            text: "ok".to_string(),
+        }],
+    )
+    .await
+    else {
+        return;
+    };
+    let rule_matched_route_id = case
+        .add_a_rule_matched_route_carrying_the_same_profile()
+        .await;
+
+    let (status, body) = case
+        .diagnose_routed(
+            None,
+            RULE_MATCHING_PROMPT,
+            false,
+            ExecutionOptions::default(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "diagnose failed: {body}");
+    assert_eq!(body["outcome"]["status"], "succeeded", "{body}");
+
+    let selection = only_route_selection(&body);
+    assert_eq!(
+        selection["reason"], "rule_match",
+        "this case exists to drive the rule-match arm: {selection}"
+    );
+    assert_eq!(
+        selection["route_key"].as_str(),
+        Some(RULE_MATCHED_ROUTE_KEY),
+        "{selection}"
+    );
+    assert_eq!(
+        selection["route_id"].as_str(),
+        Some(rule_matched_route_id.to_string().as_str()),
+        "the route the rule matched must be the one this case created and attached the profile \
+         to, not this fixture's own route under a different name: {selection}"
+    );
+
+    assert_the_profile_reached_the_wire(&case.only_provider_body().await, RULE_MATCHING_PROMPT);
 
     case.shutdown().await;
 }
