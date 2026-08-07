@@ -132,13 +132,31 @@ discriminant. An AEAD failure gets one opaque code and one opaque log line (`aea
 because saying why a tag did not verify is an oracle. Both reach the caller with a constant
 message carrying no key id, no discriminant and no fragment of the row.
 
-## Not covered by this policy
+## What else this policy governs, and what it does not
 
-- **Memories and RAG document versions.** `memory_records.content_plain` and
-  `rag_document_versions.content_plain` are written under their own policies and are **not yet**
-  wired to their `*_encrypted` columns; `conversation_content_persistence` governs conversation
-  content only.
+This setting is the application's **single** answer to "what do you keep of caller content", so it
+reaches past conversation messages. All five `*_encrypted` columns are wired to it:
+
+- **Memories obey it in full, since issue #140.** All four values apply — a memory written under
+  `none` or `metadata_only` stores no body at all. `memory_records.content_hash` is retained under
+  every value, but its *form* follows this setting: keyed under `encrypted_content`, the unkeyed
+  content address otherwise. See `docs/security.md`.
+- **RAG bodies obey it on the sealing axis only, since issue #141.**
+  `rag_document_versions.content_plain` and `rag_chunks.chunk_text_plain` move to their
+  `*_encrypted` columns under `encrypted_content`; `none` and `metadata_only` store plaintext
+  rather than omitting the body. That divergence is deliberate and is argued at
+  `ContentWrite::under_policy_for_rag` — a chunk row with its body removed would still carry the
+  document's verbatim section heading, the chunk offsets, an unkeyed hash and an embedding of the
+  text, so suppressing the body alone would be a privacy claim that is not true.
+
+Not covered at all:
+
 - **Protected internal instructions** are never persisted in conversation messages.
+- **Embeddings.** `memory_embeddings` and `rag_chunk_embeddings` are computed from the plaintext
+  and stored unencrypted under every value of this setting. `docs/security.md` states the
+  consequence plainly.
+- **Rows written before the encryption release train.** Switching to `encrypted_content` does not
+  seal existing history, and switching away does not unseal it.
 
 ## Stored metadata and deletion
 

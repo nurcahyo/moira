@@ -98,8 +98,12 @@ pub enum ConversationMessageType {
 ///   established. See [`crate::security::ContentSealer::memory_content_hash`] — an unkeyed
 ///   digest of a short, guessable memory body stored beside that body's ciphertext would defeat
 ///   the encryption outright.
-/// * **It does not govern RAG documents.** `rag_document_versions.content_plain` and
-///   `rag_chunks.chunk_text_plain` are not yet wired to their `*_encrypted` columns.
+/// * **It governs RAG bodies on the sealing axis only, since issue #141.**
+///   `rag_document_versions.content_plain` and `rag_chunks.chunk_text_plain` are wired to their
+///   `*_encrypted` columns through [`ContentWrite::under_policy_for_rag`], which seals under
+///   `encrypted_content` and stores plaintext under every other value. `none` and
+///   `metadata_only` are deliberately **not** honoured there, and the reason is on that function:
+///   honouring them would produce a false privacy claim rather than privacy.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ConversationContentPersistence {
@@ -198,6 +202,68 @@ impl ContentWrite {
                 Self::Omitted
             }
             ConversationContentPersistence::PlainContent => Self::Plain(plaintext),
+            ConversationContentPersistence::EncryptedContent => {
+                Self::Encrypt(Zeroizing::new(plaintext))
+            }
+        }
+    }
+
+    /// Decide what to store for a **RAG** body — a `rag_document_versions.content_*` or a
+    /// `rag_chunks.chunk_text_*` column.
+    ///
+    /// Two of the four policy values map differently here than they do in
+    /// [`Self::under_policy`], and the asymmetry is a decision rather than an oversight, so it
+    /// is written down where it is made.
+    ///
+    /// | policy | conversations, summaries, memories | RAG bodies |
+    /// |---|---|---|
+    /// | `plain_content` | `Plain` | `Plain` |
+    /// | `encrypted_content` | `Encrypt` | `Encrypt` |
+    /// | `metadata_only` | `Omitted` | **`Plain`** |
+    /// | `none` | `Omitted` | **`Plain`** |
+    ///
+    /// # Why `Omitted` is refused here
+    ///
+    /// Not because RAG content is less sensitive. Because a `rag_chunks` row is one of several
+    /// artifacts derived from the same document, and this column is the only one of them a
+    /// content policy can currently suppress. Under `Omitted` the row would still carry:
+    ///
+    /// * `section_title` — **a verbatim substring of the document**, the nearest preceding
+    ///   Markdown heading (`crate::orchestration::chunk`);
+    /// * `start_offset`, `end_offset` and `token_count` — the chunk's exact position and size;
+    /// * `chunk_hash` — an **unkeyed** SHA-256 content address, by the decision recorded in
+    ///   `docs/security.md`;
+    /// * a `rag_chunk_embeddings` row — a dense vector computed from the plaintext, from which
+    ///   embedding-inversion attacks recover substantial source text.
+    ///
+    /// A build that dropped the body and kept those four would be telling an operator it stored
+    /// nothing while storing the headings, the shape and an invertible encoding of the text. That
+    /// is a false privacy claim, which is worse than an honest absence of one, and it is exactly
+    /// the class of dishonesty finding F32 was.
+    ///
+    /// `encrypted_content` has no such problem: it is a claim about *this* column, it is true of
+    /// this column, and `docs/security.md` states plainly which sibling artifacts it does not
+    /// cover.
+    ///
+    /// # Reversal condition
+    ///
+    /// Route RAG through [`Self::under_policy`] — one rule for all five columns — the moment the
+    /// derived artifacts can be suppressed together with the body: `section_title` dropped,
+    /// offsets and token counts dropped, `chunk_hash` keyed or dropped, and the embedding rows
+    /// not written. That is a RAG-ingestion design change, not a cipher change, and it is not
+    /// this decision to make.
+    ///
+    /// The `match` is exhaustive with no catch-all, exactly like [`Self::under_policy`], so a
+    /// fifth [`ConversationContentPersistence`] value does not compile until somebody decides
+    /// what a RAG body does with it.
+    pub fn under_policy_for_rag(
+        persistence: ConversationContentPersistence,
+        plaintext: String,
+    ) -> Self {
+        match persistence {
+            ConversationContentPersistence::None
+            | ConversationContentPersistence::MetadataOnly
+            | ConversationContentPersistence::PlainContent => Self::Plain(plaintext),
             ConversationContentPersistence::EncryptedContent => {
                 Self::Encrypt(Zeroizing::new(plaintext))
             }

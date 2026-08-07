@@ -981,6 +981,7 @@ impl ConversationService {
             let limit = candidate_limit(policy.maximum_chunk_results);
             let candidates = find_rag_chunk_candidates(
                 pool,
+                &self.state.content_access(),
                 &scope,
                 &encoded,
                 &policy.allowed_collection_ids,
@@ -2763,6 +2764,10 @@ impl ConversationService {
         // Moved out of the closure only because `self` cannot cross the `move` boundary;
         // the hash itself is still computed inside the transaction, as the comment below says.
         let content_hasher = self.command_hasher();
+        // Likewise. Cloning it is an `Option<Arc>` clone and no I/O, and the seal itself happens
+        // inside the transaction below — which is what makes "refusal, never fallback" hold: a
+        // body that cannot be sealed rolls the whole insert back.
+        let sealer = self.state.content_access();
         let outcome = AdminCommandRunner::new(self.admin_repo.clone(), self.command_hasher())
             .execute(spec, |transaction| {
                 Box::pin(async move {
@@ -2776,6 +2781,7 @@ impl ConversationService {
                     let id = Uuid::now_v7();
                     let record = create_rag_document_with_connection(
                         transaction.connection(),
+                        &sealer,
                         id,
                         &format!("doc_{id}"),
                         &collection_id,
@@ -2919,6 +2925,8 @@ impl ConversationService {
         // Moved out of the closure only because `self` cannot cross the `move` boundary;
         // the hash itself is still computed inside the transaction, as the comment below says.
         let content_hasher = self.command_hasher();
+        // See `create_rag_document` for why this is cloned out here and sealed in there.
+        let sealer = self.state.content_access();
         let outcome = AdminCommandRunner::new(self.admin_repo.clone(), self.command_hasher())
             .execute(spec, |transaction| {
                 Box::pin(async move {
@@ -2929,6 +2937,7 @@ impl ConversationService {
                     let content_hash = content_hasher.hash(content.as_bytes());
                     let record = ingest_rag_document_with_connection(
                         transaction.connection(),
+                        &sealer,
                         &document_id,
                         &request,
                         &content_hash,

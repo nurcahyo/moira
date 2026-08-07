@@ -91,7 +91,14 @@ pub struct RagChunkCandidate {
     pub document_title: Option<String>,
     pub section_title: Option<String>,
     pub chunk_index: i32,
-    /// `None` when the collection persists chunk text encrypted only.
+    /// `None` when the row holds no body in either column.
+    ///
+    /// Since issue #141 a sealed chunk is **opened** on this path, so `None` no longer covers
+    /// "stored encrypted" — it did before, and a collection under `encrypted_content` therefore
+    /// retrieved as a page of textless chunks with nothing saying so.
+    /// `ContentWrite::under_policy_for_rag` never writes a bodyless chunk, so this is currently
+    /// unreachable in practice and is kept because the columns are nullable and pre-existing
+    /// rows were never checked.
     pub text: Option<String>,
     pub distance: f64,
     pub age_seconds: f64,

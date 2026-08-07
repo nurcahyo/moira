@@ -47,26 +47,35 @@ branch on it for control flow; it exists to explain a missing body to a human.
 The two policies now answer an unimplementable mode differently, and the difference is worth
 naming so neither side is mistaken for an oversight:
 
-- The **conversation** policy now *implements* `encrypted_content` (issue #139): the message and
-  summary bodies are sealed into the `*_encrypted` columns. Its
-  **422 `conversation_content_persistence_unsupported`** narrowed to the one case that is still
-  unhonourable — encryption configured but unusable at write time. See
+- The **conversation** policy now *implements* `encrypted_content` (issues #139, #140, #141): the
+  message, summary, memory, RAG document and RAG chunk bodies are sealed into the five
+  `*_encrypted` columns. Its **422 `conversation_content_persistence_unsupported`** narrowed to
+  the one case that is still unhonourable — encryption configured but unusable at write time. See
   `docs/conversation-persistence.md`.
 - The **execution** policy's `ResponsePersistenceMode` still *accepts* both
   `encrypted_content` and `plain_content` even though neither is implemented. F40 chose to
   explain the gap at read time instead — the `content_persistence_not_implemented` string in
   the table above — rather than reject the value at write time.
 
-**The remaining gap on the response side is now a schema gap, not a cipher gap.** The
-conversation-side reasoning that "no cipher is wired to the `*_encrypted` columns" stopped being
-true with issue #139. What is still true, and is the actual reason `ResponsePersistenceMode`
-cannot be implemented by that design, is that **`responses` has no `*_encrypted` column at all** —
-the five that exist are on `conversation_messages`, `conversation_summaries`, `memory_records`,
-`rag_document_versions` and `rag_chunks`, verified in `migrations/0006_public_execution_api.sql`.
-Implementing it therefore needs new DDL, which is why
+**The remaining gap on the response side is a schema gap, not a cipher gap — and it is wider than
+the encrypted half.** The reasoning this section used to give, "no cipher is wired to the
+`*_encrypted` columns", was true when F40 was written and is false now: the
+envelope-encryption release train wired all five of them.
+
+What is true, and what actually blocks `ResponsePersistenceMode`, is that
+`migrations/0006_public_execution_api.sql` creates `responses` **with no output body column of
+either form** — no `output_text_plain`, no `output_text_encrypted`. What the table stores of a
+result is `output_summary jsonb`, `usage_summary jsonb`, `failure_class`, `failure_message` and
+the `output_persisted` boolean; the only later migrations to touch it add `conversation_id`
+(`0007`) and `updated_at` (`0008`). So **`plain_content` has nowhere to write either**, and the
+five sealed columns all belong to `conversation_messages`, `conversation_summaries`,
+`memory_records`, `rag_document_versions` and `rag_chunks` — none of them to `responses`.
+
+Implementing either mode therefore needs new DDL, not a cipher, which is why
 `docs/decision-encryption-at-rest.md` §14 resolves
 [#103](https://github.com/nurcahyo/moira/issues/103) toward *refuse with a 422, symmetric with the
-conversation side* rather than *implement*.
+conversation side* rather than *implement*. The arm in `src/application/public.rs` stays untouched
+until that decision is taken.
 
 The explanatory string is honest about the outcome, but it is a weaker guarantee than a
 refusal: an operator can still set a response persistence mode whose name promises a body that

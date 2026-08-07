@@ -72,13 +72,13 @@ use uuid::Uuid;
 
 use crate::{
     domain::{
-        ContentWrite, ConversationCreateRequest, ConversationMessageQuery,
-        ConversationMessageRecord, ConversationMessageRole, ConversationMessageType,
-        ConversationPatchRequest, ConversationPolicyPutRequest, ConversationPolicyRecord,
-        ConversationQuery, ConversationRecord, ConversationStatus, EmbeddingPolicyPutRequest,
-        EmbeddingPolicyRecord, ListCursor, MemoryCreateRequest, MemoryPatchRequest,
-        MemoryPolicyPutRequest, MemoryPolicyRecord, MemoryQuery, MemoryRecord, MemoryScope,
-        MemorySensitivity, MemoryStatus, MemoryType, RagCollectionCreateRequest,
+        ContentWrite, ConversationContentPersistence, ConversationCreateRequest,
+        ConversationMessageQuery, ConversationMessageRecord, ConversationMessageRole,
+        ConversationMessageType, ConversationPatchRequest, ConversationPolicyPutRequest,
+        ConversationPolicyRecord, ConversationQuery, ConversationRecord, ConversationStatus,
+        EmbeddingPolicyPutRequest, EmbeddingPolicyRecord, ListCursor, MemoryCreateRequest,
+        MemoryPatchRequest, MemoryPolicyPutRequest, MemoryPolicyRecord, MemoryQuery, MemoryRecord,
+        MemoryScope, MemorySensitivity, MemoryStatus, MemoryType, RagCollectionCreateRequest,
         RagCollectionPatchRequest, RagCollectionQuery, RagCollectionRecord, RagCollectionStatus,
         RagDocumentCreateRequest, RagDocumentIngestRequest, RagDocumentRecord,
         RetrievalPolicyPutRequest, RetrievalPolicyRecord, SeqCursor,
@@ -1649,6 +1649,7 @@ impl ConversationRepository for PgConversationRepository {
         let mut tx = self.pool.begin().await?;
         let record = create_rag_document_with_connection(
             &mut tx,
+            &self.content_access(),
             id,
             public_id,
             collection_public_id,
@@ -1722,9 +1723,15 @@ impl ConversationRepository for PgConversationRepository {
         plan: &RagIngestionPlan,
     ) -> Result<RagDocumentRecord, AppError> {
         let mut tx = self.pool.begin().await?;
-        let record =
-            ingest_rag_document_with_connection(&mut tx, public_id, request, content_hash, plan)
-                .await?;
+        let record = ingest_rag_document_with_connection(
+            &mut tx,
+            &self.content_access(),
+            public_id,
+            request,
+            content_hash,
+            plan,
+        )
+        .await?;
         tx.commit().await?;
         Ok(record)
     }
@@ -1782,8 +1789,17 @@ pub(crate) async fn create_rag_collection_with_connection(
     rag_collection_record_from_row(&row)
 }
 
+/// The sealer is the eighth parameter, and it stays a parameter.
+///
+/// Bundling these into a struct to satisfy the argument count would take the one seam that
+/// matters — *can this function seal, and with what* — and hide it inside a bag alongside four
+/// unrelated ids. "Which functions can write a sealed column" is precisely the question
+/// `every_sealed_column_named_in_sql_sits_in_an_allowlisted_function` exists to keep answerable,
+/// and a `&dyn ContentSealer` in the signature is the cheapest possible answer to it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_rag_document_with_connection(
     connection: &mut PgConnection,
+    sealer: &dyn ContentSealer,
     id: Uuid,
     public_id: &str,
     collection_public_id: &str,
@@ -1791,8 +1807,21 @@ pub(crate) async fn create_rag_document_with_connection(
     content_hash: Option<&str>,
     plan: &RagIngestionPlan,
 ) -> Result<RagDocumentRecord, AppError> {
-    let collection_id: Uuid = sqlx::query_scalar(
-        "select id from rag_collections where public_id = $1 and deleted_at is null",
+    // The collection lookup carries the persistence policy, exactly as `add_message`'s row lock
+    // does: the policy is read in the same statement and the same instant as the row it governs,
+    // so it costs no extra round trip and cannot be observed from a different moment. `left join`
+    // plus `coalesce` because an application that has never had a policy written gets the column
+    // default — a missing row must not mean "no policy" and therefore some other answer.
+    let collection = sqlx::query(
+        r#"
+        select c.id,
+               coalesce(p.conversation_content_persistence, 'plain_content')
+                   as content_persistence
+        from rag_collections c
+        left join application_conversation_policies p
+               on p.application_id = c.application_id
+        where c.public_id = $1 and c.deleted_at is null
+        "#,
     )
     .bind(collection_public_id)
     .fetch_optional(&mut *connection)
@@ -1804,6 +1833,10 @@ pub(crate) async fn create_rag_document_with_connection(
             "RAG collection not found",
         )
     })?;
+    let collection_id: Uuid = collection.try_get("id")?;
+    let persistence = conversation_content_persistence_from_db(
+        collection.try_get::<String, _>("content_persistence")?,
+    )?;
     let mut row = sqlx::query(&rag_document_select(
         r#"
             insert into rag_documents (
@@ -1826,7 +1859,29 @@ pub(crate) async fn create_rag_document_with_connection(
     .fetch_one(&mut *connection)
     .await?;
     if let (Some(content), Some(hash)) = (&request.content, content_hash) {
+        // Minted immediately above its own insert and never updated afterwards, which is the
+        // rule `ContentIdentity` states: AAD profile 4 binds this id, the document id and the
+        // version number, and this path's version number is the literal `1` below.
         let version_id = Uuid::now_v7();
+        let stored = ContentWrite::under_policy_for_rag(persistence, content.clone());
+        let identity = ContentIdentity::RagDocumentVersion {
+            version_id,
+            document_id: id,
+            version_number: 1,
+        };
+        // Exhaustive with no catch-all, the same shape as `add_message` and `create_memory`: a
+        // fourth `ContentWrite` variant does not compile until this site decides which column it
+        // lands in. `Omitted` cannot arise from `under_policy_for_rag` — see the reasoning
+        // there — and is spelled out rather than folded away so that routing RAG through
+        // `under_policy` one day is a visible change here rather than a silent bodyless write.
+        //
+        // The `?` is the refusal: this runs inside the command transaction, so a document whose
+        // body cannot be sealed is not written in the clear, it is not written.
+        let (content_plain, content_encrypted): (Option<&str>, Option<Vec<u8>>) = match &stored {
+            ContentWrite::Omitted => (None, None),
+            ContentWrite::Plain(text) => (Some(text.as_str()), None),
+            ContentWrite::Encrypt(text) => (None, Some(sealer.seal_content(&identity, text)?)),
+        };
         // The status is *derived* from what the pipeline actually produced
         // (`RagIngestionPlan::terminal_status`) and can never be passed in as a literal. That
         // is the structural fix for P0-1: the old code bound `'indexed'` unconditionally, and
@@ -1835,23 +1890,35 @@ pub(crate) async fn create_rag_document_with_connection(
         sqlx::query(
             r#"
                 insert into rag_document_versions (
-                    id, document_id, version_number, content_plain, content_hash,
-                    content_size_bytes, ingestion_status, metadata
+                    id, document_id, version_number, content_plain, content_encrypted,
+                    content_hash, content_size_bytes, ingestion_status, metadata
                 )
-                values ($1, $2, 1, $3, $4, $5, $6, $7)
+                values ($1, $2, 1, $3, $4, $5, $6, $7, $8)
                 "#,
         )
         .bind(version_id)
         .bind(id)
-        .bind(content)
+        .bind(content_plain)
+        .bind(content_encrypted)
         .bind(hash)
+        // Computed on the **plaintext**, before any sealing — a ciphertext length must never
+        // reach a counter something else does arithmetic on.
         .bind(content.len() as i64)
         .bind(rag_ingestion_status_to_db(plan.terminal_status()))
         .bind(&request.metadata)
         .execute(&mut *connection)
         .await?;
-        write_rag_ingestion_artifacts(&mut *connection, id, version_id, collection_id, hash, plan)
-            .await?;
+        write_rag_ingestion_artifacts(
+            &mut *connection,
+            sealer,
+            persistence,
+            id,
+            version_id,
+            collection_id,
+            hash,
+            plan,
+        )
+        .await?;
         sqlx::query("update rag_documents set current_version_id = $2 where id = $1")
             .bind(id)
             .bind(version_id)
@@ -1873,13 +1940,29 @@ pub(crate) async fn create_rag_document_with_connection(
 
 pub(crate) async fn ingest_rag_document_with_connection(
     connection: &mut PgConnection,
+    sealer: &dyn ContentSealer,
     public_id: &str,
     request: &RagDocumentIngestRequest,
     content_hash: &str,
     plan: &RagIngestionPlan,
 ) -> Result<RagDocumentRecord, AppError> {
+    // `for update of d` rather than a bare `for update`: the nullable side of an outer join
+    // cannot be locked, and locking the policy row is not wanted anyway — a concurrent policy
+    // change should not serialise behind ingestion. Same reasoning, same spelling, as
+    // `add_message`.
     let target = sqlx::query(
-        "select id, collection_id from rag_documents where public_id = $1 and deleted_at is null for update",
+        r#"
+        select d.id,
+               d.collection_id,
+               coalesce(p.conversation_content_persistence, 'plain_content')
+                   as content_persistence
+        from rag_documents d
+        join rag_collections c on c.id = d.collection_id
+        left join application_conversation_policies p
+               on p.application_id = c.application_id
+        where d.public_id = $1 and d.deleted_at is null
+        for update of d
+        "#,
     )
     .bind(public_id)
     .fetch_optional(&mut *connection)
@@ -1893,6 +1976,9 @@ pub(crate) async fn ingest_rag_document_with_connection(
     })?;
     let document_id: Uuid = target.try_get("id")?;
     let collection_id: Uuid = target.try_get("collection_id")?;
+    let persistence = conversation_content_persistence_from_db(
+        target.try_get::<String, _>("content_persistence")?,
+    )?;
     let version_number: i32 = sqlx::query_scalar(
         "select coalesce(max(version_number), 0) + 1 from rag_document_versions where document_id = $1",
     )
@@ -1912,22 +1998,40 @@ pub(crate) async fn ingest_rag_document_with_connection(
     .bind(document_id)
     .execute(&mut *connection)
     .await?;
+    // AAD profile 4. `version_id` was minted above this insert and `version_number` was read
+    // under the document's row lock a few lines up, so neither can move under the ciphertext
+    // later — the rule `ContentIdentity` states. `rag_document_versions` is insert-only; nothing
+    // in `src/` updates `version_number`.
+    let stored = ContentWrite::under_policy_for_rag(persistence, content.to_string());
+    let identity = ContentIdentity::RagDocumentVersion {
+        version_id,
+        document_id,
+        version_number,
+    };
+    // Exhaustive, no catch-all, `?` is the refusal — see the create path.
+    let (content_plain, content_encrypted): (Option<&str>, Option<Vec<u8>>) = match &stored {
+        ContentWrite::Omitted => (None, None),
+        ContentWrite::Plain(text) => (Some(text.as_str()), None),
+        ContentWrite::Encrypt(text) => (None, Some(sealer.seal_content(&identity, text)?)),
+    };
     // Derived, never a literal — see the matching comment on the create path.
     sqlx::query(
         r#"
             insert into rag_document_versions (
-                id, document_id, version_number, content_plain, content_hash,
-                content_size_bytes, source_etag, source_last_modified,
+                id, document_id, version_number, content_plain, content_encrypted,
+                content_hash, content_size_bytes, source_etag, source_last_modified,
                 ingestion_status, metadata
             )
-            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             "#,
     )
     .bind(version_id)
     .bind(document_id)
     .bind(version_number)
-    .bind(content)
+    .bind(content_plain)
+    .bind(content_encrypted)
     .bind(content_hash)
+    // Plaintext length, before sealing.
     .bind(content.len() as i64)
     .bind(&request.source_etag)
     .bind(request.source_last_modified)
@@ -1937,6 +2041,8 @@ pub(crate) async fn ingest_rag_document_with_connection(
     .await?;
     write_rag_ingestion_artifacts(
         &mut *connection,
+        sealer,
+        persistence,
         document_id,
         version_id,
         collection_id,
@@ -1980,8 +2086,13 @@ pub(crate) async fn ingest_rag_document_with_connection(
 /// create path cannot drift — `/reindex` is a literal alias of `/ingest` and the create path
 /// writes version 1, and a pipeline wired into only one of them would leave the others writing
 /// bare, chunk-less versions forever.
+/// Same reasoning as `create_rag_document_with_connection` on the argument count: the sealer and
+/// the persistence value are the two things a reader must be able to see from the signature.
+#[allow(clippy::too_many_arguments)]
 async fn write_rag_ingestion_artifacts(
     connection: &mut PgConnection,
+    sealer: &dyn ContentSealer,
+    persistence: ConversationContentPersistence,
     document_id: Uuid,
     document_version_id: Uuid,
     collection_id: Uuid,
@@ -1990,14 +2101,43 @@ async fn write_rag_ingestion_artifacts(
 ) -> Result<(), AppError> {
     for chunk in &plan.chunks {
         let chunk_id = Uuid::now_v7();
+        // AAD profile 5, and every field it binds is final at encrypt time.
+        //
+        // **`chunk_index` is safe to bind, and that was verified rather than assumed.** No
+        // statement anywhere in `src/` or `migrations/` updates `rag_chunks`; the table is
+        // insert-only, and `rag_chunks_version_index_unique (document_version_id, chunk_index)`
+        // would refuse a renumbering that collided anyway. A re-ingest does not renumber these
+        // rows: it inserts a **new** `rag_document_versions` row with a fresh `version_id` and a
+        // fresh set of chunks, and marks the old version superseded — the old chunk rows keep
+        // their ids, their version and their indices forever. So the value bound here can never
+        // move under the ciphertext, which is the only property `ContentIdentity` requires. Had
+        // it been mutable the binding would have had to drop to `chunk_id` and
+        // `document_version_id` alone, because binding a mutable value creates a re-encryption
+        // requirement and that is what this design refuses.
+        let identity = ContentIdentity::RagChunk {
+            chunk_id,
+            document_version_id,
+            chunk_index: chunk.chunk_index,
+        };
+        let stored = ContentWrite::under_policy_for_rag(persistence, chunk.text.clone());
+        // Exhaustive, no catch-all, `?` is the refusal. The refusal matters more here than it
+        // looks: this loop runs inside the command transaction alongside the version insert, so
+        // a chunk that cannot be sealed aborts the whole ingestion rather than leaving a version
+        // whose chunks are half sealed and half in the clear.
+        let (chunk_text_plain, chunk_text_encrypted): (Option<&str>, Option<Vec<u8>>) =
+            match &stored {
+                ContentWrite::Omitted => (None, None),
+                ContentWrite::Plain(text) => (Some(text.as_str()), None),
+                ContentWrite::Encrypt(text) => (None, Some(sealer.seal_content(&identity, text)?)),
+            };
         sqlx::query(
             r#"
                 insert into rag_chunks (
                     id, public_id, document_version_id, collection_id, chunk_index,
-                    chunk_text_plain, chunk_hash, token_count, start_offset, end_offset,
-                    section_title, metadata
+                    chunk_text_plain, chunk_text_encrypted, chunk_hash, token_count,
+                    start_offset, end_offset, section_title, metadata
                 )
-                values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                 "#,
         )
         .bind(chunk_id)
@@ -2007,7 +2147,8 @@ async fn write_rag_ingestion_artifacts(
         .bind(document_version_id)
         .bind(collection_id)
         .bind(chunk.chunk_index)
-        .bind(&chunk.text)
+        .bind(chunk_text_plain)
+        .bind(chunk_text_encrypted)
         .bind(&chunk.chunk_hash)
         .bind(chunk.token_estimate)
         .bind(chunk.start_offset)
@@ -2021,6 +2162,12 @@ async fn write_rag_ingestion_artifacts(
         .await?;
 
         if let Some(vector) = &chunk.embedding {
+            // **This vector is stored in the clear even when the chunk above was sealed**, and
+            // it is computed from the same plaintext. Embedding-inversion attacks recover
+            // substantial source text from one, so `chunk_text_encrypted` is not a complete
+            // answer for this row and nothing here should imply that it is. Out of scope to
+            // fix, in scope to disclose: `docs/security.md`, "What this does not protect".
+            //
             // The vector is bound as `text` and cast with `$4::vector` rather than through the
             // `pgvector` crate — decision and reversal condition are recorded on
             // `crate::orchestration::encode_vector_literal`.
@@ -2377,6 +2524,7 @@ fn memory_candidate_from_row(
 /// chunks from retrieval without deleting them.
 pub(crate) async fn find_rag_chunk_candidates(
     pool: &PgPool,
+    opener: &dyn ContentOpener,
     scope: &RetrievalScope,
     query_vector: &str,
     allowed_collection_ids: &[Uuid],
@@ -2388,6 +2536,14 @@ pub(crate) async fn find_rag_chunk_candidates(
                    ch.public_id,
                    ch.chunk_index,
                    ch.chunk_text_plain,
+                   -- `chunk_text_encrypted` and `document_version_id` are not decoration: with
+                   -- `ch.id` and `ch.chunk_index` they are AAD profile 5's identity, and
+                   -- `chunk_candidate_from_row` cannot open the sealed body without them. A
+                   -- candidate reader that kept looking only at `chunk_text_plain` would render
+                   -- every sealed chunk as empty — the collection would appear to have silently
+                   -- lost its content the moment an operator turned encryption on.
+                   ch.chunk_text_encrypted,
+                   ch.document_version_id,
                    ch.section_title,
                    d.id as document_uuid,
                    d.public_id as document_public_id,
@@ -2421,19 +2577,42 @@ pub(crate) async fn find_rag_chunk_candidates(
     .bind(limit)
     .fetch_all(pool)
     .await?;
-    rows.iter().map(chunk_candidate_from_row).collect()
+    rows.iter()
+        .map(|row| chunk_candidate_from_row(row, opener))
+        .collect()
 }
 
-fn chunk_candidate_from_row(row: &sqlx::postgres::PgRow) -> Result<RagChunkCandidate, AppError> {
+fn chunk_candidate_from_row(
+    row: &sqlx::postgres::PgRow,
+    opener: &dyn ContentOpener,
+) -> Result<RagChunkCandidate, AppError> {
+    let chunk_id: Uuid = row.try_get("chunk_uuid")?;
+    let chunk_index: i32 = row.try_get("chunk_index")?;
     Ok(RagChunkCandidate {
-        chunk_uuid: row.try_get("chunk_uuid")?,
+        chunk_uuid: chunk_id,
         public_id: row.try_get("public_id")?,
         document_uuid: row.try_get("document_uuid")?,
         document_public_id: row.try_get("document_public_id")?,
         document_title: row.try_get("document_title")?,
         section_title: row.try_get("section_title")?,
-        chunk_index: row.try_get("chunk_index")?,
-        text: row.try_get("chunk_text_plain")?,
+        chunk_index,
+        // `None` now means only "neither column holds a body", which
+        // `ContentWrite::under_policy_for_rag` never writes. Before issue #141 it also meant
+        // "sealed, and this reader cannot open it" — a sealed collection retrieved as a page of
+        // empty chunks, silently.
+        text: conversation_content_from_row(
+            row,
+            opener,
+            "chunk_text_plain",
+            "chunk_text_encrypted",
+            "rag_chunks",
+            chunk_id,
+            ContentIdentity::RagChunk {
+                chunk_id,
+                document_version_id: row.try_get("document_version_id")?,
+                chunk_index,
+            },
+        )?,
         distance: row.try_get("distance")?,
         age_seconds: row.try_get::<Option<f64>, _>("age_seconds")?.unwrap_or(0.0),
     })
