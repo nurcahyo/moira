@@ -242,10 +242,13 @@ per request are therefore unchanged by this release, and a caller cannot obtain 
 work by pointing a schema at a backend that does not honour it.
 
 What *is* new is that `usage_records` can now contain a row for an attempt whose status is
-`failed` — until this release every row belonged to a successful one. The row carries
-`metadata.attempt_outcome = "failed"` and `metadata.failure_class`, so a job that must distinguish
-them can, without joining back to `execution_attempts`. `GET /api/v1/usage` does not expose
-`metadata` and its output is unaffected. See `docs/execution-attempts-and-usage.md`.
+`failed` — until this release every row belonged to a successful one. The failed row carries
+`metadata.attempt_outcome = "failed"` and `metadata.failure_class`; the success row carries
+`metadata.attempt_outcome = "succeeded"`. Both are stamped explicitly rather than one being left
+to be inferred from the other's absence, so a job that must distinguish them can query either
+value directly — e.g. `where metadata->>'attempt_outcome' = 'succeeded'` — without joining back to
+`execution_attempts`. `GET /api/v1/usage` does not expose `metadata` and its output is unaffected.
+See `docs/execution-attempts-and-usage.md`.
 
 **OpenAPI.** Unchanged: no new error code, no new enum value, no new operation — 152 operations
 across 100 paths and 183 schemas, identical to the previous release. `structured_output_invalid`

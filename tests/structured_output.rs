@@ -727,6 +727,76 @@ async fn a_plain_provider_failure_writes_no_usage_record_at_all() {
     case.shutdown().await;
 }
 
+/// **The success arm stamps `attempt_outcome` too — issue #155 B2.**
+///
+/// The failure arm (case 5, above) writes `metadata.attempt_outcome = "failed"` on the row it
+/// meters, and both `docs/execution-attempts-and-usage.md` and `docs/release-notes.md` describe
+/// that as letting "a billing job tell a metered refusal from a metered answer" — true only by
+/// **absence** on the success side, since the success arm used to write only
+/// `{"cost_estimation": "unavailable"}`. A reader who took the docs at face value and wrote
+/// `where metadata->>'attempt_outcome' = 'succeeded'` got nothing back, on a column any consumer
+/// could already be querying.
+///
+/// This drives an ordinary successful execution — non-streaming and streaming, since the two
+/// terminal writes are independent call sites — and runs exactly that query, proving it returns
+/// the row rather than nothing.
+#[tokio::test]
+async fn a_successful_attempt_is_stamped_succeeded_in_usage_metadata() {
+    for stream in [false, true] {
+        let script = if stream {
+            ProviderScript::Stream {
+                deltas: vec!["all ".to_string(), "clear".to_string()],
+            }
+        } else {
+            ProviderScript::Completion {
+                text: "all clear".to_string(),
+            }
+        };
+        let Some(case) = Case::new(vec![script]).await else {
+            return;
+        };
+
+        let (status, body) = case.diagnose(stream, None).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "diagnose failed (stream={stream}): {body}"
+        );
+        assert_eq!(
+            body["outcome"]["status"], "succeeded",
+            "control: this case is about the success arm, not a refusal (stream={stream}): {body}"
+        );
+        let execution_id: uuid::Uuid = body["outcome"]["execution_id"]
+            .as_str()
+            .expect("execution id")
+            .parse()
+            .expect("execution id is a uuid");
+
+        let succeeded_rows: Vec<UsageRow> = sqlx::query_as(
+            "select input_tokens, output_tokens, total_tokens, metadata from usage_records \
+             where execution_id = $1 and metadata->>'attempt_outcome' = 'succeeded'",
+        )
+        .bind(execution_id)
+        .fetch_all(&case.fixture.pool)
+        .await
+        .expect("read usage_records");
+        assert_eq!(
+            succeeded_rows.len(),
+            1,
+            "the exact query the docs describe must return the row a successful attempt wrote, \
+             not nothing (stream={stream}): {body}"
+        );
+        assert_eq!(
+            succeeded_rows[0].metadata["cost_estimation"], "unavailable",
+            "the pre-existing key must survive the addition of attempt_outcome \
+             (stream={stream}): {}",
+            succeeded_rows[0].metadata
+        );
+
+        case.shutdown().await;
+    }
+}
+
 /// One schema-carrying public request, answered by `script`, against a fixture wired for
 /// structured output.
 ///
