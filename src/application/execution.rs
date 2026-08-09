@@ -620,7 +620,15 @@ impl MoiraExecutionService {
                                     provider_model_id: candidate.provider_model_id,
                                     credential_id: credential.credential.credential_id,
                                     usage: output.usage.clone(),
-                                    metadata: json!({ "cost_estimation": "unavailable" }),
+                                    // Stamped explicitly rather than left to be inferred from
+                                    // absence: the failure arm below writes
+                                    // `attempt_outcome: "failed"`, and a reader who queries
+                                    // `metadata->>'attempt_outcome' = 'succeeded'` must get rows
+                                    // back rather than nothing (issue #155 item B2).
+                                    metadata: json!({
+                                        "cost_estimation": "unavailable",
+                                        "attempt_outcome": "succeeded"
+                                    }),
                                 })
                                 .await?;
                             self.runtime_repo

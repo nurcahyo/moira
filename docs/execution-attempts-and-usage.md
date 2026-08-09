@@ -31,6 +31,13 @@ schema at a backend that does not honour it. The row carries
 `metadata.attempt_outcome = "failed"` and `metadata.failure_class`, so a billing job can tell a
 metered refusal from a metered answer without joining back to `execution_attempts`.
 
+**Both arms stamp `metadata.attempt_outcome` explicitly** — the success arm
+(`src/application/execution.rs:628`) writes `"succeeded"` and the failure arm
+(`src/application/execution.rs:921`) writes `"failed"`. Neither value is left to be inferred from
+the other's absence: a query such as `where metadata->>'attempt_outcome' = 'succeeded'` returns
+every successfully metered row, not nothing ([issue #155](https://github.com/nurcahyo/moira/issues/155)
+item B2).
+
 A failure raised *mid*-stream deliberately does not do this: it is retryable and
 fallback-eligible, so its partial counts would be added to whatever the retry reports, and it was
 never a metered success to begin with.
