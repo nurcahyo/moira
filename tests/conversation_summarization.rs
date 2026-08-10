@@ -107,7 +107,61 @@ impl Case {
         let fixture = LifecycleFixture::new().await?;
         let completion = MockOpenAiServer::start(scripts).await;
         fixture
-            .add_provider(completion.base_url(), 10, RuntimePolicy::default())
+            .add_provider(
+                completion.base_url(),
+                10,
+                RuntimePolicy {
+                    // **30 s, not the 2 s `RuntimePolicy::default()`. Do not "restore the default".**
+                    //
+                    // WHY, precisely — and what this is *not*. `effective_runtime_policy` makes the
+                    // attempt budget `min(policy.timeout_ms, runtime.request_timeout_ms)`, so this
+                    // value *is* the wall-clock lifetime of a provider call parked on a `ScriptGate`.
+                    //
+                    // `a_concurrent_summarization_is_answered_with_202_and_retry_after` parks its
+                    // first run inside `ProviderScript::HeldCompletion` and then performs a
+                    // **complete authenticated HTTP round trip** — including an uncached,
+                    // memory-hard Argon2id (19 MiB) consumer-key verify (`src/security/auth.rs` ->
+                    // `src/security/api_keys.rs`, no `spawn_blocking`; see issue #176) — before
+                    // releasing the gate. The first run's clock runs for all of it.
+                    //
+                    // That is the argument: "the singleflight lock is held while the second caller
+                    // is served" is the property under test, so the first run is *required* to
+                    // outlive the second caller's entire round trip. A budget shorter than that
+                    // round trip is ill-formed rather than merely tight — it makes the test's
+                    // premise depend on the host finishing an HTTP round trip inside 2 s.
+                    //
+                    // HONEST LIMITS OF THE EVIDENCE. This is **not** a demonstrated fix for the
+                    // flake recorded in `plans/reports/EXECUTION-LEDGER.md` and `HANDOFF.md` §2.2a,
+                    // and it should not be cited as one. Measured 2026-08-08:
+                    //   * At ~load 90 the 2 s budget reproduced the documented failure — 2/12 runs,
+                    //     `left: 502, right: 200` — so the mechanism above is real, not theorised.
+                    //   * At that same load, 30 s did **not** rescue the test. It removed the 502
+                    //     and the run then failed on a *different* bound, the gate's own 5 s
+                    //     `WAIT_TIMEOUT` ("timed out waiting for provider request arrival"), which
+                    //     fires upstream of any budget.
+                    //   * Under realistic load — CPU spinners at 1x and 1.5x cores, and a
+                    //     concurrent DB-heavy `cargo test` — **neither** budget failed in 10-15
+                    //     runs each, so those runs distinguish nothing.
+                    //
+                    // So what this buys is narrower than "the flake is fixed": it removes an
+                    // ill-formed premise, and when the test does fail the message names the real
+                    // cause instead of a `502` that `summarization_failed` produces for every
+                    // execution error alike — the same status an empty reply gets.
+                    //
+                    // REJECTED ALTERNATIVES. `#[tokio::test(flavor = "multi_thread")]` is not the
+                    // answer and would be worse: with real parallelism the first run's timer can
+                    // fire *during* the second caller's round trip and release the lock before the
+                    // lock is checked, turning a late `502` into an earlier `200`-instead-of-`202`.
+                    // Retries are not it either — `.config/nextest.toml` keeps `retries = 0`
+                    // deliberately, and its own rationale is a case where a retry would have hidden
+                    // a real isolation bug.
+                    //
+                    // Nothing else in this file depends on the provider budget: every other script
+                    // answers immediately, and `WAIT` is what bounds a genuine hang.
+                    request_timeout_ms: 30_000,
+                    ..RuntimePolicy::default()
+                },
+            )
             .await;
         let response_key = fixture.enable_public_streaming().await;
         // After `enable_public_streaming`, which writes its own conversation policy.
@@ -973,6 +1027,11 @@ async fn a_conversation_with_no_new_messages_is_refused_even_when_forced() {
 /// No `sleep` anywhere: the first run is parked inside the provider call on a `ScriptGate`, so
 /// "the lock is held right now" is an ordering the test states rather than a race it bets on
 /// (CONVENTIONS.md §3, finding P2-12).
+///
+/// That holds for the *lock*, but not for the *budget*: the gate is held across a whole HTTP round
+/// trip, and that round trip runs on the parked call's clock. `Case::new` widens the provider
+/// budget to 30 s for exactly this reason — see the comment there, which also records what that
+/// widening was measured **not** to fix, before changing it.
 #[tokio::test]
 async fn a_concurrent_summarization_is_answered_with_202_and_retry_after() {
     let gate = ScriptGate::new();
