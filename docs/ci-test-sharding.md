@@ -18,6 +18,14 @@ nothing.)
 `rust-shard (0)`…`(4)`: matrix check names embed the shard index and change whenever
 `SHARD_TOTAL` is re-tuned, which un-gates the branch without anything going red.
 
+`docs/ci-docs-only.md` extends this same require-the-aggregator arrangement to five more
+required checks, so that a documentation-only change can skip the jobs whose inputs it
+cannot have touched without any required check reporting `skipped`. `rust`'s assertion
+step now lives in `scripts/ci-required-gate.sh`, shared with those five; it is unchanged
+in the case that matters — anything other than `success` fails — and accepts `skipped`
+only when the `changes` job succeeded and classified every path in the change set as
+inert.
+
 ## Adding a test target
 
 Create `tests/new_thing.rs`. That is the whole procedure.
