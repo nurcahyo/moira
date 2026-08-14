@@ -2588,7 +2588,16 @@ fn failure_http_status(class: ExecutionFailureClass) -> axum::http::StatusCode {
         // conflict it is — the request cannot be completed while the target resource is in this
         // state, and retrying is futile until the state changes. It is not `503`, which promises
         // that waiting helps, and not `502`, which blames a provider none of this contacted.
-        ExecutionFailureClass::AgentProfileDisabled => StatusCode::CONFLICT,
+        // Issue #84, and `409` for the same reason `AgentProfileDisabled` is: every cause
+        // behind this class is a state an operator can see and change on the admin plane —
+        // a skill left in `draft`, one switched off, one whose executor row is missing, a
+        // duplicate `skill_key`. Saying `404` about rows the operator can list would send
+        // them looking for the wrong thing, and the caller named none of these ids, so
+        // "not found" is not about anything they asked for. Retrying is futile until the
+        // configuration changes, which is exactly what `409` promises and `503` does not.
+        ExecutionFailureClass::AgentProfileDisabled | ExecutionFailureClass::SkillUnavailable => {
+            StatusCode::CONFLICT
+        }
         ExecutionFailureClass::CapacityExhausted => StatusCode::TOO_MANY_REQUESTS,
         ExecutionFailureClass::ProviderTimeout | ExecutionFailureClass::DeadlineExceeded => {
             StatusCode::GATEWAY_TIMEOUT

@@ -1,10 +1,10 @@
 # Agent platform: skills, evaluations, flows
 
-Issue #214 (plan 12 §3/§5), extended by issue #237 (plan 12 §5, workstream H: the OpenAPI import
-pipeline and `skill_http_executors` CRUD) and by F2 (this document's evals/flows CRUD section
-below). This is **still schema + CRUD only** — there is no execution engine here — the
-multi-agent flow orchestrator and the Rig tool-call loop that would make a skill callable are
-deferred and depend on rig tools (#84).
+Issue #214 (plan 12 §3/§5), extended by issue #237 (the OpenAPI import pipeline and
+`skill_http_executors` CRUD), by F2 (the evals/flows CRUD section below), and by issue #84 (the
+Rig tool loop that makes an enabled skill callable — see
+[Executing skills](#executing-skills-the-rig-tool-loop)). The **multi-agent flow orchestrator is
+still deferred**: `agent_flows` and its run tables carry CRUD but nothing executes a flow.
 
 ## What landed
 
@@ -160,9 +160,83 @@ flow (or its patched step list) is ever written — the write never lands half-v
 **What's deferred, explicitly**: there is **no execution endpoint** — no `POST
 /api/v1/admin/flows/{id}/run`, no way to score an eval suite. A flow can be fully authored (all
 its steps, in order, each naming a live agent profile) but cannot run; an eval suite can be fully
-populated with cases but cannot be graded. Both the offline-eval runner and the flow orchestrator
-that would walk the step DAG through the existing 11-step execution pipeline depend on rig tools
-(#84) and are that issue's follow-up, not this one's.
+populated with cases but cannot be graded. The rig tool loop those two were waiting on has since
+landed (issue #84, the section below), so the remaining work is the offline-eval runner and the
+flow orchestrator that walks the step DAG through the existing execution pipeline — a follow-up
+to #84's next stage, not to this one.
+
+## Executing skills: the rig tool loop
+
+Issue #84 (plan 12 §5), the partial slice that makes an **enabled** skill actually callable by a
+model. The multi-agent flow engine is still deferred.
+
+An agent profile's `skill_refs` is the whole selection mechanism — §5's MVP tier, "the router is
+the agent author". Resolution runs once per execution, before any provider is chosen:
+
+1. Each `skill_refs` id is classified (`domain::SkillResolution::classify`). An enabled
+   `kind = 'tool'` row with its executor becomes a callable tool; an enabled `kind = 'guard'` row
+   becomes a guard; **anything else refuses the execution** with `409 skill_unavailable` — missing,
+   still `draft`, disabled, or a tool with no executor row. Fail-closed, the same decision issue
+   #79 took for a dangling `agent_profile_id`: an agent silently missing a skill it was configured
+   with answers wrongly and nobody is told.
+2. Each tool's `params_schema` becomes the `ToolDefinition.parameters` on the wire, in `skill_refs`
+   order. `agent_profiles.tool_policy` is still **not** read — it is an unspecified placeholder
+   column from migration 0005, and pinned tests hold it that way.
+3. The loop (`orchestration::skill_tool::run_tool_loop`) issues up to
+   `skill_execution.maximum_tool_turns` model calls. Each turn's tool calls become one assistant
+   message plus exactly one user message carrying every tool result, in call order — the shape
+   providers require for parallel calls.
+
+### What a call does
+
+`HttpSkillTool` fills `{placeholder}` segments from the model's arguments (percent-encoded, so an
+argument cannot escape its segment), sends every remaining declared argument as a query parameter,
+sends `body` as the JSON request body on `POST`/`PUT`/`PATCH`, and re-runs
+`security::ssrf::validate_outbound_url` on the **resolved** URL plus an `allowed_host` equality
+check (plan 12 risk R20 — import-time validation cannot cover a URL that only exists at call time).
+The executor's `credential_id` is decrypted per execution into an `Authorization: Bearer` header;
+it is never a tool argument, never in the tool's output, and never in a `Debug` rendering.
+
+Failures stay **in-band** by default: a refused address, a timeout or an upstream error becomes a
+classified tool result the model can recover from. Only an exhausted turn budget terminates the
+attempt (`deadline_exceeded`).
+
+### Guards
+
+A `kind = 'guard'` skill in `skill_refs` is a deterministic policy check evaluated **before** every
+dispatch, from its `metadata.guard` object:
+
+```json
+{ "guard": { "allowed_skill_keys": ["orders_get"], "denied_skill_keys": [], "required_scopes": [] } }
+```
+
+Guards **narrow only** (CONVENTIONS §7.5): the first denial wins and no later guard can reverse it,
+and no field can grant a scope the caller does not already hold. A guard whose policy cannot be
+parsed denies everything it governs. A denial reaches the model as a keyed
+`skill_guard_denied` result and is recorded as a `tool_result` runtime event carrying
+`guard_key` and the reason (`skill_not_allowed`, `skill_denied`, `missing_scope`,
+`policy_unreadable`).
+
+### Deliberately deferred
+
+- **Streamed tools.** The streamed path surfaces `ToolCallStarted`/`ToolCallDelta` but cannot feed
+  a tool *result* back into a new stream, so `stream: true` plus skills is refused
+  (`invalid_execution_request`) rather than advertising tools nothing can satisfy.
+- **Structured output plus skills**, refused for finding F48: `rig-core` silently drops
+  `response_format` whenever tools are advertised on turn 1, so the combination would return prose
+  and blame the caller's schema.
+- **Caller-declared tools** on the public API remain rejected (`unsupported_tool`); this slice
+  enables *operator-configured* skills only.
+
+### Settings (`[skill_execution]`)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `maximum_tool_turns` | `4` | Total model calls one tool-bearing execution may make |
+| `maximum_advertised_tools` | `32` | Ceiling on tools one request may advertise |
+| `maximum_response_bytes` | `65536` | Ceiling on the skill response fed back to the model |
+| `dns_timeout_ms` | `5000` | Budget for the execution-time SSRF hostname resolution |
+| `allow_insecure_dev_urls` | `false` | Dev-only; production start-up refuses to come up while true. Import never honours it |
 
 ## These tables are not runtime configuration
 
@@ -194,3 +268,9 @@ versioned registries (`skills`, `eval_suites`, `agent_flows`).
 - `tests/agent_platform.rs` — end-to-end coverage over real Postgres for skills, eval
   suites/cases, and flows/steps: full CRUD lifecycles, stale `If-Match`, and idempotent create
   replay.
+- `src/orchestration/skill_tool.rs` — `HttpSkillTool` (the `rig_core::tool::Tool` impl), the
+  `ToolSet` assembly, and the multi-turn loop (issue #84). A widening of the Rig seam, listed in
+  `tests/rig_boundary.rs`'s allow-list with its argument.
+- `tests/skill_tool_loop.rs` — end-to-end coverage of the loop against two scripted servers (a
+  model and a skill target): advertise, call, round-trip, guards, SSRF, the turn budget, and the
+  two deliberate refusals.
