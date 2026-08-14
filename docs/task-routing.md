@@ -19,3 +19,7 @@ Precedence:
 4. Routing failure.
 
 Route definitions live in `route_definitions`. They do not own instantiated Rig agents.
+
+A route may name an agent profile. If it names one the runtime cannot use — disabled, or deleted —
+the request is **refused**, not served without it: see
+[agent profile resolution](agent-profile-resolution.md).

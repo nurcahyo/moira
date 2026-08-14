@@ -119,13 +119,32 @@ The values that column can hold are:
 
 | value | meaning |
 |---|---|
-| `structured_output_invalid` | the model replied, and the reply was not the declared envelope |
+| `structured_output_invalid` | the model replied, and the reply was not the declared envelope — including a reply that is **fenced** in ```` ```json ````, see below |
 | any `ExecutionFailureClass` code — `provider_upstream_error`, `provider_timeout`, `capacity_exhausted`, `route_not_found`, … | the extraction call reached the execution kernel and that is what it reported |
 | `extraction_call_failed` | there was no execution to ask: no database pool, the execution service could not be constructed, or `execute` itself returned an error |
 
 Recording the execution's own class is finding F29's third precondition. Before it, every one of
 those cases was flattened to `extraction_call_failed`, so "the model did not comply" and "the call
 did not happen" were indistinguishable on the row that exists to tell them apart.
+
+### A fenced reply is a failed run (changed by issue #80)
+
+Extraction sends an `output_schema`, so since issue #80 the **execution** parses the reply and
+fails it if it is not JSON — before `parse_candidates` is ever asked. A model that wraps the
+envelope in a ```` ```json ```` fence therefore produces a `failed` run with
+`structured_output_invalid` and no memories.
+
+This is a behaviour change and a regression for one real population: `parse_candidates` strips
+that fence, so a fenced reply used to be accepted and its memories written. The tolerance is still
+in the code and still unit-tested, but no execution can reach it any more. Fencing is what a
+provider that ignores `output_schema` commonly does, i.e. the `openai_compatible` and `local`
+types — and extraction sets no `required_capabilities`, so it can be routed to a model that never
+claimed to honour a schema at all. Because extraction is invisible to the caller, the run rows are
+the only signal; `docs/release-notes.md` carries the query.
+
+If a deployment measures this, the fix is to move the fence tolerance to
+`structured_output_from_text` in `src/application/execution.rs` — the single parse site — rather
+than to add a second accept-set. That reversal condition is recorded there.
 
 ### Getting from a failed run to the execution that failed
 

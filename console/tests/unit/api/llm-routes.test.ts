@@ -276,6 +276,7 @@ function install(
     auth,
     configs: [CONFIG],
     problems: [],
+    stale: false,
   };
   setConsoleApiDependenciesForTests({
     runtime: async () => runtime,

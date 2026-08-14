@@ -368,8 +368,8 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
     },
     I18nEntry {
         key: "moira.error.structured_output_invalid",
-        default_message: "The structured output schema is invalid.",
-        description: "Used when a structured-output request cannot be honoured because of the schema the caller supplied — never because of the model's reply. Two emitters, both on the request: validate_response_format rejects a schema over public_api.maximum_schema_bytes, and build_completion_request rejects one that is not a readable schemars::Schema (as ExecutionFailureClass::StructuredOutputInvalid, mapped to 422). An earlier wording also claimed 'or the model's output does not conform to it'; no such path exists (F42). F29 made the parse lenient, so a non-conforming reply leaves structured_output null and still succeeds — pinned by a_reply_that_is_not_json_leaves_the_field_null_and_still_succeeds in tests/structured_output.rs. memory_extraction::FAILURE_STRUCTURED_OUTPUT_INVALID is the same string for the reply case, but it is written to memory_extraction_runs.failure_class and never returned to a caller, so it never renders this message. All three of F29's preconditions now hold: F39 landed; StructuredOutputInvalid has a recorded disposition (in none of is_retryable, is_fallback_eligible or is_circuit_failure, each with the reason stated at the function); and run_extraction reads execution.status via extraction_failure_class. Widening is therefore gated only on the fail-hard variant itself shipping, which is deliberately a separate change — until it does, every sentence above is still true as written, and structured_output_invalid_has_only_the_two_emitters_its_catalog_entry_describes is what keeps it that way.",
+        default_message: "The structured output request could not be honoured.",
+        description: "Used when a structured-output request cannot be honoured — because of the schema the caller supplied, or because of what the model sent back. Three emitters, all mapped to 422 by failure_http_status. Two are about the request: validate_response_format rejects a schema over public_api.maximum_schema_bytes, and build_completion_request rejects one that is not a readable schemars::Schema. One is about the reply: structured_output_from_text raises it when a schema-carrying request comes back as bytes that are not JSON, on the completion path and the streaming path alike (issue #80, decided 2026-08-06 — the fail-hard flip F29 deferred and F42 recorded as non-existent; both of those earlier wordings were true when written and are false from #80 onward). The flip exists because structured_output: null on a 200 was the same document a legitimately empty answer produces, so a caller could not tell a provider that did not comply from an empty result; now a failure is a 422 and only an answer is a 200. Moira parses JSON here rather than validating against the schema, so a reply that is valid JSON but violates the schema still succeeds, and null, {} and [] parse and are answers rather than failures. The message is a constant and never carries the provider's bytes. memory_extraction::FAILURE_STRUCTURED_OUTPUT_INVALID is the same string for a reply that parsed as JSON but is not the extraction envelope, but it is written to memory_extraction_runs.failure_class and never returned to a caller, so it never renders this message. StructuredOutputInvalid is in none of is_retryable, is_fallback_eligible or is_circuit_failure — one disposition for all three emitters, each reason stated at its function — and structured_output_invalid_has_only_the_three_emitters_its_catalog_entry_describes counts the emitters per file so a fourth cannot be added silently.",
     },
     I18nEntry {
         key: "moira.error.structured_output_unsupported",
@@ -440,6 +440,16 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         key: "moira.error.route_not_found",
         default_message: "No route matched this request.",
         description: "Used when the requested route does not exist or is not visible to the caller. Retrying will not help until a matching route is configured.",
+    },
+    I18nEntry {
+        key: "moira.error.agent_profile_not_found",
+        default_message: "The route requires an agent profile that no longer exists.",
+        description: "Used when the selected route's agent_profile_id names no live agent_profiles row, because the profile was soft-deleted or never existed. Moira refuses the execution rather than serving it without the profile's preamble (issue #79); the English message names the route and the profile id so the deployment can be corrected without reading server logs. Distinct from agent_profile_disabled, where the row is still there: the remedy here is to create a profile and repoint the route.",
+    },
+    I18nEntry {
+        key: "moira.error.agent_profile_disabled",
+        default_message: "The route requires an agent profile that is currently disabled.",
+        description: "Used when the selected route's agent_profile_id names an agent profile whose status is disabled. Moira refuses the execution rather than serving it without the profile's preamble (issue #79). Distinct from agent_profile_not_found, which means no live row has that id: the remedy here is to re-enable the profile or point the route at an active one, and the HTTP status is 409 rather than 404 because the profile exists and is visible on the admin plane.",
     },
     I18nEntry {
         key: "moira.error.route_forbidden",
@@ -710,8 +720,33 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         description: "Used when clearing is_primary, or revoking a primary grant, would leave zero active primary admins - locking every remaining admin out of admin management and leaving system-key break-glass as the only re-entry path. Transfer ownership to another identity first. This guard is expressible only because ownership is row state: as a scope it would have been implied by moira:admin and held by everyone, leaving nothing to count.",
     },
     I18nEntry {
+        key: "moira.error.content_decryption_failed",
+        default_message: "The stored content could not be read.",
+        description: "Used when a stored content envelope did not authenticate under its data key - the AES-256-GCM tag did not verify. Deliberately ONE opaque code for every AEAD outcome, and its message is a constant: distinguishing a wrong key from a tampered blob is an oracle, so the wire says nothing beyond the fact of failure and the log line says only aead_open_failed. That is the same posture credential_decryption_failed already takes. The precise reason an operator needs is never absent, it just lives in the log rather than in the response. Contrast content_envelope_unsupported, which covers the failures decided BEFORE any key is touched and therefore may name its discriminant.",
+    },
+    I18nEntry {
+        key: "moira.error.content_envelope_unsupported",
+        default_message: "The stored content is not in a format this version of the service can read.",
+        description: "Used when a stored content envelope is not a well-formed envelope this build can interpret: bad magic, an unknown format version, algorithm id or key mode, a non-zero reserved byte, an unknown AAD profile, a blob under the 58-byte floor, a body_len that disagrees with the stored bytes, or a profile or data-key id that does not match the identity being opened. Every one of these is decided before any key lookup and before any crypto call, from bytes anyone holding the ciphertext can already read, so the LOG names the specific discriminant while the wire stays generic. The usual cause is a rollback: a blob written by a newer build reaching an older one. Split from content_decryption_failed because 'you are running a build that predates this format' and 'your key is wrong' have opposite remedies at three in the morning.",
+    },
+    I18nEntry {
+        key: "moira.error.content_key_unavailable",
+        default_message: "Content encryption is configured but no usable content key is available. Retry shortly.",
+        description: "Used in two places, both of which mean the content keyring cannot serve this operation. On the WRITE path: an application whose conversation_content_persistence is encrypted_content produced a message or summary and no active, writable content data key exists. The write is REFUSED and nothing is stored - writing plaintext under a policy named for encryption would be finding F32 with extra steps, and a test asserts the row count did not increase. On the READ path: the envelope names a data key this replica's keyring snapshot does not carry, which is a key minted after the last refresh, or a retired one. 503 rather than 500 because both conditions are resolved by restoring, promoting or refreshing a key rather than by the caller changing anything.",
+    },
+    I18nEntry {
+        key: "moira.error.content_key_abandoned",
+        default_message: "The key that protects this content was abandoned and the content cannot be read.",
+        description: "Used when a stored envelope names a content data key an operator explicitly abandoned with `moira keyring abandon`. Distinguished from content_key_unavailable because the remedy differs in kind: the key is not missing from this process, it is gone from the world and that loss was deliberately recorded. Rows sealed under it are permanently unreadable and no retry, restart or configuration change recovers them. 500 rather than 503 for exactly that reason - 503 promises that waiting helps.",
+    },
+    I18nEntry {
+        key: "moira.error.content_storage_ambiguous",
+        default_message: "The stored content is ambiguous.",
+        description: "The impossible case, catalogued because it is reachable. A conversation row holding BOTH a plaintext body and a sealed body has two contradictory answers about what it stores. migrations/0027_content_encryption_keyring.sql adds check (content_plain is null or content_encrypted is null) to every affected table, so this cannot be written - but the constraint is NOT VALID, so rows that predate it were never checked. The sealed body wins, because it is the stricter of the two intentions and rendering the plaintext of a row that also carries a ciphertext would quietly serve content an operator believed was encrypted. Exactly one WARN naming the table and row id is logged and the read succeeds; this code is emitted as that log line's `code` field and is NOT returned to a caller, which is why no AppError constructor carries it.",
+    },
+    I18nEntry {
         key: "moira.error.admin_identity_not_primary",
-        default_message: "Only a primary admin identity may manage other admin identities.",
-        description: "Used when a caller who is not a primary admin attempts an ownership transfer or a grant revocation. Ownership is admin_identities.is_primary, not a scope: AuthorizationService::has_scope grants a moira:admin-holding trusted-JWT actor every scope by implication, so a scope could not express 'not every admin'. System-key callers pass this check, because break-glass remains the documented last resort.",
+        default_message: "Only the primary admin identity may do that.",
+        description: "Used when a caller who is not a primary admin attempts an ownership transfer, a grant revocation, or - since issue #185 - a WRITE to the auth-provider settings surface. Ownership is admin_identities.is_primary, not a scope: AuthorizationService::has_scope grants a moira:admin-holding trusted-JWT actor every scope by implication, so a scope could not express 'not every admin'. The message was widened from 'manage other admin identities' when the second surface arrived, because rewriting the sign-in configuration is not identity management and the copy named only the first caller. System-key callers pass this check, because break-glass remains the documented last resort - and on the auth-provider surface it is the ONLY way back in once a bad write has broken sign-in.",
     },
 ];

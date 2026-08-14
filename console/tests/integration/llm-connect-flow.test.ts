@@ -244,7 +244,13 @@ async function signIn(): Promise<string> {
 function install(handlers: Record<string, StubHandler> = moiraHandlers()): void {
   stub = createMoiraStub(handlers);
   setConsoleApiDependenciesForTests({
-    runtime: async () => ({ ok: true, auth: consoleServer.auth, configs: [config], problems: [] }),
+    runtime: async () => ({
+      ok: true,
+      auth: consoleServer.auth,
+      configs: [config],
+      problems: [],
+      stale: false,
+    }),
     env: () => env,
     clientFor: () =>
       new MoiraClient({

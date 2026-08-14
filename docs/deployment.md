@@ -32,3 +32,22 @@ development headers, wildcard CORS, insecure provider URLs, and an API replica
 count other than one.
 
 No real secrets belong in manifests or Helm values. Use sealed secrets, an external secret operator, Vault, or cloud secret managers.
+
+## The admin console
+
+The console is a separate deployable with its own image, its own database, its
+own release cadence and its own chart, `charts/moira-console`. It is deliberately
+not a subchart of `charts/moira`.
+
+It stays at `replicaCount: 1`. Sessions, rate limits, the Better Auth ES256 key
+pair and the sealed OAuth client secrets are all shared through
+`CONSOLE_DATABASE_URL`, but the auth-config snapshot in
+`console/lib/auth-runtime.ts` is still per process, so two pods can serve
+different provider configurations — including different client secrets after a
+rotation — for an unbounded time. `autoscaling` and `podDisruptionBudget` are
+disabled against the same constraint and are restored together with it. The
+reversal condition is written out at `charts/moira-console/values.yaml:29-81`.
+
+The console serves **one** enabled auth provider. Going to N is a staged rollout
+with a mandatory verification between the server change and the console change:
+see [console-multi-provider-rollout.md](console-multi-provider-rollout.md).

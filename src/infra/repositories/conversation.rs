@@ -62,6 +62,8 @@
 //! All of this is standard keyset behaviour for a mutable sort key and is accepted
 //! deliberately — the alternative is changing the sort key, which rule 1 forbids.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use serde_json::Value;
@@ -70,32 +72,36 @@ use uuid::Uuid;
 
 use crate::{
     domain::{
-        ConversationCreateRequest, ConversationMessageQuery, ConversationMessageRecord,
-        ConversationMessageRole, ConversationMessageType, ConversationPatchRequest,
-        ConversationPolicyPutRequest, ConversationPolicyRecord, ConversationQuery,
-        ConversationRecord, ConversationStatus, EmbeddingPolicyPutRequest, EmbeddingPolicyRecord,
-        ListCursor, MemoryCreateRequest, MemoryPatchRequest, MemoryPolicyPutRequest,
-        MemoryPolicyRecord, MemoryQuery, MemoryRecord, MemoryScope, MemorySensitivity,
-        MemoryStatus, MemoryType, RagCollectionCreateRequest, RagCollectionPatchRequest,
-        RagCollectionQuery, RagCollectionRecord, RagCollectionStatus, RagDocumentCreateRequest,
-        RagDocumentIngestRequest, RagDocumentRecord, RetrievalPolicyPutRequest,
-        RetrievalPolicyRecord, SeqCursor,
+        ContentWrite, ConversationContentPersistence, ConversationCreateRequest,
+        ConversationMessageQuery, ConversationMessageRecord, ConversationMessageRole,
+        ConversationMessageType, ConversationPatchRequest, ConversationPolicyPutRequest,
+        ConversationPolicyRecord, ConversationQuery, ConversationRecord, ConversationStatus,
+        EmbeddingPolicyPutRequest, EmbeddingPolicyRecord, ListCursor, MemoryCreateRequest,
+        MemoryPatchRequest, MemoryPolicyPutRequest, MemoryPolicyRecord, MemoryQuery, MemoryRecord,
+        MemoryScope, MemorySensitivity, MemoryStatus, MemoryType, RagCollectionCreateRequest,
+        RagCollectionPatchRequest, RagCollectionQuery, RagCollectionRecord, RagCollectionStatus,
+        RagDocumentCreateRequest, RagDocumentIngestRequest, RagDocumentRecord,
+        RetrievalPolicyPutRequest, RetrievalPolicyRecord, SeqCursor,
     },
     error::AppError,
     infra::pg_rows::{
-        conversation_content_persistence_from_db, conversation_content_persistence_to_db,
-        conversation_message_record_from_row, conversation_message_role_to_db,
-        conversation_message_type_to_db, conversation_policy_record_from_row,
-        conversation_record_from_row, conversation_status_to_db, embedding_policy_record_from_row,
-        history_strategy_to_db, memory_consent_mode_to_db, memory_policy_record_from_row,
-        memory_record_from_row, memory_scope_to_db, memory_sensitivity_to_db, memory_status_to_db,
-        memory_type_to_db, rag_collection_record_from_row, rag_collection_status_to_db,
+        conversation_content_from_row, conversation_content_persistence_from_db,
+        conversation_content_persistence_to_db, conversation_message_record_from_row,
+        conversation_message_role_to_db, conversation_message_type_to_db,
+        conversation_policy_record_from_row, conversation_record_from_row,
+        conversation_status_to_db, embedding_policy_record_from_row, history_strategy_to_db,
+        memory_consent_mode_to_db, memory_policy_record_from_row, memory_record_from_row,
+        memory_scope_to_db, memory_sensitivity_to_db, memory_status_to_db, memory_type_to_db,
+        rag_collection_record_from_row, rag_collection_status_to_db,
         rag_collection_visibility_to_db, rag_document_record_from_row, rag_ingestion_status_to_db,
         retrieval_policy_record_from_row,
     },
     orchestration::{
         MemoryCandidate, RagChunkCandidate, RagIngestionPlan, SUPPORTED_EMBEDDING_DIMENSION,
         encode_vector_literal,
+    },
+    security::{
+        ContentIdentity, ContentKeyring, ContentOpener, ContentSealer, KeyringContentAccess,
     },
 };
 
@@ -104,6 +110,15 @@ use super::policy_row::get_or_create_policy_row;
 #[derive(Debug, Clone)]
 pub struct PgConversationRepository {
     pool: PgPool,
+    /// The keyring this repository seals and opens content with.
+    ///
+    /// `None` is a process with no content keyring — which is a process with no database, since
+    /// `AppState` loads one whenever a pool exists. Every sealed read and every encrypted write
+    /// then **refuses** with `content_key_unavailable`; none of them falls back to plaintext.
+    ///
+    /// Carried as the keyring rather than as a snapshot so a rotation is visible to a long-lived
+    /// repository; taking a snapshot is a lock read and an `Arc` clone, and is still no I/O.
+    content_keyring: Option<Arc<ContentKeyring>>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,9 +136,20 @@ pub struct ConversationMessageInsert {
     pub execution_id: Option<Uuid>,
     pub role: ConversationMessageRole,
     pub message_type: ConversationMessageType,
-    pub content_plain: Option<String>,
+    /// The body the caller is offering, as a [`ContentWrite`] — **replacing** the former
+    /// `content_plain: Option<String>` rather than sitting beside it, so a caller cannot supply a
+    /// plaintext and a ciphertext for one row. See [`ContentWrite`] for the full argument.
+    ///
+    /// A caller offers what it has, normally [`ContentWrite::Plain`]. [`ConversationRepository::add_message`]
+    /// then **re-derives** the stored form from the application's policy under the same lock that
+    /// reads it: this is the choke point, and a caller that guessed the policy wrong must not be
+    /// able to talk the repository out of it.
+    pub content: ContentWrite,
     pub content_hash: String,
+    /// Computed on the **plaintext**, by the caller, before anything is sealed. A ciphertext
+    /// length must never reach this field: something else does arithmetic on it.
     pub content_size_bytes: i64,
+    /// Computed on the plaintext, for the reason [`Self::content_size_bytes`] gives.
     pub token_count: Option<i64>,
     pub metadata: Value,
 }
@@ -141,6 +167,12 @@ pub struct ConversationInsert<'a> {
 
 #[derive(Debug, Clone)]
 pub struct MemoryInsert<'a> {
+    /// Minted by the caller **before** this struct is built, and bound into the AAD.
+    ///
+    /// [`ContentIdentity`] admits only values that are final at encrypt time, and this one is:
+    /// `ConversationService::create_memory` calls `Uuid::now_v7()` and derives `public_id` from
+    /// it in the same breath, so the id the envelope authenticates is the id the row is stored
+    /// under. Generating it here instead would be a second uuid.
     pub id: Uuid,
     pub public_id: &'a str,
     pub application_id: Uuid,
@@ -148,7 +180,15 @@ pub struct MemoryInsert<'a> {
     pub external_user_id: Option<&'a str>,
     pub scope: MemoryScope,
     pub request: &'a MemoryCreateRequest,
-    pub content_hash: &'a str,
+    /// What to store for the memory body — **replacing** the former direct read of
+    /// `request.content`, for the reasons [`ContentWrite`] gives.
+    ///
+    /// Resolved by the single caller, which has already read the application's persistence
+    /// policy; the same shape [`ConversationSummaryInsert::summary_text`] uses and for the same
+    /// reason. `content_hash` is deliberately **not** a field beside it: the hash's form is
+    /// decided by this value, and a caller able to supply them independently is a caller able to
+    /// put an unkeyed digest of a plaintext next to that plaintext's ciphertext.
+    pub content: ContentWrite,
 }
 
 // ---------------------------------------------------------------------------
@@ -370,14 +410,20 @@ pub trait ConversationRepository: Send + Sync {
     /// Appends a message, **applying the application's
     /// [`ConversationContentPersistence`](crate::domain::ConversationContentPersistence)**.
     ///
-    /// `insert.content_plain`, `content_size_bytes` and `token_count` are what the caller
-    /// *offers*; what is stored is whatever the policy admits. A caller therefore cannot force
-    /// plaintext into `conversation_messages` by constructing the insert differently, and the
-    /// returned record reflects what was stored rather than what was offered.
+    /// `insert.content`, `content_size_bytes` and `token_count` are what the caller *offers*;
+    /// what is stored is whatever the policy admits. A caller therefore cannot force plaintext
+    /// into `conversation_messages` by constructing the insert differently, and the returned
+    /// record reflects what was stored rather than what was offered.
     ///
     /// This is the enforcement point on purpose: it is the only path into the table, so the
     /// policy is applied once instead of at each of the (currently three) application-layer
     /// call sites, where a fourth could omit it.
+    ///
+    /// Under `encrypted_content` the body is sealed here, inside the same transaction as the
+    /// insert. That is safe precisely because sealing does no I/O — see
+    /// [`crate::security::content_access`]. If no usable content key exists the whole
+    /// transaction is abandoned and nothing is written: `503 content_key_unavailable`, never a
+    /// plaintext fallback.
     async fn add_message(
         &self,
         insert: &ConversationMessageInsert,
@@ -422,11 +468,18 @@ pub trait ConversationRepository: Send + Sync {
         limit: i64,
     ) -> Result<Vec<(MemoryRecord, ListCursor)>, AppError>;
 
+    /// Patches a memory, resealing its body when the patch replaces it.
+    ///
+    /// `content` is `Some` exactly when `request.content` is: it is the same body, already
+    /// resolved against the application's persistence policy by the caller. The `content_hash`
+    /// that used to be the third parameter is gone — it is now derived inside, from this value,
+    /// so a patch cannot write a keyed digest beside a plaintext body or an unkeyed one beside a
+    /// ciphertext.
     async fn patch_memory(
         &self,
         public_id: &str,
         request: &MemoryPatchRequest,
-        content_hash: Option<&str>,
+        content: Option<ContentWrite>,
     ) -> Result<MemoryRecord, AppError>;
 
     async fn delete_memory(&self, public_id: &str) -> Result<(), AppError>;
@@ -526,8 +579,19 @@ pub trait ConversationRepository: Send + Sync {
 }
 
 impl PgConversationRepository {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    /// `content_keyring` is a required argument rather than a builder step on purpose: a
+    /// repository silently constructed without one would refuse every encrypted write at runtime,
+    /// which is precisely the failure this parameter exists to make visible at the call site.
+    pub fn new(pool: PgPool, content_keyring: Option<Arc<ContentKeyring>>) -> Self {
+        Self {
+            pool,
+            content_keyring,
+        }
+    }
+
+    /// The seal/open seam for this repository. Cheap — an `Option<Arc<_>>` clone.
+    fn content_access(&self) -> KeyringContentAccess {
+        KeyringContentAccess::new(self.content_keyring.clone())
     }
 }
 
@@ -1094,10 +1158,17 @@ impl ConversationRepository for PgConversationRepository {
         // the only path into `conversation_messages`, so a fourth writer inherits the policy
         // instead of having to remember it — which is precisely what finding F32 was: two
         // comments asserting this policy was honoured, guarding nothing.
-        let content_plain = insert
-            .content_plain
-            .as_deref()
-            .filter(|_| persistence.persists_plaintext());
+        //
+        // Re-derived from the policy rather than taken as offered. The caller hands over the body
+        // it has; the *storage form* is this function's decision, read under the same `for update`
+        // as the row it governs.
+        let stored = match insert.content.plaintext() {
+            Some(plaintext) => ContentWrite::under_policy(persistence, plaintext.to_string()),
+            None => ContentWrite::Omitted,
+        };
+        // Length and token counts come from what the caller measured on the **plaintext**, before
+        // any sealing happened. Deriving them from `stored` after a seal would put a ciphertext
+        // length into a counter that limits, metrics and the API all do arithmetic on.
         let (content_size_bytes, token_count) = if persistence.persists_content_metadata() {
             (insert.content_size_bytes, insert.token_count)
         } else {
@@ -1115,14 +1186,37 @@ impl ConversationRepository for PgConversationRepository {
         .await?;
         let message_id = Uuid::now_v7();
         let public_id = format!("msg_{message_id}");
+        // Every field the AAD binds is final before the insert and never updated afterwards, which
+        // is the rule `ContentIdentity` states: `message_id` is minted above and `sequence` was
+        // read under the row lock, so nothing here can move under the ciphertext later.
+        let identity = ContentIdentity::ConversationMessage {
+            message_id,
+            conversation_id,
+            sequence_number: sequence,
+        };
+        // Exhaustive, with no catch-all arm: a fourth `ContentWrite` variant does not compile
+        // until this site decides which column it lands in.
+        //
+        // The seal happens **inside the transaction**, and the `?` is the refusal: if no usable
+        // content key exists, `tx` is dropped un-committed and the row is never written. That is
+        // the whole of "refusal, never fallback" — there is no arm below that reaches
+        // `content_plain` under an encrypted policy.
+        let (content_plain, content_encrypted): (Option<&str>, Option<Vec<u8>>) = match &stored {
+            ContentWrite::Omitted => (None, None),
+            ContentWrite::Plain(text) => (Some(text.as_str()), None),
+            ContentWrite::Encrypt(text) => (
+                None,
+                Some(self.content_access().seal_content(&identity, text)?),
+            ),
+        };
         let row = sqlx::query(&conversation_message_select(
             r#"
             insert into conversation_messages (
                 id, public_id, conversation_id, response_id, execution_id, role,
-                message_type, sequence_number, content_plain, content_hash,
+                message_type, sequence_number, content_plain, content_encrypted, content_hash,
                 content_size_bytes, token_count, metadata
             )
-            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             returning *
             "#,
         ))
@@ -1135,6 +1229,7 @@ impl ConversationRepository for PgConversationRepository {
         .bind(conversation_message_type_to_db(insert.message_type))
         .bind(sequence)
         .bind(content_plain)
+        .bind(content_encrypted)
         .bind(&insert.content_hash)
         .bind(content_size_bytes)
         .bind(token_count)
@@ -1153,7 +1248,7 @@ impl ConversationRepository for PgConversationRepository {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        conversation_message_record_from_row(&row)
+        conversation_message_record_from_row(&row, &self.content_access())
     }
 
     async fn list_messages(
@@ -1171,9 +1266,13 @@ impl ConversationRepository for PgConversationRepository {
             .bind(limit)
             .fetch_all(&self.pool)
             .await?;
+        // One access object for the whole page. It clones an `Arc` per call anyway, but building
+        // it once makes it obvious that a page of 50 messages does not touch the keyring 50 times
+        // in a way a reader has to go and check.
+        let opener = self.content_access();
         rows.iter()
             .map(|row| {
-                let record = conversation_message_record_from_row(row)?;
+                let record = conversation_message_record_from_row(row, &opener)?;
                 let key = SeqCursor::new(record.sequence_number);
                 Ok((record, key))
             })
@@ -1181,16 +1280,40 @@ impl ConversationRepository for PgConversationRepository {
     }
 
     async fn create_memory(&self, insert: &MemoryInsert<'_>) -> Result<MemoryRecord, AppError> {
+        let access = self.content_access();
+        let scope = memory_scope_to_db(insert.scope);
+        // Every field the AAD binds is final: `id` was minted by the caller before this struct
+        // existed, `application_id` comes from the actor, and `memory_scope` is chosen once at
+        // creation and never patched (`patch_memory` does not offer it). Nothing here can move
+        // under the ciphertext later, which is the rule `ContentIdentity` states.
+        let identity = ContentIdentity::MemoryRecord {
+            memory_id: insert.id,
+            application_id: insert.application_id,
+            memory_scope: scope,
+        };
+        // Exhaustive, no catch-all — the same shape as `add_message`. The `?` is the refusal: a
+        // memory that cannot be sealed is not written in the clear, it is not written.
+        let (content_plain, content_encrypted): (Option<&str>, Option<Vec<u8>>) =
+            match &insert.content {
+                ContentWrite::Omitted => (None, None),
+                ContentWrite::Plain(text) => (Some(text.as_str()), None),
+                ContentWrite::Encrypt(text) => (None, Some(access.seal_content(&identity, text)?)),
+            };
+        // Keyed under every policy value since issue #168, so it takes the plaintext and nothing
+        // else: there is no storage form that selects a different digest, and therefore no way
+        // for the body and its digest to disagree. The `?` is the second refusal on this path —
+        // a memory whose digest cannot be keyed is not written with an unkeyed one.
+        let content_hash = access.memory_content_hash(&insert.request.content)?;
         let row = sqlx::query(&memory_select(
             r#"
             insert into memory_records (
                 id, public_id, application_id, external_tenant_id, external_user_id,
-                memory_scope, memory_type, content_plain, content_hash, importance,
-                confidence, sensitivity, status, valid_until, metadata
+                memory_scope, memory_type, content_plain, content_encrypted, content_hash,
+                importance, confidence, sensitivity, status, valid_until, metadata
             )
             values (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9,
-                coalesce($10, 0.5), coalesce($11, 1.0), 'normal', 'active', $12, $13
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                coalesce($11, 0.5), coalesce($12, 1.0), 'normal', 'active', $13, $14
             )
             returning *
             "#,
@@ -1200,17 +1323,18 @@ impl ConversationRepository for PgConversationRepository {
         .bind(insert.application_id)
         .bind(insert.external_tenant_id)
         .bind(insert.external_user_id)
-        .bind(memory_scope_to_db(insert.scope))
+        .bind(scope)
         .bind(memory_type_to_db(insert.request.memory_type))
-        .bind(&insert.request.content)
-        .bind(insert.content_hash)
+        .bind(content_plain)
+        .bind(content_encrypted)
+        .bind(&content_hash)
         .bind(insert.request.importance)
         .bind(insert.request.confidence)
         .bind(insert.request.valid_until)
         .bind(&insert.request.metadata)
         .fetch_one(&self.pool)
         .await?;
-        memory_record_from_row(&row)
+        memory_record_from_row(&row, &access)
     }
 
     async fn find_memory_authorized(
@@ -1244,7 +1368,7 @@ impl ConversationRepository for PgConversationRepository {
                 "memory not found",
             )
         })?;
-        memory_record_from_row(&row)
+        memory_record_from_row(&row, &self.content_access())
     }
 
     async fn list_memories_authorized(
@@ -1266,9 +1390,12 @@ impl ConversationRepository for PgConversationRepository {
             .bind(limit)
             .fetch_all(&self.pool)
             .await?;
+        // One access object for the whole page, for the reason `list_messages` gives: a page of
+        // memories must not touch the keyring once per row.
+        let opener = self.content_access();
         rows.iter()
             .map(|row| {
-                let record = memory_record_from_row(row)?;
+                let record = memory_record_from_row(row, &opener)?;
                 let key = ListCursor::new(record.updated_at, row.try_get("id")?);
                 Ok((record, key))
             })
@@ -1279,12 +1406,82 @@ impl ConversationRepository for PgConversationRepository {
         &self,
         public_id: &str,
         request: &MemoryPatchRequest,
-        content_hash: Option<&str>,
+        content: Option<ContentWrite>,
     ) -> Result<MemoryRecord, AppError> {
+        let access = self.content_access();
+        // **The one write site whose AAD inputs are not already in hand.** `create_memory` and
+        // `insert_extracted_memory` are handed a freshly minted id; a patch is addressed by
+        // `public_id` alone, so the three columns the AAD binds have to be read — and read
+        // *under a row lock*, in the same transaction as the update, or a concurrent write could
+        // move `memory_scope` between the seal and the store and leave a row whose ciphertext
+        // authenticates against an identity the row no longer has.
+        //
+        // `memory_scope` is not patchable today, which is exactly why the lock is written down
+        // rather than skipped: the day it becomes patchable, this is already correct.
+        let mut tx = self.pool.begin().await?;
+        let existing = sqlx::query(
+            r#"
+            select id, application_id, memory_scope
+            from memory_records
+            where public_id = $1 and deleted_at is null
+            for update
+            "#,
+        )
+        .bind(public_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            AppError::coded(
+                axum::http::StatusCode::NOT_FOUND,
+                "memory_not_found",
+                "memory not found",
+            )
+        })?;
+        let memory_id: Uuid = existing.try_get("id")?;
+        let application_id: Uuid = existing.try_get("application_id")?;
+        let memory_scope: String = existing.try_get("memory_scope")?;
+        let identity = ContentIdentity::MemoryRecord {
+            memory_id,
+            application_id,
+            memory_scope: &memory_scope,
+        };
+
+        // `replaces_content` is what makes the update able to *clear* the other column. A pair of
+        // `coalesce`s cannot: patching a plaintext row under an encrypted policy would leave the
+        // old `content_plain` standing beside the new ciphertext, which the CHECK constraint from
+        // migration 0027 refuses outright — and on a row predating that constraint would be a
+        // sealed body serving its own plaintext.
+        let replaces_content = content.is_some();
+        let (content_plain, content_encrypted, content_hash): (
+            Option<&str>,
+            Option<Vec<u8>>,
+            Option<String>,
+        ) = match (&content, request.content.as_deref()) {
+            (None, _) => (None, None, None),
+            (Some(stored), plaintext) => {
+                // `request.content` is `Some` whenever `content` is — the caller derives one
+                // from the other — but the hash needs the body even under `Omitted`, where
+                // `ContentWrite` carries none. Fall back to what `ContentWrite` does carry so
+                // the two can never be hashed over different bytes.
+                let plaintext = plaintext.or_else(|| stored.plaintext()).unwrap_or_default();
+                let hash = access.memory_content_hash(plaintext)?;
+                match stored {
+                    ContentWrite::Omitted => (None, None, Some(hash)),
+                    ContentWrite::Plain(text) => (Some(text.as_str()), None, Some(hash)),
+                    ContentWrite::Encrypt(text) => (
+                        None,
+                        Some(access.seal_content(&identity, text)?),
+                        Some(hash),
+                    ),
+                }
+            }
+        };
+
         let row = sqlx::query(&memory_select(
             r#"
             update memory_records
-            set content_plain = coalesce($2, content_plain),
+            set content_plain = case when $8 then $2 else content_plain end,
+                content_encrypted = case when $8 then $9 else content_encrypted end,
                 content_hash = coalesce($3, content_hash),
                 importance = coalesce($4, importance),
                 valid_until = coalesce($5, valid_until),
@@ -1295,13 +1492,15 @@ impl ConversationRepository for PgConversationRepository {
             "#,
         ))
         .bind(public_id)
-        .bind(&request.content)
+        .bind(content_plain)
         .bind(content_hash)
         .bind(request.importance)
         .bind(request.valid_until)
         .bind(request.status.map(memory_status_to_db))
         .bind(&request.metadata)
-        .fetch_optional(&self.pool)
+        .bind(replaces_content)
+        .bind(content_encrypted)
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| {
             AppError::coded(
@@ -1310,7 +1509,8 @@ impl ConversationRepository for PgConversationRepository {
                 "memory not found",
             )
         })?;
-        memory_record_from_row(&row)
+        tx.commit().await?;
+        memory_record_from_row(&row, &access)
     }
 
     async fn delete_memory(&self, public_id: &str) -> Result<(), AppError> {
@@ -1451,6 +1651,7 @@ impl ConversationRepository for PgConversationRepository {
         let mut tx = self.pool.begin().await?;
         let record = create_rag_document_with_connection(
             &mut tx,
+            &self.content_access(),
             id,
             public_id,
             collection_public_id,
@@ -1524,9 +1725,15 @@ impl ConversationRepository for PgConversationRepository {
         plan: &RagIngestionPlan,
     ) -> Result<RagDocumentRecord, AppError> {
         let mut tx = self.pool.begin().await?;
-        let record =
-            ingest_rag_document_with_connection(&mut tx, public_id, request, content_hash, plan)
-                .await?;
+        let record = ingest_rag_document_with_connection(
+            &mut tx,
+            &self.content_access(),
+            public_id,
+            request,
+            content_hash,
+            plan,
+        )
+        .await?;
         tx.commit().await?;
         Ok(record)
     }
@@ -1584,8 +1791,17 @@ pub(crate) async fn create_rag_collection_with_connection(
     rag_collection_record_from_row(&row)
 }
 
+/// The sealer is the eighth parameter, and it stays a parameter.
+///
+/// Bundling these into a struct to satisfy the argument count would take the one seam that
+/// matters — *can this function seal, and with what* — and hide it inside a bag alongside four
+/// unrelated ids. "Which functions can write a sealed column" is precisely the question
+/// `every_sealed_column_named_in_sql_sits_in_an_allowlisted_function` exists to keep answerable,
+/// and a `&dyn ContentSealer` in the signature is the cheapest possible answer to it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_rag_document_with_connection(
     connection: &mut PgConnection,
+    sealer: &dyn ContentSealer,
     id: Uuid,
     public_id: &str,
     collection_public_id: &str,
@@ -1593,8 +1809,21 @@ pub(crate) async fn create_rag_document_with_connection(
     content_hash: Option<&str>,
     plan: &RagIngestionPlan,
 ) -> Result<RagDocumentRecord, AppError> {
-    let collection_id: Uuid = sqlx::query_scalar(
-        "select id from rag_collections where public_id = $1 and deleted_at is null",
+    // The collection lookup carries the persistence policy, exactly as `add_message`'s row lock
+    // does: the policy is read in the same statement and the same instant as the row it governs,
+    // so it costs no extra round trip and cannot be observed from a different moment. `left join`
+    // plus `coalesce` because an application that has never had a policy written gets the column
+    // default — a missing row must not mean "no policy" and therefore some other answer.
+    let collection = sqlx::query(
+        r#"
+        select c.id,
+               coalesce(p.conversation_content_persistence, 'plain_content')
+                   as content_persistence
+        from rag_collections c
+        left join application_conversation_policies p
+               on p.application_id = c.application_id
+        where c.public_id = $1 and c.deleted_at is null
+        "#,
     )
     .bind(collection_public_id)
     .fetch_optional(&mut *connection)
@@ -1606,6 +1835,10 @@ pub(crate) async fn create_rag_document_with_connection(
             "RAG collection not found",
         )
     })?;
+    let collection_id: Uuid = collection.try_get("id")?;
+    let persistence = conversation_content_persistence_from_db(
+        collection.try_get::<String, _>("content_persistence")?,
+    )?;
     let mut row = sqlx::query(&rag_document_select(
         r#"
             insert into rag_documents (
@@ -1628,7 +1861,29 @@ pub(crate) async fn create_rag_document_with_connection(
     .fetch_one(&mut *connection)
     .await?;
     if let (Some(content), Some(hash)) = (&request.content, content_hash) {
+        // Minted immediately above its own insert and never updated afterwards, which is the
+        // rule `ContentIdentity` states: AAD profile 4 binds this id, the document id and the
+        // version number, and this path's version number is the literal `1` below.
         let version_id = Uuid::now_v7();
+        let stored = ContentWrite::under_policy_for_rag(persistence, content.clone());
+        let identity = ContentIdentity::RagDocumentVersion {
+            version_id,
+            document_id: id,
+            version_number: 1,
+        };
+        // Exhaustive with no catch-all, the same shape as `add_message` and `create_memory`: a
+        // fourth `ContentWrite` variant does not compile until this site decides which column it
+        // lands in. `Omitted` cannot arise from `under_policy_for_rag` — see the reasoning
+        // there — and is spelled out rather than folded away so that routing RAG through
+        // `under_policy` one day is a visible change here rather than a silent bodyless write.
+        //
+        // The `?` is the refusal: this runs inside the command transaction, so a document whose
+        // body cannot be sealed is not written in the clear, it is not written.
+        let (content_plain, content_encrypted): (Option<&str>, Option<Vec<u8>>) = match &stored {
+            ContentWrite::Omitted => (None, None),
+            ContentWrite::Plain(text) => (Some(text.as_str()), None),
+            ContentWrite::Encrypt(text) => (None, Some(sealer.seal_content(&identity, text)?)),
+        };
         // The status is *derived* from what the pipeline actually produced
         // (`RagIngestionPlan::terminal_status`) and can never be passed in as a literal. That
         // is the structural fix for P0-1: the old code bound `'indexed'` unconditionally, and
@@ -1637,23 +1892,35 @@ pub(crate) async fn create_rag_document_with_connection(
         sqlx::query(
             r#"
                 insert into rag_document_versions (
-                    id, document_id, version_number, content_plain, content_hash,
-                    content_size_bytes, ingestion_status, metadata
+                    id, document_id, version_number, content_plain, content_encrypted,
+                    content_hash, content_size_bytes, ingestion_status, metadata
                 )
-                values ($1, $2, 1, $3, $4, $5, $6, $7)
+                values ($1, $2, 1, $3, $4, $5, $6, $7, $8)
                 "#,
         )
         .bind(version_id)
         .bind(id)
-        .bind(content)
+        .bind(content_plain)
+        .bind(content_encrypted)
         .bind(hash)
+        // Computed on the **plaintext**, before any sealing — a ciphertext length must never
+        // reach a counter something else does arithmetic on.
         .bind(content.len() as i64)
         .bind(rag_ingestion_status_to_db(plan.terminal_status()))
         .bind(&request.metadata)
         .execute(&mut *connection)
         .await?;
-        write_rag_ingestion_artifacts(&mut *connection, id, version_id, collection_id, hash, plan)
-            .await?;
+        write_rag_ingestion_artifacts(
+            &mut *connection,
+            sealer,
+            persistence,
+            id,
+            version_id,
+            collection_id,
+            hash,
+            plan,
+        )
+        .await?;
         sqlx::query("update rag_documents set current_version_id = $2 where id = $1")
             .bind(id)
             .bind(version_id)
@@ -1675,13 +1942,29 @@ pub(crate) async fn create_rag_document_with_connection(
 
 pub(crate) async fn ingest_rag_document_with_connection(
     connection: &mut PgConnection,
+    sealer: &dyn ContentSealer,
     public_id: &str,
     request: &RagDocumentIngestRequest,
     content_hash: &str,
     plan: &RagIngestionPlan,
 ) -> Result<RagDocumentRecord, AppError> {
+    // `for update of d` rather than a bare `for update`: the nullable side of an outer join
+    // cannot be locked, and locking the policy row is not wanted anyway — a concurrent policy
+    // change should not serialise behind ingestion. Same reasoning, same spelling, as
+    // `add_message`.
     let target = sqlx::query(
-        "select id, collection_id from rag_documents where public_id = $1 and deleted_at is null for update",
+        r#"
+        select d.id,
+               d.collection_id,
+               coalesce(p.conversation_content_persistence, 'plain_content')
+                   as content_persistence
+        from rag_documents d
+        join rag_collections c on c.id = d.collection_id
+        left join application_conversation_policies p
+               on p.application_id = c.application_id
+        where d.public_id = $1 and d.deleted_at is null
+        for update of d
+        "#,
     )
     .bind(public_id)
     .fetch_optional(&mut *connection)
@@ -1695,6 +1978,9 @@ pub(crate) async fn ingest_rag_document_with_connection(
     })?;
     let document_id: Uuid = target.try_get("id")?;
     let collection_id: Uuid = target.try_get("collection_id")?;
+    let persistence = conversation_content_persistence_from_db(
+        target.try_get::<String, _>("content_persistence")?,
+    )?;
     let version_number: i32 = sqlx::query_scalar(
         "select coalesce(max(version_number), 0) + 1 from rag_document_versions where document_id = $1",
     )
@@ -1714,22 +2000,40 @@ pub(crate) async fn ingest_rag_document_with_connection(
     .bind(document_id)
     .execute(&mut *connection)
     .await?;
+    // AAD profile 4. `version_id` was minted above this insert and `version_number` was read
+    // under the document's row lock a few lines up, so neither can move under the ciphertext
+    // later — the rule `ContentIdentity` states. `rag_document_versions` is insert-only; nothing
+    // in `src/` updates `version_number`.
+    let stored = ContentWrite::under_policy_for_rag(persistence, content.to_string());
+    let identity = ContentIdentity::RagDocumentVersion {
+        version_id,
+        document_id,
+        version_number,
+    };
+    // Exhaustive, no catch-all, `?` is the refusal — see the create path.
+    let (content_plain, content_encrypted): (Option<&str>, Option<Vec<u8>>) = match &stored {
+        ContentWrite::Omitted => (None, None),
+        ContentWrite::Plain(text) => (Some(text.as_str()), None),
+        ContentWrite::Encrypt(text) => (None, Some(sealer.seal_content(&identity, text)?)),
+    };
     // Derived, never a literal — see the matching comment on the create path.
     sqlx::query(
         r#"
             insert into rag_document_versions (
-                id, document_id, version_number, content_plain, content_hash,
-                content_size_bytes, source_etag, source_last_modified,
+                id, document_id, version_number, content_plain, content_encrypted,
+                content_hash, content_size_bytes, source_etag, source_last_modified,
                 ingestion_status, metadata
             )
-            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             "#,
     )
     .bind(version_id)
     .bind(document_id)
     .bind(version_number)
-    .bind(content)
+    .bind(content_plain)
+    .bind(content_encrypted)
     .bind(content_hash)
+    // Plaintext length, before sealing.
     .bind(content.len() as i64)
     .bind(&request.source_etag)
     .bind(request.source_last_modified)
@@ -1739,6 +2043,8 @@ pub(crate) async fn ingest_rag_document_with_connection(
     .await?;
     write_rag_ingestion_artifacts(
         &mut *connection,
+        sealer,
+        persistence,
         document_id,
         version_id,
         collection_id,
@@ -1782,8 +2088,13 @@ pub(crate) async fn ingest_rag_document_with_connection(
 /// create path cannot drift — `/reindex` is a literal alias of `/ingest` and the create path
 /// writes version 1, and a pipeline wired into only one of them would leave the others writing
 /// bare, chunk-less versions forever.
+/// Same reasoning as `create_rag_document_with_connection` on the argument count: the sealer and
+/// the persistence value are the two things a reader must be able to see from the signature.
+#[allow(clippy::too_many_arguments)]
 async fn write_rag_ingestion_artifacts(
     connection: &mut PgConnection,
+    sealer: &dyn ContentSealer,
+    persistence: ConversationContentPersistence,
     document_id: Uuid,
     document_version_id: Uuid,
     collection_id: Uuid,
@@ -1792,14 +2103,43 @@ async fn write_rag_ingestion_artifacts(
 ) -> Result<(), AppError> {
     for chunk in &plan.chunks {
         let chunk_id = Uuid::now_v7();
+        // AAD profile 5, and every field it binds is final at encrypt time.
+        //
+        // **`chunk_index` is safe to bind, and that was verified rather than assumed.** No
+        // statement anywhere in `src/` or `migrations/` updates `rag_chunks`; the table is
+        // insert-only, and `rag_chunks_version_index_unique (document_version_id, chunk_index)`
+        // would refuse a renumbering that collided anyway. A re-ingest does not renumber these
+        // rows: it inserts a **new** `rag_document_versions` row with a fresh `version_id` and a
+        // fresh set of chunks, and marks the old version superseded — the old chunk rows keep
+        // their ids, their version and their indices forever. So the value bound here can never
+        // move under the ciphertext, which is the only property `ContentIdentity` requires. Had
+        // it been mutable the binding would have had to drop to `chunk_id` and
+        // `document_version_id` alone, because binding a mutable value creates a re-encryption
+        // requirement and that is what this design refuses.
+        let identity = ContentIdentity::RagChunk {
+            chunk_id,
+            document_version_id,
+            chunk_index: chunk.chunk_index,
+        };
+        let stored = ContentWrite::under_policy_for_rag(persistence, chunk.text.clone());
+        // Exhaustive, no catch-all, `?` is the refusal. The refusal matters more here than it
+        // looks: this loop runs inside the command transaction alongside the version insert, so
+        // a chunk that cannot be sealed aborts the whole ingestion rather than leaving a version
+        // whose chunks are half sealed and half in the clear.
+        let (chunk_text_plain, chunk_text_encrypted): (Option<&str>, Option<Vec<u8>>) =
+            match &stored {
+                ContentWrite::Omitted => (None, None),
+                ContentWrite::Plain(text) => (Some(text.as_str()), None),
+                ContentWrite::Encrypt(text) => (None, Some(sealer.seal_content(&identity, text)?)),
+            };
         sqlx::query(
             r#"
                 insert into rag_chunks (
                     id, public_id, document_version_id, collection_id, chunk_index,
-                    chunk_text_plain, chunk_hash, token_count, start_offset, end_offset,
-                    section_title, metadata
+                    chunk_text_plain, chunk_text_encrypted, chunk_hash, token_count,
+                    start_offset, end_offset, section_title, metadata
                 )
-                values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                 "#,
         )
         .bind(chunk_id)
@@ -1809,7 +2149,8 @@ async fn write_rag_ingestion_artifacts(
         .bind(document_version_id)
         .bind(collection_id)
         .bind(chunk.chunk_index)
-        .bind(&chunk.text)
+        .bind(chunk_text_plain)
+        .bind(chunk_text_encrypted)
         .bind(&chunk.chunk_hash)
         .bind(chunk.token_estimate)
         .bind(chunk.start_offset)
@@ -1823,6 +2164,12 @@ async fn write_rag_ingestion_artifacts(
         .await?;
 
         if let Some(vector) = &chunk.embedding {
+            // **This vector is stored in the clear even when the chunk above was sealed**, and
+            // it is computed from the same plaintext. Embedding-inversion attacks recover
+            // substantial source text from one, so `chunk_text_encrypted` is not a complete
+            // answer for this row and nothing here should imply that it is. Out of scope to
+            // fix, in scope to disclose: `docs/security.md`, "What this does not protect".
+            //
             // The vector is bound as `text` and cast with `$4::vector` rather than through the
             // `pgvector` crate — decision and reversal condition are recorded on
             // `crate::orchestration::encode_vector_literal`.
@@ -2016,12 +2363,14 @@ pub struct RetrievalScope {
 /// a claim about several that a later edit can quietly falsify. `every_memory_read_shares_the_isolation_predicate`
 /// asserts every builder below embeds it.
 ///
-/// It also carries F14's third clause. `memory_records.content_hash` is an **unkeyed content
-/// address** (`memory_content_hash`, `src/application/conversation.rs`), and that decision holds
-/// only while the hash is never compared across applications. The `m.application_id = $2` line
-/// here is what makes that true for the extraction dedupe. A query that stops using this
-/// constant, or an edit that removes that line from it, is exactly the condition that reverses
-/// F14 and puts the peppered hasher back.
+/// It also carries what is left of F14's third clause. Since issue #168
+/// `memory_records.content_hash` is **keyed under every policy value**
+/// ([`crate::security::ContentSealer::memory_content_hash`]), so the clause no longer holds up an
+/// unkeyed digest — but the predicate still holds up the *scope* of the comparison, and a keyed
+/// digest compared across applications would leak equality of memory bodies between tenants that
+/// share nothing else. The `m.application_id = $2` line here is what makes that true for the
+/// extraction dedupe. Rows written before #168 are still unkeyed and still in this table, so a
+/// query that stops using this constant is also the condition that re-exposes them.
 const MEMORY_SCOPE_PREDICATE: &str = r#"
               m.application_id = $2
               and (
@@ -2050,7 +2399,13 @@ fn memory_candidates_sql() -> String {
                    m.public_id,
                    m.memory_type,
                    m.memory_key,
+                   -- `application_id` and `memory_scope` are not decoration: with `m.id` they
+                   -- are AAD profile 3's identity, and `memory_candidate_from_row` cannot open
+                   -- `content_encrypted` without them.
+                   m.application_id,
+                   m.memory_scope,
                    m.content_plain,
+                   m.content_encrypted,
                    m.importance,
                    (e.embedding <=> $1::vector) as distance,
                    -- `extract` returns `numeric` on PostgreSQL 14+, which sqlx will not decode as
@@ -2099,6 +2454,7 @@ fn memory_candidates_sql() -> String {
 /// rather than left meaning nothing.
 pub(crate) async fn find_memory_candidates(
     pool: &PgPool,
+    opener: &dyn ContentOpener,
     scope: &RetrievalScope,
     query_vector: &str,
     limit: i64,
@@ -2111,16 +2467,39 @@ pub(crate) async fn find_memory_candidates(
         .bind(limit)
         .fetch_all(pool)
         .await?;
-    rows.iter().map(memory_candidate_from_row).collect()
+    rows.iter()
+        .map(|row| memory_candidate_from_row(row, opener))
+        .collect()
 }
 
-fn memory_candidate_from_row(row: &sqlx::postgres::PgRow) -> Result<MemoryCandidate, AppError> {
+fn memory_candidate_from_row(
+    row: &sqlx::postgres::PgRow,
+    opener: &dyn ContentOpener,
+) -> Result<MemoryCandidate, AppError> {
+    let memory_id: Uuid = row.try_get("memory_uuid")?;
+    let memory_scope: String = row.try_get("memory_scope")?;
     Ok(MemoryCandidate {
-        memory_uuid: row.try_get("memory_uuid")?,
+        memory_uuid: memory_id,
         public_id: row.try_get("public_id")?,
         memory_type: row.try_get("memory_type")?,
         memory_key: row.try_get("memory_key")?,
-        content: row.try_get("content_plain")?,
+        // Retrieval is a read path like any other, and it is the one that puts a memory in front
+        // of a model. A candidate reader that kept looking only at `content_plain` would render
+        // every sealed memory as absent — the application would appear to have silently lost its
+        // memories the moment an operator turned encryption on.
+        content: conversation_content_from_row(
+            row,
+            opener,
+            "content_plain",
+            "content_encrypted",
+            "memory_records",
+            memory_id,
+            ContentIdentity::MemoryRecord {
+                memory_id,
+                application_id: row.try_get("application_id")?,
+                memory_scope: &memory_scope,
+            },
+        )?,
         importance: row.try_get("importance")?,
         distance: row.try_get("distance")?,
         age_seconds: row.try_get::<Option<f64>, _>("age_seconds")?.unwrap_or(0.0),
@@ -2148,6 +2527,7 @@ fn memory_candidate_from_row(row: &sqlx::postgres::PgRow) -> Result<MemoryCandid
 /// chunks from retrieval without deleting them.
 pub(crate) async fn find_rag_chunk_candidates(
     pool: &PgPool,
+    opener: &dyn ContentOpener,
     scope: &RetrievalScope,
     query_vector: &str,
     allowed_collection_ids: &[Uuid],
@@ -2159,6 +2539,14 @@ pub(crate) async fn find_rag_chunk_candidates(
                    ch.public_id,
                    ch.chunk_index,
                    ch.chunk_text_plain,
+                   -- `chunk_text_encrypted` and `document_version_id` are not decoration: with
+                   -- `ch.id` and `ch.chunk_index` they are AAD profile 5's identity, and
+                   -- `chunk_candidate_from_row` cannot open the sealed body without them. A
+                   -- candidate reader that kept looking only at `chunk_text_plain` would render
+                   -- every sealed chunk as empty — the collection would appear to have silently
+                   -- lost its content the moment an operator turned encryption on.
+                   ch.chunk_text_encrypted,
+                   ch.document_version_id,
                    ch.section_title,
                    d.id as document_uuid,
                    d.public_id as document_public_id,
@@ -2192,19 +2580,42 @@ pub(crate) async fn find_rag_chunk_candidates(
     .bind(limit)
     .fetch_all(pool)
     .await?;
-    rows.iter().map(chunk_candidate_from_row).collect()
+    rows.iter()
+        .map(|row| chunk_candidate_from_row(row, opener))
+        .collect()
 }
 
-fn chunk_candidate_from_row(row: &sqlx::postgres::PgRow) -> Result<RagChunkCandidate, AppError> {
+fn chunk_candidate_from_row(
+    row: &sqlx::postgres::PgRow,
+    opener: &dyn ContentOpener,
+) -> Result<RagChunkCandidate, AppError> {
+    let chunk_id: Uuid = row.try_get("chunk_uuid")?;
+    let chunk_index: i32 = row.try_get("chunk_index")?;
     Ok(RagChunkCandidate {
-        chunk_uuid: row.try_get("chunk_uuid")?,
+        chunk_uuid: chunk_id,
         public_id: row.try_get("public_id")?,
         document_uuid: row.try_get("document_uuid")?,
         document_public_id: row.try_get("document_public_id")?,
         document_title: row.try_get("document_title")?,
         section_title: row.try_get("section_title")?,
-        chunk_index: row.try_get("chunk_index")?,
-        text: row.try_get("chunk_text_plain")?,
+        chunk_index,
+        // `None` now means only "neither column holds a body", which
+        // `ContentWrite::under_policy_for_rag` never writes. Before issue #141 it also meant
+        // "sealed, and this reader cannot open it" — a sealed collection retrieved as a page of
+        // empty chunks, silently.
+        text: conversation_content_from_row(
+            row,
+            opener,
+            "chunk_text_plain",
+            "chunk_text_encrypted",
+            "rag_chunks",
+            chunk_id,
+            ContentIdentity::RagChunk {
+                chunk_id,
+                document_version_id: row.try_get("document_version_id")?,
+                chunk_index,
+            },
+        )?,
         distance: row.try_get("distance")?,
         age_seconds: row.try_get::<Option<f64>, _>("age_seconds")?.unwrap_or(0.0),
     })
@@ -2430,10 +2841,18 @@ fn memory_by_content_hash_sql() -> String {
 
 /// The oldest in-scope memory whose content address equals `content_hash`.
 ///
-/// Exact dedupe. `content_hash` here is the **unkeyed** content address F14 established, so
-/// identical text produces an identical value indefinitely and this lookup keeps working across
-/// a pepper rotation. The `application_id` binding is what keeps that safe — see
-/// [`MEMORY_SCOPE_PREDICATE`].
+/// Exact dedupe. `content_hash` here is the one stable form
+/// [`crate::security::ContentSealer::memory_content_hash`] writes — keyed, under every storage
+/// policy since issue #168 — so identical text produces an identical value indefinitely and this
+/// lookup keeps working across a pepper rotation *and* across a master-key rotation. The
+/// `application_id` binding is what keeps the comparison scoped — see [`MEMORY_SCOPE_PREDICATE`].
+///
+/// **A row written before #168 misses; it never falsely matches.** The keyed form is prefixed
+/// [`crate::security::MEMORY_DEDUPE_HASH_PREFIX`], whose `:` cannot occur in the base64url
+/// content address the older rows carry — migration `0021`'s own rule, reused. So an application
+/// whose corpus predates the change gets one duplicate per re-stated memory, never a false match
+/// onto a row stored in the other form. Nothing rewrites those rows; the miss is the announced
+/// cost.
 pub(crate) async fn find_memory_by_content_hash(
     pool: &PgPool,
     scope: &RetrievalScope,
@@ -2564,6 +2983,9 @@ pub(crate) async fn confirm_memory(pool: &PgPool, memory_uuid: Uuid) -> Result<(
 /// One extracted memory, ready to insert.
 #[derive(Debug, Clone)]
 pub struct ExtractedMemoryInsert<'a> {
+    /// Minted by the extraction loop immediately before this struct is built, and bound into the
+    /// AAD. Verified rather than assumed: `run_extraction` calls `Uuid::now_v7()` per accepted
+    /// candidate and derives `public_id` from it on the next line.
     pub id: Uuid,
     pub public_id: &'a str,
     pub application_id: Uuid,
@@ -2573,7 +2995,18 @@ pub struct ExtractedMemoryInsert<'a> {
     pub scope: MemoryScope,
     pub memory_type: MemoryType,
     pub memory_key: Option<&'a str>,
-    pub content: &'a str,
+    /// What to store for the body, resolved against the application's persistence policy by the
+    /// one caller — the same shape [`MemoryInsert::content`] uses.
+    pub content: ContentWrite,
+    /// The digest, computed by the caller **from `content`** through
+    /// [`ContentSealer::memory_content_hash`].
+    ///
+    /// The one place in this file where the hash is not derived at the write site, and the reason
+    /// is structural rather than convenient: extraction must perform its exact-dedupe lookup
+    /// (`find_memory_by_content_hash`) with this value *before* deciding to insert at all.
+    /// Recomputing it here would be a second computation able to disagree with the one the
+    /// lookup used, which is a dedupe that silently stops matching — F14's failure mode, from a
+    /// new direction.
     pub content_hash: &'a str,
     pub confidence: f64,
     pub sensitivity: MemorySensitivity,
@@ -2594,8 +3027,24 @@ pub struct ExtractedMemoryInsert<'a> {
 /// on the caller-facing path to serve a use case it does not have.
 pub(crate) async fn insert_extracted_memory(
     pool: &PgPool,
+    access: &impl ContentSealer,
     insert: &ExtractedMemoryInsert<'_>,
 ) -> Result<(), AppError> {
+    let scope = memory_scope_to_db(insert.scope);
+    let identity = ContentIdentity::MemoryRecord {
+        memory_id: insert.id,
+        application_id: insert.application_id,
+        memory_scope: scope,
+    };
+    // Exhaustive, no catch-all, and the `?` is the refusal: an extracted memory that cannot be
+    // sealed is dropped by the caller's `insert_failed` rejection rather than written in the
+    // clear under a policy named for encryption.
+    let (content_plain, content_encrypted): (Option<&str>, Option<Vec<u8>>) = match &insert.content
+    {
+        ContentWrite::Omitted => (None, None),
+        ContentWrite::Plain(text) => (Some(text.as_str()), None),
+        ContentWrite::Encrypt(text) => (None, Some(access.seal_content(&identity, text)?)),
+    };
     sqlx::query(
         r#"
             insert into memory_records (
@@ -2603,12 +3052,12 @@ pub(crate) async fn insert_extracted_memory(
                 conversation_id, memory_scope, memory_type, memory_key, content_plain,
                 content_hash, confidence, sensitivity, status, source_message_ids,
                 source_response_id, source_extraction_run_id, contradicts_memory_id,
-                resolution_status, metadata
+                resolution_status, metadata, content_encrypted
             )
             values (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                 $11, $12, $13, $14, $15, $16, $17, $18, $19,
-                jsonb_build_object('source', 'automatic_extraction')
+                jsonb_build_object('source', 'automatic_extraction'), $20
             )
             "#,
     )
@@ -2618,10 +3067,10 @@ pub(crate) async fn insert_extracted_memory(
     .bind(insert.external_tenant_id)
     .bind(insert.external_user_id)
     .bind(insert.conversation_uuid)
-    .bind(memory_scope_to_db(insert.scope))
+    .bind(scope)
     .bind(memory_type_to_db(insert.memory_type))
     .bind(insert.memory_key)
-    .bind(insert.content)
+    .bind(content_plain)
     .bind(insert.content_hash)
     .bind(insert.confidence)
     .bind(memory_sensitivity_to_db(insert.sensitivity))
@@ -2631,6 +3080,7 @@ pub(crate) async fn insert_extracted_memory(
     .bind(insert.source_extraction_run_id)
     .bind(insert.contradicts_memory_id)
     .bind(insert.resolution_status)
+    .bind(content_encrypted)
     .execute(pool)
     .await?;
     Ok(())
@@ -2701,15 +3151,20 @@ pub struct HistoryMessage {
 /// The `sequence_number` cutoff excludes the turn the current request just wrote: the planner
 /// runs *after* `prepare_response_conversation` has persisted the user's message, and including
 /// it would duplicate the caller's own input into the history block.
+/// The SELECT list grows by `m.content_encrypted` and `m.conversation_id`: the first is the body
+/// under an encrypted policy, the second is an AAD field. Aliasing `m.id` to `message_uuid` is
+/// kept for the existing consumers, and the alias is what the identity below binds.
 pub(crate) async fn find_recent_messages(
     pool: &PgPool,
+    opener: &dyn ContentOpener,
     conversation_public_id: &str,
     before_sequence: i64,
     limit: i64,
 ) -> Result<Vec<HistoryMessage>, AppError> {
     let rows = sqlx::query(
         r#"
-            select m.id as message_uuid, m.role, m.content_plain, m.sequence_number
+            select m.id as message_uuid, m.conversation_id, m.role,
+                   m.content_plain, m.content_encrypted, m.sequence_number
             from conversation_messages m
             join conversations c on c.id = m.conversation_id
             where c.public_id = $1
@@ -2727,29 +3182,59 @@ pub(crate) async fn find_recent_messages(
     .await?;
     let mut messages = rows
         .iter()
-        .map(|row| {
-            Ok(HistoryMessage {
-                message_uuid: row.try_get("message_uuid")?,
-                role: row.try_get("role")?,
-                content: row.try_get("content_plain")?,
-                sequence_number: row.try_get("sequence_number")?,
-            })
-        })
+        .map(|row| history_message_from_row(row, opener))
         .collect::<Result<Vec<_>, AppError>>()?;
     messages.reverse();
     Ok(messages)
 }
 
+/// One history row, with the read-side precedence applied.
+///
+/// Shared by [`find_recent_messages`] and [`find_messages_after_sequence`] so the two cannot
+/// disagree about whether encrypted wins — they read the same columns for the same purpose, and
+/// two copies of a three-arm precedence is two places for it to be two arms.
+fn history_message_from_row(
+    row: &sqlx::postgres::PgRow,
+    opener: &dyn ContentOpener,
+) -> Result<HistoryMessage, AppError> {
+    let message_uuid: Uuid = row.try_get("message_uuid")?;
+    let conversation_id: Uuid = row.try_get("conversation_id")?;
+    let sequence_number: i64 = row.try_get("sequence_number")?;
+    let content = crate::infra::pg_rows::conversation_content_from_row(
+        row,
+        opener,
+        "content_plain",
+        "content_encrypted",
+        "conversation_messages",
+        message_uuid,
+        ContentIdentity::ConversationMessage {
+            message_id: message_uuid,
+            conversation_id,
+            sequence_number,
+        },
+    )?;
+    Ok(HistoryMessage {
+        message_uuid,
+        role: row.try_get("role")?,
+        content,
+        sequence_number,
+    })
+}
+
 /// The conversation's row id and the active summary that covers it, if any.
 ///
-/// `conversation_summaries` has no writer yet — summarization is Sub-Phase E, deliberately not
-/// in this wave. The read is here anyway rather than stubbed to `None`, because the planner's
-/// drop-priority order places the summary *above* retrieved content, and wiring that ordering
-/// only once a writer exists would mean the ordering shipped untested. Today this reliably
-/// returns `None`, and the planner's summary branch is exercised by a fixture that inserts a
-/// row directly.
+/// This comment used to say `conversation_summaries` had no writer and that the read reliably
+/// returned `None`. That stopped being true when Sub-Phase E landed
+/// [`insert_conversation_summary`], and issue #139 makes it wrong a second way: the body it
+/// returns may have come out of `summary_text_encrypted` rather than `summary_text_plain`.
+///
+/// The lateral join is a `left` join, so a conversation with no summary yields NULL for every
+/// `s.*` column — including the two the AAD needs. The opener is therefore gated on `summary_id`
+/// being present rather than on the ciphertext being non-null: reading `covers_through_sequence`
+/// out of a summary-less row would be a decode error on an entirely ordinary conversation.
 pub(crate) async fn find_conversation_context_anchor(
     pool: &PgPool,
+    opener: &dyn ContentOpener,
     conversation_public_id: &str,
 ) -> Result<Option<(Uuid, Option<Uuid>, Option<String>, i64)>, AppError> {
     let row = sqlx::query(
@@ -2757,10 +3242,13 @@ pub(crate) async fn find_conversation_context_anchor(
             select c.id as conversation_uuid,
                    s.id as summary_id,
                    s.summary_text_plain,
+                   s.summary_text_encrypted,
+                   s.covers_through_sequence,
                    coalesce(c.message_count, 0) as message_count
             from conversations c
             left join lateral (
-                select s.id, s.summary_text_plain
+                select s.id, s.summary_text_plain, s.summary_text_encrypted,
+                       s.covers_through_sequence
                 from conversation_summaries s
                 where s.conversation_id = c.id and s.superseded_at is null
                 order by s.summary_version desc
@@ -2772,15 +3260,37 @@ pub(crate) async fn find_conversation_context_anchor(
     .bind(conversation_public_id)
     .fetch_optional(pool)
     .await?;
-    row.map(|row| {
-        Ok((
-            row.try_get("conversation_uuid")?,
-            row.try_get("summary_id")?,
-            row.try_get("summary_text_plain")?,
-            row.try_get("message_count")?,
-        ))
-    })
-    .transpose()
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let conversation_uuid: Uuid = row.try_get("conversation_uuid")?;
+    let summary_id: Option<Uuid> = row.try_get("summary_id")?;
+    // The lateral join is `left`, so with no summary every `s.*` column is NULL — including the
+    // two the AAD needs. Opening is therefore gated on `summary_id`, not on the ciphertext being
+    // non-null: reading `covers_through_sequence` out of a row that has no summary would be a
+    // decode error on a perfectly ordinary conversation.
+    let summary_text = match summary_id {
+        Some(summary_id) => crate::infra::pg_rows::conversation_content_from_row(
+            &row,
+            opener,
+            "summary_text_plain",
+            "summary_text_encrypted",
+            "conversation_summaries",
+            summary_id,
+            ContentIdentity::ConversationSummary {
+                summary_id,
+                conversation_id: conversation_uuid,
+                covers_through_sequence: row.try_get("covers_through_sequence")?,
+            },
+        )?,
+        None => None,
+    };
+    Ok(Some((
+        conversation_uuid,
+        summary_id,
+        summary_text,
+        row.try_get("message_count")?,
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -2808,14 +3318,32 @@ pub struct ConversationSummaryRow {
     pub superseded_at: Option<chrono::DateTime<Utc>>,
 }
 
+/// The row must project `conversation_id` and `summary_text_encrypted` on top of what it used to:
+/// the first is an AAD field, the second is where the body lives under `encrypted_content`.
 fn conversation_summary_row_from(
     row: &sqlx::postgres::PgRow,
+    opener: &dyn ContentOpener,
 ) -> Result<ConversationSummaryRow, AppError> {
+    let id: Uuid = row.try_get("id")?;
+    let covers_through_sequence: i64 = row.try_get("covers_through_sequence")?;
+    let summary_text = crate::infra::pg_rows::conversation_content_from_row(
+        row,
+        opener,
+        "summary_text_plain",
+        "summary_text_encrypted",
+        "conversation_summaries",
+        id,
+        ContentIdentity::ConversationSummary {
+            summary_id: id,
+            conversation_id: row.try_get("conversation_id")?,
+            covers_through_sequence,
+        },
+    )?;
     Ok(ConversationSummaryRow {
-        id: row.try_get("id")?,
+        id,
         summary_version: row.try_get("summary_version")?,
-        covers_through_sequence: row.try_get("covers_through_sequence")?,
-        summary_text: row.try_get("summary_text_plain")?,
+        covers_through_sequence,
+        summary_text,
         token_count: row.try_get("token_count")?,
         created_at: row.try_get("created_at")?,
         superseded_at: row.try_get("superseded_at")?,
@@ -2831,12 +3359,14 @@ fn conversation_summary_row_from(
 /// a historical row predating that write should not make this ambiguous.
 pub(crate) async fn find_active_conversation_summary(
     pool: &PgPool,
+    opener: &dyn ContentOpener,
     conversation_uuid: Uuid,
 ) -> Result<Option<ConversationSummaryRow>, AppError> {
     let row = sqlx::query(
         r#"
-            select id, summary_version, covers_through_sequence,
-                   summary_text_plain, token_count, created_at, superseded_at
+            select id, conversation_id, summary_version, covers_through_sequence,
+                   summary_text_plain, summary_text_encrypted, token_count,
+                   created_at, superseded_at
             from conversation_summaries
             where conversation_id = $1 and superseded_at is null
             order by summary_version desc
@@ -2846,7 +3376,9 @@ pub(crate) async fn find_active_conversation_summary(
     .bind(conversation_uuid)
     .fetch_optional(pool)
     .await?;
-    row.as_ref().map(conversation_summary_row_from).transpose()
+    row.as_ref()
+        .map(|row| conversation_summary_row_from(row, opener))
+        .transpose()
 }
 
 /// How many live messages sit after a coverage boundary.
@@ -2887,13 +3419,15 @@ pub(crate) async fn count_messages_after_sequence(
 /// nothing downstream could detect.
 pub(crate) async fn find_messages_after_sequence(
     pool: &PgPool,
+    opener: &dyn ContentOpener,
     conversation_uuid: Uuid,
     after_sequence: i64,
     limit: i64,
 ) -> Result<Vec<HistoryMessage>, AppError> {
     let rows = sqlx::query(
         r#"
-            select id as message_uuid, role, content_plain, sequence_number
+            select id as message_uuid, conversation_id, role,
+                   content_plain, content_encrypted, sequence_number
             from conversation_messages
             where conversation_id = $1
               and deleted_at is null
@@ -2908,14 +3442,7 @@ pub(crate) async fn find_messages_after_sequence(
     .fetch_all(pool)
     .await?;
     rows.iter()
-        .map(|row| {
-            Ok(HistoryMessage {
-                message_uuid: row.try_get("message_uuid")?,
-                role: row.try_get("role")?,
-                content: row.try_get("content_plain")?,
-                sequence_number: row.try_get("sequence_number")?,
-            })
-        })
+        .map(|row| history_message_from_row(row, opener))
         .collect()
 }
 
@@ -2924,8 +3451,14 @@ pub(crate) async fn find_messages_after_sequence(
 pub struct ConversationSummaryInsert<'a> {
     pub conversation_uuid: Uuid,
     pub covers_through_sequence: i64,
-    /// `None` when the application's persistence policy excludes plaintext.
-    pub summary_text: Option<&'a str>,
+    /// What to store for the summary body — **replacing** the former
+    /// `summary_text: Option<&'a str>`, for the reasons [`ContentWrite`] gives.
+    ///
+    /// Unlike [`ConversationMessageInsert::content`], this arrives already resolved: this write
+    /// has exactly one caller, and that caller has already read the application's policy in order
+    /// to decide whether a run should happen at all. Re-reading it here would be a second read of
+    /// the same document in the same request, able to disagree with the first.
+    pub summary_text: ContentWrite,
     /// `request_hash` over the summary bytes — a content address, written even when the text is
     /// not, so two runs producing the same summary are recognisable without the body.
     pub summary_hash: &'a str,
@@ -2953,6 +3486,7 @@ pub struct ConversationSummaryInsert<'a> {
 /// reached only by a genuine race, which is exactly what it is for.
 pub(crate) async fn insert_conversation_summary(
     pool: &PgPool,
+    access: &(impl ContentSealer + ContentOpener),
     insert: &ConversationSummaryInsert<'_>,
 ) -> Result<ConversationSummaryRow, AppError> {
     let mut tx = pool.begin().await?;
@@ -2976,29 +3510,52 @@ pub(crate) async fn insert_conversation_summary(
     .bind(insert.conversation_uuid)
     .fetch_one(&mut *tx)
     .await?;
+    // **Named, not inline.** This used to be `.bind(Uuid::now_v7())` in the middle of the bind
+    // chain, which was fine while nothing else needed the value. The AAD binds `summary_id`, so
+    // the id the envelope authenticates and the id the row is stored under have to be the same
+    // `Uuid`; two calls to `now_v7()` would produce two, and the resulting row would be sealed
+    // against an identity that does not exist. `add_message` already named its id.
+    let summary_id = Uuid::now_v7();
+    let identity = ContentIdentity::ConversationSummary {
+        summary_id,
+        conversation_id: insert.conversation_uuid,
+        covers_through_sequence: insert.covers_through_sequence,
+    };
+    // Exhaustive, no catch-all — the same shape as `add_message`, and the `?` is the same
+    // refusal: an unsealable summary aborts the transaction, which leaves the *previous* summary
+    // active rather than superseding it for nothing.
+    let (summary_text_plain, summary_text_encrypted): (Option<&str>, Option<Vec<u8>>) =
+        match &insert.summary_text {
+            ContentWrite::Omitted => (None, None),
+            ContentWrite::Plain(text) => (Some(text.as_str()), None),
+            ContentWrite::Encrypt(text) => (None, Some(access.seal_content(&identity, text)?)),
+        };
     let row = sqlx::query(
         r#"
             insert into conversation_summaries (
                 id, conversation_id, summary_version, covers_through_sequence,
-                summary_text_plain, summary_hash, token_count, provider_model_id
+                summary_text_plain, summary_text_encrypted, summary_hash, token_count,
+                provider_model_id
             )
-            values ($1, $2, $3, $4, $5, $6, $7, $8)
-            returning id, summary_version, covers_through_sequence,
-                      summary_text_plain, token_count, created_at, superseded_at
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            returning id, conversation_id, summary_version, covers_through_sequence,
+                      summary_text_plain, summary_text_encrypted, token_count,
+                      created_at, superseded_at
             "#,
     )
-    .bind(Uuid::now_v7())
+    .bind(summary_id)
     .bind(insert.conversation_uuid)
     .bind(next_version)
     .bind(insert.covers_through_sequence)
-    .bind(insert.summary_text)
+    .bind(summary_text_plain)
+    .bind(summary_text_encrypted)
     .bind(insert.summary_hash)
     .bind(insert.token_count)
     .bind(insert.provider_model_id)
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
-    conversation_summary_row_from(&row)
+    conversation_summary_row_from(&row, access)
 }
 
 /// The route key the conversation's most recent completed turn was issued against.
@@ -4009,7 +4566,7 @@ impl ConversationRepository for InMemoryConversationRepository {
         &self,
         _public_id: &str,
         _request: &MemoryPatchRequest,
-        _content_hash: Option<&str>,
+        _content: Option<ContentWrite>,
     ) -> Result<MemoryRecord, AppError> {
         Err(not_stubbed("patch_memory"))
     }

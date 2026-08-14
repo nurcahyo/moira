@@ -62,6 +62,11 @@ export MOIRA_SECRETS__MASTER_KEY_BASE64="$(openssl rand -base64 32)"
 export MOIRA_SECRETS__KEY_ID=local-dev
 export MOIRA_API_KEYS__PEPPER_BASE64="$(openssl rand -base64 32)"
 export MOIRA_API_KEYS__PEPPER_VERSION=local-dev
+# Content encryption at rest. Required in production — the process refuses to start without it,
+# and there is no fallback to MOIRA_SECRETS__MASTER_KEY_BASE64. The value is an
+# "<id>:<base64>" list; keep every key an existing row may have been sealed under listed.
+export MOIRA_CONTENT_ENCRYPTION__KEYS="local-dev:$(openssl rand -base64 32)"
+export MOIRA_CONTENT_ENCRYPTION__ACTIVE_KEY_ID=local-dev
 ```
 
 `.env.example` lists the supported local environment variables for shells, containers, and process managers. The Moira binary does not load `.env` automatically; if you use one, export it before running the process:
@@ -201,6 +206,27 @@ After configuring providers, models, credentials, routes, and routing policies, 
 cargo run -- execute-test -- --prompt "Hello" --route general
 ```
 
+## Content key rotation
+
+`moira keyring` is the operator surface for the content-encryption keyring — a process
+mode, deliberately not an admin endpoint. `cargo run -- keyring` prints the verbs.
+
+```bash
+cargo run -- keyring status                                  # ids, states, master keys, row counts
+cargo run -- keyring add                                     # mint a data key, 'pending'
+cargo run -- keyring promote <id>                            # R1: rotate the DATA key. No restart,
+                                                             #     nothing re-encrypted.
+cargo run -- keyring rewrap --to <master-key-id>             # R2/R3: rotate the MASTER key. No row
+                                                             #        of user data is read or written.
+cargo run -- keyring abandon <id> --confirm --reason "<text>" # acknowledge a permanently lost
+                                                             # master key. Irreversible data loss.
+```
+
+The full four-step master-key procedure, and why the order is enforced rather than merely
+documented, is [`docs/decision-encryption-at-rest.md`](docs/decision-encryption-at-rest.md) §9.
+`make rotate-keys` performs a real R1 **and** a real R2 against your local database, so the
+path is exercised routinely rather than for the first time on the day it is needed.
+
 Run the standard quality checks before handoff:
 
 ```bash
@@ -230,6 +256,17 @@ panic with an explanation. If you genuinely want to run without one — knowing 
 almost all of Moira's coverage — set `MOIRA_TEST_ALLOW_NO_DATABASE=1`; it is ignored when
 `CI=true`, and the skip line it prints still reds `scripts/gates.sh`.
 
+**The keyring-rotation gate does not honour that opt-out at all.** The rotation suite
+(`src/security/keyring_admin/tests.rs`) takes its database from
+`test_support::rotation_gate_database`, which returns a database or panics — so there is
+no early-return form for one of those tests to be written with, and no configuration in
+which they report success without having run. `scripts/rotation-gate.sh` (`make
+rotation-gate`, and the `rotation-gate` CI job) additionally asserts that a non-zero
+number of them **executed**, checked against the count declared in the source: deleting
+the module or renaming it out of the filter reds the gate rather than quietly removing
+the only proof that master-key rotation works. The reasoning is
+[`docs/decision-encryption-at-rest.md`](docs/decision-encryption-at-rest.md) §12.
+
 Validate database migrations against the local pgvector Postgres container when database behavior changes:
 
 ```bash
@@ -250,6 +287,6 @@ scripts/mutants.sh            # mutants in this branch's src/ diff against origi
 
 Scoped to the diff on purpose, and deliberately not a CI gate. See [docs/mutation-testing.md](docs/mutation-testing.md) for how to read a surviving mutant and the condition under which it would become one.
 
-See [docs/conversations.md](docs/conversations.md), [docs/conversation-api.md](docs/conversation-api.md), [docs/conversation-persistence.md](docs/conversation-persistence.md), [docs/context-planning.md](docs/context-planning.md), [docs/conversation-summarization.md](docs/conversation-summarization.md), [docs/memory-architecture.md](docs/memory-architecture.md), [docs/memory-policy.md](docs/memory-policy.md), [docs/memory-consent.md](docs/memory-consent.md), [docs/memory-extraction.md](docs/memory-extraction.md), [docs/memory-retrieval.md](docs/memory-retrieval.md), [docs/memory-correction-and-deletion.md](docs/memory-correction-and-deletion.md), [docs/rag-architecture.md](docs/rag-architecture.md), [docs/rag-collections.md](docs/rag-collections.md), [docs/document-ingestion.md](docs/document-ingestion.md), [docs/document-chunking.md](docs/document-chunking.md), [docs/embeddings.md](docs/embeddings.md), [docs/pgvector.md](docs/pgvector.md), [docs/retrieval-ranking.md](docs/retrieval-ranking.md), [docs/retrieval-citations.md](docs/retrieval-citations.md), [docs/rag-security.md](docs/rag-security.md), [docs/conversation-memory-rag-api.md](docs/conversation-memory-rag-api.md), [docs/data-retention-and-deletion.md](docs/data-retention-and-deletion.md), [docs/public-api.md](docs/public-api.md), [docs/responses-api.md](docs/responses-api.md), [docs/streaming-api.md](docs/streaming-api.md), [docs/public-authentication.md](docs/public-authentication.md), [docs/public-authorization.md](docs/public-authorization.md), [docs/idempotency.md](docs/idempotency.md), [docs/response-persistence.md](docs/response-persistence.md), [docs/execution-and-usage-api.md](docs/execution-and-usage-api.md), [docs/model-and-route-discovery.md](docs/model-and-route-discovery.md), [docs/openai-compatibility.md](docs/openai-compatibility.md), [docs/admin-api.md](docs/admin-api.md), [docs/application-management.md](docs/application-management.md), [docs/provider-management.md](docs/provider-management.md), [docs/provider-credential-management.md](docs/provider-credential-management.md), [docs/jwt-issuer-management.md](docs/jwt-issuer-management.md), [docs/admin-identity-claiming.md](docs/admin-identity-claiming.md), [docs/admin-invitations.md](docs/admin-invitations.md), [docs/system-and-consumer-keys.md](docs/system-and-consumer-keys.md), [docs/audit-api.md](docs/audit-api.md), [docs/runtime-architecture.md](docs/runtime-architecture.md), [docs/rig-integration.md](docs/rig-integration.md), [docs/task-routing.md](docs/task-routing.md), [docs/model-routing.md](docs/model-routing.md), [docs/credential-resolution-runtime.md](docs/credential-resolution-runtime.md), [docs/provider-runtime-factory.md](docs/provider-runtime-factory.md), [docs/provider-pools.md](docs/provider-pools.md), [docs/concurrency-and-backpressure.md](docs/concurrency-and-backpressure.md), [docs/retry-and-fallback.md](docs/retry-and-fallback.md), [docs/circuit-breakers.md](docs/circuit-breakers.md), [docs/runtime-events.md](docs/runtime-events.md), [docs/execution-attempts-and-usage.md](docs/execution-attempts-and-usage.md), [docs/runtime-diagnostics.md](docs/runtime-diagnostics.md), [docs/runtime-cache-invalidation.md](docs/runtime-cache-invalidation.md), [docs/deployment.md](docs/deployment.md), [docs/kubernetes.md](docs/kubernetes.md), [docs/redis.md](docs/redis.md), [docs/otel.md](docs/otel.md), [docs/prometheus.md](docs/prometheus.md), [docs/grafana.md](docs/grafana.md), [docs/production-checklist.md](docs/production-checklist.md), [docs/security.md](docs/security.md), [docs/disaster-recovery.md](docs/disaster-recovery.md), [docs/scaling.md](docs/scaling.md), [docs/load-testing.md](docs/load-testing.md), [docs/chaos-testing.md](docs/chaos-testing.md), [docs/enterprise-operations.md](docs/enterprise-operations.md), [docs/todo.md](docs/todo.md), and [docs/openapi.md](docs/openapi.md). See [docs/project-structure.md](docs/project-structure.md) for module boundaries and agent guidance.
+See [docs/conversations.md](docs/conversations.md), [docs/conversation-api.md](docs/conversation-api.md), [docs/conversation-persistence.md](docs/conversation-persistence.md), [docs/context-planning.md](docs/context-planning.md), [docs/conversation-summarization.md](docs/conversation-summarization.md), [docs/memory-architecture.md](docs/memory-architecture.md), [docs/memory-policy.md](docs/memory-policy.md), [docs/memory-consent.md](docs/memory-consent.md), [docs/memory-extraction.md](docs/memory-extraction.md), [docs/memory-retrieval.md](docs/memory-retrieval.md), [docs/memory-correction-and-deletion.md](docs/memory-correction-and-deletion.md), [docs/rag-architecture.md](docs/rag-architecture.md), [docs/rag-collections.md](docs/rag-collections.md), [docs/document-ingestion.md](docs/document-ingestion.md), [docs/document-chunking.md](docs/document-chunking.md), [docs/embeddings.md](docs/embeddings.md), [docs/pgvector.md](docs/pgvector.md), [docs/retrieval-ranking.md](docs/retrieval-ranking.md), [docs/retrieval-citations.md](docs/retrieval-citations.md), [docs/rag-security.md](docs/rag-security.md), [docs/conversation-memory-rag-api.md](docs/conversation-memory-rag-api.md), [docs/data-retention-and-deletion.md](docs/data-retention-and-deletion.md), [docs/public-api.md](docs/public-api.md), [docs/responses-api.md](docs/responses-api.md), [docs/streaming-api.md](docs/streaming-api.md), [docs/public-authentication.md](docs/public-authentication.md), [docs/public-authorization.md](docs/public-authorization.md), [docs/idempotency.md](docs/idempotency.md), [docs/response-persistence.md](docs/response-persistence.md), [docs/execution-and-usage-api.md](docs/execution-and-usage-api.md), [docs/model-and-route-discovery.md](docs/model-and-route-discovery.md), [docs/openai-compatibility.md](docs/openai-compatibility.md), [docs/admin-api.md](docs/admin-api.md), [docs/application-management.md](docs/application-management.md), [docs/provider-management.md](docs/provider-management.md), [docs/provider-credential-management.md](docs/provider-credential-management.md), [docs/jwt-issuer-management.md](docs/jwt-issuer-management.md), [docs/admin-identity-claiming.md](docs/admin-identity-claiming.md), [docs/admin-invitations.md](docs/admin-invitations.md), [docs/system-and-consumer-keys.md](docs/system-and-consumer-keys.md), [docs/audit-api.md](docs/audit-api.md), [docs/runtime-architecture.md](docs/runtime-architecture.md), [docs/rig-integration.md](docs/rig-integration.md), [docs/task-routing.md](docs/task-routing.md), [docs/model-routing.md](docs/model-routing.md), [docs/credential-resolution-runtime.md](docs/credential-resolution-runtime.md), [docs/provider-runtime-factory.md](docs/provider-runtime-factory.md), [docs/provider-pools.md](docs/provider-pools.md), [docs/concurrency-and-backpressure.md](docs/concurrency-and-backpressure.md), [docs/retry-and-fallback.md](docs/retry-and-fallback.md), [docs/circuit-breakers.md](docs/circuit-breakers.md), [docs/runtime-events.md](docs/runtime-events.md), [docs/execution-attempts-and-usage.md](docs/execution-attempts-and-usage.md), [docs/runtime-diagnostics.md](docs/runtime-diagnostics.md), [docs/runtime-cache-invalidation.md](docs/runtime-cache-invalidation.md), [docs/deployment.md](docs/deployment.md), [docs/kubernetes.md](docs/kubernetes.md), [docs/console-multi-provider-rollout.md](docs/console-multi-provider-rollout.md), [docs/redis.md](docs/redis.md), [docs/otel.md](docs/otel.md), [docs/prometheus.md](docs/prometheus.md), [docs/grafana.md](docs/grafana.md), [docs/production-checklist.md](docs/production-checklist.md), [docs/security.md](docs/security.md), [docs/decision-encryption-at-rest.md](docs/decision-encryption-at-rest.md), [docs/disaster-recovery.md](docs/disaster-recovery.md), [docs/scaling.md](docs/scaling.md), [docs/load-testing.md](docs/load-testing.md), [docs/chaos-testing.md](docs/chaos-testing.md), [docs/enterprise-operations.md](docs/enterprise-operations.md), [docs/todo.md](docs/todo.md), and [docs/openapi.md](docs/openapi.md). See [docs/project-structure.md](docs/project-structure.md) for module boundaries and agent guidance.
 
 For the response localization contract, see [docs/i18n-response-contract.md](docs/i18n-response-contract.md) and the runtime registry at [src/i18n/catalog/](src/i18n/catalog/). The directory index lives in [src/i18n/catalog/mod.rs](src/i18n/catalog/mod.rs), with error translations in [src/i18n/catalog/errors.rs](src/i18n/catalog/errors.rs) and notice translations in [src/i18n/catalog/notices.rs](src/i18n/catalog/notices.rs). The docs copy lives at [docs/i18n-response-catalog.json](docs/i18n-response-catalog.json).

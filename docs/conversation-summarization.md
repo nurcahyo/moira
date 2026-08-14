@@ -106,7 +106,10 @@ summary exists" and "the summary text is available" are two separate facts.
   conversation accumulated plaintext under `plain_content` and the operator then tightened the
   policy, which is the case `a_summary_is_withheld_when_the_policy_no_longer_admits_plaintext`
   drives.
-- `encrypted_content` **does not encrypt**, and the admin API refuses it
-  (`conversation_content_persistence_unsupported`, 422). No cipher is wired to the
-  `content_encrypted`/`summary_text_encrypted` columns on any table. A policy row that already
-  holds the value keeps parsing and fails closed — no plaintext is written under it.
+- `encrypted_content` **seals the summary** into `summary_text_encrypted` (issue #139) and leaves
+  `summary_text_plain` null. `covers_through_sequence`, `summary_hash` and `token_count` are
+  written exactly as under `plain_content`, and `token_count` is measured on the plaintext. The
+  AAD binds the summary's id, its conversation and its coverage boundary, which is why
+  `insert_conversation_summary` names its `Uuid::now_v7()` instead of binding it inline. If no
+  usable content key exists the whole insert is abandoned — `503 content_key_unavailable`, and the
+  *previous* summary stays active rather than being superseded for nothing.

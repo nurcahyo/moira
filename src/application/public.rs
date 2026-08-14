@@ -2100,10 +2100,32 @@ fn citations_from_link(link: Option<&ConversationExecutionLink>) -> Vec<PublicCi
 /// The literal was previously `"metadata_only_persistence"` unconditionally, which is correct
 /// for the default configuration and **false** for the other three modes — it named a cause
 /// the operator had not configured, sending them to change a setting that was not the reason.
-/// `plain_content` and `encrypted_content` are honoured by nothing in the tree (see
-/// `docs/response-persistence.md`, and F33 for the five unused encryption-at-rest columns), so
-/// the honest answer for those is that content persistence is unimplemented, not that the
-/// application asked for metadata only.
+/// `plain_content` and `encrypted_content` are honoured by nothing in the tree, so the honest
+/// answer for those is that content persistence is unimplemented, not that the application
+/// asked for metadata only.
+///
+/// # Why it is still unimplemented — the reason changed, the answer did not
+///
+/// The old reason was "no cipher is wired to the `*_encrypted` columns". That stopped being
+/// true when the envelope-encryption release train landed (issues #139, #140, #141): all five
+/// of F33's columns now seal and open. Restating it would be prose that is merely stale, which
+/// is worse than none — it points a reader at work that is finished.
+///
+/// **The remaining gap is a schema gap, and it is wider than the encrypted half.**
+/// `migrations/0006_public_execution_api.sql` creates `responses` with no output body column of
+/// *either* form: not `output_text_plain`, not `output_text_encrypted`. What it stores of an
+/// execution's result is `output_summary jsonb`, `usage_summary jsonb`, `failure_class`,
+/// `failure_message` and the `output_persisted` boolean. The only two later migrations to touch
+/// the table add `conversation_id` (`0007`) and `updated_at` (`0008`). So `plain_content` has
+/// nowhere to write either, and the five `*_encrypted` columns this build seals all belong to
+/// `conversation_messages`, `conversation_summaries`, `memory_records`,
+/// `rag_document_versions` and `rag_chunks` — none of them to `responses`.
+///
+/// Implementing either mode therefore needs **new DDL**, not a cipher, which is why
+/// `docs/decision-encryption-at-rest.md` §14 resolves
+/// [#103](https://github.com/nurcahyo/moira/issues/103) toward *refuse with a 422, symmetric
+/// with the conversation side* rather than *implement*. This arm stays exactly as it is until
+/// that decision is taken; it is a finding, not an omission.
 ///
 /// An absent or unrecognised mode falls back to the previous literal: `output_summary` is
 /// always written on the completed path, so the fallback is unreachable, and if it ever became
@@ -2221,9 +2243,14 @@ fn map_runtime_event(
         // A dangling `agent_profile_id` is an operator fault in this deployment's
         // configuration, and its payload names a route and a profile the caller has no
         // relationship with. Putting it on the public SSE contract would leak the shape of
-        // the admin plane to every API consumer and would say nothing they could act on.
-        // The audiences that need it are the diagnostic endpoint (which returns every
-        // `RuntimeEventEnvelope` verbatim), the `warn!` and the audit row.
+        // the admin plane to every API consumer. The audiences that need it are the
+        // diagnostic endpoint (which returns every `RuntimeEventEnvelope` verbatim), the
+        // `warn!` and the audit row.
+        //
+        // Issue #79 did not change this. The caller is now refused, and learns why from the
+        // terminal `response.failed` event's `agent_profile_disabled` /
+        // `agent_profile_not_found` error — which names the profile and the remedy without
+        // exposing the route id or the admin-plane event stream.
         RuntimeEventType::AgentProfileUnavailable => return None,
     };
     Some(public_sse(
@@ -2526,14 +2553,42 @@ fn failure_http_status(class: ExecutionFailureClass) -> axum::http::StatusCode {
         ExecutionFailureClass::RouteForbidden
         | ExecutionFailureClass::ModelForbidden
         | ExecutionFailureClass::CredentialForbidden => StatusCode::FORBIDDEN,
+        // Issue #79. `AgentProfileNotFound` joins the family it belongs to: a runtime reference on
+        // the resolution chain (route → agent profile → model → credential) that does not resolve
+        // is already a `404` for the route and for the credential, and neither of those is named
+        // by the caller either. The status also agrees with what the admin plane says about the
+        // same id — `GET /api/v1/admin/agent-profiles/{id}` answers `404` for a soft-deleted
+        // profile — and two different answers about one row would be worse than either.
         ExecutionFailureClass::NoEligibleModel
         | ExecutionFailureClass::ModelNotFound
         | ExecutionFailureClass::RouteNotFound
+        | ExecutionFailureClass::AgentProfileNotFound
         | ExecutionFailureClass::CredentialNotFound => StatusCode::NOT_FOUND,
+        // Issue #79, and deliberately *not* `404`: the profile exists, it is addressable on the
+        // admin plane, and the operator switched it off. Saying "not found" about a row an
+        // operator can see would send them looking for the wrong thing. `409` is the state
+        // conflict it is — the request cannot be completed while the target resource is in this
+        // state, and retrying is futile until the state changes. It is not `503`, which promises
+        // that waiting helps, and not `502`, which blames a provider none of this contacted.
+        ExecutionFailureClass::AgentProfileDisabled => StatusCode::CONFLICT,
         ExecutionFailureClass::CapacityExhausted => StatusCode::TOO_MANY_REQUESTS,
         ExecutionFailureClass::ProviderTimeout | ExecutionFailureClass::DeadlineExceeded => {
             StatusCode::GATEWAY_TIMEOUT
         }
+        // Issue #139. Spelled out rather than left to the `_` arm below, because these four are
+        // *also* raised as `AppError::coded(...)` from the conversation persistence path with an
+        // explicit status. Two different answers about one condition would be worse than either,
+        // so the statuses here are the same ones
+        // `crate::security::content_access` uses, and the test
+        // `content_failure_classes_agree_with_the_statuses_content_access_raises` compares them.
+        //
+        // `503` for the two key conditions that a restored key or a keyring refresh fixes; `500`
+        // for the two that name damaged or unreadable stored bytes, where waiting does not help
+        // and no provider was involved — which is what `502` would wrongly imply.
+        ExecutionFailureClass::ContentKeyUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+        ExecutionFailureClass::ContentDecryptionFailed
+        | ExecutionFailureClass::ContentEnvelopeUnsupported
+        | ExecutionFailureClass::ContentKeyAbandoned => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::BAD_GATEWAY,
     }
 }
@@ -2765,9 +2820,11 @@ mod tests {
         assert_eq!(pipeline.names().last().copied(), Some("AuditInterceptor"));
     }
 
-    #[test]
-    fn metadata_rejects_secret_like_keys() {
-        let state = AppState::new(crate::config::Settings::default(), None).unwrap();
+    #[tokio::test]
+    async fn metadata_rejects_secret_like_keys() {
+        let state = AppState::new(crate::config::Settings::default(), None)
+            .await
+            .unwrap();
         let metadata = json!({ "api_key": "sk-test" });
         assert!(validate_metadata(&state, &metadata).is_err());
     }

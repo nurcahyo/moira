@@ -61,7 +61,9 @@ import { consoleSessionCheck } from "./auth";
 import { consoleRuntime, type ConsoleRuntime } from "./auth-runtime";
 import { consoleEnv, type ConsoleEnv } from "./env";
 import { isMoiraRequestError, type MoiraError } from "./errors";
+import { CONSOLE_MESSAGE_KEYS } from "./i18n/keys";
 import type { MoiraClient } from "./moira-client";
+import type { AdminIdentityRecord } from "./types";
 import { moiraClientForSession, type ConsoleSessionIdentity } from "./moira-session";
 
 /** What a guarded handler is handed. Never the raw request headers. */
@@ -79,6 +81,25 @@ export interface ConsoleApiContext {
    */
   readonly client: MoiraClient;
   readonly env: ConsoleEnv;
+  /**
+   * The `admin_identities` NAMESPACE this session belongs to —
+   * `SessionCheck.consoleIssuer`, resolved from the configuration that actually
+   * resolved the cookie, never a caller's string.
+   *
+   * Forwarded for issue #185's ownership gate: `admin_identities` is keyed by
+   * `(issuer, subject)`, so "is this caller the owner" is unanswerable without
+   * it. `consoleSessionCheck` has always resolved it; nothing downstream could
+   * see it.
+   */
+  readonly consoleIssuer: string;
+  /**
+   * The `auth_provider_settings` ROW this session was established through.
+   *
+   * `consoleIssuer` answers "which namespace"; this answers "which provider",
+   * and the two are not interchangeable when the question is whether a caller
+   * may REWRITE that row — which is exactly what `/settings/auth` asks.
+   */
+  readonly moiraProviderId: string;
 }
 
 export type ConsoleApiHandler = (context: ConsoleApiContext) => Promise<Response>;
@@ -208,7 +229,13 @@ export async function withConsoleSession(
       : wiring.clientFor(env, runtimeState, request.headers);
 
   try {
-    return await handler({ identity: check.identity, client, env });
+    return await handler({
+      identity: check.identity,
+      client,
+      env,
+      consoleIssuer: check.consoleIssuer,
+      moiraProviderId: check.moiraProviderId,
+    });
   } catch (error) {
     if (isMoiraRequestError(error)) {
       return Response.json(moiraErrorBody(error.moiraError), {
@@ -275,6 +302,117 @@ export type PageLookup<T> =
   | { readonly kind: "found"; readonly row: T }
   | { readonly kind: "absent" }
   | { readonly kind: "truncated" };
+
+/**
+ * The OWNER gate (issue #185). Ownership is row state, not a scope.
+ *
+ * ============================================================================
+ * WHY THIS EXISTS WHEN MOIRA ALREADY REFUSES
+ * ============================================================================
+ *
+ * Moira gates the auth-provider WRITE surface on `require_primary_actor`, so a
+ * non-owner's request is refused at the source whatever this console believes.
+ * That refusal is the enforcement; this function is not.
+ *
+ * What this buys is the thing a 403 arriving mid-form cannot: a screen that does
+ * not offer a control the caller may not use. The alternative — render the form
+ * to every admin and let Moira answer — teaches operators that the console shows
+ * them buttons that fail, which is how people learn to retry destructive things.
+ *
+ * It is therefore a PRE-CHECK and is described as one. It must never become the
+ * only check: a console-side gate is bypassable by anyone who can call Moira
+ * directly with their own bearer token, which every admin can.
+ *
+ * ============================================================================
+ * `truncated` IS ITS OWN ANSWER, NOT "not the owner"
+ * ============================================================================
+ *
+ * Issue #117's lesson, applied to the one lookup where getting it wrong is worst:
+ * an owner whose grant sits on page two would be told they are not the owner of
+ * a deployment they own, on the screen that exists to let them fix their sign-in.
+ * `lookupOnPage` distinguishes the three cases and each gets its own keyed
+ * refusal.
+ */
+export async function requireConsoleOwner(
+  context: ConsoleApiContext,
+): Promise<{ readonly ok: true } | { readonly ok: false; readonly response: Response }> {
+  const lookup = await lookUpOwnGrant(
+    context.client,
+    context.consoleIssuer,
+    context.identity.idpSubject,
+  );
+
+  if (lookup.kind === "truncated") {
+    return {
+      ok: false,
+      response: keyed(
+        409,
+        "admin_identity_lookup_truncated",
+        CONSOLE_MESSAGE_KEYS.authsettings_owner_lookup_truncated,
+      ),
+    };
+  }
+  if (lookup.kind === "absent") {
+    // A signed-in operator with no grant in this namespace. Reachable: the
+    // session resolved, so the domain allow-list admitted them, but nobody has
+    // granted them admin here.
+    return {
+      ok: false,
+      response: keyed(
+        403,
+        "admin_identity_not_primary",
+        CONSOLE_MESSAGE_KEYS.authsettings_owner_grant_absent,
+      ),
+    };
+  }
+  if (!grantIsOwner(lookup)) {
+    return {
+      ok: false,
+      response: keyed(
+        403,
+        "admin_identity_not_primary",
+        CONSOLE_MESSAGE_KEYS.authsettings_not_owner,
+      ),
+    };
+  }
+  return { ok: true };
+}
+
+/**
+ * One page is enough to find one grant on any deployment a flat admin list
+ * serves, and `truncated` is answered rather than guessed when it is not.
+ */
+const OWNER_LOOKUP_PAGE_LIMIT = 200;
+
+/**
+ * The caller's OWN `admin_identities` grant, if this page holds it.
+ *
+ * Exported because two surfaces ask the same question and must not answer it
+ * twice: the route handler (which owes a keyed refusal) and the PAGE (which owes
+ * a rendered explanation and cannot use a `Response`). A second lookup written
+ * for the page is a second predicate to keep in step with
+ * `admin_identities.is_primary`, and the first time they disagreed one of the
+ * two would be showing a form it should not.
+ *
+ * Matched on BOTH halves of the key. A subject is unique only within its issuer,
+ * and this console can hold several namespaces (wave 4B slugs), so a
+ * subject-only match could find a grant from a different namespace entirely.
+ */
+export async function lookUpOwnGrant(
+  client: MoiraClient,
+  consoleIssuer: string,
+  idpSubject: string,
+): Promise<PageLookup<AdminIdentityRecord>> {
+  const page = await client.listAdminIdentities({ limit: OWNER_LOOKUP_PAGE_LIMIT });
+  return lookupOnPage(page, (row) => row.issuer === consoleIssuer && row.subject === idpSubject);
+}
+
+/** Whether that grant is one that may rewrite the sign-in configuration. */
+export function grantIsOwner(lookup: PageLookup<AdminIdentityRecord>): boolean {
+  // `status` as well as `is_primary`: a revoked row keeps its flag, and a
+  // revoked owner is not an owner.
+  return lookup.kind === "found" && lookup.row.status === "active" && lookup.row.is_primary;
+}
 
 /**
  * Find one row on a single page, distinguishing a truncated page from an absent

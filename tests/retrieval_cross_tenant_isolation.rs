@@ -386,6 +386,73 @@ async fn memory_user_isolation_holds_even_when_the_other_user_scores_higher() {
     case.shutdown().await;
 }
 
+/// A **sealed** memory still reaches the prompt — issue #140.
+///
+/// # Why this belongs here and not with the other #140 cases
+///
+/// Retrieval is the read path that puts a memory in front of a model, and it does not go through
+/// `memory_record_from_row`: it has its own projection and its own mapper,
+/// `memory_candidate_from_row`. That mapper read `content_plain` and nothing else until this
+/// issue, so a build that sealed memory bodies while leaving it alone would render every stored
+/// memory as *absent* — the application would look like it had silently forgotten everything the
+/// moment an operator turned encryption on, with no error anywhere.
+///
+/// This case is here because the mutation that reintroduces exactly that — reverting
+/// `memory_candidate_from_row` to `row.try_get("content_plain")` — reddened **nothing** in the
+/// whole suite when it was tried. The isolation harness is the only one that drives a real
+/// candidate query into a real assembled context, which is what makes it the honest home for it.
+///
+/// The `must_not_contain` half is not decoration either: an out-of-scope sealed row must still be
+/// excluded by the scope predicate, and adding two columns to that query's projection is exactly
+/// the sort of edit that could disturb it.
+#[tokio::test]
+async fn a_sealed_memory_is_retrieved_and_decrypted_into_the_assembled_context() {
+    let Some(case) = Case::new().await else {
+        return;
+    };
+    case.service()
+        .put_conversation_policy(
+            &case.fixture.actor,
+            &request_context(),
+            case.fixture.application_id,
+            moira::domain::ConversationPolicyPutRequest {
+                conversation_content_persistence: Some(
+                    moira::domain::ConversationContentPersistence::EncryptedContent,
+                ),
+                ..moira::domain::ConversationPolicyPutRequest::default()
+            },
+        )
+        .await
+        .expect("encrypted_content must be accepted on a fixture with a loaded keyring");
+
+    let mine = case.fixture.caller_actor(Some("tenant-a"), Some("user-a"));
+    let theirs = case.fixture.caller_actor(Some("tenant-a"), Some("user-b"));
+    let own_id = case.seed_memory(&mine, OWN_TEXT).await;
+    let other_id = case.seed_memory(&theirs, OTHER_TEXT).await;
+    case.assert_memory_is_indexed(&own_id).await;
+    case.assert_memory_is_indexed(&other_id).await;
+
+    // Premise: the rows really are sealed. Without it this case passes identically against a
+    // build that ignored the policy and stored plaintext, and proves nothing about decryption.
+    let sealed: i64 = sqlx::query_scalar(
+        "select count(*) from memory_records \
+         where public_id = any($1) and content_plain is null and content_encrypted is not null",
+    )
+    .bind(vec![own_id.clone(), other_id.clone()])
+    .fetch_one(&case.fixture.pool)
+    .await
+    .expect("count sealed memories");
+    assert_eq!(
+        sealed, 2,
+        "both memories must be stored sealed for this case to be about the read path"
+    );
+
+    let planned = case.plan_for(&mine).await;
+    planned.must_contain(&own_id, OWN_TEXT);
+    planned.must_not_contain(&other_id, OTHER_TEXT);
+    case.shutdown().await;
+}
+
 #[tokio::test]
 async fn memory_tenant_isolation_holds_even_when_the_other_tenant_scores_higher() {
     let Some(case) = Case::new().await else {

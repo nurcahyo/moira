@@ -48,12 +48,21 @@ key32() { openssl rand -base64 32; }
 # it is not length-checked the way `master_key_bytes` is.
 key48() { openssl rand -base64 48; }
 
+# `MOIRA_CONTENT_ENCRYPTION__KEYS` is a *list* — "id:base64" entries joined by commas — so it
+# needs an id, unlike the three bare 32-byte secrets above. The key it mints is real and random:
+# the built-in development sentinel is refused whenever it appears in this variable, in every
+# environment, precisely so that shipping it is impossible.
+CONTENT_KEY_ID=local-dev
+content_key32() { printf '%s:%s' "$CONTENT_KEY_ID" "$(key32)"; }
+content_key_id() { printf '%s' "$CONTENT_KEY_ID"; }
+
 # Reuse the key material an existing file already holds.
 #
 # **What goes wrong without this.** `--force` rewrites `.env`, and every secret in
 # it is generated. But `MOIRA_SECRETS__MASTER_KEY_BASE64` is what every
 # `provider_credentials` row was sealed with, `MOIRA_API_KEYS__PEPPER_BASE64` is
-# what every live API key hash was peppered with, and `BETTER_AUTH_SECRET`
+# what every live API key hash was peppered with, `MOIRA_CONTENT_ENCRYPTION__KEYS`
+# is what every content data key is wrapped under, and `BETTER_AUTH_SECRET`
 # encrypts the console's stored ES256 signing key. Minting new ones does not
 # fail, and does not warn: the old rows simply stop being readable, at use time,
 # one endpoint at a time. The `.bak` file is the only copy left.
@@ -69,6 +78,12 @@ carry() {
 }
 
 MASTER_KEY=$(carry MOIRA_SECRETS__MASTER_KEY_BASE64 .env key32)
+# Seals every content data key. Carried like the rest: minting a new one orphans the keyring,
+# and `--force` is not a rotation.
+CONTENT_KEY=$(carry MOIRA_CONTENT_ENCRYPTION__KEYS .env content_key32)
+# Carried separately rather than parsed out of the line above, so a developer who adds a second
+# key by hand and points the active id at it keeps both across `make env-force`.
+CONTENT_ACTIVE=$(carry MOIRA_CONTENT_ENCRYPTION__ACTIVE_KEY_ID .env content_key_id)
 API_PEPPER=$(carry MOIRA_API_KEYS__PEPPER_BASE64 .env key32)
 IDEM_PEPPER=$(carry MOIRA_IDEMPOTENCY__PEPPER_BASE64 .env key32)
 AUTH_SECRET=$(carry BETTER_AUTH_SECRET console/.env.local key48)
@@ -151,6 +166,14 @@ MOIRA_DATABASE__MIGRATE_ON_STARTUP=true
 MOIRA_SECRETS__MASTER_KEY_BASE64=$MASTER_KEY
 MOIRA_SECRETS__KEY_ID=local-dev
 MOIRA_SECRETS__ALLOW_INSECURE_DEV_KEY=false
+
+# Content encryption at rest. Real random material, never the built-in sentinel — pasting the
+# sentinel into this variable is refused in every environment. The list format is
+# "<id>:<base64>"; every key an existing row may have been sealed under stays listed here.
+MOIRA_CONTENT_ENCRYPTION__CUSTODY=environment
+MOIRA_CONTENT_ENCRYPTION__KEYS=$CONTENT_KEY
+MOIRA_CONTENT_ENCRYPTION__ACTIVE_KEY_ID=$CONTENT_ACTIVE
+MOIRA_CONTENT_ENCRYPTION__ALLOW_INSECURE_DEV_KEY=false
 
 MOIRA_API_KEYS__PEPPER_BASE64=$API_PEPPER
 MOIRA_API_KEYS__PEPPER_VERSION=local-dev

@@ -354,7 +354,9 @@ async fn readyz_reports_cluster_lease_denied_when_the_lease_is_lost_mid_run() {
         cluster: settings.clone(),
         ..Settings::default()
     };
-    let state = AppState::new(app_settings, Some(database.pool.clone())).expect("app state");
+    let state = AppState::new(app_settings, Some(database.pool.clone()))
+        .await
+        .expect("app state");
     let router = build_router(state.clone()).expect("router");
 
     let handle = cluster_lease::acquire(Some(&database.pool), &settings, &state.cluster_lease)

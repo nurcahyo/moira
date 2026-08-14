@@ -560,12 +560,13 @@ async fn enabling_a_provider_with_incomplete_non_secret_config_is_refused() {
 /// would mask both halves of the anonymity boundary: the `401` a gated endpoint must return,
 /// and — worse — the `200` an anonymous one returns, which would prove nothing because the
 /// fallback actor would have satisfied a gate had one existed.
-fn router_with_admin_auth_enabled(fixture: &LifecycleFixture) -> Router {
+async fn router_with_admin_auth_enabled(fixture: &LifecycleFixture) -> Router {
     let mut settings = moira::config::Settings::default();
     settings.auth.jwks.allow_insecure_dev_urls = true;
     settings.auth.admin.enabled = true;
-    let state =
-        AppState::new(settings, Some(fixture.pool.clone())).expect("state with admin auth on");
+    let state = AppState::new(settings, Some(fixture.pool.clone()))
+        .await
+        .expect("state with admin auth on");
     moira::build_router(state).expect("router")
 }
 
@@ -589,7 +590,7 @@ async fn the_anonymous_setup_surface_is_claim_status_and_sign_in_methods_but_nev
     let Some(fixture) = LifecycleFixture::new().await else {
         return;
     };
-    let router = router_with_admin_auth_enabled(&fixture);
+    let router = router_with_admin_auth_enabled(&fixture).await;
 
     let claim_status = request(
         router.clone(),
@@ -690,7 +691,7 @@ async fn sign_in_methods_serves_a_populated_list_with_no_credential_and_no_secre
     assert_eq!(enabled.status, StatusCode::OK, "{:?}", enabled.body);
 
     let anonymous = request(
-        router_with_admin_auth_enabled(&fixture),
+        router_with_admin_auth_enabled(&fixture).await,
         "GET",
         "/api/v1/admin/setup/sign-in-methods",
         // No bearer token, no system key, no consumer key. Not a weak credential — none.
@@ -782,7 +783,7 @@ async fn sign_in_methods_omits_enabled_jwks_rows() {
     assert_eq!(enabled.status, StatusCode::OK, "{:?}", enabled.body);
 
     let anonymous = request(
-        router_with_admin_auth_enabled(&fixture),
+        router_with_admin_auth_enabled(&fixture).await,
         "GET",
         "/api/v1/admin/setup/sign-in-methods",
         HeaderMap::new(),

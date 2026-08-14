@@ -26,6 +26,39 @@ describe("navigation", () => {
     const link = screen.getByRole("link", { name: copy(CONSOLE_MESSAGE_KEYS.chrome_nav_admins) });
     expect(link.getAttribute("href")).toBe("/admins");
   });
+
+  test("/settings/llm is reachable without typing the URL", () => {
+    // The wizard's last step hands the operator to `/`, and the whole point of
+    // finishing setup is to point Moira at a provider. That screen shipped a
+    // wave after this header and was left out of it, so the only route to it
+    // was the address bar. This is the assertion that keeps it in the chrome.
+    render(<ConsoleHeader />);
+    const link = screen.getByRole("link", {
+      name: copy(CONSOLE_MESSAGE_KEYS.chrome_nav_llm_settings),
+    });
+    expect(link.getAttribute("href")).toBe("/settings/llm");
+  });
+
+  test("/settings/auth is reachable without typing the URL", () => {
+    // Issue #185. Shown to EVERY admin, not only the owner: reading the sign-in
+    // configuration escalates nothing, and a menu entry that disappears for some
+    // people is a support question nobody can answer from a screenshot. The
+    // screen itself says who may change it.
+    render(<ConsoleHeader />);
+    const link = screen.getByRole("link", {
+      name: copy(CONSOLE_MESSAGE_KEYS.chrome_nav_auth_settings),
+    });
+    expect(link.getAttribute("href")).toBe("/settings/auth");
+  });
+
+  test("/settings/keys is reachable without typing the URL", () => {
+    // Issue #180's screen, and the same failure mode as the one above: it is the
+    // last step of a first run — the credential the operator's own software
+    // presents — and a screen nothing links to is a screen nobody finds.
+    render(<ConsoleHeader />);
+    const link = screen.getByRole("link", { name: copy(CONSOLE_MESSAGE_KEYS.chrome_nav_keys) });
+    expect(link.getAttribute("href")).toBe("/settings/keys");
+  });
 });
 
 describe("sign-out is a POST, not a link", () => {
@@ -50,8 +83,7 @@ describe("sign-out is a POST, not a link", () => {
   });
 
   test("a refusal keeps the operator where they are and gives a client-side remedy", async () => {
-    const fetchImpl = (async () =>
-      new Response("{}", { status: 500 })) as unknown as typeof fetch;
+    const fetchImpl = (async () => new Response("{}", { status: 500 })) as unknown as typeof fetch;
     const visited: string[] = [];
 
     render(<ConsoleHeader fetchImpl={fetchImpl} navigate={(url) => visited.push(url)} />);

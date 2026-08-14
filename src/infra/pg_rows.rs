@@ -19,6 +19,7 @@ use crate::{
         TrustedJwtIssuerRecord,
     },
     error::AppError,
+    security::{ContentIdentity, ContentOpener, warn_content_storage_ambiguous},
 };
 
 pub fn provider_from_row(row: &sqlx::postgres::PgRow) -> Result<ProviderConfig, AppError> {
@@ -464,9 +465,38 @@ pub fn conversation_record_from_row(
     })
 }
 
+/// One `conversation_messages` row as the API exposes it.
+///
+/// # Why this takes an `opener`
+///
+/// This is a **pure function with no access to `AppState`**, so it cannot decrypt on its own —
+/// and a row whose body lives in `content_encrypted` would silently render as *absent* if it
+/// simply kept reading `content_plain`. Threading a [`ContentOpener`] through the signature makes
+/// the compiler visit every call site and demand an answer. That is the intended mechanism:
+/// a type error, not a grep (`docs/decision-encryption-at-rest.md` §8).
+///
+/// The row must therefore project `content_encrypted`, `id`, `conversation_id` and
+/// `sequence_number` — the last three are what the AAD binds. `conversation_message_select` does,
+/// through `message_rows.*`.
 pub fn conversation_message_record_from_row(
     row: &sqlx::postgres::PgRow,
+    opener: &dyn ContentOpener,
 ) -> Result<ConversationMessageRecord, AppError> {
+    let message_id: uuid::Uuid = row.try_get("id")?;
+    let sequence_number: i64 = row.try_get("sequence_number")?;
+    let content = conversation_content_from_row(
+        row,
+        opener,
+        "content_plain",
+        "content_encrypted",
+        "conversation_messages",
+        message_id,
+        ContentIdentity::ConversationMessage {
+            message_id,
+            conversation_id: row.try_get("conversation_id")?,
+            sequence_number,
+        },
+    )?;
     Ok(ConversationMessageRecord {
         id: row.try_get("public_id")?,
         object: "conversation.message".to_string(),
@@ -479,8 +509,8 @@ pub fn conversation_message_record_from_row(
             .map(|id| format!("exec_{id}")),
         role: conversation_message_role_from_db(row.try_get::<String, _>("role")?)?,
         message_type: conversation_message_type_from_db(row.try_get::<String, _>("message_type")?)?,
-        sequence_number: row.try_get("sequence_number")?,
-        content: row.try_get("content_plain")?,
+        sequence_number,
+        content,
         content_hash: row.try_get("content_hash")?,
         content_size_bytes: row.try_get("content_size_bytes")?,
         token_count: row.try_get("token_count")?,
@@ -488,6 +518,46 @@ pub fn conversation_message_record_from_row(
         deleted_at: row.try_get("deleted_at")?,
         metadata: row.try_get("metadata")?,
     })
+}
+
+/// The read-side precedence for a `(plain, encrypted)` content column pair — **defined once**.
+///
+/// ```text
+/// (_,          Some(bytes)) => open(...)?     // encrypted wins
+/// (Some(text), None)        => plaintext
+/// (None,       None)        => content absent  (policy `none` / `metadata_only`)
+/// ```
+///
+/// `(Some, Some)` cannot arise: migration 0027 adds
+/// `check (content_plain is null or content_encrypted is null)` to every affected table. The
+/// constraint is `NOT VALID`, though, so rows written before it was added were never checked —
+/// and a row holding both is *ambiguous*, not merely untidy. Encrypted wins, because it is the
+/// stricter of the two intentions and because rendering the plaintext of a row that also carries
+/// a sealed body would quietly serve content an operator believed was encrypted. Exactly one WARN
+/// naming the row is logged.
+///
+/// Every reader of a sealed column goes through this function rather than restating the three
+/// arms, so "encrypted wins" cannot hold in one place and not another.
+pub fn conversation_content_from_row(
+    row: &sqlx::postgres::PgRow,
+    opener: &dyn ContentOpener,
+    plain_column: &str,
+    encrypted_column: &str,
+    table: &'static str,
+    row_id: uuid::Uuid,
+    identity: ContentIdentity<'_>,
+) -> Result<Option<String>, AppError> {
+    let plain: Option<String> = row.try_get(plain_column)?;
+    let encrypted: Option<Vec<u8>> = row.try_get(encrypted_column)?;
+    match (plain, encrypted) {
+        (plain, Some(bytes)) => {
+            if plain.is_some() {
+                warn_content_storage_ambiguous(table, row_id);
+            }
+            opener.open_content(&bytes, &identity).map(Some)
+        }
+        (plain, None) => Ok(plain),
+    }
 }
 
 pub fn conversation_policy_record_from_row(
@@ -614,13 +684,36 @@ pub fn embedding_policy_record_from_row(
     })
 }
 
-pub fn memory_record_from_row(row: &sqlx::postgres::PgRow) -> Result<MemoryRecord, AppError> {
+/// One `memory_records` row as the API exposes it.
+///
+/// Takes an `opener` for the reason [`conversation_message_record_from_row`] gives, and the row
+/// must therefore project `content_encrypted`, `id`, `application_id` and `memory_scope` — the
+/// last three are AAD profile 3's identity. `memory_select` does, through `memory_rows.*`.
+pub fn memory_record_from_row(
+    row: &sqlx::postgres::PgRow,
+    opener: &dyn ContentOpener,
+) -> Result<MemoryRecord, AppError> {
+    let memory_id: uuid::Uuid = row.try_get("id")?;
+    let memory_scope: String = row.try_get("memory_scope")?;
+    let content = conversation_content_from_row(
+        row,
+        opener,
+        "content_plain",
+        "content_encrypted",
+        "memory_records",
+        memory_id,
+        ContentIdentity::MemoryRecord {
+            memory_id,
+            application_id: row.try_get("application_id")?,
+            memory_scope: &memory_scope,
+        },
+    )?;
     Ok(MemoryRecord {
         id: row.try_get("public_id")?,
         object: "memory".to_string(),
         memory_type: memory_type_from_db(row.try_get::<String, _>("memory_type")?)?,
-        scope: memory_scope_from_db(row.try_get::<String, _>("memory_scope")?)?,
-        content: row.try_get("content_plain")?,
+        scope: memory_scope_from_db(memory_scope.clone())?,
+        content,
         importance: row.try_get("importance")?,
         confidence: row.try_get("confidence")?,
         sensitivity: memory_sensitivity_from_db(row.try_get::<String, _>("sensitivity")?)?,
@@ -1164,6 +1257,8 @@ pub fn execution_failure_class_from_db(value: String) -> Result<ExecutionFailure
         "application_unavailable" => Ok(ExecutionFailureClass::ApplicationUnavailable),
         "route_not_found" => Ok(ExecutionFailureClass::RouteNotFound),
         "route_forbidden" => Ok(ExecutionFailureClass::RouteForbidden),
+        "agent_profile_not_found" => Ok(ExecutionFailureClass::AgentProfileNotFound),
+        "agent_profile_disabled" => Ok(ExecutionFailureClass::AgentProfileDisabled),
         "model_not_found" => Ok(ExecutionFailureClass::ModelNotFound),
         "model_forbidden" => Ok(ExecutionFailureClass::ModelForbidden),
         "model_capability_mismatch" => Ok(ExecutionFailureClass::ModelCapabilityMismatch),
@@ -1187,6 +1282,10 @@ pub fn execution_failure_class_from_db(value: String) -> Result<ExecutionFailure
         "deadline_exceeded" => Ok(ExecutionFailureClass::DeadlineExceeded),
         "structured_output_invalid" => Ok(ExecutionFailureClass::StructuredOutputInvalid),
         "stream_backpressure_exceeded" => Ok(ExecutionFailureClass::StreamBackpressureExceeded),
+        "content_decryption_failed" => Ok(ExecutionFailureClass::ContentDecryptionFailed),
+        "content_envelope_unsupported" => Ok(ExecutionFailureClass::ContentEnvelopeUnsupported),
+        "content_key_unavailable" => Ok(ExecutionFailureClass::ContentKeyUnavailable),
+        "content_key_abandoned" => Ok(ExecutionFailureClass::ContentKeyAbandoned),
         "internal_error" => Ok(ExecutionFailureClass::InternalError),
         _ => Err(AppError::Internal(format!(
             "unknown execution failure class {value}"

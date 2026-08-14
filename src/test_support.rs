@@ -246,6 +246,47 @@ pub(crate) async fn test_database() -> Option<LibTestDatabase> {
     Some(LibTestDatabase { pool, url, name })
 }
 
+/// The name of the gate that refuses to be skipped. Printed in its panic so a failing run
+/// says which rule it broke, not merely that a database was missing.
+pub(crate) const ROTATION_GATE: &str = "keyring-rotation";
+
+/// A database for the **keyring rotation gate**, which fails when there is none.
+///
+/// # Why this exists next to [`test_database`], which already refuses
+///
+/// `test_database` refuses a missing `MOIRA_TEST_DATABASE_URL` — but it honours one opt-out,
+/// `MOIRA_TEST_ALLOW_NO_DATABASE=1`, and returns `None`. Every caller then writes
+/// `let Some(db) = … else { return }`, and a test that returns early **passes**. That is the
+/// correct trade for most suites: a developer without Docker gets a usable, loudly-announced
+/// subset.
+///
+/// It is the wrong trade for exactly one suite. `docs/decision-encryption-at-rest.md` §12
+/// names the largest risk to the whole encryption plan, and it is not a missing test — it is a
+/// **skipped** one, because the rotation tests are the ones that would then never run and
+/// nobody would learn until the day a master key had to be rotated. That is the shape of the
+/// `accept_legacy_hashes` incident (#125): a check wired to nothing, green forever.
+///
+/// So this accessor returns `LibTestDatabase`, not `Option<LibTestDatabase>`. There is no
+/// early-return form to write, the opt-out does not reach it, and a rotation test without a
+/// database is a **failing** test. `scripts/rotation-gate.sh` additionally asserts that a
+/// non-zero number of these tests actually executed, because a suite that fails when it cannot
+/// run is still not a suite that ran.
+pub(crate) async fn rotation_gate_database() -> LibTestDatabase {
+    match test_database().await {
+        Some(database) => database,
+        None => panic!(
+            "the {ROTATION_GATE} gate cannot run without a database, and it does not skip.\n\n\
+             {ALLOW_NO_DATABASE} does not apply here. The keyring rotation suite is the one \
+             set of tests in this repository that must never report success without having \
+             run: it is the only proof that a master-key rotation works, and nobody discovers \
+             a broken rotation at a convenient moment.\n\n\
+             Start PostgreSQL and set MOIRA_TEST_DATABASE_URL, for example:\n\n    \
+             export MOIRA_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/moira\n\n\
+             The role it names needs CREATEDB. See docs/decision-encryption-at-rest.md §12."
+        ),
+    }
+}
+
 /// Creates and migrates the database, and returns its URL. Everything it opens is closed
 /// before it returns — see [`LIB_DATABASE`].
 async fn create_private_database(origin: &Url) -> String {

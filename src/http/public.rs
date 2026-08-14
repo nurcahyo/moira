@@ -50,6 +50,20 @@ async fn public_actor(
         (status = 400, description = "Malformed request", body = ErrorResponse),
         (status = 401, description = "Authentication failed", body = ErrorResponse),
         (status = 403, description = "Operation is not permitted", body = ErrorResponse),
+        // A reference on the resolution chain — route, agent profile, model, credential —
+        // that does not resolve. None of these is named by the caller, so this is a
+        // configuration answer rather than a "you asked for a thing that isn't there":
+        // `route_not_found`, `agent_profile_not_found`, `model_not_found`,
+        // `no_eligible_model`, `credential_not_found`, per `failure_http_status`.
+        //
+        // Undeclared until now. `route_not_found` has returned `404` here since long
+        // before #79 added `agent_profile_not_found` to the same family, and
+        // `tests/openapi_drift.rs` could never have caught it: it compares the served
+        // document to the committed one, and both were generated from this same
+        // annotation. A status a handler returns but never declares is invisible to
+        // every generated client, which is what makes this the one gap in the set worth
+        // fixing rather than only recording.
+        (status = 404, description = "A route, agent profile, model or credential on the resolution chain does not exist", body = ErrorResponse),
         (status = 409, description = "Idempotency or execution conflict", body = ErrorResponse),
         (status = 422, description = "Request violates execution policy", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
@@ -96,6 +110,18 @@ pub async fn create_response(
         (status = 400, description = "Malformed request", body = ErrorResponse),
         (status = 401, description = "Authentication failed", body = ErrorResponse),
         (status = 403, description = "Operation is not permitted", body = ErrorResponse),
+        // No `404` and no `409` here, and the asymmetry with `POST /api/v1/responses` is
+        // real rather than an oversight. Execution failures on this operation do not
+        // reach the caller as a status at all: the stream has already opened `200` by the
+        // time the resolution chain is walked, so the refusal arrives as the terminal
+        // `response.failed` event carrying the same code. Pinned by
+        // `guards_the_public_stream_refuses_a_dangling_agent_profile_in_its_terminal_event`
+        // in `tests/agent_profile_wire.rs`, which asserts `200` on the transport and reads
+        // the code out of the last event.
+        //
+        // The statuses that remain below are the ones raised *before* the stream opens —
+        // authentication, authorization, the streaming-disabled policy check, the rate
+        // limit, and request validation.
         (status = 422, description = "Request violates execution policy", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
         (status = 502, description = "Upstream provider failed", body = ErrorResponse),
@@ -379,10 +405,32 @@ pub async fn capabilities(
         (status = 400, description = "Malformed or unsupported compatibility request", body = ErrorResponse),
         (status = 401, description = "Authentication failed", body = ErrorResponse),
         (status = 403, description = "Operation is not permitted", body = ErrorResponse),
-        (status = 404, description = "Compatibility endpoint is disabled", body = ErrorResponse),
+        // Issue #157, item 2. One status, two unrelated meanings, and the description used to
+        // name only the first: the handler raises it directly when
+        // `openai_responses_compat_enabled` is off, *and* `failure_http_status` raises it for
+        // every unresolved reference on the resolution chain. Since #79 that family is
+        // `route_not_found`, `agent_profile_not_found`, `model_not_found`, `no_eligible_model`
+        // and `credential_not_found` — none of them named by the caller, since this endpoint
+        // carries no route field at all. A caller who reads only "the endpoint is disabled"
+        // has no way to tell an off switch from a misconfigured default route.
+        (status = 404, description = "Compatibility endpoint is disabled, or a route, agent profile, model or credential on the resolution chain does not exist", body = ErrorResponse),
+        // Issue #157, item 2. `AgentProfileDisabled` maps to `CONFLICT` in
+        // `failure_http_status`, which this endpoint shares by routing through
+        // `PublicExecutionService` exactly as the native path does. Confirmed over the wire
+        // rather than by reading — `compat_response_format` is a translation layer the native
+        // path does not have, so the shared-code argument was an argument, not evidence — by
+        // `compat_refuses_a_disabled_agent_profile_with_409_exactly_as_the_native_path_does`
+        // in `tests/openai_compat_text_format.rs`, which drives a real disabled profile on the
+        // default route through `POST /v1/responses` and reads the status off the socket.
+        (status = 409, description = "Execution conflict; the resolved route names a disabled agent profile", body = ErrorResponse),
         (status = 422, description = "Request violates execution policy, or carries a `text.format` Moira will not honour", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
         (status = 502, description = "Upstream provider failed", body = ErrorResponse),
+        // Issue #157, item 2. Declared on both native response operations and absent here for
+        // no stated reason. Pinned by `compat_answers_503_when_the_database_is_unavailable`,
+        // which drives the endpoint over a poolless `AppState` — `public_actor` asks for
+        // `state.pool()` before anything else and `AppError::DatabaseUnavailable` is a `503`.
+        (status = 503, description = "Required infrastructure is unavailable", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(

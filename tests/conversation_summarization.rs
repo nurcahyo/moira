@@ -107,7 +107,61 @@ impl Case {
         let fixture = LifecycleFixture::new().await?;
         let completion = MockOpenAiServer::start(scripts).await;
         fixture
-            .add_provider(completion.base_url(), 10, RuntimePolicy::default())
+            .add_provider(
+                completion.base_url(),
+                10,
+                RuntimePolicy {
+                    // **30 s, not the 2 s `RuntimePolicy::default()`. Do not "restore the default".**
+                    //
+                    // WHY, precisely — and what this is *not*. `effective_runtime_policy` makes the
+                    // attempt budget `min(policy.timeout_ms, runtime.request_timeout_ms)`, so this
+                    // value *is* the wall-clock lifetime of a provider call parked on a `ScriptGate`.
+                    //
+                    // `a_concurrent_summarization_is_answered_with_202_and_retry_after` parks its
+                    // first run inside `ProviderScript::HeldCompletion` and then performs a
+                    // **complete authenticated HTTP round trip** — including an uncached,
+                    // memory-hard Argon2id (19 MiB) consumer-key verify (`src/security/auth.rs` ->
+                    // `src/security/api_keys.rs`, no `spawn_blocking`; see issue #176) — before
+                    // releasing the gate. The first run's clock runs for all of it.
+                    //
+                    // That is the argument: "the singleflight lock is held while the second caller
+                    // is served" is the property under test, so the first run is *required* to
+                    // outlive the second caller's entire round trip. A budget shorter than that
+                    // round trip is ill-formed rather than merely tight — it makes the test's
+                    // premise depend on the host finishing an HTTP round trip inside 2 s.
+                    //
+                    // HONEST LIMITS OF THE EVIDENCE. This is **not** a demonstrated fix for the
+                    // flake recorded in `plans/reports/EXECUTION-LEDGER.md` and `HANDOFF.md` §2.2a,
+                    // and it should not be cited as one. Measured 2026-08-08:
+                    //   * At ~load 90 the 2 s budget reproduced the documented failure — 2/12 runs,
+                    //     `left: 502, right: 200` — so the mechanism above is real, not theorised.
+                    //   * At that same load, 30 s did **not** rescue the test. It removed the 502
+                    //     and the run then failed on a *different* bound, the gate's own 5 s
+                    //     `WAIT_TIMEOUT` ("timed out waiting for provider request arrival"), which
+                    //     fires upstream of any budget.
+                    //   * Under realistic load — CPU spinners at 1x and 1.5x cores, and a
+                    //     concurrent DB-heavy `cargo test` — **neither** budget failed in 10-15
+                    //     runs each, so those runs distinguish nothing.
+                    //
+                    // So what this buys is narrower than "the flake is fixed": it removes an
+                    // ill-formed premise, and when the test does fail the message names the real
+                    // cause instead of a `502` that `summarization_failed` produces for every
+                    // execution error alike — the same status an empty reply gets.
+                    //
+                    // REJECTED ALTERNATIVES. `#[tokio::test(flavor = "multi_thread")]` is not the
+                    // answer and would be worse: with real parallelism the first run's timer can
+                    // fire *during* the second caller's round trip and release the lock before the
+                    // lock is checked, turning a late `502` into an earlier `200`-instead-of-`202`.
+                    // Retries are not it either — `.config/nextest.toml` keeps `retries = 0`
+                    // deliberately, and its own rationale is a case where a retry would have hidden
+                    // a real isolation bug.
+                    //
+                    // Nothing else in this file depends on the provider budget: every other script
+                    // answers immediately, and `WAIT` is what bounds a genuine hang.
+                    request_timeout_ms: 30_000,
+                    ..RuntimePolicy::default()
+                },
+            )
             .await;
         let response_key = fixture.enable_public_streaming().await;
         // After `enable_public_streaming`, which writes its own conversation policy.
@@ -973,6 +1027,11 @@ async fn a_conversation_with_no_new_messages_is_refused_even_when_forced() {
 /// No `sleep` anywhere: the first run is parked inside the provider call on a `ScriptGate`, so
 /// "the lock is held right now" is an ordering the test states rather than a race it bets on
 /// (CONVENTIONS.md §3, finding P2-12).
+///
+/// That holds for the *lock*, but not for the *budget*: the gate is held across a whole HTTP round
+/// trip, and that round trip runs on the parked call's clock. `Case::new` widens the provider
+/// budget to 30 s for exactly this reason — see the comment there, which also records what that
+/// widening was measured **not** to fix, before changing it.
 #[tokio::test]
 async fn a_concurrent_summarization_is_answered_with_202_and_retry_after() {
     let gate = ScriptGate::new();
@@ -1600,6 +1659,137 @@ async fn a_summary_is_withheld_when_the_policy_no_longer_admits_plaintext() {
             "the withheld summary body reached audit metadata on {action}"
         );
     }
+
+    case.shutdown().await;
+}
+
+/// The summary body is **sealed** under `encrypted_content`, and reads back through the
+/// context planner — issue #139.
+///
+/// # What this case proves that the withholding case above cannot
+///
+/// `a_summary_is_withheld_when_the_policy_no_longer_admits_plaintext` asserts an absence, and an
+/// absence is exactly what the *old* behaviour produced for `encrypted_content` too: the value
+/// was grouped with the refusals, so it wrote nothing. This asserts the presence of a sealed
+/// body and the absence of the plaintext inside it, which is the only pair that distinguishes
+/// "sealed" from both "withheld" and "stored in the clear".
+///
+/// # The `Uuid::now_v7()` refactor is what this case is really guarding
+///
+/// `insert_conversation_summary` used to bind its row id **inline** in the `.bind(...)` chain.
+/// The AAD binds `summary_id`, so the id inside the envelope and the id in the `id` column have
+/// to be the same value; two `now_v7()` calls would produce two, and the row would be sealed
+/// against an identity that does not exist anywhere. Nothing would notice on the write — the
+/// insert succeeds and the ciphertext looks fine. It surfaces only on the read, which is why
+/// this case reads the summary back through the planner rather than stopping at the row.
+#[tokio::test]
+async fn a_summary_is_sealed_when_the_policy_says_encrypted_content() {
+    let Some(case) = Case::new(
+        ConversationPolicyPutRequest {
+            summarization_enabled: Some(false),
+            ..ConversationPolicyPutRequest::default()
+        },
+        vec![
+            completion(ASSISTANT_REPLY),
+            completion(SUMMARY_BODY),
+            completion("second turn reply"),
+        ],
+    )
+    .await
+    else {
+        return;
+    };
+
+    let (status, body) = case.respond(USER_TURN).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let conversation_id = body["conversation"]["id"]
+        .as_str()
+        .expect("a conversation id")
+        .to_string();
+
+    moira::application::ConversationService::new(&case.fixture.state)
+        .expect("conversation service")
+        .put_conversation_policy(
+            &case.fixture.actor,
+            &support::request_context(),
+            case.fixture.application_id,
+            ConversationPolicyPutRequest {
+                summarization_enabled: Some(true),
+                conversation_content_persistence: Some(
+                    moira::domain::ConversationContentPersistence::EncryptedContent,
+                ),
+                ..ConversationPolicyPutRequest::default()
+            },
+        )
+        .await
+        .expect("encrypted_content must be accepted");
+
+    let (status, _, summarize_body) = case
+        .summarize(&case.summarize_key, &conversation_id, true)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{summarize_body}");
+    // Premise: the summarizer genuinely ran. Without this a null plaintext column below is
+    // indistinguishable from a run that never happened.
+    assert_eq!(
+        case.completion.call_count().await,
+        2,
+        "the summarizer must have issued its own completion call"
+    );
+
+    let summaries = case.summaries().await;
+    assert_eq!(summaries.len(), 1, "{summaries:?}");
+    assert_eq!(
+        summaries[0].summary_text_plain, None,
+        "the summary body was written in plaintext under encrypted_content"
+    );
+
+    // The raw column, straight out of PostgreSQL — the assertion that separates "sealed" from
+    // "copied into the other column".
+    let sealed: Vec<u8> = sqlx::query_scalar(
+        "select summary_text_encrypted from conversation_summaries where id = $1",
+    )
+    .bind(summaries[0].id)
+    .fetch_one(&case.fixture.pool)
+    .await
+    .expect("read summary_text_encrypted");
+    assert!(
+        !sealed.is_empty(),
+        "encrypted_content wrote no sealed summary body at all — that is the OLD behaviour, \
+         where the value was grouped with the refusals"
+    );
+    assert!(
+        !sealed
+            .windows(SUMMARY_BODY.len())
+            .any(|window| window == SUMMARY_BODY.as_bytes()),
+        "the summary body appears verbatim inside summary_text_encrypted; the cipher was not \
+         called"
+    );
+
+    // The boundary and the content address are still written, exactly as under every other
+    // policy: the run happened and really does cover that backlog.
+    assert!(summaries[0].covers_through_sequence > 0);
+    assert_eq!(
+        summaries[0].summary_hash,
+        request_hash(SUMMARY_BODY.as_bytes()),
+        "summary_hash must stay a content address of the PLAINTEXT under encrypted_content"
+    );
+
+    // And it opens again. This is the half that would go red if `insert_conversation_summary`
+    // sealed against a different uuid than it stored, or if the read path forgot to project
+    // `conversation_id` and `covers_through_sequence` for the AAD.
+    let (status, next_body) = case
+        .respond_in("and the refunds scope?", Some(&conversation_id))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{next_body}");
+    let requests = case.completion.requests().await;
+    let messages = request_messages(&requests[2].body);
+    assert!(
+        messages
+            .iter()
+            .any(|(_, content)| content.contains(SUMMARY_BODY)),
+        "the sealed summary did not reach the next turn's context; it was written and never \
+         read, which looks identical to a working feature from the outside. Messages: {messages:?}"
+    );
 
     case.shutdown().await;
 }

@@ -1006,20 +1006,27 @@ mod tests {
         }
     }
 
-    /// F42 — the `structured_output_invalid` catalog entry names its emitters, so the emitter
-    /// set is pinned.
+    /// F42, and issue #80 — the `structured_output_invalid` catalog entry names its emitters, so
+    /// the emitter set is pinned.
     ///
     /// The entry used to assert a second case, "or the model's output does not conform to it",
-    /// and there is no such path: both emitters reject the *caller's schema*. The corrected
-    /// wording states that as a fact about the code, which raises the question §3.4 asks —
-    /// **what is the cheapest edit that falsifies it while leaving the guards green?**
+    /// and there was no such path: both emitters rejected the *caller's schema*. **Issue #80 made
+    /// that sentence false on purpose** by adding the third emitter — a reply that is not JSON is
+    /// now a 422 rather than a silent `null` — so the description now names two request emitters
+    /// and one reply emitter, and this guard is what keeps that count honest.
     ///
-    /// Neither existing guard covers it. `docs_mirror_matches_rust_catalog` proves only that the
-    /// Rust catalog and the JSON mirror agree; they can be wrong together, and were.
-    /// `a_reply_that_is_not_json_leaves_the_field_null_and_still_succeeds` watches exactly one
-    /// completion path. So the cheapest falsifying edit is a **third emitter somewhere else** —
-    /// a tool-argument validator raising the same code for a non-conforming *reply* is the
-    /// obvious one — and both stay green through it.
+    /// The question §3.4 asks is **what is the cheapest edit that falsifies the description while
+    /// leaving the guards green?** Neither existing guard covers it.
+    /// `docs_mirror_matches_rust_catalog` proves only that the Rust catalog and the JSON mirror
+    /// agree; they can be wrong together, and were. The suite in `tests/structured_output.rs`
+    /// watches the execution paths, not the code's other emitters. So the cheapest falsifying
+    /// edit is a **fourth emitter somewhere else** — a tool-argument validator raising the same
+    /// code is the obvious one — and both stay green through it.
+    ///
+    /// **#80 also showed the earlier version of this guard was one-directional in a second way:**
+    /// it collected a *set of files*, and the new emitter landed in a file that was already in
+    /// that set, so it would have stayed green through the very change it exists to catch. It now
+    /// counts emitters per file.
     ///
     /// This is the guard for that edit. It derives the emitter set by walking `src/` and parsing
     /// calls (not by matching mentions, which would harvest doc comments), in both spellings the
@@ -1035,8 +1042,8 @@ mod tests {
     /// returned to a caller, so it never renders this message. That near-miss is the reason the
     /// description was plausible enough to survive.
     #[test]
-    fn structured_output_invalid_has_only_the_two_emitters_its_catalog_entry_describes() {
-        use std::collections::BTreeSet;
+    fn structured_output_invalid_has_only_the_three_emitters_its_catalog_entry_describes() {
+        use std::collections::BTreeMap;
 
         // Assembled with `concat!` for the reason `CODED_CONSTRUCTORS` is: this file is walked by
         // the scanner too, and a spelled-out needle would be found in its own source.
@@ -1054,7 +1061,11 @@ mod tests {
             files.len()
         );
 
-        let mut emitters: BTreeSet<String> = BTreeSet::new();
+        // File **and count**, not just file. Issue #80 added a third emitter to a file that was
+        // already in the set, which a set of paths cannot see — the same one-directional blind
+        // spot HANDOFF §3.4 keeps finding. A per-file count sees an emitter appearing next to an
+        // existing one, and sees one disappearing.
+        let mut emitters: BTreeMap<String, usize> = BTreeMap::new();
         for file in &files {
             let source = std::fs::read_to_string(file)
                 .unwrap_or_else(|error| panic!("read {}: {error}", file.display()));
@@ -1079,7 +1090,7 @@ mod tests {
 
                     let args = top_level_args(&source[open..]);
                     if args.get(position).is_some_and(|argument| wanted(argument)) {
-                        emitters.insert(relative.clone());
+                        *emitters.entry(relative.clone()).or_default() += 1;
                     }
                 }
             };
@@ -1092,13 +1103,18 @@ mod tests {
             record(failure_ctor, 0, &|argument| argument == failure_class);
         }
 
-        let expected: BTreeSet<String> = [
-            // `validate_response_format` — the caller's schema exceeds
+        let expected: BTreeMap<String, usize> = [
+            // One: `validate_response_format` — the caller's schema exceeds
             // `public_api.maximum_schema_bytes`.
-            "src/application/public.rs".to_string(),
-            // `build_completion_request` — the caller's schema is not a readable
-            // `schemars::Schema`. The only construction site of the failure class.
-            "src/application/execution.rs".to_string(),
+            ("src/application/public.rs".to_string(), 1),
+            // Two: `build_completion_request` — the caller's schema is not a readable
+            // `schemars::Schema`.
+            // Three: `structured_output_from_text` — the model's reply to a schema-carrying
+            // request is not JSON (issue #80). This is the emitter F42 recorded as non-existent
+            // and F29 deferred; it is the only one that is about the reply rather than the
+            // request, and it is why the description no longer says "never because of the
+            // model's reply".
+            ("src/application/execution.rs".to_string(), 2),
         ]
         .into_iter()
         .collect();
@@ -1106,10 +1122,12 @@ mod tests {
         assert_eq!(
             emitters, expected,
             "the emitter set for `{code_needle}` has changed. The catalog entry for \
-             moira.error.{code_needle} states that every emitter rejects the CALLER'S SCHEMA and \
-             that no model-output-non-conformance path exists (F42). Re-read that description in \
-             src/i18n/catalog/errors.rs and docs/i18n-response-catalog.json, correct it if the \
-             new emitter is about the model's reply, and only then update this list."
+             moira.error.{code_needle} names each emitter and says which of them are about the \
+             CALLER'S SCHEMA (two) and which about the MODEL'S REPLY (one, issue #80). Re-read \
+             that description in src/i18n/catalog/errors.rs and docs/i18n-response-catalog.json, \
+             correct it if the new emitter changes which of those two sentences is true, re-read \
+             the disposition in src/orchestration/controls.rs — which is load-bearing on this \
+             class having one disposition for every emitter — and only then update this list."
         );
     }
 

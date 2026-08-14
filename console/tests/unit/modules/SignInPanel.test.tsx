@@ -106,6 +106,56 @@ describe("each refusal state renders its own message and no button", () => {
   }
 });
 
+describe("a refusal with an open setup window offers the way out of it", () => {
+  test("the link appears only when the SERVER said the window is open", () => {
+    // `/` sends a signed-out visitor to `/login`, and the first-run copy there
+    // says "Finish setting up this deployment first" — advice with nothing to
+    // click until this link existed. It is opt-in per render precisely because
+    // the same refusal shows on a CLAIMED deployment whose provider broke, and
+    // `/setup` cannot help that operator.
+    render(
+      <SignInPanel
+        state={{
+          kind: "unavailable",
+          messageKey: CONSOLE_MESSAGE_KEYS.no_enabled_auth_provider,
+          setupOpen: true,
+        }}
+      />,
+    );
+    const link = screen.getByRole("link", {
+      name: copy(CONSOLE_MESSAGE_KEYS.sign_in_go_to_setup),
+    });
+    expect(link.getAttribute("href")).toBe("/setup");
+  });
+
+  test("the same refusal without the flag stays a dead end, deliberately", () => {
+    render(
+      <SignInPanel
+        state={{
+          kind: "unavailable",
+          messageKey: CONSOLE_MESSAGE_KEYS.no_enabled_auth_provider,
+        }}
+      />,
+    );
+    expect(screen.queryAllByRole("link")).toEqual([]);
+  });
+
+  test("it is a link, not a button — the refusal renders with no client bundle", () => {
+    // The panel's own invariant is that a refusal state renders ZERO buttons,
+    // and this remedy must not become the exception that erodes it.
+    render(
+      <SignInPanel
+        state={{
+          kind: "unavailable",
+          messageKey: CONSOLE_MESSAGE_KEYS.no_enabled_auth_provider,
+          setupOpen: true,
+        }}
+      />,
+    );
+    expect(screen.queryAllByRole("button")).toEqual([]);
+  });
+});
+
 describe("the server-supplied message is the fallback, and the catalog wins", () => {
   test("a key the console catalogues ignores the server's prose", () => {
     render(
@@ -325,5 +375,41 @@ describe("the sign-in request uses the wire format the integration test drives",
     expect(alert).toHaveTextContent(copy(CONSOLE_MESSAGE_KEYS.sign_in_request_failed));
     expect(alert.textContent).not.toContain("10.0.0.1");
     expect(alert.textContent).not.toContain("ECONNREFUSED");
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The staleness notice (issue #152)                                          */
+/* -------------------------------------------------------------------------- */
+
+describe("a stale configuration is announced WITHOUT removing the way in", () => {
+  const STALE: SignInPanelState = {
+    ...(READY as Extract<SignInPanelState, { kind: "ready" }>),
+    noticeKey: CONSOLE_MESSAGE_KEYS.auth_config_stale,
+  };
+
+  test("the notice renders and the button still does", () => {
+    // THE MUTATION THIS EXISTS FOR: fold staleness onto the `unavailable` state.
+    // That is one line, it reads as caution, and it takes away the only
+    // remaining way into a console whose snapshot cannot be refreshed — the
+    // buttons for the configuration it is still serving.
+    render(<SignInPanel state={STALE} />);
+    expect(screen.getByRole("status")).toHaveTextContent(
+      copy(CONSOLE_MESSAGE_KEYS.auth_config_stale),
+    );
+    expect(screen.getAllByRole("button")).toHaveLength(1);
+  });
+
+  test("a ready state with nothing to announce renders no notice", () => {
+    // A notice that is always there is a notice nobody reads.
+    render(<SignInPanel state={READY} />);
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  test("the notice is a status, not an alert — the refusal keeps `alert`", () => {
+    // Two different urgencies on the same surface. `alert` interrupts a screen
+    // reader; a standing condition beside working buttons must not.
+    render(<SignInPanel state={STALE} />);
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 });

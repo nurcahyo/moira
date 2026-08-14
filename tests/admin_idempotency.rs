@@ -66,7 +66,9 @@ impl Fixture {
         let mut settings = Settings::default();
         settings.provider_security.allow_http_provider_urls = true;
         settings.provider_security.allow_private_provider_urls = true;
-        let state = AppState::new(settings, Some(pool.clone())).expect("test app state");
+        let state = AppState::new(settings, Some(pool.clone()))
+            .await
+            .expect("test app state");
         let router = moira::build_router(state.clone()).expect("test router");
         Some(Self {
             pool,

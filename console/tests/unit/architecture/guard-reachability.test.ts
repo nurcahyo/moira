@@ -77,6 +77,11 @@ const GUARDS: readonly Guard[] = [
     why: "W5-D5/F25: app/api/** sits outside every route group, so a mutation route handler inherits NO session check. This is the wrapper each one performs its own with. Unreached, the console's invitation and ownership endpoints are unauthenticated. `route-handler-session.test.ts` additionally asserts every handler under app/api/** calls it.",
   },
   {
+    symbol: "requireConsoleOwner",
+    definedIn: "lib/console-api.ts",
+    why: "#185: the owner pre-check on the sign-in-settings surface. Unreached, /settings/auth's endpoint is open to every admin and the screen's own copy — 'only the owner can change this' — becomes a claim the console does not make. Moira still refuses the write (require_primary_actor), so the failure is a 403 the operator did not expect rather than an unauthorised write; that is the difference between a bug and an incident, and it is still a bug.",
+  },
+  {
     symbol: "consoleSessionCheck",
     definedIn: "lib/auth.ts",
     why: "F25/G12: the request-level form. Its call sites are the token route (which owes the caller a keyed 403 rather than a 500) and the console layout. Both must exist; a layout-only wiring redirects the browser while GET /api/auth/token keeps minting for the same cookie.",
@@ -185,7 +190,8 @@ describe("the scan is alive", () => {
   test("NEGATIVE CONTROL — a real call is a call site", () => {
     const caller: SourceFile = {
       path: "lib/fixture-caller.ts",
-      source: 'import { checkSession } from "./moira-session";\nexport const c = checkSession(null, x);',
+      source:
+        'import { checkSession } from "./moira-session";\nexport const c = checkSession(null, x);',
       code: 'import { checkSession } from "./moira-session";\nexport const c = checkSession(null, x);',
     };
     expect(

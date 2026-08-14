@@ -14,6 +14,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
+import { API_KEY_SCHEMA_CONTRACTS } from "@/lib/moira-api-key-types";
 import { CREDENTIAL_SCHEMA_CONTRACTS } from "@/lib/moira-credential-types";
 import {
   AUTH_PROVIDER_OPERATION_NAMES,
@@ -25,17 +26,18 @@ import {
 import { SCHEMA_CONTRACTS, type SchemaContract } from "@/lib/types";
 
 /**
- * Every descriptor the console declares, from BOTH modules that declare any.
+ * Every descriptor the console declares, from EVERY module that declares any.
  *
- * The credential DTOs are in `lib/moira-credential-types.ts` rather than
- * `lib/types.ts` because they model a raw secret and `lib/types.ts` is asserted
- * client-safe — see that module's header. Splitting them must not create a
- * second way to fall out of this gate, so the completeness scan below runs over
- * both files and the shape check runs over the concatenation.
+ * The credential DTOs (issue #73) and the consumer-key DTOs (issue #180) live
+ * outside `lib/types.ts` because they model a raw secret and `lib/types.ts` is
+ * asserted client-safe — see those modules' headers. Splitting them must not
+ * create a second way to fall out of this gate, so the completeness scan below
+ * runs over all three files and the shape check runs over the concatenation.
  */
 const ALL_SCHEMA_CONTRACTS: readonly SchemaContract[] = [
   ...SCHEMA_CONTRACTS,
   ...CREDENTIAL_SCHEMA_CONTRACTS,
+  ...API_KEY_SCHEMA_CONTRACTS,
 ];
 
 const SPEC_PATH = resolve(import.meta.dir, "../../../docs/openapi.json");
@@ -127,6 +129,12 @@ const CONTRACT_MODULES: ReadonlyArray<{
     runtime: CREDENTIAL_SCHEMA_CONTRACTS,
     floor: 3,
   },
+  {
+    path: "../../lib/moira-api-key-types.ts",
+    array: "API_KEY_SCHEMA_CONTRACTS",
+    runtime: API_KEY_SCHEMA_CONTRACTS,
+    floor: 3,
+  },
 ];
 
 for (const contractModule of CONTRACT_MODULES) {
@@ -142,7 +150,9 @@ for (const contractModule of CONTRACT_MODULES) {
     test("the scanner found the declarations at all", () => {
       // Zero declarations found means the regex stopped matching, at which point
       // "every declaration is registered" is vacuously true.
-      expect(declared.length, `found: ${declared.join(", ")}`).toBeGreaterThanOrEqual(contractModule.floor);
+      expect(declared.length, `found: ${declared.join(", ")}`).toBeGreaterThanOrEqual(
+        contractModule.floor,
+      );
     });
 
     test(`every declared *_CONTRACT appears in ${contractModule.array}`, () => {
@@ -165,22 +175,31 @@ for (const contractModule of CONTRACT_MODULES) {
   });
 }
 
-describe("the two descriptor arrays do not overlap", () => {
-  test("no two descriptors name the same schema, across both modules", () => {
+describe("the descriptor arrays do not overlap", () => {
+  test("no two descriptors name the same schema, across every module", () => {
     // Across BOTH arrays: a schema described twice means two interfaces claiming
     // one wire shape, and only one of them can be right.
     const schemas = ALL_SCHEMA_CONTRACTS.map((contract) => contract.schema);
     expect(new Set(schemas).size).toBe(schemas.length);
   });
 
-  test("the credential descriptors really are the ones with a secret-shaped field", () => {
+  test("the contained descriptors really are the ones with a secret-shaped field", () => {
     // The split is only worth its cost if it lands the right DTOs. Asserted so a
-    // later edit cannot drift a credential DTO back into the client-safe module
-    // while this file keeps reporting green.
+    // later edit cannot drift a secret-bearing DTO back into the client-safe
+    // module while this file keeps reporting green.
     expect(CREDENTIAL_SCHEMA_CONTRACTS.map((contract) => contract.schema).sort()).toEqual([
       "CredentialCreateRequest",
       "CredentialRecord",
       "RotateCredentialRequest",
+    ]);
+    // Issue #180. `ApiKeySecretResponse` carries the plaintext consumer key and
+    // `ApiKeyRecord` carries its `fingerprint`; `ConsumerKeyCreateRequest` joins
+    // them because it is the request that produces one, and splitting a family
+    // across a containment boundary is how a shape ends up in the wrong module.
+    expect(API_KEY_SCHEMA_CONTRACTS.map((contract) => contract.schema).sort()).toEqual([
+      "ApiKeyRecord",
+      "ApiKeySecretResponse",
+      "ConsumerKeyCreateRequest",
     ]);
     const secretShaped = /(secret|masked|fingerprint|api_?key|password)/i;
     // The one pre-existing carve-out, and it is the SAME one
@@ -436,9 +455,9 @@ describe("the facts the console's behaviour depends on", () => {
     const ifMatch = parameterNamed(declared!, "If-Match");
     expect(ifMatch).toBeDefined();
     expect(ifMatch?.required === true).toBe(false);
-    expect(
-      Object.values(MOIRA_OPERATIONS).map((operation) => operation.path),
-    ).not.toContain("/api/v1/admin/providers/{provider_id}/runtime-policy");
+    expect(Object.values(MOIRA_OPERATIONS).map((operation) => operation.path)).not.toContain(
+      "/api/v1/admin/providers/{provider_id}/runtime-policy",
+    );
   });
 
   test("CredentialSecret's api_key and azure arms are genuinely ambiguous", () => {

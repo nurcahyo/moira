@@ -38,10 +38,18 @@ import { CONSOLE_MESSAGE_KEYS, t } from "@/lib/i18n";
 import { MoiraClient } from "@/lib/moira-client";
 import { SignInPanel, type SignInPanelState } from "@/modules/signIn/SignInPanel";
 
+import { GET as readSetupWindow } from "../api/setup/route";
 import styles from "./page.module.css";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
+/**
+ * The origin is never used. `readSetupWindow` reads only the query string, and a
+ * `Request` needs an absolute URL to construct — the same placeholder origin
+ * `app/setup/page.tsx` builds its in-process request with.
+ */
+const SETUP_PROBE_URL = "http://setup.local/api/setup";
 
 /**
  * Human-readable names by Moira row id, from the ANONYMOUS projection.
@@ -119,16 +127,60 @@ async function resolveSignInState(): Promise<SignInPanelState> {
       providerId: config.providerId,
       displayName: names.get(config.moiraProviderId) ?? null,
     })),
+    // ISSUE #152. The console is past its snapshot TTL and could not re-read the
+    // configuration — no bootstrap credential, or Moira is unreachable. The
+    // buttons stay, because this configuration is the only one anybody could
+    // sign in with; what changes is that the operator is TOLD, rather than
+    // discovering it as a fetch error against an endpoint that moved.
+    ...(runtimeState.stale ? { noticeKey: CONSOLE_MESSAGE_KEYS.auth_config_stale } : {}),
   };
+}
+
+/**
+ * Is the first-run wizard still open on this deployment?
+ *
+ * Asked of `GET /api/setup` IN PROCESS — the same handler and the same
+ * `withSetupWindow` gate `/setup` itself answers to, so this page cannot offer a
+ * door the wizard would then close in the visitor's face. A 404 (no bootstrap
+ * key), a 409 (already claimed) and a Moira outage all come back the same way:
+ * no link.
+ *
+ * Only called from the `unavailable` branch. On a working deployment the sign-in
+ * page must not pay for a second Moira round trip to answer a question about a
+ * state it is not in.
+ */
+async function setupWindowOpen(): Promise<boolean> {
+  try {
+    const response = await readSetupWindow(new Request(SETUP_PROBE_URL));
+    if (!response.ok) return false;
+    const payload: unknown = await response.json();
+    return (
+      typeof payload === "object" &&
+      payload !== null &&
+      (payload as Record<string, unknown>)["claimed"] === false
+    );
+  } catch {
+    // This page answers < 400 in every configuration state (see the header), and
+    // a probe for a REMEDY is the last thing that may take it down.
+    return false;
+  }
 }
 
 export default async function LoginPage() {
   const state = await resolveSignInState();
+  // `unavailable` on a deployment nobody has claimed is the first-run state, and
+  // its copy — "Finish setting up this deployment first" — was advice with
+  // nothing to click. `/` sends a signed-out visitor here, so without this link
+  // the front door of an unconfigured console is a dead end.
+  const withRemedy: SignInPanelState =
+    state.kind === "unavailable" && (await setupWindowOpen())
+      ? { ...state, setupOpen: true }
+      : state;
 
   return (
     <main className={styles.main}>
       <h1 className={styles.title}>{t(CONSOLE_MESSAGE_KEYS.page_login_title)}</h1>
-      <SignInPanel state={state} />
+      <SignInPanel state={withRemedy} />
     </main>
   );
 }

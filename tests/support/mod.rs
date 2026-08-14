@@ -56,6 +56,28 @@ pub struct RuntimePolicy {
     pub circuit_failure_threshold: i32,
 }
 
+/// Fast by design — and therefore **wrong for any test that parks a provider call**.
+///
+/// The 2 s budgets exist so timeout-focused tests fail quickly instead of stalling a suite. But
+/// `effective_runtime_policy` turns `request_timeout_ms` into the attempt budget
+/// (`min(policy.timeout_ms, runtime.request_timeout_ms)`), which means it is also the wall-clock
+/// lifetime of a provider call held open on a `ScriptGate`.
+///
+/// So: **a test that holds a `ScriptGate` across anything heavier than in-process message passing
+/// must override `request_timeout_ms`.** The held window runs on the parked call's clock, and if
+/// that window contains a real HTTP round trip — Moira's authentication alone does an uncached,
+/// memory-hard Argon2id (19 MiB) verify — 2 s is not a tight budget but an ill-formed one: the
+/// property under test ("the lock is still held while the second caller is served") requires the
+/// parked call to outlive the work being done inside the window.
+///
+/// Inheriting this default silently is one measured contributor to
+/// `a_concurrent_summarization_is_answered_with_202_and_retry_after` failing under host CPU
+/// contention — at ~load 90 the 2 s budget reproduced its documented `502 vs 200` in 2 of 12 runs.
+/// Overriding it removes that failure mode but is **not** on its own enough to make such a test
+/// survive pathological load: the gate's own 5 s `WAIT_TIMEOUT` fires upstream of any budget. Treat
+/// this as one bound of several, not a cure. Precedents that override it and say why:
+/// `tests/conversation_summarization.rs` (`Case::new`) and `tests/execution_lifecycle.rs`
+/// (`public_sse_stalled_reader…`).
 impl Default for RuntimePolicy {
     fn default() -> Self {
         Self {
@@ -164,7 +186,9 @@ impl LifecycleFixture {
         settings.runtime.external_user_execution_concurrency = 64;
         settings.runtime.internal_stream_queue_capacity = 64;
         customize(&mut settings);
-        let state = AppState::new(settings, Some(pool.clone())).expect("test app state");
+        let state = AppState::new(settings, Some(pool.clone()))
+            .await
+            .expect("test app state");
         let actor = admin_actor();
         let suffix = Uuid::now_v7().simple().to_string();
         let ctx = request_context();

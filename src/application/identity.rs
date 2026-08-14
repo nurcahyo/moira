@@ -884,7 +884,19 @@ impl<'a> AdminIdentityService<'a> {
     /// is the safe direction to be wrong in. System-key and dev-admin callers pass
     /// because break-glass must keep working — that is the documented last resort when
     /// no primary remains, and this wave does not remove it.
-    async fn require_primary_actor(
+    ///
+    /// # It is `pub` because a second surface needs the same answer (issue #185)
+    ///
+    /// `AuthProviderSettingsService`'s write methods call this. Rewriting the
+    /// deployment's sign-in configuration is the one administrative act that can lock
+    /// every other admin out — a wrong `client_id`, a wrong discovery URL or a disable
+    /// takes the console's only door with it — so it belongs to the owner for the same
+    /// reason ownership transfer does, and it must be the *same* check rather than a
+    /// second implementation that can drift from this one.
+    ///
+    /// It is exported rather than duplicated, and the copy on
+    /// `moira.error.admin_identity_not_primary` was widened to cover both surfaces.
+    pub async fn require_primary_actor(
         &self,
         actor: &Actor,
         issuer: Option<&str>,
@@ -1636,6 +1648,7 @@ mod tests {
         let issuer = format!("https://fresh-{}.invalid", Uuid::now_v7().simple());
         register_issuer(&pool, &issuer).await;
         let state = AppState::new(crate::config::Settings::default(), Some(pool.clone()))
+            .await
             .expect("build app state");
 
         let outcome = AdminIdentityService::new(&state)
@@ -1685,6 +1698,7 @@ mod tests {
         .await
         .expect("configure an enabled provider with no allowed domains");
         let state = AppState::new(crate::config::Settings::default(), Some(pool.clone()))
+            .await
             .expect("build app state");
 
         let outcome = AdminIdentityService::new(&state)
@@ -1725,6 +1739,7 @@ mod tests {
         .await
         .expect("configure an enabled provider with an allow-list");
         let state = AppState::new(crate::config::Settings::default(), Some(pool.clone()))
+            .await
             .expect("build app state");
         let service = AdminIdentityService::new(&state).expect("service");
 
@@ -1775,8 +1790,9 @@ mod tests {
         let Some((pool, _setup_lock)) = migrated_pool().await else {
             return;
         };
-        let state =
-            AppState::new(crate::config::Settings::default(), Some(pool)).expect("build app state");
+        let state = AppState::new(crate::config::Settings::default(), Some(pool))
+            .await
+            .expect("build app state");
         let mut request = claim_request("https://unused.invalid", "sub", "owner@example.com");
         request.setup_token = Some("moira_setup_whatever".to_string());
 
@@ -1799,8 +1815,9 @@ mod tests {
         let Some((pool, _setup_lock)) = migrated_pool().await else {
             return;
         };
-        let state =
-            AppState::new(crate::config::Settings::default(), Some(pool)).expect("build app state");
+        let state = AppState::new(crate::config::Settings::default(), Some(pool))
+            .await
+            .expect("build app state");
         let jwt_actor = Actor {
             actor_type: ActorType::TrustedJwt,
             subject: Some("first-arrival".to_string()),
@@ -1829,8 +1846,9 @@ mod tests {
         let Some((pool, _setup_lock)) = migrated_pool().await else {
             return;
         };
-        let state =
-            AppState::new(crate::config::Settings::default(), Some(pool)).expect("build app state");
+        let state = AppState::new(crate::config::Settings::default(), Some(pool))
+            .await
+            .expect("build app state");
         let mut request = claim_request("https://unused.invalid", "sub", "owner@example.com");
         request.scopes = vec!["moira:not-a-real-scope".to_string()];
 

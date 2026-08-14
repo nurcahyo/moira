@@ -32,28 +32,30 @@ use uuid::Uuid;
 
 use support::TestDatabase;
 
-fn default_state() -> AppState {
+async fn default_state() -> AppState {
     let settings = Settings::default();
     assert!(
         !settings.redis.enabled,
         "redis.enabled must default to false — plan 10 §0.4b pins this, and \
          `redis_is_optional_by_default` pins the client half of it"
     );
-    AppState::new(settings, None).expect("build the default app state")
+    AppState::new(settings, None)
+        .await
+        .expect("build the default app state")
 }
 
 /// The default build has no Redis client at all, so no Redis code path can run.
-#[test]
-fn the_default_build_has_no_redis_client() {
-    let state = default_state();
+#[tokio::test]
+async fn the_default_build_has_no_redis_client() {
+    let state = default_state().await;
     assert!(state.redis.is_none());
 }
 
 /// The controls a default deployment gets are the in-process ones, and they say
 /// so.
-#[test]
-fn the_default_build_selects_the_in_process_controls() {
-    let state = default_state();
+#[tokio::test]
+async fn the_default_build_selects_the_in_process_controls() {
+    let state = default_state().await;
     assert!(
         !state.public_rate_limiter.is_cluster_wide(),
         "the default rate limiter must be the in-process one"
@@ -67,14 +69,16 @@ fn the_default_build_selects_the_in_process_controls() {
 /// **The invariant that must not move.** Turning Redis on changes which backend
 /// counts; it must never change *whether* the limits are enforced, and it must
 /// never touch breakers.
-#[test]
-fn enabling_redis_changes_the_backend_and_nothing_else() {
+#[tokio::test]
+async fn enabling_redis_changes_the_backend_and_nothing_else() {
     let mut settings = Settings::default();
     settings.redis.enabled = true;
     settings.redis.url = Some("redis://127.0.0.1:6379/0".to_string());
     // No connection is opened by `AppState::new`, so this asserts the *selection*
     // and needs no live Redis.
-    let state = AppState::new(settings, None).expect("build a Redis-enabled app state");
+    let state = AppState::new(settings, None)
+        .await
+        .expect("build a Redis-enabled app state");
 
     assert!(state.redis.is_some());
     assert!(state.public_rate_limiter.is_cluster_wide());
@@ -87,7 +91,7 @@ fn enabling_redis_changes_the_backend_and_nothing_else() {
 /// admission lease's cap on the replica count is what makes tolerable.
 #[tokio::test]
 async fn the_default_build_still_enforces_rate_limits_and_concurrency() {
-    let state = default_state();
+    let state = default_state().await;
     let window = std::time::Duration::from_secs(60);
     let key = format!("application:{}", Uuid::now_v7());
 
@@ -139,6 +143,7 @@ async fn the_postgres_invalidation_listener_runs_with_redis_absent() {
         return;
     };
     let state = AppState::new(Settings::default(), Some(database.pool.clone()))
+        .await
         .expect("build the default app state");
     assert!(state.redis.is_none(), "no Redis in the default build");
 
@@ -176,6 +181,7 @@ async fn the_durable_queue_works_end_to_end_with_redis_absent() {
     };
     let pool = database.pool.clone();
     let state = AppState::new(Settings::default(), Some(pool.clone()))
+        .await
         .expect("build the default app state");
     assert!(state.redis.is_none());
 

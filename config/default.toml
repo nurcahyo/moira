@@ -18,6 +18,41 @@ master_key_base64 = ""
 key_id = "dev-local"
 allow_insecure_dev_key = true
 
+# Envelope encryption at rest for the content columns (docs/decision-encryption-at-rest.md).
+#
+# A separate block from [secrets] on purpose. Provider credentials and user content have
+# different retention and different blast radius, [secrets] cannot express a key *list*, and
+# there is deliberately NO implicit fallback from `keys` to `secrets.master_key_base64` — a
+# configuration that looks set and is inert is the failure this whole subsystem exists to refuse.
+#
+# **In production this block is required unconditionally**, even where no application stores
+# encrypted content today, because the persistence policy is flippable at runtime through the
+# admin API without a restart. Startup fails until MOIRA_CONTENT_ENCRYPTION__KEYS is set.
+[content_encryption]
+# Where the master key lives. "environment" is the only variant this build serves; "kms" and
+# "vault" are deliberately absent rather than present-and-unimplemented, so setting one is a
+# startup refusal naming what is accepted.
+custody = "environment"
+# "id:base64,id:base64". Neither ',' nor ':' is in the base64 alphabet, so the split is
+# unambiguous. Every key an existing row might have been sealed under stays listed here through
+# a rotation — that is what makes already-wrapped data keys readable with no re-encryption.
+# Empty here, and supplied by MOIRA_CONTENT_ENCRYPTION__KEYS; key material never lives in a
+# committed file.
+keys = ""
+# The id new data keys are wrapped under. Must be one of the ids in `keys`.
+active_key_id = "dev-local"
+# Development only. With `keys` empty this substitutes the built-in 32-byte sentinel, and
+# registers as `insecure_content_encryption_key` in the unsafe-development-features startup WARN.
+# Production start-up refuses to come up while this is true. Pasting the sentinel into `keys`
+# is refused in *every* environment: it is reachable only through this flag, never by typing it.
+allow_insecure_dev_key = true
+# How often the keyring is re-read, and the floor under that interval. `Settings::validate`
+# enforces the floor — an unenforced floor is an inert setting.
+refresh_seconds = 300
+min_refresh_seconds = 5
+# Age past which the active data key is reported as overdue for rotation.
+data_key_rotation_days = 30
+
 [auth.admin]
 enabled = false
 jwks_url = ""

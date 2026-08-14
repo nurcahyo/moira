@@ -235,7 +235,9 @@ async fn a_supervisor_follower_runs_no_retention_sweep() {
     settings.workers.enabled = true;
     settings.workers.retention_interval_seconds = 1;
 
-    let state = AppState::new(settings, Some(database.pool.clone())).expect("supervisor state");
+    let state = AppState::new(settings, Some(database.pool.clone()))
+        .await
+        .expect("supervisor state");
     assert!(
         state.workers.leader_election_enabled(),
         "leader election must be on, or this test proves nothing"
@@ -282,7 +284,9 @@ async fn a_supervisor_leader_runs_the_retention_sweep() {
     settings.workers.enabled = true;
     settings.workers.retention_interval_seconds = 1;
 
-    let state = AppState::new(settings, Some(database.pool.clone())).expect("supervisor state");
+    let state = AppState::new(settings, Some(database.pool.clone()))
+        .await
+        .expect("supervisor state");
     let expired = insert_expired_idempotency_record(&database.pool).await;
     let supervisor = state
         .workers

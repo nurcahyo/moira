@@ -161,8 +161,10 @@ async fn get_with_headers(router: &Router, path: &str, headers: &[(&str, &str)])
     }
 }
 
-fn poolless_router() -> Router {
-    let state = AppState::new(Settings::default(), None).expect("app state without a pool");
+async fn poolless_router() -> Router {
+    let state = AppState::new(Settings::default(), None)
+        .await
+        .expect("app state without a pool");
     build_router(state).expect("router")
 }
 
@@ -177,7 +179,7 @@ fn poolless_router() -> Router {
 /// query type would move off it one at a time.
 #[tokio::test]
 async fn each_admin_list_endpoint_rejects_an_unknown_query_field() {
-    let router = poolless_router();
+    let router = poolless_router().await;
     let paths = admin_list_paths();
     assert_eq!(
         paths.len(),
@@ -235,7 +237,7 @@ async fn each_admin_list_endpoint_rejects_an_unknown_query_field() {
 /// that `deny_unknown_fields` works.
 #[tokio::test]
 async fn each_admin_list_endpoint_accepts_the_same_request_without_the_unknown_field() {
-    let router = poolless_router();
+    let router = poolless_router().await;
 
     for (handler, path) in &admin_list_paths() {
         let result = get(&router, path).await;
@@ -351,7 +353,7 @@ fn json_string_values(value: &Value, out: &mut Vec<String>) {
 ///    vary with the caller's input.
 #[tokio::test]
 async fn unknown_query_field_rejection_carries_the_error_envelope_and_enumerates_nothing() {
-    let router = poolless_router();
+    let router = poolless_router().await;
     let documented = documented_query_parameter_names();
 
     // Random, so it cannot collide with a real field name and cannot be matched by a

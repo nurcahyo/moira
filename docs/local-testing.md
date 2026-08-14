@@ -3,10 +3,15 @@
 What you can exercise on a laptop, in what order, and what each failure means.
 
 The API is testable end to end today: a real prompt goes through routing, a real
-provider answers, and the tokens are accounted. **The console is not, in a
-browser** — the provisioning write path has landed as `POST /api/setup`, but no
-page drives it yet. [The console](#the-console) says exactly what is there and
-what is not.
+provider answers, and the tokens are accounted. So is the console: its whole
+first-run path — `/setup` → an OIDC round trip → the first admin claimed → a
+provider registered from `/settings/llm` → an answered prompt — has been walked in
+a browser against a real Moira. It still needs an IdP reachable over TLS, and it
+still serves **one** sign-in provider.
+[The console](#the-console) says exactly what is there and what is not, and
+[Two sign-in providers, locally](#two-sign-in-providers-locally) says which parts
+of the multi-provider work you can exercise on a laptop today and which you
+cannot.
 
 ## Cold start
 
@@ -67,7 +72,10 @@ provider ──┬── provider_model ──┐
 
 `routing_policy` has three NOT NULL foreign keys — `route_id`, `provider_id`,
 `provider_model_id` — which fixes the order. `make seed` creates all of it, plus an
-application and a consumer key, and reuses anything that already matches.
+application and a consumer key. Re-running reuses a row only when it already
+matches what you asked for this run; a provider's `base_url` or a routing
+policy's `provider_model_id` that has drifted from `MOIRA_SEED_BASE_URL` /
+`MOIRA_SEED_MODEL` is PATCHed back into agreement, not silently left alone.
 
 By default it targets `http://127.0.0.1:8000/v1` and asks that endpoint which
 models it serves. Point it elsewhere:
@@ -185,22 +193,100 @@ WARN moira: unsafe development configuration is active
 ## Rotating keys
 
 `make env-force` rewrites the layout of both env files and **keeps** the master
-key, both peppers and the console secrets. That is deliberate:
+key, both peppers, the content-encryption key and the console secrets. That is
+deliberate:
 
 - `MOIRA_SECRETS__MASTER_KEY_BASE64` seals every `provider_credentials` row
 - `MOIRA_API_KEYS__PEPPER_BASE64` peppers every live API key hash
+- `MOIRA_CONTENT_ENCRYPTION__KEYS` wraps every content data key
 - `BETTER_AUTH_SECRET` encrypts the console's stored ES256 signing key
 
 Minting new ones does not fail and does not warn. The old rows simply stop being
 readable, at use time, one endpoint at a time. `make env-rotate` does rotate them,
 and asks first.
 
+### Rotating the content-encryption master key
+
+`MOIRA_CONTENT_ENCRYPTION__KEYS` is a **list**, and that is the whole point — it is
+what makes a rotation something other than a data-loss event:
+
+```
+MOIRA_CONTENT_ENCRYPTION__KEYS=local-dev:<old-base64>,local-2026-08:<new-base64>
+MOIRA_CONTENT_ENCRYPTION__ACTIVE_KEY_ID=local-2026-08
+```
+
+Add the new key, leave the old one in place, then move `ACTIVE_KEY_ID`. New data
+keys are wrapped under the new master key; anything already wrapped under the old
+one keeps opening, with nothing re-encrypted. Removing an id that something is
+still sealed under is what breaks it, and the failure is loud rather than silent:
+the custody refuses by name, saying which id it wanted.
+
+Two guards you will meet if you get it wrong:
+
+- Setting `ACTIVE_KEY_ID` to an id that is not in the list is a **startup refusal**
+  that names the ids that are configured.
+- Pasting the built-in development sentinel into `KEYS` is refused in *every*
+  environment, not only production. It is reachable only through
+  `MOIRA_CONTENT_ENCRYPTION__ALLOW_INSECURE_DEV_KEY=true` with `KEYS` empty, which
+  is what `unsafe_development_features` reports as
+  `insecure_content_encryption_key` in the startup WARN.
+
+`scripts/dev-env.sh` generates real random material for this, never the sentinel,
+and carries it across `make env-force` exactly like the other secrets.
+
+Nothing reads or writes an encrypted column yet — this release ships the
+configuration surface and the boot validation one release ahead of the behaviour,
+so the variable can be in place before it is required. See
+[`decision-encryption-at-rest.md`](decision-encryption-at-rest.md).
+
 ## The console
 
-`make console-dev` serves it on <http://localhost:3000>. `/` redirects to `/login`,
-and `/login` renders. **Signing in still does not work from the browser**, but the
-gap is narrower than it was: the write path exists, the screen that drives it does
-not.
+`make console-dev` serves it on <http://localhost:3000>. `/` redirects to
+`/login` on a claimed deployment and to `/setup` while the setup window is open.
+
+**The whole wizard has now been walked, by hand, in a browser, against a real
+Moira** — welcome → auth settings → a real OIDC round trip → `claim` → the
+authenticated console → an LLM provider registered from `/settings/llm` → a real
+prompt answered by a real provider. [Walking the wizard
+yourself](#walking-the-wizard-yourself) is the recipe, and it is reproducible on
+a laptop with no Google credential. What that leaves open is **automation**, not
+existence: nothing in CI walks past the sign-in step yet, which is issue #72.
+
+**Proven, first-hand:** Moira's own API path, end to end —
+`make setup` / `make start` / `make seed` / `make smoke` / `make execute-test`,
+the last of which produced a real completion. And, as of 2026-08-14, this
+console's own first-run path, by the manual walk above. Separately, an operator
+signed in through a browser against a local OIDC provider and got a Moira-routed
+answer — but that was the **commerce-os platform console**, not this one. How
+that is wired is documented in that repo, not copied here: see
+[commerce-os's `DEV-GUIDE.md`](https://github.com/motrait/commerce-os/blob/develop/DEV-GUIDE.md).
+
+**Not proven — meaning not automated:** no suite in this repo drives the
+wizard's `claim` step, and no suite drives any of it against a real Moira.
+
+A real sign-in in a real browser *is* automated — just not through the wizard.
+`console/e2e/authenticated-session.e2e.ts:46` drives an actual browser through
+`/login` → the mock IdP's `/authorize` → an authorization-code exchange with
+PKCE → a Better Auth session, and asserts the `(console)` home heading renders,
+not just a redirect landing on `/`. The harness behind it is
+`console/e2e/support/authenticated-stack.ts`, which imports `startMockIdp` from
+`tests/support/mock-idp` (line 66) and starts it (line 285);
+`console/playwright.config.ts:187-188` runs the spec as its own
+`authenticated-setup` project. That harness landed under issue #75.
+
+The wizard's own `claim` step is still not reached by any spec. Its e2e suite
+(`console/e2e/setup-wizard.e2e.ts`) runs against
+`console/e2e/support/setup-fixture.ts`, and that fixture wires no IdP at all —
+its `discoveryUrl` is the placeholder `https://idp.fixture.invalid` (line 130).
+So one test there still asserts *positively* that `claim` is not reached, and
+the gap stays visible on purpose instead of silently closing itself once
+someone assumes it's covered. That is issue #72, and it is still open. The
+manual walk below is the evidence that the harness has a working flow to
+automate rather than a broken one to discover.
+
+And no spec has run against a real Moira: `authenticated-stack.ts` also mocks
+Moira's HTTP surface (`console/e2e/support/moira-fixture.ts`), the same as the
+wizard's stub.
 
 What has landed — `console/app/api/setup/route.ts`, the single door setup writes
 through:
@@ -218,30 +304,188 @@ through:
   bootstrap system key is a 404, and a deployment Moira already reports as claimed
   is a 409.
 
+What has landed since — `console/app/setup/` and `console/modules/setup/`: `/setup`
+is a five-step wizard (welcome → auth_settings → sign_in → claim → done) and it
+is the UI caller of `POST /api/setup`. A trusted issuer, an auth provider and the
+first admin no longer have to be created by hand. The page calls its own route
+handler **in process**, so Moira's raw auth-methods response never reaches the
+browser, and it answers < 400 in every window state — the window being closed is
+a configuration fact, not an error.
+
 What is still missing:
 
-1. **No setup wizard page.** `console/app/` contains `(console)`, `api`, `invite`,
-   `layout.tsx` and `login` — there is no `setup` route segment. Nothing in the UI
-   calls `/api/setup`, so a trusted issuer, an auth provider and the first admin
-   have to be created by hand against that endpoint.
+1. **Only the OWNER may change the sign-in provider** (issue #185). `/settings/auth`
+   is readable by any admin and writable by the primary admin identity alone, and
+   Moira enforces that itself — `require_primary_actor` guards the auth-provider
+   write surface, so a non-owner is refused whether they go through the console
+   or call the admin API directly with their own bearer token. System-key callers
+   still pass, which is what keeps the break-glass recovery in
+   `docs/console-architecture.md` working.
 2. **Moira refuses any non-`https` auth-provider URL**, with no escape hatch —
    unlike provider URLs, which have two. See `validate_https_url` in
    `src/application/auth_settings.rs`; it rejects with
-   `auth_provider_url_not_allowed`.
+   `auth_provider_url_not_allowed`. So the IdP you point the wizard at has to be
+   reachable over TLS from the console process. This is a constraint on the
+   local recipe, not a blocker: `mkcert` satisfies it in one command, below.
 
-So the login page is honest when it says *"No sign-in provider is enabled yet."*
 On a fresh database `auth_provider_settings` and `trusted_jwt_issuers` are both
-empty, and no screen can fill them.
+empty, which is why `/login` says *"No sign-in provider is enabled yet."* —
+`/setup` is the screen that fills them.
 
 What already works: the console reaches Moira (`MOIRA_SYSTEM_KEY` is its bootstrap
 credential — `console/lib/auth-runtime.ts` returns a keyed refusal without ever
 contacting Moira when it is unset), its own database is migrated, and
 `/api/health` answers.
 
-A mock sign-in is possible without any Google credential:
-`console/tests/support/mock-idp.ts` is a real TLS OIDC server whose `/authorize`
-auto-redirects with no consent screen. Wiring it up means driving `POST /api/setup`
-yourself, because no page does.
+### Walking the wizard yourself
+
+No Google credential is needed. `console/tests/support/mock-idp.ts` is a real TLS
+OIDC server whose `/authorize` auto-redirects with no consent screen — real
+discovery and JWKS documents, real ES256 ID tokens, and a token endpoint that
+checks `client_id`, `client_secret`, `redirect_uri` and the PKCE
+`code_verifier`, so it refuses a wrong secret with `401 invalid_client` exactly
+as Google would. Its `publicOrigin` option (issue #151) is what makes it usable
+by hand: a fixed origin survives a restart, and `iss` is signed into the ID
+token, so a TLS proxy in front of an ephemeral port cannot substitute for it.
+
+Two trust decisions, and they are separate:
+
+- **The browser** must trust the IdP's certificate, or the redirect dead-ends on
+  an interstitial. `mkcert -cert-file idp-cert.pem -key-file idp-key.pem
+  localhost 127.0.0.1` issues one from a CA already in the system trust store.
+- **The console process** must trust it too — it performs the token exchange
+  server-side. `NODE_EXTRA_CA_CERTS="$(mkcert -CAROOT)/rootCA.pem"` must be set
+  when the console starts; Node reads it once, at process start.
+
+Point the mock IdP's `publicOrigin` at a fixed port, start it with that
+certificate, then fill the wizard's auth-settings form with
+`https://localhost:<port>/.well-known/openid-configuration` as the discovery
+URL, the client id and secret you configured it with, and an allowed email
+domain that matches the mock user's address. The rest of the walk is the UI.
+
+Two things worth knowing before you start:
+
+- **Use a scratch database for both halves.** The wizard claims the first
+  administrator exactly once; running it against the deployment you already use
+  burns that claim. A separate `MOIRA_DATABASE__URL` and `CONSOLE_DATABASE_URL`
+  keeps the walk repeatable.
+- **`next dev` is what makes an `http` `MOIRA_API_URL` legal.** Next's
+  standalone entrypoint hard-sets `NODE_ENV=production`, and `console/lib/env.ts`
+  then refuses both an http Moira URL and `CONSOLE_ALLOW_INSECURE_URLS`. The
+  console↔Moira leg is the one leg of this walk that a production build would
+  make you terminate with TLS as well.
+
+### Two sign-in providers, locally
+
+The console refuses to resolve sign-in when more than one auth provider is
+enabled — `ambiguous_enabled_providers`, in `console/lib/auth-config.ts`. That
+refusal is deliberate and still standing; it comes down only after Stage 4A is
+deployed. See [console-multi-provider-rollout.md](console-multi-provider-rollout.md).
+
+So the honest answer has two halves: **the multi-provider machinery does run on a
+laptop, through the test harness. It does not run in a browser, and the thing
+stopping it is the guard, not your setup.** (A single-provider sign-in *does* run
+in a browser now — see [above](#the-console) — but nobody has driven two enabled
+providers through a browser at once; only `multi-provider.test.ts`, below,
+exercises that.)
+
+#### 1. Run the multi-provider suite — this is the real thing
+
+```bash
+make up                     # Postgres on 127.0.0.1:5432, if it is not already
+cd console && bun install   # once
+bun test tests/integration/multi-provider.test.ts
+```
+
+Roughly 30 seconds; expect `17 pass`, `0 fail`. No Google credential, no GitHub
+OAuth app, no network.
+
+It is not a mock of the resolution — it *is* the resolution. Two genuinely
+different providers (`generic_oidc` against `mock-idp.ts`, `github_oauth` against
+`mock-github.ts`), both over TLS, resolved by the shipped `resolveAuthConfigs`,
+served by a real console bound to a real socket, over real PostgreSQL. It drives
+both authorization-code flows to completion and mints a Moira-bound token from
+each session. The assertions with teeth:
+
+- the two `iss` values **differ**, and each equals its own trusted issuer's
+  registered string. Under the defect this closes, both tokens carry
+  `bffIssuerUrl`, and `admin_identities` — keyed `(issuer, subject)` — collapses
+  two IdPs returning the same `sub` into **one** admin grant (finding F24);
+- one human, two providers, **two** grants — asserted in SQL;
+- a pre-4B account still resolves to the frozen `moira-console-idp` id and is not
+  orphaned by the upgrade;
+- GitHub's verified primary address wins over its attacker-settable public
+  profile address, and an unverified one produces no session at all.
+
+`ambiguityGuard` is bypassed here on purpose: the fixture resolves through
+`resolveAuthConfigs` and deliberately not through `loadAuthConfigs`, which is the
+only caller that applies the guard. The comment saying so is at the
+`resolveFixture` helper in that file.
+
+Two failure modes worth naming:
+
+| you see | it means |
+| --- | --- |
+| a connection error naming the DSN, redacted | Postgres is not up. This suite does **not** skip silently — a missing or wrong URL is an error, because a vanishing database suite is how this repository has previously turned a gate green without running it. |
+| `0 pass`, and `console-db-availability.test.ts` red | `CONSOLE_SKIP_DB_TESTS=1` is set in your environment. That escape hatch exists, and using it fails a test on purpose. |
+
+The database is `console_auth_test` on the same local server, created for you if
+absent, and separate from Moira's `moira` on purpose — two migration ledgers in
+one database is the failure that separation prevents. Override with
+`CONSOLE_TEST_DATABASE_URL`.
+
+#### 2. Watch the guard refuse, in one second
+
+```bash
+cd console && bun test tests/unit/lib/auth-config.test.ts -t "ambiguityGuard"
+```
+
+`3 pass`, `46 filtered out`. The middle one is the whole state of play in a
+single assertion: two providers, both of which **resolved successfully**, and the
+guard refuses the resolution anyway.
+
+#### 3. In a browser, you will hit the guard — here is how to tell
+
+You are not doing anything wrong. Both halves of the console refuse a second
+enabled provider, in two different places, with two different messages.
+
+**Through `/setup`.** The wizard's `slug` field looks like the way to add a
+second provider. It is not — it selects a console-issuer *namespace*, and a run
+that would take the deployment-wide enabled count above one is refused before it
+writes anything:
+
+```
+409  {"error":{"code":"setup_single_enabled_provider_only", …}}
+```
+
+That is `provisioningAdmissionFor` in `console/app/api/setup/route.ts`. It is a
+limit, not a permission, so signing in first does not get you past it — the
+previous design let the legitimate operator through and then locked them out of
+their own wizard on the next reload.
+
+**Through Moira's admin API**, bypassing the console (`POST /api/v1/admin/auth/providers`
+plus `POST …/{id}/enable`, which Moira permits when each row is bound to its own
+trusted issuer). Reload `/login`:
+
+> More than one sign-in provider is enabled. The console will not guess which one
+> governs — disable all but one in Moira.
+
+**Zero buttons, for either provider.** Not one button, not a broken button.
+
+Read that message as *"the guard is doing its job"*, and distinguish it from the
+other refusals, which really do mean your setup is wrong:
+
+| what `/login` says | what is actually wrong |
+| --- | --- |
+| *More than one sign-in provider is enabled…* | Nothing. This is `ambiguityGuard`. Disable one row and sign-in returns. |
+| *No sign-in provider is enabled yet…* | The normal first-run state. Finish `/setup`. |
+| *…client secret…* (`console_secret_unavailable`) | No `console_provider_secret` row for that provider, or the stored `client_id` has drifted from Moira's. Re-run provisioning. |
+| *…machine trust method…* | The enabled row's `method` is `jwks`. Nobody can sign in through it. |
+
+One more thing that surprises people: the guard fires on the **count**, after
+resolution. Two enabled rows produce that message even if neither of them would
+have resolved anyway — so it can mask a second, real configuration problem. Fix
+the count first, then read the message again.
 
 ## Reference
 

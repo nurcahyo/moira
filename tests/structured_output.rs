@@ -24,19 +24,37 @@
 //!    still report `structured_output: null`. This is the case that protects conversation
 //!    summarization, which sends no schema and stores `output_text` as a content-addressed
 //!    body — see `tests/conversation_summarization.rs`.
-//! 4. **No fail-hard.** A schema-carrying request whose reply is prose must still succeed with
-//!    the prose in `output_text`. `StructuredOutputInvalid` is in neither `is_retryable` nor
-//!    `is_fallback_eligible` nor `is_circuit_failure`, so failing here would kill the execution
-//!    with no retry and no fallback — and on DeepSeek, where Rig drops the schema before the
-//!    wire (finding F39), it would fail *every* structured request. See the ledger's F29 entry.
+//! 4. **Fail hard — issue #80, decided 2026-08-06.** A schema-carrying request whose reply is not
+//!    JSON fails the execution with `structured_output_invalid`, which a public caller receives as
+//!    **422**. It used to succeed with `structured_output: null` and the prose in `output_text`,
+//!    which is the same document a legitimately empty answer produces — so a caller could not tell
+//!    "the provider did not comply" from "the answer was empty". Four cases, because the property
+//!    has four surfaces: the completion path, the streaming path, the public HTTP contract that is
+//!    the whole point of the decision, and the public *stream*, where the same code cannot be a
+//!    status and arrives as the terminal `response.failed` event instead.
+//!    `StructuredOutputInvalid` is in neither `is_retryable` nor `is_fallback_eligible` nor
+//!    `is_circuit_failure`, so the failure is terminal on the first non-conforming reply —
+//!    asserted here as "the provider was called exactly once".
+//! 5. **The refusal is metered.** The provider answered and billed for the answer, so the refused
+//!    attempt still writes `execution_attempts.usage` and a `usage_records` row — as it did when
+//!    the same request succeeded. Without it the flip would have opened a caller-reachable hole
+//!    for unmetered provider spend, since routing a schema at a backend that does not honour it
+//!    is caller-controlled input against a class Moira cannot verify.
 //!
-//!    **This is now a policy choice rather than a blocked one.** All three of F29's preconditions
-//!    have been discharged — F39 landed, the disposition above is recorded and guarded in
-//!    `src/orchestration/controls.rs` rather than merely true by omission, and `run_extraction`
-//!    reads `execution.status`. The fail-hard variant is deliberately left unshipped so that the
-//!    blast-radius decision gets its own diff; the two cases below (and the streaming twin) are
-//!    what it has to replace when it does. The doc comment on `structured_output_from_text` in
-//!    `src/application/execution.rs` carries the full argument.
+//!    All three of F29's preconditions were discharged first — F39 landed, the disposition is
+//!    recorded and guarded in `src/orchestration/controls.rs` rather than true by omission, and
+//!    `run_extraction` reads `execution.status`. The doc comment on `structured_output_from_text`
+//!    in `src/application/execution.rs` carries the full argument, including the boundary: `null`,
+//!    `{}` and `[]` all parse, so an empty *answer* is still a `200`.
+//! 6. **The negative control for the metering guard — issue #155 A2.** Case 5 says a refused
+//!    reply *is* metered; on its own that does not pin the `if` that keeps every *other* failure
+//!    from being metered, and deleting it succeeds silently because migration `0005` makes all
+//!    five token columns nullable. So an ordinary provider 500 is driven too, and asserted to
+//!    write **no** `usage_records` row at all.
+//! 7. **The empty controls — issue #155 A3.** The `null`/`{}`/`[]` boundary was pinned only by a
+//!    unit test calling `structured_output_from_text` directly, so an edit anywhere else on the
+//!    path could have turned an empty answer into a `422` with the tree green. All three now ride
+//!    as public controls inside case 4's public case.
 
 mod support;
 
@@ -162,6 +180,24 @@ impl Case {
         output_schema: Option<Value>,
         required_capabilities: Vec<String>,
     ) -> (StatusCode, Value) {
+        self.diagnose_with(
+            stream,
+            ExecutionOptions {
+                output_schema,
+                required_capabilities,
+                ..ExecutionOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// As [`Self::diagnose`], with the whole `ExecutionOptions` under the caller's control.
+    ///
+    /// `timeout_ms` and `stream` are still forced, because they have to agree with the `stream`
+    /// argument and with this suite's budget. Everything else is the caller's — which is what
+    /// lets a case pin `max_retries: 0` and so assert on an *exact* number of attempts rather
+    /// than on whatever `maximum_retries_per_candidate` happens to be configured to.
+    async fn diagnose_with(&self, stream: bool, options: ExecutionOptions) -> (StatusCode, Value) {
         let request = DiagnosticExecutionRequest {
             application_id: Some(self.fixture.application_id),
             external_tenant_id: None,
@@ -175,9 +211,7 @@ impl Case {
             options: ExecutionOptions {
                 timeout_ms: Some(5_000),
                 stream,
-                output_schema,
-                required_capabilities,
-                ..ExecutionOptions::default()
+                ..options
             },
             metadata: json!({ "test_fixture": true }),
         };
@@ -316,22 +350,35 @@ async fn a_reply_that_is_json_is_not_parsed_when_no_schema_was_requested() {
     case.shutdown().await;
 }
 
-/// **No fail-hard.** A non-conforming reply leaves the field `null` and changes nothing else.
+/// The reply a non-conforming model sends. Held as a constant because two assertions are about
+/// it: that it does not come back as an answer, and that it does not come back inside the error.
+const NON_CONFORMING_REPLY: &str = "I am afraid I cannot do that.";
+
+/// **Fail hard, issue #80.** A non-conforming reply ends the execution instead of leaving the
+/// field `null` on a `succeeded` outcome.
 ///
-/// The tripwire for anyone who adopts the fail-hard variant without also doing F39: this case
-/// and `an_unparseable_extraction_reply_fails_the_run_and_writes_no_memory` both go red.
+/// Replaces `a_reply_that_is_not_json_leaves_the_field_null_and_still_succeeds`, which asserted
+/// the opposite on the same fixture and whose own failure message named this change as the thing
+/// that would make it wrong. That case was correct for F29 and is wrong from #80 onward; the
+/// catalog description it protected has been widened in the same commit.
 ///
-/// **F42 — this case is also what makes the `moira.error.structured_output_invalid` catalog
-/// entry true.** That entry used to assert a second emitter, "or the model's output does not
-/// conform to it", and there is none: both real emitters reject the *caller's schema*
-/// (`validate_response_format`, `build_completion_request`). The catalog description now says
-/// so, and this is the assertion that would have to change first if it ever stopped being so —
-/// hence the pointer in the failure message below. A prose claim nothing observes is not a
-/// claim; this is the thing that observes it.
+/// **Four assertions, and each one is a different way the flip could be half-done:**
+///
+/// 1. the outcome is `failed` and the class is `structured_output_invalid` — not
+///    `provider_invalid_response`, and not a routing failure;
+/// 2. `output_text` is absent. A 422 that still carried the model's prose would hand the caller
+///    something that reads like an answer next to an error, which is the ambiguity the decision
+///    exists to remove;
+/// 3. the failure message does not contain the reply. `failure.message` is copied verbatim into
+///    the public error envelope, so a message built from the provider's bytes would put untrusted
+///    output under Moira's own error surface;
+/// 4. the provider was called **exactly once**. `StructuredOutputInvalid` is in neither
+///    `is_retryable` nor `is_fallback_eligible`, and a second call here would be the cheapest
+///    silent way to violate that — the disposition is asserted as behaviour, not as membership.
 #[tokio::test]
-async fn a_reply_that_is_not_json_leaves_the_field_null_and_still_succeeds() {
+async fn a_reply_that_is_not_json_fails_the_execution_with_structured_output_invalid() {
     let Some(case) = Case::new(vec![ProviderScript::Completion {
-        text: "I am afraid I cannot do that.".to_string(),
+        text: NON_CONFORMING_REPLY.to_string(),
     }])
     .await
     else {
@@ -341,37 +388,57 @@ async fn a_reply_that_is_not_json_leaves_the_field_null_and_still_succeeds() {
     let (status, body) = case.diagnose(false, Some(trivial_object_schema())).await;
     assert_eq!(status, StatusCode::OK, "diagnose failed: {body}");
     assert_eq!(
-        body["outcome"]["status"], "succeeded",
-        "a non-conforming reply must not fail the execution. If this is now intentional (the \
-         fail-hard variant), widen the moira.error.structured_output_invalid description in \
-         src/i18n/catalog/errors.rs AND docs/i18n-response-catalog.json in the same change — it \
-         currently states that no model-output-non-conformance path exists (F42): {body}"
+        body["outcome"]["status"], "failed",
+        "issue #80: a reply that is not JSON must fail a schema-carrying execution rather than \
+         reporting success with a null value: {body}"
+    );
+    assert_eq!(
+        body["outcome"]["failure"]["class"], "structured_output_invalid",
+        "the failure must name the structured-output contract, not the transport: {body}"
     );
     assert_eq!(body["outcome"]["structured_output"], Value::Null, "{body}");
     assert_eq!(
-        body["outcome"]["output_text"], "I am afraid I cannot do that.",
-        "{body}"
+        body["outcome"]["output_text"],
+        Value::Null,
+        "a failed structured execution must not return the prose as though it were an answer: \
+         {body}"
     );
-    assert_eq!(body["outcome"]["failure"], Value::Null, "{body}");
+    let message = body["outcome"]["failure"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !message.contains(NON_CONFORMING_REPLY),
+        "the failure message is copied verbatim into the public error envelope and must not echo \
+         the provider's reply: {message}"
+    );
+
+    assert_eq!(
+        case.provider().requests().await.len(),
+        1,
+        "the provider must be called exactly once: this class is neither retryable nor \
+         fallback-eligible, so a second call would mean the disposition in \
+         src/orchestration/controls.rs is not what its own guard says"
+    );
 
     case.shutdown().await;
 }
 
-/// **No fail-hard, on the stream.** F42 — added because the suite's own header argues for it and
-/// then did not do it.
+/// **Fail hard on the stream.** The streaming twin, and it guards a distinct failure mode.
 ///
-/// The header says `execute_rig_stream` "is a genuinely separate code path, and a fix applied at
-/// the Rig boundary would cover only case 1". That argument was applied to the *conforming*
-/// reply (case 2) and not to the non-conforming one, which left the cheapest falsifying edit
-/// unguarded: adding the fail-hard variant to the **streaming arm only** leaves all seven
-/// existing cases green — case 2 sends conforming JSON and never reaches the branch, and case 4
-/// never streams. Verified by running it, not by reading.
+/// `execute_rig_stream` never constructs a `RuntimeCompletionOutput` — it accumulates text itself
+/// — so the flip has to be applied there separately, and the cheapest half-done version of this
+/// change is applying it to the completion arm only. Every other case in this file stays green
+/// through that omission: case 2 sends conforming JSON, and the case above never streams.
 ///
-/// This case and the completion twin above are what make the
-/// `moira.error.structured_output_invalid` catalog entry's "no model-output-non-conformance
-/// path exists" true on *both* execution paths rather than on the one that was easy to write.
+/// The deltas are split so the failure is provably raised on the *accumulated* text rather than
+/// on a chunk, which is the same property case 2 pins for the success path.
+///
+/// It also pins the harder half of the decision: the caller has **already received these deltas**
+/// when the failure is raised. Failing anyway is deliberate — the deltas were text, and the
+/// caller asked for a value.
 #[tokio::test]
-async fn a_stream_whose_reply_is_not_json_leaves_the_field_null_and_still_succeeds() {
+async fn a_stream_whose_reply_is_not_json_fails_the_execution_with_structured_output_invalid() {
     let Some(case) = Case::new(vec![ProviderScript::Stream {
         deltas: vec!["I am afraid ".to_string(), "I cannot do that.".to_string()],
     }])
@@ -383,21 +450,616 @@ async fn a_stream_whose_reply_is_not_json_leaves_the_field_null_and_still_succee
     let (status, body) = case.diagnose(true, Some(trivial_object_schema())).await;
     assert_eq!(status, StatusCode::OK, "diagnose failed: {body}");
     assert_eq!(
-        body["outcome"]["status"], "succeeded",
-        "a non-conforming streamed reply must not fail the execution either. If this is now \
-         intentional (the fail-hard variant), widen the moira.error.structured_output_invalid \
-         description in src/i18n/catalog/errors.rs AND docs/i18n-response-catalog.json in the \
-         same change — it currently states that no model-output-non-conformance path exists \
-         (F42): {body}"
+        body["outcome"]["status"], "failed",
+        "issue #80 applies to the streaming path too, and this is the arm a completion-only fix \
+         leaves behind: {body}"
+    );
+    assert_eq!(
+        body["outcome"]["failure"]["class"], "structured_output_invalid",
+        "{body}"
     );
     assert_eq!(body["outcome"]["structured_output"], Value::Null, "{body}");
     assert_eq!(
-        body["outcome"]["output_text"], "I am afraid I cannot do that.",
-        "the accumulated text must survive unchanged: {body}"
+        body["outcome"]["output_text"],
+        Value::Null,
+        "the accumulated prose must not be reported as an answer: {body}"
     );
-    assert_eq!(body["outcome"]["failure"], Value::Null, "{body}");
+
+    assert_eq!(
+        case.provider().requests().await.len(),
+        1,
+        "no retry and no fallback on the streaming path either"
+    );
 
     case.shutdown().await;
+}
+
+/// One `usage_records` row, which is what billing and `GET /api/v1/usage` read.
+#[derive(Debug, sqlx::FromRow)]
+struct UsageRow {
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    total_tokens: Option<i64>,
+    metadata: Value,
+}
+
+/// **The refused reply is still metered — issue #80 review.**
+///
+/// This is the one property of the flip that is about money rather than about correctness, and it
+/// is the one a reader is most likely to assume comes for free. It does not: the failure lands on
+/// the attempt loop's failure arm, which records `UsageSummary::default()` and writes no
+/// `usage_records` row for every *other* failure it handles. Before the flip this exact request
+/// **succeeded**, so the provider's counts reached `execution_attempts.usage` and `usage_records`
+/// through the success arm. A fail-hard implementation that simply raised the failure would
+/// therefore have turned a metered request into unmetered provider spend — reachable on demand by
+/// sending a schema to a backend that does not honour it, which is caller-controlled input
+/// (`route`, `provider`, `model`) against an unverifiable backend class.
+///
+/// Both paths are driven, because the usage is carried at two independent call sites — one in
+/// `execute_rig_completion`, one at the end of `execute_rig_stream` — and reverting either alone
+/// must red this case. The mock reports `prompt_tokens: 2, completion_tokens: 1, total_tokens: 3`
+/// on both, so the assertion is on the exact counts rather than on "a row exists": a row built
+/// from `UsageSummary::default()` is all-`NULL`, and all-`NULL` is precisely the shape this case
+/// exists to reject.
+///
+/// The `usage_records` row is the load-bearing one — it is what billing and quota read
+/// (`GET /api/v1/usage`, `docs/execution-and-usage-api.md`) — but the outcome document is
+/// asserted too, because finding F38 was an outcome that contradicted its own `attempts` array
+/// about exactly this field.
+#[tokio::test]
+async fn a_refused_reply_is_still_metered_for_the_tokens_the_provider_billed() {
+    for stream in [false, true] {
+        let script = if stream {
+            ProviderScript::Stream {
+                deltas: vec!["I am afraid ".to_string(), "I cannot do that.".to_string()],
+            }
+        } else {
+            ProviderScript::Completion {
+                text: NON_CONFORMING_REPLY.to_string(),
+            }
+        };
+        let Some(case) = Case::new(vec![script]).await else {
+            return;
+        };
+
+        let (status, body) = case.diagnose(stream, Some(trivial_object_schema())).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "diagnose failed (stream={stream}): {body}"
+        );
+        assert_eq!(
+            body["outcome"]["failure"]["class"], "structured_output_invalid",
+            "control: this case is only about the refusal path (stream={stream}): {body}"
+        );
+        let execution_id: uuid::Uuid = body["outcome"]["execution_id"]
+            .as_str()
+            .expect("execution id")
+            .parse()
+            .expect("execution id is a uuid");
+
+        let usage_rows: Vec<UsageRow> = sqlx::query_as(
+            "select input_tokens, output_tokens, total_tokens, metadata from usage_records \
+             where execution_id = $1",
+        )
+        .bind(execution_id)
+        .fetch_all(&case.fixture.pool)
+        .await
+        .expect("read usage_records");
+        assert_eq!(
+            usage_rows.len(),
+            1,
+            "a provider call that was answered and billed must be metered even when Moira \
+             refuses the answer; no row here is unmetered provider spend a caller can summon \
+             (stream={stream}): {body}"
+        );
+        let metered = &usage_rows[0];
+        assert_eq!(
+            (
+                metered.input_tokens,
+                metered.output_tokens,
+                metered.total_tokens
+            ),
+            (Some(2), Some(1), Some(3)),
+            "the row must carry the counts the provider reported, not the all-NULL row a \
+             defaulted UsageSummary writes (stream={stream})"
+        );
+        assert_eq!(
+            metered.metadata["attempt_outcome"], "failed",
+            "billing must be able to tell a metered refusal from a metered answer without \
+             joining back to execution_attempts (stream={stream}): {}",
+            metered.metadata
+        );
+        assert_eq!(
+            metered.metadata["failure_class"], "structured_output_invalid",
+            "and it must say which refusal (stream={stream}): {}",
+            metered.metadata
+        );
+
+        let attempts: Vec<(String, Option<i64>)> = sqlx::query_as(
+            "select status, total_tokens from execution_attempts where execution_id = $1",
+        )
+        .bind(execution_id)
+        .fetch_all(&case.fixture.pool)
+        .await
+        .expect("read execution_attempts");
+        assert_eq!(attempts.len(), 1, "exactly one attempt (stream={stream})");
+        assert_eq!(attempts[0].0, "failed", "(stream={stream})");
+        assert_eq!(
+            attempts[0].1,
+            Some(3),
+            "the attempt row is what an operator reads per attempt, and it must not disagree \
+             with the usage record written from the same counts (stream={stream})"
+        );
+
+        assert_eq!(
+            body["outcome"]["usage"]["total_tokens"], 3,
+            "the outcome must report what the execution cost; F38 was this field hardcoded to \
+             all-null next to an attempts array that knew better (stream={stream}): {body}"
+        );
+        assert_eq!(
+            body["outcome"]["attempts"][0]["usage"]["total_tokens"], 3,
+            "and the two halves of the document must agree (stream={stream}): {body}"
+        );
+
+        case.shutdown().await;
+    }
+}
+
+/// The error body the mock returns with its `500`.
+///
+/// Deliberately not a JSON document and not a token count: the point of the case below is a
+/// failure the provider reported *nothing* measurable about, which is the input
+/// `usage_was_reported` reads.
+const PROVIDER_FAILURE_BODY: &str = "the provider fell over";
+
+/// **The negative control for the metering guard — issue #155 A2.**
+///
+/// The case above proves a *refused* reply is metered. On its own that is only half a property:
+/// the mechanism that keeps it from metering **every** failure is a single `if` —
+/// `usage_was_reported(&usage)` in the attempt loop's failure arm — and deleting it succeeds
+/// silently. Migration `0005` makes all five token columns nullable, so an ordinary provider
+/// failure would write an all-`NULL` `usage_records` row instead of erroring, and no test in the
+/// tree went red. That edit inverts what the table means: `usage_records` has only ever held
+/// attempts that were billed, and a billing job that counts rows rather than summing tokens would
+/// start charging for every 500 the deployment absorbs.
+///
+/// The two `usage_records is empty` assertions in `tests/execution_lifecycle.rs` are not this
+/// guard. They are about the terminal-persistence deadline — a *successful* execution whose
+/// writes were cut short — and they run on a path that never reaches this arm.
+///
+/// # The three controls, and what each one rules out
+///
+/// 1. **The provider was called exactly once.** "No usage row" is also what a request refused at
+///    admission produces — `no_eligible_model`, a bad credential, a route that does not resolve —
+///    and such a request never reaches the arm this case is about. One call proves it did.
+/// 2. **Exactly one `execution_attempts` row, and its status is `failed`.** The attempt row is
+///    written by `complete_failed_attempt`, immediately above the `if` under test, so its
+///    presence is what makes the absence below meaningful: the arm ran, and chose not to meter.
+/// 3. **That row's `total_tokens` is `NULL`.** This is the reading `usage_was_reported` acts on —
+///    all-`None` is *unknown*, not zero — stated as a fact about this fixture rather than assumed.
+///    If the mock ever started reporting counts on an error response, the property under test
+///    would change meaning and this assertion is what would say so.
+///
+/// `max_retries: 0` is set so "exactly one" is exact: with the default retry budget a retryable
+/// class would produce several attempts, and the case would have to assert a count it does not
+/// control. `allow_fallback: false` does the same for the candidate list.
+#[tokio::test]
+async fn a_plain_provider_failure_writes_no_usage_record_at_all() {
+    let Some(case) = Case::new(vec![ProviderScript::HttpError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        body: PROVIDER_FAILURE_BODY.to_string(),
+    }])
+    .await
+    else {
+        return;
+    };
+
+    let (status, body) = case
+        .diagnose_with(
+            false,
+            ExecutionOptions {
+                max_retries: Some(0),
+                max_fallbacks: Some(0),
+                allow_fallback: false,
+                ..ExecutionOptions::default()
+            },
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "diagnose failed: {body}");
+    assert_eq!(
+        body["outcome"]["status"], "failed",
+        "control: this case is about an ordinary provider failure, so the execution must have \
+         failed: {body}"
+    );
+    assert_eq!(
+        body["outcome"]["failure"]["class"], "provider_unavailable",
+        "control: a 5xx from the provider, not a structured-output refusal — those are metered, \
+         and confusing the two would make this case assert the opposite of what it means: {body}"
+    );
+    let execution_id: uuid::Uuid = body["outcome"]["execution_id"]
+        .as_str()
+        .expect("execution id")
+        .parse()
+        .expect("execution id is a uuid");
+
+    assert_eq!(
+        case.provider().requests().await.len(),
+        1,
+        "control: the provider must actually have been called, or 'no usage row' is just what a \
+         request refused before any attempt looks like: {body}"
+    );
+
+    let attempts: Vec<(String, Option<i64>)> = sqlx::query_as(
+        "select status, total_tokens from execution_attempts where execution_id = $1",
+    )
+    .bind(execution_id)
+    .fetch_all(&case.fixture.pool)
+    .await
+    .expect("read execution_attempts");
+    assert_eq!(
+        attempts.len(),
+        1,
+        "control: exactly one attempt, so the absence below is about one trip through the \
+         failure arm rather than an execution that never made one: {attempts:?}"
+    );
+    assert_eq!(attempts[0].0, "failed", "{attempts:?}");
+    assert_eq!(
+        attempts[0].1, None,
+        "control: the provider reported no counts, which is the input usage_was_reported reads; \
+         a mock that started reporting them on an error would change what this case tests"
+    );
+
+    let metered: i64 =
+        sqlx::query_scalar("select count(*) from usage_records where execution_id = $1")
+            .bind(execution_id)
+            .fetch_one(&case.fixture.pool)
+            .await
+            .expect("count usage_records");
+    assert_eq!(
+        metered, 0,
+        "a provider failure that billed nothing must be metered nowhere: an all-NULL row here is \
+         a billing record asserting zero tokens for a call that never completed, and it inverts \
+         what usage_records has always meant — see issue #155 A2 and usage_was_reported in \
+         src/application/execution.rs"
+    );
+
+    case.shutdown().await;
+}
+
+/// **The success arm stamps `attempt_outcome` too — issue #155 B2.**
+///
+/// The failure arm (case 5, above) writes `metadata.attempt_outcome = "failed"` on the row it
+/// meters, and both `docs/execution-attempts-and-usage.md` and `docs/release-notes.md` describe
+/// that as letting "a billing job tell a metered refusal from a metered answer" — true only by
+/// **absence** on the success side, since the success arm used to write only
+/// `{"cost_estimation": "unavailable"}`. A reader who took the docs at face value and wrote
+/// `where metadata->>'attempt_outcome' = 'succeeded'` got nothing back, on a column any consumer
+/// could already be querying.
+///
+/// This drives an ordinary successful execution — non-streaming and streaming, since the two
+/// terminal writes are independent call sites — and runs exactly that query, proving it returns
+/// the row rather than nothing.
+#[tokio::test]
+async fn a_successful_attempt_is_stamped_succeeded_in_usage_metadata() {
+    for stream in [false, true] {
+        let script = if stream {
+            ProviderScript::Stream {
+                deltas: vec!["all ".to_string(), "clear".to_string()],
+            }
+        } else {
+            ProviderScript::Completion {
+                text: "all clear".to_string(),
+            }
+        };
+        let Some(case) = Case::new(vec![script]).await else {
+            return;
+        };
+
+        let (status, body) = case.diagnose(stream, None).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "diagnose failed (stream={stream}): {body}"
+        );
+        assert_eq!(
+            body["outcome"]["status"], "succeeded",
+            "control: this case is about the success arm, not a refusal (stream={stream}): {body}"
+        );
+        let execution_id: uuid::Uuid = body["outcome"]["execution_id"]
+            .as_str()
+            .expect("execution id")
+            .parse()
+            .expect("execution id is a uuid");
+
+        let succeeded_rows: Vec<UsageRow> = sqlx::query_as(
+            "select input_tokens, output_tokens, total_tokens, metadata from usage_records \
+             where execution_id = $1 and metadata->>'attempt_outcome' = 'succeeded'",
+        )
+        .bind(execution_id)
+        .fetch_all(&case.fixture.pool)
+        .await
+        .expect("read usage_records");
+        assert_eq!(
+            succeeded_rows.len(),
+            1,
+            "the exact query the docs describe must return the row a successful attempt wrote, \
+             not nothing (stream={stream}): {body}"
+        );
+        assert_eq!(
+            succeeded_rows[0].metadata["cost_estimation"], "unavailable",
+            "the pre-existing key must survive the addition of attempt_outcome \
+             (stream={stream}): {}",
+            succeeded_rows[0].metadata
+        );
+
+        case.shutdown().await;
+    }
+}
+
+/// One schema-carrying public request, answered by `script`, against a fixture wired for
+/// structured output.
+///
+/// `path` selects the endpoint — `responses` or `responses/stream` — because the two publish
+/// *different* contracts for the same failure (a `422` status versus a `200` carrying a terminal
+/// `response.failed` event) and the difference is exactly what the streaming case has to observe.
+///
+/// Returns `(status, raw body, provider call count)`. The body is returned as a string rather than
+/// parsed so a case can assert on the *bytes* the caller received — which is how "the provider's
+/// reply is not echoed anywhere in the envelope" is checked, including in fields a targeted
+/// assertion would not look at; for the stream it is also the raw SSE frames.
+///
+/// The count is taken after the response, so "one call" covers the whole request rather than the
+/// part before the failure.
+async fn public_request(path: &str, script: ProviderScript) -> Option<(StatusCode, String, usize)> {
+    let fixture = LifecycleFixture::new().await?;
+    let provider = MockOpenAiServer::start(vec![script]).await;
+    fixture
+        .add_provider_with_capabilities(
+            provider.base_url(),
+            10,
+            RuntimePolicy::default(),
+            // A schema-carrying public request requires this capability
+            // (`required_capabilities` in `application/public.rs`), so the default
+            // streaming-only model would fail at routing before reaching the provider.
+            json!({ "streaming": true, "structured_output": true }),
+        )
+        .await;
+    let consumer_key = fixture.enable_public_streaming().await;
+    let moira = MoiraHttpServer::start(fixture.state.clone()).await;
+
+    let response = tokio::time::timeout(
+        WAIT,
+        reqwest::Client::new()
+            .post(format!("{}/api/v1/{path}", moira.base_url))
+            .header("x-consumer-key", &consumer_key)
+            .header("x-request-id", format!("i80-{}", uuid::Uuid::now_v7()))
+            .json(&json!({
+                "input": [{ "role": "user", "content": [{ "type": "input_text", "text": "return the object" }] }],
+                "route": fixture.route_key,
+                "response_format": {
+                    "type": "json_schema",
+                    "name": "trivial",
+                    "schema": trivial_object_schema()
+                }
+            }))
+            .send(),
+    )
+    .await
+    .expect("public response request timed out")
+    .expect("public response request");
+    let status = response.status();
+    let body = response.text().await.expect("public response body");
+    let calls = provider.call_count().await;
+
+    moira.shutdown().await;
+    provider.shutdown().await;
+    Some((status, body, calls))
+}
+
+/// The non-streaming public request, which is what the `422` contract is about.
+async fn public_response(reply: &str) -> Option<(StatusCode, String, usize)> {
+    public_request(
+        "responses",
+        ProviderScript::Completion {
+            text: reply.to_string(),
+        },
+    )
+    .await
+}
+
+/// **The decision itself, where a caller can see it: `422`, not a `200` with a null value.**
+///
+/// The three cases above drive `POST /api/v1/admin/runtime/diagnose`, which answers `200` with an
+/// outcome document whatever the execution did — so it can show that the execution failed, but it
+/// cannot show the status code or the error code the public contract promises. Issue #80 is a
+/// statement about that contract, so it is asserted on the contract.
+///
+/// **The control is in the same test and is not decoration.** "422 and the code is
+/// `structured_output_invalid`" is also what a *schema* rejection produces
+/// (`validate_response_format`, `build_completion_request` — the class's other two emitters), and
+/// a fixture whose model could not be routed a schema at all would fail before any provider call
+/// with the same status. The conforming control proves this fixture reaches the provider and that
+/// its reply is accepted — asserted as `200`, one provider call, `status: completed` and the
+/// provider's own document in the output text, since `PublicResponse` has no structured-output
+/// field to read the parsed value from. The refusal is therefore attributable to the reply rather
+/// than to the request or to the wiring — the vacuous-pass shape HANDOFF §2.3 keeps finding.
+///
+/// # The empty controls — issue #155 A3
+///
+/// The half of issue #80 most worth protecting is the boundary: `null`, `{}` and `[]` are all
+/// valid JSON, so an *empty answer* is still a `200`. Until issue #155 that was pinned only by
+/// `a_schema_carrying_reply_that_is_not_json_is_a_failure_rather_than_a_none`, a unit test that
+/// calls `structured_output_from_text` directly — so any edit **outside** that function would have
+/// turned legitimately empty answers into `422`s with the whole tree green. The one-line version
+/// is `if structured_output.as_ref().is_none_or(Value::is_null) { return Err(..) }` in
+/// `execute_rig_completion`, which reads like a tightening of exactly the decision this file is
+/// about and is wrong.
+///
+/// All three documented empties are driven rather than one, because the plausible edits do not
+/// all catch the same value: a null check misses `{}`, an emptiness check on objects misses
+/// `null`, and a truthiness check catches all three. Each is a complete public request against a
+/// fresh fixture, which is the cost of asserting this where a caller can see it.
+#[tokio::test]
+async fn a_public_caller_receives_422_rather_than_a_null_structured_output() {
+    let Some((status, body, calls)) = public_response(NON_CONFORMING_REPLY).await else {
+        return;
+    };
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "issue #80: a reply that is not JSON must reach the caller as 422, got {status}: {body}"
+    );
+    let envelope: Value = serde_json::from_str(&body).expect("coded error envelope");
+    assert_eq!(
+        envelope["error"]["code"], "structured_output_invalid",
+        "the caller must be told which contract failed: {body}"
+    );
+    assert_eq!(
+        envelope["error"]["message_key"], "moira.error.structured_output_invalid",
+        "the code must resolve to its catalog entry, which is what makes the message \
+         translatable: {body}"
+    );
+    assert!(
+        !body.contains(NON_CONFORMING_REPLY),
+        "the error envelope must not carry the provider's reply back to the caller: {body}"
+    );
+    assert_eq!(calls, 1, "exactly one provider call, no retry, no fallback");
+
+    // The control. Same fixture, same schema, same route — a reply that *is* JSON must still be
+    // answered `200`, carrying the provider's own document, or the refusal above is
+    // unattributable.
+    const CONFORMING_REPLY: &str = "{\"a\":1}";
+    let Some((status, body, calls)) = public_response(CONFORMING_REPLY).await else {
+        return;
+    };
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the control request must succeed, or the 422 above proves only that the fixture is \
+         broken: {body}"
+    );
+    assert_eq!(
+        calls, 1,
+        "the control request must reach the provider: {body}"
+    );
+    let control: Value = serde_json::from_str(&body).expect("public response envelope");
+    assert_eq!(
+        control["status"], "completed",
+        "a 200 whose response is not `completed` would not show that the schema-carrying request \
+         was actually answered: {body}"
+    );
+    // `PublicResponse` has no structured-output field — that is why the three cases above use the
+    // diagnostic endpoint — so the observable proof that the reply was accepted rather than
+    // merely tolerated is the provider's document arriving as the output text.
+    assert_eq!(
+        control["output"][0]["content"][0]["text"], CONFORMING_REPLY,
+        "the control must return the provider's own reply, or 'this fixture reaches the provider \
+         and its reply is accepted' is asserted only by the status code: {body}"
+    );
+
+    // The empty controls. An answer with nothing in it is still an answer: these three are the
+    // exact values `structured_output_from_text`'s doc comment names as the boundary of the
+    // decision, and each one must come back as a `200` carrying itself.
+    for empty_reply in ["{}", "null", "[]"] {
+        let Some((status, body, calls)) = public_response(empty_reply).await else {
+            return;
+        };
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "issue #80 refuses replies that are not JSON, not replies that are empty; `{empty_reply}` \
+             is valid JSON and must still be a 200: {body}"
+        );
+        assert_eq!(
+            calls, 1,
+            "the empty control must reach the provider (reply={empty_reply}): {body}"
+        );
+        let empty: Value = serde_json::from_str(&body).expect("public response envelope");
+        assert_eq!(
+            empty["status"], "completed",
+            "an empty answer completes; a 200 that is not `completed` would mean the request was \
+             refused somewhere the status code cannot show (reply={empty_reply}): {body}"
+        );
+        assert_eq!(
+            empty["output"][0]["content"][0]["text"], empty_reply,
+            "and it must carry the provider's own document, so this cannot pass against a \
+             response that succeeded with the answer discarded (reply={empty_reply}): {body}"
+        );
+    }
+}
+
+/// **The other half of the published contract: on the stream the refusal is an event, not a
+/// status.**
+///
+/// `docs/release-notes.md` promises operators two different things for one failure — `422` on
+/// `POST /api/v1/responses`, and `200` on `POST /api/v1/responses/stream` with the same code
+/// arriving as the terminal `response.failed` event *after the deltas the caller has already
+/// received*. The case above pins the first. Without this one the second is published and
+/// unguarded: the response head is written before the execution starts, so a stream cannot report
+/// this failure the way the non-streaming path does, and the plausible half-done shapes — ending
+/// the stream with no terminal event, or reporting `response.completed` with no output — are
+/// invisible to every other case in this file.
+///
+/// **The deltas are asserted to have arrived**, which is the uncomfortable part of the decision
+/// stated as behaviour: the caller was streamed prose and the request is failed anyway, because
+/// the deltas were text and the caller asked for a value. It is also what distinguishes this from
+/// a request refused before it ran — a schema rejection produces the same terminal code with no
+/// deltas at all.
+#[tokio::test]
+async fn a_public_stream_carries_the_refusal_as_its_terminal_event_after_the_deltas() {
+    let Some((status, body, calls)) = public_request(
+        "responses/stream",
+        ProviderScript::Stream {
+            deltas: vec!["I am afraid ".to_string(), "I cannot do that.".to_string()],
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the transport still succeeds: the head is written before the execution starts, so the \
+         refusal has to arrive on the stream: {body}"
+    );
+    assert_eq!(calls, 1, "exactly one provider call: {body}");
+
+    let events: Vec<Value> = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .collect();
+    let deltas: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["type"] == "response.output_text.delta")
+        .collect();
+    assert!(
+        !deltas.is_empty(),
+        "the caller must already have received the text before the refusal, or this case is not \
+         about the streaming decision at all: {events:?}"
+    );
+    let failed: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["type"] == "response.failed")
+        .collect();
+    assert_eq!(
+        failed.len(),
+        1,
+        "a refused stream must end with exactly one response.failed event: {events:?}"
+    );
+    assert_eq!(
+        failed[0]["payload"]["error"]["code"], "structured_output_invalid",
+        "and it must carry the same code the non-streaming path returns as a 422: {:?}",
+        failed[0]
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["type"] == "response.completed"),
+        "a refused stream must not also report completion: {events:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

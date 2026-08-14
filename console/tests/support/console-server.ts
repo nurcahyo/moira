@@ -68,6 +68,10 @@ export function startConsoleServer(deps: ConsoleAuthDeps, port: number): Console
           // that wants to exercise the drifted-row path resolves through
           // `loadAuthConfigs` instead of through this seam.
           problems: [],
+          // The harness resolves a configuration on the spot, so it is never a
+          // snapshot that aged out. The staleness path has its own tests in
+          // `tests/unit/lib/auth-runtime-refresh.test.ts`.
+          stale: false,
         }));
       }
       // The post-sign-in landing page. The flow redirects here, so it has to

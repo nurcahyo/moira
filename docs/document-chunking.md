@@ -45,9 +45,11 @@ indefinitely; that is its whole job. The reversal condition is recorded on
 Finding F14 applied that same admitting rule per *table* rather than to `content_hash` as one
 thing, and `memory_records.content_hash` moved to `request_hash` for the same reason (it is not
 caller-visible, is never a caller-supplied lookup key, and is only ever compared within one
-application — see `memory_content_hash` in `src/application/conversation.rs`).
-`conversation_messages.content_hash` stays peppered because it fails the first clause outright:
-it is returned on `ConversationMessageRecord`.
+application). It has since moved **off** it again: issues #140 and #168 keyed that column under
+every persistence policy, because the admitting rule asks how guessable the digested thing is and
+a memory body is very guessable — see `ContentSealer::memory_content_hash`. A chunk is not, which
+is why `chunk_hash` is unaffected. `conversation_messages.content_hash` stays peppered because it
+fails the first clause outright: it is returned on `ConversationMessageRecord`.
 
 ## Limits
 

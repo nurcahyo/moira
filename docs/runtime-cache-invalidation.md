@@ -29,6 +29,18 @@ Phase 3 invalidates:
 - model candidate calculations
 - circuit-breaker configuration/state (scoped, as above)
 
+## The console follows the same shape, without the trigger
+
+The Next.js console (`console/`) keeps its own per-process snapshot of the
+resolved auth configuration, and it is a client of Moira's HTTP API rather than
+of its database — so it cannot `LISTEN` on this channel. It applies the same two
+mechanisms in the same order: `invalidateAuthConfig()` at the one write it owns
+(the setup wizard's provisioning route), and a 60-second TTL as the backstop for
+every write it cannot see. The TTL is shorter than
+`provider_settings_cache_ttl_seconds` deliberately — here it is not behind a
+listener that observes every write, so it is the staleness bound an operator
+actually experiences. See `docs/console-architecture.md` and issue #152.
+
 ```mermaid
 flowchart TD
     A["Admin write"] --> B["PostgreSQL trigger"]

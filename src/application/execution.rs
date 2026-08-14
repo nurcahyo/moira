@@ -17,13 +17,14 @@ use crate::{
     app::AppState,
     application::RequestContext,
     domain::{
-        AgentProfileRecord, AttemptStatus, AuditLogInsert, AuditResult, CallerRuntimeIdentity,
-        CredentialDecision, DiagnosticExecutionRequest, DiagnosticExecutionResponse, DomainMessage,
-        EffectiveExecutionPolicy, ExecutionCommand, ExecutionFailure, ExecutionFailureClass,
-        ExecutionOutcome, ExecutionStatus, ExecutionStreamHandle, ModelCandidate, ModelDecision,
-        ModelSelectionReason, ProviderAttemptSummary, ProviderRuntimePolicyRecord, ProviderType,
-        ResolvedCredential, ResolvedProviderConfiguration, RouteDecision, RouteSelectionReason,
-        RuntimeEventEnvelope, RuntimeEventType, UsageSummary,
+        AgentProfileRecord, AgentProfileResolution, AttemptStatus, AuditLogInsert, AuditResult,
+        CallerRuntimeIdentity, CredentialDecision, DiagnosticExecutionRequest,
+        DiagnosticExecutionResponse, DomainMessage, EffectiveExecutionPolicy, ExecutionCommand,
+        ExecutionFailure, ExecutionFailureClass, ExecutionOutcome, ExecutionStatus,
+        ExecutionStreamHandle, ModelCandidate, ModelDecision, ModelSelectionReason,
+        ProviderAttemptSummary, ProviderRuntimePolicyRecord, ProviderType, ResolvedCredential,
+        ResolvedProviderConfiguration, RouteDecision, RouteSelectionReason, RuntimeEventEnvelope,
+        RuntimeEventType, UsageSummary,
     },
     error::AppError,
     infra::{
@@ -188,14 +189,43 @@ impl MoiraExecutionService {
         )
         .await?;
 
+        // F50, decided fail-closed on issue #79. A route that names an agent profile the
+        // runtime cannot use is refused here, before any provider is chosen, any credential is
+        // decrypted and any attempt row is written — see `agent_profile_failure` for the
+        // reasoning and for why the two answers carry different codes.
         let agent_profile = match route.agent_profile_id {
             Some(id) => {
-                let resolved = self.runtime_repo.get_active_agent_profile(id).await?;
-                if resolved.is_none() {
-                    self.announce_dangling_agent_profile(&command, &route, id, events)
+                let resolution = AgentProfileResolution::classify(
+                    self.runtime_repo.find_agent_profile_reference(id).await?,
+                );
+                match resolution {
+                    AgentProfileResolution::Active(profile) => Some(*profile),
+                    unusable => {
+                        let failure = agent_profile_failure(&route, id, &unusable);
+                        self.announce_dangling_agent_profile(
+                            &command, &route, id, &unusable, events,
+                        )
                         .await?;
+                        self.audit_execution(
+                            &command,
+                            "execution.failed",
+                            AuditResult::Failed,
+                            &failure,
+                        )
+                        .await?;
+                        events.push(
+                            RuntimeEventType::ExecutionFailed,
+                            json!({ "failure_class": failure.class }),
+                        );
+                        return Ok(failed_outcome(
+                            command,
+                            Some(route),
+                            None,
+                            attempts,
+                            failure,
+                        ));
+                    }
                 }
-                resolved
             }
             None => None,
         };
@@ -545,7 +575,7 @@ impl MoiraExecutionService {
                 let bounded_by_total_deadline =
                     attempt_timeout < Duration::from_millis(runtime_policy.timeout_ms);
                 let result = tokio::select! {
-                    _ = cancellation.cancelled() => Ok(Err(cancelled_failure())),
+                    _ = cancellation.cancelled() => Ok(Err(cancelled_failure().into())),
                     result = tokio::time::timeout(attempt_timeout, execution) => result,
                 };
                 drop(permits);
@@ -590,7 +620,15 @@ impl MoiraExecutionService {
                                     provider_model_id: candidate.provider_model_id,
                                     credential_id: credential.credential.credential_id,
                                     usage: output.usage.clone(),
-                                    metadata: json!({ "cost_estimation": "unavailable" }),
+                                    // Stamped explicitly rather than left to be inferred from
+                                    // absence: the failure arm below writes
+                                    // `attempt_outcome: "failed"`, and a reader who queries
+                                    // `metadata->>'attempt_outcome' = 'succeeded'` must get rows
+                                    // back rather than nothing (issue #155 item B2).
+                                    metadata: json!({
+                                        "cost_estimation": "unavailable",
+                                        "attempt_outcome": "succeeded"
+                                    }),
                                 })
                                 .await?;
                             self.runtime_repo
@@ -817,7 +855,7 @@ impl MoiraExecutionService {
                             failure: None,
                         });
                     }
-                    Ok(Err(failure)) => {
+                    Ok(Err(FailedAttempt { failure, usage })) => {
                         self.state
                             .circuits
                             .on_failure(
@@ -843,11 +881,51 @@ impl MoiraExecutionService {
                             attempt_id,
                             started,
                             &failure,
-                            UsageSummary::default(),
+                            usage.clone(),
                             None,
                             json!({}),
                         )
                         .await?;
+                        // **A billed provider call is metered even when its reply is refused
+                        // (issue #80 review).** `usage` is all-`None` for every failure raised
+                        // before or instead of a complete reply, and the row is skipped then —
+                        // the shape this arm has always had. It is populated only where the
+                        // provider answered, was charged for answering, and Moira then refused
+                        // the answer: without this row that request burns provider tokens with
+                        // nothing in `usage_records`, on a path a caller reaches by sending a
+                        // schema to a backend that does not honour it. Before the flip the same
+                        // request succeeded and was metered here-equivalent by the success arm,
+                        // so this restores the row rather than adding one.
+                        //
+                        // Written *after* the attempt row is completed, so the foreign key it
+                        // carries always resolves, and unbounded like the neighbouring writes in
+                        // this arm rather than under the success arm's terminal-persistence
+                        // budget: there is no committed output to protect here.
+                        if usage_was_reported(&usage) {
+                            self.runtime_repo
+                                .insert_usage_record(&UsageRecordInsert {
+                                    id: Uuid::now_v7(),
+                                    request_id: command.request_id.clone(),
+                                    execution_id: command.execution_id,
+                                    attempt_id,
+                                    application_id: command.application_id,
+                                    external_tenant_id: command.external_tenant_id.clone(),
+                                    external_user_id: command.external_user_id.clone(),
+                                    provider_id: candidate.provider_id,
+                                    provider_model_id: candidate.provider_model_id,
+                                    credential_id: credential.credential.credential_id,
+                                    usage: usage.clone(),
+                                    // The failure class travels with the row so a billing job
+                                    // can tell a metered refusal from a metered answer without
+                                    // joining back to `execution_attempts`.
+                                    metadata: json!({
+                                        "cost_estimation": "unavailable",
+                                        "attempt_outcome": "failed",
+                                        "failure_class": failure.class
+                                    }),
+                                })
+                                .await?;
+                        }
                         attempts.push(attempt_summary(
                             attempt_id,
                             attempt_number,
@@ -855,7 +933,7 @@ impl MoiraExecutionService {
                             credential.credential.credential_id,
                             Some(failure.class),
                             started,
-                            UsageSummary::default(),
+                            usage,
                         ));
                         events.push(
                             RuntimeEventType::ProviderAttemptFailed,
@@ -1226,38 +1304,30 @@ impl MoiraExecutionService {
 
     /// F50 — the route names an agent profile that no longer resolves.
     ///
-    /// # What this does and, just as deliberately, what it does not
+    /// # What this does, and what now happens after it
     ///
-    /// `get_active_agent_profile` filters `status = 'active' and deleted_at is null`.
-    /// Disabling a profile or soft-deleting it leaves `route_definitions.agent_profile_id`
+    /// [`AgentProfileResolution::classify`] reads the row without a `status`/`deleted_at`
+    /// filter. Disabling a profile or soft-deleting it leaves `route_definitions.agent_profile_id`
     /// pointing at the row — the FK is `on delete set null` and `soft_delete_agent_profile`
-    /// only writes `status = 'deleted', deleted_at = now()`, never a `DELETE` — so the
-    /// lookup returns `Ok(None)` and the caller's request proceeds without the profile's
-    /// `preamble`, `temperature` and `max_tokens`, reporting `succeeded`. A preamble is
-    /// where guardrails live, so the failure mode is an unguarded model answering
-    /// production traffic.
+    /// only writes `status = 'deleted', deleted_at = now()`, never a `DELETE` — so the route
+    /// keeps naming a profile the runtime will not use. Before the observability shipped there
+    /// was **no failure, no `warn!`, no runtime event and no audit row**: the request simply
+    /// proceeded without the profile's `preamble`, `temperature` and `max_tokens` and reported
+    /// `succeeded`. A preamble is where guardrails live, so the failure mode was an unguarded
+    /// model answering production traffic.
     ///
-    /// Until this function existed there was **no failure, no `warn!`, no runtime event and
-    /// no audit row** — the agent profile was the only runtime reference on this path whose
-    /// disappearance was silent, where an unresolvable *route* is a `RouteNotFound` failure.
-    ///
-    /// **The request's behaviour is unchanged.** Whether Moira should also *refuse* is a
-    /// product decision that has not been taken: fail-closed is safer but breaks any
-    /// deployment that disables a profile expecting its routes to keep serving, and
-    /// observable fail-open still serves the unguarded request. Silence, however, is a
-    /// defect under *either* answer — both require the operator to be told, and they differ
-    /// only in whether the request is also refused. So the observability is not half of one
-    /// option; it is the part both options share, and it ships first.
-    ///
-    /// *Reversal condition:* when that decision is taken this becomes "observe and refuse"
-    /// or stays as it is. The observability itself is not revisited.
+    /// **Issue #79 decided that fail-closed, so the caller is now also refused** — see
+    /// [`agent_profile_failure`]. This function is unchanged in purpose: it is the *operator's*
+    /// half, and it still runs on the refusal path because the caller's error is neither durable
+    /// nor allowed to name the route's internals.
     ///
     /// # It cannot fire for a route that has no profile
     ///
     /// Called only from the `Some(id)` arm above, so "this route was never given a profile"
     /// — the normal case, and the one every fixture in the tree exercises — stays exactly as
-    /// silent as it was. The two are distinguishable because `route.agent_profile_id` is the
-    /// thing that differs, and it is read before the lookup rather than inferred from it.
+    /// silent as it was, and keeps executing. The two are distinguishable because
+    /// `route.agent_profile_id` is the thing that differs, and it is read before the lookup
+    /// rather than inferred from it.
     ///
     /// # Three signals, because they have three different consumers
     ///
@@ -1266,24 +1336,33 @@ impl MoiraExecutionService {
     /// deliberately *not* mapped onto the public SSE contract, see `map_runtime_event`. The
     /// audit row is the durable one: it survives log rotation and is queryable by
     /// `resource_id = execution_id` alongside `execution.started`.
+    ///
+    /// All three carry `reason`, which is the same distinction the caller's error code makes:
+    /// an operator reading `agent_profile.unavailable` and a caller reading
+    /// `agent_profile_disabled` must be looking at the same fact.
     async fn announce_dangling_agent_profile(
         &self,
         command: &ExecutionCommand,
         route: &RouteDecision,
         agent_profile_id: Uuid,
+        resolution: &AgentProfileResolution,
         events: &mut EventCollector,
     ) -> Result<(), AppError> {
+        let reason = agent_profile_reason(resolution);
         warn!(
             execution_id = %command.execution_id,
             request_id = %command.request_id,
             route_id = %route.route_id,
             route_key = %route.route_key,
             %agent_profile_id,
-            "route references an agent profile that is disabled or deleted; the execution \
-             proceeds without its preamble, temperature and max_tokens"
+            reason,
+            "route references an agent profile that is disabled or deleted; the execution is \
+             refused"
         );
         let detail = json!({
             "agent_profile_id": agent_profile_id,
+            "agent_profile_key": agent_profile_key(resolution),
+            "reason": reason,
             "route_id": route.route_id,
             "route_key": route.route_key,
         });
@@ -1778,6 +1857,17 @@ impl EventCollector {
     }
 }
 
+/// The whole of what a caller is told when a schema-carrying request came back as something that
+/// is not JSON — issue #80.
+///
+/// One constant, no interpolation, because this string is copied verbatim into the public error
+/// envelope and into `responses.failure_message`. Naming the provider, the model, the reply's
+/// length or where the parse gave up would either leak deployment topology to a caller who named
+/// only a route, or leak the provider's own bytes into Moira's error surface. What the caller can
+/// act on is here: they asked for a schema, and what came back was not JSON.
+const STRUCTURED_OUTPUT_NOT_JSON: &str = "the model's reply to a schema-constrained request was not JSON, so no structured output \
+     could be produced";
+
 /// Parses a schema-constrained reply into [`ExecutionRunOutput::structured_output`] — finding F29.
 ///
 /// # Why the parse lives here rather than at the Rig boundary
@@ -1807,61 +1897,86 @@ impl EventCollector {
 /// makes re-serialisation safe, because a caller asking for a schema wants the value, not the
 /// bytes.
 ///
-/// # Why a non-conforming reply is `None` rather than `StructuredOutputInvalid`
+/// # A reply that is not JSON is a failure, not a `None` — issue #80, decided 2026-08-06
 ///
-/// Three reasons, each verified against the tree rather than assumed. **All three have since
-/// been discharged** — see "the reversal condition now holds" below. They are kept because they
-/// are the argument the flip has to answer, not a changelog.
+/// **The flip is taken.** A schema-carrying request whose reply does not parse now ends the
+/// execution with [`ExecutionFailureClass::StructuredOutputInvalid`], which `failure_http_status`
+/// maps to **422**. There is no setting that restores the silent `None`, deliberately: a flag
+/// would be a second code path plus a chance to be inert, and this repo has a measured example of
+/// exactly that (`accept_legacy_hashes`).
+///
+/// **What the decision is actually about.** The old behaviour left `structured_output: null` on a
+/// `succeeded` outcome, which is the same document a model that legitimately answered with an
+/// empty value produces — so no consumer of an [`ExecutionOutcome`] could tell "the provider did
+/// not comply" from "the answer was empty", and the cheap reading, *treat null as empty*, is the
+/// wrong one every time. **On the public plane it was worse:** `PublicResponse` carries no
+/// structured-output field at all, so a caller who asked for a schema and received prose got
+/// `200 completed` with no signal whatsoever. After the flip both surfaces agree, and the public
+/// one carries the whole decision: a failure is a 422 and cannot be mistaken for an answer. See
+/// "empty is not a failure" below for the boundary.
+///
+/// **Why this was blocked and no longer is.** Three preconditions, each verified against the tree
+/// rather than assumed, and all three discharged before this change:
 ///
 /// 1. `StructuredOutputInvalid` was in **neither** `is_retryable` nor `is_fallback_eligible` nor
-///    `is_circuit_failure` — by omission, with nothing recording whether that was a decision — so
-///    one non-conforming reply would end the execution with no retry and no fallback.
+///    `is_circuit_failure` — by omission, with nothing recording whether that was a decision.
+///    **Done:** the exclusion is now a recorded disposition in `src/orchestration/controls.rs`,
+///    guarded in both directions by
+///    `every_failure_class_has_a_recorded_retry_fallback_and_circuit_disposition`. The disposition
+///    is unchanged by this flip and was written with this third emitter already in view: a class
+///    carries exactly one disposition, so admitting it to `is_fallback_eligible` for the reply
+///    case would also let one 2 MB caller schema walk the whole fallback chain.
 /// 2. On DeepSeek the schema never reaches the wire — Rig's `SUPPORTS_RESPONSE_FORMAT = false`
-///    drops it — so *every* structured request on that route would hard-fail where it previously
-///    returned 200. Failing loudly is the right end state; it must follow the capability fix
-///    (finding F39), not precede it.
+///    drops it — so *every* structured request on that route would have hard-failed.
+///    **Done:** F39 landed, and a model that cannot carry a schema is no longer routed a
+///    schema-carrying request. What fails here is a model declining to comply, never a provider
+///    structurally unable to.
 /// 3. `ConversationService::run_extraction` detected failure by `output_text` being `None` and
-///    never inspected `execution.status`, so a hard failure would reclassify an unparseable
-///    extraction reply from `structured_output_invalid` to `extraction_call_failed` — losing the
-///    signal that distinguishes "the model did not comply" from "the call did not happen".
+///    never inspected `execution.status`, so a hard failure would have reclassified an
+///    unparseable extraction reply from `structured_output_invalid` to `extraction_call_failed`.
+///    **Done:** `extraction_failure_class` reads the execution's own class, so
+///    `memory_extraction_runs.failure_class` says `structured_output_invalid` before **and**
+///    after the flip — written by `parse_candidates` refusing prose before, by the execution now.
 ///
-/// # The reversal condition now holds, and the flip is still not taken here
+/// # Empty is not a failure, and the two are distinguishable — but only in one direction
 ///
-/// All three preconditions are discharged:
+/// A model that legitimately answers "nothing" under a schema sends `null`, `{}` or `[]`. All
+/// three parse, so all three still succeed and arrive as `structured_output: null`, `{}` or `[]`.
+/// Only bytes that are **not JSON at all** fail.
 ///
-/// 1. **Done.** The absence is now a recorded disposition rather than an omission:
-///    `is_retryable`, `is_fallback_eligible` and `is_circuit_failure` in
-///    `src/orchestration/controls.rs` each carry the reason `StructuredOutputInvalid` is excluded,
-///    and `every_failure_class_has_a_recorded_retry_fallback_and_circuit_disposition` fails on a
-///    change in either direction. The disposition is *stay out of all three*, and the load-bearing
-///    reason is that a class carries exactly one disposition while this class has two emitters —
-///    a caller's unusable schema and (under the flip) a model's non-conforming reply. Admitting it
-///    to `is_fallback_eligible` would let one 2 MB schema walk the whole fallback chain.
-/// 2. **Done.** F39 landed. A model that cannot carry a schema is no longer routed a
-///    schema-carrying request, so the failure the flip introduces is a model declining to comply,
-///    not a provider structurally unable to.
-/// 3. **Done.** `run_extraction` reads `execution.status` and labels the run row with the
-///    execution's own failure class (`extraction_failure_class` in
-///    `src/application/conversation.rs`). A non-conforming reply is recorded as
-///    `structured_output_invalid` **before and after** the flip: today `parse_candidates` writes
-///    it by refusing prose, afterwards the execution writes it. The signal reason 3 was protecting
-///    survives the flip rather than being traded for it.
+/// Two honest limits, stated rather than implied:
 ///
-/// **The flip is deliberately a separate change.** Landing the preconditions and flipping the
-/// behaviour together would bury a blast-radius decision inside enabling work: the flip turns a
-/// silent `None` into a terminal 422 for every caller whose model returns prose, on a class that
-/// by design neither retries nor falls back. What it needs is its own diff, its own tests, and its
-/// own review of that consequence.
+/// - **Moira does not validate against the schema; it parses JSON.** A reply that is valid JSON
+///   but violates the caller's schema still succeeds, exactly as before. Enforcement is the
+///   provider's job (`strict: true` reaches every provider that receives a schema at all), and
+///   Moira has no validator. The failure raised here therefore says "not JSON", which is what was
+///   measured, rather than "does not conform", which was not.
+/// - **`Some(Value::Null)` and `None` serialise identically.** A model answering the JSON literal
+///   `null` is indistinguishable on the wire from a request that carried no schema. That
+///   ambiguity is *why* the flip matters rather than an argument against it: after it, a null
+///   `structured_output` on a `200` can only mean an answer, never a failure, because every
+///   failure is a `422`.
 ///
-/// **What the flip must still do**, none of which is done here:
-/// - Widen the `moira.error.structured_output_invalid` catalog description, which currently states
-///   as fact that the class is never raised for a model's reply, and update
-///   `structured_output_invalid_has_only_the_two_emitters_its_catalog_entry_describes`
-///   (`src/i18n/catalog/mod.rs`), which pins the emitter count at two and *will* go red — that red
-///   is the interlock working, not a broken test.
-/// - Re-read the disposition above with three emitters in view rather than two.
-/// - Replace `a_reply_that_is_not_json_leaves_the_field_null_and_still_succeeds` and its streaming
-///   twin in `tests/structured_output.rs`, which pin the current behaviour on both run paths.
+/// # What a failed parse deliberately does not do
+///
+/// It does not put the provider's bytes in the failure message. `failure.message` is copied
+/// verbatim into the public error envelope by `PublicExecutionService`, so echoing the reply
+/// would hand a caller — and every log that records the envelope — untrusted provider output
+/// under Moira's own error surface. The message is [`STRUCTURED_OUTPUT_NOT_JSON`], a constant.
+/// The prose is dropped with the rest of the outcome by `failed_outcome`, which is the same
+/// reason: a 422 must not return something that reads like an answer.
+///
+/// It also does not retry or fall back. The disposition above is unchanged, so the failure is
+/// terminal on the first non-conforming reply.
+///
+/// **Recorded consequence.** `memory_extraction::strip_code_fence` — the tolerance for a model
+/// that wraps its JSON in a ```` ```json ```` fence — is no longer reachable from an execution:
+/// extraction always sends a schema, so a fenced reply now fails here before `parse_candidates`
+/// is asked. That tolerance is left in place rather than deleted in this change, and it is left
+/// *strict* here rather than duplicated: what counts as a parse is unchanged by the flip, which
+/// is the whole of what was decided. *Reversal condition:* if a real deployment measures fenced
+/// replies from schema-receiving backends, move the fence tolerance to this one site — do not add
+/// a second one.
 ///
 /// # Strict, and deliberately not a scavenger
 ///
@@ -1871,20 +1986,90 @@ impl EventCollector {
 /// is a parser differential waiting to happen") and owns the one real-world tolerance — a
 /// ```` ```json ```` fence — on the `output_text` it already falls back to. Duplicating that
 /// tolerance here would give the tree two parsers with two accept-sets over the same bytes.
-fn structured_output_from_text(wants_structured: bool, text: &str) -> Option<Value> {
+fn structured_output_from_text(
+    wants_structured: bool,
+    text: &str,
+) -> Result<Option<Value>, ExecutionFailure> {
     if !wants_structured {
-        return None;
+        return Ok(None);
     }
-    serde_json::from_str(text.trim()).ok()
+    match serde_json::from_str::<Value>(text.trim()) {
+        Ok(value) => Ok(Some(value)),
+        // The `serde_json::Error` is dropped rather than formatted in. It carries a line and
+        // column into the provider's reply, which is a description of bytes this message must not
+        // describe; the condition is the same one however far into the reply it was detected.
+        Err(_) => Err(ExecutionFailure::new(
+            ExecutionFailureClass::StructuredOutputInvalid,
+            STRUCTURED_OUTPUT_NOT_JSON,
+        )),
+    }
+}
+
+/// A failed provider attempt, carrying whatever the provider reported spending before it failed.
+///
+/// # Why the usage travels with the failure
+///
+/// Issue #80 introduced the first failure that is raised **after** a complete, billed provider
+/// reply: the model answered, the provider charged for the answer, and Moira refuses it because
+/// it is not JSON. Before the flip that same request succeeded, so it wrote an
+/// `execution_attempts.usage` and a `usage_records` row through the success arm. Returning a bare
+/// [`ExecutionFailure`] would have dropped both — provider tokens spent with nothing metered,
+/// on a path a caller can steer traffic onto by sending a schema to a backend that does not
+/// honour it (`openai_compatible` and `local` are admitted unverified — see
+/// `docs/openai-compatibility.md` — and route, provider and model are caller-supplied). That is
+/// a revenue and quota hole rather than a reporting nicety, which is why the tokens are carried
+/// rather than recorded as a known cost.
+///
+/// [`UsageSummary::default()`] is all-`None`, i.e. **unknown, not zero** — the reading
+/// `insert_usage_record` is skipped on. Every failure raised before or instead of a complete
+/// reply keeps that default through the [`From`] impl below, so `?` still means "no reply, so
+/// nothing measured" and only a site with real counts in hand has to say so.
+struct FailedAttempt {
+    failure: ExecutionFailure,
+    usage: UsageSummary,
+}
+
+impl From<ExecutionFailure> for FailedAttempt {
+    fn from(failure: ExecutionFailure) -> Self {
+        Self {
+            failure,
+            usage: UsageSummary::default(),
+        }
+    }
+}
+
+/// Whether the provider reported any token counts at all.
+///
+/// The distinction is `UsageSummary`'s own: every field is an `Option`, and all-`None` means the
+/// provider said nothing rather than that it charged nothing. A `usage_records` row built from
+/// all-`None` would be a billing row asserting zero tokens for a call that certainly used some,
+/// which is worse than the absence it replaces.
+fn usage_was_reported(usage: &UsageSummary) -> bool {
+    usage.input_tokens.is_some()
+        || usage.output_tokens.is_some()
+        || usage.cached_input_tokens.is_some()
+        || usage.reasoning_tokens.is_some()
+        || usage.total_tokens.is_some()
 }
 
 async fn execute_rig_completion(
     handle: Arc<RuntimeModelHandle>,
     request: CompletionRequest,
-) -> Result<ExecutionRunOutput, ExecutionFailure> {
+) -> Result<ExecutionRunOutput, FailedAttempt> {
     let wants_structured = request.output_schema.is_some();
     let output = handle.completion(request).await?;
-    let structured_output = structured_output_from_text(wants_structured, &output.text);
+    let structured_output = match structured_output_from_text(wants_structured, &output.text) {
+        Ok(structured_output) => structured_output,
+        // The provider answered and billed for the answer; only the shape was refused. The
+        // counts are in hand at exactly this statement, and this is the one place they can be
+        // kept without the attempt loop having to guess.
+        Err(failure) => {
+            return Err(FailedAttempt {
+                failure,
+                usage: output.usage,
+            });
+        }
+    };
     Ok(ExecutionRunOutput {
         text: output.text,
         structured_output,
@@ -1947,15 +2132,15 @@ async fn execute_rig_stream(
     events: &mut EventCollector,
     idle_timeout: Duration,
     stream_metrics: StreamMetricsContext<'_>,
-) -> Result<ExecutionRunOutput, ExecutionFailure> {
+) -> Result<ExecutionRunOutput, FailedAttempt> {
     if let Some(failure) = events.delivery_failure() {
-        return Err(failure);
+        return Err(failure.into());
     }
     // Captured before `request` is moved into `start_stream` below.
     let wants_structured = request.output_schema.is_some();
     let cancellation = events.cancellation();
     let mut stream = tokio::select! {
-        _ = cancellation.cancelled() => return Err(cancelled_failure()),
+        _ = cancellation.cancelled() => return Err(cancelled_failure().into()),
         result = handle.start_stream(request) => result?,
     };
     let mut text = String::new();
@@ -1969,7 +2154,7 @@ async fn execute_rig_stream(
 
     loop {
         let item = tokio::select! {
-            _ = cancellation.cancelled() => return Err(cancelled_failure()),
+            _ = cancellation.cancelled() => return Err(cancelled_failure().into()),
             result = tokio::time::timeout(idle_timeout, stream.next()) => {
                 match result {
                     Ok(item) => item,
@@ -1982,7 +2167,7 @@ async fn execute_rig_stream(
                             failure.retryable = false;
                             failure.fallback_eligible = false;
                         }
-                        return Err(failure);
+                        return Err(failure.into());
                     }
                 }
             }
@@ -1998,7 +2183,14 @@ async fn execute_rig_stream(
                     failure.retryable = false;
                     failure.fallback_eligible = false;
                 }
-                return Err(failure);
+                // Deliberately **not** carrying `usage` here, unlike the structured-output site
+                // below. A stream that breaks mid-flight was never a metered success — it failed
+                // this way before issue #80 as well, so no metering is being lost — and this
+                // failure *is* retryable and fallback-eligible, so the counts a retry reports
+                // would be added to a partial figure whose relationship to the provider's own
+                // invoice nothing here can establish. Widening it is a separate decision with a
+                // separate blast radius.
+                return Err(failure.into());
             }
         };
         match item {
@@ -2073,7 +2265,19 @@ async fn execute_rig_stream(
         }
     }
 
-    let structured_output = structured_output_from_text(wants_structured, &text);
+    // Issue #80. On this path the caller may already have received every delta, and the failure
+    // is raised anyway: the deltas were text, and the caller asked for a value. `committed` does
+    // not clamp anything here because `StructuredOutputInvalid` is already neither retryable nor
+    // fallback-eligible, so there is no re-run for a committed stream to be protected from.
+    //
+    // The stream ran to completion, so `usage` holds whatever the provider's final usage chunk
+    // reported: the same counts the success arm two lines below would have metered. They travel
+    // with the failure for the same reason they would have been metered — the provider will
+    // invoice for this call either way.
+    let structured_output = match structured_output_from_text(wants_structured, &text) {
+        Ok(structured_output) => structured_output,
+        Err(failure) => return Err(FailedAttempt { failure, usage }),
+    };
     Ok(ExecutionRunOutput {
         text,
         structured_output,
@@ -2143,11 +2347,109 @@ fn failed_outcome(
         status: execution_status_for_failure(failure.class),
         output_text: None,
         structured_output: None,
-        usage: UsageSummary::default(),
+        usage: usage_reported_by(&attempts),
         route,
         model,
         attempts,
         failure: Some(failure),
+    }
+}
+
+/// What a failed outcome reports as its usage: whatever its own attempts reported.
+///
+/// **Derived rather than passed in, so the two cannot disagree.** Finding F38 was exactly that
+/// asymmetry in the other direction — an outcome hardcoding `UsageSummary::default()` next to an
+/// `attempts` array that carried the real counts, inside one serialised document. Since the issue
+/// #80 review a *failed* attempt can carry counts too (a billed reply Moira refused), so the
+/// hardcoded default would have re-created the contradiction on the new path. Reading the array
+/// makes it impossible to state a total the document itself contradicts.
+///
+/// The last attempt that reported anything, not a sum: `ExecutionOutcome.usage` is the same
+/// "what this execution's answering call cost" figure the success arm sets from a single
+/// attempt, and every earlier attempt already has its own `usage_records` row. All-`None` when
+/// no attempt reported anything — unknown, which is what it has always meant here.
+fn usage_reported_by(attempts: &[ProviderAttemptSummary]) -> UsageSummary {
+    attempts
+        .iter()
+        .rev()
+        .find(|attempt| usage_was_reported(&attempt.usage))
+        .map(|attempt| attempt.usage.clone())
+        .unwrap_or_default()
+}
+
+/// The refusal a route with an unusable agent profile produces — F50, decided fail-closed on
+/// issue #79.
+///
+/// # Why two classes and not one
+///
+/// "The operator switched this profile off" and "no live row has this id" are different
+/// conditions with different remedies — re-enable versus re-create — and a single
+/// `agent_profile_unavailable` code would force whoever received it to go and look. They also get
+/// different HTTP statuses (`404` and `409`, see `failure_http_status`), so a client can branch
+/// on the status alone without parsing anything.
+///
+/// # What the message must contain
+///
+/// The id, always: it is the value written in `route_definitions.agent_profile_id` and the one
+/// thing that identifies the profile when the row is gone. The `profile_key` too whenever a row
+/// exists, because that is what an operator recognises in the console. And the route key, because
+/// the caller named a route, not a profile — without it the error names something the caller has
+/// never heard of. **The point of this text is that whoever receives it can fix the deployment
+/// without being given access to the server's logs.** None of it is a secret: these are
+/// configuration identifiers already visible on the admin plane, and the profile's `preamble` —
+/// the one field that could carry sensitive prompt content — is deliberately not here.
+fn agent_profile_failure(
+    route: &RouteDecision,
+    agent_profile_id: Uuid,
+    resolution: &AgentProfileResolution,
+) -> ExecutionFailure {
+    match resolution {
+        // Not constructible: the caller only reaches this for a non-`Active` resolution. Kept as
+        // a real arm rather than an `unreachable!` so a future reshuffle degrades into the safe
+        // answer — refusing an active profile is a visible bug, serving an unusable one is not.
+        AgentProfileResolution::Active(profile) => ExecutionFailure::new(
+            ExecutionFailureClass::AgentProfileNotFound,
+            format!(
+                "route '{}' resolved agent profile '{}' ({agent_profile_id}) but the execution \
+                 refused it; this is a bug in Moira, not in your configuration",
+                route.route_key, profile.profile_key
+            ),
+        ),
+        AgentProfileResolution::Disabled(profile) => ExecutionFailure::new(
+            ExecutionFailureClass::AgentProfileDisabled,
+            format!(
+                "route '{}' requires agent profile '{}' ({agent_profile_id}), which is disabled; \
+                 re-enable that profile or point the route at an active one",
+                route.route_key, profile.profile_key
+            ),
+        ),
+        AgentProfileResolution::Missing => ExecutionFailure::new(
+            ExecutionFailureClass::AgentProfileNotFound,
+            format!(
+                "route '{}' requires agent profile {agent_profile_id}, which no longer exists; \
+                 create the profile or point the route at an existing one",
+                route.route_key
+            ),
+        ),
+    }
+}
+
+/// The `reason` the operator-side signals carry, matching the caller's error code.
+fn agent_profile_reason(resolution: &AgentProfileResolution) -> &'static str {
+    match resolution {
+        AgentProfileResolution::Active(_) => "active",
+        AgentProfileResolution::Disabled(_) => "disabled",
+        AgentProfileResolution::Missing => "missing",
+    }
+}
+
+/// The profile's key when a row still exists, so the operator signal names what the console shows.
+fn agent_profile_key(resolution: &AgentProfileResolution) -> Option<&str> {
+    match resolution {
+        AgentProfileResolution::Active(profile) | AgentProfileResolution::Disabled(profile) => {
+            Some(profile.profile_key.as_str())
+        }
+        AgentProfileResolution::Missing => None,
     }
 }
 
@@ -2999,12 +3301,13 @@ mod tests {
     /// so the gate cannot become unobservable if a fixture stops being reachable.
     #[test]
     fn structured_output_is_parsed_only_when_a_schema_was_requested() {
+        let parsed = |wants: bool, text: &str| {
+            structured_output_from_text(wants, text).expect("must not fail for this input")
+        };
+
         // The property: identical bytes, opposite results, decided solely by the flag.
-        assert_eq!(
-            structured_output_from_text(true, "{\"a\":1}"),
-            Some(json!({ "a": 1 }))
-        );
-        assert_eq!(structured_output_from_text(false, "{\"a\":1}"), None);
+        assert_eq!(parsed(true, "{\"a\":1}"), Some(json!({ "a": 1 })));
+        assert_eq!(parsed(false, "{\"a\":1}"), None);
 
         // The corruption shape easiest to reach in practice, and the reason the flag is not
         // merely an optimisation: a model that wraps its prose reply in quotes has emitted a
@@ -3012,36 +3315,78 @@ mod tests {
         // any interior escaping, now part of the body and of `summary_hash` with it.
         // Summarization sends no schema, so it takes the second branch.
         assert_eq!(
-            structured_output_from_text(true, "\"a quoted summary\""),
+            parsed(true, "\"a quoted summary\""),
             Some(json!("a quoted summary"))
         );
-        assert_eq!(
-            structured_output_from_text(false, "\"a quoted summary\""),
-            None
-        );
+        assert_eq!(parsed(false, "\"a quoted summary\""), None);
 
         // Whitespace is trimmed before the parse, and only around the document.
-        assert_eq!(
-            structured_output_from_text(true, "  \n{\"a\":1}\n  "),
-            Some(json!({ "a": 1 }))
-        );
+        assert_eq!(parsed(true, "  \n{\"a\":1}\n  "), Some(json!({ "a": 1 })));
 
-        // A non-conforming reply is `None`, never an error: see the doc comment's three
-        // reasons. If this ever becomes a `Result`, `run_extraction`'s failure class flips.
-        assert_eq!(structured_output_from_text(true, "I cannot do that."), None);
-        assert_eq!(structured_output_from_text(true, ""), None);
+        // **The gate is what decides, not the bytes.** With no schema requested, a reply that
+        // could never parse is still `Ok(None)` rather than a failure — summarization sends no
+        // schema and every reply it gets is prose, so a failure here would break every
+        // summarization in the tree.
+        assert_eq!(parsed(false, "I cannot do that."), None);
+    }
 
-        // Strict, not a scavenger. Both of these are what Rig's balanced-brace scan and
-        // `memory_extraction::strip_code_fence` would accept; neither is accepted here, so
-        // they keep flowing to the caller through `output_text` and are handled by the one
-        // parser that documents its tolerance.
+    /// Issue #80 — the flip, stated as a unit fact, and its boundary.
+    ///
+    /// The integration cases in `tests/structured_output.rs` each need a database, a mock
+    /// provider and an HTTP server; this one needs none of them, so the property stays observable
+    /// even if a fixture stops being reachable. It is separate from the gate test above because
+    /// the two answer different questions — "was a schema asked for" and "what happens when the
+    /// reply does not parse" — and a single test that went red would not say which.
+    #[test]
+    fn a_schema_carrying_reply_that_is_not_json_is_a_failure_rather_than_a_none() {
+        for reply in [
+            "I cannot do that.",
+            // Empty is the case worth naming: it is what a model sends when it has nothing to
+            // say, and it is **not** an empty *result*. A schema-carrying request that wants to
+            // answer "nothing" answers `null`, `{}` or `[]` — all three parse, and all three are
+            // asserted below as successes. Zero bytes are not a JSON document at all, so they
+            // fail, which is the same answer the caller would otherwise have had to infer from a
+            // 200 with a null field.
+            "",
+            // Strict, not a scavenger. Both of these are what Rig's balanced-brace scan and
+            // `memory_extraction::strip_code_fence` would accept. Neither is accepted here: what
+            // counts as a parse is exactly what it was before the flip, because the decision was
+            // about what happens on a failed parse, not about widening the accept-set.
+            "here you go: {\"a\":1}",
+            "```json\n{\"a\":1}\n```",
+        ] {
+            let failure = structured_output_from_text(true, reply)
+                .expect_err("a schema-carrying reply that is not JSON must fail");
+            assert_eq!(
+                failure.class,
+                ExecutionFailureClass::StructuredOutputInvalid,
+                "reply {reply:?}"
+            );
+            assert!(
+                !failure.retryable && !failure.fallback_eligible,
+                "the disposition in src/orchestration/controls.rs must reach the failure this \
+                 site constructs: {failure:?}"
+            );
+            assert!(
+                !failure.message.contains(reply.trim()) || reply.trim().is_empty(),
+                "the failure message must not echo the provider's reply: {}",
+                failure.message
+            );
+        }
+
+        // The boundary the decision draws. An *empty answer* is an answer: all three of these
+        // parse, so they still succeed and are reported as values rather than as failures.
         assert_eq!(
-            structured_output_from_text(true, "here you go: {\"a\":1}"),
-            None
+            structured_output_from_text(true, "null").expect("null is a JSON document"),
+            Some(Value::Null)
         );
         assert_eq!(
-            structured_output_from_text(true, "```json\n{\"a\":1}\n```"),
-            None
+            structured_output_from_text(true, "{}").expect("{} is a JSON document"),
+            Some(json!({}))
+        );
+        assert_eq!(
+            structured_output_from_text(true, "[]").expect("[] is a JSON document"),
+            Some(json!([]))
         );
     }
 
@@ -3110,9 +3455,9 @@ mod tests {
         assert!(budget <= Duration::from_secs(30));
     }
 
-    #[test]
-    fn router_builds_without_database_for_type_checking() {
-        let state = AppState::new(Settings::default(), None).unwrap();
+    #[tokio::test]
+    async fn router_builds_without_database_for_type_checking() {
+        let state = AppState::new(Settings::default(), None).await.unwrap();
         assert!(MoiraExecutionService::new(state).is_err());
     }
 }

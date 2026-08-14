@@ -1,8 +1,13 @@
 mod api_keys;
 mod auth;
 mod authz;
+mod content_access;
+mod content_envelope;
 mod crypto;
+mod data_keys;
 mod idempotency;
+mod key_custody;
+mod keyring_admin;
 mod masking;
 mod ssrf;
 
@@ -19,11 +24,36 @@ pub use auth::{
     TrustedJwtIdentity,
 };
 pub use authz::AuthorizationService;
+pub use content_access::{
+    ContentOpener, ContentSealer, KeyringContentAccess, SnapshotContentOpener,
+    content_key_unavailable, warn_content_storage_ambiguous,
+};
+pub use content_envelope::{
+    AAD_SEPARATOR, ALGORITHM_AES_256_GCM, AadProfile, ContentCipher, ContentEnvelopeError,
+    ContentIdentity, ENVELOPE_HEADER_LEN, ENVELOPE_MAGIC, ENVELOPE_NONCE_LEN, ENVELOPE_TAG_LEN,
+    EnvelopeHeader, FORMAT_VERSION_V1, IDENTITY_PREFIX, KEY_MODE_WRAPPED_DEK, MIN_ENVELOPE_LEN,
+    envelope_aad,
+};
 pub use crypto::{
     CredentialAadParts, ENVELOPE_VERSION_V1, EncryptedSecret, LOCAL_AES_256_GCM, LocalSecretCipher,
     SecretCipher, credential_aad, credential_secret_field,
 };
+pub use data_keys::{
+    ContentKeyring, DataKeyPurpose, DataKeyState, KEY_CHECK_VALUE_LABEL, KEY_CHECK_VALUE_LEN,
+    KeyEntry, KeyringError, KeyringSnapshot, MEMORY_DEDUPE_HASH_PREFIX, MemoryDedupeHasher,
+    format_key_check_value, key_check_value,
+};
 pub use idempotency::IdempotencyHasher;
+pub use key_custody::{
+    CUSTODY_BACKEND_ENVIRONMENT, ENVIRONMENT_WRAP_BLOB_LENGTH, ENVIRONMENT_WRAP_FORMAT_V1,
+    EnvironmentMasterKeyCustody, KeyCustodyError, MASTER_KEY_ID_MAX_LENGTH, MasterKeyCustody,
+    MasterKeyRing, PreflightedCustody, WRAP_ALGORITHM_AES_256_GCM, WrappedKey,
+    is_valid_master_key_id, wrapped_data_key_aad,
+};
+pub use keyring_admin::{
+    Abandonment, AddedKey, KeyStatus, KeyUsage, KeyringAdmin, KeyringAdminError, KeyringStatus,
+    Promotion, ResealOptions, ResealReport, Retirement, RewrapReport, envelope_data_key_id,
+};
 pub use masking::{mask_plain_secret, mask_secret_value, request_hash, secret_fingerprint};
 pub use ssrf::{
     HostResolver, JwksDenialReason, JwksFetchError, OutboundDenialReason, OutboundUrlDenial,

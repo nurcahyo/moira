@@ -359,3 +359,23 @@ as approved.
    Issue #96 explicitly asked for this to be scheduled; it is now carried as an item in
    [`TODO.md`](../TODO.md) with its trigger condition written down, which is as far as a docs change
    can take it. It still needs a named owner and a date, and neither can be invented here.
+
+---
+
+## Decisions of a different provenance — recorded elsewhere, not in this table
+
+This file is scoped to decisions **plan runners took unilaterally**, none of which carries a human
+signature. A decision a maintainer actually made does not belong in that table: filing it here would
+break the one property this file exists to preserve — that every row above is unconfirmed.
+
+Such decisions are recorded in their own file, in the same directory and the same voice, and are
+listed here so a reader who starts at this file can find them.
+
+| Decision | Record | Decided | Status |
+|---|---|---|---|
+| Envelope encryption at rest for the five `*_encrypted` content columns — key custody behind a pluggable trait, environment-backed first (F33, issue [#86](https://github.com/nurcahyo/moira/issues/86)) | [`decision-encryption-at-rest.md`](./decision-encryption-at-rest.md) | Maintainer, 2026-08-06 | Decided; implementation issued as #134–#142 |
+
+The other established home for maintainer decisions is
+[`plans/CONVENTIONS.md` §0](../plans/CONVENTIONS.md) — "product-owner decisions (RESOLVED — do not
+reopen)", D1–D7. That table is scoped to the iteration plans `02a`–`11` and to one-row entries; a
+decision that is neither gets a file, and the file says why in its own opening section.

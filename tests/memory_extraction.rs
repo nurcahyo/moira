@@ -28,8 +28,15 @@ mod support;
 use std::{collections::HashMap, time::Duration};
 
 use axum::http::StatusCode;
-use moira::domain::{MemoryConsentMode, MemoryPolicyPutRequest, MemorySensitivity, MemoryType};
+use moira::{
+    domain::{
+        ConversationContentPersistence, MemoryConsentMode, MemoryPolicyPutRequest,
+        MemorySensitivity, MemoryType,
+    },
+    security::{MEMORY_DEDUPE_HASH_PREFIX, request_hash},
+};
 use serde_json::{Value, json};
+use sqlx::Row;
 use support::{
     LifecycleFixture, MoiraHttpServer, RuntimePolicy,
     mock_openai::{EmbeddingBehaviour, MockOpenAiServer, ProviderScript, planar_vector},
@@ -184,6 +191,24 @@ impl Case {
             status,
             serde_json::from_str(&body).unwrap_or(Value::String(body)),
         )
+    }
+
+    /// Sets the application's content-persistence policy, after the setup helpers have written
+    /// their own conversation policies. Same ordering trap `enable_memory_extraction` documents.
+    async fn set_content_persistence(&self, persistence: ConversationContentPersistence) {
+        moira::application::ConversationService::new(&self.fixture.state)
+            .expect("conversation service")
+            .put_conversation_policy(
+                &self.fixture.actor,
+                &support::request_context(),
+                self.fixture.application_id,
+                moira::domain::ConversationPolicyPutRequest {
+                    conversation_content_persistence: Some(persistence),
+                    ..moira::domain::ConversationPolicyPutRequest::default()
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{persistence:?} must be accepted: {error:?}"));
     }
 
     /// `memory_behavior` as a caller of `GET /api/v1/conversations` is told it.
@@ -820,6 +845,80 @@ async fn an_unparseable_extraction_reply_fails_the_run_and_writes_no_memory() {
     case.shutdown().await;
 }
 
+/// **The one behaviour issue #80 took away, pinned so it cannot be taken away again by accident.**
+///
+/// A fenced reply — ```` ```json ```` around the envelope — **used to produce memories**. The
+/// execution succeeded with `structured_output: null`, `run_extraction` fell back to
+/// `execution.output_text`, and `parse_candidates` stripped the fence before deserialising. Since
+/// issue #80 the execution carries a schema and so fails on the fence first, the reply is dropped
+/// with the rest of the failed outcome, and the run ends `failed` / `structured_output_invalid`
+/// with nothing written.
+///
+/// This case exists because that regression was, until it was written, **unobserved in either
+/// direction**: no case asserted the old acceptance and none asserted the new refusal, so the
+/// only evidence an operator had was `docs/release-notes.md`. `parse_candidates`' own fence unit
+/// test still passes — it calls the parser directly, so it says nothing about whether an
+/// execution can still reach it.
+///
+/// Fencing is not a hypothetical: `memory_extraction.rs` documents it as what providers that
+/// ignore `output_schema` "commonly" do — and extraction sets no `required_capabilities`, so it
+/// can be routed to a model that never claimed to honour a schema in the first place, which makes
+/// the exposed population wider than the release note's SQL. If this ever needs reversing, the
+/// fence tolerance moves to
+/// `structured_output_from_text` in `src/application/execution.rs` — the reversal condition
+/// recorded there — and this case is the one that must flip with it.
+///
+/// The control is the payload: the identical envelope **without** the fence is asserted to write
+/// its memory in `a_consenting_application_writes_an_active_memory_and_records_the_run`, so the
+/// refusal here is attributable to the fence and not to the fixture.
+#[tokio::test]
+async fn a_fenced_extraction_reply_fails_the_run_since_the_execution_parses_it_first() {
+    let envelope = json!({ "memories": [memory("preference", MEMORY_BODY, 0.95, "normal")] });
+    let Some(case) = Case::consenting(vec![
+        ProviderScript::Completion {
+            text: ASSISTANT_REPLY.to_string(),
+        },
+        ProviderScript::Completion {
+            text: format!("```json\n{envelope}\n```"),
+        },
+    ])
+    .await
+    else {
+        return;
+    };
+    let (status, body) = case.respond(USER_TURN).await;
+    // Extraction stays fail-open: the caller cannot tell, which is exactly why the release note
+    // has to say this out loud.
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "completed");
+    assert_eq!(
+        body["output"][0]["content"][0]["text"], ASSISTANT_REPLY,
+        "the caller's own answer must be untouched by an extraction failure: {body}"
+    );
+    assert_eq!(
+        case.completion.call_count().await,
+        2,
+        "extraction must have issued its own completion call, or the empty result below would \
+         prove nothing"
+    );
+
+    assert!(
+        case.memories().await.is_empty(),
+        "a fenced reply used to be un-fenced by parse_candidates and written; since issue #80 \
+         the execution refuses it first and nothing is written"
+    );
+    let runs = case.runs().await;
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0].status, "failed", "{runs:?}");
+    assert_eq!(
+        runs[0].failure_class.as_deref(),
+        Some("structured_output_invalid"),
+        "the run row must name the execution's own class"
+    );
+    assert!(runs[0].completed);
+    case.shutdown().await;
+}
+
 /// The extractor being unreachable must not disturb the caller's response — **and the run row
 /// must say what actually went wrong**.
 ///
@@ -1148,6 +1247,156 @@ async fn an_exact_repeat_is_deduped_with_no_embedding_to_fall_back_on() {
     );
     assert_eq!(memories[0].use_count, 1);
     assert_eq!(case.runs().await[1].metadata["duplicates"], json!(1));
+    case.shutdown().await;
+}
+
+/// The same exact-hash dedupe, with every memory body **sealed** — issue #140.
+///
+/// # Why this is not covered by the case above
+///
+/// The value compared is the keyed HMAC prefixed `d1:` — under every policy since issue #168,
+/// so this no longer differs from the plaintext case in *which* digest it compares. What it
+/// still adds is the sealed row itself: the lookup happens **before** the insert, and only a
+/// case that seals proves the body reached the extractor at all (`find_recent_messages` has to
+/// open the sealed transcript first). A build that failed there would write no memory rather
+/// than a duplicate, and "one row" below would quietly mean "zero writes".
+///
+/// Embeddings are off for the same reason the case above turns them off: with the near-duplicate
+/// path available, a broken exact check is invisible.
+#[tokio::test]
+async fn an_exact_repeat_is_deduped_when_memory_bodies_are_sealed() {
+    let Some(case) = Case::consenting(vec![
+        ProviderScript::Completion {
+            text: ASSISTANT_REPLY.to_string(),
+        },
+        extraction_reply(json!([memory("preference", MEMORY_BODY, 0.95, "normal")])),
+        ProviderScript::Completion {
+            text: "Still understood.".to_string(),
+        },
+        extraction_reply(json!([memory("preference", MEMORY_BODY, 0.95, "normal")])),
+    ])
+    .await
+    else {
+        return;
+    };
+    case.fixture
+        .patch_embedding_policy(moira::domain::EmbeddingPolicyPutRequest {
+            memory_embeddings_enabled: Some(false),
+            ..moira::domain::EmbeddingPolicyPutRequest::default()
+        })
+        .await;
+    case.set_content_persistence(ConversationContentPersistence::EncryptedContent)
+        .await;
+
+    let (status, first) = case.respond(USER_TURN).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let conversation_id = first["conversation"]["id"]
+        .as_str()
+        .expect("conversation id")
+        .to_string();
+    let (status, second) = case.respond_in(USER_TURN, Some(&conversation_id)).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+
+    // Premise one: extraction ran at all, twice. Under an encrypted policy the transcript
+    // reaches the extractor only because `find_recent_messages` opens the sealed messages; if
+    // that regressed, `turns` would be empty, no run would fire, and "one memory row" below
+    // would mean "zero writes" rather than "one dedupe".
+    let runs = case.runs().await;
+    assert_eq!(runs.len(), 2, "both turns must have extracted: {runs:?}");
+
+    let rows = sqlx::query(
+        "select content_plain, content_encrypted, content_hash, use_count \
+         from memory_records where application_id = $1 order by created_at asc",
+    )
+    .bind(case.fixture.application_id)
+    .fetch_all(&case.fixture.pool)
+    .await
+    .expect("read memory rows");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the keyed exact-hash dedupe must suppress the duplicate; {} rows were written",
+        rows.len()
+    );
+    let row = &rows[0];
+
+    // Premise two: the row really is sealed. Without this the case would pass identically
+    // against a build that ignored the policy, stored plaintext and deduped on the unkeyed
+    // address — the exact defect the `d1:` form exists to prevent.
+    assert_eq!(
+        row.try_get::<Option<String>, _>("content_plain")
+            .expect("content_plain"),
+        None,
+        "an extracted memory was stored in the clear under `encrypted_content`"
+    );
+    assert!(
+        row.try_get::<Option<Vec<u8>>, _>("content_encrypted")
+            .expect("content_encrypted")
+            .is_some_and(|bytes| !bytes.is_empty())
+    );
+
+    let hash: String = row.try_get("content_hash").expect("content_hash");
+    assert!(
+        hash.starts_with(MEMORY_DEDUPE_HASH_PREFIX),
+        "a sealed memory must carry the keyed digest, got {hash}"
+    );
+    assert_ne!(
+        hash,
+        request_hash(MEMORY_BODY.as_bytes()),
+        "the sealed row stored the unkeyed content address of its own plaintext, which is an \
+         offline verifier for the body sitting next to it in the same row"
+    );
+
+    assert_eq!(
+        row.try_get::<i64, _>("use_count").expect("use_count"),
+        1,
+        "the duplicate must confirm the existing memory rather than be dropped silently"
+    );
+    assert_eq!(runs[1].metadata["duplicates"], json!(1));
+
+    // ---------------------------------------------------------------------------------------
+    // The sibling column, and the reason the pin lives *here*.
+    //
+    // `conversation_messages.content_hash` stays **peppered** — `0021` left it alone on purpose,
+    // because it is returned to callers on `ConversationMessageRecord` and an unkeyed digest
+    // handed out over the API is an offline verifier for content the schema expects to be able
+    // to hold encrypted. The cheapest way to lose that is a later "cleanup" unifying the two
+    // columns on the grounds that they share a name, and #140 — which gives one of them a second
+    // form — is exactly the change that invites it.
+    //
+    // `tests/memory_content_hash_rotation.rs` pins the format, but only for `create_message`.
+    // There are **three** writers of this column: that one, `prepare_response_conversation`, and
+    // the assistant-output writer. The other two run only on the response path, so unifying
+    // either of them onto the unkeyed address reddened nothing anywhere in the suite when it was
+    // tried. This case drives two full turns through `POST /api/v1/responses`, so both of them
+    // fire here — which makes this the only place the assertion has teeth.
+    let messages: Vec<String> = sqlx::query_scalar(
+        "select m.content_hash from conversation_messages m \
+         join conversations c on c.id = m.conversation_id where c.application_id = $1",
+    )
+    .bind(case.fixture.application_id)
+    .fetch_all(&case.fixture.pool)
+    .await
+    .expect("read message hashes");
+    assert!(
+        messages.len() >= 3,
+        "premise: the response path must have written the user and assistant messages for both \
+         turns, got {messages:?}"
+    );
+    for hash in &messages {
+        assert!(
+            hash.contains(':'),
+            "a conversation message hash lost its pepper-version prefix ({hash}). A peppered \
+             digest always carries one; an unkeyed content address is base64url and can never \
+             contain `:`"
+        );
+        assert!(
+            !hash.starts_with(MEMORY_DEDUPE_HASH_PREFIX),
+            "a conversation message was hashed with the *memory* dedupe key ({hash}); the two \
+             columns are decided per table and must not converge"
+        );
+    }
+
     case.shutdown().await;
 }
 

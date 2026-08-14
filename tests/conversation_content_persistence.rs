@@ -13,6 +13,14 @@
 //! produce that state. The comments were doing the work of a guard, which is the shape this
 //! project has now been bitten by more than once.
 //!
+//! # What issue #139 changed here
+//!
+//! `encrypted_content` now **seals** the body rather than withholding it, and the admin API's
+//! 422 narrowed from "this value" to "this deployment cannot seal". The two cases here that
+//! asserted the old refusal now assert the new acceptance — kept in this file rather than moved,
+//! so a revert to a blanket 422 goes red in the suite whose subject it is. The sealed storage
+//! form itself is covered by `tests/conversation_content_encryption.rs`.
+//!
 //! # Why the first case matters most
 //!
 //! `plain_content_stores_the_body_and_its_length` is the premise. Every other case here asserts
@@ -30,7 +38,6 @@
 
 mod support;
 
-use axum::http::StatusCode;
 use moira::{
     application::ConversationService,
     domain::{
@@ -49,6 +56,10 @@ const BODY: &str = "F32-CANARY-4d9a1c73e05b48f6-MESSAGE-BODY";
 /// What a message row actually holds, read back from PostgreSQL rather than from the API.
 struct StoredMessage {
     content_plain: Option<String>,
+    /// Since issue #139 this is where the body lives under `encrypted_content`. Read here so the
+    /// "the record agrees with the row" assertion below can compare against what was *stored*
+    /// rather than against one of the two columns it might have been stored in.
+    content_encrypted: Option<Vec<u8>>,
     content_hash: String,
     content_size_bytes: i64,
     token_count: Option<i64>,
@@ -163,7 +174,8 @@ impl Case {
             .await
             .expect("create message");
         let row = sqlx::query(
-            "select content_plain, content_hash, content_size_bytes, token_count, metadata \
+            "select content_plain, content_encrypted, content_hash, content_size_bytes, \
+                    token_count, metadata \
              from conversation_messages where public_id = $1",
         )
         .bind(&record.id)
@@ -172,6 +184,7 @@ impl Case {
         .expect("read the message row");
         let stored = StoredMessage {
             content_plain: row.try_get("content_plain").expect("content_plain"),
+            content_encrypted: row.try_get("content_encrypted").expect("content_encrypted"),
             content_hash: row.try_get("content_hash").expect("content_hash"),
             content_size_bytes: row
                 .try_get("content_size_bytes")
@@ -182,10 +195,31 @@ impl Case {
         // The record handed back to the caller must describe what was stored, not what was
         // offered. A record claiming content that the table does not hold is the same class of
         // dishonesty as the policy that was not read.
-        assert_eq!(
-            record.content, stored.content_plain,
-            "the returned record disagrees with the stored row about the message body"
-        );
+        //
+        // Since #139 "what was stored" can be either column, so the comparison is against
+        // *whether a body was stored at all* plus, when it was, the body itself. Comparing only
+        // against `content_plain` would now fail every encrypted case for the wrong reason, and
+        // dropping the assertion would lose the property.
+        match (&stored.content_plain, &stored.content_encrypted) {
+            (Some(plain), None) => assert_eq!(
+                record.content.as_deref(),
+                Some(plain.as_str()),
+                "the returned record disagrees with the stored row about the message body"
+            ),
+            (None, Some(_)) => assert!(
+                record.content.is_some(),
+                "the row holds a sealed body but the record returned no content; a caller \
+                 cannot tell that from a withheld body"
+            ),
+            (None, None) => assert_eq!(
+                record.content, None,
+                "the row holds no body at all but the record claims one"
+            ),
+            (Some(_), Some(_)) => panic!(
+                "the row holds both a plaintext and a sealed body; migration 0027's CHECK \
+                 constraint forbids that"
+            ),
+        }
         assert_eq!(record.content_size_bytes, stored.content_size_bytes);
         assert_eq!(record.token_count, stored.token_count);
         stored
@@ -311,26 +345,26 @@ async fn none_and_metadata_only_differ_in_exactly_the_length_metadata() {
     assert!(metadata_only.token_count.is_some() && none.token_count.is_none());
 }
 
-/// The API must refuse a value it cannot honour rather than storing it and behaving as
-/// something else.
+/// Issue #139 narrowed this refusal; it did not remove it.
+///
+/// `encrypted_content` is now honourable — a cipher is wired to the `content_encrypted`
+/// columns — so the value is **accepted** on a deployment whose content keyring is loaded, which
+/// every fixture here is. The refusal survives for the condition rather than the value:
+/// encryption configured but unusable at write time.
+///
+/// **Why this is asserted here and not only in `tests/conversation_content_encryption.rs`.**
+/// This suite is where the old, opposite assertion lived. Deleting it and testing only the new
+/// behaviour elsewhere would leave nothing in this file pinning the direction of the change, and
+/// a later revert to a blanket 422 would go green in exactly the file whose subject it is.
 #[tokio::test]
-async fn encrypted_content_is_refused_because_no_cipher_exists() {
+async fn encrypted_content_is_accepted_now_that_a_cipher_is_wired() {
     let Some(case) = Case::new().await else {
         return;
     };
-    let error = case
-        .set_policy(ConversationContentPersistence::EncryptedContent)
+    case.set_policy(ConversationContentPersistence::EncryptedContent)
         .await
-        .expect_err("encrypted_content must be refused while nothing writes content_encrypted");
-    let response = error.error_response(None);
-    assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(
-        response.error.code, "conversation_content_persistence_unsupported",
-        "the refusal must be coded, not a bare 422"
-    );
+        .expect("encrypted_content must be accepted once a cipher is wired");
 
-    // And the refusal must not have written anything: a stored value plus an error is worse
-    // than either alone.
     let persisted: String = sqlx::query_scalar(
         "select conversation_content_persistence from application_conversation_policies \
          where application_id = $1",
@@ -339,16 +373,32 @@ async fn encrypted_content_is_refused_because_no_cipher_exists() {
     .fetch_one(&case.fixture.pool)
     .await
     .expect("read the policy back");
-    assert_ne!(
+    assert_eq!(
         persisted, "encrypted_content",
-        "the refused value reached the database anyway"
+        "the accepted value did not reach the database"
     );
+
+    // The other three values are storage policies and are untouched by the narrowing. Asserted
+    // here so a change that widened the refusal back over any of them fails.
+    for value in [
+        ConversationContentPersistence::None,
+        ConversationContentPersistence::MetadataOnly,
+        ConversationContentPersistence::PlainContent,
+    ] {
+        case.set_policy(value)
+            .await
+            .unwrap_or_else(|error| panic!("{value:?} must still be accepted: {error:?}"));
+    }
 }
 
-/// A deployment that set `encrypted_content` before the refusal existed must be made safer,
-/// not broken: the row keeps parsing, and it stores no plaintext.
+/// A deployment that set `encrypted_content` before it was implemented now gets the behaviour the
+/// value always promised: no plaintext, and a sealed body.
+///
+/// The `content_plain is null` half is the same assertion this case always made. What is new is
+/// the second half — before #139 that row held *nothing*, which is a strictly weaker outcome and
+/// is what this assertion now forbids regressing to.
 #[tokio::test]
-async fn a_row_already_holding_encrypted_content_fails_closed() {
+async fn a_row_already_holding_encrypted_content_now_seals_the_body() {
     let Some(case) = Case::new().await else {
         return;
     };
@@ -370,6 +420,22 @@ async fn a_row_already_holding_encrypted_content_fails_closed() {
         stored.content_plain, None,
         "encrypted_content stored plaintext — the value promises encryption, and storing the \
          body in the clear under it is the exact misrepresentation F32 was about"
+    );
+    let sealed: Option<Vec<u8>> = sqlx::query_scalar(
+        "select content_encrypted from conversation_messages m join conversations c \
+         on c.id = m.conversation_id where c.public_id = $1 order by m.sequence_number desc \
+         limit 1",
+    )
+    .bind(&case.conversation_id)
+    .fetch_one(&case.fixture.pool)
+    .await
+    .expect("read content_encrypted");
+    let sealed = sealed.expect("encrypted_content must now write a sealed body, not nothing");
+    assert!(
+        !sealed
+            .windows(BODY.len())
+            .any(|window| window == BODY.as_bytes()),
+        "the body sits verbatim inside content_encrypted; the cipher was not called"
     );
 }
 

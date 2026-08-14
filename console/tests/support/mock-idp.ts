@@ -68,6 +68,31 @@ export interface MockIdpOptions {
   readonly clientSecret: string;
   readonly user: MockIdpUser;
   /**
+   * Serve on a FIXED origin instead of an OS-assigned port on `localhost`.
+   *
+   * The suite wants an ephemeral port — a hard-coded one cannot run twice
+   * concurrently. A human driving the setup wizard by hand wants the opposite:
+   * the issuer is typed into a form, stored in Moira, and must still be the
+   * issuer after the process restarts.
+   *
+   * It cannot be solved with a TLS proxy in front. `iss` is signed into the ID
+   * token and echoed on the callback, so rewriting it downstream invalidates
+   * the signature — Better Auth refuses with `issuer_mismatch`, naming the
+   * upstream port. The provider itself has to know its public origin, which is
+   * what this supplies.
+   *
+   * `cert` and `key` are PEM bytes. Supply a certificate the consumer already
+   * trusts (mkcert issues one) when a real browser has to follow the redirect;
+   * the default self-signed fixture cert is fine for Playwright, which is
+   * launched with `ignoreHTTPSErrors`.
+   */
+  readonly publicOrigin?: {
+    readonly host: string;
+    readonly port: number;
+    readonly cert?: string | Buffer;
+    readonly key?: string | Buffer;
+  };
+  /**
    * Leave `email` out of the ID token.
    *
    * Better Auth's generic-oauth provider uses the ID token's claims when it
@@ -184,9 +209,12 @@ export async function startMockIdp(options: MockIdpOptions): Promise<MockIdp> {
   // `port: 0` — the OS picks. A hard-coded port makes a suite that cannot run
   // twice concurrently and fails opaquely when something else holds it.
   const server = Bun.serve({
-    port: 0,
+    port: options.publicOrigin?.port ?? 0,
     hostname: "127.0.0.1",
-    tls: { key: tls.key, cert: tls.cert },
+    tls: {
+      key: options.publicOrigin?.key ?? tls.key,
+      cert: options.publicOrigin?.cert ?? tls.cert,
+    },
     async fetch(request): Promise<Response> {
       const url = new URL(request.url);
       requests.push(`${request.method} ${url.pathname}`);
@@ -345,7 +373,12 @@ export async function startMockIdp(options: MockIdpOptions): Promise<MockIdp> {
     },
   });
 
-  const origin = `https://localhost:${server.port}`;
+  // Every advertised URL and the signed `iss` come from this one expression, so
+  // an override cannot leave discovery and the token disagreeing.
+  const origin =
+    options.publicOrigin === undefined
+      ? `https://localhost:${server.port}`
+      : `https://${options.publicOrigin.host}:${options.publicOrigin.port}`;
   const issuer = origin;
 
   return {

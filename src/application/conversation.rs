@@ -17,7 +17,8 @@ use crate::{
         parse_summary, render_transcript, summarization_messages,
     },
     domain::{
-        AuditLogInsert, AuditResult, CallerRuntimeIdentity, ConversationCreateRequest,
+        AuditLogInsert, AuditResult, CallerRuntimeIdentity, ContentWrite,
+        ConversationContentPersistence, ConversationCreateRequest,
         ConversationMessageCreateRequest, ConversationMessageQuery, ConversationMessageRecord,
         ConversationMessageRole, ConversationMessageType, ConversationPatchRequest,
         ConversationPolicyPutRequest, ConversationPolicyRecord, ConversationQuery,
@@ -58,7 +59,7 @@ use crate::{
         SUPPORTED_EMBEDDING_DIMENSION, Scored, embed_texts, encode_vector_literal, prepare_chunks,
         provider_type_supports_embeddings, rank_chunks, rank_memories,
     },
-    security::{Actor, ActorType, request_hash},
+    security::{Actor, ActorType, ContentSealer, request_hash},
 };
 
 /// What `POST /api/v1/conversations/{id}/summarize` did — plan 11 Sub-Phase E.
@@ -225,8 +226,8 @@ fn failed_extraction(failure_class: &'static str) -> MemoryExtractionRunOutcome 
 /// `run_extraction` used to answer this question with the constant
 /// [`FAILURE_EXTRACTION_CALL_FAILED`], which made every failed execution look the same on
 /// `memory_extraction_runs.failure_class`: a route that resolves to nothing, a provider returning
-/// 500, and — once the structured-output fail-hard variant ships — a model that did not comply
-/// were all recorded as *"the call did not happen"*. Recording the execution's own class instead
+/// 500, and — since the structured-output fail-hard flip shipped (issue #80) — a model that did
+/// not comply were all recorded as *"the call did not happen"*. Recording the execution's own class instead
 /// keeps the distinction the run row exists to make, and gives
 /// [`FAILURE_EXTRACTION_CALL_FAILED`] back its literal meaning: it is now written **only** when
 /// there was no execution to ask — no pool, no service, or `execute` itself returned `Err`.
@@ -234,16 +235,19 @@ fn failed_extraction(failure_class: &'static str) -> MemoryExtractionRunOutcome 
 /// **Why the general form rather than one arm for `StructuredOutputInvalid`.** A special case for
 /// that one class would be code no test in this tree can reach: extraction builds its own schema
 /// from [`extraction_output_schema`], which is always readable, and never crosses
-/// `validate_response_format`, so neither of the class's two live emitters is on this path. An
-/// arm that cannot be executed is not a guard, it is a promise. Recording whatever the execution
-/// reports is reachable today — `a_failed_extraction_call_leaves_the_response_untouched` drives a
-/// real provider 500 through it — and it produces the right answer for the fail-hard variant
-/// without a second edit.
+/// `validate_response_format`, so neither of the class's two *request* emitters is on this path.
+/// An arm that cannot be executed is not a guard, it is a promise. Recording whatever the
+/// execution reports is reachable — `a_failed_extraction_call_leaves_the_response_untouched`
+/// drives a real provider 500 through it — and it produced the right answer for the fail-hard
+/// flip without a second edit, which is what happened: issue #80 added the class's third emitter
+/// and this function needed no change.
 ///
-/// **The consequence worth stating: the flip becomes invisible here.** A non-conforming reply is
-/// recorded as `structured_output_invalid` today, by `parse_candidates` refusing prose. Under the
-/// fail-hard variant the same string arrives from the execution instead. The run row says the
-/// same thing before and after, which is exactly what F29's doc comment was worried about losing.
+/// **The consequence worth stating: the flip is invisible here, and that was the point.** A
+/// non-conforming reply was recorded as `structured_output_invalid` before the flip, by
+/// `parse_candidates` refusing prose. Since the flip the same string arrives from the execution
+/// instead — the reply never reaches `parse_candidates`, because the execution failed. The run
+/// row says the same thing before and after, which is exactly what F29's doc comment was worried
+/// about losing.
 ///
 /// # This does **not** re-open F38
 ///
@@ -343,8 +347,8 @@ impl ConversationService {
     pub fn new(state: &AppState) -> Result<Self, AppError> {
         let pool = state.pool()?.clone();
         Ok(Self {
+            repo: PgConversationRepository::new(pool.clone(), state.content_keyring.clone()),
             state: state.clone(),
-            repo: PgConversationRepository::new(pool.clone()),
             admin_repo: PgAdminRepository::new(pool),
         })
     }
@@ -610,7 +614,9 @@ impl ConversationService {
                 execution_id: None,
                 role: request.role,
                 message_type: ConversationMessageType::Input,
-                content_plain: Some(request.content.clone()),
+                // What the caller has. `add_message` re-derives the storage form from the
+                // application's policy under the row lock — see its doc comment.
+                content: ContentWrite::Plain(request.content.clone()),
                 content_hash,
                 content_size_bytes: request.content.len() as i64,
                 token_count: Some(estimate_tokens(&request.content)),
@@ -685,7 +691,7 @@ impl ConversationService {
                 execution_id: None,
                 role: ConversationMessageRole::User,
                 message_type: ConversationMessageType::Input,
-                content_plain: Some(content.clone()),
+                content: ContentWrite::Plain(content.clone()),
                 content_hash,
                 content_size_bytes: content.len() as i64,
                 token_count: Some(estimate_tokens(&content)),
@@ -767,13 +773,19 @@ impl ConversationService {
             .await?;
 
         let Some((conversation_uuid, summary_id, summary_text, _)) =
-            find_conversation_context_anchor(pool, conversation_public_id).await?
+            find_conversation_context_anchor(
+                pool,
+                &self.state.content_access(),
+                conversation_public_id,
+            )
+            .await?
         else {
             return Ok(PlannedContext::default());
         };
 
         let history = find_recent_messages(
             pool,
+            &self.state.content_access(),
             conversation_public_id,
             current_sequence,
             history_message_limit(&conversation_policy),
@@ -947,9 +959,10 @@ impl ConversationService {
 
         if want_memory {
             let limit = candidate_limit(policy.maximum_memory_results);
-            let candidates = find_memory_candidates(pool, &scope, &encoded, limit)
-                .await
-                .map_err(|_| FAILURE_RETRIEVAL_BACKEND)?;
+            let candidates =
+                find_memory_candidates(pool, &self.state.content_access(), &scope, &encoded, limit)
+                    .await
+                    .map_err(|_| FAILURE_RETRIEVAL_BACKEND)?;
             outcome.memory_candidate_count = candidates.len() as i32;
             outcome.memories = rank_memories(
                 query,
@@ -968,6 +981,7 @@ impl ConversationService {
             let limit = candidate_limit(policy.maximum_chunk_results);
             let candidates = find_rag_chunk_candidates(
                 pool,
+                &self.state.content_access(),
                 &scope,
                 &encoded,
                 &policy.allowed_collection_ids,
@@ -1095,7 +1109,7 @@ impl ConversationService {
                 execution_id: Some(execution_id),
                 role: ConversationMessageRole::Assistant,
                 message_type: ConversationMessageType::Output,
-                content_plain: Some(output.to_string()),
+                content: ContentWrite::Plain(output.to_string()),
                 content_hash,
                 content_size_bytes: output.len() as i64,
                 token_count: Some(estimate_tokens(output)),
@@ -1223,8 +1237,12 @@ impl ConversationService {
             return;
         };
 
-        let Ok(Some((conversation_uuid, _, _, _))) =
-            find_conversation_context_anchor(pool, &link.conversation_id).await
+        let Ok(Some((conversation_uuid, _, _, _))) = find_conversation_context_anchor(
+            pool,
+            &self.state.content_access(),
+            &link.conversation_id,
+        )
+        .await
         else {
             return;
         };
@@ -1232,6 +1250,7 @@ impl ConversationService {
         // the turn that just happened — it is the whole subject of the run.
         let Ok(history) = find_recent_messages(
             pool,
+            &self.state.content_access(),
             &link.conversation_id,
             i64::MAX,
             EXTRACTION_TRANSCRIPT_MESSAGES,
@@ -1250,10 +1269,16 @@ impl ConversationService {
             })
             .collect();
         if turns.is_empty() {
-            // A conversation persisting no plaintext (`conversation_content_persistence` of
-            // `'none'`/`'metadata_only'`/`'encrypted_content'`) has nothing to extract from.
-            // Returning here rather than calling a model with an empty transcript is both the
-            // cheaper and the more honest answer.
+            // A conversation persisting no body at all (`conversation_content_persistence` of
+            // `'none'` or `'metadata_only'`) has nothing to extract from. Returning here rather
+            // than calling a model with an empty transcript is both the cheaper and the more
+            // honest answer.
+            //
+            // **`'encrypted_content'` is no longer on that list.** It was, and correctly, while
+            // `content_encrypted` had no reader: `find_recent_messages` opens it since issue
+            // #139, so a sealed conversation yields a full transcript here and extraction runs
+            // on it normally. The memories it produces are themselves sealed — issue #140 routes
+            // all three memory writers through the same policy — so nothing lands in the clear.
             //
             // **This is a consequence, not the guard.** The policy is enforced in `add_message`
             // — that is what makes `content_plain` null and this branch reachable. Until F32 was
@@ -1302,6 +1327,7 @@ impl ConversationService {
                 execution_id,
                 status,
                 &memory_policy,
+                conversation_policy.conversation_content_persistence,
                 &turns,
                 link.route_hint.clone(),
             )
@@ -1351,6 +1377,11 @@ impl ConversationService {
         execution_id: Uuid,
         status: MemoryStatus,
         policy: &MemoryPolicyRecord,
+        // `persistence` is the application's content-persistence policy, read once by
+        // `extract_memories` alongside the consent columns. Passed rather than re-read so a run
+        // cannot store its memories under a policy from a different instant than the one that
+        // admitted the transcript it extracted them from.
+        persistence: ConversationContentPersistence,
         turns: &[(String, String)],
         route_hint: Option<String>,
     ) -> MemoryExtractionRunOutcome {
@@ -1402,8 +1433,12 @@ impl ConversationService {
         };
         // `structured_output` is populated by the execution kernel since F29
         // (`structured_output_from_text`, gated on the request carrying an `output_schema`),
-        // which this call does. It falls back to `output_text` for a reply that is not valid
-        // JSON, which F29 deliberately does not fail hard on.
+        // which this call does. **Since issue #80 a reply that is not JSON fails the execution
+        // instead of arriving here as `None`**, so on this path the `.or(output_text)` fallback
+        // is reached only when there is no reply at all: extraction always sends a schema, so a
+        // successful execution always carries a parsed value. What that costs is recorded at
+        // `structured_output_from_text` — `parse_candidates`' ```json fence tolerance is no
+        // longer reachable from an execution.
         //
         // **Whether to proceed is still inferred from these two fields rather than from
         // `execution.status`** (finding F38's second reversal condition; the other site is
@@ -1478,7 +1513,27 @@ impl ConversationService {
                     continue;
                 }
             };
-            let content_hash = memory_content_hash(&candidate.content);
+            // The storage form and the digest are now independent — since issue #168 the digest
+            // is keyed under every policy value, so there is one format in this table and no
+            // ordering hazard between deciding the column and computing the hash. Both are still
+            // computed from the same `candidate.content`, which is what keeps the value the
+            // lookup below compares equal to the value the insert stores.
+            let stored = ContentWrite::under_policy(persistence, candidate.content.clone());
+            let content_hash = match self
+                .state
+                .content_access()
+                .memory_content_hash(&candidate.content)
+            {
+                Ok(hash) => hash,
+                // No usable dedupe key. Rejected rather than written under any policy: the
+                // alternative is an unkeyed digest of a short, guessable body, which is a
+                // dictionary-attack oracle whether or not the row also holds that body.
+                Err(_) => {
+                    rejected += 1;
+                    *rejections.entry("dedupe_key_unavailable").or_default() += 1;
+                    continue;
+                }
+            };
 
             // Exact dedupe first: it needs no embedding, so an application with embeddings off
             // still gets duplicate suppression.
@@ -1539,7 +1594,7 @@ impl ConversationService {
                 scope: memory_scope,
                 memory_type: candidate.memory_type,
                 memory_key: candidate.memory_key.as_deref(),
-                content: &candidate.content,
+                content: stored,
                 content_hash: &content_hash,
                 confidence: candidate.confidence,
                 sensitivity: candidate.sensitivity,
@@ -1550,7 +1605,10 @@ impl ConversationService {
                 contradicts_memory_id: contradicts,
                 resolution_status: contradicts.map(|_| CONTRADICTION_UNRESOLVED),
             };
-            if insert_extracted_memory(pool, &insert).await.is_err() {
+            if insert_extracted_memory(pool, &self.state.content_access(), &insert)
+                .await
+                .is_err()
+            {
                 rejected += 1;
                 *rejections.entry("insert_failed").or_default() += 1;
                 continue;
@@ -1710,7 +1768,8 @@ impl ConversationService {
             .await?;
 
         let Some((conversation_uuid, _, _, _)) =
-            find_conversation_context_anchor(pool, &conversation.id).await?
+            find_conversation_context_anchor(pool, &self.state.content_access(), &conversation.id)
+                .await?
         else {
             return Err(AppError::coded(
                 axum::http::StatusCode::NOT_FOUND,
@@ -1817,7 +1876,9 @@ impl ConversationService {
         policy: &ConversationPolicyRecord,
         force: bool,
     ) -> Result<SummarizationPlan, AppError> {
-        let previous = find_active_conversation_summary(pool, conversation_uuid).await?;
+        let previous =
+            find_active_conversation_summary(pool, &self.state.content_access(), conversation_uuid)
+                .await?;
         let boundary = previous
             .as_ref()
             .map(|row| row.covers_through_sequence)
@@ -1830,6 +1891,7 @@ impl ConversationService {
             count_messages_after_sequence(pool, conversation_uuid, boundary).await?;
         let messages = find_messages_after_sequence(
             pool,
+            &self.state.content_access(),
             conversation_uuid,
             boundary,
             SUMMARY_TRANSCRIPT_MESSAGES,
@@ -2012,12 +2074,18 @@ impl ConversationService {
         // genuinely happened and genuinely covers that backlog; recording the boundary without
         // the body is the honest outcome, and is exactly the shape `ConversationSummaryRow`
         // already documents for a null `summary_text`.
-        let summary_text = policy
-            .conversation_content_persistence
-            .persists_plaintext()
-            .then_some(summary.text.as_str());
+        //
+        // Since issue #139 the decision goes through `ContentWrite::under_policy`, which is
+        // exhaustive on the policy: `encrypted_content` now yields a body that
+        // `insert_conversation_summary` seals rather than a `None` that drops it, and a fifth
+        // policy value would not compile until somebody decided which of the three it is.
+        let summary_text = ContentWrite::under_policy(
+            policy.conversation_content_persistence,
+            summary.text.clone(),
+        );
         let row = insert_conversation_summary(
             pool,
+            &self.state.content_access(),
             &ConversationSummaryInsert {
                 conversation_uuid,
                 covers_through_sequence: plan.covers_through_sequence,
@@ -2114,11 +2182,25 @@ impl ConversationService {
         }
         validate_content(&request.content)?;
         validate_metadata(&request.metadata)?;
+        // Minted here, and the AAD binds it — so the id the envelope authenticates is the id the
+        // row is stored under. `public_id` is derived from the same value on the next line;
+        // there is no second `now_v7()` anywhere on this path.
         let id = Uuid::now_v7();
         let public_id = format!("mem_{id}");
         let external_tenant_id = effective_tenant(actor);
         let external_user_id = effective_user(actor);
-        let content_hash = memory_content_hash(&request.content);
+        // Memory bodies obey `conversation_content_persistence` since issue #140. It is the
+        // application's one content-persistence setting — `application_memory_policies` has no
+        // column of its own — and a memory is caller content in exactly the sense the policy
+        // names. Read here rather than in the repository because `create_memory` has one caller
+        // and this is it; `add_message` re-derives instead because it has three.
+        let content = ContentWrite::under_policy(
+            self.repo
+                .get_or_create_conversation_policy(application_id)
+                .await?
+                .conversation_content_persistence,
+            request.content.clone(),
+        );
         let record = self
             .repo
             .create_memory(&MemoryInsert {
@@ -2129,7 +2211,7 @@ impl ConversationService {
                 external_user_id: external_user_id.as_deref(),
                 scope: MemoryScope::UserApplication,
                 request: &request,
-                content_hash: &content_hash,
+                content,
             })
             .await?;
         // Embed the memory so it can actually be retrieved.
@@ -2243,15 +2325,24 @@ impl ConversationService {
         if let Some(metadata) = &request.metadata {
             validate_metadata(metadata)?;
         }
-        // Same content address `create_memory` writes — see `memory_content_hash`. A patch that
-        // wrote a different *kind* of digest would leave one table holding two incomparable
-        // formats, which is F14's silent-mismatch failure re-created from a format split
-        // instead of a pepper rotation.
-        let hash = request.content.as_deref().map(memory_content_hash);
-        let record = self
-            .repo
-            .patch_memory(memory_id, &request, hash.as_deref())
-            .await?;
+        // The same storage form `create_memory` chooses, from the same policy. A patch that
+        // wrote a different *kind* of digest — or a plaintext body under an encrypted policy —
+        // would leave one table holding two incomparable formats, which is F14's silent-mismatch
+        // failure re-created from a format split instead of a pepper rotation.
+        //
+        // The digest itself is derived inside `patch_memory` from this value, so the two cannot
+        // be chosen independently.
+        let content = match request.content.as_deref() {
+            Some(content) => Some(ContentWrite::under_policy(
+                self.repo
+                    .get_or_create_conversation_policy(required_application_id(actor)?)
+                    .await?
+                    .conversation_content_persistence,
+                content.to_string(),
+            )),
+            None => None,
+        };
+        let record = self.repo.patch_memory(memory_id, &request, content).await?;
         self.audit(
             actor,
             ctx,
@@ -2312,29 +2403,38 @@ impl ConversationService {
             .authz
             .require(actor, "moira:conversation-policies:write")?;
         validate_metadata_option(&request.metadata)?;
-        // Refuse a value Moira cannot honour rather than storing it and behaving as something
-        // else. `encrypted_content` is the only one: the `content_encrypted` columns exist on
-        // three tables and have no writer anywhere in `src/`, so accepting it would tell an
-        // operator with a PII or data-residency obligation that their content is encrypted at
-        // rest when it is not. That was finding F32's sharpest edge — the API was the thing
-        // doing the misleading.
+        // **The refusal narrowed with issue #139; it did not disappear.**
         //
-        // Fail-closed on both sides: a row that already holds `encrypted_content` keeps
-        // parsing and stores no plaintext (`persists_plaintext` is false for it), so an
-        // existing deployment is made safer rather than broken, while no new deployment can
-        // select it.
+        // It used to fire for `encrypted_content` as a *value*, because the `content_encrypted`
+        // columns had no writer anywhere in `src/` and accepting the setting would have told an
+        // operator with a PII or data-residency obligation that their content was encrypted at
+        // rest when it was not. That was finding F32's sharpest edge — the API was the thing
+        // doing the misleading. A cipher is now wired to those columns, so the value is
+        // honourable and is accepted.
         //
-        // **Reversal condition:** delete this check the moment a cipher is wired to the
-        // `content_encrypted` columns. It is deliberately the only thing that has to change.
+        // What remains is the condition, not the value: encryption configured but **unusable at
+        // write time**. Two reasons it is not simply deleted:
+        //
+        // * Deleting it would leave no write-time refusal for a key-custody failure, which is a
+        //   real and permanent condition rather than a transitional one. An operator who selects
+        //   `encrypted_content` on a process that cannot seal deserves the answer here, not on
+        //   their users' next message.
+        // * It is not made conditional on "is the feature built" either. A permanently-true
+        //   branch is the never-taken code this project has been bitten by — `accept_legacy_hashes`
+        //   (#125) is the same shape — so the check reads live state that can genuinely be false.
+        //
+        // The refusals for `none` and `metadata_only` are storage policies and are untouched.
         if let Some(persistence) = request.conversation_content_persistence
-            && !persistence.is_enforceable()
+            && persistence.persists_ciphertext()
+            && !self.state.content_access().can_seal()
         {
             return Err(AppError::coded_with_details(
                 axum::http::StatusCode::UNPROCESSABLE_ENTITY,
                 "conversation_content_persistence_unsupported",
-                "encrypted_content is not implemented: no cipher is wired to the content \
-                 columns, so Moira cannot encrypt conversation content at rest. Use \
-                 metadata_only or none to withhold plaintext.",
+                "encrypted_content cannot be honoured: this deployment has no usable content \
+                 encryption key, so Moira would be unable to store conversation content at all \
+                 under this policy. Restore the content keyring, or use metadata_only or none to \
+                 withhold plaintext.",
                 json!({ "conversation_content_persistence": "encrypted_content" }),
             ));
         }
@@ -2665,6 +2765,10 @@ impl ConversationService {
         // Moved out of the closure only because `self` cannot cross the `move` boundary;
         // the hash itself is still computed inside the transaction, as the comment below says.
         let content_hasher = self.command_hasher();
+        // Likewise. Cloning it is an `Option<Arc>` clone and no I/O, and the seal itself happens
+        // inside the transaction below — which is what makes "refusal, never fallback" hold: a
+        // body that cannot be sealed rolls the whole insert back.
+        let sealer = self.state.content_access();
         let outcome = AdminCommandRunner::new(self.admin_repo.clone(), self.command_hasher())
             .execute(spec, |transaction| {
                 Box::pin(async move {
@@ -2678,6 +2782,7 @@ impl ConversationService {
                     let id = Uuid::now_v7();
                     let record = create_rag_document_with_connection(
                         transaction.connection(),
+                        &sealer,
                         id,
                         &format!("doc_{id}"),
                         &collection_id,
@@ -2821,6 +2926,8 @@ impl ConversationService {
         // Moved out of the closure only because `self` cannot cross the `move` boundary;
         // the hash itself is still computed inside the transaction, as the comment below says.
         let content_hasher = self.command_hasher();
+        // See `create_rag_document` for why this is cloned out here and sealed in there.
+        let sealer = self.state.content_access();
         let outcome = AdminCommandRunner::new(self.admin_repo.clone(), self.command_hasher())
             .execute(spec, |transaction| {
                 Box::pin(async move {
@@ -2831,6 +2938,7 @@ impl ConversationService {
                     let content_hash = content_hasher.hash(content.as_bytes());
                     let record = ingest_rag_document_with_connection(
                         transaction.connection(),
+                        &sealer,
                         &document_id,
                         &request,
                         &content_hash,
@@ -3158,59 +3266,6 @@ pub(crate) fn conversation_audit(
         user_agent: ctx.user_agent.clone(),
         metadata,
     }
-}
-
-/// The content address stored in `memory_records.content_hash`.
-///
-/// **Decision (finding F14).** This is [`crate::security::request_hash`] — a plain, unkeyed
-/// SHA-256 aliasing `secret_fingerprint` — and deliberately **not**
-/// `IdempotencyHasher::hash`, which is what it used to be and what the neighbouring
-/// `conversation_messages.content_hash` still is.
-///
-/// # Why the two tables diverge
-///
-/// `IdempotencyHasher`'s rotation contract (`src/security/idempotency.rs`) accepts only the
-/// *active* pepper, and justifies that narrowness with a retention argument: every
-/// `idempotency_records` row expires within 24 hours, so old-pepper rows age out on their own.
-/// **`memory_records` has no such retention.** Its rows are long-lived by design — a nullable
-/// `valid_until` and a `status` that stays `'active'` indefinitely — so a pepper rotation would
-/// not produce a bounded window, it would permanently orphan every stored hash. Exact-match
-/// memory dedupe would then stop matching, silently, with no error and no log line. The hasher
-/// is right for its namesake table and was reused for one with a fundamentally different
-/// lifetime.
-///
-/// The same admitting rule plan 11 wrote for `rag_chunks.chunk_hash`
-/// (`src/orchestration/ingestion.rs`) is applied here per *table*, and `memory_records` passes
-/// all three clauses where `conversation_messages` fails the first:
-///
-/// * **(a) not caller-visible.** [`MemoryRecord`] has no `content_hash` field and no schema in
-///   `docs/openapi.json` carries one for a memory. `ConversationMessageRecord` does, which is
-///   why *that* column stays peppered: an unkeyed digest of message content, handed to the
-///   caller, is an offline verifier for content the schema otherwise expects to hold encrypted.
-/// * **(b) never a caller-supplied lookup key.** `MemoryCreateRequest`, `MemoryPatchRequest`
-///   and `MemoryQuery` all carry `deny_unknown_fields` and none of them has a hash field; the
-///   only caller-supplied memory lookup key is the `mem_…` public id.
-/// * **(c) never a cross-application comparison.** Every `memory_records` read is bound by
-///   `application_id` — `find_memory_authorized`, `list_memories_authorized` and
-///   `find_memory_candidates` all require it in every arm — so a dedupe built on this value
-///   cannot become an existence oracle over another application's memories.
-///
-///   **Plan 11 Sub-Phase F built that dedupe, so clause (c) now has a second set of call
-///   sites.** `find_memory_by_content_hash` compares this exact value across rows, and
-///   `find_nearest_memory`/`find_memory_by_key` compare content by other means; all three go
-///   through `MEMORY_SCOPE_PREDICATE` in `src/infra/repositories/conversation.rs`, which binds
-///   `application_id` in every arm, and `every_memory_read_shares_the_isolation_predicate`
-///   asserts it against the emitted SQL rather than against behaviour.
-///
-/// # Reversal condition
-///
-/// Go back to a keyed hash — and pair it with a re-hash-on-rotation procedure, because the
-/// lifetime problem above does not go away — the moment any one of those three clauses stops
-/// holding: `content_hash` appears on `MemoryRecord` or any other caller-visible DTO, a filter
-/// or lookup accepts a caller-supplied hash, or a dedupe/similarity query drops the
-/// `application_id` predicate.
-fn memory_content_hash(content: &str) -> String {
-    request_hash(content.as_bytes())
 }
 
 fn required_application_id(actor: &Actor) -> Result<Uuid, AppError> {
@@ -3759,9 +3814,11 @@ mod tests {
         assert!(validate_metadata(&json!({ "ticket": "MOIRA-5" })).is_ok());
     }
 
-    #[test]
-    fn only_system_and_development_admin_actors_can_read_all_context() {
-        let state = AppState::new(crate::config::Settings::default(), None).unwrap();
+    #[tokio::test]
+    async fn only_system_and_development_admin_actors_can_read_all_context() {
+        let state = AppState::new(crate::config::Settings::default(), None)
+            .await
+            .unwrap();
         for actor_type in [ActorType::SystemKey, ActorType::DevAdmin] {
             let actor = Actor {
                 actor_type,

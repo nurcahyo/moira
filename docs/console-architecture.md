@@ -78,6 +78,48 @@ snapshot and refreshes on any request that carries an operator credential. The
 snapshot is per process, which is why `charts/moira-console` still pins
 `replicaCount: 1`.
 
+### That snapshot has a lifetime (issue #152)
+
+The snapshot used to be written once per process and never again, so a provider
+changed in Moira kept being served — with no upper bound and nothing saying so —
+until somebody restarted the console. The observable symptom was a sign-in that
+failed `ECONNREFUSED` against an endpoint that had been decommissioned, which
+reads as "the identity provider is down".
+
+It is invalidated the same way Moira invalidates its own runtime caches
+(`docs/runtime-cache-invalidation.md`): **explicit invalidation first, a bounded
+TTL as the backstop**.
+
+- **Explicit.** `invalidateAuthConfig()` is called by the one auth-configuration
+  writer the console owns — `app/api/setup/route.ts`, in the `finally` of a
+  provisioning run, so a partial write invalidates as surely as a complete one.
+  A provider re-pointed through the wizard is in effect on the next request.
+- **TTL.** `AUTH_CONFIG_SNAPSHOT_TTL_MS` (60s) bounds every change the console
+  cannot observe: a write through Moira's admin API, or by another replica. It
+  is shorter than Moira's own 300s equivalent because there the TTL sits behind
+  a `NOTIFY` listener that sees every write and here nothing does.
+  `AUTH_CONFIG_REFRESH_RETRY_MS` (10s) stops a Moira outage turning every
+  request into another doomed round trip.
+
+Re-resolving on every request was rejected: `consoleRuntime()` is on the hot path
+of every authenticated request, every page render and every `/api/auth/*` call,
+and `loadAuthConfigs` is two Moira calls plus a secret-store read per provider.
+
+**A configuration that cannot be refreshed says so.** A process with no
+`MOIRA_SYSTEM_KEY` cannot re-read at all, and a Moira outage cannot either. Both
+keep serving what they have — the alternative is taking sign-in down over a
+backend blip, and on the credential-less path the old configuration is the only
+one anybody could sign in with — but `ConsoleRuntime.stale` is set and `/login`
+renders `console.error.auth_config_stale` beside the working buttons. Silence was
+as much the defect as the staleness.
+
+**And a provider it cannot reach is named as such.** `betterAuth` is configured
+with `onAPIError: { throw: true }`, which hands non-API errors back to
+`app/api/auth/[...all]/route.ts` instead of answering with an empty 500; that
+route turns a network-level failure into a keyed `503 auth_provider_unreachable`
+and re-raises everything else, so a genuine console bug is still loud rather than
+reported as somebody else's endpoint being down.
+
 **The sign-in screen reads that configuration without a credential.** "Read
 by the console at boot" must not be taken to mean the console always holds a
 Moira credential when it needs to render a login page — it does not, and
@@ -218,6 +260,21 @@ from the allow-list still authenticated through the row, so the wizard's
 "Edit auth settings" way back, widen the list, save again is a path the console
 accepts end to end.
 
+**After the claim, that path is `/settings/auth`** (issue #185). The setup window
+answers `409 setup_already_claimed` from the first admin onwards, so the wizard's
+auth-settings form stops existing at exactly the moment a deployment starts being
+used; the settings screen is the same two writes — Moira's row, and this
+console's sealed client secret — reachable afterwards, and restricted to the
+**owner**, because a wrong value there takes the deployment's only door with it.
+Moira enforces that restriction itself (`require_primary_actor` on the
+auth-provider write surface), so it is not a UI convention a direct API call can
+step around.
+
+It carries the rule that makes the screen safe: a **changed client id needs its
+client secret in the same save**, refused before any request reaches Moira. The
+sealed envelope binds `(provider_id, client_id)`, so a client id that moves
+without one leaves a secret that cannot open — which is the state below.
+
 What remains is the provider enabled with a credential **nobody at all** can sign
 in with — a mistyped client id or client secret, or a discovery URL pointing at
 the wrong IdP. That row cannot be corrected *from the console*: no session can be
@@ -225,8 +282,9 @@ obtained through it, so there is nothing to prove operatorship with, and the
 console will not be an unauthenticated proxy for a write against a live
 authenticator.
 
-The way out is the bootstrap system key you already hold. Moira's admin API takes
-it directly — `POST /api/v1/admin/auth/providers/{id}/disable` and `PATCH
+The way out is still the bootstrap system key you already hold — `/settings/auth`
+cannot help here, because reaching it requires the session this row is refusing
+to issue. Moira's admin API takes the key directly — `POST /api/v1/admin/auth/providers/{id}/disable` and `PATCH
 /api/v1/admin/auth/providers/{id}` both accept `systemKeyAuth`.
 
 Two things about that API are easy to get wrong, and getting either wrong is the
@@ -265,7 +323,11 @@ If step 3 answers `409 resource_version_conflict`, something changed the row
 between steps 2 and 3: re-run step 2 and try again. A quoted ETag value works
 too — the handler trims the quotes before parsing.
 
-**Disable the broken row, then finish in the wizard.** A disabled row
+**Disable the broken row, then finish in the wizard.** *(On a deployment that has
+never been claimed. Once it has, `/setup` is closed and `/settings/auth` is where
+this ends instead — but that screen needs a session, so a row nobody can sign in
+through still has to be disabled with the system key first, at which point the
+console's remaining sign-in configuration decides whether you can reach it.)* A disabled row
 authenticates nobody and no longer counts towards the one-enabled-provider limit,
 so every console rule above stands down: the setup window will re-save it and
 enable it again with no session, exactly as it does for an interrupted first run.
@@ -333,11 +395,22 @@ test forbids `components/atoms/**` and `components/molecules/**` from calling
 matching `/(^|[/-])auth([/-]|$)|better-auth|next-auth/i`. It is also the first
 `"use client"` file in the repository.
 
-**At most one button, by construction.** `resolveAuthConfig` returns
-`ambiguous_enabled_providers` when more than one provider is enabled, and
-`loadAuthConfig` will not even read a secret in that case. A provider picker is
-not "unbuilt" — it is wrong until the ownership question behind multi-provider is
-decided.
+**One button per RESOLVED provider — and today that is at most one.** The
+resolution below the panel is N-capable: `resolveAuthConfigs` resolves every
+enabled row independently and reports the ones that failed as `problems` rather
+than as a whole-deployment failure, so a drifted GitHub row cannot take OIDC
+sign-in down. The panel renders a button only for a provider the server fully
+resolved, never for one it merely knows about.
+
+What is not switched on is the *gate above it*. `ambiguityGuard`, applied by
+`loadAuthConfigs` in `lib/auth-config.ts`, still refuses every resolution once
+more than one row is enabled and `active` — so on today's deployments this
+renders one button. The guard comes down only after Stage 4A is deployed, not
+merely merged; the sequence and its verification are in
+[console-multi-provider-rollout.md](console-multi-provider-rollout.md). The write
+side agrees: `provisioningAdmissionFor` in `app/api/setup/route.ts` refuses a
+provisioning run that would take the enabled count above one, with
+`409 setup_single_enabled_provider_only`.
 
 **The refusal states are resolved server-side.** The anonymous
 `GET /api/v1/admin/setup/sign-in-methods` projection is enough to RENDER a button

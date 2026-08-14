@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use super::i18n::ResponseText;
 
@@ -37,42 +38,73 @@ pub enum ConversationMessageType {
 
 /// What an application persists of its conversation content.
 ///
-/// Enforced in exactly two places, both of which write a body derived from caller content:
-/// `add_message` (`conversation_messages.content_plain`) and the summarization write
-/// (`conversation_summaries.summary_text_plain`). `add_message` is the choke point every
-/// message writer already goes through, so a new call site inherits the policy rather than
-/// having to remember it.
+/// Enforced at every site that writes a body derived from caller content: `add_message`
+/// (`conversation_messages`), the summarization write (`conversation_summaries`), and — since
+/// issue #140 — all three memory writers (`create_memory`, `insert_extracted_memory`,
+/// `patch_memory`, over `memory_records`). `add_message` is the choke point every message writer
+/// already goes through, so a new message call site inherits the policy rather than having to
+/// remember it. Every site routes the body through [`ContentWrite`], so a fifth value here is a
+/// compile error at each of them rather than a silently defaulted branch.
 ///
 /// # What each value does
 ///
 /// | Value | Body | Length-revealing metadata |
 /// |---|---|---|
-/// | `plain_content` (default) | stored as plaintext | stored |
+/// | `plain_content` (default) | stored as plaintext in `*_plain` | stored |
 /// | `metadata_only` | **not stored** | stored |
 /// | `none` | **not stored** | **not stored** — `content_size_bytes` is `0`, `token_count` is null |
-/// | `encrypted_content` | **not stored** | stored |
+/// | `encrypted_content` | **sealed** into `*_encrypted` (AES-256-GCM, per-row nonce, AAD bound to the row's identity) | stored |
 ///
-/// `content_hash` is retained under every value. It is an HMAC under a deployment-held pepper,
-/// not a content address — see `crate::security::idempotency` — so it is a fingerprint of
-/// content rather than content, and dropping it would break the documented
+/// `conversation_messages.content_hash` is retained under every value. It is an HMAC under a
+/// deployment-held pepper, not a content address — see `crate::security::idempotency` — so it is
+/// a fingerprint of content rather than content, and dropping it would break the documented
 /// `"{pepper_version}:{base64url}"` shape the API contract already publishes. Caller-supplied
 /// `metadata` is likewise retained under every value: it is the caller's own JSON, not
 /// something derived from the message body.
 ///
-/// # What it does NOT do
+/// # `encrypted_content`, since issue #139
 ///
-/// * **`encrypted_content` does not encrypt.** No cipher is wired to the `content_encrypted`
-///   columns on any table; they have no writer anywhere in `src/`. The value therefore
-///   **fails closed** — it stores no plaintext, which is the half of its promise that can be
-///   kept — and the admin API **refuses it on write** (`conversation_content_persistence_unsupported`,
-///   422) rather than accepting a setting Moira cannot honour. Existing rows holding it keep
-///   parsing and keep failing closed.
-/// * **It is not retroactive.** Changing the policy governs subsequent writes only. Plaintext
-///   already stored under `plain_content` stays stored and stays readable through the API;
-///   removing it is a retention concern, not a persistence-policy one.
-/// * **It does not govern memories or RAG documents.** `memory_records.content_plain` and
-///   `rag_document_versions.content_plain` are written under their own policies. This value is
-///   scoped to conversation messages and the summaries derived from them.
+/// The body is sealed by [`crate::security::ContentCipher`] under the content keyring's active
+/// data key and written to the `*_encrypted` column; `*_plain` is left null, and the CHECK
+/// constraints from `migrations/0027_content_encryption_keyring.sql` make holding both a database
+/// refusal. Reads open it transparently, so the public API returns the same bytes the caller
+/// wrote.
+///
+/// Three consequences that are easy to misread and are therefore stated:
+///
+/// * **`content_size_bytes` and `token_count` are still computed on the plaintext.** Ciphertext
+///   length never reaches a counter, so flipping the policy does not move a limit or shift a
+///   metric.
+/// * **Refusal, never fallback.** A write under this value with no usable content key returns
+///   `503 content_key_unavailable` and stores **nothing**. Writing plaintext under a policy
+///   named for encryption would be finding F32 with extra steps.
+/// * **It is not retroactive, in either direction.** Switching *to* `encrypted_content` does not
+///   encrypt existing history, and switching *away* does not decrypt it. The policy governs
+///   subsequent writes only; already-stored rows keep their storage form and stay readable.
+///   Removing content is retention's job.
+///
+/// # What it does and does not govern
+///
+/// * **It governs memories, since issue #140.** `application_memory_policies` has no
+///   content-persistence column of its own and never had one; this is the application's single
+///   setting for "what do you keep of caller content", and a memory body is caller content in
+///   exactly the sense it names. All four values apply: a memory written under `none` or
+///   `metadata_only` stores no body at all and reads back with `content: null`, which is a
+///   **behaviour change** for such applications — before #140 memory bodies were stored in the
+///   clear whatever the policy said, which is finding F32's shape one table over.
+/// * **`memory_records.content_hash` is retained under every value, and its form no longer
+///   follows this setting.** Since issue #168 it is a digest keyed by the keyring's
+///   `memory_dedupe` key under **all four** values, where #140 keyed only `encrypted_content`.
+///   See [`crate::security::ContentSealer::memory_content_hash`]: a memory body is short and
+///   guessable, so an unkeyed digest is a dictionary-attack oracle — under `encrypted_content` it
+///   defeated the encryption outright, and under `none` and `metadata_only` it was an oracle for
+///   content the row deliberately does not hold.
+/// * **It governs RAG bodies on the sealing axis only, since issue #141.**
+///   `rag_document_versions.content_plain` and `rag_chunks.chunk_text_plain` are wired to their
+///   `*_encrypted` columns through [`ContentWrite::under_policy_for_rag`], which seals under
+///   `encrypted_content` and stores plaintext under every other value. `none` and
+///   `metadata_only` are deliberately **not** honoured there, and the reason is on that function:
+///   honouring them would produce a false privacy claim rather than privacy.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ConversationContentPersistence {
@@ -85,9 +117,10 @@ pub enum ConversationContentPersistence {
 impl ConversationContentPersistence {
     /// Whether a body derived from caller content may be written as plaintext.
     ///
-    /// `PlainContent` alone. `EncryptedContent` is deliberately grouped with the refusals:
-    /// until a cipher exists, storing plaintext under a value named for encryption is the
-    /// failure mode this policy exists to prevent.
+    /// `PlainContent` alone. `EncryptedContent` stays false here now that a cipher exists, for
+    /// the same reason it was false before one did: storing the body in the clear under a value
+    /// named for encryption is the failure mode this policy exists to prevent. What changed is
+    /// only that its body now goes somewhere ([`Self::persists_ciphertext`]) rather than nowhere.
     pub const fn persists_plaintext(self) -> bool {
         matches!(self, Self::PlainContent)
     }
@@ -101,14 +134,155 @@ impl ConversationContentPersistence {
         !matches!(self, Self::None)
     }
 
-    /// Whether Moira can deliver what this value's name promises.
+    /// Whether a body derived from caller content is sealed into the `*_encrypted` column.
     ///
-    /// False for `EncryptedContent` only, and the single reason is that nothing writes the
-    /// `content_encrypted` columns. **Reversal condition:** this becomes unconditionally true
-    /// the day a cipher is wired to those columns — at which point `persists_plaintext` must
-    /// stay false for it and a `persists_ciphertext` arm joins them.
-    pub const fn is_enforceable(self) -> bool {
-        !matches!(self, Self::EncryptedContent)
+    /// `EncryptedContent` alone, and it is the exact complement of [`Self::persists_plaintext`]
+    /// rather than an overlap: the CHECK constraints added by
+    /// `migrations/0027_content_encryption_keyring.sql` make a row holding both a refusal at the
+    /// database, so a policy that claimed both would be a write that cannot commit.
+    pub const fn persists_ciphertext(self) -> bool {
+        matches!(self, Self::EncryptedContent)
+    }
+}
+
+/// What a write offers for a content column — and, once the policy has been applied, what is
+/// stored in it.
+///
+/// **This replaces `content_plain: Option<String>` on the insert structs; it does not sit beside
+/// it.** Three things follow from replacing rather than adding, and all three are the point:
+///
+/// 1. A caller **physically cannot** supply a plaintext and a ciphertext for the same row. The
+///    CHECK constraint from migration 0027 says the same thing at the database; this says it at
+///    compile time, where the fix is cheaper.
+/// 2. `Omitted` is a **named state**, not a `None` with a comment next to it explaining which of
+///    two very different intentions it encodes.
+/// 3. A fourth persistence mode becomes a **compile error at every write site**, because
+///    [`ContentWrite::under_policy`] is exhaustive on
+///    [`ConversationContentPersistence`] and every storage `match` is exhaustive on this enum
+///    with no catch-all arm.
+///
+/// Point 3 is why the wider diff was worth it. Finding F32 was precisely a write path that
+/// ignored its policy while two comments asserted it did not; making "forgotten" unrepresentable
+/// is the only version of that fix that a fourth writer inherits for free.
+///
+/// # `Debug` is hand-written
+///
+/// A derived `Debug` would render the message body into any stray `{:?}` — including
+/// `ConversationMessageInsert`'s own derived one — and `tests/content_leak_snapshots.rs` exists
+/// because that has happened. This prints the variant and a byte count.
+#[derive(Clone)]
+pub enum ContentWrite {
+    /// Policy `none` or `metadata_only`: no body is stored at all, in either column.
+    Omitted,
+    /// Policy `plain_content`: stored verbatim in the `*_plain` column.
+    Plain(String),
+    /// Policy `encrypted_content`: **the repository seals it**. The plaintext never reaches a
+    /// column, and the wrapper keeps it from lingering in freed memory after the seal.
+    Encrypt(Zeroizing<String>),
+}
+
+impl std::fmt::Debug for ContentWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Omitted => f.write_str("ContentWrite::Omitted"),
+            Self::Plain(text) => write!(f, "ContentWrite::Plain({} bytes)", text.len()),
+            Self::Encrypt(text) => write!(f, "ContentWrite::Encrypt({} bytes)", text.len()),
+        }
+    }
+}
+
+impl ContentWrite {
+    /// Decide what to store, from the application's policy and the body the caller offered.
+    ///
+    /// The `match` is exhaustive with no catch-all: a fifth
+    /// [`ConversationContentPersistence`] value does not compile until somebody decides, here,
+    /// what it stores.
+    pub fn under_policy(persistence: ConversationContentPersistence, plaintext: String) -> Self {
+        match persistence {
+            ConversationContentPersistence::None | ConversationContentPersistence::MetadataOnly => {
+                Self::Omitted
+            }
+            ConversationContentPersistence::PlainContent => Self::Plain(plaintext),
+            ConversationContentPersistence::EncryptedContent => {
+                Self::Encrypt(Zeroizing::new(plaintext))
+            }
+        }
+    }
+
+    /// Decide what to store for a **RAG** body — a `rag_document_versions.content_*` or a
+    /// `rag_chunks.chunk_text_*` column.
+    ///
+    /// Two of the four policy values map differently here than they do in
+    /// [`Self::under_policy`], and the asymmetry is a decision rather than an oversight, so it
+    /// is written down where it is made.
+    ///
+    /// | policy | conversations, summaries, memories | RAG bodies |
+    /// |---|---|---|
+    /// | `plain_content` | `Plain` | `Plain` |
+    /// | `encrypted_content` | `Encrypt` | `Encrypt` |
+    /// | `metadata_only` | `Omitted` | **`Plain`** |
+    /// | `none` | `Omitted` | **`Plain`** |
+    ///
+    /// # Why `Omitted` is refused here
+    ///
+    /// Not because RAG content is less sensitive. Because a `rag_chunks` row is one of several
+    /// artifacts derived from the same document, and this column is the only one of them a
+    /// content policy can currently suppress. Under `Omitted` the row would still carry:
+    ///
+    /// * `section_title` — **a verbatim substring of the document**, the nearest preceding
+    ///   Markdown heading (`crate::orchestration::chunk`);
+    /// * `start_offset`, `end_offset` and `token_count` — the chunk's exact position and size;
+    /// * `chunk_hash` — an **unkeyed** SHA-256 content address, by the decision recorded in
+    ///   `docs/security.md`;
+    /// * a `rag_chunk_embeddings` row — a dense vector computed from the plaintext, from which
+    ///   embedding-inversion attacks recover substantial source text.
+    ///
+    /// A build that dropped the body and kept those four would be telling an operator it stored
+    /// nothing while storing the headings, the shape and an invertible encoding of the text. That
+    /// is a false privacy claim, which is worse than an honest absence of one, and it is exactly
+    /// the class of dishonesty finding F32 was.
+    ///
+    /// `encrypted_content` has no such problem: it is a claim about *this* column, it is true of
+    /// this column, and `docs/security.md` states plainly which sibling artifacts it does not
+    /// cover.
+    ///
+    /// # Reversal condition
+    ///
+    /// Route RAG through [`Self::under_policy`] — one rule for all five columns — the moment the
+    /// derived artifacts can be suppressed together with the body: `section_title` dropped,
+    /// offsets and token counts dropped, `chunk_hash` keyed or dropped, and the embedding rows
+    /// not written. That is a RAG-ingestion design change, not a cipher change, and it is not
+    /// this decision to make.
+    ///
+    /// The `match` is exhaustive with no catch-all, exactly like [`Self::under_policy`], so a
+    /// fifth [`ConversationContentPersistence`] value does not compile until somebody decides
+    /// what a RAG body does with it.
+    pub fn under_policy_for_rag(
+        persistence: ConversationContentPersistence,
+        plaintext: String,
+    ) -> Self {
+        match persistence {
+            ConversationContentPersistence::None
+            | ConversationContentPersistence::MetadataOnly
+            | ConversationContentPersistence::PlainContent => Self::Plain(plaintext),
+            ConversationContentPersistence::EncryptedContent => {
+                Self::Encrypt(Zeroizing::new(plaintext))
+            }
+        }
+    }
+
+    /// The plaintext this write carries, whichever column it is destined for.
+    ///
+    /// **The counters are computed through this, before sealing.** `content_size_bytes`,
+    /// `token_count` and the 262,144-byte content cap are all arithmetic somebody else does
+    /// later; letting a ciphertext length reach any of them would move a limit and shift a
+    /// metric the moment an operator flips the policy, with nothing in the request to explain it.
+    pub fn plaintext(&self) -> Option<&str> {
+        match self {
+            Self::Omitted => None,
+            Self::Plain(text) => Some(text.as_str()),
+            Self::Encrypt(text) => Some(text.as_str()),
+        }
     }
 }
 

@@ -5,7 +5,7 @@ use sqlx::PgPool;
 
 use crate::{
     app::cluster_lease::ClusterLeaseStatus,
-    config::Settings,
+    config::{ContentEncryptionCustody, Settings},
     error::AppError,
     infra::{
         coordination::RedisCoordinator, metrics::MetricsRegistry, redis::RedisClient,
@@ -18,7 +18,8 @@ use crate::{
     },
     security::{
         AdminAuthenticator, ApiKeyHasher, AuthService, AuthorizationService, CallerAuthenticator,
-        IdempotencyHasher, JwksCache, LocalSecretCipher,
+        ContentKeyring, EnvironmentMasterKeyCustody, IdempotencyHasher, JwksCache,
+        KeyringContentAccess, LocalSecretCipher, MasterKeyCustody, PreflightedCustody,
     },
 };
 
@@ -36,6 +37,30 @@ pub struct AppState {
     /// refuses redirects outright. See `src/security/ssrf.rs`.
     pub http: Client,
     pub cipher: LocalSecretCipher,
+    /// Custody of the master key that wraps content data keys.
+    ///
+    /// Constructed and **preflighted** in [`AppState::new`], which is why that function is
+    /// `async`. Nothing reads or writes an `*_encrypted` column yet; the seam and its boot
+    /// validation ship one full release ahead of any behaviour change so operators can set
+    /// `MOIRA_CONTENT_ENCRYPTION__KEYS` before the release that requires it.
+    ///
+    /// Typed [`PreflightedCustody`] rather than `Arc<dyn MasterKeyCustody>` so that "the boot
+    /// probe ran" is carried by the type: the only way to obtain one is to await
+    /// [`MasterKeyCustody::preflight`], so a refactor that drops the probe stops compiling
+    /// instead of shipping green (issue #161). It still wraps an `Arc<dyn _>` — the whole point
+    /// of the seam is that swapping in AWS KMS or Vault Transit later touches
+    /// [`build_content_custody`] and nothing else.
+    pub content_custody: PreflightedCustody,
+    /// The content keyring, loaded and fully unwrapped before the listener binds.
+    ///
+    /// `None` only when there is no database at all — the health-and-metrics-only mode
+    /// [`AppState::pool`] already encodes. There is no keyring to load without one, and there
+    /// is nothing that could read a sealed column either, so the absence is the same absence.
+    /// It is emphatically **not** a lenient fallback: with a pool present, a keyring that
+    /// cannot be fully opened aborts `AppState::new`.
+    ///
+    /// Behind an `Arc` because the background refresh task holds one too.
+    pub content_keyring: Option<Arc<ContentKeyring>>,
     pub key_hasher: ApiKeyHasher,
     pub idempotency_hasher: IdempotencyHasher,
     pub auth: AuthService,
@@ -82,7 +107,16 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(settings: Settings, pool: Option<PgPool>) -> Result<Self, AppError> {
+    /// `async` because of [`AppState::content_custody`]'s preflight and
+    /// [`AppState::content_keyring`]'s load, and for no other reason.
+    ///
+    /// It is awaited here — before `main` binds a listener — rather than lazily on first use,
+    /// on the same reasoning as the console's Postgres secret store: a bad key must fail at
+    /// construction, not on some user's first read. `MasterKeyCustody::wrap` is `async` from
+    /// day one because a KMS or Vault backend does network I/O, so making this synchronous now
+    /// and asynchronous later would break every caller at exactly the moment the backend swap
+    /// is supposed to be cheap.
+    pub async fn new(settings: Settings, pool: Option<PgPool>) -> Result<Self, AppError> {
         let http = Client::builder()
             .user_agent("moira/0.1")
             .build()
@@ -91,6 +125,7 @@ impl AppState {
             settings.secrets.master_key_bytes()?,
             settings.secrets.key_id.clone(),
         );
+        let content_custody = build_content_custody(&settings).await?;
         let key_hasher = ApiKeyHasher::new(
             settings.api_keys.pepper_bytes()?,
             settings.api_keys.pepper_version.clone(),
@@ -115,6 +150,21 @@ impl AppState {
         let authz = AuthorizationService::new();
         let redis = RedisClient::from_settings(&settings.redis)?;
         let metrics = MetricsRegistry::new(&settings.telemetry.service_name, pool.clone());
+        // Boot steps 3 to 5 of `docs/decision-encryption-at-rest.md` §10, before the listener
+        // binds and before any worker starts. A keyring this process cannot fully open aborts
+        // here, with a message naming both remedies; see `ContentKeyring::load`.
+        let content_keyring = match pool.clone() {
+            Some(pool) => Some(Arc::new(
+                ContentKeyring::load(
+                    pool,
+                    content_custody.custody(),
+                    &settings.content_encryption,
+                    metrics.clone(),
+                )
+                .await?,
+            )),
+            None => None,
+        };
         let cluster_lease = ClusterLeaseStatus::not_enforced();
         let workers = WorkerRegistry::new(
             settings.workers.clone(),
@@ -182,6 +232,8 @@ impl AppState {
             pool,
             http,
             cipher,
+            content_custody,
+            content_keyring,
             key_hasher,
             idempotency_hasher,
             auth,
@@ -204,5 +256,179 @@ impl AppState {
 
     pub fn pool(&self) -> Result<&PgPool, AppError> {
         self.pool.as_ref().ok_or(AppError::DatabaseUnavailable)
+    }
+
+    /// The seal/open seam for content columns, over this process's keyring.
+    ///
+    /// Cheap enough to build per call — an `Option<Arc<_>>` clone — and deliberately not cached
+    /// on `AppState`: holding a `KeyringContentAccess` would be holding the keyring, which is
+    /// what `content_keyring` already is.
+    ///
+    /// Returns an access that refuses everything when there is no keyring, rather than an
+    /// `Option`: a caller forced to unwrap would eventually write `unwrap_or(plaintext)`, and
+    /// that is the one thing this whole subsystem exists to prevent.
+    pub fn content_access(&self) -> KeyringContentAccess {
+        KeyringContentAccess::new(self.content_keyring.clone())
+    }
+}
+
+/// Builds the configured custody backend and proves it is *usable*, not merely configured.
+///
+/// The `match` is the seam: adding `Kms` or `Vault` adds an arm here and changes nothing else.
+///
+/// `pub` because `moira keyring …` needs custody **without** an `AppState`. That mode must run
+/// against a keyring [`ContentKeyring::load`] refuses — `abandon` is only ever reached after
+/// that refusal — so it cannot go through `AppState::new`, which loads the keyring. Duplicating
+/// the four lines below in the CLI would be a second place for the `Kms` arm to be forgotten.
+///
+/// Returns [`PreflightedCustody`], not `Arc<dyn MasterKeyCustody>`, and that is the guard: the
+/// only constructor of that type awaits the probe, so deleting the [`preflighted`] call below
+/// fails to compile rather than silently shipping a process that boots without one (#161).
+pub async fn build_content_custody(settings: &Settings) -> Result<PreflightedCustody, AppError> {
+    let (keys, active_key_id) = settings.content_encryption.master_keys()?;
+    let custody: Arc<dyn MasterKeyCustody> = match settings.content_encryption.custody {
+        ContentEncryptionCustody::Environment => Arc::new(
+            EnvironmentMasterKeyCustody::new(keys, active_key_id).map_err(|err| {
+                AppError::Config(format!("content encryption key custody: {err}"))
+            })?,
+        ),
+    };
+
+    preflighted(custody).await
+}
+
+/// Runs the boot probe and turns a failure into a refusal to start.
+///
+/// Separate from [`build_content_custody`] so the failure path can be exercised with a backend
+/// that *can* fail it: the environment backend cannot, because a 32-byte AES key that decoded
+/// and loaded always round-trips. A KMS or Vault backend fails here routinely — wrong IAM
+/// policy, unreachable endpoint, disabled key — which is the case this refusal exists for.
+///
+/// The `Arc` is cloned rather than moved so the failure message can still name the backend and
+/// the active key id, which are the two facts an operator needs from it.
+async fn preflighted(custody: Arc<dyn MasterKeyCustody>) -> Result<PreflightedCustody, AppError> {
+    PreflightedCustody::preflight(custody.clone())
+        .await
+        .map_err(|err| {
+            AppError::Config(format!(
+                "content encryption key custody preflight failed for backend {:?} and active key \
+                 {:?}: {err}",
+                custody.backend_name(),
+                custody.active_master_key_id()
+            ))
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use zeroize::Zeroizing;
+
+    use super::*;
+    use crate::security::{KeyCustodyError, WrappedKey};
+
+    #[tokio::test]
+    async fn boot_builds_a_usable_content_custody() {
+        let state = AppState::new(Settings::default(), None).await.unwrap();
+
+        assert_eq!(state.content_custody.backend_name(), "environment");
+        assert_eq!(state.content_custody.active_master_key_id(), "dev-local");
+
+        // "Usable", not merely "constructed" — the same property `preflight` asserts, checked
+        // here through the handle the rest of the process will actually hold.
+        let dek = Zeroizing::new([7u8; 32]);
+        let wrapped = state.content_custody.wrap(&dek, b"probe").await.unwrap();
+        assert_eq!(
+            state
+                .content_custody
+                .unwrap(&wrapped, b"probe")
+                .await
+                .unwrap()
+                .as_slice(),
+            dek.as_slice()
+        );
+    }
+
+    /// The break this release owns: no key, no boot. Asserted at `AppState::new`, which runs
+    /// before `main` binds a listener, and asserted on the message text because that string is
+    /// the only instruction the operator gets.
+    #[tokio::test]
+    async fn boot_fails_when_the_content_encryption_key_is_missing() {
+        let mut settings = Settings::default();
+        settings.content_encryption.allow_insecure_dev_key = false;
+        // Set, and deliberately unused: there is no implicit fallback from the content keyring
+        // to the provider-credential master key.
+        settings.secrets.master_key_base64 = Some(STANDARD.encode([42; 32]));
+
+        let error = match AppState::new(settings, None).await {
+            Ok(_) => panic!("a missing content encryption key must abort startup"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            error.contains("MOIRA_CONTENT_ENCRYPTION__KEYS must be set"),
+            "{error}"
+        );
+    }
+
+    #[derive(Debug)]
+    struct UnusableCustody;
+
+    #[async_trait::async_trait]
+    impl MasterKeyCustody for UnusableCustody {
+        fn backend_name(&self) -> &'static str {
+            "aws_kms"
+        }
+        fn active_master_key_id(&self) -> &str {
+            "arn-alias-moira"
+        }
+        fn can_unwrap(&self, _master_key_id: &str) -> bool {
+            true
+        }
+        fn wrap_algorithm(&self) -> &'static str {
+            "aws-kms:symmetric_default"
+        }
+        fn master_key_ids(&self) -> Vec<String> {
+            vec!["arn-alias-moira".to_string()]
+        }
+        async fn wrap(
+            &self,
+            _dek: &Zeroizing<[u8; 32]>,
+            _aad: &[u8],
+        ) -> Result<WrappedKey, KeyCustodyError> {
+            Err(KeyCustodyError::Unavailable { backend: "aws_kms" })
+        }
+        async fn wrap_under(
+            &self,
+            _master_key_id: &str,
+            _dek: &Zeroizing<[u8; 32]>,
+            _aad: &[u8],
+        ) -> Result<WrappedKey, KeyCustodyError> {
+            Err(KeyCustodyError::Unavailable { backend: "aws_kms" })
+        }
+        async fn unwrap(
+            &self,
+            _wrapped: &WrappedKey,
+            _aad: &[u8],
+        ) -> Result<Zeroizing<[u8; 32]>, KeyCustodyError> {
+            Err(KeyCustodyError::Unavailable { backend: "aws_kms" })
+        }
+        async fn preflight(&self) -> Result<(), KeyCustodyError> {
+            Err(KeyCustodyError::Unavailable { backend: "aws_kms" })
+        }
+    }
+
+    /// A backend that is *configured* but not *usable* must abort startup, and the refusal must
+    /// name the backend and the active key id — the two facts that tell an operator whether to
+    /// look at their key policy or at their key list.
+    #[tokio::test]
+    async fn a_failing_preflight_aborts_startup() {
+        let error = preflighted(Arc::new(UnusableCustody))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("preflight failed"), "{error}");
+        assert!(error.contains("aws_kms"), "{error}");
+        assert!(error.contains("arn-alias-moira"), "{error}");
     }
 }

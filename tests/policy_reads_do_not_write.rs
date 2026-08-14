@@ -94,7 +94,10 @@ const POLICY_TABLES: [&str; 5] = [
 /// Reads every family member once, so a test can express "do the reads" without repeating the
 /// five call sites. Returns nothing: the assertions are all on the database.
 async fn read_every_policy(pool: &PgPool, application_id: Uuid) {
-    let conversations = PgConversationRepository::new(pool.clone());
+    // No content keyring: this suite only reads policy documents, and none of those paths seals
+    // or opens content. A repository with `None` here refuses every encrypted write rather than
+    // degrading, which is what makes passing it safe rather than convenient.
+    let conversations = PgConversationRepository::new(pool.clone(), None);
     let public = PgPublicRepository::new(pool.clone());
     conversations
         .get_or_create_conversation_policy(application_id)
@@ -434,7 +437,7 @@ async fn concurrent_first_touches_all_succeed() {
             let pool = pool.clone();
             let barrier = Arc::clone(&barrier);
             tasks.push(tokio::spawn(async move {
-                let conversations = PgConversationRepository::new(pool.clone());
+                let conversations = PgConversationRepository::new(pool.clone(), None);
                 let public = PgPublicRepository::new(pool);
                 // An acknowledgement gate, not a delay: `wait` returns only once every task
                 // has arrived, so all ten issue their first statement together.

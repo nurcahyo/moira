@@ -106,7 +106,9 @@ async fn served_openapi_document_matches_committed_docs_openapi_json() {
     // leaves it at the hardened default, so a second state is built over the same pool.
     let mut settings = Settings::default();
     settings.docs.expose_admin = true;
-    let state = AppState::new(settings, Some(fixture.pool.clone())).expect("docs app state");
+    let state = AppState::new(settings, Some(fixture.pool.clone()))
+        .await
+        .expect("docs app state");
     let server = MoiraHttpServer::start(state).await;
     let client = Client::new();
 
@@ -156,7 +158,9 @@ async fn served_openapi_document_matches_committed_docs_openapi_json() {
 async fn served_public_openapi_document_is_the_committed_document_without_admin_paths() {
     // No database: with `expose_admin` off the handler never touches `state.pool()`, so
     // this gate runs everywhere rather than skipping wherever Postgres is absent.
-    let state = AppState::new(Settings::default(), None).expect("public docs app state");
+    let state = AppState::new(Settings::default(), None)
+        .await
+        .expect("public docs app state");
     let server = MoiraHttpServer::start(state).await;
     let client = Client::new();
 
