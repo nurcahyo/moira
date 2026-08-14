@@ -133,6 +133,12 @@ const SIGN_IN_PATH = "/login";
 const ROUTES_NOT_AUDITED_PENDING_AUTHENTICATED_E2E: readonly string[] = [
   "/",
   "/admins",
+  // Plan 12 workstream G (relationship graph). Gated inside `(console)`, so the
+  // walker asserts the redirect to `/login` and audits nothing — a real gap
+  // pending an authenticated a11y spec, the same shape as `/settings/keys` and
+  // `/settings/auth` below. The react-flow canvas will want its own audit when
+  // that authenticated stack can render it.
+  "/graph",
   // Issue #74. Inside `(console)`, so the walker below asserts it redirects to
   // `/login` and does NOT audit it. Listed rather than silently uncovered: the
   // bidirectional assertion means adding a gated screen without touching this

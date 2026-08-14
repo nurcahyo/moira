@@ -64,6 +64,7 @@ const NAV_ITEMS: readonly NavItem[] = [
   { href: "/settings/keys", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_keys },
   { href: "/settings/auth", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_auth_settings },
   { href: "/admins", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_admins },
+  { href: "/graph", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_graph },
 ];
 
 export interface ConsoleHeaderProps {

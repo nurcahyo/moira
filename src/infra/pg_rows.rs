@@ -3,19 +3,20 @@ use sqlx::Row;
 
 use crate::{
     domain::{
-        ApiKeyRecord, ApplicationExecutionPolicyRecord, ApplicationRecord,
-        ApplicationRoutingDefaultsRecord, AttemptSelectionReason, AuditEvent, AuditLogRecord,
-        AuditResult, ConversationContentPersistence, ConversationMessageRecord,
+        AgentProfileGraphRow, AgentRouteEdgeRow, ApiKeyRecord, ApplicationExecutionPolicyRecord,
+        ApplicationRecord, ApplicationRoutingDefaultsRecord, AttemptSelectionReason, AuditEvent,
+        AuditLogRecord, AuditResult, ConversationContentPersistence, ConversationMessageRecord,
         ConversationMessageRole, ConversationMessageType, ConversationPolicyRecord,
         ConversationRecord, ConversationStatus, CredentialRecord, CredentialScope,
         CredentialStatus, CredentialSummary, CredentialType, EmbeddingPolicyRecord,
-        ExecutionFailureClass, HistoryStrategy, HttpMethod, KeyStatus, MemoryConsentMode,
-        MemoryPolicyRecord, MemoryRecord, MemoryScope, MemorySensitivity, MemoryStatus, MemoryType,
-        OwnerScope, ProviderConfig, ProviderKind, ProviderModelRecord, ProviderModelRuntimeConfig,
-        ProviderRecord, ProviderRuntimePolicyRecord, ProviderType, PublicResponseRecord,
-        PublicResponseStatus, PublicUsageSummary, RagCollectionRecord, RagCollectionStatus,
-        RagCollectionVisibility, RagDocumentRecord, RagDocumentStatus, RagIngestionStatus,
-        ResourceStatus, ResponsePersistenceMode, RetrievalPolicyRecord, RouteDefinitionRecord,
+        ExecutionFailureClass, FlowStepGraphRow, HistoryStrategy, HttpMethod, KeyStatus,
+        MemoryConsentMode, MemoryPolicyRecord, MemoryRecord, MemoryScope, MemorySensitivity,
+        MemoryStatus, MemoryType, NamedStatusGraphRow, OwnerScope, ProviderConfig, ProviderKind,
+        ProviderModelRecord, ProviderModelRuntimeConfig, ProviderRecord,
+        ProviderRuntimePolicyRecord, ProviderType, PublicResponseRecord, PublicResponseStatus,
+        PublicUsageSummary, RagCollectionRecord, RagCollectionStatus, RagCollectionVisibility,
+        RagDocumentRecord, RagDocumentStatus, RagIngestionStatus, ResourceStatus,
+        ResponsePersistenceMode, RetrievalPolicyRecord, RouteDefinitionRecord,
         RouteSelectionStrategy, RoutingPolicyRecord, RuntimePolicyStatus, ScopeType,
         SkillHttpExecutorRecord, SkillKind, SkillRecord, SkillStatus, TrustedJwtIssuerRecord,
     },
@@ -1557,6 +1558,56 @@ fn credential_scope_from_parts(
             external_tenant_id,
         }),
     }
+}
+
+// =====================================================================================
+// Relationship graph raw rows (plan 12 §4, issue #234). `PgGraphRepository`
+// (`src/infra/repositories/graph.rs`) is the only caller; the decoded rows feed
+// `domain::assemble_graph`, never a caller directly.
+// =====================================================================================
+
+pub fn agent_profile_graph_row_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<AgentProfileGraphRow, AppError> {
+    Ok(AgentProfileGraphRow {
+        id: row.try_get("id")?,
+        display_name: row.try_get("display_name")?,
+        status: row.try_get("status")?,
+        skill_refs: row.try_get("skill_refs")?,
+        eval_suite_refs: row.try_get("eval_suite_refs")?,
+        memory_scope_refs: row.try_get("memory_scope_refs")?,
+    })
+}
+
+/// Shared by every "named registry row with a lifecycle status" the graph reads — see
+/// [`NamedStatusGraphRow`]'s own doc comment for which tables that covers and why
+/// `provider_models` fits without a sixth type.
+pub fn named_status_graph_row_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<NamedStatusGraphRow, AppError> {
+    Ok(NamedStatusGraphRow {
+        id: row.try_get("id")?,
+        display_name: row.try_get("display_name")?,
+        status: row.try_get("status")?,
+    })
+}
+
+pub fn flow_step_graph_row_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<FlowStepGraphRow, AppError> {
+    Ok(FlowStepGraphRow {
+        flow_id: row.try_get("flow_id")?,
+        agent_profile_id: row.try_get("agent_profile_id")?,
+    })
+}
+
+pub fn agent_route_edge_row_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<AgentRouteEdgeRow, AppError> {
+    Ok(AgentRouteEdgeRow {
+        agent_profile_id: row.try_get("agent_profile_id")?,
+        provider_model_id: row.try_get("provider_model_id")?,
+    })
 }
 
 #[cfg(test)]

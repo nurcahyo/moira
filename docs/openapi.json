@@ -2961,6 +2961,103 @@
         ],
         "type": "string"
       },
+      "GraphEdge": {
+        "description": "One edge in the derived graph. `from`/`to` are [`GraphNode::id`] values.",
+        "properties": {
+          "from": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/GraphEdgeKind"
+          },
+          "to": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "from",
+          "to",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "GraphEdgeKind": {
+        "description": "The FK/ref an edge was derived from (plan 12 §4). Every edge is a straight read of an\nexisting column — no computed weight, no new join table.",
+        "enum": [
+          "agent_uses_skill",
+          "agent_uses_eval_suite",
+          "agent_reads_memory_scope",
+          "flow_contains_agent",
+          "agent_routes_to_model"
+        ],
+        "type": "string"
+      },
+      "GraphNode": {
+        "description": "One node in the derived graph. `id` is `\"<type>:<key>\"` (e.g. `\"agent:0199…\"`,\n`\"memory_scope:tenant_application\"`) — composite so an edge's `from`/`to` can never collide\nacross node types that would otherwise share a bare UUID namespace.",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "status": {
+            "description": "The owning row's lifecycle status, passed through as-is. Registries do not share one\nstatus vocabulary (skills are `draft`/`enabled`/`disabled`; most others are\n`active`/`disabled`/`deleted`), so this is intentionally a bare string rather than one\nshared enum. `None` for the synthetic `memory_scope` node type, which has no row of its\nown to carry a status.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "type": {
+            "$ref": "#/components/schemas/GraphNodeType"
+          }
+        },
+        "required": [
+          "id",
+          "type",
+          "label"
+        ],
+        "type": "object"
+      },
+      "GraphNodeType": {
+        "description": "Which registry a [`GraphNode`] was derived from.",
+        "enum": [
+          "agent",
+          "skill",
+          "eval_suite",
+          "flow",
+          "provider",
+          "model",
+          "memory_scope"
+        ],
+        "type": "string"
+      },
+      "GraphResponse": {
+        "properties": {
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/GraphEdge"
+            },
+            "type": "array"
+          },
+          "generated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "nodes": {
+            "items": {
+              "$ref": "#/components/schemas/GraphNode"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "nodes",
+          "edges",
+          "generated_at"
+        ],
+        "type": "object"
+      },
       "HealthResponse": {
         "properties": {
           "database": {
@@ -16635,6 +16732,92 @@
         ],
         "tags": [
           "admin-api-keys"
+        ]
+      }
+    },
+    "/api/v1/admin/graph": {
+      "get": {
+        "operationId": "get_graph",
+        "parameters": [
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GraphResponse"
+                }
+              }
+            },
+            "description": "Derived relationship graph over the agent-platform and provider/model registries",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Authentication or authorization error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-graph"
         ]
       }
     },
@@ -32410,6 +32593,10 @@
     {
       "description": "Skill (declarative tool/guard) administration",
       "name": "admin-skills"
+    },
+    {
+      "description": "Derived relationship graph over the agent-platform and provider/model registries",
+      "name": "admin-graph"
     },
     {
       "description": "Runtime policy and diagnostics",

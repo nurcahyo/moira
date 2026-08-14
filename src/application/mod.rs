@@ -6,6 +6,8 @@ mod context;
 mod context_planner;
 mod conversation;
 mod execution;
+// Issue #234 (plan 12 §4). The read-only relationship-graph admin service.
+mod graph;
 mod identity;
 mod memory_extraction;
 mod public;
@@ -28,6 +30,7 @@ pub use conversation::{
     ConversationExecutionLink, ConversationService, PlannedContext, SummarizationOutcome,
 };
 pub use execution::{ExecutionService, MoiraExecutionService, execute_diagnostic};
+pub use graph::GraphService;
 pub use identity::{AdminIdentityService, ClaimCredential};
 // Plan 11 Sub-Phase F. Everything here is pure decision-making — the consent branch, the policy
 // validation, the prompt boundary — kept out of `conversation.rs` so it can be tested without a

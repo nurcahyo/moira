@@ -1571,6 +1571,90 @@ assertKeyContract<
 >();
 
 /* -------------------------------------------------------------------------- */
+/* Relationship graph (plan 12 §4, issue #234) — derived, read-only          */
+/* -------------------------------------------------------------------------- */
+
+/** `#/components/schemas/GraphNodeType` */
+export type GraphNodeType =
+  "agent" | "skill" | "eval_suite" | "flow" | "provider" | "model" | "memory_scope";
+
+/** `#/components/schemas/GraphEdgeKind` */
+export type GraphEdgeKind =
+  | "agent_uses_skill"
+  | "agent_uses_eval_suite"
+  | "agent_reads_memory_scope"
+  | "flow_contains_agent"
+  | "agent_routes_to_model";
+
+/**
+ * `#/components/schemas/GraphNode`. `id` is `"<type>:<key>"` (e.g. `"agent:0199…"`), composite
+ * so an edge's `from`/`to` never collides across node types. `status` is `null` for the
+ * synthetic `memory_scope` node type, which has no row of its own to carry one.
+ */
+export interface GraphNode {
+  id: string;
+  type: GraphNodeType;
+  label: string;
+  status?: string | null;
+}
+
+/** `#/components/schemas/GraphEdge`. `from`/`to` are `GraphNode.id` values. */
+export interface GraphEdge {
+  from: string;
+  to: string;
+  kind: GraphEdgeKind;
+}
+
+export const GRAPH_NODE_CONTRACT = {
+  schema: "GraphNode",
+  required: ["id", "type", "label"],
+  optional: ["status"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    GraphNode,
+    (typeof GRAPH_NODE_CONTRACT)["required"][number],
+    (typeof GRAPH_NODE_CONTRACT)["optional"][number]
+  >
+>();
+
+export const GRAPH_EDGE_CONTRACT = {
+  schema: "GraphEdge",
+  required: ["from", "to", "kind"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    GraphEdge,
+    (typeof GRAPH_EDGE_CONTRACT)["required"][number],
+    (typeof GRAPH_EDGE_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/GraphResponse` — `GET /api/v1/admin/graph`'s whole body. */
+export interface GraphResponse {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  generated_at: string;
+}
+
+export const GRAPH_RESPONSE_CONTRACT = {
+  schema: "GraphResponse",
+  required: ["nodes", "edges", "generated_at"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    GraphResponse,
+    (typeof GRAPH_RESPONSE_CONTRACT)["required"][number],
+    (typeof GRAPH_RESPONSE_CONTRACT)["optional"][number]
+  >
+>();
+
+/* -------------------------------------------------------------------------- */
 /* Error envelope (server-side shape — never crosses to the browser)          */
 /* -------------------------------------------------------------------------- */
 
@@ -1672,6 +1756,9 @@ export const SCHEMA_CONTRACTS: readonly SchemaContract[] = [
   ROUTING_POLICY_RECORD_CONTRACT,
   APPLICATION_RECORD_CONTRACT,
   APPLICATION_CREATE_REQUEST_CONTRACT,
+  GRAPH_NODE_CONTRACT,
+  GRAPH_EDGE_CONTRACT,
+  GRAPH_RESPONSE_CONTRACT,
   ERROR_DETAIL_CONTRACT,
   ERROR_RESPONSE_CONTRACT,
 ];

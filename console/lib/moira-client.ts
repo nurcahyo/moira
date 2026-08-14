@@ -76,6 +76,7 @@ import type {
   ConsoleClaimAdminIdentityRequest,
   ConsoleTrustedJwtIssuerCreateRequest,
   ConsoleProviderModelCreateRequest,
+  GraphResponse,
   ListResponse,
   ProviderCreateRequest,
   ProviderModelRecord,
@@ -719,6 +720,19 @@ export const MOIRA_OPERATIONS = {
     declaresIdempotencyKey: false,
     requiresIfMatch: false,
   }),
+  /**
+   * `GET /api/v1/admin/graph` (plan 12 §4, issue #234) — the derived, read-only
+   * relationship graph over the agent-platform and provider/model registries.
+   * No `Idempotency-Key`, no `If-Match`: nothing here ever writes.
+   */
+  getGraph: op({
+    id: "get_graph",
+    method: "GET",
+    path: "/api/v1/admin/graph",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: false,
+  }),
 } as const;
 
 export type MoiraOperationName = keyof typeof MOIRA_OPERATIONS;
@@ -1058,9 +1072,7 @@ export function apiKeyCredentialSecret(apiKey: string): ApiKeyCredentialSecret {
  */
 export function oauth2CredentialSecret(accessToken: string): OAuth2CredentialSecret {
   if (typeof accessToken !== "string" || accessToken.length === 0) {
-    throw new MoiraClientContractError(
-      "the credential secret requires a non-empty `access_token`",
-    );
+    throw new MoiraClientContractError("the credential secret requires a non-empty `access_token`");
   }
   return { access_token: accessToken };
 }
@@ -1986,6 +1998,15 @@ export class MoiraClient {
    */
   async revokeConsumerKey(id: string): Promise<ApiKeyRecord> {
     return this.#request<ApiKeyRecord>("revokeConsumerKey", { pathParams: { id } });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* Relationship graph (plan 12 §4, issue #234)                            */
+  /* ---------------------------------------------------------------------- */
+
+  /** `GET /api/v1/admin/graph` — the whole derived graph, assembled fresh on every call. */
+  async getGraph(): Promise<GraphResponse> {
+    return this.#request<GraphResponse>("getGraph", {});
   }
 
   /* ---------------------------------------------------------------------- */

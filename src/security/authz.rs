@@ -76,6 +76,10 @@ pub const ADMIN_SCOPES: &[&str] = &[
     "moira:skills:read",
     "moira:skills:write",
     "moira:skills:delete",
+    // Issue #234 (plan 12 §4) — the derived, read-only relationship graph. One scope, no
+    // `:write`/`:delete` siblings: the endpoint has no write side to gate. Implied by
+    // `moira:admin` like every scope in this list.
+    "moira:graph:read",
     "moira:runtime-policies:read",
     "moira:runtime-policies:write",
     // Issue #213 — context router MVP-static slice. `application_routing_defaults` admin

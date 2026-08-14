@@ -22,6 +22,7 @@
     "db:generate": "bun run db/generate.ts"
   },
   "dependencies": {
+    "@xyflow/react": "^12.11.3",
     "better-auth": "1.6.25",
     "next": "16.2.11",
     "pg": "8.16.3",
