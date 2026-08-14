@@ -12,7 +12,7 @@ Binding context: `plans/CONVENTIONS.md` (gates, i18n, testing, auth architecture
 
 | # | Feature | Proposed approach | MVP / Later | Depends on |
 |---|---------|-------------------|-------------|------------|
-| 1 | Claude via subscription | Raw OAuth-token reuse against the Messages API is **blocked by Anthropic since Jan 2026 — do not build**. The sanctioned subscription route is **Agent SDK / `claude -p`** (reinstated mid-2026 with usage caveats): either a local OpenAI-compatible sidecar proxy Moira consumes as a normal provider, or a native CLI-forwarding runner (boundary decision — item 1). Long-lived subscription token stored as an `oauth2` credential in the DB; `oauth-token-refresh` worker stays as generic plumbing | MVP = Wave-0 local spike + decision 1; build after | 08 (console), existing credential machinery, local `claude` CLI |
+| 1 | Claude via subscription | Raw OAuth-token reuse against the Messages API is **blocked by Anthropic since Jan 2026 — do not build**. The sanctioned subscription route is **Agent SDK / `claude -p`** (reinstated mid-2026 with usage caveats): either a local OpenAI-compatible sidecar proxy Moira consumes as a normal provider, or a native CLI-forwarding runner (boundary decision — item 1). Long-lived subscription token stored as an `oauth2` credential in the DB; `oauth-token-refresh` worker stays as generic plumbing | MVP = Wave-0 local spike; **decision 1 resolved: sidecar** — build after spike evidence | 08 (console), existing credential machinery, local `claude` CLI |
 | 2 | ChatGPT via subscription OAuth | **Do not build execution in this phase** — no rig-core-compatible wire path exists; gate behind a research spike. API-key path already works via `ProviderType::OpenAi` | Later (spike first) | 08, spike outcome |
 | 3 | DeepSeek provider | Already functional at the Rig boundary; remaining work is a `provider_models` catalog/seed update (v4 model ids, deprecate legacy aliases) | MVP (trivial) | nothing |
 | 4 | Context router (complexity + priority scoring, failover) | Extend `DefaultModelRouter` with a post-fetch re-rank; failover semantics unchanged (already built and tested); wire the dead `cost_weight`/`latency_weight`/`quality_weight` columns | MVP = static priority chains; scoring later | A (soft), existing routing |
@@ -24,6 +24,8 @@ Binding context: `plans/CONVENTIONS.md` (gates, i18n, testing, auth architecture
 | 10 | Fast Rust builds | New code in new modules; ≤3 new test binaries; adopt cargo-nextest (workstream J); no new Cargo features | — | — |
 
 ---
+
+> **Update 2026-08-14:** all 26 decision items in §7 are **RESOLVED** (interactive owner session — §7 lists the deviations). Owner additions folded in: the MVP → Growth → Enterprise maturity roadmap (§6b) and the skill router + skills-as-guards design (§5).
 
 ## Dependency graph
 
@@ -697,6 +699,23 @@ The owner asked: are DB-stored skills enough, or is MCP needed? Three options:
 - **Later:** MCP server exposure (option B); skill versioning across re-imports (a re-upload changing an operation's schema out from under an already-wired agent needs a story); per-skill rate limiting/circuit breaking (extend the existing per-provider/model circuit-breaker shape to per-skill-host).
 - **Explicitly not now:** MCP-client mode (option C) — no stated need, and it's a materially different feature from what was asked.
 
+### Skill router and skills-as-guards (owner additions, 2026-08-14)
+
+Two owner-directed extensions recorded at decision time (items 22/23); design directions for this workstream with their own phasing, not new MVP scope.
+
+**Skill router — context-dependent skill loading.** A 300-operation import (decision 23's cap) makes "attach every enabled skill to every request" impossible twice over: tool definitions consume context budget (`docs/context-budgeting.md`), and models degrade when offered hundreds of tools. Selection therefore layers:
+
+1. **MVP — static refs:** an agent carries an explicit `skill_refs` list (§3 schema); only those definitions enter the tool loop. No router logic at all — the "router" is the agent author.
+2. **Growth — declarative filters:** per-skill `tags` plus per-route/per-application allowlists narrow the candidate set. Plain SQL filtering, no new subsystem.
+3. **Enterprise — semantic selection:** embed skill descriptions and retrieve the top-K relevant skills per request from the user's context — rig-core's dynamic-toolset pattern (`moira-rig-tools`) over plan 11's embedding infrastructure. This is the owner's "router picks which skills to load depending on the user's context" ask; it depends on plan 11 and ships only after static refs have proven the tool loop.
+
+**Skills as guards — access and interaction-context gating.** The owner wants skills that gate rather than act: which callers may do what, and which interaction contexts are permitted. Recorded posture:
+
+- A guard is a skill of `kind = 'guard'` evaluated **before** an agent step or skill invocation; its verdict (allow/deny + keyed reason) short-circuits the step **fail-closed**, consistent with decision 15's flow-failure posture.
+- **MVP-shape guards are deterministic policy checks** (caller identity/scopes, per-agent allowed-skill lists, interaction-context allowlists) — cheap, auditable, no model call. They **complement, never replace, Moira's own authorization**: scopes and `admin_identities` grants stay the system of record; a guard may only narrow further, never widen (the same direction-of-trust rule as the no-scope-claim invariant, `CONVENTIONS.md` §7.5).
+- **Enterprise-stage guards** may be model-backed (intent/content classification via a designated agent) — flagged now as cost-bearing and latency-adding, with the same budget caution as online evals (decision 14).
+- Guard outcomes are observable: a denial emits a runtime event plus a `moira_guard_denied_total{guard_key,reason}`-shaped counter under §6's closed-set label discipline.
+
 Decisions for this section: consolidated items **20–25**. Risks: consolidated items **R15, R21–R24**.
 
 ---
@@ -723,9 +742,38 @@ Decisions for this section: consolidated items **10–11**. Risks: consolidated 
 
 ---
 
-## 7. Consolidated [decision] items for the owner
+## 6b. Maturity roadmap: MVP → Growth → Enterprise (owner-requested 2026-08-14)
 
-Numbered, deduplicated across all sections. Recommendations are the assembling authors'; none is binding until the owner answers in writing (`plans/README.md` — a decision closes only when a human has answered it, cited).
+Requested by the owner when accepting the MVP cut of decisions 13–15: the cut is acceptable *because* the full ladder is written down. Stages are cumulative — a later stage extends an earlier one, never rewrites it. "Growth" = single-team production; "Enterprise" = multi-team / multi-replica with compliance expectations.
+
+| Area | MVP (this plan's cut) | Growth | Enterprise |
+|---|---|---|---|
+| Providers | API-key providers + DeepSeek catalog; Claude subscription via sidecar (decision 1) behind a loud health check | Native Agent-SDK runner if the sidecar disappoints (its own numbered plan); ChatGPT-subscription spike | Multi-account credential pools per provider; automatic rotation; per-tenant billing attribution |
+| Context router | Static priority chains; `priority` as a profile selector; attempt-level observability columns | Last-N measured latency (decision 7) + weighted scoring behind `scoring_enabled` | Learned routing from eval + usage feedback; per-tenant weight profiles; per-application cost-budget enforcement |
+| Flows | Sequential-only, fail-closed abort (decisions 13/15) | `parallel` fan-out + `condition` branches; per-step continue-on-failure policy | Durable long-running flows on plan 10's distributed substrate; human-in-the-loop steps; cross-flow composition |
+| Evaluations | Offline suites; `exact_match`/`contains`/`schema_valid` only (decision 14) | LLM-judge grading on-demand for offline suites | Online sampled scoring of live traffic with cost controls; eval-gated rollout of agent/prompt changes; regression dashboards |
+| Skills | CRUD + static per-agent refs; OpenAPI import capped at 300 ops (decision 23) | Tag/route filtering; per-skill rate limits + circuit breaking; re-import versioning | Semantic skill router (top-K retrieval, §5); guard skills incl. model-backed (§5); MCP server exposure (option B) under consumer-key scopes |
+| Graph | Static derived graph + react-flow page | Live overlay: edge weights from usage counts | Drift detection (graph diff between deploys); Mermaid/DOT export (decision 19); cross-replica view |
+| Observability | §6 metric families + console tables over existing APIs | Routing/failover/OAuth-health panels + alert rules wired | SLOs with error budgets per provider/route; audit-grade routing-decision log where audit precedent applies (decision 11) |
+| Platform | Single replica; Postgres LISTEN/NOTIFY | — | Plan 10 executed: Redis-backed limiter/locks, admission lease, leader election, durable workers |
+
+The Enterprise column is direction, not commitment — each cell graduates into its own numbered plan with the same gates (`CONVENTIONS.md` §2–3) once its Growth predecessor has shipped and been used in anger.
+
+---
+
+## 7. Consolidated [decision] items — RESOLVED 2026-08-14
+
+Numbered, deduplicated across all sections. **All 26 items were answered by the owner in an interactive session on 2026-08-14** (recorded per `plans/README.md`'s written-answer rule; this session is the citation). **Unless listed under "Deviations and additions" below, the Recommendation column IS the binding decision — do not reopen without a new owner sign-off.**
+
+**Deviations and additions from the recommendations:**
+
+- **Item 7 — resolved against the recommendation:** latency is a *measured* signal — the naive last-N statistic over real `execution_attempts` durations (the `provider_model_latency_stats` sketch in §2), not declared-only. Accepted consequence: workstream D's scoring phase includes the background aggregation job — possibly the codebase's **first real `JobDispatcher`** (§1's correction). Coordinate with workstream B's oauth-refresh worker; whichever lands first establishes the pattern.
+- **Items 13/14/15 — accepted, with an addition:** the MVP cut stands *conditional on* the full maturity ladder being documented — delivered as §6b.
+- **Items 22/23 — accepted (cap = 300), with two additions:** the skill router (context-dependent skill loading) and skills-as-guards (access-rights and interaction-context gating) — both specified with phasing in §5's "Skill router and skills-as-guards" subsection.
+- **Item 1 — resolved: (a) sidecar.** The Wave-0 spike still runs first as evidence before build.
+- **Item 18 — resolved: new `moira:graph:read` scope.**
+- **Item 20 — resolved: option A now, option B later, option C rejected.**
+- **Item 24 — resolved: inline/blocking.**
 
 | # | Area | Decision | Recommendation |
 |---|------|----------|----------------|
@@ -735,7 +783,7 @@ Numbered, deduplicated across all sections. Recommendations are the assembling a
 | 4 | Providers | Refresh worker write path: internal service method (uniform versioning/audit, bypasses `If-Match`) vs direct repository write? | Internal service path |
 | 5 | Providers | Do OAuth2 subscription refresh tokens need a stricter sensitivity/masking review (`masking.rs`/`secret_fingerprint`) before shipping — a leaked one exposes a personal account, not an API relationship? | Do the review before shipping |
 | 6 | Context router | Scoring opt-in granularity: per-`routing_policies`-row (`scoring_enabled`) vs per-application vs global switch? | Per-row as sketched; confirm the mixed-row tie-break semantics |
-| 7 | Context router | Is latency a measured (real attempt-duration) or purely declared signal in MVP? | Declared-only MVP as sketched; confirm, or admit even a naive last-N stat |
+| 7 | Context router | Is latency a measured (real attempt-duration) or purely declared signal in MVP? | **RESOLVED: naive last-N measured stat** (deviation — see list above) |
 | 8 | Context router | Authorization gate for caller-supplied `priority`/`complexity_hint` — same posture as `route_hint`/`model_hint`, or open to all callers? | Same gate as the existing hints; an open priority field is self-declared urgency |
 | 9 | Failure classes | Is a new `ExecutionFailureClass` for content-policy refusal needed, distinct from the router's scope? | Decide under `moira-rig-errors-testing`, not inside the router work |
 | 10 | Console/monitoring | Does the console need a read replica/cache of usage data, or is direct `GET /api/v1/usage` per page-load fine? | Direct calls; add a console-side cache only if profiling shows need |
