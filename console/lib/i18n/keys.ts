@@ -155,6 +155,7 @@ export const CONSOLE_MESSAGE_KEYS = {
   chrome_nav_label: "console.chrome.nav_label",
   chrome_nav_home: "console.chrome.nav_home",
   chrome_nav_admins: "console.chrome.nav_admins",
+  chrome_nav_llm_settings: "console.chrome.nav_llm_settings",
   chrome_sign_out: "console.chrome.sign_out",
   chrome_sign_out_pending: "console.chrome.sign_out_pending",
   chrome_sign_out_failed: "console.chrome.sign_out_failed",

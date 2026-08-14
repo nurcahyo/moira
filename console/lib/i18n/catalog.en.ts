@@ -1180,6 +1180,16 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "Navigation link to `/admins`. Without it that route is reachable only by typing the URL, " +
       "which is why the (console) layout's own header scheduled the chrome for this wave.",
   },
+  [K.chrome_nav_llm_settings]: {
+    key: K.chrome_nav_llm_settings,
+    message: "Language models",
+    description:
+      "Navigation link to `/settings/llm`. That page shipped after this header did, and until " +
+      "this key existed it was reachable only by typing the URL — so an operator who had just " +
+      "finished the setup wizard had no way from the UI to the screen that points Moira at a " +
+      "provider. Deliberately not the page's own heading (`console.llm.page_title`): two keys " +
+      "sharing one message fail the catalog gate.",
+  },
   [K.chrome_sign_out]: {
     key: K.chrome_sign_out,
     message: "Sign out",

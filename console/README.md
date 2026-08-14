@@ -1,9 +1,9 @@
 # Moira Console
 
-The Moira admin console — a Next.js BFF (backend-for-frontend) that will
-eventually handle operator authentication and administration UI for Moira.
+The Moira admin console — a Next.js BFF (backend-for-frontend) that handles
+operator authentication and the administration UI for Moira.
 
-**This is scaffold only.** See [Status](#status) below.
+[Status](#status) lists what ships today and what does not.
 
 ## Toolchain (pinned — see `plans/CONVENTIONS.md` §5)
 
@@ -110,20 +110,35 @@ server actions) and stays there. Nothing secret may ever appear in
 
 ## Status
 
-This is a **workspace scaffold only**: toolchain, TypeScript/lint/format
-config, the Atomic Design directory structure with a small number of
-genuinely trivial example primitives, test harnesses (Bun unit, Playwright
-e2e, axe accessibility), a Dockerfile, and this documentation.
+The console is **running software**, not a scaffold. Its whole first-run path —
+`/setup` → an OIDC round trip → the first administrator claimed → a provider
+registered from `/settings/llm` → a prompt answered by that provider — has been
+walked in a browser against a real Moira. `docs/local-testing.md` §"The console"
+records that walk and the recipe for repeating it with no Google credential.
 
-**Not yet implemented** — all of the following arrive in
-[`plans/08-nextjs-console-google-oauth.md`](../plans/08-nextjs-console-google-oauth.md),
-after `plans/07-identity-foundation.md` lands Moira's identity contract:
+**Shipped surfaces**
 
-- Better Auth, Google OAuth, or any OAuth/OIDC flow
-- The setup wizard
-- Any Moira API client or call to a Moira endpoint
-- JWT minting or JWKS
-- Sessions or login pages
+| route | what it does |
+|-------|--------------|
+| `/setup` | the five-step first-run wizard (welcome → auth settings → sign-in → claim → done), the UI caller of `POST /api/setup` |
+| `/login` | one sign-in button per enabled interactive provider |
+| `/invite/[token]` | redeems an admin invitation |
+| `/` | the authenticated home, behind the `(console)` session boundary |
+| `/admins` | admin grants, invitations, ownership transfer |
+| `/settings/llm` | LLM providers, models, credential rows, routing — plus the one-step "connect a local endpoint" chain |
 
-See [`docs/console-architecture.md`](../docs/console-architecture.md) for
-how the console will relate to Moira once those pieces exist.
+Better Auth, the OAuth/OIDC flow, the ES256 JWKS the console publishes and the
+admin JWTs it mints, the Moira API client, sessions and the console's own
+PostgreSQL storage are all in place. `../docs/console-architecture.md` describes
+how the pieces fit.
+
+**Not implemented yet**
+
+- No screen mints a **consumer key** — the credential an *application* presents
+  to Moira. `lib/moira-client.ts` carries no consumer-key operation at all.
+- `/` is still a placeholder heading; there is no dashboard content.
+- Exactly **one** auth provider may be enabled at a time. More than one resolves
+  to `ambiguous_enabled_providers` in `lib/auth-config.ts` — deliberate, and
+  lifted only after Stage 4A (issue #78).
+- No automated suite walks the wizard past its sign-in step (issue #72). The
+  manual walk above is the only evidence `claim` works.
