@@ -16,8 +16,8 @@ use utoipa::{
 use crate::{
     app::AppState,
     domain::{
-        AuditResult, ConversationStatus, CredentialType, MemoryStatus, MemoryType,
-        RagCollectionStatus, ResponseText, ScopeType,
+        AttemptSelectionReason, AuditResult, ConversationStatus, CredentialType, MemoryStatus,
+        MemoryType, RagCollectionStatus, ResponseText, ScopeType,
     },
     error::{AppError, ErrorDetail, ErrorResponse},
 };
@@ -30,6 +30,7 @@ use crate::{
         description = "Moira public responses, conversations, memory, retrieval, RAG, discovery, usage, observability, and administrative runtime configuration API."
     ),
     components(schemas(
+        AttemptSelectionReason,
         AuditResult,
         ConversationStatus,
         CredentialType,

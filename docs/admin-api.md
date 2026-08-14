@@ -31,6 +31,7 @@ List endpoints use `limit` with default `50` and max `200`. Responses are shaped
 - Agent profiles: `/api/v1/admin/agent-profiles`
 - Provider runtime policies: `/api/v1/admin/providers/{provider_id}/runtime-policy`
 - Application execution policies: `/api/v1/admin/applications/{id}/execution-policy`
+- Application routing defaults (context router, issue #213): `/api/v1/admin/applications/{id}/routing-defaults` — `If-Match` optional (same posture as provider runtime policies), requiring `moira:routing-defaults:read` / `moira:routing-defaults:write`
 - Runtime diagnostics: `/api/v1/admin/runtime/diagnose`, disabled by default and requiring `moira:runtime:diagnose`
 
 OpenAPI is served at `/openapi.json`; admin paths are exposed only when `MOIRA_DOCS__EXPOSE_ADMIN=true`.

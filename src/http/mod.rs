@@ -547,6 +547,10 @@ fn admin_routes() -> OpenApiRouter<AppState> {
             admin::put_provider_runtime_policy
         ))
         .routes(routes!(
+            admin::get_application_routing_defaults,
+            admin::put_application_routing_defaults
+        ))
+        .routes(routes!(
             admin::list_provider_models,
             admin::create_provider_model
         ))
@@ -703,6 +707,7 @@ mod tests {
             "/api/v1/admin/providers/{id}/enable",
             "/api/v1/admin/providers/{id}/disable",
             "/api/v1/admin/providers/{provider_id}/runtime-policy",
+            "/api/v1/admin/applications/{id}/routing-defaults",
             "/api/v1/admin/providers/{provider_id}/models",
             "/api/v1/admin/routes",
             "/api/v1/admin/routes/{id}",
@@ -1430,8 +1435,9 @@ mod tests {
     /// baked into the published contract.
     ///
     /// `false` is reserved for preconditions that are genuinely advisory: the provider
-    /// runtime-policy `PUT` reads the header through `optional_if_match`.
-    const IF_MATCH_OPERATIONS: [(&str, &str, bool); 41] = [
+    /// runtime-policy `PUT` reads the header through `optional_if_match`, and the
+    /// context-router routing-defaults `PUT` (issue #213) mirrors that exact contract.
+    const IF_MATCH_OPERATIONS: [(&str, &str, bool); 42] = [
         // Plan 09 wave 2. Ownership transfer takes a required precondition and grant
         // revocation deliberately does not: a `PATCH` that flips a flag is a lost-update
         // hazard, while a soft revoke is idempotent in intent and answers a repeat with
@@ -1485,6 +1491,11 @@ mod tests {
         ("/api/v1/admin/providers/{id}/enable", "post", true),
         (
             "/api/v1/admin/providers/{provider_id}/runtime-policy",
+            "put",
+            false,
+        ),
+        (
+            "/api/v1/admin/applications/{id}/routing-defaults",
             "put",
             false,
         ),

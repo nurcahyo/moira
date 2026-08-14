@@ -16,6 +16,13 @@ flowchart TD
 
 Stored fields include selected route, provider, model, credential id, latency, status, safe failure class, provider status code, and normalized usage.
 
+Since issue #213, each attempt row also stores `candidate_rank` (the candidate's 0-based position
+in the ordered list the context router resolved for the execution), `candidate_score` (always
+`null` in the current MVP-static slice — no scoring function exists yet), and `selection_reason`
+(`priority` | `explicit_hint` | `scored` | `fallback_after_failure`). See
+[model routing](model-routing.md#context-router-issue-213-mvp-static-slice) for how these relate
+to the fallback loop.
+
 ## A failed attempt that still costs tokens
 
 Most failures happen before or instead of a reply — a timeout, a refused connection, a 500 — so

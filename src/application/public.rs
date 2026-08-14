@@ -1054,6 +1054,13 @@ impl PublicExecutionService {
                     max_fallbacks: None,
                     max_retries: None,
                     output_schema,
+                    // Context router (issue #213): not yet reachable from the public
+                    // `/api/v1/responses` request DTO in this MVP-static slice — only
+                    // `POST /api/v1/admin/runtime/diagnose` (which deserializes
+                    // `ExecutionOptions` directly) can set these today. Both fields stay gated
+                    // by `has_runtime_scope` in `execution.rs` regardless of entry point.
+                    priority: None,
+                    complexity_hint: None,
                 },
                 metadata: request.metadata.clone(),
             },
@@ -2252,6 +2259,17 @@ fn map_runtime_event(
         // `agent_profile_not_found` error — which names the profile and the remedy without
         // exposing the route id or the admin-plane event stream.
         RuntimeEventType::AgentProfileUnavailable => return None,
+        // Context router (issue #213) — deliberately not on the caller's stream, for the same
+        // reason as `AgentProfileUnavailable` above: unlike `ModelSelected`/`FallbackSelected`,
+        // which reveal one provider/model as it is actually attempted, this event's payload is
+        // the *entire* ordered candidate list a route resolved to — every provider/model
+        // configured as a fallback, whether or not this request ever reaches it. Streaming that
+        // to every caller on every request would expose the full shape of the admin-configured
+        // routing chain up front rather than progressively. The audiences that need it are the
+        // diagnostic endpoint (verbatim) and `execution_attempts.candidate_rank` /
+        // `candidate_score` / `selection_reason`, which only ever record the candidates actually
+        // tried.
+        RuntimeEventType::CandidateRanked => return None,
     };
     Some(public_sse(
         response_id,
