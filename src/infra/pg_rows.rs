@@ -16,8 +16,8 @@ use crate::{
         PublicResponseStatus, PublicUsageSummary, RagCollectionRecord, RagCollectionStatus,
         RagCollectionVisibility, RagDocumentRecord, RagDocumentStatus, RagIngestionStatus,
         ResourceStatus, ResponsePersistenceMode, RetrievalPolicyRecord, RouteDefinitionRecord,
-        RouteSelectionStrategy, RoutingPolicyRecord, RuntimePolicyStatus, ScopeType,
-        TrustedJwtIssuerRecord,
+        RouteSelectionStrategy, RoutingPolicyRecord, RuntimePolicyStatus, ScopeType, SkillKind,
+        SkillRecord, SkillStatus, TrustedJwtIssuerRecord,
     },
     error::AppError,
     security::{ContentIdentity, ContentOpener, warn_content_storage_ambiguous},
@@ -866,6 +866,41 @@ pub fn resource_status_to_db(status: &ResourceStatus) -> &'static str {
         ResourceStatus::Disabled => "disabled",
         ResourceStatus::Deleted => "deleted",
     }
+}
+
+pub fn skill_status_from_db(value: String) -> Result<SkillStatus, AppError> {
+    match value.as_str() {
+        "draft" => Ok(SkillStatus::Draft),
+        "enabled" => Ok(SkillStatus::Enabled),
+        "disabled" => Ok(SkillStatus::Disabled),
+        _ => Err(AppError::Internal(format!("unknown skill status {value}"))),
+    }
+}
+
+pub fn skill_kind_from_db(value: String) -> Result<SkillKind, AppError> {
+    match value.as_str() {
+        "tool" => Ok(SkillKind::Tool),
+        "guard" => Ok(SkillKind::Guard),
+        _ => Err(AppError::Internal(format!("unknown skill kind {value}"))),
+    }
+}
+
+pub fn skill_record_from_row(row: &sqlx::postgres::PgRow) -> Result<SkillRecord, AppError> {
+    Ok(SkillRecord {
+        id: row.try_get("id")?,
+        skill_key: row.try_get("skill_key")?,
+        display_name: row.try_get("display_name")?,
+        description: row.try_get("description")?,
+        kind: skill_kind_from_db(row.try_get::<String, _>("kind")?)?,
+        params_schema: row.try_get("params_schema")?,
+        tags: row.try_get("tags")?,
+        status: skill_status_from_db(row.try_get::<String, _>("status")?)?,
+        metadata: row.try_get("metadata")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+        deleted_at: row.try_get("deleted_at")?,
+        version: row.try_get("version")?,
+    })
 }
 
 pub fn route_selection_strategy_from_db(value: String) -> Result<RouteSelectionStrategy, AppError> {

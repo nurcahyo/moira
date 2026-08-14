@@ -69,6 +69,13 @@ pub const ADMIN_SCOPES: &[&str] = &[
     "moira:agent-profiles:read",
     "moira:agent-profiles:write",
     "moira:agent-profiles:delete",
+    // Issue #214 (plan 12 §3) — agent-platform skill registry. Named against the
+    // `moira:agent-profiles:{read,write,delete}` precedent; `write` covers create, patch,
+    // enable/disable, and bulk-enable, matching how the routing surfaces reuse `write` for
+    // their enable/disable toggles. Implied by `moira:admin` like every scope in this list.
+    "moira:skills:read",
+    "moira:skills:write",
+    "moira:skills:delete",
     "moira:runtime-policies:read",
     "moira:runtime-policies:write",
     // Issue #213 — context router MVP-static slice. `application_routing_defaults` admin

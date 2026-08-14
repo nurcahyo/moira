@@ -68,6 +68,7 @@ use crate::{
         (name = "admin-routes", description = "Route definition administration"),
         (name = "admin-routing-policies", description = "Routing policy administration"),
         (name = "admin-agent-profiles", description = "Agent profile administration"),
+        (name = "admin-skills", description = "Skill (declarative tool/guard) administration"),
         (name = "admin-runtime", description = "Runtime policy and diagnostics"),
         (name = "admin-rag", description = "RAG collection and document administration")
     )
