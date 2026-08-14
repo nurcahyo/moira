@@ -11,13 +11,20 @@
 //! other's internals. `commit_with_audit` is shared from `super::admin` because it writes the
 //! one audit-in-transaction shape every admin write uses.
 
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::{
-    domain::{AuditLogInsert, ListCursor, SkillCreateRequest, SkillPatchRequest, SkillRecord},
+    domain::{
+        AuditLogInsert, ListCursor, SkillCreateRequest, SkillHttpExecutorPatchRequest,
+        SkillHttpExecutorRecord, SkillPatchRequest, SkillRecord,
+    },
     error::AppError,
-    infra::pg_rows::skill_record_from_row,
+    infra::pg_rows::{
+        http_method_to_db, skill_http_executor_record_from_row, skill_record_from_row,
+    },
+    orchestration::ParsedOperation,
 };
 
 use super::admin::commit_with_audit;
@@ -29,6 +36,12 @@ const SKILL_COLUMNS: &str = "id, skill_key, display_name, description, kind, par
 
 const SKILL_VERSION_FOR_UPDATE: &str =
     "select version from skills where id = $1 and deleted_at is null for update";
+
+/// The column list every `skill_http_executors` read and write returns. Unlike
+/// [`SKILL_COLUMNS`] there is no `deleted_at`/`version` — see
+/// `domain::SkillHttpExecutorRecord`'s doc comment for why this table carries neither.
+const EXECUTOR_COLUMNS: &str = "skill_id, method, url_template, allowed_host, header_template, \
+     credential_id, timeout_ms, response_schema, created_at, updated_at";
 
 #[derive(Clone)]
 pub struct PgAgentPlatformRepository {
@@ -219,6 +232,196 @@ impl PgAgentPlatformRepository {
             .collect::<Result<Vec<_>, _>>()?;
         commit_with_audit(tx, audit).await?;
         Ok(records)
+    }
+
+    /// Imports every parsed operation as a `skills` row (status defaults to `draft`) plus
+    /// its `skill_http_executors` row, in one transaction — all-or-nothing, so a document
+    /// that fails partway (for instance a `skill_key` collision with an existing row)
+    /// leaves nothing behind rather than a half-imported registry.
+    ///
+    /// `base_url` and `allowed_host` are shared by every operation in `operations` — one
+    /// import is always relative to one already-SSRF-validated server URL (the caller,
+    /// `AgentPlatformService::import_skills`, validates it exactly once before calling
+    /// this).
+    pub async fn import_operations(
+        &self,
+        operations: &[ParsedOperation],
+        base_url: &str,
+        allowed_host: &str,
+        audit: AuditLogInsert,
+    ) -> Result<(Vec<SkillRecord>, Vec<SkillHttpExecutorRecord>), AppError> {
+        let mut tx = self.pool.begin().await?;
+        let mut skills = Vec::with_capacity(operations.len());
+        let mut executors = Vec::with_capacity(operations.len());
+        for operation in operations {
+            let skill_id = Uuid::now_v7();
+            let skill_row = sqlx::query(&format!(
+                "insert into skills (id, skill_key, display_name, description, kind, \
+                 params_schema, tags, metadata) values ($1, $2, $3, $4, 'tool', $5, $6, '{{}}') \
+                 returning {SKILL_COLUMNS}"
+            ))
+            .bind(skill_id)
+            .bind(&operation.skill_key)
+            .bind(&operation.display_name)
+            .bind(&operation.description)
+            .bind(&operation.params_schema)
+            .bind(&operation.tags)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(skill_key_conflict_on_unique_violation)?;
+            skills.push(skill_record_from_row(&skill_row)?);
+
+            let url_template = format!("{base_url}{}", operation.path);
+            let executor_row = sqlx::query(&format!(
+                "insert into skill_http_executors (skill_id, method, url_template, \
+                 allowed_host, header_template) values ($1, $2, $3, $4, '{{}}') \
+                 returning {EXECUTOR_COLUMNS}"
+            ))
+            .bind(skill_id)
+            .bind(http_method_to_db(&operation.method))
+            .bind(&url_template)
+            .bind(allowed_host)
+            .fetch_one(&mut *tx)
+            .await?;
+            executors.push(skill_http_executor_record_from_row(&executor_row)?);
+        }
+        commit_with_audit(tx, audit).await?;
+        Ok((skills, executors))
+    }
+
+    pub async fn get_executor(&self, skill_id: Uuid) -> Result<SkillHttpExecutorRecord, AppError> {
+        let row = sqlx::query(&format!(
+            "select {EXECUTOR_COLUMNS} from skill_http_executors where skill_id = $1"
+        ))
+        .bind(skill_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| executor_not_found(skill_id))?;
+        skill_http_executor_record_from_row(&row)
+    }
+
+    pub async fn list_executors(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<SkillHttpExecutorRecord>, AppError> {
+        let rows = sqlx::query(&format!(
+            "select {EXECUTOR_COLUMNS} from skill_http_executors \
+             where ($1::timestamptz is null or (created_at, skill_id) < ($1::timestamptz, $2::uuid)) \
+             order by created_at desc, skill_id desc limit $3"
+        ))
+        .bind(cursor.map(|c| c.ts))
+        .bind(cursor.map(|c| c.id))
+        .bind(over_fetch_limit(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(skill_http_executor_record_from_row)
+            .collect()
+    }
+
+    /// `expected_updated_at` is this table's `If-Match` basis — see
+    /// `domain::SkillHttpExecutorRecord`'s doc comment. `new_url_template`/`new_allowed_host`
+    /// are `Some` together exactly when the caller validated a new `url_template` through
+    /// SSRF and re-derived its host; passing them separately from `patch.url_template`
+    /// keeps this repository from ever writing an `allowed_host` the service layer did not
+    /// itself compute from a validated URL.
+    pub async fn patch_executor(
+        &self,
+        skill_id: Uuid,
+        expected_updated_at: DateTime<Utc>,
+        patch: &SkillHttpExecutorPatchRequest,
+        new_url_template: Option<&str>,
+        new_allowed_host: Option<&str>,
+        audit: AuditLogInsert,
+    ) -> Result<SkillHttpExecutorRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_updated_at = sqlx::query_scalar::<_, DateTime<Utc>>(
+            "select updated_at from skill_http_executors where skill_id = $1 for update",
+        )
+        .bind(skill_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| executor_not_found(skill_id))?;
+        if current_updated_at != expected_updated_at {
+            return Err(version_conflict());
+        }
+        let row = sqlx::query(&format!(
+            "update skill_http_executors set \
+                method = coalesce($2, method), \
+                url_template = coalesce($3, url_template), \
+                allowed_host = coalesce($4, allowed_host), \
+                header_template = coalesce($5, header_template), \
+                credential_id = coalesce($6, credential_id), \
+                timeout_ms = coalesce($7, timeout_ms), \
+                response_schema = coalesce($8, response_schema), \
+                updated_at = now() \
+             where skill_id = $1 returning {EXECUTOR_COLUMNS}"
+        ))
+        .bind(skill_id)
+        .bind(patch.method.as_ref().map(http_method_to_db))
+        .bind(new_url_template)
+        .bind(new_allowed_host)
+        .bind(&patch.header_template)
+        .bind(patch.credential_id)
+        .bind(patch.timeout_ms)
+        .bind(&patch.response_schema)
+        .fetch_one(&mut *tx)
+        .await?;
+        let record = skill_http_executor_record_from_row(&row)?;
+        commit_with_audit(tx, audit).await?;
+        Ok(record)
+    }
+
+    pub async fn delete_executor(
+        &self,
+        skill_id: Uuid,
+        expected_updated_at: DateTime<Utc>,
+        audit: AuditLogInsert,
+    ) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_updated_at = sqlx::query_scalar::<_, DateTime<Utc>>(
+            "select updated_at from skill_http_executors where skill_id = $1 for update",
+        )
+        .bind(skill_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| executor_not_found(skill_id))?;
+        if current_updated_at != expected_updated_at {
+            return Err(version_conflict());
+        }
+        sqlx::query("delete from skill_http_executors where skill_id = $1")
+            .bind(skill_id)
+            .execute(&mut *tx)
+            .await?;
+        commit_with_audit(tx, audit).await?;
+        Ok(())
+    }
+}
+
+fn executor_not_found(skill_id: Uuid) -> AppError {
+    AppError::coded(
+        axum::http::StatusCode::NOT_FOUND,
+        "executor_not_found",
+        format!("skill {skill_id} has no HTTP executor"),
+    )
+}
+
+/// `skills_skill_key_active_unique` is the only unique index on live `skills` rows
+/// (`migrations/0031_agent_platform.sql`), so any unique violation reaching an import
+/// insert is a `skill_key` collision — either against an existing skill, or (rarely, since
+/// `openapi_import::parse_openapi_document` already deduplicates within one document)
+/// against a key generated by a concurrent import. Mapped to the existing generic
+/// `conflict` code rather than a new catalog entry: the caller's remedy is the same either
+/// way — rename the colliding operation's `operationId` and re-import — so a dedicated
+/// code would not tell them anything the existing one does not.
+fn skill_key_conflict_on_unique_violation(error: sqlx::Error) -> AppError {
+    match &error {
+        sqlx::Error::Database(database) if database.is_unique_violation() => AppError::conflict(
+            "conflict",
+            "an imported operation's skill_key collides with an existing skill",
+        ),
+        _ => AppError::from(error),
     }
 }
 

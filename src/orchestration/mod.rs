@@ -2,6 +2,7 @@ mod chunking;
 mod controls;
 mod embedding;
 mod ingestion;
+mod openapi_import;
 mod provider_url;
 mod retrieval;
 mod runtime_cache;
@@ -24,6 +25,10 @@ pub use ingestion::{
     FAILURE_EMBEDDING_DIMENSION_UNSUPPORTED, FAILURE_EMBEDDING_FAILED,
     FAILURE_EMBEDDING_NOT_CONFIGURED, PreparedChunk, RAG_DOCUMENT_TOO_LARGE, RagIngestionPlan,
     prepare_chunks,
+};
+pub use openapi_import::{
+    MAX_IMPORT_OPERATIONS, OpenApiImportError, ParsedImport, ParsedOperation,
+    parse_openapi_document,
 };
 pub use provider_url::normalize_openai_base_url;
 pub use retrieval::{

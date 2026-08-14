@@ -28,9 +28,10 @@ pub use agent_platform::{
     AgentFlowCreateRequest, AgentFlowPatchRequest, AgentFlowRecord, AgentFlowRunRecord,
     AgentFlowStepCreateRequest, AgentFlowStepRecord, EvalCaseCreateRequest, EvalCaseRecord,
     EvalRunRecord, EvalRunStatus, EvalSuiteCreateRequest, EvalSuitePatchRequest, EvalSuiteRecord,
-    EvalTriggerKind, FlowRunStatus, FlowStepOnFailure, FlowStepRunStatus, GradingKind,
-    SkillBulkEnableRequest, SkillBulkEnableResponse, SkillCreateRequest, SkillKind,
-    SkillPatchRequest, SkillRecord, SkillStatus,
+    EvalTriggerKind, FlowRunStatus, FlowStepOnFailure, FlowStepRunStatus, GradingKind, HttpMethod,
+    SkillBulkEnableRequest, SkillBulkEnableResponse, SkillCreateRequest,
+    SkillHttpExecutorPatchRequest, SkillHttpExecutorRecord, SkillImportRequest,
+    SkillImportResponse, SkillKind, SkillPatchRequest, SkillRecord, SkillStatus,
 };
 pub use auth_settings::{
     AuthMethod, AuthProviderSettingsCreateRequest, AuthProviderSettingsPatchRequest,

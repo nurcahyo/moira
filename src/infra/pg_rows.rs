@@ -9,15 +9,15 @@ use crate::{
         ConversationMessageRole, ConversationMessageType, ConversationPolicyRecord,
         ConversationRecord, ConversationStatus, CredentialRecord, CredentialScope,
         CredentialStatus, CredentialSummary, CredentialType, EmbeddingPolicyRecord,
-        ExecutionFailureClass, HistoryStrategy, KeyStatus, MemoryConsentMode, MemoryPolicyRecord,
-        MemoryRecord, MemoryScope, MemorySensitivity, MemoryStatus, MemoryType, OwnerScope,
-        ProviderConfig, ProviderKind, ProviderModelRecord, ProviderModelRuntimeConfig,
+        ExecutionFailureClass, HistoryStrategy, HttpMethod, KeyStatus, MemoryConsentMode,
+        MemoryPolicyRecord, MemoryRecord, MemoryScope, MemorySensitivity, MemoryStatus, MemoryType,
+        OwnerScope, ProviderConfig, ProviderKind, ProviderModelRecord, ProviderModelRuntimeConfig,
         ProviderRecord, ProviderRuntimePolicyRecord, ProviderType, PublicResponseRecord,
         PublicResponseStatus, PublicUsageSummary, RagCollectionRecord, RagCollectionStatus,
         RagCollectionVisibility, RagDocumentRecord, RagDocumentStatus, RagIngestionStatus,
         ResourceStatus, ResponsePersistenceMode, RetrievalPolicyRecord, RouteDefinitionRecord,
-        RouteSelectionStrategy, RoutingPolicyRecord, RuntimePolicyStatus, ScopeType, SkillKind,
-        SkillRecord, SkillStatus, TrustedJwtIssuerRecord,
+        RouteSelectionStrategy, RoutingPolicyRecord, RuntimePolicyStatus, ScopeType,
+        SkillHttpExecutorRecord, SkillKind, SkillRecord, SkillStatus, TrustedJwtIssuerRecord,
     },
     error::AppError,
     security::{ContentIdentity, ContentOpener, warn_content_storage_ambiguous},
@@ -900,6 +900,44 @@ pub fn skill_record_from_row(row: &sqlx::postgres::PgRow) -> Result<SkillRecord,
         updated_at: row.try_get("updated_at")?,
         deleted_at: row.try_get("deleted_at")?,
         version: row.try_get("version")?,
+    })
+}
+
+pub fn http_method_from_db(value: String) -> Result<HttpMethod, AppError> {
+    match value.as_str() {
+        "GET" => Ok(HttpMethod::Get),
+        "POST" => Ok(HttpMethod::Post),
+        "PUT" => Ok(HttpMethod::Put),
+        "PATCH" => Ok(HttpMethod::Patch),
+        "DELETE" => Ok(HttpMethod::Delete),
+        _ => Err(AppError::Internal(format!("unknown http method {value}"))),
+    }
+}
+
+pub fn http_method_to_db(method: &HttpMethod) -> &'static str {
+    match method {
+        HttpMethod::Get => "GET",
+        HttpMethod::Post => "POST",
+        HttpMethod::Put => "PUT",
+        HttpMethod::Patch => "PATCH",
+        HttpMethod::Delete => "DELETE",
+    }
+}
+
+pub fn skill_http_executor_record_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<SkillHttpExecutorRecord, AppError> {
+    Ok(SkillHttpExecutorRecord {
+        skill_id: row.try_get("skill_id")?,
+        method: http_method_from_db(row.try_get::<String, _>("method")?)?,
+        url_template: row.try_get("url_template")?,
+        allowed_host: row.try_get("allowed_host")?,
+        header_template: row.try_get("header_template")?,
+        credential_id: row.try_get("credential_id")?,
+        timeout_ms: row.try_get("timeout_ms")?,
+        response_schema: row.try_get("response_schema")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
     })
 }
 

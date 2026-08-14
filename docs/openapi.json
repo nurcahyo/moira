@@ -2996,6 +2996,17 @@
         ],
         "type": "string"
       },
+      "HttpMethod": {
+        "description": "The HTTP methods `skill_http_executors.method` accepts (migration check constraint).",
+        "enum": [
+          "GET",
+          "POST",
+          "PUT",
+          "PATCH",
+          "DELETE"
+        ],
+        "type": "string"
+      },
       "JwtClaimMapping": {
         "properties": {
           "application_id": {
@@ -4998,6 +5009,75 @@
                 "created_at",
                 "updated_at",
                 "version"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/Pagination"
+          }
+        },
+        "required": [
+          "data",
+          "pagination"
+        ],
+        "type": "object"
+      },
+      "ListResponse_SkillHttpExecutorRecord": {
+        "properties": {
+          "data": {
+            "items": {
+              "description": "`skill_http_executors` has no `version`/`deleted_at` columns — F's migration gives\noptimistic concurrency only to the three named registries (`skills`, `eval_suites`,\n`agent_flows`); this row is a versionless 1:1 child of a `skills` row, cascade-deleted\nwith it. `updated_at` is therefore this resource's `If-Match` basis instead of an\ninteger `version` — see `executor_etag_headers`/`require_executor_if_match` in\n`src/http/agent_platform.rs`, which encode/parse it as a quoted RFC 3339 timestamp\n(microsecond precision, matching Postgres `timestamptz`) rather than reusing the\nshared `etag_headers`/`require_if_match` helpers, which are hard-wired to an `i64`.",
+              "properties": {
+                "allowed_host": {
+                  "description": "The exact host `url_template` resolves to, checked at execution time by\n`security::ssrf::validate_outbound_url` without re-parsing the `{placeholder}`\ntemplate. Always derived server-side from `url_template`'s host — never a\nclient-settable field, or PATCH could point execution at a host the URL no longer\nnames.",
+                  "type": "string"
+                },
+                "created_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "credential_id": {
+                  "description": "References `provider_credentials` — no inline secrets (decision 21).",
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "header_template": {
+                  "description": "Static, non-secret headers only (migration comment, `0031_agent_platform.sql`)."
+                },
+                "method": {
+                  "$ref": "#/components/schemas/HttpMethod"
+                },
+                "response_schema": {},
+                "skill_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "timeout_ms": {
+                  "format": "int32",
+                  "type": "integer"
+                },
+                "updated_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "url_template": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "skill_id",
+                "method",
+                "url_template",
+                "allowed_host",
+                "header_template",
+                "timeout_ms",
+                "created_at",
+                "updated_at"
               ],
               "type": "object"
             },
@@ -8778,6 +8858,137 @@
           "skill_key",
           "display_name",
           "kind"
+        ],
+        "type": "object"
+      },
+      "SkillHttpExecutorPatchRequest": {
+        "additionalProperties": false,
+        "description": "`allowed_host` is intentionally absent — see [`SkillHttpExecutorRecord::allowed_host`].\nChanging `url_template` re-derives and re-validates it server-side rather than taking a\nclient-supplied value. Follows `SkillPatchRequest`'s coalesce convention: an omitted\nfield means \"leave unchanged\", so this cannot clear `response_schema` to `null` — the\nsame limitation `SkillPatchRequest.description` already accepts.",
+        "properties": {
+          "credential_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "header_template": {},
+          "method": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/HttpMethod"
+              }
+            ]
+          },
+          "response_schema": {},
+          "timeout_ms": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "url_template": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "SkillHttpExecutorRecord": {
+        "description": "`skill_http_executors` has no `version`/`deleted_at` columns — F's migration gives\noptimistic concurrency only to the three named registries (`skills`, `eval_suites`,\n`agent_flows`); this row is a versionless 1:1 child of a `skills` row, cascade-deleted\nwith it. `updated_at` is therefore this resource's `If-Match` basis instead of an\ninteger `version` — see `executor_etag_headers`/`require_executor_if_match` in\n`src/http/agent_platform.rs`, which encode/parse it as a quoted RFC 3339 timestamp\n(microsecond precision, matching Postgres `timestamptz`) rather than reusing the\nshared `etag_headers`/`require_if_match` helpers, which are hard-wired to an `i64`.",
+        "properties": {
+          "allowed_host": {
+            "description": "The exact host `url_template` resolves to, checked at execution time by\n`security::ssrf::validate_outbound_url` without re-parsing the `{placeholder}`\ntemplate. Always derived server-side from `url_template`'s host — never a\nclient-settable field, or PATCH could point execution at a host the URL no longer\nnames.",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "credential_id": {
+            "description": "References `provider_credentials` — no inline secrets (decision 21).",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "header_template": {
+            "description": "Static, non-secret headers only (migration comment, `0031_agent_platform.sql`)."
+          },
+          "method": {
+            "$ref": "#/components/schemas/HttpMethod"
+          },
+          "response_schema": {},
+          "skill_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "timeout_ms": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "url_template": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "skill_id",
+          "method",
+          "url_template",
+          "allowed_host",
+          "header_template",
+          "timeout_ms",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "SkillImportRequest": {
+        "additionalProperties": false,
+        "description": "`POST /api/v1/admin/skills/import` — the raw OpenAPI 3.x document to import (plan 12\n§5). Parsing is pure and lives in `orchestration::openapi_import`; this is only the\nwire envelope.",
+        "properties": {
+          "document": {}
+        },
+        "required": [
+          "document"
+        ],
+        "type": "object"
+      },
+      "SkillImportResponse": {
+        "description": "One row per imported operation (draft `skills` row + its `skill_http_executors` row),\ncreated together and returned together so the caller can review-then-enable\n(§5 decision 22) without a second round trip per skill.",
+        "properties": {
+          "executors": {
+            "items": {
+              "$ref": "#/components/schemas/SkillHttpExecutorRecord"
+            },
+            "type": "array"
+          },
+          "imported_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "skills": {
+            "items": {
+              "$ref": "#/components/schemas/SkillRecord"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "imported_count",
+          "skills",
+          "executors"
         ],
         "type": "object"
       },
@@ -24974,6 +25185,309 @@
         ]
       }
     },
+    "/api/v1/admin/skill-executors": {
+      "get": {
+        "operationId": "list_skill_executors",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "external_application_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "application_slug",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_before",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_after",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "provider_id",
+            "required": false,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "credential_type",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/CredentialType"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scope_type",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ScopeType"
+            }
+          },
+          {
+            "in": "query",
+            "name": "application_id",
+            "required": false,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "external_user_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "external_tenant_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "expires_before",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "expires_after",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "request_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "actor_type",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "actor_subject",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "delegated_subject",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "resource_type",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "resource_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "action",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "result",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/AuditResult"
+            }
+          },
+          {
+            "in": "query",
+            "name": "occurred_before",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "occurred_after",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListResponse_SkillHttpExecutorRecord"
+                }
+              }
+            },
+            "description": "Paginated skill HTTP executors",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Query, authentication, or authorization error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-skills"
+        ]
+      }
+    },
     "/api/v1/admin/skills": {
       "get": {
         "operationId": "list_skills",
@@ -25485,6 +25999,115 @@
         ]
       }
     },
+    "/api/v1/admin/skills/import": {
+      "post": {
+        "operationId": "import_skills",
+        "parameters": [
+          {
+            "description": "Optional replay key",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SkillImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillImportResponse"
+                }
+              }
+            },
+            "description": "Skills and HTTP executors imported as drafts",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request, authentication, authorization, or SSRF-blocked-host error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "summary": "Issue #237 (plan 12 §5) — the OpenAPI import pipeline: parses `request.document`, caps it\nat 300 operations (§5 decision 23), SSRF-validates the server URL, and creates one `draft`\nskill plus one HTTP executor per operation. Live execution (an actual `HttpSkillTool`\ncalling the executor) is deferred to the rig tool loop, #84 — this endpoint only ever\ncreates disabled rows for an operator to review and enable via F's\n`/enable`/`/bulk-enable`.",
+        "tags": [
+          "admin-skills"
+        ]
+      }
+    },
     "/api/v1/admin/skills/{id}": {
       "delete": {
         "operationId": "delete_skill",
@@ -25984,6 +26607,323 @@
               }
             },
             "description": "Authentication, authorization, conflict, or not-found error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-skills"
+        ]
+      }
+    },
+    "/api/v1/admin/skills/{id}/executor": {
+      "delete": {
+        "operationId": "delete_skill_executor",
+        "parameters": [
+          {
+            "description": "Skill identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required current updated_at (quoted RFC 3339)",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "HTTP executor deleted",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Authentication, authorization, conflict, or not-found error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-skills"
+        ]
+      },
+      "get": {
+        "operationId": "get_skill_executor",
+        "parameters": [
+          {
+            "description": "Skill identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillHttpExecutorRecord"
+                }
+              }
+            },
+            "description": "The skill's HTTP executor",
+            "headers": {
+              "ETag": {
+                "description": "Quoted RFC 3339 updated_at, this resource's If-Match basis",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Authentication, authorization, or not-found error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-skills"
+        ]
+      },
+      "patch": {
+        "operationId": "patch_skill_executor",
+        "parameters": [
+          {
+            "description": "Skill identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required current updated_at (quoted RFC 3339)",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SkillHttpExecutorPatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillHttpExecutorRecord"
+                }
+              }
+            },
+            "description": "HTTP executor updated",
+            "headers": {
+              "ETag": {
+                "description": "Quoted RFC 3339 updated_at, this resource's If-Match basis",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request, authentication, authorization, conflict, not-found, or SSRF-blocked-host error",
             "headers": {
               "X-Request-Id": {
                 "description": "Request correlation identifier",

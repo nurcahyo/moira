@@ -10,7 +10,8 @@
 //!
 //! Evals and flows CRUD are a documented follow-up; their tables and domain types already exist.
 
-use chrono::{Duration, Utc};
+use axum::http::StatusCode;
+use chrono::{DateTime, Duration, Utc};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -21,20 +22,39 @@ use crate::{
     domain::{
         AuditLogInsert, AuditResult, CursorScope, IdempotencyRecord, ListCursor, ListResponse,
         Pagination, SkillBulkEnableRequest, SkillBulkEnableResponse, SkillCreateRequest,
-        SkillPatchRequest, SkillRecord,
+        SkillHttpExecutorPatchRequest, SkillHttpExecutorRecord, SkillImportRequest,
+        SkillImportResponse, SkillPatchRequest, SkillRecord,
     },
     error::AppError,
     infra::repositories::{AdminRepository, PgAdminRepository, PgAgentPlatformRepository},
-    security::Actor,
+    orchestration::{OpenApiImportError, parse_openapi_document},
+    security::{
+        Actor, OutboundUrlDenial, OutboundUrlPolicy, SystemResolver, validate_outbound_url,
+    },
 };
 
 /// Keyset cursor scope for `GET /api/v1/admin/skills`, minted and validated only here so a
 /// cursor for this list can never be replayed against another list.
 const SKILLS_SCOPE: CursorScope = CursorScope::new("admin.skills");
 
+/// Keyset cursor scope for `GET /api/v1/admin/skill-executors`.
+const EXECUTORS_SCOPE: CursorScope = CursorScope::new("admin.skill_executors");
+
 /// Largest skill-id batch a single bulk-enable accepts. A guard against an unbounded array, in
 /// the spirit of the 300-operation import cap (§5 decision 23).
 const MAX_BULK_ENABLE: usize = 500;
+
+/// DNS-resolution timeout applied to the outbound-URL SSRF guard for a skill's server URL —
+/// shared by import (the document's `servers[0].url`) and by an executor PATCH that changes
+/// `url_template`. A local constant rather than a new `Settings` field: this hardening is
+/// mandatory for every deployment (plan 12 §5, "SSRF safety is mandatory from day one"), not an
+/// operator-tunable knob the way `auth.jwks`'s equivalent is for JWKS fetches.
+const SKILL_URL_DNS_TIMEOUT_MS: u64 = 5_000;
+
+/// Ceiling `skill_http_executors.timeout_ms` may be set to via PATCH. The database only
+/// enforces `> 0`; this additionally bounds it so a configured per-call timeout cannot
+/// outlive Moira's own execution deadlines by an unbounded amount.
+const MAX_EXECUTOR_TIMEOUT_MS: i32 = 5 * 60 * 1000;
 
 pub struct AgentPlatformService<'a> {
     state: &'a AppState,
@@ -234,6 +254,168 @@ impl<'a> AgentPlatformService<'a> {
         Ok(SkillBulkEnableResponse { data })
     }
 
+    /// `POST /api/v1/admin/skills/import` (plan 12 §5). Parses `request.document` with
+    /// [`parse_openapi_document`] (pure — enforces the 300-operation cap, §5 decision 23),
+    /// SSRF-validates the document's server URL through
+    /// [`validate_outbound_url`](crate::security::validate_outbound_url) — the same guard
+    /// `security::ssrf` already applies to JWKS fetches — and, only once that succeeds,
+    /// creates one `draft` `skills` row plus one `skill_http_executors` row per operation in
+    /// a single transaction.
+    ///
+    /// The SSRF check runs **before** any database write and validates the server URL
+    /// exactly once for the whole document: every derived operation shares one
+    /// already-SSRF-validated `allowed_host` (`domain::SkillHttpExecutorRecord::allowed_host`),
+    /// so per-operation `url_template`s can differ only in path, never in host.
+    pub async fn import_skills(
+        &self,
+        actor: &Actor,
+        ctx: &RequestContext,
+        request: SkillImportRequest,
+    ) -> Result<SkillImportResponse, AppError> {
+        self.state.authz.require(actor, "moira:skills:write")?;
+        if let Some(replay) = self
+            .idempotency_replay(ctx, actor, "skill.import", &request)
+            .await?
+        {
+            return Ok(replay);
+        }
+
+        let parsed =
+            parse_openapi_document(&request.document).map_err(import_parse_error_to_app_error)?;
+        let validated_url = validate_skill_url(&parsed.base_url).await?;
+        let allowed_host = validated_url
+            .host_str()
+            .expect("validate_outbound_url guarantees a validated URL carries a host")
+            .to_string();
+
+        let (skills, executors) = self
+            .repo
+            .import_operations(
+                &parsed.operations,
+                &parsed.base_url,
+                &allowed_host,
+                self.audit(
+                    actor,
+                    ctx,
+                    "skill.import",
+                    "skill",
+                    None,
+                    json!({
+                        "operation_count": parsed.operations.len(),
+                        "base_url": &parsed.base_url,
+                    }),
+                ),
+            )
+            .await?;
+
+        let response = SkillImportResponse {
+            imported_count: skills.len(),
+            skills,
+            executors,
+        };
+        self.record_idempotency(ctx, actor, "skill.import", &request, &response)
+            .await?;
+        Ok(response)
+    }
+
+    pub async fn get_executor(
+        &self,
+        actor: &Actor,
+        skill_id: Uuid,
+    ) -> Result<SkillHttpExecutorRecord, AppError> {
+        self.state.authz.require(actor, "moira:skills:read")?;
+        self.repo.get_executor(skill_id).await
+    }
+
+    pub async fn list_executors(
+        &self,
+        actor: &Actor,
+        cursor: Option<&str>,
+        limit: i64,
+    ) -> Result<ListResponse<SkillHttpExecutorRecord>, AppError> {
+        self.state.authz.require(actor, "moira:skills:read")?;
+        let cursor = ListCursor::decode_optional(cursor, EXECUTORS_SCOPE)?;
+        let rows = self.repo.list_executors(cursor, limit).await?;
+        Ok(paginate_executors(rows, limit, EXECUTORS_SCOPE))
+    }
+
+    /// `expected_updated_at` is this resource's `If-Match` basis instead of an integer
+    /// `version` — see `domain::SkillHttpExecutorRecord`'s doc comment. When
+    /// `request.url_template` is set, the new URL is SSRF-validated and its host replaces
+    /// `allowed_host` server-side; `request.url_template` alone can never set `allowed_host`
+    /// to a value the URL does not actually resolve to.
+    pub async fn patch_executor(
+        &self,
+        actor: &Actor,
+        ctx: &RequestContext,
+        skill_id: Uuid,
+        expected_updated_at: DateTime<Utc>,
+        request: SkillHttpExecutorPatchRequest,
+    ) -> Result<SkillHttpExecutorRecord, AppError> {
+        self.state.authz.require(actor, "moira:skills:write")?;
+        if let Some(timeout_ms) = request.timeout_ms {
+            validate_executor_timeout_ms(timeout_ms)?;
+        }
+        if let Some(credential_id) = request.credential_id {
+            // Existence-only check: confirms the reference is live before it is stored.
+            // `provider_credentials` owns its own secret handling — this never reads a
+            // secret.
+            self.admin_repo.get_credential(credential_id).await?;
+        }
+        let (new_url_template, new_allowed_host) = match &request.url_template {
+            Some(url_template) => {
+                let validated_url = validate_skill_url(url_template).await?;
+                let host = validated_url
+                    .host_str()
+                    .expect("validate_outbound_url guarantees a validated URL carries a host")
+                    .to_string();
+                (Some(url_template.clone()), Some(host))
+            }
+            None => (None, None),
+        };
+        self.repo
+            .patch_executor(
+                skill_id,
+                expected_updated_at,
+                &request,
+                new_url_template.as_deref(),
+                new_allowed_host.as_deref(),
+                self.audit(
+                    actor,
+                    ctx,
+                    "skill_executor.update",
+                    "skill_http_executor",
+                    Some(skill_id.to_string()),
+                    json!({}),
+                ),
+            )
+            .await
+    }
+
+    pub async fn delete_executor(
+        &self,
+        actor: &Actor,
+        ctx: &RequestContext,
+        skill_id: Uuid,
+        expected_updated_at: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        self.state.authz.require(actor, "moira:skills:delete")?;
+        self.repo
+            .delete_executor(
+                skill_id,
+                expected_updated_at,
+                self.audit(
+                    actor,
+                    ctx,
+                    "skill_executor.delete",
+                    "skill_http_executor",
+                    Some(skill_id.to_string()),
+                    json!({}),
+                ),
+            )
+            .await
+    }
+
     /// Builds this service's audit row; the repository writes it inside the write's own
     /// transaction, exactly as `RuntimeAdminService::runtime_audit` does.
     fn audit(
@@ -372,6 +554,104 @@ fn paginate(
     }
 }
 
+/// [`paginate`]'s twin for `skill_http_executors`, whose keyset is `(created_at, skill_id)`
+/// rather than `(created_at, id)` — the table has no separate `id` column, `skill_id` is its
+/// primary key.
+fn paginate_executors(
+    mut rows: Vec<SkillHttpExecutorRecord>,
+    limit: i64,
+    scope: CursorScope,
+) -> ListResponse<SkillHttpExecutorRecord> {
+    let has_more = (rows.len() as i64) > limit;
+    if has_more {
+        rows.truncate(limit.max(0) as usize);
+    }
+    let next_cursor = if has_more {
+        rows.last()
+            .map(|record| ListCursor::new(record.created_at, record.skill_id).encode(scope))
+    } else {
+        None
+    };
+    ListResponse {
+        data: rows,
+        pagination: Pagination {
+            next_cursor,
+            has_more,
+        },
+    }
+}
+
+/// Maps a pure parse failure from `orchestration::openapi_import` onto the two catalogued
+/// codes the wire contract promises: `import_cap_exceeded` carries the true operation count
+/// in `details` (never silently truncated, §5 decision 23); every other parse failure is the
+/// generic `invalid_openapi_spec`.
+fn import_parse_error_to_app_error(error: OpenApiImportError) -> AppError {
+    match error {
+        OpenApiImportError::TooManyOperations { found, cap } => AppError::coded_with_details(
+            StatusCode::BAD_REQUEST,
+            "import_cap_exceeded",
+            format!(
+                "The OpenAPI document defines {found} operations, which exceeds the \
+                 {cap}-operation import cap."
+            ),
+            json!({ "operation_count": found, "cap": cap }),
+        ),
+        other => AppError::coded(
+            StatusCode::BAD_REQUEST,
+            "invalid_openapi_spec",
+            format!("The OpenAPI document could not be parsed: {other}"),
+        ),
+    }
+}
+
+/// SSRF-validates a skill's server URL — the document's `servers[0].url` on import, or a new
+/// `url_template` on an executor PATCH — through the same
+/// [`validate_outbound_url`](crate::security::validate_outbound_url) guard `security::ssrf`
+/// already applies to JWKS fetches. Always enforced (`allow_insecure: false`): unlike JWKS,
+/// this is not an operator-configured trust boundary with its own dev override, it is
+/// outbound HTTP whose destination an admin's pasted document or edit fully controls (plan 12
+/// §5, "SSRF safety is mandatory from day one").
+async fn validate_skill_url(raw_url: &str) -> Result<url::Url, AppError> {
+    let policy = OutboundUrlPolicy {
+        subject: "skill http executor url",
+        dns_timeout: std::time::Duration::from_millis(SKILL_URL_DNS_TIMEOUT_MS),
+        allowed_hosts: Vec::new(),
+        reject_credentials: true,
+        allow_insecure: false,
+    };
+    validate_outbound_url(raw_url, &policy, &SystemResolver)
+        .await
+        .map_err(|denial| ssrf_blocked_error(&denial))
+}
+
+/// The denial `detail` can name a resolved internal address — logged server-side only, per
+/// the same posture `security::ssrf`'s own JWKS path takes, so the response body never turns
+/// into an SSRF oracle that confirms which internal hosts exist.
+fn ssrf_blocked_error(denial: &OutboundUrlDenial) -> AppError {
+    tracing::warn!(
+        reason = denial.reason().as_str(),
+        detail = denial.detail(),
+        "skill server url blocked by the outbound SSRF policy"
+    );
+    AppError::coded(
+        StatusCode::BAD_REQUEST,
+        "ssrf_blocked_host",
+        "The server URL was rejected by the outbound SSRF policy.",
+    )
+}
+
+/// The database only enforces `timeout_ms > 0`; this additionally caps it so a PATCH cannot
+/// configure a per-call timeout that outlives Moira's own execution deadlines by an unbounded
+/// amount.
+fn validate_executor_timeout_ms(timeout_ms: i32) -> Result<(), AppError> {
+    if timeout_ms <= 0 || timeout_ms > MAX_EXECUTOR_TIMEOUT_MS {
+        return Err(AppError::BadRequest(format!(
+            "timeout_ms must be between 1 and {MAX_EXECUTOR_TIMEOUT_MS}"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_key(label: &str, value: &str) -> Result<(), AppError> {
     if value.is_empty() || value.len() > 128 {
         return Err(AppError::BadRequest(format!(
@@ -443,4 +723,92 @@ fn validate_metadata(value: &Value) -> Result<(), AppError> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod skill_import_tests {
+    use super::*;
+
+    /// The cap-exceeded parse failure must reach the wire as the catalogued
+    /// `import_cap_exceeded` code with the true count in `details` — never silently
+    /// truncated (§5 decision 23).
+    #[test]
+    fn too_many_operations_maps_to_import_cap_exceeded_with_details() {
+        let error = import_parse_error_to_app_error(OpenApiImportError::TooManyOperations {
+            found: 301,
+            cap: 300,
+        });
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        let response = error.error_response(None);
+        assert_eq!(response.error.code, "import_cap_exceeded");
+        assert_eq!(
+            response.error.message_key,
+            "moira.error.import_cap_exceeded"
+        );
+        let details = response.error.details.expect("details must be present");
+        assert_eq!(details["operation_count"], 301);
+        assert_eq!(details["cap"], 300);
+    }
+
+    /// Every other parse failure — bad version, missing server, no operations, and so on —
+    /// maps to the single generic `invalid_openapi_spec` code.
+    #[test]
+    fn other_parse_failures_map_to_invalid_openapi_spec() {
+        for failure in [
+            OpenApiImportError::NotAnObject,
+            OpenApiImportError::UnsupportedVersion,
+            OpenApiImportError::MissingServerUrl,
+            OpenApiImportError::InvalidServerUrl("not a url".to_string()),
+            OpenApiImportError::NoOperations,
+        ] {
+            let error = import_parse_error_to_app_error(failure);
+            assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+            let response = error.error_response(None);
+            assert_eq!(response.error.code, "invalid_openapi_spec");
+            assert_eq!(
+                response.error.message_key,
+                "moira.error.invalid_openapi_spec"
+            );
+        }
+    }
+
+    /// The cloud metadata endpoint is the canonical SSRF target — a skill import or executor
+    /// PATCH pointing at it must be refused before any database write, and the rejection
+    /// must carry the catalogued `ssrf_blocked_host` code without leaking *why* (the denial
+    /// reason and resolved address stay server-side, in the `tracing::warn!` this function
+    /// emits, exactly like the JWKS path it shares its guard with).
+    #[tokio::test]
+    async fn validate_skill_url_blocks_the_cloud_metadata_endpoint() {
+        let error = validate_skill_url("https://169.254.169.254/latest/meta-data/")
+            .await
+            .expect_err("the metadata endpoint must be refused");
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        let response = error.error_response(None);
+        assert_eq!(response.error.code, "ssrf_blocked_host");
+        assert_eq!(response.error.message_key, "moira.error.ssrf_blocked_host");
+        // The response must not leak the resolved address or the specific denial reason.
+        assert!(!response.error.message.contains("169.254.169.254"));
+    }
+
+    #[tokio::test]
+    async fn validate_skill_url_blocks_a_non_https_scheme() {
+        let error = validate_skill_url("http://api.example.com/")
+            .await
+            .expect_err("a non-https server url must be refused");
+        let response = error.error_response(None);
+        assert_eq!(response.error.code, "ssrf_blocked_host");
+    }
+
+    #[test]
+    fn executor_timeout_ms_rejects_zero_and_negative_values() {
+        assert!(validate_executor_timeout_ms(0).is_err());
+        assert!(validate_executor_timeout_ms(-1).is_err());
+    }
+
+    #[test]
+    fn executor_timeout_ms_rejects_values_over_the_ceiling() {
+        assert!(validate_executor_timeout_ms(MAX_EXECUTOR_TIMEOUT_MS + 1).is_err());
+        assert!(validate_executor_timeout_ms(MAX_EXECUTOR_TIMEOUT_MS).is_ok());
+        assert!(validate_executor_timeout_ms(1).is_ok());
+    }
 }
