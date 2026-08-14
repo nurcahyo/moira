@@ -3,9 +3,11 @@
 What you can exercise on a laptop, in what order, and what each failure means.
 
 The API is testable end to end today: a real prompt goes through routing, a real
-provider answers, and the tokens are accounted. The console has caught up some of
-the way — `POST /api/setup` has a page driving it now, `/setup` — but it still
-needs an IdP reachable over TLS, and it still serves **one** sign-in provider.
+provider answers, and the tokens are accounted. So is the console: its whole
+first-run path — `/setup` → an OIDC round trip → the first admin claimed → a
+provider registered from `/settings/llm` → an answered prompt — has been walked in
+a browser against a real Moira. It still needs an IdP reachable over TLS, and it
+still serves **one** sign-in provider.
 [The console](#the-console) says exactly what is there and what is not, and
 [Two sign-in providers, locally](#two-sign-in-providers-locally) says which parts
 of the multi-provider work you can exercise on a laptop today and which you
@@ -239,26 +241,30 @@ so the variable can be in place before it is required. See
 
 ## The console
 
-`make console-dev` serves it on <http://localhost:3000>. `/` redirects to `/login`,
-and `/login` renders. **Signing in has never been proven against a real Moira, in
-a browser, on this console.** That gap is narrower than it used to be — the write
-path and the wizard screen that drives it both exist now — but "exists" and
-"proven" are different claims, and this section keeps them separate.
+`make console-dev` serves it on <http://localhost:3000>. `/` redirects to
+`/login` on a claimed deployment and to `/setup` while the setup window is open.
 
-**Proven, first-hand, today:** Moira's own API path, end to end —
+**The whole wizard has now been walked, by hand, in a browser, against a real
+Moira** — welcome → auth settings → a real OIDC round trip → `claim` → the
+authenticated console → an LLM provider registered from `/settings/llm` → a real
+prompt answered by a real provider. [Walking the wizard
+yourself](#walking-the-wizard-yourself) is the recipe, and it is reproducible on
+a laptop with no Google credential. What that leaves open is **automation**, not
+existence: nothing in CI walks past the sign-in step yet, which is issue #72.
+
+**Proven, first-hand:** Moira's own API path, end to end —
 `make setup` / `make start` / `make seed` / `make smoke` / `make execute-test`,
-the last of which produced a real completion. Separately, an operator signed in
-through a browser against a local OIDC provider and got a Moira-routed answer —
-but that was the **commerce-os platform console**, not this one. How that is
-wired, and exactly what was observed, is documented in that repo, not copied
-here: see
+the last of which produced a real completion. And, as of 2026-08-14, this
+console's own first-run path, by the manual walk above. Separately, an operator
+signed in through a browser against a local OIDC provider and got a Moira-routed
+answer — but that was the **commerce-os platform console**, not this one. How
+that is wired is documented in that repo, not copied here: see
 [commerce-os's `DEV-GUIDE.md`](https://github.com/motrait/commerce-os/blob/develop/DEV-GUIDE.md).
 
-**Not proven, here:** this repo's own console has never signed in against a
-real (non-mocked) Moira end to end. Two narrower facts sit under that one
-sentence, and collapsing them into "no real sign-in exists" would be wrong.
+**Not proven — meaning not automated:** no suite in this repo drives the
+wizard's `claim` step, and no suite drives any of it against a real Moira.
 
-A real sign-in, in a real browser, is proven — just not through the wizard.
+A real sign-in in a real browser *is* automated — just not through the wizard.
 `console/e2e/authenticated-session.e2e.ts:46` drives an actual browser through
 `/login` → the mock IdP's `/authorize` → an authorization-code exchange with
 PKCE → a Better Auth session, and asserts the `(console)` home heading renders,
@@ -268,20 +274,19 @@ not just a redirect landing on `/`. The harness behind it is
 `console/playwright.config.ts:187-188` runs the spec as its own
 `authenticated-setup` project. That harness landed under issue #75.
 
-The wizard's own `claim` step is still not reached. Its e2e suite
+The wizard's own `claim` step is still not reached by any spec. Its e2e suite
 (`console/e2e/setup-wizard.e2e.ts`) runs against
 `console/e2e/support/setup-fixture.ts`, and that fixture wires no IdP at all —
 its `discoveryUrl` is the placeholder `https://idp.fixture.invalid` (line 130).
 So one test there still asserts *positively* that `claim` is not reached, and
 the gap stays visible on purpose instead of silently closing itself once
-someone assumes it's covered. That is issue #72, and it is still open.
+someone assumes it's covered. That is issue #72, and it is still open. The
+manual walk below is the evidence that the harness has a working flow to
+automate rather than a broken one to discover.
 
-And neither path has run against a real Moira: `authenticated-stack.ts` also
-mocks Moira's HTTP surface (`console/e2e/support/moira-fixture.ts`), the same
-as the wizard's stub. So the honest remaining gap is narrower than "any real
-sign-in is unproven" — it is "the wizard's own sign-in is unproven, and
-nothing here has run past a mocked Moira." It also needs the IdP reachable
-over **https** for the wizard's own scenario — see the missing item below.
+And no spec has run against a real Moira: `authenticated-stack.ts` also mocks
+Moira's HTTP surface (`console/e2e/support/moira-fixture.ts`), the same as the
+wizard's stub.
 
 What has landed — `console/app/api/setup/route.ts`, the single door setup writes
 through:
@@ -302,11 +307,10 @@ through:
 What has landed since — `console/app/setup/` and `console/modules/setup/`: `/setup`
 is a five-step wizard (welcome → auth_settings → sign_in → claim → done) and it
 is the UI caller of `POST /api/setup`. A trusted issuer, an auth provider and the
-first admin no longer have to be created by hand — by the shipped code path, not
-yet by anyone who has actually walked it in a browser against a real Moira (see
-above). The page calls its own route handler **in process**, so Moira's raw
-auth-methods response never reaches the browser, and it answers < 400 in every
-window state — the window being closed is a configuration fact, not an error.
+first admin no longer have to be created by hand. The page calls its own route
+handler **in process**, so Moira's raw auth-methods response never reaches the
+browser, and it answers < 400 in every window state — the window being closed is
+a configuration fact, not an error.
 
 What is still missing:
 
@@ -314,23 +318,60 @@ What is still missing:
    unlike provider URLs, which have two. See `validate_https_url` in
    `src/application/auth_settings.rs`; it rejects with
    `auth_provider_url_not_allowed`. So the IdP you point the wizard at has to be
-   reachable over TLS from the console process.
+   reachable over TLS from the console process. This is a constraint on the
+   local recipe, not a blocker: `mkcert` satisfies it in one command, below.
+2. **No console screen mints a consumer key.** Setup ends with an operator who
+   can administer the deployment; the API key an *application* presents still
+   comes from `make seed` or a hand-written admin call. `console/lib/moira-client.ts`
+   carries no consumer-key operation at all, so this is a missing feature rather
+   than a missing page.
 
-So the login page is honest when it says *"No sign-in provider is enabled yet."*
 On a fresh database `auth_provider_settings` and `trusted_jwt_issuers` are both
-empty, and no screen can fill them.
+empty, which is why `/login` says *"No sign-in provider is enabled yet."* —
+`/setup` is the screen that fills them.
 
 What already works: the console reaches Moira (`MOIRA_SYSTEM_KEY` is its bootstrap
 credential — `console/lib/auth-runtime.ts` returns a keyed refusal without ever
 contacting Moira when it is unset), its own database is migrated, and
 `/api/health` answers.
 
-A mock sign-in is possible without any Google credential:
-`console/tests/support/mock-idp.ts` is a real TLS OIDC server whose `/authorize`
-auto-redirects with no consent screen — real discovery and JWKS documents, real
-ES256 ID tokens, and a token endpoint that checks `client_id`, `client_secret`,
-`redirect_uri` and the PKCE `code_verifier`, so it refuses a wrong secret with
-`401 invalid_client` exactly as Google would.
+### Walking the wizard yourself
+
+No Google credential is needed. `console/tests/support/mock-idp.ts` is a real TLS
+OIDC server whose `/authorize` auto-redirects with no consent screen — real
+discovery and JWKS documents, real ES256 ID tokens, and a token endpoint that
+checks `client_id`, `client_secret`, `redirect_uri` and the PKCE
+`code_verifier`, so it refuses a wrong secret with `401 invalid_client` exactly
+as Google would. Its `publicOrigin` option (issue #151) is what makes it usable
+by hand: a fixed origin survives a restart, and `iss` is signed into the ID
+token, so a TLS proxy in front of an ephemeral port cannot substitute for it.
+
+Two trust decisions, and they are separate:
+
+- **The browser** must trust the IdP's certificate, or the redirect dead-ends on
+  an interstitial. `mkcert -cert-file idp-cert.pem -key-file idp-key.pem
+  localhost 127.0.0.1` issues one from a CA already in the system trust store.
+- **The console process** must trust it too — it performs the token exchange
+  server-side. `NODE_EXTRA_CA_CERTS="$(mkcert -CAROOT)/rootCA.pem"` must be set
+  when the console starts; Node reads it once, at process start.
+
+Point the mock IdP's `publicOrigin` at a fixed port, start it with that
+certificate, then fill the wizard's auth-settings form with
+`https://localhost:<port>/.well-known/openid-configuration` as the discovery
+URL, the client id and secret you configured it with, and an allowed email
+domain that matches the mock user's address. The rest of the walk is the UI.
+
+Two things worth knowing before you start:
+
+- **Use a scratch database for both halves.** The wizard claims the first
+  administrator exactly once; running it against the deployment you already use
+  burns that claim. A separate `MOIRA_DATABASE__URL` and `CONSOLE_DATABASE_URL`
+  keeps the walk repeatable.
+- **`next dev` is what makes an `http` `MOIRA_API_URL` legal.** Next's
+  standalone entrypoint hard-sets `NODE_ENV=production`, and `console/lib/env.ts`
+  then refuses both an http Moira URL and `CONSOLE_ALLOW_INSECURE_URLS`. The
+  console↔Moira leg is the one leg of this walk that a production build would
+  make you terminate with TLS as well.
 
 ### Two sign-in providers, locally
 

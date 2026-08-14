@@ -26,6 +26,18 @@ describe("navigation", () => {
     const link = screen.getByRole("link", { name: copy(CONSOLE_MESSAGE_KEYS.chrome_nav_admins) });
     expect(link.getAttribute("href")).toBe("/admins");
   });
+
+  test("/settings/llm is reachable without typing the URL", () => {
+    // The wizard's last step hands the operator to `/`, and the whole point of
+    // finishing setup is to point Moira at a provider. That screen shipped a
+    // wave after this header and was left out of it, so the only route to it
+    // was the address bar. This is the assertion that keeps it in the chrome.
+    render(<ConsoleHeader />);
+    const link = screen.getByRole("link", {
+      name: copy(CONSOLE_MESSAGE_KEYS.chrome_nav_llm_settings),
+    });
+    expect(link.getAttribute("href")).toBe("/settings/llm");
+  });
 });
 
 describe("sign-out is a POST, not a link", () => {
