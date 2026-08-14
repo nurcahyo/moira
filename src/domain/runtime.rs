@@ -273,6 +273,31 @@ pub struct ProviderRuntimePolicyPutRequest {
     pub status: Option<RuntimePolicyStatus>,
 }
 
+/// The context router's per-application priority default (issue #213, MVP-static slice).
+///
+/// Shaped like [`ProviderRuntimePolicyRecord`]: a singleton row per owning id, `version` for
+/// optimistic concurrency on `PUT /api/v1/admin/applications/{id}/routing-defaults`. See
+/// `migrations/0029_context_router_static_priority.sql` for why this table intentionally has no
+/// surrogate `id` column and no `runtime_config_notify` trigger.
+///
+/// `complexity_weight_profile` is carried ahead of any reader — it is the seam the deferred
+/// scoring consumer (plans/12 §2 "Later") will read; nothing in this slice consumes its value.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ApplicationRoutingDefaultsRecord {
+    pub application_id: Uuid,
+    pub default_priority: i32,
+    pub complexity_weight_profile: Value,
+    pub updated_at: DateTime<Utc>,
+    pub version: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ApplicationRoutingDefaultsPutRequest {
+    pub default_priority: Option<i32>,
+    pub complexity_weight_profile: Option<Value>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallerRuntimeIdentity {
     pub actor_type: String,
@@ -315,6 +340,21 @@ pub struct ExecutionOptions {
     pub max_fallbacks: Option<usize>,
     pub max_retries: Option<usize>,
     pub output_schema: Option<Value>,
+    /// Context router (issue #213, MVP-static slice): a caller-declared selector between
+    /// operator-predefined static routing chains — **not** a scoring function. Gated by the
+    /// same authorization posture as `route_hint`/`model_hint` (decision 8, plans/12 §2):
+    /// see `has_runtime_scope(command, "moira:execution:override-priority")` in
+    /// `src/application/execution.rs`. Falls back to `application_routing_defaults.default_priority`
+    /// when unset — that fallback is admin-configurable (`PUT
+    /// /api/v1/admin/applications/{id}/routing-defaults`) but, in this MVP slice, not yet read
+    /// on the execution path: candidate ordering is unchanged until the deferred scoring phase
+    /// lands (plans/12 §2 "Later").
+    pub priority: Option<i32>,
+    /// Caller-declared complexity tier. Wired for the deferred scoring consumer the same way
+    /// `tool_policy`/`memory_policy` were wired ahead of their reader (R16-shaped: present on
+    /// the wire, inert until the Later phase). Gated identically to `priority` above via
+    /// `moira:execution:override-complexity-hint`.
+    pub complexity_hint: Option<ComplexityTier>,
 }
 
 impl Default for ExecutionOptions {
@@ -329,8 +369,23 @@ impl Default for ExecutionOptions {
             max_fallbacks: None,
             max_retries: None,
             output_schema: None,
+            priority: None,
+            complexity_hint: None,
         }
     }
+}
+
+/// Ordinal complexity tier a caller may declare on a request (plans/12 §2 "Complexity").
+///
+/// Deliberately a small ordinal rather than a continuous score — continuous complexity scoring
+/// against provider capability is a research problem the owner did not ask for. Inert in this
+/// MVP-static slice: nothing reads it yet (the deferred scoring consumer is the reader).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ComplexityTier {
+    Trivial,
+    Standard,
+    Heavy,
 }
 
 #[derive(Debug, Clone)]
@@ -394,6 +449,31 @@ pub enum ModelSelectionReason {
     ExplicitHint,
     Priority,
     Weighted,
+}
+
+/// Why a particular candidate was tried, recorded per attempt (`execution_attempts.selection_reason`,
+/// migration 0030) and in the `CandidateRanked` runtime event.
+///
+/// Distinct from [`ModelSelectionReason`] on purpose: that type answers "why did the *final*
+/// model win" for the outcome's `ModelDecision`, computed once per candidate regardless of its
+/// position in the chain. This type answers "why was *this specific attempt's* candidate tried at
+/// all", which depends on the candidate's rank — the same provider/model can be `ExplicitHint` at
+/// rank 0 and would be `FallbackAfterFailure` at any later rank, a distinction
+/// `ModelSelectionReason` has no room for.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptSelectionReason {
+    /// Rank 0, no caller hint: the highest-priority candidate `list_model_candidates` returned.
+    Priority,
+    /// The caller's `provider_hint`/`model_hint` (or, once wired, `priority`) selected this
+    /// candidate.
+    ExplicitHint,
+    /// Reserved for the deferred weighted-scoring phase (`routing_policies.scoring_enabled`).
+    /// Never emitted by this MVP-static slice.
+    Scored,
+    /// Reached only because every higher-ranked candidate failed with a fallback-eligible
+    /// failure (`src/orchestration/controls.rs::is_fallback_eligible`).
+    FallbackAfterFailure,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -713,6 +793,14 @@ pub enum RuntimeEventType {
     /// audit log and returned by `POST /api/v1/admin/runtime/diagnose`.
     AgentProfileUnavailable,
     ModelSelected,
+    /// Context router (issue #213) — the ordered candidate list `select_candidates` returned for
+    /// this execution, with each candidate's `candidate_rank`/`candidate_score`/`selection_reason`
+    /// (the same three values persisted onto `execution_attempts`, migration 0030). Emitted once
+    /// per execution, immediately after routing and before the first attempt — **not** once per
+    /// candidate, to stay low-cardinality. Exists because `FallbackSelected` only ever fired on
+    /// failure, so a scored ranking that changes ordering on a *successful* first attempt was
+    /// otherwise invisible (plans/12 §2 "Observability of routing decisions").
+    CandidateRanked,
     ProviderAttemptStarted,
     OutputTextDelta,
     ToolCallStarted,

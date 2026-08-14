@@ -71,6 +71,11 @@ pub const ADMIN_SCOPES: &[&str] = &[
     "moira:agent-profiles:delete",
     "moira:runtime-policies:read",
     "moira:runtime-policies:write",
+    // Issue #213 — context router MVP-static slice. `application_routing_defaults` admin
+    // surface, named against the `moira:runtime-policies:{read,write}` precedent immediately
+    // above it (same "singleton policy row per owning id" shape).
+    "moira:routing-defaults:read",
+    "moira:routing-defaults:write",
     "moira:runtime:diagnose",
     "moira:responses:create",
     "moira:responses:stream",
@@ -85,6 +90,11 @@ pub const ADMIN_SCOPES: &[&str] = &[
     "moira:execution:override-provider",
     "moira:execution:override-credential",
     "moira:execution:override-timeout",
+    // Issue #213 — context router MVP-static slice. Gates `ExecutionOptions.priority` /
+    // `.complexity_hint` with the same posture as the four `override-*` scopes above (decision
+    // 8, plans/12 §2: "identity scopes gate the *_hint fields today; same gate applies here").
+    "moira:execution:override-priority",
+    "moira:execution:override-complexity-hint",
     "moira:execution:use-tools",
     "moira:conversations:create",
     "moira:conversations:read",

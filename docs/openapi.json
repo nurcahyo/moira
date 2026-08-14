@@ -871,6 +871,60 @@
         ],
         "type": "object"
       },
+      "ApplicationRoutingDefaultsPutRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "complexity_weight_profile": {},
+          "default_priority": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ApplicationRoutingDefaultsRecord": {
+        "description": "The context router's per-application priority default (issue #213, MVP-static slice).\n\nShaped like [`ProviderRuntimePolicyRecord`]: a singleton row per owning id, `version` for\noptimistic concurrency on `PUT /api/v1/admin/applications/{id}/routing-defaults`. See\n`migrations/0029_context_router_static_priority.sql` for why this table intentionally has no\nsurrogate `id` column and no `runtime_config_notify` trigger.\n\n`complexity_weight_profile` is carried ahead of any reader — it is the seam the deferred\nscoring consumer (plans/12 §2 \"Later\") will read; nothing in this slice consumes its value.",
+        "properties": {
+          "application_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "complexity_weight_profile": {},
+          "default_priority": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "application_id",
+          "default_priority",
+          "complexity_weight_profile",
+          "updated_at",
+          "version"
+        ],
+        "type": "object"
+      },
+      "AttemptSelectionReason": {
+        "description": "Why a particular candidate was tried, recorded per attempt (`execution_attempts.selection_reason`,\nmigration 0030) and in the `CandidateRanked` runtime event.\n\nDistinct from [`ModelSelectionReason`] on purpose: that type answers \"why did the *final*\nmodel win\" for the outcome's `ModelDecision`, computed once per candidate regardless of its\nposition in the chain. This type answers \"why was *this specific attempt's* candidate tried at\nall\", which depends on the candidate's rank — the same provider/model can be `ExplicitHint` at\nrank 0 and would be `FallbackAfterFailure` at any later rank, a distinction\n`ModelSelectionReason` has no room for.",
+        "enum": [
+          "priority",
+          "explicit_hint",
+          "scored",
+          "fallback_after_failure"
+        ],
+        "type": "string"
+      },
       "AttemptStatus": {
         "enum": [
           "started",
@@ -1378,6 +1432,15 @@
           "email_verified"
         ],
         "type": "object"
+      },
+      "ComplexityTier": {
+        "description": "Ordinal complexity tier a caller may declare on a request (plans/12 §2 \"Complexity\").\n\nDeliberately a small ordinal rather than a continuous score — continuous complexity scoring\nagainst provider capability is a research problem the owner did not ask for. Inert in this\nMVP-static slice: nothing reads it yet (the deferred scoring consumer is the reader).",
+        "enum": [
+          "trivial",
+          "standard",
+          "heavy"
+        ],
+        "type": "string"
       },
       "ConsumerKeyCreateRequest": {
         "additionalProperties": false,
@@ -2753,6 +2816,17 @@
           "allow_fallback": {
             "type": "boolean"
           },
+          "complexity_hint": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ComplexityTier",
+                "description": "Caller-declared complexity tier. Wired for the deferred scoring consumer the same way\n`tool_policy`/`memory_policy` were wired ahead of their reader (R16-shaped: present on\nthe wire, inert until the Later phase). Gated identically to `priority` above via\n`moira:execution:override-complexity-hint`."
+              }
+            ]
+          },
           "max_fallbacks": {
             "minimum": 0,
             "type": [
@@ -2776,6 +2850,14 @@
             ]
           },
           "output_schema": {},
+          "priority": {
+            "description": "Context router (issue #213, MVP-static slice): a caller-declared selector between\noperator-predefined static routing chains — **not** a scoring function. Gated by the\nsame authorization posture as `route_hint`/`model_hint` (decision 8, plans/12 §2):\nsee `has_runtime_scope(command, \"moira:execution:override-priority\")` in\n`src/application/execution.rs`. Falls back to `application_routing_defaults.default_priority`\nwhen unset — that fallback is admin-configurable (`PUT\n/api/v1/admin/applications/{id}/routing-defaults`) but, in this MVP slice, not yet read\non the execution path: candidate ordering is unchanged until the deferred scoring phase\nlands (plans/12 §2 \"Later\").",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "required_capabilities": {
             "items": {
               "type": "string"
@@ -8373,6 +8455,7 @@
           "route_selected",
           "agent_profile_unavailable",
           "model_selected",
+          "candidate_ranked",
           "provider_attempt_started",
           "output_text_delta",
           "tool_call_started",
@@ -13631,6 +13714,243 @@
         ],
         "tags": [
           "admin-policies"
+        ]
+      }
+    },
+    "/api/v1/admin/applications/{id}/routing-defaults": {
+      "get": {
+        "operationId": "get_application_routing_defaults",
+        "parameters": [
+          {
+            "description": "Application identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationRoutingDefaultsRecord"
+                }
+              }
+            },
+            "description": "Application routing defaults",
+            "headers": {
+              "ETag": {
+                "description": "Current resource version",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Authentication, authorization, or not-found error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-runtime"
+        ]
+      },
+      "put": {
+        "operationId": "put_application_routing_defaults",
+        "parameters": [
+          {
+            "description": "Application identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional current resource version",
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Optional replay key",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApplicationRoutingDefaultsPutRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationRoutingDefaultsRecord"
+                }
+              }
+            },
+            "description": "Application routing defaults updated",
+            "headers": {
+              "ETag": {
+                "description": "Current resource version",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request, authentication, authorization, conflict, or not-found error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-runtime"
         ]
       }
     },

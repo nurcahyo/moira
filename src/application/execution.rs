@@ -17,14 +17,14 @@ use crate::{
     app::AppState,
     application::RequestContext,
     domain::{
-        AgentProfileRecord, AgentProfileResolution, AttemptStatus, AuditLogInsert, AuditResult,
-        CallerRuntimeIdentity, CredentialDecision, DiagnosticExecutionRequest,
-        DiagnosticExecutionResponse, DomainMessage, EffectiveExecutionPolicy, ExecutionCommand,
-        ExecutionFailure, ExecutionFailureClass, ExecutionOutcome, ExecutionStatus,
-        ExecutionStreamHandle, ModelCandidate, ModelDecision, ModelSelectionReason,
-        ProviderAttemptSummary, ProviderRuntimePolicyRecord, ProviderType, ResolvedCredential,
-        ResolvedProviderConfiguration, RouteDecision, RouteSelectionReason, RuntimeEventEnvelope,
-        RuntimeEventType, UsageSummary,
+        AgentProfileRecord, AgentProfileResolution, AttemptSelectionReason, AttemptStatus,
+        AuditLogInsert, AuditResult, CallerRuntimeIdentity, CredentialDecision,
+        DiagnosticExecutionRequest, DiagnosticExecutionResponse, DomainMessage,
+        EffectiveExecutionPolicy, ExecutionCommand, ExecutionFailure, ExecutionFailureClass,
+        ExecutionOutcome, ExecutionStatus, ExecutionStreamHandle, ModelCandidate, ModelDecision,
+        ModelSelectionReason, ProviderAttemptSummary, ProviderRuntimePolicyRecord, ProviderType,
+        ResolvedCredential, ResolvedProviderConfiguration, RouteDecision, RouteSelectionReason,
+        RuntimeEventEnvelope, RuntimeEventType, UsageSummary,
     },
     error::AppError,
     infra::{
@@ -260,7 +260,53 @@ impl MoiraExecutionService {
             1
         };
 
-        for candidate in candidates.into_iter().take(max_candidates) {
+        // Context router (issue #213, MVP-static slice): the ranked list is fixed here, before
+        // the fallback loop starts — nothing below reorders it. `candidate_rank` is each
+        // candidate's 0-based position in this list; `candidate_score` stays `None` throughout
+        // this slice (no scoring function exists yet, `routing_policies.scoring_enabled`
+        // Later-phase work); `selection_reason` records why *this* candidate is tried: the
+        // caller's explicit hint, first-by-priority, or reached only because every
+        // higher-ranked candidate already failed. See `AttemptSelectionReason` for the full
+        // contract this mirrors onto `execution_attempts` (migration 0030).
+        let ranked_candidates: Vec<ModelCandidate> =
+            candidates.into_iter().take(max_candidates).collect();
+        let selection_reasons: Vec<AttemptSelectionReason> = ranked_candidates
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| attempt_selection_reason(&command, index, candidate))
+            .collect();
+        // The candidate `FallbackSelected` moves *to* at each rank, precomputed before the loop
+        // takes ownership of `ranked_candidates` so the emission sites below can look one rank
+        // ahead without re-borrowing a `Vec` the loop is consuming.
+        let next_candidate_refs: Vec<Option<(Uuid, i32)>> = (0..ranked_candidates.len())
+            .map(|index| {
+                ranked_candidates
+                    .get(index + 1)
+                    .map(|next| (next.provider_id, (index + 1) as i32))
+            })
+            .collect();
+        events.push(
+            RuntimeEventType::CandidateRanked,
+            json!({
+                "candidates": ranked_candidates
+                    .iter()
+                    .zip(selection_reasons.iter())
+                    .enumerate()
+                    .map(|(index, (candidate, reason))| json!({
+                        "provider_id": candidate.provider_id,
+                        "provider_model_id": candidate.provider_model_id,
+                        "candidate_rank": index as i32,
+                        "candidate_score": Option::<f64>::None,
+                        "selection_reason": reason,
+                    }))
+                    .collect::<Vec<_>>()
+            }),
+        );
+
+        for (candidate_rank, candidate) in ranked_candidates.into_iter().enumerate() {
+            let candidate_rank = candidate_rank as i32;
+            let selection_reason = selection_reasons[candidate_rank as usize];
+            let next_candidate = next_candidate_refs[candidate_rank as usize];
             let model = ModelDecision {
                 policy_id: candidate.policy_id,
                 provider_id: candidate.provider_id,
@@ -298,7 +344,12 @@ impl MoiraExecutionService {
                     if policy.allow_fallback && failure.fallback_eligible {
                         events.push(
                             RuntimeEventType::FallbackSelected,
-                            json!({ "from_provider_id": candidate.provider_id, "failure_class": failure.class }),
+                            json!({
+                                "from_provider_id": candidate.provider_id,
+                                "failure_class": failure.class,
+                                "to_provider_id": next_candidate.map(|(provider_id, _)| provider_id),
+                                "candidate_rank": next_candidate.map(|(_, rank)| rank),
+                            }),
                         );
                         continue;
                     }
@@ -418,6 +469,9 @@ impl MoiraExecutionService {
                             "policy_id": candidate.policy_id,
                             "credential_source": credential.decision.source,
                         }),
+                        candidate_rank,
+                        candidate_score: None,
+                        selection_reason,
                     })
                     .await?;
                 events.push(
@@ -1045,7 +1099,11 @@ impl MoiraExecutionService {
             }
             events.push(
                 RuntimeEventType::FallbackSelected,
-                json!({ "from_provider_id": candidate.provider_id }),
+                json!({
+                    "from_provider_id": candidate.provider_id,
+                    "to_provider_id": next_candidate.map(|(provider_id, _)| provider_id),
+                    "candidate_rank": next_candidate.map(|(_, rank)| rank),
+                }),
             );
         }
 
@@ -1489,6 +1547,28 @@ impl ExecutionPolicyService for DefaultExecutionPolicyService<'_> {
             return Err(ExecutionFailure::new(
                 ExecutionFailureClass::ModelForbidden,
                 "model override is not authorized",
+            ));
+        }
+        // Context router (issue #213, decision 8): `priority`/`complexity_hint` are gated with
+        // the same posture as `route_hint`/`model_hint` above — "an open priority field is
+        // self-declared urgency" (plans/12 §2). Reusing `ModelForbidden` rather than minting a
+        // new `ExecutionFailureClass` mirrors `provider_hint` immediately above, which already
+        // shares `ModelForbidden` with `model_hint` despite being a distinct field — this
+        // codebase buckets override denials by category, not one class per field.
+        if command.options.priority.is_some()
+            && !has_runtime_scope(command, "moira:execution:override-priority")
+        {
+            return Err(ExecutionFailure::new(
+                ExecutionFailureClass::ModelForbidden,
+                "priority override is not authorized",
+            ));
+        }
+        if command.options.complexity_hint.is_some()
+            && !has_runtime_scope(command, "moira:execution:override-complexity-hint")
+        {
+            return Err(ExecutionFailure::new(
+                ExecutionFailureClass::ModelForbidden,
+                "complexity hint override is not authorized",
             ));
         }
         let defaults = &self.state.settings.runtime;
@@ -2550,6 +2630,28 @@ fn provider_emits_output_schema(provider_type: ProviderType) -> bool {
 /// The reconciliation only ever **subtracts**. A row that declares `structured_output: false`
 /// stays unusable for structured requests even on a provider Rig would honour, because that
 /// declaration is also an operator decision to disable it.
+/// Context router (issue #213, MVP-static slice) — why `candidate`, at this `index` in the
+/// ranked list `select_candidates` returned, is the one tried at this point in the fallback
+/// loop. Pure and index-driven rather than "was this the first attempt": a caller's explicit
+/// `model_hint`/`provider_hint` can survive a partial filter (`DefaultModelRouter::select_candidates`
+/// retains only matching candidates when a hint is set) at any surviving index, so the hint check
+/// runs before the index check rather than being folded into the `index == 0` case.
+fn attempt_selection_reason(
+    command: &ExecutionCommand,
+    index: usize,
+    candidate: &ModelCandidate,
+) -> AttemptSelectionReason {
+    if command.model_hint == Some(candidate.provider_model_id)
+        || command.provider_hint == Some(candidate.provider_id)
+    {
+        AttemptSelectionReason::ExplicitHint
+    } else if index == 0 {
+        AttemptSelectionReason::Priority
+    } else {
+        AttemptSelectionReason::FallbackAfterFailure
+    }
+}
+
 fn capabilities_match(
     provider_type: ProviderType,
     capabilities: &Value,
@@ -3459,5 +3561,255 @@ mod tests {
     async fn router_builds_without_database_for_type_checking() {
         let state = AppState::new(Settings::default(), None).await.unwrap();
         assert!(MoiraExecutionService::new(state).is_err());
+    }
+
+    /// Context router (issue #213) test fixtures and coverage for `attempt_selection_reason`.
+    mod context_router {
+        use super::*;
+        use crate::domain::{ComplexityTier, RuntimePolicyStatus};
+
+        fn sample_command(
+            model_hint: Option<Uuid>,
+            provider_hint: Option<Uuid>,
+        ) -> ExecutionCommand {
+            ExecutionCommand {
+                request_id: "req".to_string(),
+                execution_id: Uuid::now_v7(),
+                identity: CallerRuntimeIdentity {
+                    actor_type: format!("{:?}", ActorType::SystemKey),
+                    subject: None,
+                    external_user_id: None,
+                    external_tenant_id: None,
+                    application_id: None,
+                    scopes: vec!["moira:admin".to_string()],
+                },
+                application_id: None,
+                external_tenant_id: None,
+                external_user_id: None,
+                messages: vec![DomainMessage::user("hello")],
+                route_hint: None,
+                provider_hint,
+                model_hint,
+                credential_hint: None,
+                options: ExecutionOptions::default(),
+                metadata: Value::Null,
+            }
+        }
+
+        fn sample_candidate(provider_id: Uuid, provider_model_id: Uuid) -> ModelCandidate {
+            ModelCandidate {
+                policy_id: Uuid::now_v7(),
+                provider_id,
+                provider_version: 1,
+                provider_type: ProviderType::OpenAi,
+                provider_display_name: "test provider".to_string(),
+                base_url: None,
+                provider_model_id,
+                model_version: 1,
+                model_key: "gpt-test".to_string(),
+                capabilities: json!({}),
+                policy_priority: 100,
+                weight: 1,
+                timeout_ms: None,
+                retry_policy: json!({}),
+                runtime_policy: ProviderRuntimePolicyRecord {
+                    id: provider_id,
+                    provider_id,
+                    connect_timeout_ms: 5_000,
+                    request_timeout_ms: 120_000,
+                    stream_idle_timeout_ms: 30_000,
+                    max_concurrent_requests: 100,
+                    max_concurrent_streams: 50,
+                    retry_limit: 2,
+                    retry_base_delay_ms: 100,
+                    retry_max_delay_ms: 2_000,
+                    circuit_failure_threshold: 5,
+                    circuit_open_duration_ms: 30_000,
+                    status: RuntimePolicyStatus::Active,
+                    updated_at: chrono::Utc::now(),
+                    version: 1,
+                },
+            }
+        }
+
+        /// The un-hinted case: rank 0 is `Priority`, every later rank is
+        /// `FallbackAfterFailure` — the shape a plain priority-ordered chain has with no
+        /// caller override at all.
+        #[test]
+        fn priority_at_rank_zero_fallback_after_failure_at_every_later_rank() {
+            let command = sample_command(None, None);
+            let candidates: Vec<ModelCandidate> = (0..3)
+                .map(|_| sample_candidate(Uuid::now_v7(), Uuid::now_v7()))
+                .collect();
+
+            assert_eq!(
+                attempt_selection_reason(&command, 0, &candidates[0]),
+                AttemptSelectionReason::Priority
+            );
+            assert_eq!(
+                attempt_selection_reason(&command, 1, &candidates[1]),
+                AttemptSelectionReason::FallbackAfterFailure
+            );
+            assert_eq!(
+                attempt_selection_reason(&command, 2, &candidates[2]),
+                AttemptSelectionReason::FallbackAfterFailure
+            );
+        }
+
+        /// `model_hint` overrides the reason at whatever rank the hinted candidate survives to
+        /// — including rank 0, where it must not be reported as plain `Priority` just because
+        /// the index matches.
+        #[test]
+        fn explicit_model_hint_wins_over_rank_at_every_position() {
+            let hinted_model_id = Uuid::now_v7();
+            let command = sample_command(Some(hinted_model_id), None);
+            let hinted = sample_candidate(Uuid::now_v7(), hinted_model_id);
+            let other = sample_candidate(Uuid::now_v7(), Uuid::now_v7());
+
+            assert_eq!(
+                attempt_selection_reason(&command, 0, &hinted),
+                AttemptSelectionReason::ExplicitHint
+            );
+            assert_eq!(
+                attempt_selection_reason(&command, 1, &hinted),
+                AttemptSelectionReason::ExplicitHint,
+                "a hint match must win even at a non-zero rank"
+            );
+            assert_eq!(
+                attempt_selection_reason(&command, 0, &other),
+                AttemptSelectionReason::Priority,
+                "a non-matching candidate at rank 0 is plain priority, not a hint"
+            );
+        }
+
+        /// `provider_hint` is the other explicit override `DefaultModelRouter::select_candidates`
+        /// honours, and must be recognised the same way `model_hint` is.
+        #[test]
+        fn explicit_provider_hint_wins_over_rank() {
+            let hinted_provider_id = Uuid::now_v7();
+            let command = sample_command(None, Some(hinted_provider_id));
+            let hinted = sample_candidate(hinted_provider_id, Uuid::now_v7());
+
+            assert_eq!(
+                attempt_selection_reason(&command, 2, &hinted),
+                AttemptSelectionReason::ExplicitHint
+            );
+        }
+
+        /// Decision 8 (plans/12 §2): `ExecutionOptions.priority`/`.complexity_hint` are gated
+        /// with the same posture as `route_hint`/`model_hint` — an unauthorized caller setting
+        /// either is refused *before* routing, not silently ignored.
+        fn command_with_options(
+            options: ExecutionOptions,
+            scopes: Vec<String>,
+        ) -> ExecutionCommand {
+            ExecutionCommand {
+                request_id: "req".to_string(),
+                execution_id: Uuid::now_v7(),
+                identity: CallerRuntimeIdentity {
+                    actor_type: format!("{:?}", ActorType::ConsumerKey),
+                    subject: None,
+                    external_user_id: None,
+                    external_tenant_id: None,
+                    application_id: None,
+                    scopes,
+                },
+                application_id: None,
+                external_tenant_id: None,
+                external_user_id: None,
+                messages: vec![DomainMessage::user("hello")],
+                route_hint: None,
+                provider_hint: None,
+                model_hint: None,
+                credential_hint: None,
+                options,
+                metadata: Value::Null,
+            }
+        }
+
+        #[tokio::test]
+        async fn priority_override_without_scope_is_forbidden() {
+            let state = AppState::new(Settings::default(), None).await.unwrap();
+            let command = command_with_options(
+                ExecutionOptions {
+                    priority: Some(10),
+                    ..ExecutionOptions::default()
+                },
+                vec![],
+            );
+            let failure = DefaultExecutionPolicyService::new(&state)
+                .evaluate(&command)
+                .await
+                .expect_err("an unscoped caller must not be able to set priority");
+            assert_eq!(failure.class, ExecutionFailureClass::ModelForbidden);
+        }
+
+        #[tokio::test]
+        async fn priority_override_with_scope_is_authorized() {
+            let state = AppState::new(Settings::default(), None).await.unwrap();
+            let command = command_with_options(
+                ExecutionOptions {
+                    priority: Some(10),
+                    ..ExecutionOptions::default()
+                },
+                vec!["moira:execution:override-priority".to_string()],
+            );
+            DefaultExecutionPolicyService::new(&state)
+                .evaluate(&command)
+                .await
+                .expect("a caller holding the scope must be authorized to set priority");
+        }
+
+        #[tokio::test]
+        async fn complexity_hint_override_without_scope_is_forbidden() {
+            let state = AppState::new(Settings::default(), None).await.unwrap();
+            let command = command_with_options(
+                ExecutionOptions {
+                    complexity_hint: Some(ComplexityTier::Heavy),
+                    ..ExecutionOptions::default()
+                },
+                vec![],
+            );
+            let failure = DefaultExecutionPolicyService::new(&state)
+                .evaluate(&command)
+                .await
+                .expect_err("an unscoped caller must not be able to set complexity_hint");
+            assert_eq!(failure.class, ExecutionFailureClass::ModelForbidden);
+        }
+
+        #[tokio::test]
+        async fn complexity_hint_override_with_scope_is_authorized() {
+            let state = AppState::new(Settings::default(), None).await.unwrap();
+            let command = command_with_options(
+                ExecutionOptions {
+                    complexity_hint: Some(ComplexityTier::Heavy),
+                    ..ExecutionOptions::default()
+                },
+                vec!["moira:execution:override-complexity-hint".to_string()],
+            );
+            DefaultExecutionPolicyService::new(&state)
+                .evaluate(&command)
+                .await
+                .expect("a caller holding the scope must be authorized to set complexity_hint");
+        }
+
+        /// Neither field is gated by the other's scope — decision 8 treats them as independent
+        /// overrides, mirroring `route_hint`/`model_hint` being independently scoped today.
+        #[tokio::test]
+        async fn priority_scope_does_not_authorize_complexity_hint() {
+            let state = AppState::new(Settings::default(), None).await.unwrap();
+            let command = command_with_options(
+                ExecutionOptions {
+                    complexity_hint: Some(ComplexityTier::Trivial),
+                    ..ExecutionOptions::default()
+                },
+                vec!["moira:execution:override-priority".to_string()],
+            );
+            let failure = DefaultExecutionPolicyService::new(&state)
+                .evaluate(&command)
+                .await
+                .expect_err("holding only the priority scope must not authorize complexity_hint");
+            assert_eq!(failure.class, ExecutionFailureClass::ModelForbidden);
+        }
     }
 }
