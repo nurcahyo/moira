@@ -202,8 +202,12 @@ async fn put_then_get_round_trips_and_the_returned_etag_chains() {
     .await;
     assert_eq!(accepted.status, StatusCode::OK, "{}", accepted.body);
     assert_eq!(accepted.body["default_priority"], 250);
-    assert_eq!(accepted.version(), 2);
-    assert_eq!(accepted.etag.as_deref(), Some("\"2\""));
+    // The row is created at version 1: `moira_bump_resource_version()` fires `before update`
+    // only (it reads `old.version`), so an INSERT lands at the column default `1` — the same
+    // convention as every other declared-default resource (`version: 1`). The first *update*
+    // below is what bumps to 2, which is what makes a replayed `If-Match: "1"` a 409.
+    assert_eq!(accepted.version(), 1);
+    assert_eq!(accepted.etag.as_deref(), Some("\"1\""));
 
     let fetched = send(&fixture, "GET", &path(fixture.application_id), None, None).await;
     assert_eq!(fetched.status, StatusCode::OK, "{}", fetched.body);
