@@ -153,3 +153,6 @@ mod tests {
         assert_eq!(decoded, message);
     }
 }
+
+// A throwaway comment for the #230 CI demonstration (case 3): a docs file beside a code
+// file must never let the code file skip anything.

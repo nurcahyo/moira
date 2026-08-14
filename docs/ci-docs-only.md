@@ -237,3 +237,5 @@ The three cases that matter most:
 /usr/bin/make docs-only        # is HEAD vs origin/develop a docs-only change?
 /usr/bin/make test-docs-only   # drive the filter and the gate through every case
 ```
+
+<!-- CI demonstration for #230, case 3: markdown beside code. Throwaway. -->
