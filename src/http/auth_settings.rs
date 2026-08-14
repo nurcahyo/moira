@@ -41,7 +41,7 @@ use crate::{
     error::{AppError, ErrorResponse},
 };
 
-use super::admin::{admin_actor, etag_headers, require_if_match};
+use super::admin::{admin_actor, admin_actor_with_issuer, etag_headers, require_if_match};
 
 #[utoipa::path(
     get, path = "/api/v1/admin/setup/sign-in-methods", tag = "admin-setup",
@@ -87,6 +87,7 @@ pub async fn get_setup_auth_methods(
 
 #[utoipa::path(
     post, path = "/api/v1/admin/auth/providers", tag = "admin-auth-settings",
+    description = "Registers an auth provider configuration. Requires the caller to be the PRIMARY admin identity (issue #185): admin_identities.is_primary, resolved from the caller's (issuer, subject), not a scope - moira:auth-settings:write is implied by moira:admin, which every grant carries, so a scope cannot express 'not every admin'. Rewriting this row rewrites the deployment's only sign-in door, and the OAuth client secret it needs lives in the console rather than here, so a bad write cannot be repaired through this API. A non-owner trusted-JWT caller gets 403 admin_identity_not_primary. System-key callers pass, and that is the documented way back in after a broken write.",
     request_body = AuthProviderSettingsCreateRequest,
     params(("Idempotency-Key" = Option<String>, Header, description = "Optional replay key. A repeated request with the same key and body replays the stored response instead of creating a second configuration.")),
     responses(
@@ -102,14 +103,14 @@ pub async fn create_auth_provider(
     headers: HeaderMap,
     Json(request): Json<AuthProviderSettingsCreateRequest>,
 ) -> Result<(StatusCode, HeaderMap, Json<AuthProviderSettingsRecord>), AppError> {
-    let actor = admin_actor(&state, &headers).await?;
+    let (actor, issuer) = admin_actor_with_issuer(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     // The replay flag is deliberately unused here: the frozen contract documents 201 for
     // this operation, fresh or replayed, and a replay returns the stored body verbatim so
     // the two are indistinguishable to the client anyway. Only the claim endpoint
     // distinguishes them, because plan 08's wizard renders a different message.
     let (record, _replayed) = AuthProviderSettingsService::new(&state)?
-        .create(&actor, &ctx, request)
+        .create(&actor, issuer.as_deref(), &ctx, request)
         .await?;
     Ok((
         StatusCode::CREATED,
@@ -164,6 +165,7 @@ pub async fn get_auth_provider(
 
 #[utoipa::path(
     patch, path = "/api/v1/admin/auth/providers/{id}", tag = "admin-auth-settings",
+    description = "Updates an auth provider configuration. Requires the caller to be the PRIMARY admin identity (issue #185): admin_identities.is_primary, resolved from the caller's (issuer, subject), not a scope - moira:auth-settings:write is implied by moira:admin, which every grant carries, so a scope cannot express 'not every admin'. Rewriting this row rewrites the deployment's only sign-in door, and the OAuth client secret it needs lives in the console rather than here, so a bad write cannot be repaired through this API. A non-owner trusted-JWT caller gets 403 admin_identity_not_primary. System-key callers pass, and that is the documented way back in after a broken write.",
     request_body = AuthProviderSettingsPatchRequest,
     params(
         ("id" = Uuid, Path, description = "Auth provider configuration identifier"),
@@ -182,18 +184,26 @@ pub async fn patch_auth_provider(
     Path(id): Path<Uuid>,
     Json(request): Json<AuthProviderSettingsPatchRequest>,
 ) -> Result<(HeaderMap, Json<AuthProviderSettingsRecord>), AppError> {
-    let actor = admin_actor(&state, &headers).await?;
+    let (actor, issuer) = admin_actor_with_issuer(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = AuthProviderSettingsService::new(&state)?;
     let expected_version = require_if_match(&headers)?;
     let record = service
-        .patch(&actor, &ctx, id, expected_version, request)
+        .patch(
+            &actor,
+            issuer.as_deref(),
+            &ctx,
+            id,
+            expected_version,
+            request,
+        )
         .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
 
 #[utoipa::path(
     delete, path = "/api/v1/admin/auth/providers/{id}", tag = "admin-auth-settings",
+    description = "Soft-deletes an auth provider configuration. Requires the caller to be the PRIMARY admin identity (issue #185): admin_identities.is_primary, resolved from the caller's (issuer, subject), not a scope - moira:auth-settings:write is implied by moira:admin, which every grant carries, so a scope cannot express 'not every admin'. Rewriting this row rewrites the deployment's only sign-in door, and the OAuth client secret it needs lives in the console rather than here, so a bad write cannot be repaired through this API. A non-owner trusted-JWT caller gets 403 admin_identity_not_primary. System-key callers pass, and that is the documented way back in after a broken write.",
     params(
         ("id" = Uuid, Path, description = "Auth provider configuration identifier"),
         ("If-Match" = i64, Header, description = "Required current resource version")
@@ -210,16 +220,19 @@ pub async fn delete_auth_provider(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
-    let actor = admin_actor(&state, &headers).await?;
+    let (actor, issuer) = admin_actor_with_issuer(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = AuthProviderSettingsService::new(&state)?;
     let expected_version = require_if_match(&headers)?;
-    service.delete(&actor, &ctx, id, expected_version).await?;
+    service
+        .delete(&actor, issuer.as_deref(), &ctx, id, expected_version)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(
     post, path = "/api/v1/admin/auth/providers/{id}/enable", tag = "admin-auth-settings",
+    description = "Enables an auth provider configuration. Requires the caller to be the PRIMARY admin identity (issue #185): admin_identities.is_primary, resolved from the caller's (issuer, subject), not a scope - moira:auth-settings:write is implied by moira:admin, which every grant carries, so a scope cannot express 'not every admin'. Rewriting this row rewrites the deployment's only sign-in door, and the OAuth client secret it needs lives in the console rather than here, so a bad write cannot be repaired through this API. A non-owner trusted-JWT caller gets 403 admin_identity_not_primary. System-key callers pass, and that is the documented way back in after a broken write.",
     params(
         ("id" = Uuid, Path, description = "Auth provider configuration identifier"),
         ("If-Match" = i64, Header, description = "Required current resource version")
@@ -236,18 +249,19 @@ pub async fn enable_auth_provider(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<(HeaderMap, Json<AuthProviderSettingsRecord>), AppError> {
-    let actor = admin_actor(&state, &headers).await?;
+    let (actor, issuer) = admin_actor_with_issuer(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = AuthProviderSettingsService::new(&state)?;
     let expected_version = require_if_match(&headers)?;
     let record = service
-        .set_enabled(&actor, &ctx, id, expected_version, true)
+        .set_enabled(&actor, issuer.as_deref(), &ctx, id, expected_version, true)
         .await?;
     Ok((etag_headers(record.version), Json(record)))
 }
 
 #[utoipa::path(
     post, path = "/api/v1/admin/auth/providers/{id}/disable", tag = "admin-auth-settings",
+    description = "Disables an auth provider configuration. Requires the caller to be the PRIMARY admin identity (issue #185): admin_identities.is_primary, resolved from the caller's (issuer, subject), not a scope - moira:auth-settings:write is implied by moira:admin, which every grant carries, so a scope cannot express 'not every admin'. Rewriting this row rewrites the deployment's only sign-in door, and the OAuth client secret it needs lives in the console rather than here, so a bad write cannot be repaired through this API. A non-owner trusted-JWT caller gets 403 admin_identity_not_primary. System-key callers pass, and that is the documented way back in after a broken write.",
     params(
         ("id" = Uuid, Path, description = "Auth provider configuration identifier"),
         ("If-Match" = i64, Header, description = "Required current resource version")
@@ -264,12 +278,12 @@ pub async fn disable_auth_provider(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<(HeaderMap, Json<AuthProviderSettingsRecord>), AppError> {
-    let actor = admin_actor(&state, &headers).await?;
+    let (actor, issuer) = admin_actor_with_issuer(&state, &headers).await?;
     let ctx = RequestContext::from_headers(&headers);
     let service = AuthProviderSettingsService::new(&state)?;
     let expected_version = require_if_match(&headers)?;
     let record = service
-        .set_enabled(&actor, &ctx, id, expected_version, false)
+        .set_enabled(&actor, issuer.as_deref(), &ctx, id, expected_version, false)
         .await?;
     Ok((etag_headers(record.version), Json(record)))
 }

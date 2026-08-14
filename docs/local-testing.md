@@ -314,7 +314,14 @@ a configuration fact, not an error.
 
 What is still missing:
 
-1. **Moira refuses any non-`https` auth-provider URL**, with no escape hatch —
+1. **Only the OWNER may change the sign-in provider** (issue #185). `/settings/auth`
+   is readable by any admin and writable by the primary admin identity alone, and
+   Moira enforces that itself — `require_primary_actor` guards the auth-provider
+   write surface, so a non-owner is refused whether they go through the console
+   or call the admin API directly with their own bearer token. System-key callers
+   still pass, which is what keeps the break-glass recovery in
+   `docs/console-architecture.md` working.
+2. **Moira refuses any non-`https` auth-provider URL**, with no escape hatch —
    unlike provider URLs, which have two. See `validate_https_url` in
    `src/application/auth_settings.rs`; it rejects with
    `auth_provider_url_not_allowed`. So the IdP you point the wizard at has to be

@@ -59,6 +59,27 @@ pub(super) async fn admin_actor(
     state.auth.authenticate_admin(state.pool()?, headers).await
 }
 
+/// `admin_actor`, plus the *issuer* the credential authenticated under.
+///
+/// `pub(super)` for the same reason as `admin_actor` above, and it is a separate
+/// function rather than a wider return type because most handlers do not need the
+/// issuer and threading an ignored value through them would invite `let (actor, _)`
+/// at 30 call sites.
+///
+/// The issuer is what the ownership check keys on: `admin_identities` is scoped by
+/// `(issuer, subject)`, so "is this caller the owner" is unanswerable without it.
+/// Two surfaces need that answer — the identity handlers (decision D1) and, since
+/// issue #185, the auth-provider WRITE handlers.
+pub(super) async fn admin_actor_with_issuer(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(crate::security::Actor, Option<String>), AppError> {
+    state
+        .auth
+        .authenticate_admin_with_issuer(state.pool()?, headers)
+        .await
+}
+
 pub(super) fn etag_headers(version: i64) -> HeaderMap {
     let mut headers = HeaderMap::new();
     if let Ok(value) = HeaderValue::from_str(&format!("\"{version}\"")) {

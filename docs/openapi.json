@@ -14336,6 +14336,7 @@
         ]
       },
       "post": {
+        "description": "Registers an auth provider configuration. Requires the caller to be the PRIMARY admin identity (issue #185): admin_identities.is_primary, resolved from the caller's (issuer, subject), not a scope - moira:auth-settings:write is implied by moira:admin, which every grant carries, so a scope cannot express 'not every admin'. Rewriting this row rewrites the deployment's only sign-in door, and the OAuth client secret it needs lives in the console rather than here, so a bad write cannot be repaired through this API. A non-owner trusted-JWT caller gets 403 admin_identity_not_primary. System-key callers pass, and that is the documented way back in after a broken write.",
         "operationId": "create_auth_provider",
         "parameters": [
           {
@@ -14468,6 +14469,7 @@
     },
     "/api/v1/admin/auth/providers/{id}": {
       "delete": {
+        "description": "Soft-deletes an auth provider configuration. Requires the caller to be the PRIMARY admin identity (issue #185): admin_identities.is_primary, resolved from the caller's (issuer, subject), not a scope - moira:auth-settings:write is implied by moira:admin, which every grant carries, so a scope cannot express 'not every admin'. Rewriting this row rewrites the deployment's only sign-in door, and the OAuth client secret it needs lives in the console rather than here, so a bad write cannot be repaired through this API. A non-owner trusted-JWT caller gets 403 admin_identity_not_primary. System-key callers pass, and that is the documented way back in after a broken write.",
         "operationId": "delete_auth_provider",
         "parameters": [
           {
@@ -14665,6 +14667,7 @@
         ]
       },
       "patch": {
+        "description": "Updates an auth provider configuration. Requires the caller to be the PRIMARY admin identity (issue #185): admin_identities.is_primary, resolved from the caller's (issuer, subject), not a scope - moira:auth-settings:write is implied by moira:admin, which every grant carries, so a scope cannot express 'not every admin'. Rewriting this row rewrites the deployment's only sign-in door, and the OAuth client secret it needs lives in the console rather than here, so a bad write cannot be repaired through this API. A non-owner trusted-JWT caller gets 403 admin_identity_not_primary. System-key callers pass, and that is the documented way back in after a broken write.",
         "operationId": "patch_auth_provider",
         "parameters": [
           {
@@ -14787,6 +14790,7 @@
     },
     "/api/v1/admin/auth/providers/{id}/disable": {
       "post": {
+        "description": "Disables an auth provider configuration. Requires the caller to be the PRIMARY admin identity (issue #185): admin_identities.is_primary, resolved from the caller's (issuer, subject), not a scope - moira:auth-settings:write is implied by moira:admin, which every grant carries, so a scope cannot express 'not every admin'. Rewriting this row rewrites the deployment's only sign-in door, and the OAuth client secret it needs lives in the console rather than here, so a bad write cannot be repaired through this API. A non-owner trusted-JWT caller gets 403 admin_identity_not_primary. System-key callers pass, and that is the documented way back in after a broken write.",
         "operationId": "disable_auth_provider",
         "parameters": [
           {
@@ -14899,6 +14903,7 @@
     },
     "/api/v1/admin/auth/providers/{id}/enable": {
       "post": {
+        "description": "Enables an auth provider configuration. Requires the caller to be the PRIMARY admin identity (issue #185): admin_identities.is_primary, resolved from the caller's (issuer, subject), not a scope - moira:auth-settings:write is implied by moira:admin, which every grant carries, so a scope cannot express 'not every admin'. Rewriting this row rewrites the deployment's only sign-in door, and the OAuth client secret it needs lives in the console rather than here, so a bad write cannot be repaired through this API. A non-owner trusted-JWT caller gets 403 admin_identity_not_primary. System-key callers pass, and that is the documented way back in after a broken write.",
         "operationId": "enable_auth_provider",
         "parameters": [
           {

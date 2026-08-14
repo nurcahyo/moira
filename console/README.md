@@ -127,6 +127,8 @@ records that walk and the recipe for repeating it with no Google credential.
 | `/`               | the authenticated home, behind the `(console)` session boundary                                                       |
 | `/admins`         | admin grants, invitations, ownership transfer                                                                         |
 | `/settings/llm`   | LLM providers, models, credential rows, routing — plus the one-step "connect a local endpoint" chain                  |
+| `/settings/keys`  | applications, and the consumer keys they present to Moira — minted, listed, revoked                                   |
+| `/settings/auth`  | the sign-in provider — readable by any admin, changeable only by the owner                                            |
 
 Better Auth, the OAuth/OIDC flow, the ES256 JWKS the console publishes and the
 admin JWTs it mints, the Moira API client, sessions and the console's own

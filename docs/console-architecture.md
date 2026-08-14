@@ -260,6 +260,21 @@ from the allow-list still authenticated through the row, so the wizard's
 "Edit auth settings" way back, widen the list, save again is a path the console
 accepts end to end.
 
+**After the claim, that path is `/settings/auth`** (issue #185). The setup window
+answers `409 setup_already_claimed` from the first admin onwards, so the wizard's
+auth-settings form stops existing at exactly the moment a deployment starts being
+used; the settings screen is the same two writes — Moira's row, and this
+console's sealed client secret — reachable afterwards, and restricted to the
+**owner**, because a wrong value there takes the deployment's only door with it.
+Moira enforces that restriction itself (`require_primary_actor` on the
+auth-provider write surface), so it is not a UI convention a direct API call can
+step around.
+
+It carries the rule that makes the screen safe: a **changed client id needs its
+client secret in the same save**, refused before any request reaches Moira. The
+sealed envelope binds `(provider_id, client_id)`, so a client id that moves
+without one leaves a secret that cannot open — which is the state below.
+
 What remains is the provider enabled with a credential **nobody at all** can sign
 in with — a mistyped client id or client secret, or a discovery URL pointing at
 the wrong IdP. That row cannot be corrected *from the console*: no session can be
@@ -267,8 +282,9 @@ obtained through it, so there is nothing to prove operatorship with, and the
 console will not be an unauthenticated proxy for a write against a live
 authenticator.
 
-The way out is the bootstrap system key you already hold. Moira's admin API takes
-it directly — `POST /api/v1/admin/auth/providers/{id}/disable` and `PATCH
+The way out is still the bootstrap system key you already hold — `/settings/auth`
+cannot help here, because reaching it requires the session this row is refusing
+to issue. Moira's admin API takes the key directly — `POST /api/v1/admin/auth/providers/{id}/disable` and `PATCH
 /api/v1/admin/auth/providers/{id}` both accept `systemKeyAuth`.
 
 Two things about that API are easy to get wrong, and getting either wrong is the
@@ -307,7 +323,11 @@ If step 3 answers `409 resource_version_conflict`, something changed the row
 between steps 2 and 3: re-run step 2 and try again. A quoted ETag value works
 too — the handler trims the quotes before parsing.
 
-**Disable the broken row, then finish in the wizard.** A disabled row
+**Disable the broken row, then finish in the wizard.** *(On a deployment that has
+never been claimed. Once it has, `/setup` is closed and `/settings/auth` is where
+this ends instead — but that screen needs a session, so a row nobody can sign in
+through still has to be disabled with the system key first, at which point the
+console's remaining sign-in configuration decides whether you can reach it.)* A disabled row
 authenticates nobody and no longer counts towards the one-enabled-provider limit,
 so every console rule above stands down: the setup window will re-save it and
 enable it again with no session, exactly as it does for an interrupted first run.

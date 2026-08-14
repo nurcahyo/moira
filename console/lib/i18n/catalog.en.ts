@@ -1525,6 +1525,163 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "has no `expires_at`. An invitation always has one; a consumer key need not.",
   },
 
+  /* ------------------------------------------------------------------------ */
+  /* The /settings/auth screen (issue #185)                                   */
+  /* ------------------------------------------------------------------------ */
+  [K.authsettings_page_title]: {
+    key: K.authsettings_page_title,
+    message: "How operators sign in",
+    description:
+      "The h1 of /settings/auth. Names what the screen governs — how a human signs in to this console — rather than the row it edits.",
+  },
+  [K.authsettings_page_intro]: {
+    key: K.authsettings_page_intro,
+    message:
+      "This is how operators sign in to the console. Only the owner can change it, because a wrong value here locks everybody out, including you.",
+    description:
+      "Rendered under the page heading. States the ownership rule and the reason for it in the same breath, so the restriction reads as a consequence rather than as bureaucracy.",
+  },
+  [K.authsettings_not_owner]: {
+    key: K.authsettings_not_owner,
+    message:
+      "Only the owner can change how operators sign in. Ask them, or transfer ownership first.",
+    description:
+      "Emitted when a signed-in admin who is not the primary identity reaches the screen or its endpoint. Names the two ways forward, because the refusal is otherwise a dead end.",
+  },
+  [K.authsettings_owner_grant_absent]: {
+    key: K.authsettings_owner_grant_absent,
+    message:
+      "This console has no admin grant for your account in this namespace, so it cannot tell whether you are the owner.",
+    description:
+      "Emitted when the ownership lookup finds no grant for the caller's (issuer, subject). Distinct from the not-owner refusal: the answer is unknown rather than no.",
+  },
+  [K.authsettings_owner_lookup_truncated]: {
+    key: K.authsettings_owner_lookup_truncated,
+    message:
+      "There are more admins than this console can read in one page, so it cannot confirm who the owner is.",
+    description:
+      "Emitted when the ownership lookup's page reported more results. Issue #117's lesson: an owner whose grant sits on page two must not be told they are not the owner.",
+  },
+  [K.authsettings_current_heading]: {
+    key: K.authsettings_current_heading,
+    message: "What is configured now",
+    description: "Heading of the read-only summary of the live provider row.",
+  },
+  [K.authsettings_secret_hint]: {
+    key: K.authsettings_secret_hint,
+    message:
+      "Write-only. Stored encrypted by this console and never shown again. Leave it blank to keep the one already stored.",
+    description:
+      "Hint under the secret field on the update form. The blank-means-keep rule is the whole reason an operator can correct a display name without retyping a secret they may not have.",
+  },
+  [K.authsettings_secret_required_for_new_client_id]: {
+    key: K.authsettings_secret_required_for_new_client_id,
+    message:
+      "Changing the client ID needs its client secret in the same save. The stored one is sealed against the old ID and would stop working.",
+    description:
+      "Emitted, BEFORE any request to Moira, when the submitted client id differs from the sealed one and no secret was supplied. This is the refusal that prevents the most likely lockout.",
+  },
+  [K.authsettings_sealed_against]: {
+    key: K.authsettings_sealed_against,
+    message: "A secret is stored, sealed against client ID {client_id}.",
+    description:
+      "Rendered in the summary when the console holds a sealed secret. The sealed client id is stored in the clear precisely so drift can be shown without decrypting anything.",
+  },
+  [K.authsettings_sealed_absent]: {
+    key: K.authsettings_sealed_absent,
+    message: "No client secret is stored in this console for this provider.",
+    description:
+      "Rendered in the summary when the console holds no sealed secret — the state in which sign-in cannot complete a code exchange.",
+  },
+  [K.authsettings_update_heading]: {
+    key: K.authsettings_update_heading,
+    message: "Change the sign-in provider",
+    description:
+      "Heading of the form that writes both Moira's row and, when supplied, this console's sealed secret.",
+  },
+  [K.authsettings_update_button]: {
+    key: K.authsettings_update_button,
+    message: "Save sign-in settings",
+    description: "The submit control of the update form.",
+  },
+  [K.authsettings_rotate_heading]: {
+    key: K.authsettings_rotate_heading,
+    message: "Replace the stored client secret",
+    description:
+      "Heading of the secret-only form. Separate from the update form because it makes no request to Moira at all.",
+  },
+  [K.authsettings_rotate_intro]: {
+    key: K.authsettings_rotate_intro,
+    message:
+      "Use this when the secret changed at the identity provider and nothing else did. It writes only to this console.",
+    description:
+      "Rendered under that heading. Says where the write lands, because an operator reasonably expects a settings save to reach the backend.",
+  },
+  [K.authsettings_rotate_button]: {
+    key: K.authsettings_rotate_button,
+    message: "Replace stored secret",
+    description: "The submit control of the secret-only form.",
+  },
+  [K.authsettings_saved]: {
+    key: K.authsettings_saved,
+    message: "Saved. Sign-in now uses the settings above.",
+    description:
+      "Announced after a successful update, once the drift re-check has confirmed the console and Moira agree.",
+  },
+  [K.authsettings_drift_after_write]: {
+    key: K.authsettings_drift_after_write,
+    message:
+      "The settings were saved, but this console's stored secret no longer matches them. Enter the client secret again.",
+    description:
+      "Emitted when the post-write drift re-check is not in_sync. The write is NOT reported as success: the deployment is in the state that stops sign-in working, and saying 'saved' would send the operator away from the one screen that can fix it.",
+  },
+  [K.authsettings_request_body_invalid]: {
+    key: K.authsettings_request_body_invalid,
+    message: "The console could not read that save request.",
+    description: "Emitted by the /settings/auth handler for a body that is not an object.",
+  },
+  [K.authsettings_client_id_required]: {
+    key: K.authsettings_client_id_required,
+    message: "The OAuth client ID cannot be empty.",
+    description: "Emitted when the update form submits a blank client id.",
+  },
+  [K.authsettings_domains_required]: {
+    key: K.authsettings_domains_required,
+    message:
+      "Keep at least one allowed email domain. An empty list denies every operator, including you.",
+    description:
+      "Emitted when the update form submits an empty allow-list. Moira would accept it; the deployment it produces has no way back in.",
+  },
+  [K.authsettings_secret_required]: {
+    key: K.authsettings_secret_required,
+    message: "Enter the client secret.",
+    description: "Emitted when the secret-only form is submitted with an empty field.",
+  },
+  [K.authsettings_no_provider]: {
+    key: K.authsettings_no_provider,
+    message: "No sign-in provider is configured for this console's namespace yet.",
+    description:
+      "Rendered when the row derivation finds nothing to edit — a deployment claimed through a different namespace, or one whose provider row was deleted.",
+  },
+  [K.authsettings_load_failed]: {
+    key: K.authsettings_load_failed,
+    message: "The console could not read the sign-in settings from Moira.",
+    description:
+      "Rendered by /settings/auth when the server-side read threw. The page still answers below 400, because the a11y walker fails the gate on any status >= 400.",
+  },
+  [K.authsettings_request_failed]: {
+    key: K.authsettings_request_failed,
+    message: "The console could not save that. Try again in a moment.",
+    description:
+      "Rendered by the panels when a request never reached a keyed refusal — a transport failure rather than an answer.",
+  },
+  [K.chrome_nav_auth_settings]: {
+    key: K.chrome_nav_auth_settings,
+    message: "Sign-in",
+    description:
+      "Navigation link to /settings/auth. Shown to every admin; the screen itself explains that only the owner may change anything, which is more useful than a menu entry that silently disappears.",
+  },
+
   /* --- the authenticated chrome (plan 09 wave 5) -------------------------- */
   [K.chrome_nav_label]: {
     key: K.chrome_nav_label,
