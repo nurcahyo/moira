@@ -49,11 +49,7 @@ import { setSetupWindowDependenciesForTests } from "@/lib/setup-window";
 
 import { createBrowserAgent } from "../support/browser-agent";
 import { createMoiraStub, MOIRA_STUB_BASE_URL, type StubHandler } from "../support/moira-stub";
-import {
-  reserveConsolePort,
-  startConsoleServer,
-  type ConsoleServer,
-} from "../support/console-server";
+import { withBoundConsole, type ConsoleServer } from "../support/console-server";
 import { trustFixtureCa, untrustFixtureCa } from "../support/fixture-tls";
 import { restoreDomWhatwgGlobals, useNativeWhatwgGlobals } from "../support/native-globals";
 import { startMockIdp, type MockIdp } from "../support/mock-idp";
@@ -179,26 +175,24 @@ describe("OAuth sign-in against a real mock IdP", () => {
     // See `native-globals.ts`.
     useNativeWhatwgGlobals();
 
-    const port = reserveConsolePort();
-    const consoleOrigin = `https://localhost:${port}`;
-    trustFixtureCa(consoleOrigin);
+    consoleServer = await withBoundConsole(async (pending) => {
+      const consoleOrigin = pending.origin;
+      trustFixtureCa(consoleOrigin);
 
-    idp = await startMockIdp({
-      clientId: CLIENT_ID,
-      clientSecret: CLIENT_SECRET,
-      user: OPERATOR,
-    });
-    trustFixtureCa(idp.origin);
+      idp = await startMockIdp({
+        clientId: CLIENT_ID,
+        clientSecret: CLIENT_SECRET,
+        user: OPERATOR,
+      });
+      trustFixtureCa(idp.origin);
 
-    env = envFor(consoleOrigin);
-    consoleServer = startConsoleServer(
-      {
+      env = envFor(consoleOrigin);
+      return pending.serve({
         env,
         configs: [configFor(idp, CLIENT_SECRET, env)],
         database: memoryAdapter(createConsoleMemoryDatabase()),
-      },
-      port,
-    );
+      });
+    });
   });
 
   afterAll(() => {
@@ -365,28 +359,26 @@ describe("the console-held client secret is load-bearing", () => {
     // See `native-globals.ts`.
     useNativeWhatwgGlobals();
 
-    const port = reserveConsolePort();
-    const consoleOrigin = `https://localhost:${port}`;
-    trustFixtureCa(consoleOrigin);
+    consoleServer = await withBoundConsole(async (pending) => {
+      const consoleOrigin = pending.origin;
+      trustFixtureCa(consoleOrigin);
 
-    idp = await startMockIdp({
-      clientId: CLIENT_ID,
-      clientSecret: CLIENT_SECRET,
-      user: OPERATOR,
-    });
-    trustFixtureCa(idp.origin);
+      idp = await startMockIdp({
+        clientId: CLIENT_ID,
+        clientSecret: CLIENT_SECRET,
+        user: OPERATOR,
+      });
+      trustFixtureCa(idp.origin);
 
-    consoleServer = startConsoleServer(
-      {
+      return pending.serve({
         env: envFor(consoleOrigin),
-        // The drift D7 makes possible: Moira's row is right, the console's
-        // stored secret is stale. Nothing on the Moira side can detect this,
-        // because Moira never held the secret.
+        // The drift D7 makes possible: Moira's row is right, the console's stored
+        // secret is stale. Nothing on the Moira side can detect this, because
+        // Moira never held the secret.
         configs: [configFor(idp, "the-wrong-secret", envFor(consoleOrigin))],
         database: memoryAdapter(createConsoleMemoryDatabase()),
-      },
-      port,
-    );
+      });
+    });
   });
 
   afterAll(() => {
@@ -421,28 +413,26 @@ describe("identity falls back to the userinfo endpoint when the ID token is thin
   beforeAll(async () => {
     useNativeWhatwgGlobals();
 
-    const port = reserveConsolePort();
-    const consoleOrigin = `https://localhost:${port}`;
-    trustFixtureCa(consoleOrigin);
+    consoleServer = await withBoundConsole(async (pending) => {
+      const consoleOrigin = pending.origin;
+      trustFixtureCa(consoleOrigin);
 
-    idp = await startMockIdp({
-      clientId: CLIENT_ID,
-      clientSecret: CLIENT_SECRET,
-      user: OPERATOR,
-      // Better Auth uses the ID token only when it carries `sub` AND `email`.
-      idTokenOmitsEmail: true,
-    });
-    trustFixtureCa(idp.origin);
+      idp = await startMockIdp({
+        clientId: CLIENT_ID,
+        clientSecret: CLIENT_SECRET,
+        user: OPERATOR,
+        // Better Auth uses the ID token only when it carries `sub` AND `email`.
+        idTokenOmitsEmail: true,
+      });
+      trustFixtureCa(idp.origin);
 
-    env = envFor(consoleOrigin);
-    consoleServer = startConsoleServer(
-      {
+      env = envFor(consoleOrigin);
+      return pending.serve({
         env,
         configs: [configFor(idp, CLIENT_SECRET, env)],
         database: memoryAdapter(createConsoleMemoryDatabase()),
-      },
-      port,
-    );
+      });
+    });
   });
 
   afterAll(() => {
@@ -486,26 +476,24 @@ describe("a provider that supplies no subject cannot produce a console session",
   beforeAll(async () => {
     useNativeWhatwgGlobals();
 
-    const port = reserveConsolePort();
-    const consoleOrigin = `https://localhost:${port}`;
-    trustFixtureCa(consoleOrigin);
+    consoleServer = await withBoundConsole(async (pending) => {
+      const consoleOrigin = pending.origin;
+      trustFixtureCa(consoleOrigin);
 
-    idp = await startMockIdp({
-      clientId: CLIENT_ID,
-      clientSecret: CLIENT_SECRET,
-      user: OPERATOR,
-      omitSubject: true,
-    });
-    trustFixtureCa(idp.origin);
+      idp = await startMockIdp({
+        clientId: CLIENT_ID,
+        clientSecret: CLIENT_SECRET,
+        user: OPERATOR,
+        omitSubject: true,
+      });
+      trustFixtureCa(idp.origin);
 
-    consoleServer = startConsoleServer(
-      {
+      return pending.serve({
         env: envFor(consoleOrigin),
         configs: [configFor(idp, CLIENT_SECRET, envFor(consoleOrigin))],
         database: memoryAdapter(createConsoleMemoryDatabase()),
-      },
-      port,
-    );
+      });
+    });
   });
 
   afterAll(() => {
@@ -584,15 +572,14 @@ describe("a session outside the allow-list cannot be exchanged for a Moira crede
   beforeAll(async () => {
     useNativeWhatwgGlobals();
 
-    const port = reserveConsolePort();
-    const consoleOrigin = `https://localhost:${port}`;
-    trustFixtureCa(consoleOrigin);
+    consoleServer = await withBoundConsole(async (pending) => {
+      const consoleOrigin = pending.origin;
+      trustFixtureCa(consoleOrigin);
 
-    idp = await startMockIdp({ clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, user: OPERATOR });
-    trustFixtureCa(idp.origin);
+      idp = await startMockIdp({ clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, user: OPERATOR });
+      trustFixtureCa(idp.origin);
 
-    consoleServer = startConsoleServer(
-      {
+      return pending.serve({
         env: envFor(consoleOrigin),
         configs: [
           {
@@ -603,9 +590,8 @@ describe("a session outside the allow-list cannot be exchanged for a Moira crede
           },
         ],
         database: memoryAdapter(createConsoleMemoryDatabase()),
-      },
-      port,
-    );
+      });
+    });
   });
 
   afterAll(() => {
@@ -661,19 +647,17 @@ describe("a session outside the allow-list cannot be exchanged for a Moira crede
     // The negative control. Without it, a check that refused everybody — or a
     // token endpoint broken for an unrelated reason — would pass every assertion
     // above.
-    const port = reserveConsolePort();
-    const origin = `https://localhost:${port}`;
-    trustFixtureCa(origin);
-    const permissive = startConsoleServer(
-      {
+    const permissive = await withBoundConsole((pending) => {
+      const origin = pending.origin;
+      trustFixtureCa(origin);
+      return pending.serve({
         env: envFor(origin),
         configs: [
           { ...configFor(idp, CLIENT_SECRET, envFor(origin)), allowedEmailDomains: ["example.com"] },
         ],
         database: memoryAdapter(createConsoleMemoryDatabase()),
-      },
-      port,
-    );
+      });
+    });
     try {
       const outcome = await signIn(permissive.origin);
       const response = await outcome.agent.request(`${permissive.origin}/api/auth/token`);
@@ -859,28 +843,30 @@ describe("the setup window's re-save gate, driven by a real console session", ()
   beforeAll(async () => {
     useNativeWhatwgGlobals();
 
-    const port = reserveConsolePort();
-    const consoleOrigin = `https://localhost:${port}`;
-    trustFixtureCa(consoleOrigin);
+    consoleServer = await withBoundConsole(async (pending) => {
+      const consoleOrigin = pending.origin;
+      trustFixtureCa(consoleOrigin);
 
-    idp = await startMockIdp({ clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, user: OPERATOR });
-    trustFixtureCa(idp.origin);
+      idp = await startMockIdp({ clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, user: OPERATOR });
+      trustFixtureCa(idp.origin);
 
-    env = envFor(consoleOrigin);
-    configs = [
-      {
-        ...configFor(idp, CLIENT_SECRET, env),
-        moiraProviderId: MOIRA_PROVIDER_ID,
-        trustedJwtIssuerId: TRUSTED_ISSUER_ID,
-        // OPERATOR is `operator@example.com`. This is the list they came back to
-        // widen, and it is the list their own session is refused by.
-        allowedEmailDomains: ["corp.test"],
-      },
-    ];
-    consoleServer = startConsoleServer(
-      { env, configs, database: memoryAdapter(createConsoleMemoryDatabase()) },
-      port,
-    );
+      env = envFor(consoleOrigin);
+      configs = [
+        {
+          ...configFor(idp, CLIENT_SECRET, env),
+          moiraProviderId: MOIRA_PROVIDER_ID,
+          trustedJwtIssuerId: TRUSTED_ISSUER_ID,
+          // OPERATOR is `operator@example.com`. This is the list they came back to
+          // widen, and it is the list their own session is refused by.
+          allowedEmailDomains: ["corp.test"],
+        },
+      ];
+      return pending.serve({
+        env,
+        configs,
+        database: memoryAdapter(createConsoleMemoryDatabase()),
+      });
+    });
   });
 
   afterAll(() => {

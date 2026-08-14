@@ -61,7 +61,7 @@ import {
   openConsoleTestDatabase,
   resetConsoleTestDatabase,
 } from "../support/console-db";
-import { reserveConsolePort, startConsoleServer, type ConsoleServer } from "../support/console-server";
+import { withBoundConsole, type ConsoleServer } from "../support/console-server";
 import { trustFixtureCa, untrustFixtureCa } from "../support/fixture-tls";
 import { startMockGithub, type MockGithub } from "../support/mock-github";
 import { startMockIdp, type MockIdp } from "../support/mock-idp";
@@ -302,48 +302,49 @@ describeDatabase("G8 — the minted `iss` names the authenticating provider", ()
     pool = await openConsoleTestDatabase();
     await resetConsoleTestDatabase(pool);
 
-    const port = reserveConsolePort();
-    const origin = `https://localhost:${port}`;
-    trustFixtureCa(origin);
+    server = await withBoundConsole(async (pending) => {
+      const origin = pending.origin;
+      trustFixtureCa(origin);
 
-    idp = await startMockIdp({
-      clientId: OIDC_CLIENT_ID,
-      clientSecret: OIDC_CLIENT_SECRET,
-      user: {
-        sub: "corp-idp-subject-g8",
-        email: "operator@corp.test",
-        emailVerified: true,
-        name: "Corp Operator",
-      },
+      idp = await startMockIdp({
+        clientId: OIDC_CLIENT_ID,
+        clientSecret: OIDC_CLIENT_SECRET,
+        user: {
+          sub: "corp-idp-subject-g8",
+          email: "operator@corp.test",
+          emailVerified: true,
+          name: "Corp Operator",
+        },
+      });
+      github = await startMockGithub({
+        clientId: GITHUB_CLIENT_ID,
+        clientSecret: GITHUB_CLIENT_SECRET,
+        user: {
+          // A short numeric id — the shape that makes F24 concrete, since a
+          // generic-OIDC IdP returning a numeric `sub` collides with it.
+          id: 4242,
+          login: "contractor",
+          name: "Contractor Person",
+          email: "person@contractor.test",
+        },
+      });
+      trustFixtureCa(idp.origin);
+      trustFixtureCa(github.origin);
+
+      configs = resolveFixture(
+        [oidcRow(idp), githubRow(github)],
+        [
+          issuerRow(OIDC_ISSUER_ROW_ID, PRE_4B_ISSUER),
+          issuerRow(GITHUB_ISSUER_ROW_ID, GITHUB_CONSOLE_ISSUER),
+        ],
+        new Map([
+          [OIDC_ROW_ID, OIDC_CLIENT_SECRET],
+          [GITHUB_ROW_ID, GITHUB_CLIENT_SECRET],
+        ]),
+      );
+
+      return pending.serve({ env: envFor(origin), configs, database: pool });
     });
-    github = await startMockGithub({
-      clientId: GITHUB_CLIENT_ID,
-      clientSecret: GITHUB_CLIENT_SECRET,
-      user: {
-        // A short numeric id — the shape that makes F24 concrete, since a
-        // generic-OIDC IdP returning a numeric `sub` collides with it.
-        id: 4242,
-        login: "contractor",
-        name: "Contractor Person",
-        email: "person@contractor.test",
-      },
-    });
-    trustFixtureCa(idp.origin);
-    trustFixtureCa(github.origin);
-
-    configs = resolveFixture(
-      [oidcRow(idp), githubRow(github)],
-      [
-        issuerRow(OIDC_ISSUER_ROW_ID, PRE_4B_ISSUER),
-        issuerRow(GITHUB_ISSUER_ROW_ID, GITHUB_CONSOLE_ISSUER),
-      ],
-      new Map([
-        [OIDC_ROW_ID, OIDC_CLIENT_SECRET],
-        [GITHUB_ROW_ID, GITHUB_CLIENT_SECRET],
-      ]),
-    );
-
-    server = startConsoleServer({ env: envFor(origin), configs, database: pool }, port);
   });
 
   afterAll(async () => {
@@ -489,17 +490,18 @@ describeDatabase("GitHub's non-OIDC profile is read safely", () => {
     options: Parameters<typeof startMockGithub>[0],
     allowedEmailDomains: string[] = ["contractor.test"],
   ): Promise<void> {
-    const port = reserveConsolePort();
-    const origin = `https://localhost:${port}`;
-    trustFixtureCa(origin);
-    github = await startMockGithub(options);
-    trustFixtureCa(github.origin);
-    const configs = resolveFixture(
-      [githubRow(github, { allowed_email_domains: allowedEmailDomains })],
-      [issuerRow(GITHUB_ISSUER_ROW_ID, GITHUB_CONSOLE_ISSUER)],
-      new Map([[GITHUB_ROW_ID, GITHUB_CLIENT_SECRET]]),
-    );
-    server = startConsoleServer({ env: envFor(origin), configs, database: pool }, port);
+    server = await withBoundConsole(async (pending) => {
+      const origin = pending.origin;
+      trustFixtureCa(origin);
+      github = await startMockGithub(options);
+      trustFixtureCa(github.origin);
+      const configs = resolveFixture(
+        [githubRow(github, { allowed_email_domains: allowedEmailDomains })],
+        [issuerRow(GITHUB_ISSUER_ROW_ID, GITHUB_CONSOLE_ISSUER)],
+        new Map([[GITHUB_ROW_ID, GITHUB_CLIENT_SECRET]]),
+      );
+      return pending.serve({ env: envFor(origin), configs, database: pool });
+    });
   }
 
   beforeAll(async () => {
@@ -658,46 +660,47 @@ describeDatabase("G9 — a pre-4B admin is not orphaned by the upgrade", () => {
     pool = await openConsoleTestDatabase();
     await resetConsoleTestDatabase(pool);
 
-    const port = reserveConsolePort();
-    const origin = `https://localhost:${port}`;
-    trustFixtureCa(origin);
+    server = await withBoundConsole(async (pending) => {
+      const origin = pending.origin;
+      trustFixtureCa(origin);
 
-    idp = await startMockIdp({
-      clientId: OIDC_CLIENT_ID,
-      clientSecret: OIDC_CLIENT_SECRET,
-      user: {
-        sub: LEGACY_SUBJECT,
-        email: LEGACY_EMAIL,
-        emailVerified: true,
-        name: "Incumbent Admin",
-      },
+      idp = await startMockIdp({
+        clientId: OIDC_CLIENT_ID,
+        clientSecret: OIDC_CLIENT_SECRET,
+        user: {
+          sub: LEGACY_SUBJECT,
+          email: LEGACY_EMAIL,
+          emailVerified: true,
+          name: "Incumbent Admin",
+        },
+      });
+      trustFixtureCa(idp.origin);
+
+      // ---- THE PRE-UPGRADE FIXTURE, WRITTEN BY HAND -------------------------
+      // Exactly the rows a console that has been running since wave 3 has: a
+      // `user`, an `account` under the literal `moira-console-idp`, and NO
+      // `providerId` on any session (the column did not exist).
+      await pool.query(
+        `insert into "user" (id, name, email, "emailVerified", "createdAt", "updatedAt")
+         values ($1, $2, $3, true, now(), now())`,
+        [LEGACY_USER_ID, "Incumbent Admin", LEGACY_EMAIL],
+      );
+      await pool.query(
+        `insert into "account" (id, "accountId", "providerId", "userId", "createdAt", "updatedAt")
+         values ($1, $2, $3, $4, now(), now())`,
+        ["pre4b-account-row", LEGACY_SUBJECT, PRE_4B_PROVIDER_ID, LEGACY_USER_ID],
+      );
+
+      // The 4B configuration this deployment resolves to AFTER the upgrade. The
+      // provider row is bound to a trusted issuer whose string is the console's own
+      // `bffIssuerUrl`, which is the definition of "the incumbent".
+      configs = resolveFixture(
+        [oidcRow(idp, { allowed_email_domains: ["corp.test"] })],
+        [issuerRow(OIDC_ISSUER_ROW_ID, PRE_4B_ISSUER)],
+        new Map([[OIDC_ROW_ID, OIDC_CLIENT_SECRET]]),
+      );
+      return pending.serve({ env: envFor(origin), configs, database: pool });
     });
-    trustFixtureCa(idp.origin);
-
-    // ---- THE PRE-UPGRADE FIXTURE, WRITTEN BY HAND -------------------------
-    // Exactly the rows a console that has been running since wave 3 has: a
-    // `user`, an `account` under the literal `moira-console-idp`, and NO
-    // `providerId` on any session (the column did not exist).
-    await pool.query(
-      `insert into "user" (id, name, email, "emailVerified", "createdAt", "updatedAt")
-       values ($1, $2, $3, true, now(), now())`,
-      [LEGACY_USER_ID, "Incumbent Admin", LEGACY_EMAIL],
-    );
-    await pool.query(
-      `insert into "account" (id, "accountId", "providerId", "userId", "createdAt", "updatedAt")
-       values ($1, $2, $3, $4, now(), now())`,
-      ["pre4b-account-row", LEGACY_SUBJECT, PRE_4B_PROVIDER_ID, LEGACY_USER_ID],
-    );
-
-    // The 4B configuration this deployment resolves to AFTER the upgrade. The
-    // provider row is bound to a trusted issuer whose string is the console's own
-    // `bffIssuerUrl`, which is the definition of "the incumbent".
-    configs = resolveFixture(
-      [oidcRow(idp, { allowed_email_domains: ["corp.test"] })],
-      [issuerRow(OIDC_ISSUER_ROW_ID, PRE_4B_ISSUER)],
-      new Map([[OIDC_ROW_ID, OIDC_CLIENT_SECRET]]),
-    );
-    server = startConsoleServer({ env: envFor(origin), configs, database: pool }, port);
   });
 
   afterAll(async () => {
@@ -825,45 +828,46 @@ describeDatabase("G10 — `sub` and `iss` name the same account", () => {
     pool = await openConsoleTestDatabase();
     await resetConsoleTestDatabase(pool);
 
-    const port = reserveConsolePort();
-    const origin = `https://localhost:${port}`;
-    trustFixtureCa(origin);
+    server = await withBoundConsole(async (pending) => {
+      const origin = pending.origin;
+      trustFixtureCa(origin);
 
-    idpA = await startMockIdp({
-      clientId: OIDC_CLIENT_ID,
-      clientSecret: OIDC_CLIENT_SECRET,
-      user: { sub: SUB_A, email: SHARED_EMAIL, emailVerified: true, name: "Dual Identity" },
-    });
-    idpB = await startMockIdp({
-      clientId: CLIENT_B_ID,
-      clientSecret: CLIENT_B_SECRET,
-      user: { sub: SUB_B, email: SHARED_EMAIL, emailVerified: true, name: "Dual Identity" },
-    });
-    trustFixtureCa(idpA.origin);
-    trustFixtureCa(idpB.origin);
+      idpA = await startMockIdp({
+        clientId: OIDC_CLIENT_ID,
+        clientSecret: OIDC_CLIENT_SECRET,
+        user: { sub: SUB_A, email: SHARED_EMAIL, emailVerified: true, name: "Dual Identity" },
+      });
+      idpB = await startMockIdp({
+        clientId: CLIENT_B_ID,
+        clientSecret: CLIENT_B_SECRET,
+        user: { sub: SUB_B, email: SHARED_EMAIL, emailVerified: true, name: "Dual Identity" },
+      });
+      trustFixtureCa(idpA.origin);
+      trustFixtureCa(idpB.origin);
 
-    const configs = resolveFixture(
-      [
-        oidcRow(idpA),
-        oidcRow(idpB, {
-          id: ROW_B_ID,
-          display_name: "Contractor IdP",
-          issuer: idpB.issuer,
-          discovery_url: idpB.discoveryUrl,
-          client_id: CLIENT_B_ID,
-          trusted_jwt_issuer_id: ISSUER_B_ROW_ID,
-        }),
-      ],
-      [
-        issuerRow(OIDC_ISSUER_ROW_ID, PRE_4B_ISSUER),
-        issuerRow(ISSUER_B_ROW_ID, PROVIDER_B_ISSUER),
-      ],
-      new Map([
-        [OIDC_ROW_ID, OIDC_CLIENT_SECRET],
-        [ROW_B_ID, CLIENT_B_SECRET],
-      ]),
-    );
-    server = startConsoleServer({ env: envFor(origin), configs, database: pool }, port);
+      const configs = resolveFixture(
+        [
+          oidcRow(idpA),
+          oidcRow(idpB, {
+            id: ROW_B_ID,
+            display_name: "Contractor IdP",
+            issuer: idpB.issuer,
+            discovery_url: idpB.discoveryUrl,
+            client_id: CLIENT_B_ID,
+            trusted_jwt_issuer_id: ISSUER_B_ROW_ID,
+          }),
+        ],
+        [
+          issuerRow(OIDC_ISSUER_ROW_ID, PRE_4B_ISSUER),
+          issuerRow(ISSUER_B_ROW_ID, PROVIDER_B_ISSUER),
+        ],
+        new Map([
+          [OIDC_ROW_ID, OIDC_CLIENT_SECRET],
+          [ROW_B_ID, CLIENT_B_SECRET],
+        ]),
+      );
+      return pending.serve({ env: envFor(origin), configs, database: pool });
+    });
   });
 
   afterAll(async () => {

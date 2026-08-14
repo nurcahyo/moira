@@ -13,10 +13,10 @@
 
 import { afterAll, describe, expect, test } from "bun:test";
 
-import { reserveConsolePort } from "../support/console-server";
 import { trustFixtureCa, untrustFixtureCa } from "../support/fixture-tls";
 import { startMockIdp, type MockIdp } from "../support/mock-idp";
 import { restoreDomWhatwgGlobals, useNativeWhatwgGlobals } from "../support/native-globals";
+import { withFreePort } from "../support/ports";
 
 describe("startMockIdp with a fixed publicOrigin", () => {
   let idp: MockIdp | undefined;
@@ -32,39 +32,47 @@ describe("startMockIdp with a fixed publicOrigin", () => {
     // way of a real TLS handshake. See `native-globals.ts`.
     useNativeWhatwgGlobals();
 
-    const port = reserveConsolePort();
     const host = "127.0.0.1";
-    const origin = `https://${host}:${port}`;
-
-    idp = await startMockIdp({
-      clientId: "moira-console.apps.mock-idp.test",
-      clientSecret: "mock-idp-client-secret-do-not-reuse",
-      user: {
-        sub: "mock-idp-subject-public-origin",
-        email: "operator@example.com",
-        emailVerified: true,
-        name: "Console Operator",
-      },
-      publicOrigin: { host, port },
-    });
+    // The one place in this suite where the port is an INPUT rather than an
+    // output: the whole point of `publicOrigin` is that the issuer is decided
+    // before the socket exists, so `port: 0` cannot be used here the way every
+    // other fixture uses it. `withFreePort` retries on `EADDRINUSE` with a fresh
+    // number instead — see `tests/support/ports.ts` and issue #195.
+    const started = await withFreePort(async (port) => ({
+      idp: await startMockIdp({
+        clientId: "moira-console.apps.mock-idp.test",
+        clientSecret: "mock-idp-client-secret-do-not-reuse",
+        user: {
+          sub: "mock-idp-subject-public-origin",
+          email: "operator@example.com",
+          emailVerified: true,
+          name: "Console Operator",
+        },
+        publicOrigin: { host, port },
+      }),
+      origin: `https://${host}:${port}`,
+    }));
+    // Held for `afterAll` as well as used below.
+    idp = started.idp;
+    const origin = started.origin;
     trustFixtureCa(origin);
 
     // The returned handle: not derived from the OS-assigned port, but from the
     // fixed one this test chose.
-    expect(idp.origin).toBe(origin);
-    expect(idp.issuer).toBe(origin);
-    expect(idp.discoveryUrl).toBe(`${origin}/.well-known/openid-configuration`);
-    expect(idp.jwksUrl).toBe(`${origin}/jwks`);
-    expect(idp.authorizationUrl).toBe(`${origin}/authorize`);
-    expect(idp.tokenUrl).toBe(`${origin}/token`);
-    expect(idp.userInfoUrl).toBe(`${origin}/userinfo`);
+    expect(started.idp.origin).toBe(origin);
+    expect(started.idp.issuer).toBe(origin);
+    expect(started.idp.discoveryUrl).toBe(`${origin}/.well-known/openid-configuration`);
+    expect(started.idp.jwksUrl).toBe(`${origin}/jwks`);
+    expect(started.idp.authorizationUrl).toBe(`${origin}/authorize`);
+    expect(started.idp.tokenUrl).toBe(`${origin}/token`);
+    expect(started.idp.userInfoUrl).toBe(`${origin}/userinfo`);
 
     // The discovery document itself — fetched over the real socket, not
     // asserted against the handle's own fields — has to say the same thing.
     // This is the check a rewriting proxy cannot satisfy: it would leave the
     // signed `iss` on the eventual ID token pointing at the upstream origin
     // while this document (or the reverse) pointed at the public one.
-    const response = await fetch(idp.discoveryUrl);
+    const response = await fetch(started.idp.discoveryUrl);
     expect(response.status).toBe(200);
     const discovery = (await response.json()) as Record<string, unknown>;
     expect(discovery["issuer"]).toBe(origin);
