@@ -235,14 +235,35 @@ describe("rule (b) — an allowed file may hold the secret but never forward it"
 const MODAL_MODULE = "modules/secrets/OnceOnlySecretModal";
 
 /**
- * The single module permitted to render it.
+ * The modules permitted to render it.
  *
- * One answer, like the allow-list above, and for the same reason: "which
- * component may put the plaintext on screen" and "which component may hand it
- * there" are both one-answer questions, and the second one had no guard at all
- * until this wave.
+ * NOT the same kind of list as `SECRET_PROP_ALLOW_LIST` above, and the
+ * difference is why this one can have two entries while that one cannot.
+ * "Which component may HOLD the plaintext" is a one-answer question — a second
+ * answer means a second implementation of containment, and rule (b) would have
+ * to scan both. "Which component may HAND it there" is a per-FEATURE question:
+ * each mount is one credential a deployment can mint, and refusing a second
+ * would mean either shipping no UI for it or building a second modal, which is
+ * the thing rule (a) forbids.
+ *
+ * So the bar for an entry is the argument the first one made, restated for the
+ * new feature, plus the per-file assertion below:
+ *
+ *   `modules/admins/InviteAdminForm.tsx`  the once-only invitation token.
+ *   `modules/keys/MintKeyForm.tsx`        the once-only consumer key (issue
+ *                                         #180) — the credential an application
+ *                                         presents to Moira. Holds
+ *                                         `MintedConsumerKey` and reads
+ *                                         `.secret` at the JSX site, exactly as
+ *                                         the first entry holds its envelope.
+ *
+ * An empty set still fails: it would mean the needle in `secret-leak.e2e.ts` is
+ * guarding a component nothing uses.
  */
-const MODAL_MOUNT_ALLOW_LIST: readonly string[] = ["modules/admins/InviteAdminForm.tsx"];
+const MODAL_MOUNT_ALLOW_LIST: readonly string[] = [
+  "modules/admins/InviteAdminForm.tsx",
+  "modules/keys/MintKeyForm.tsx",
+];
 
 /**
  * A standalone binding of the token.
@@ -293,25 +314,25 @@ function modalImporters(): string[] {
     });
 }
 
-describe("rule (c) — exactly one module mounts the once-only modal", () => {
+describe("rule (c) — only named modules mount the once-only modal", () => {
   test("the file walk found the tree at all", () => {
     const files = everySourceFile();
     expect(files.length, `walked ${files.length} files`).toBeGreaterThanOrEqual(25);
-    expect(files, "the allow-listed mount is not in the scan set").toContain(
-      MODAL_MOUNT_ALLOW_LIST[0]!,
-    );
+    for (const mount of MODAL_MOUNT_ALLOW_LIST) {
+      expect(files, `${mount} is not in the scan set`).toContain(mount);
+    }
   });
 
   test("the mounting set is exactly the allow-list", () => {
-    // Both directions. A second mount point means a second place the plaintext
-    // is handled and a second render to reason about; a mounting set that has
-    // become empty means the invitation UI was removed and this rule, plus the
-    // e2e needle it backs, are now asserting nothing.
+    // Both directions. An UNLISTED mount is a place the plaintext is handled
+    // that nobody argued for and that the per-file assertion below does not
+    // scan; a mounting set that has become empty means the UI was removed and
+    // this rule, plus the e2e needle it backs, are now asserting nothing.
     expect(
       modalImporters().sort(),
-      "who renders the once-only token is a one-answer question. A new entry needs the same " +
-        "argument the first one made, and an empty set means the needle in " +
-        "e2e/secret-leak.e2e.ts is guarding a component nothing uses.",
+      "a module mounts the once-only modal without being listed. A new entry needs the same " +
+        "argument the first one made, written where the list is, and an empty set means the " +
+        "needle in e2e/secret-leak.e2e.ts is guarding a component nothing uses.",
     ).toEqual([...MODAL_MOUNT_ALLOW_LIST].sort());
   });
 
@@ -323,13 +344,14 @@ describe("rule (c) — exactly one module mounts the once-only modal", () => {
       //
       // which puts the plaintext into a named binding inside a file that is NOT
       // on the rule-(b) allow-list, so nothing would scan how it flows from
-      // there. Holding `AdminInviteSecretResponse` and reading `.secret` at the
-      // JSX site keeps the count of bindings at one — in the modal.
+      // there. Holding the ENVELOPE — `AdminInviteSecretResponse` for the
+      // invitation, `MintedConsumerKey` for the key — and reading `.secret` at
+      // the JSX site keeps the count of bindings at one, in the modal.
       const code = readConsoleFile(file).replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "");
       expect(
         STANDALONE_SECRET_BINDING.test(code),
-        `${file} binds the invitation token to a standalone identifier. Hold the whole ` +
-          "AdminInviteSecretResponse and read `.secret` where the modal is rendered.",
+        `${file} binds the plaintext to a standalone identifier. Hold the whole response ` +
+          "envelope and read `.secret` where the modal is rendered.",
       ).toBe(false);
       // And it really does mount the modal, so the rule above is not passing on
       // a file that stopped being relevant.

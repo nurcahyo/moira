@@ -61,6 +61,7 @@ interface NavItem {
 const NAV_ITEMS: readonly NavItem[] = [
   { href: "/", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_home },
   { href: "/settings/llm", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_llm_settings },
+  { href: "/settings/keys", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_keys },
   { href: "/admins", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_admins },
 ];
 
@@ -124,7 +125,9 @@ export function ConsoleHeader({ fetchImpl, navigate }: ConsoleHeaderProps) {
         >
           {t(CONSOLE_MESSAGE_KEYS.chrome_sign_out)}
         </Button>
-        {phase === "pending" && <Spinner size="sm" label={t(CONSOLE_MESSAGE_KEYS.chrome_sign_out_pending)} />}
+        {phase === "pending" && (
+          <Spinner size="sm" label={t(CONSOLE_MESSAGE_KEYS.chrome_sign_out_pending)} />
+        )}
       </div>
 
       {phase === "failed" && (

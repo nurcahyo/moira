@@ -1,6 +1,32 @@
 "use client";
 
-// The once-only invitation token, shown exactly once.
+// The once-only credential, shown exactly once.
+//
+// ============================================================================
+// TWO CALLERS, ONE COMPONENT, AND THAT IS THE RULE RATHER THAN AN ACCIDENT
+// ============================================================================
+//
+// This started as the invitation-token modal. Issue #180 needed the same thing
+// for a minted consumer key, and the obvious move — a second modal beside this
+// one — is exactly what `no-secret-props.test.ts` forbids: its allow-list is
+// asserted to hold AT MOST ONE entry, because "which component may hold the
+// plaintext" is a one-answer question. So this component was generalised
+// instead, and the generalisation is deliberately thin: two optional props and
+// a catalog key, no discriminated union, no envelope-shaped parameter.
+//
+//   `inviteBaseUrl`   present only for an invitation, where a link exists to
+//                     compose. A consumer key has no redemption URL.
+//   `notice`          Moira's own `ResponseText`, present only on the invitation
+//                     envelope. `ApiKeySecretResponse` carries none, so the
+//                     consumer-key caller passes `noticeKey` and the console's
+//                     own copy is rendered rather than a fabricated
+//                     server-shaped message.
+//   `secretLabelKey`  "Invitation token" or "Consumer key". A label that said
+//                     the wrong one is a small lie about what the operator is
+//                     holding.
+//   `headingKey`      the same problem one line higher up. The default reads
+//                     "Invitation created", which above a minted API key is
+//                     wrong in the first words an operator reads.
 //
 // ============================================================================
 // NOTHING REDACTS THIS. READ THIS BEFORE ASSUMING SOMETHING DOES.
@@ -66,7 +92,7 @@ import { CopyButton } from "@/components/atoms/CopyButton";
 import { Button } from "@/components/atoms/Button";
 import { Dialog } from "@/components/atoms/Dialog";
 import { CONSOLE_MESSAGE_KEYS, t } from "@/lib/i18n";
-import type { AdminInviteRecord, ResponseText } from "@/lib/types";
+import type { ResponseText } from "@/lib/types";
 
 import styles from "./OnceOnlySecretModal.module.css";
 
@@ -82,12 +108,44 @@ export interface OnceOnlySecretModalProps {
    * checks.
    */
   readonly secret: string | null;
-  /** The sanitized record. Carries no token by construction. */
-  readonly resource: AdminInviteRecord;
-  /** Moira's success notice. Rendered through `t()`, never as hardcoded English. */
-  readonly notice: ResponseText;
-  /** e.g. `https://console.example/invite`. The token is appended here. */
-  readonly inviteBaseUrl: string;
+  /**
+   * The sanitized record. Carries no plaintext by construction.
+   *
+   * Structural rather than one named DTO: an invitation always has an
+   * `expires_at` and a consumer key need not, and the expiry line is the only
+   * thing this component reads off it. Widening it to a union of two records
+   * would let this file reach for fields neither caller intends it to render.
+   */
+  readonly resource: { readonly expires_at?: string | null };
+  /**
+   * Moira's own success notice, when the envelope carries one.
+   *
+   * `AdminInviteSecretResponse` requires it; `ApiKeySecretResponse` has no such
+   * field, so that caller passes `noticeKey` instead. Fabricating a
+   * `ResponseText` for it would put console copy behind a shape that claims to
+   * be Moira's.
+   */
+  readonly notice?: ResponseText;
+  /** The console's own notice copy, for an envelope that carries none. */
+  readonly noticeKey?: string;
+  /**
+   * The dialog's heading and accessible name.
+   *
+   * Defaults to the invitation wording this component shipped with. A consumer
+   * key passes its own: the default reads "Invitation created", which is a
+   * plainly wrong label to put above a minted API key — and it is the FIRST
+   * thing an operator reads, so getting it wrong is not cosmetic.
+   */
+  readonly headingKey?: string;
+  /** Which credential this is, for the plaintext field's label. */
+  readonly secretLabelKey?: string;
+  /**
+   * e.g. `https://console.example/invite`. The token is appended here.
+   *
+   * Omitted when there is no link to compose — a consumer key is presented on a
+   * header, not redeemed at a URL.
+   */
+  readonly inviteBaseUrl?: string;
   readonly open: boolean;
   readonly onDismiss: () => void;
 }
@@ -96,6 +154,9 @@ export function OnceOnlySecretModal({
   secret,
   resource,
   notice,
+  noticeKey,
+  headingKey,
+  secretLabelKey,
   inviteBaseUrl,
   open,
   onDismiss,
@@ -105,16 +166,24 @@ export function OnceOnlySecretModal({
 
   // Composed inline, not stored: one expression, one holder.
   const inviteUrl =
-    secret === null ? null : `${inviteBaseUrl.replace(/\/+$/, "")}/${encodeURIComponent(secret)}`;
+    secret === null || inviteBaseUrl === undefined
+      ? null
+      : `${inviteBaseUrl.replace(/\/+$/, "")}/${encodeURIComponent(secret)}`;
 
   return (
-    <Dialog open={open} label={t(CONSOLE_MESSAGE_KEYS.secret_modal_heading)}>
-      <h2 className={styles.heading}>{t(CONSOLE_MESSAGE_KEYS.secret_modal_heading)}</h2>
+    <Dialog open={open} label={t(headingKey ?? CONSOLE_MESSAGE_KEYS.secret_modal_heading)}>
+      <h2 className={styles.heading}>
+        {t(headingKey ?? CONSOLE_MESSAGE_KEYS.secret_modal_heading)}
+      </h2>
 
-      {/* Moira's own notice, through the i18n helper. `message_args` may be
-          absent; `message` is always present on this envelope and is the
-          fallback. */}
-      <p className={styles.notice}>{t(notice.message_key, notice.message_args, notice.message)}</p>
+      {/* Moira's own notice when the envelope carries one, through the i18n
+          helper — `message_args` may be absent, `message` is the fallback — and
+          the console's own catalogued copy when it does not. */}
+      <p className={styles.notice}>
+        {notice === undefined
+          ? t(noticeKey ?? CONSOLE_MESSAGE_KEYS.secret_shown_once)
+          : t(notice.message_key, notice.message_args, notice.message)}
+      </p>
 
       {secret === null ? (
         <p className={styles.replay} role="status">
@@ -128,7 +197,7 @@ export function OnceOnlySecretModal({
 
           <div className={styles.field}>
             <span className={styles.label} id={`${tokenId}-label`}>
-              {t(CONSOLE_MESSAGE_KEYS.secret_token_label)}
+              {t(secretLabelKey ?? CONSOLE_MESSAGE_KEYS.secret_token_label)}
             </span>
             <code className={styles.value} id={tokenId}>
               {secret}
@@ -136,20 +205,30 @@ export function OnceOnlySecretModal({
             <CopyButton targetId={tokenId} aria-describedby={`${tokenId}-label`} />
           </div>
 
-          <div className={styles.field}>
-            <span className={styles.label} id={`${linkId}-label`}>
-              {t(CONSOLE_MESSAGE_KEYS.secret_link_label)}
-            </span>
-            <code className={styles.value} id={linkId}>
-              {inviteUrl}
-            </code>
-            <CopyButton targetId={linkId} aria-describedby={`${linkId}-label`} />
-          </div>
+          {/* Only where there is a link to compose. A consumer key is presented
+              on a request header and has no redemption URL, and a field showing
+              `null` would invite somebody to make one up. */}
+          {inviteUrl !== null && (
+            <div className={styles.field}>
+              <span className={styles.label} id={`${linkId}-label`}>
+                {t(CONSOLE_MESSAGE_KEYS.secret_link_label)}
+              </span>
+              <code className={styles.value} id={linkId}>
+                {inviteUrl}
+              </code>
+              <CopyButton targetId={linkId} aria-describedby={`${linkId}-label`} />
+            </div>
+          )}
         </>
       )}
 
+      {/* An unbounded credential is stated as such. A blank expiry line reads as
+          missing data, which is the wrong impression to leave about a key that
+          works until somebody revokes it. */}
       <p className={styles.expiry}>
-        {t(CONSOLE_MESSAGE_KEYS.secret_expires_at, { expires_at: resource.expires_at })}
+        {resource.expires_at === undefined || resource.expires_at === null
+          ? t(CONSOLE_MESSAGE_KEYS.secret_no_expiry)
+          : t(CONSOLE_MESSAGE_KEYS.secret_expires_at, { expires_at: resource.expires_at })}
       </p>
 
       <Button type="button" variant="primary" onClick={onDismiss}>

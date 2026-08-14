@@ -143,6 +143,14 @@ const ROUTES_NOT_AUDITED_PENDING_AUTHENTICATED_E2E: readonly string[] = [
   // the second stack. See the UPDATE in this file's header for why the entry
   // stays.
   "/settings/llm",
+  // Issue #180. Gated like the rest of `(console)`, so the walker asserts the
+  // redirect and audits nothing. It is a REAL gap rather than `/settings/llm`'s
+  // bookkeeping entry: no authenticated spec renders this screen yet, so its
+  // forms — including the one that puts a minted key on screen — have never been
+  // through axe. Closing it needs the same shape as the LLM one, a spec against
+  // the authenticated stack, and that stack's Moira fixture has no application
+  // or consumer-key surface yet.
+  "/settings/keys",
 ];
 
 /** The pathname a route's fixture URL resolves to. */

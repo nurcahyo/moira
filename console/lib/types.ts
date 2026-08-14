@@ -100,6 +100,16 @@ export type AuthMethod = "google_oauth" | "generic_oidc" | "jwks" | "github_oaut
 /** `#/components/schemas/ResourceStatus` */
 export type ResourceStatus = "active" | "disabled" | "deleted";
 
+/**
+ * `#/components/schemas/KeyStatus`.
+ *
+ * Client-safe, unlike the rest of the consumer-key family: it is four words, it
+ * names no secret, and `/settings/keys` renders it. The shapes that carry a key
+ * or a hash of one live in `lib/moira-api-key-types.ts`, which the browser
+ * cannot load at all.
+ */
+export type KeyStatus = "active" | "revoked" | "expired" | "deleted";
+
 /** `#/components/schemas/AdminIdentityStatus` */
 export type AdminIdentityStatus = "active" | "revoked";
 
@@ -1203,10 +1213,7 @@ assertKeyContract<
  * would make this type say something `#/components/schemas/ProviderModelCreateRequest`
  * does not, and the value is a free-form JSON document whose shape Moira owns.
  */
-export type ConsoleProviderModelCreateRequest = Omit<
-  ProviderModelCreateRequest,
-  "capabilities"
-> & {
+export type ConsoleProviderModelCreateRequest = Omit<ProviderModelCreateRequest, "capabilities"> & {
   capabilities: JsonValue;
 };
 
@@ -1503,6 +1510,67 @@ assertKeyContract<
 >();
 
 /* -------------------------------------------------------------------------- */
+/* Applications and consumer keys (issue #180)                                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * `#/components/schemas/ApplicationRecord`.
+ *
+ * An application is what a consumer key HANGS OFF: `ConsumerKeyCreateRequest`
+ * requires an `application_id`, so a console that mints keys has to be able to
+ * create and list these too. It is not an optional nicety of the keys screen —
+ * it is a precondition of it.
+ */
+export interface ApplicationRecord {
+  id: string;
+  display_name: string;
+  status: ResourceStatus;
+  metadata: JsonValue;
+  created_at: string;
+  updated_at: string;
+  version: number;
+  application_slug?: string | null;
+  external_application_id?: string | null;
+  deleted_at?: string | null;
+}
+
+export const APPLICATION_RECORD_CONTRACT = {
+  schema: "ApplicationRecord",
+  required: ["id", "display_name", "status", "metadata", "created_at", "updated_at", "version"],
+  optional: ["application_slug", "external_application_id", "deleted_at"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ApplicationRecord,
+    (typeof APPLICATION_RECORD_CONTRACT)["required"][number],
+    (typeof APPLICATION_RECORD_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/ApplicationCreateRequest`. `additionalProperties: false`. */
+export interface ApplicationCreateRequest {
+  display_name: string;
+  application_slug?: string | null;
+  external_application_id?: string | null;
+  metadata?: JsonValue;
+}
+
+export const APPLICATION_CREATE_REQUEST_CONTRACT = {
+  schema: "ApplicationCreateRequest",
+  required: ["display_name"],
+  optional: ["application_slug", "external_application_id", "metadata"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ApplicationCreateRequest,
+    (typeof APPLICATION_CREATE_REQUEST_CONTRACT)["required"][number],
+    (typeof APPLICATION_CREATE_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/* -------------------------------------------------------------------------- */
 /* Error envelope (server-side shape — never crosses to the browser)          */
 /* -------------------------------------------------------------------------- */
 
@@ -1602,6 +1670,8 @@ export const SCHEMA_CONTRACTS: readonly SchemaContract[] = [
   ROUTING_POLICY_CREATE_REQUEST_CONTRACT,
   ROUTING_POLICY_PATCH_REQUEST_CONTRACT,
   ROUTING_POLICY_RECORD_CONTRACT,
+  APPLICATION_RECORD_CONTRACT,
+  APPLICATION_CREATE_REQUEST_CONTRACT,
   ERROR_DETAIL_CONTRACT,
   ERROR_RESPONSE_CONTRACT,
 ];

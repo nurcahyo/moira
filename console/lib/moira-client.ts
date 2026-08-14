@@ -48,6 +48,11 @@ import "server-only";
 
 import { MoiraRequestError, toMoiraError, toTransportError } from "./errors";
 import type {
+  ApiKeyRecord,
+  ApiKeySecretResponse,
+  ConsumerKeyCreateRequest,
+} from "./moira-api-key-types";
+import type {
   ApiKeyCredentialSecret,
   ConsoleApiKeyCredentialCreateRequest,
   CredentialRecord,
@@ -55,6 +60,8 @@ import type {
 } from "./moira-credential-types";
 import type {
   AdminIdentityPatchRequest,
+  ApplicationCreateRequest,
+  ApplicationRecord,
   AdminIdentityRecord,
   AdminInviteCreateRequest,
   AdminInvitePreviewRequest,
@@ -643,6 +650,73 @@ export const MOIRA_OPERATIONS = {
     declaresIdempotencyKey: false,
     requiresIfMatch: true,
   }),
+
+  /**
+   * Applications and consumer keys (issue #180) — the credential an APPLICATION
+   * presents to Moira, as opposed to the credential Moira presents to a provider.
+   *
+   * Two families, not one, and not by choice: `ConsumerKeyCreateRequest` requires
+   * an `application_id`, so a console that mints keys must be able to create and
+   * list applications too.
+   *
+   * THE HEADER SHAPES ARE NOT THE PROVIDER FAMILIES' SHAPES. Transcribed from
+   * `docs/openapi.json`, where they differ in ways worth naming because guessing
+   * by analogy gets each one wrong:
+   *
+   *   `revoke_consumer_key`   POST, and declares NEITHER `If-Match` NOR
+   *                           `Idempotency-Key` — unlike every provider-family
+   *                           disable, which requires `If-Match`. Sending one is
+   *                           an unknown header, not a stricter request.
+   *   `create_consumer_key`   optional `Idempotency-Key`, no `If-Match`.
+   *   `create_application`    same.
+   *
+   * `delete_*` and `rotate_consumer_key` are deliberately UNREGISTERED. Deletion
+   * of a key with live traffic is not an operation an operator should reach
+   * through two clicks — revoke is the reversible-in-consequence one and is what
+   * the screen offers; rotation is a real need with a real design question (the
+   * overlap window, `revoke_previous_immediately`) that this issue does not
+   * settle, and a half-built rotate is worse than none.
+   */
+  listApplications: op({
+    id: "list_applications",
+    method: "GET",
+    path: "/api/v1/admin/applications",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: false,
+  }),
+  createApplication: op({
+    id: "create_application",
+    method: "POST",
+    path: "/api/v1/admin/applications",
+    credential: "admin",
+    declaresIdempotencyKey: true,
+    requiresIfMatch: false,
+  }),
+  listConsumerKeys: op({
+    id: "list_consumer_keys",
+    method: "GET",
+    path: "/api/v1/admin/consumer-keys",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: false,
+  }),
+  createConsumerKey: op({
+    id: "create_consumer_key",
+    method: "POST",
+    path: "/api/v1/admin/consumer-keys",
+    credential: "admin",
+    declaresIdempotencyKey: true,
+    requiresIfMatch: false,
+  }),
+  revokeConsumerKey: op({
+    id: "revoke_consumer_key",
+    method: "POST",
+    path: "/api/v1/admin/consumer-keys/{id}/revoke",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: false,
+  }),
 } as const;
 
 export type MoiraOperationName = keyof typeof MOIRA_OPERATIONS;
@@ -990,7 +1064,11 @@ export function assertCredentialCreateIsSafe(body: Record<string, unknown>): voi
     );
   }
   const scope = body["scope"];
-  if (typeof scope !== "object" || scope === null || typeof (scope as { type?: unknown }).type !== "string") {
+  if (
+    typeof scope !== "object" ||
+    scope === null ||
+    typeof (scope as { type?: unknown }).type !== "string"
+  ) {
     throw new MoiraClientContractError(
       "credential create body requires a `scope` carrying a `type` discriminator " +
         "(global | tenant | application | user)",
@@ -1774,6 +1852,89 @@ export class MoiraClient {
       pathParams: { id },
       ifMatch,
     });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* Applications and consumer keys (issue #180)                            */
+  /* ---------------------------------------------------------------------- */
+
+  async listApplications(
+    options: { readonly limit?: number; readonly cursor?: string; readonly status?: string } = {},
+  ): Promise<ListResponse<ApplicationRecord>> {
+    return this.#request<ListResponse<ApplicationRecord>>("listApplications", {
+      query: { limit: options.limit, cursor: options.cursor, status: options.status },
+    });
+  }
+
+  /**
+   * `POST /api/v1/admin/applications`.
+   *
+   * `idempotencyKey` should be derived from the application's own identity — its
+   * slug, or failing that its display name — so a double-submit replays instead
+   * of landing two applications an operator then has to tell apart by their
+   * creation timestamps.
+   */
+  async createApplication(
+    body: ApplicationCreateRequest,
+    options: { readonly idempotencyKey?: string } = {},
+  ): Promise<ApplicationRecord> {
+    return this.#request<ApplicationRecord>("createApplication", {
+      body,
+      idempotencyKey: options.idempotencyKey,
+    });
+  }
+
+  async listConsumerKeys(
+    options: {
+      readonly limit?: number;
+      readonly cursor?: string;
+      readonly status?: string;
+      readonly application_id?: string;
+    } = {},
+  ): Promise<ListResponse<ApiKeyRecord>> {
+    return this.#request<ListResponse<ApiKeyRecord>>("listConsumerKeys", {
+      query: {
+        limit: options.limit,
+        cursor: options.cursor,
+        status: options.status,
+        application_id: options.application_id,
+      },
+    });
+  }
+
+  /**
+   * `POST /api/v1/admin/consumer-keys` — **THE ONE CALL IN THIS CLIENT THAT
+   * RETURNS A PLAINTEXT CONSUMER KEY.**
+   *
+   * The response is `ApiKeySecretResponse` and it is returned RAW: `#request`
+   * runs `toMoiraError` only on a non-ok response, so nothing sanitises a 201
+   * body. Every caller is therefore handling a live credential, and the rule
+   * that follows from it is the same one the invitation mint carries — do not
+   * log it, do not widen it into a wrapper, and hand it to exactly one component.
+   *
+   * `secret` may be absent on an idempotent replay. That is a SUCCESS; see the
+   * note on the type.
+   */
+  async createConsumerKey(
+    body: ConsumerKeyCreateRequest,
+    options: { readonly idempotencyKey?: string } = {},
+  ): Promise<ApiKeySecretResponse> {
+    return this.#request<ApiKeySecretResponse>("createConsumerKey", {
+      body,
+      idempotencyKey: options.idempotencyKey,
+    });
+  }
+
+  /**
+   * `POST /api/v1/admin/consumer-keys/{id}/revoke`.
+   *
+   * NO `If-Match`, unlike every provider-family disable — the operation declares
+   * none, and `#buildHeaders` would send an unknown header rather than a
+   * stricter request. Confirmed against the committed spec, not inferred from
+   * the neighbouring families.
+   */
+  async revokeConsumerKey(id: string): Promise<ApiKeyRecord> {
+    return this.#request<ApiKeyRecord>("revokeConsumerKey", { pathParams: { id } });
   }
 
   /* ---------------------------------------------------------------------- */

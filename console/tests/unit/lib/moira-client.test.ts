@@ -171,7 +171,7 @@ describe("Idempotency-Key is sent only where the spec declares it", () => {
     expect(stub.requests[0]?.headers["Idempotency-Key"]).toBe("idem-1");
   });
 
-  test("exactly thirteen of the registry's operations declare a key", () => {
+  test("exactly fifteen of the registry's operations declare a key", () => {
     // Every entry is read off the spec, not assumed;
     // `tests/contract/openapi-contract.test.ts` re-derives each flag from
     // `docs/openapi.json` on every run.
@@ -187,13 +187,21 @@ describe("Idempotency-Key is sent only where the spec declares it", () => {
     // does, and `rotateProviderCredential` declares one ALONGSIDE a required
     // `If-Match` — the only entry here besides `patchAdminIdentity` that carries
     // both.
+    //
+    // TWO MORE WITH ISSUE #180, and the ABSENCE is the informative half:
+    // `createApplication` and `createConsumerKey` declare a key, and
+    // `revokeConsumerKey` declares neither that nor `If-Match` — unlike every
+    // provider-family disable. Read off the spec; the neighbouring families would
+    // have predicted the wrong answer.
     const withKey = (Object.keys(MOIRA_OPERATIONS) as MoiraOperationName[])
       .filter((name) => MOIRA_OPERATIONS[name].declaresIdempotencyKey)
       .sort();
     expect(withKey).toEqual([
       "claimAdminIdentity",
       "createAdminInvite",
+      "createApplication",
       "createAuthProvider",
+      "createConsumerKey",
       "createProvider",
       "createProviderCredential",
       "createProviderModel",
@@ -584,9 +592,9 @@ describe("the ownership surface", () => {
     const { stub, client } = clientWith({
       "PATCH /api/v1/admin/admin-identities/grant-1": ok(identityRecord),
     });
-    await expect(
-      client.patchAdminIdentity("grant-1", { is_primary: true }, ""),
-    ).rejects.toThrow(MoiraClientContractError);
+    await expect(client.patchAdminIdentity("grant-1", { is_primary: true }, "")).rejects.toThrow(
+      MoiraClientContractError,
+    );
     expect(stub.requests).toEqual([]);
   });
 
@@ -674,6 +682,15 @@ const credentialRecord = {
 const OPERATIONS_OUTSIDE_THE_LLM_AND_AUTH_PROVIDER_SURFACES = [
   "claimAdminIdentity",
   "createAdminInvite",
+  // Issue #180. Applications and consumer keys are APPLICATION IDENTITY, not LLM
+  // runtime configuration: nothing here decides which model a prompt reaches,
+  // and registering them under a collection `LLM_CONFIG_OPERATION_NAMES` derives
+  // from would have handed them that surface's assertions by accident.
+  "createApplication",
+  "createConsumerKey",
+  "listApplications",
+  "listConsumerKeys",
+  "revokeConsumerKey",
   "createTrustedJwtIssuer",
   "deleteAdminIdentity",
   "enableTrustedJwtIssuer",
@@ -1023,9 +1040,9 @@ describe("the credential builder — the untagged-union trap", () => {
   });
 
   test("rotate refuses endpoint: null and an empty replacement key", () => {
-    expect(() => assertCredentialRotateIsSafe({ secret: { api_key: "k", endpoint: null } })).toThrow(
-      /endpoint/,
-    );
+    expect(() =>
+      assertCredentialRotateIsSafe({ secret: { api_key: "k", endpoint: null } }),
+    ).toThrow(/endpoint/);
     expect(() => assertCredentialRotateIsSafe({ secret: { api_key: "" } })).toThrow(/api_key/);
     expect(() => assertCredentialRotateIsSafe({ secret: { api_key: "k2" } })).not.toThrow();
   });

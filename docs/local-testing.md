@@ -320,11 +320,6 @@ What is still missing:
    `auth_provider_url_not_allowed`. So the IdP you point the wizard at has to be
    reachable over TLS from the console process. This is a constraint on the
    local recipe, not a blocker: `mkcert` satisfies it in one command, below.
-2. **No console screen mints a consumer key.** Setup ends with an operator who
-   can administer the deployment; the API key an *application* presents still
-   comes from `make seed` or a hand-written admin call. `console/lib/moira-client.ts`
-   carries no consumer-key operation at all, so this is a missing feature rather
-   than a missing page.
 
 On a fresh database `auth_provider_settings` and `trusted_jwt_issuers` are both
 empty, which is why `/login` says *"No sign-in provider is enabled yet."* —
