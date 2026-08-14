@@ -43,6 +43,7 @@ ROUTE ?= general
 
 .PHONY: help setup start env env-force env-rotate up down reset logs ps psql redis \
         build migrate run serve release bootstrap-key seed test-seed-local smoke execute-test \
+        branch-invariant test-branch-invariant \
         keyring rotate-keys rotation-gate health openapi docs \
         console-install console-db console-dev console-build console-start console-check \
         fmt fmt-check clippy test nextest gates gates-fast check doctor clean
@@ -146,6 +147,12 @@ seed: ## Register a provider/model/credential/policy so a prompt has somewhere t
 
 test-seed-local: ## Unit-test scripts/seed-local.sh's pure logic — no server, no database
 	python3 -m unittest discover -s scripts -p 'seed_local_lib_test.py' -v
+
+branch-invariant: ## Check main ⊆ develop against origin (CONVENTIONS §1A) — no build, seconds
+	@scripts/branch-invariant.sh
+
+test-branch-invariant: ## Drive the main ⊆ develop guard through every state it classifies
+	@scripts/branch-invariant-test.sh
 
 smoke: ## End-to-end check: health, contract, and a real completion with real tokens
 	$(ENV) scripts/smoke.sh
