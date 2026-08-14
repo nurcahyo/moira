@@ -113,8 +113,46 @@ debug = 1
 [profile.test]
 debug = 1
 
-# Deliberately NOT setting `[profile.dev.package."*"] opt-level = 3`, which is the usual companion
-# advice. It optimises all 405 dependencies to make tests run faster at runtime — but this suite is
-# Postgres-I/O-bound, not CPU-bound, so the runtime win is small, while the cost is paid again in
-# full every time the dependency graph is rebuilt. Worth revisiting only if profiling ever shows
-# tests are CPU-bound.
+# `[profile.dev.package."*"] opt-level = 3` is still declined — optimising all 405 dependencies
+# costs more rebuild time than it returns. But the "this suite is Postgres-I/O-bound, not CPU-bound"
+# claim this comment used to make was wrong for the heaviest targets: they are dominated by Argon2id.
+# `ApiKeyHasher::verify` (src/security/api_keys.rs:211) is `Argon2::default()` — m=19456 KiB, t=2 —
+# and runs per authenticated request with no memoisation, compiled at opt-level 0.
+#
+# MEASURED (2026-08-14), and only this. 8-core Apple M2, Postgres in Docker Desktop, test binaries
+# invoked DIRECTLY so cargo is out of the loop, one dedicated CARGO_TARGET_DIR, arms interleaved
+# A/B/A/B, test source byte-identical between arms. The metric is libtest's own
+# "test result: … finished in Ns" line. Median of the 4 cleanest samples per arm, with the range:
+#
+#   secret_leak_snapshots   18.30s [17.90-18.69]  ->  2.75s [2.70-2.77]   6.6x   ranges disjoint
+#   content_leak_snapshots   9.39s [ 9.24- 9.68]  ->  2.01s [1.95-2.02]   4.7x   ranges disjoint
+#
+# Honest caveat: another agent's test suite loaded this machine during collection. Over ALL 50
+# samples the secret ranges stay disjoint, but the content ranges DO overlap (worst AFTER 9.35s vs
+# best BEFORE 9.24s) — every AFTER sample above 6s was taken at 1-3% CPU idle. Contention can only
+# inflate a runtime, so the k-fastest estimator above is applied identically to both arms. The
+# pairing is the stronger evidence: in all 25 back-to-back pairs the AFTER member was faster.
+#
+# NOT MEASURED: every other target, and the effect on `ubuntu-latest`. Other authenticating targets
+# should benefit, but no number here claims it, and a slower CI core plus a relatively larger
+# fixture floor do not compose predictably. `ci/test-costs.tsv` is therefore left CI-sourced and
+# knowingly stale for these two rows rather than patched with local values.
+#
+# The rebuild objection does not apply at this scope: `cargo tree -i blake2` shows blake2 is reached
+# only through argon2, so this invalidates 3 units (blake2, argon2, moira), not 405 — a one-off
+# 1m39s, not repaid on ordinary edits. Cargo.lock is unchanged.
+#
+# `--release` is untouched, so the shipped artifact is byte-identical. Argon2id is deterministic:
+# `opt-level` changes how fast a hash is computed, never what it computes, so no assertion anywhere
+# became easier to pass. If anything this raises test fidelity, because production has always run
+# these crates optimised. The `[profile.test.*]` pair below is belt-and-braces: cargo builds a test
+# target's dependencies with the dev profile, so those two blocks are expected to be inert. They are
+# set to the same value, so they cannot cause a second compile of either crate.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+[profile.test.package.argon2]
+opt-level = 3
+[profile.test.package.blake2]
+opt-level = 3

@@ -55,6 +55,17 @@ drag the hand-maintained list straight back onto the correctness path.
 `conversation_content_persistence` is currently unmeasured on purpose: it was added
 after the measurement run and rides `DEFAULT_COST`. That is the quarantine working.
 
+Two rows are knowingly **stale-high** as of 2026-08-14: `secret_leak_snapshots` (52.85s)
+and `content_leak_snapshots` (24.64s) were measured with `argon2` and `blake2` compiled
+at `opt-level = 0`, which the dev/test profile overrides in `Cargo.toml` have since
+changed. Locally those two targets dropped by roughly 6.6x and 4.7x; the CI factor is
+unmeasured. The table was deliberately **not** hand-patched with local numbers — a local
+Apple M2 with Postgres in Docker Desktop disagrees with `ubuntu-latest` in both
+directions, and mixing two provenances in one table is worse than one honestly stale
+table. Over-estimating is the safe direction (an over-weighted target is packed first
+and its shard finishes early), so this costs balance and nothing else. Refresh the file
+from the first post-merge CI run's predicted-vs-actual table.
+
 ## The three pseudo-units
 
 `ls tests/*.rs` cannot see three real test targets, and a runner that stops running one
