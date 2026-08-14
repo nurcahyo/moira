@@ -38,6 +38,15 @@ describe("navigation", () => {
     });
     expect(link.getAttribute("href")).toBe("/settings/llm");
   });
+
+  test("/settings/keys is reachable without typing the URL", () => {
+    // Issue #180's screen, and the same failure mode as the one above: it is the
+    // last step of a first run — the credential the operator's own software
+    // presents — and a screen nothing links to is a screen nobody finds.
+    render(<ConsoleHeader />);
+    const link = screen.getByRole("link", { name: copy(CONSOLE_MESSAGE_KEYS.chrome_nav_keys) });
+    expect(link.getAttribute("href")).toBe("/settings/keys");
+  });
 });
 
 describe("sign-out is a POST, not a link", () => {
@@ -62,8 +71,7 @@ describe("sign-out is a POST, not a link", () => {
   });
 
   test("a refusal keeps the operator where they are and gives a client-side remedy", async () => {
-    const fetchImpl = (async () =>
-      new Response("{}", { status: 500 })) as unknown as typeof fetch;
+    const fetchImpl = (async () => new Response("{}", { status: 500 })) as unknown as typeof fetch;
     const visited: string[] = [];
 
     render(<ConsoleHeader fetchImpl={fetchImpl} navigate={(url) => visited.push(url)} />);

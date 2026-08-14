@@ -969,7 +969,8 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
   },
   [K.setup_auth_not_complete]: {
     key: K.setup_auth_not_complete,
-    message: "The provider is saved but not fully enabled yet. Retry to finish the remaining steps.",
+    message:
+      "The provider is saved but not fully enabled yet. Retry to finish the remaining steps.",
     description:
       "Rendered when a provision response reports a state that fails `isProvisioningComplete` — " +
       "one of the four conditions (Moira row, console secret, enable, allow-list) is still " +
@@ -1018,7 +1019,7 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
     key: K.setup_claim_button,
     message: "Claim admin access",
     description:
-      "The control that sends `POST /api/setup {action: \"claim\"}`. Enabled only on the claim " +
+      'The control that sends `POST /api/setup {action: "claim"}`. Enabled only on the claim ' +
       "step, so it can never fire a request the gate guarantees Moira will refuse.",
   },
   [K.setup_claim_pending]: {
@@ -1164,6 +1165,364 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
     description:
       "The dismissing control on every DangerConfirmDialog. `console.action.*` rather than a " +
       "per-screen key because the dialog is a molecule with no idea what it is confirming.",
+  },
+
+  /* ------------------------------------------------------------------------ */
+  /* The /settings/keys screen (issue #180)                                   */
+  /* ------------------------------------------------------------------------ */
+  [K.chrome_nav_keys]: {
+    key: K.chrome_nav_keys,
+    message: "Application keys",
+    description:
+      "Navigation link to `/settings/keys`. The screen that mints the credential an " +
+      "application presents to Moira, which is the one thing a finished setup still leaves an " +
+      "operator reaching for a terminal to do.",
+  },
+  [K.keys_page_title]: {
+    key: K.keys_page_title,
+    message: "Keys your applications use",
+    description:
+      "The `<h1>` of `/settings/keys`. Names the SUBJECT rather than the object — an operator " +
+      'arrives here asking "how does my app authenticate", not "show me a key table".',
+  },
+  [K.keys_page_intro]: {
+    key: K.keys_page_intro,
+    message:
+      "An application sends one of these keys on every request. Finishing setup gives you an " +
+      "operator who can configure this deployment; a key is what lets your own software call " +
+      "it.",
+    description:
+      "Rendered under the page heading. States the boundary the screen exists to close: " +
+      "operator access and application access are different credentials, and setup only " +
+      "issues the first.",
+  },
+  [K.keys_applications_heading]: {
+    key: K.keys_applications_heading,
+    message: "Applications",
+    description:
+      "Heading of the list of applications and their keys. Emitted once per render of " +
+      "`/settings/keys`.",
+  },
+  [K.keys_applications_empty]: {
+    key: K.keys_applications_empty,
+    message:
+      "No application exists yet. Create one above — a key always belongs to an application.",
+    description:
+      "Shown when Moira reports no application at all, which is the state of a freshly " +
+      "claimed deployment. Says WHY the empty state blocks the mint form rather than leaving " +
+      "the operator to infer it from a disabled control.",
+  },
+  [K.keys_add_application_heading]: {
+    key: K.keys_add_application_heading,
+    message: "Add an application",
+    description: "Heading of the create-application form on `/settings/keys`.",
+  },
+  [K.keys_application_name_label]: {
+    key: K.keys_application_name_label,
+    message: "Application name",
+    description: "Label of the display-name field on the create-application form.",
+  },
+  [K.keys_application_name_hint]: {
+    key: K.keys_application_name_hint,
+    message: "How this application is named on this screen. It is never sent anywhere.",
+    description:
+      "Hint under the application-name field. Answers the question the field otherwise raises " +
+      "— whether the name is operational — before an operator picks a cautious one.",
+  },
+  [K.keys_application_slug_label]: {
+    key: K.keys_application_slug_label,
+    message: "Short name",
+    description: "Label of the optional slug field on the create-application form.",
+  },
+  [K.keys_application_slug_hint]: {
+    key: K.keys_application_slug_hint,
+    message:
+      "Optional. Lower-case letters, digits and hyphens. Left blank, the application is " +
+      "identified by its id alone.",
+    description:
+      "Hint under the slug field. States the character rule the console applies before " +
+      "submitting, so a rejected slug is not the first the operator hears of it.",
+  },
+  [K.keys_create_application_button]: {
+    key: K.keys_create_application_button,
+    message: "Create application",
+    description: "The submit control of the create-application form.",
+  },
+  [K.keys_issued_heading]: {
+    key: K.keys_issued_heading,
+    message: "Issued keys",
+    description:
+      "Heading above the keys belonging to one application. Rendered once per application " +
+      "row.",
+  },
+  [K.keys_issued_empty]: {
+    key: K.keys_issued_empty,
+    message: "No key has been issued for this application yet.",
+    description:
+      "Shown for an application that exists but has no key — the normal state immediately " +
+      "after creating one.",
+  },
+  [K.keys_prefix_label]: {
+    key: K.keys_prefix_label,
+    message: "Prefix",
+    description:
+      "Labels the `key_prefix` shown on a key row. That prefix identifies the key to a human " +
+      "and cannot authenticate; it is the only part of the credential this screen ever " +
+      "displays.",
+  },
+  [K.keys_scopes_label]: {
+    key: K.keys_scopes_label,
+    message: "Permissions",
+    description: "Labels the scope list on a key row and the checkbox group on the mint form.",
+  },
+  [K.keys_last_used_label]: {
+    key: K.keys_last_used_label,
+    message: "Last used",
+    description: "Labels the `last_used_at` timestamp on a key row.",
+  },
+  [K.keys_never_used]: {
+    key: K.keys_never_used,
+    message: "Never used",
+    description:
+      "Rendered in place of a timestamp when Moira reports no `last_used_at`. A key nobody " +
+      "has ever presented is the safest one to revoke, so the state is named rather than left " +
+      "blank.",
+  },
+  [K.keys_expires_label]: {
+    key: K.keys_expires_label,
+    message: "Stops working",
+    description: "Labels the `expires_at` timestamp on a key row.",
+  },
+  [K.keys_expires_never]: {
+    key: K.keys_expires_never,
+    message: "Does not expire",
+    description:
+      "Rendered in place of a timestamp when a key has no `expires_at`. Stated positively: a " +
+      "blank cell reads as missing data rather than as an unbounded credential.",
+  },
+  [K.keys_status_active]: {
+    key: K.keys_status_active,
+    message: "Accepting requests",
+    description:
+      "The `active` key status. Says what the status MEANS for traffic rather than repeating " +
+      "the enum, because that is the question an operator is asking when they look at this " +
+      "column.",
+  },
+  [K.keys_status_revoked]: {
+    key: K.keys_status_revoked,
+    message: "Revoked, no longer accepted",
+    description: "The `revoked` key status.",
+  },
+  [K.keys_status_expired]: {
+    key: K.keys_status_expired,
+    message: "Past its expiry date",
+    description: "The `expired` key status.",
+  },
+  [K.keys_status_deleted]: {
+    key: K.keys_status_deleted,
+    message: "Deleted from this deployment",
+    description:
+      "The `deleted` key status. Reachable only through the admin API — this console revokes " +
+      "and never deletes — and rendered so a row created elsewhere is not a blank badge.",
+  },
+  [K.keys_mint_heading]: {
+    key: K.keys_mint_heading,
+    message: "Issue a new key",
+    description: "Heading of the mint form inside an application's row.",
+  },
+  [K.keys_key_name_label]: {
+    key: K.keys_key_name_label,
+    message: "What is this key for",
+    description:
+      "Label of the key display-name field. Phrased as the question the field answers, " +
+      'because "name" invites a restatement of the application name and the value of this ' +
+      "field is telling two of an application's keys apart later.",
+  },
+  [K.keys_key_name_hint]: {
+    key: K.keys_key_name_hint,
+    message: "It appears in this list and in the audit trail. The key itself is never named.",
+    description: "Hint under the key-name field.",
+  },
+  [K.keys_scopes_hint]: {
+    key: K.keys_scopes_hint,
+    message:
+      "What this key may do. Administrative permissions are deliberately not offered here — a " +
+      "key that can reconfigure the deployment is not an application credential.",
+    description:
+      "Hint under the scope checkboxes on the mint form. States the omission as a decision, " +
+      "so an operator hunting for an admin scope stops looking rather than assuming the list " +
+      "is broken.",
+  },
+  [K.keys_mint_button]: {
+    key: K.keys_mint_button,
+    message: "Issue key",
+    description: "The submit control of the mint form.",
+  },
+  [K.keys_revoke_button]: {
+    key: K.keys_revoke_button,
+    message: "Revoke this key",
+    description: "The per-row control that revokes one key.",
+  },
+  [K.keys_revoke_pending]: {
+    key: K.keys_revoke_pending,
+    message: "Revoking",
+    description: "Announced while a revocation request is in flight.",
+  },
+  [K.keys_revoke_confirm_body]: {
+    key: K.keys_revoke_confirm_body,
+    message:
+      "Anything using this key stops working immediately, and the key cannot be brought back. " +
+      "The row stays here so you can still see when it was last used.",
+    description:
+      "The consequence sentence in the revoke confirmation. Names BOTH halves — the traffic that " +
+      "breaks and the row that survives — because an operator hesitating over this control is " +
+      "usually weighing exactly those two.",
+  },
+  [K.keys_unattached_heading]: {
+    key: K.keys_unattached_heading,
+    message: "Keys with no application on this page",
+    description:
+      "Heading of the list of keys whose `application_id` matches no listed application.",
+  },
+  [K.keys_unattached_intro]: {
+    key: K.keys_unattached_intro,
+    message:
+      "These keys still authenticate. Their application was deleted, or it sits beyond the " +
+      "list above.",
+    description:
+      "Rendered under that heading. The list exists because a key that works and appears on " +
+      "no screen is the credential nobody revokes; this copy is why it is not simply filtered " +
+      "out.",
+  },
+  [K.keys_truncated_notice]: {
+    key: K.keys_truncated_notice,
+    message:
+      "This deployment has more applications or keys than this screen lists. Use the admin " +
+      "API to see the rest.",
+    description:
+      "Shown when either Moira list reported more pages. Says the list is a prefix rather " +
+      "than letting it read as complete.",
+  },
+  [K.keys_request_body_invalid]: {
+    key: K.keys_request_body_invalid,
+    message: "The console could not read that request.",
+    description: "Emitted by the `/api/keys` handlers for a body that is not an object.",
+  },
+  [K.keys_application_required]: {
+    key: K.keys_application_required,
+    message: "Choose the application this key belongs to.",
+    description:
+      "Emitted when a mint request carries no `application_id`. Moira requires one and there " +
+      "is no such thing as a key belonging to no application.",
+  },
+  [K.keys_display_name_required]: {
+    key: K.keys_display_name_required,
+    message: "Give this a name first.",
+    description: "Emitted when a create-application or mint request carries an empty display name.",
+  },
+  [K.keys_request_failed]: {
+    key: K.keys_request_failed,
+    message: "The console could not complete that. Try again in a moment.",
+    description:
+      "Rendered by the keys panels when a request never reached a keyed refusal — a transport " +
+      "failure rather than an answer.",
+  },
+  [K.keys_load_failed]: {
+    key: K.keys_load_failed,
+    message: "The console could not read the applications and keys from Moira.",
+    description:
+      "Rendered by `/settings/keys` when the server-side read threw. The page still answers " +
+      "below 400 — the a11y walker fails the gate on any status >= 400, and a backend outage " +
+      "must not take that red.",
+  },
+  [K.keys_secret_heading]: {
+    key: K.keys_secret_heading,
+    message: "Key issued",
+    description:
+      "Heading and accessible name of the once-only modal when what was minted is a consumer " +
+      "key. The modal's default heading names an INVITATION, which is the other credential it " +
+      "shows and the wrong word here.",
+  },
+  [K.keys_secret_notice]: {
+    key: K.keys_secret_notice,
+    message:
+      "This is the credential your application presents to Moira. Store it where that " +
+      "application reads its configuration.",
+    description:
+      "The notice above the plaintext in the once-only modal on the keys screen. Moira's key " +
+      "envelope carries no `notice` of its own — unlike the invitation one — so the console " +
+      "supplies its own rather than fabricating a server-shaped message.",
+  },
+  [K.keys_scope_responses_create]: {
+    key: K.keys_scope_responses_create,
+    message: "Send prompts",
+    description:
+      "Copy for the `moira:responses:create` scope on the mint form. Without it a key " +
+      "authenticates and can do nothing, which is why it is the default.",
+  },
+  [K.keys_scope_responses_stream]: {
+    key: K.keys_scope_responses_stream,
+    message: "Stream answers as they are generated",
+    description: "Copy for the `moira:responses:stream` scope.",
+  },
+  [K.keys_scope_responses_read]: {
+    key: K.keys_scope_responses_read,
+    message: "Read answers it created earlier",
+    description: "Copy for the `moira:responses:read` scope.",
+  },
+  [K.keys_scope_conversations_create]: {
+    key: K.keys_scope_conversations_create,
+    message: "Start conversations",
+    description: "Copy for the `moira:conversations:create` scope.",
+  },
+  [K.keys_scope_conversations_read]: {
+    key: K.keys_scope_conversations_read,
+    message: "Read its conversations",
+    description: "Copy for the `moira:conversations:read` scope.",
+  },
+  [K.keys_scope_conversations_write]: {
+    key: K.keys_scope_conversations_write,
+    message: "Add to its conversations",
+    description: "Copy for the `moira:conversations:write` scope.",
+  },
+  [K.keys_scope_memories_create]: {
+    key: K.keys_scope_memories_create,
+    message: "Record memories",
+    description: "Copy for the `moira:memories:create` scope.",
+  },
+  [K.keys_scope_memories_read]: {
+    key: K.keys_scope_memories_read,
+    message: "Read memories",
+    description: "Copy for the `moira:memories:read` scope.",
+  },
+  [K.keys_scope_rag_collections_read]: {
+    key: K.keys_scope_rag_collections_read,
+    message: "List document collections",
+    description: "Copy for the `moira:rag-collections:read` scope.",
+  },
+  [K.keys_scope_rag_documents_read]: {
+    key: K.keys_scope_rag_documents_read,
+    message: "Read documents",
+    description: "Copy for the `moira:rag-documents:read` scope.",
+  },
+  [K.keys_scope_usage_read]: {
+    key: K.keys_scope_usage_read,
+    message: "Read its own usage figures",
+    description: "Copy for the `moira:usage:read` scope.",
+  },
+  [K.secret_key_label]: {
+    key: K.secret_key_label,
+    message: "Consumer key",
+    description:
+      "Labels the plaintext field in the once-only modal when what was minted is a consumer " +
+      "key rather than an invitation token.",
+  },
+  [K.secret_no_expiry]: {
+    key: K.secret_no_expiry,
+    message: "This credential does not expire. Revoke it when it is no longer needed.",
+    description:
+      "Rendered in the once-only modal in place of the expiry line when the minted credential " +
+      "has no `expires_at`. An invitation always has one; a consumer key need not.",
   },
 
   /* --- the authenticated chrome (plan 09 wave 5) -------------------------- */
@@ -1906,8 +2265,7 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
   [K.llm_provider_base_url_label]: {
     key: K.llm_provider_base_url_label,
     message: "Endpoint address",
-    description:
-      "Label of the field holding the OpenAI-compatible base address of a provider.",
+    description: "Label of the field holding the OpenAI-compatible base address of a provider.",
   },
   [K.llm_provider_base_url_hint]: {
     key: K.llm_provider_base_url_hint,
@@ -1960,8 +2318,7 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
   [K.llm_base_url_userinfo_rejected]: {
     key: K.llm_base_url_userinfo_rejected,
     message:
-      "Remove the sign-in details from the address, and store a key as a credential " +
-      "instead.",
+      "Remove the sign-in details from the address, and store a key as a credential " + "instead.",
     description:
       "The endpoint address carried a user name or password. Accepting it would write a " +
       "secret into a provider row, and from there into every list response this screen " +
@@ -1984,8 +2341,7 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
     key: K.llm_chain_incomplete,
     message: "Not ready yet.",
     description:
-      "Rendered when any part of the chain is missing. The missing parts are listed under " +
-      "it.",
+      "Rendered when any part of the chain is missing. The missing parts are listed under " + "it.",
   },
   [K.llm_step_model_missing]: {
     key: K.llm_step_model_missing,
@@ -2006,8 +2362,7 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
   [K.llm_add_model_label]: {
     key: K.llm_add_model_label,
     message: "Model identifier",
-    description:
-      "Label of the field holding the identifier the endpoint itself uses for a model.",
+    description: "Label of the field holding the identifier the endpoint itself uses for a model.",
   },
   [K.llm_add_model_hint]: {
     key: K.llm_add_model_hint,
@@ -2098,8 +2453,7 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
   [K.llm_bind_routing_submit]: {
     key: K.llm_bind_routing_submit,
     message: "Point routing here",
-    description:
-      "Submit control that binds the default route to the selected provider and model.",
+    description: "Submit control that binds the default route to the selected provider and model.",
   },
   [K.llm_policy_not_found]: {
     key: K.llm_policy_not_found,

@@ -7,12 +7,12 @@ operator authentication and the administration UI for Moira.
 
 ## Toolchain (pinned — see `plans/CONVENTIONS.md` §5)
 
-| Tool | Version |
-|------|---------|
-| Next.js | `16.2.11` (App Router) |
-| Node.js | `24.x` Active LTS (`.nvmrc` pins `24.18.0`) |
-| Bun | `1.3.14` — package manager, script runner, unit-test runner |
-| Playwright | e2e runner (`bunx playwright test` / `bun run e2e`) |
+| Tool       | Version                                                     |
+| ---------- | ----------------------------------------------------------- |
+| Next.js    | `16.2.11` (App Router)                                      |
+| Node.js    | `24.x` Active LTS (`.nvmrc` pins `24.18.0`)                 |
+| Bun        | `1.3.14` — package manager, script runner, unit-test runner |
+| Playwright | e2e runner (`bunx playwright test` / `bun run e2e`)         |
 
 React is not pinned independently — it tracks whatever Next.js 16.2.11 bundles.
 
@@ -72,17 +72,18 @@ dependency rule**: pages → organisms → molecules → atoms. Each layer may
 depend only on itself and the layers to its right in that chain; nothing
 may import back to its left.
 
-| Layer | Meaning | Location |
-|-------|---------|----------|
-| **Pages** | Next.js routes: routing, auth gating, server-side data fetching. Kept thin — real logic lives in organisms. | `console/app/**/page.tsx`, `layout.tsx`, `route.ts` |
-| **Organisms** | Feature-aware modules that own a slice of a page (e.g. a setup wizard, a provider table). May call server actions and the Moira client. | `console/modules/<feature>/` |
-| **Molecules** | Composite, presentational components built from atoms (e.g. a labeled form field, a confirm dialog). | `console/components/molecules/` |
-| **Atoms** | Primitive, presentational components (e.g. a button, an input, a badge). | `console/components/atoms/` |
+| Layer         | Meaning                                                                                                                                 | Location                                            |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------- |
+| **Pages**     | Next.js routes: routing, auth gating, server-side data fetching. Kept thin — real logic lives in organisms.                             | `console/app/**/page.tsx`, `layout.tsx`, `route.ts` |
+| **Organisms** | Feature-aware modules that own a slice of a page (e.g. a setup wizard, a provider table). May call server actions and the Moira client. | `console/modules/<feature>/`                        |
+| **Molecules** | Composite, presentational components built from atoms (e.g. a labeled form field, a confirm dialog).                                    | `console/components/molecules/`                     |
+| **Atoms**     | Primitive, presentational components (e.g. a button, an input, a badge).                                                                | `console/components/atoms/`                         |
 
 Shared non-UI logic (Moira client, auth helpers, formatting utilities) lives
 in `console/lib/` — never inside `components/`.
 
 **The rule, precisely:**
+
 - An atom must never import a molecule, an organism (`modules/**`), or a page (`app/**`).
 - A molecule must never import an organism or a page.
 - Atoms and molecules are presentational and feature-agnostic: no Moira/API
@@ -118,14 +119,14 @@ records that walk and the recipe for repeating it with no Google credential.
 
 **Shipped surfaces**
 
-| route | what it does |
-|-------|--------------|
-| `/setup` | the five-step first-run wizard (welcome → auth settings → sign-in → claim → done), the UI caller of `POST /api/setup` |
-| `/login` | one sign-in button per enabled interactive provider |
-| `/invite/[token]` | redeems an admin invitation |
-| `/` | the authenticated home, behind the `(console)` session boundary |
-| `/admins` | admin grants, invitations, ownership transfer |
-| `/settings/llm` | LLM providers, models, credential rows, routing — plus the one-step "connect a local endpoint" chain |
+| route             | what it does                                                                                                          |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `/setup`          | the five-step first-run wizard (welcome → auth settings → sign-in → claim → done), the UI caller of `POST /api/setup` |
+| `/login`          | one sign-in button per enabled interactive provider                                                                   |
+| `/invite/[token]` | redeems an admin invitation                                                                                           |
+| `/`               | the authenticated home, behind the `(console)` session boundary                                                       |
+| `/admins`         | admin grants, invitations, ownership transfer                                                                         |
+| `/settings/llm`   | LLM providers, models, credential rows, routing — plus the one-step "connect a local endpoint" chain                  |
 
 Better Auth, the OAuth/OIDC flow, the ES256 JWKS the console publishes and the
 admin JWTs it mints, the Moira API client, sessions and the console's own
@@ -134,8 +135,6 @@ how the pieces fit.
 
 **Not implemented yet**
 
-- No screen mints a **consumer key** — the credential an *application* presents
-  to Moira. `lib/moira-client.ts` carries no consumer-key operation at all.
 - `/` is still a placeholder heading; there is no dashboard content.
 - Exactly **one** auth provider may be enabled at a time. More than one resolves
   to `ambiguous_enabled_providers` in `lib/auth-config.ts` — deliberate, and
