@@ -45,7 +45,7 @@ ROUTE ?= general
         build migrate run serve release bootstrap-key seed test-seed-local smoke execute-test \
         keyring rotate-keys rotation-gate health openapi docs \
         console-install console-db console-dev console-build console-start console-check \
-        fmt fmt-check clippy test gates gates-fast check doctor clean
+        fmt fmt-check clippy test nextest gates gates-fast check doctor clean
 
 ##@ Getting started
 
@@ -218,6 +218,9 @@ clippy: ## Lint, warnings denied
 
 test: ## Run the test suite against the local database
 	$(ENV) cargo test --workspace --all-features
+
+nextest: ## Run the same suite under cargo-nextest — secondary/diagnostic, NOT the merge gate (see docs/ci-test-sharding.md)
+	$(ENV) cargo nextest run --workspace --all-features
 
 rotation-gate: ## The keyring-rotation gate — fails when the test database is absent, never skips
 	$(ENV) scripts/rotation-gate.sh

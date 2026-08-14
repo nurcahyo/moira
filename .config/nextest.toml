@@ -60,3 +60,10 @@ fail-fast = false
 retries = 0
 failure-output = "immediate-final"
 status-level = "retry"
+
+# Machine-readable output for the `rust-nextest` job (`.github/workflows/ci.yml`), which
+# uploads it as a build artifact. Written under this profile's own store dir, i.e.
+# `target/nextest/ci/junit.xml` — never touched by the `default` profile a developer runs
+# locally, so `make nextest` produces no file nobody asked for.
+[profile.ci.junit]
+path = "junit.xml"

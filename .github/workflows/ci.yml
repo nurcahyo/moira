@@ -351,6 +351,104 @@ jobs:
       # Never reads ci/test-costs.tsv, never a hardcoded count.
       - run: scripts/ci-assert-union.sh manifests
 
+  # ── cargo-nextest, issue #208 ─────────────────────────────────────────────────────
+  #
+  # NOT a replacement for `rust-shard`/`rust-migrations` and NOT wired into the `rust`
+  # aggregator's `needs`. `.config/nextest.toml`'s header records the measurement this
+  # decision rests on: on this suite, `cargo nextest run --workspace --all-features` is
+  # ~28% SLOWER than `cargo test --workspace --all-features` (2m07s vs 1m39s on a warm
+  # local build), because per-process isolation means 600+ process spawns each building
+  # their own Postgres pool, and the advisory locks guarding shared singletons serialise
+  # across processes instead of within one. Isolation costs more here than the extra
+  # parallelism returns. `docs/ci-test-sharding.md` records the same finding under
+  # "Approaches rejected" and the reason the union/skip-detection machinery in
+  # `scripts/test-log-lib.sh` — built and tuned against `cargo test`'s own log format —
+  # is not retargeted at nextest's here: nextest captures a PASSING test's output by
+  # default, and the skip line this repo's DB-backed tests print is emitted by a test
+  # that then passes, so pointing the existing skip gate at an unmodified nextest log
+  # would read empty and report a suite that silently skipped every DB test as green —
+  # a strictly worse version of the failure that gate exists to catch.
+  #
+  # So this job exists for the reason `.config/nextest.toml` says nextest earns its keep
+  # at all: per-process isolation surfaces cross-process contention an in-process `Mutex`
+  # cannot, which is diagnostically valuable when hunting a shared-state bug (both plan 07
+  # shared-database fixes were re-verified under it). It is `workflow_dispatch`-only —
+  # run it on demand from the Actions tab — rather than on every `pull_request`/`push`, so
+  # a routine PR does not pay a second, slower, DB-backed full-suite run for a signal the
+  # five-way shard already gives it, and so a run that goes red for a reason unrelated to
+  # the change under review (cross-process contention this project has already measured
+  # and accepted, not a regression) does not train reviewers to click "re-run" or bypass.
+  #
+  # NOTE for branch protection: do NOT require this check. It is not part of the
+  # completeness/skip-detection contract `rust` enforces, and it does not run on the
+  # triggers a required check needs to answer on every PR.
+  rust-nextest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.event_name == 'workflow_dispatch'
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: moira
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d moira"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      MOIRA_DATABASE__URL: postgres://postgres:postgres@localhost:5432/moira
+      MOIRA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/moira
+      MOIRA_DATABASE__REQUIRE: true
+      MOIRA_REDIS__ENABLED: true
+      MOIRA_REDIS__URL: redis://localhost:6379/0
+      MOIRA_SECRETS__ALLOW_INSECURE_DEV_KEY: true
+      MOIRA_API_KEYS__ALLOW_INSECURE_DEV_PEPPER: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-test
+          # Reader only, like `rust-migrations`/`rotation-gate`: a full-workspace nextest
+          # run builds every test target this repo has, and letting a fourth job fight
+          # `rust-shard`'s shard 0 for the one save slot on an immutable cache key risks
+          # publishing a thinner `target/` than the shards need. See the `rust-shard`
+          # cache-key comment above for what goes wrong when two jobs share a save.
+          save-if: false
+      # A pinned released binary, not a marketplace action — the same choice already made
+      # for gitleaks and kubeconform below, and for the same reason: one fewer action ref
+      # on the pinning surface. Version matches what CLAUDE.md's setup verified locally
+      # (`cargo nextest --version` → 0.9.140) so a CI-only regression cannot hide behind a
+      # version drift from what was checked by hand.
+      - name: Install cargo-nextest 0.9.140
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -fsSL "https://get.nexte.st/0.9.140/linux" \
+            | tar -xzf - -C "$HOME/.cargo/bin"
+      - run: cargo nextest run --workspace --all-features --profile ci
+      - name: Upload nextest JUnit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-junit
+          path: target/nextest/ci/junit.xml
+          retention-days: 7
+          if-no-files-found: warn
+
   supply-chain:
     runs-on: ubuntu-latest
     steps:
