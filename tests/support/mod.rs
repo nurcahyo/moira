@@ -950,7 +950,7 @@ pub fn admin_actor() -> Actor {
 //   force-drops its own database per run, or migrates a pre-provisioned empty one named by
 //   `MOIRA_TEST_MIGRATION_DATABASE_URL` when the role has no `CREATEDB` (issue #77).
 //
-// `tests/retention_worker.rs` was the second entry until finding F10 item 1 was closed: the
+// `tests/workers/retention_worker.rs` was the second entry until finding F10 item 1 was closed: the
 // sweep it asserts on is database-wide, never cluster-wide, so a private clone made its
 // counts exactly assertable rather than weakening them.
 //
@@ -1881,7 +1881,7 @@ pub fn public_response_request(route: &str) -> moira::domain::PublicResponseRequ
 // it and no fixture creates one. These helpers exist for the suites that
 // deliberately turn it on to exercise the cluster-wide arm of rate limiting and
 // concurrency — everything else must keep passing with Redis absent, which is the
-// property `tests/coordination_default_path.rs` pins.
+// property `tests/workers/coordination_default_path.rs` pins.
 // ---------------------------------------------------------------------------
 
 /// A Redis client on a namespace private to one test, or `None` when Redis is not

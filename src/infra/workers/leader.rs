@@ -29,7 +29,7 @@ use crate::error::AppError;
 ///
 /// `moiralrt` = moira / leader / retention. Checked against every other key in
 /// the tree by `the_leader_lock_key_collides_with_no_existing_key` below, which
-/// includes `b"MOIRARET"` — the *test-only* guard in `tests/retention_worker.rs`.
+/// includes `b"MOIRARET"` — the *test-only* guard in `tests/workers/retention_worker.rs`.
 /// That one is taken against the same database as everything else, so it is a
 /// live collision risk for this module's own tests even though it never runs in
 /// production.
@@ -393,7 +393,7 @@ mod tests {
 
     /// `b"MOIRARET"` is test-only, but it is taken against the same database as
     /// everything else, so a collision with it would deadlock this module's own
-    /// concurrency test against `tests/retention_worker.rs`.
+    /// concurrency test against `tests/workers/retention_worker.rs`.
     #[test]
     fn the_leader_lock_key_collides_with_no_existing_key() {
         for taken in [

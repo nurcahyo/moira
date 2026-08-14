@@ -396,7 +396,7 @@ impl ConcurrencyController {
     /// F43 — there used to be a second, `pub` one called `acquire`, which took four arguments
     /// and supplied `is_stream: false` and `provider_stream_limit = provider_limit` itself.
     /// Every one of its 29 call sites was test code (20 in this file's `#[cfg(test)]` modules,
-    /// 9 across `tests/cluster_coordination.rs` and `tests/coordination_default_path.rs`), so
+    /// 9 across `tests/cluster_coordination.rs` and `tests/workers/coordination_default_path.rs`), so
     /// the hardcoded `false` was never wrong in practice — but it was the shorter name, the
     /// obvious name, and the one a future streaming caller would reach for, and reaching for it
     /// would silently take a **request** permit and leave `max_concurrent_streams` unenforced.

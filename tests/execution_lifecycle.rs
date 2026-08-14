@@ -1854,7 +1854,7 @@ const OBSERVATION_BUDGET: Duration = Duration::from_secs(5);
 ///
 /// The two waits below are for a row a *background* task writes: no signal crosses back
 /// into the test, so there is nothing to await on and polling is the correct shape (see
-/// `tests/retention_worker.rs::poll_until`, which this mirrors, and P2-12 —
+/// `tests/workers/retention_worker.rs::poll_until`, which this mirrors, and P2-12 —
 /// substituting a hand-rolled `Notify` here would be a racier construction, not a safer
 /// one). What matters is that the wait is bounded: a status that never arrives fails the
 /// test with a message naming what it was waiting for, rather than hanging or passing by

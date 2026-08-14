@@ -4,8 +4,6 @@
 //! Postgres-backed by design — plan 10 §0.4b — so a deployment that never enables
 //! Redis gets all of this, and these tests are the proof.
 
-mod support;
-
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -27,7 +25,7 @@ use sqlx::{PgPool, Row};
 use tokio::sync::Barrier;
 use uuid::Uuid;
 
-use support::TestDatabase;
+use crate::support::TestDatabase;
 
 /// A dispatcher that always fails, so the retry and dead-letter paths can be
 /// exercised without waiting for a real job body to misbehave.
