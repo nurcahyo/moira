@@ -48,7 +48,7 @@ import { readConsoleEnv, type ConsoleEnv } from "@/lib/env";
 import { MoiraClient } from "@/lib/moira-client";
 
 import { createBrowserAgent } from "../support/browser-agent";
-import { reserveConsolePort, startConsoleServer, type ConsoleServer } from "../support/console-server";
+import { withBoundConsole, type ConsoleServer } from "../support/console-server";
 import { trustFixtureCa, untrustFixtureCa } from "../support/fixture-tls";
 import { restoreDomWhatwgGlobals, useNativeWhatwgGlobals } from "../support/native-globals";
 import { startMockIdp, type MockIdp } from "../support/mock-idp";
@@ -277,19 +277,21 @@ beforeAll(async () => {
   // Server-side suite: happy-dom's Headers silently discards `Set-Cookie`.
   useNativeWhatwgGlobals();
 
-  const port = reserveConsolePort();
-  const consoleOrigin = `https://localhost:${port}`;
-  trustFixtureCa(consoleOrigin);
+  consoleServer = await withBoundConsole(async (pending) => {
+    const consoleOrigin = pending.origin;
+    trustFixtureCa(consoleOrigin);
 
-  idp = await startMockIdp({ clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, user: OPERATOR });
-  trustFixtureCa(idp.origin);
+    idp = await startMockIdp({ clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, user: OPERATOR });
+    trustFixtureCa(idp.origin);
 
-  env = envFor(consoleOrigin);
-  config = configFor(idp, env);
-  consoleServer = startConsoleServer(
-    { env, configs: [config], database: memoryAdapter(createConsoleMemoryDatabase()) },
-    port,
-  );
+    env = envFor(consoleOrigin);
+    config = configFor(idp, env);
+    return pending.serve({
+      env,
+      configs: [config],
+      database: memoryAdapter(createConsoleMemoryDatabase()),
+    });
+  });
 
   // A REAL OpenAI-compatible endpoint, on a real socket. Plain http on loopback:
   // the operator's own box is exactly the case where TLS is often absent, and

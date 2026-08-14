@@ -31,7 +31,7 @@ import { InMemoryConsoleSecretStore } from "../../lib/console-secrets";
 import { PostgresConsoleSecretStore } from "../../lib/console-secrets-postgres";
 import { readConsoleEnv } from "../../lib/env";
 import type { ResolvedAuthConfig } from "../../lib/auth-config";
-import { reserveConsolePort, startConsoleServer } from "./console-server";
+import { withBoundConsole } from "./console-server";
 import { trustFixtureCa } from "./fixture-tls";
 
 function flag(name: string): string | undefined {
@@ -257,7 +257,7 @@ async function main(): Promise<void> {
      * whether the console can produce a token that verifies against the very
      * document it just served. Everything is the shipped path:
      *
-     *   * `startConsoleServer` builds the instance with `createConsoleAuth` and
+     *   * `bindConsoleServer` builds the instance with `createConsoleAuth` and
      *     routes through `app/api/auth/[...all]/route.ts` — not `auth.handler`,
      *     so the route module's own behaviour is included;
      *   * the JWKS document arrives over a real TLS socket via `fetch`, which is
@@ -271,19 +271,23 @@ async function main(): Promise<void> {
      */
     case "attest": {
       const dsn = flag("dsn");
-      const port = reserveConsolePort();
-      const origin = `https://localhost:${port}`;
-      const env = probeEnv(dsn, origin);
+      // The pool does not depend on the bound port, so it is built before the
+      // socket exists and closed by the `finally` below.
       const pool = dsn === undefined ? null : createConsolePool(dsn);
-      trustFixtureCa(origin);
-      const server = startConsoleServer(
-        {
+      // `env` does depend on the port, so it is assigned inside the guarded
+      // closure — which is also what releases the socket if anything in there
+      // throws, instead of orphaning a listener for the life of the process.
+      let env!: ReturnType<typeof probeEnv>;
+      const server = await withBoundConsole((pending) => {
+        const origin = pending.origin;
+        env = probeEnv(dsn, origin);
+        trustFixtureCa(origin);
+        return pending.serve({
           env,
           configs: [probeAuthConfig()],
           ...(pool === null ? {} : { database: pool }),
-        },
-        port,
-      );
+        });
+      });
 
       try {
         // ---- 1. what the console PUBLISHES, over the wire ----------------
