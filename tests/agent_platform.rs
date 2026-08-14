@@ -106,6 +106,10 @@ fn version_of(result: &HttpResult) -> i64 {
         .etag
         .as_deref()
         .expect("ETag header")
+        // The resource-version ETag is quoted (`"1"`), matching every sibling versioned
+        // resource — strip the quotes (and any weak-validator prefix) before parsing.
+        .trim_start_matches("W/")
+        .trim_matches('"')
         .parse()
         .expect("numeric ETag")
 }
