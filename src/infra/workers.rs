@@ -1,3 +1,4 @@
+pub mod dispatch;
 pub mod leader;
 pub mod queue;
 pub mod retention;
@@ -15,6 +16,16 @@ use crate::{app::AppState, config::WorkerSettings, infra::repositories::PgWorker
 /// literal at the call site so the spec table stays the single source of truth.
 pub const RETENTION_CLEANUP_WORKER: &str = "retention-cleanup";
 
+/// Spec names of the plan-11 retry jobs (issue #90). Referenced rather than typed
+/// as literals at call sites — including [`dispatch::default_dispatcher`] — for the
+/// same reason [`RETENTION_CLEANUP_WORKER`] is a const: a handler registered under
+/// a re-typed copy of the string would silently never be reached, because
+/// [`dispatch::RealJobDispatcher`] looks handlers up by exact `job_name`.
+pub const MEMORY_EXTRACTION_RETRY_WORKER: &str = "memory-extraction-retry";
+pub const CONVERSATION_SUMMARIZATION_RETRY_WORKER: &str = "conversation-summarization-retry";
+pub const EMBEDDING_RETRY_WORKER: &str = "embedding-retry";
+pub const DOCUMENT_INGESTION_RETRY_WORKER: &str = "document-ingestion-retry";
+
 /// Every job name the queue and the metrics layer will ever see.
 ///
 /// A closed set, and that is the point: `job_name` is a metric **label**, and
@@ -24,10 +35,10 @@ pub const RETENTION_CLEANUP_WORKER: &str = "retention-cleanup";
 /// header calls out. `worker_job_names_match_the_spec_table` pins this list
 /// against [`WorkerRegistry::new`]'s specs so the two cannot drift.
 pub const WORKER_JOB_NAMES: &[&str] = &[
-    "memory-extraction-retry",
-    "conversation-summarization-retry",
-    "embedding-retry",
-    "document-ingestion-retry",
+    MEMORY_EXTRACTION_RETRY_WORKER,
+    CONVERSATION_SUMMARIZATION_RETRY_WORKER,
+    EMBEDDING_RETRY_WORKER,
+    DOCUMENT_INGESTION_RETRY_WORKER,
     "oauth-token-refresh",
     "provider-health-check",
     RETENTION_CLEANUP_WORKER,
@@ -97,22 +108,22 @@ impl WorkerRegistry {
             leader_election_enabled,
             specs: Arc::new(vec![
                 WorkerSpec {
-                    name: "memory-extraction-retry",
+                    name: MEMORY_EXTRACTION_RETRY_WORKER,
                     description: "Retries failed memory extraction runs.",
                     enabled_by_default: true,
                 },
                 WorkerSpec {
-                    name: "conversation-summarization-retry",
+                    name: CONVERSATION_SUMMARIZATION_RETRY_WORKER,
                     description: "Retries failed conversation summary jobs.",
                     enabled_by_default: true,
                 },
                 WorkerSpec {
-                    name: "embedding-retry",
+                    name: EMBEDDING_RETRY_WORKER,
                     description: "Retries memory and RAG embedding jobs.",
                     enabled_by_default: true,
                 },
                 WorkerSpec {
-                    name: "document-ingestion-retry",
+                    name: DOCUMENT_INGESTION_RETRY_WORKER,
                     description: "Retries failed RAG document ingestion jobs.",
                     enabled_by_default: true,
                 },
@@ -251,7 +262,11 @@ impl WorkerRegistry {
                 Uuid::now_v7(),
             )
         });
-        let dispatcher = queue::StubJobDispatcher;
+        // The registry-backed dispatcher (issue #90). See `dispatch::default_dispatcher`
+        // for which job names have a real handler, which are documented stubs pending
+        // plan 11's pipeline extraction, and the seams left for `oauth-token-refresh`
+        // and a future latency-aggregation job.
+        let dispatcher = dispatch::default_dispatcher();
         let mut queue_interval = tokio::time::interval(Duration::from_secs(
             self.settings.queue_poll_interval_seconds.max(1),
         ));
