@@ -43,7 +43,7 @@ ROUTE ?= general
 
 .PHONY: help setup start env env-force env-rotate up down reset logs ps psql redis \
         build migrate run serve release bootstrap-key seed test-seed-local smoke execute-test \
-        branch-invariant test-branch-invariant \
+        branch-invariant test-branch-invariant docs-only test-docs-only \
         keyring rotate-keys rotation-gate health openapi docs \
         console-install console-db console-dev console-build console-start console-check \
         fmt fmt-check clippy test nextest gates gates-fast check doctor clean
@@ -153,6 +153,14 @@ branch-invariant: ## Check main ⊆ develop against origin (CONVENTIONS §1A) �
 
 test-branch-invariant: ## Drive the main ⊆ develop guard through every state it classifies
 	@scripts/branch-invariant-test.sh
+
+docs-only: ## Ask CI's own classifier whether HEAD vs origin/develop is a docs-only change
+	@# Same script, same allowlist, same answer as the `changes` job — so "why did CI
+	@# run everything?" is answerable in a second, without pushing.
+	@scripts/ci-docs-only.sh origin/develop HEAD
+
+test-docs-only: ## Drive the docs-only filter and the required-check gate through every case
+	@scripts/ci-docs-only-test.sh
 
 smoke: ## End-to-end check: health, contract, and a real completion with real tokens
 	$(ENV) scripts/smoke.sh
