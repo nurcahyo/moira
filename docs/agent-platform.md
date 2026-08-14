@@ -1,9 +1,10 @@
 # Agent platform: skills, evaluations, flows
 
 Issue #214 (plan 12 §3/§5), extended by issue #237 (plan 12 §5, workstream H: the OpenAPI import
-pipeline and `skill_http_executors` CRUD). This is **still schema + CRUD only** — there is no
-execution engine here — the multi-agent flow orchestrator and the Rig tool-call loop that would
-make a skill callable are deferred and depend on rig tools (#84).
+pipeline and `skill_http_executors` CRUD) and by F2 (this document's evals/flows CRUD section
+below). This is **still schema + CRUD only** — there is no execution engine here — the
+multi-agent flow orchestrator and the Rig tool-call loop that would make a skill callable are
+deferred and depend on rig tools (#84).
 
 ## What landed
 
@@ -22,8 +23,8 @@ make a skill callable are deferred and depend on rig tools (#84).
   CRUD** — issue #237, workstream H. See [OpenAPI import and HTTP executors](#openapi-import-and-http-executors)
   below.
 
-Evaluations and flows CRUD are a **documented follow-up** — their tables and domain types already
-exist; only the admin services/handlers remain.
+- **Eval suites/cases CRUD** (`/api/v1/admin/eval-suites`) and **flows CRUD**
+  (`/api/v1/admin/flows`) — F2, below.
 
 ## Skills
 
@@ -109,6 +110,60 @@ never drift apart. `credential_id`, when set, must reference a live `provider_cr
 checked at PATCH time — and carries no inline secret (decision 21). There is no `POST` to
 hand-author an executor in this MVP; every row today comes from the import pipeline.
 
+## Evaluations
+
+Issue #214, F2 (plan 12 §3, decision 14). An eval suite is a named, versioned registry of
+offline test cases; a case pairs an `input` fixture with an `expected` value and a `grading_kind`.
+`eval_runs` are **not writable through this admin surface** — a run is produced by executing a
+suite (deferred; see "What's deferred" below), so the only endpoint is a read-only list.
+
+| Method | Path | Scope | Notes |
+|---|---|---|---|
+| `POST` | `/api/v1/admin/eval-suites` | `moira:evals:write` | `Idempotency-Key` replay; 201 + `ETag` |
+| `GET` | `/api/v1/admin/eval-suites` | `moira:evals:read` | keyset pagination |
+| `GET` | `/api/v1/admin/eval-suites/{id}` | `moira:evals:read` | 404 when soft-deleted |
+| `PATCH` | `/api/v1/admin/eval-suites/{id}` | `moira:evals:write` | requires `If-Match` |
+| `DELETE` | `/api/v1/admin/eval-suites/{id}` | `moira:evals:delete` | soft delete; requires `If-Match` |
+| `POST` | `/api/v1/admin/eval-suites/{id}/cases` | `moira:evals:write` | 201; suite must be live |
+| `GET` | `/api/v1/admin/eval-suites/{id}/cases` | `moira:evals:read` | keyset pagination |
+| `DELETE` | `/api/v1/admin/eval-suites/{id}/cases/{case_id}` | `moira:evals:delete` | hard delete; no `If-Match` — `eval_cases` has no `version`/`updated_at` column |
+| `GET` | `/api/v1/admin/eval-suites/{id}/runs` | `moira:evals:read` | read-only; keyset pagination |
+
+`grading_kind` is restricted to `exact_match` / `contains` / `schema_valid` (decision 14) —
+`llm_judge` grading is deliberately absent from the MVP given its cost.
+
+## Multi-agent flows
+
+Issue #214, F2 (plan 12 §3, decision 13). A flow is a named, versioned sequence of steps; the
+MVP is sequential-only (linear chain, no branching). **Steps travel inside the flow's own
+`create`/`patch` request body as an ordered array, not through a separate steps sub-resource** —
+the simplest contract for the sequential-only MVP. `PATCH` with a `steps` field present replaces
+the entire ordered list atomically; omitting `steps` leaves the existing list untouched, the same
+coalesce convention every other field on this surface follows. Every response (`create`, `get`,
+`list`, `patch`) echoes the flow's current step list back.
+
+Each step names an `agent_profiles` row via `agent_profile_id`. That reference is validated
+fail-closed: a step naming a missing or deleted agent profile is rejected with `400` before the
+flow (or its patched step list) is ever written — the write never lands half-valid.
+`agent_flow_runs` are **not writable through this admin surface**, for the same reason
+`eval_runs` are not: they are produced by running a flow, and there is no flow-run engine yet.
+
+| Method | Path | Scope | Notes |
+|---|---|---|---|
+| `POST` | `/api/v1/admin/flows` | `moira:flows:write` | `Idempotency-Key` replay; 201 + `ETag`; `steps` optional (defaults to `[]`) |
+| `GET` | `/api/v1/admin/flows` | `moira:flows:read` | keyset pagination; each row includes its `steps` |
+| `GET` | `/api/v1/admin/flows/{id}` | `moira:flows:read` | 404 when soft-deleted |
+| `PATCH` | `/api/v1/admin/flows/{id}` | `moira:flows:write` | requires `If-Match`; `steps` present replaces the whole list |
+| `DELETE` | `/api/v1/admin/flows/{id}` | `moira:flows:delete` | soft delete; requires `If-Match` |
+| `GET` | `/api/v1/admin/flows/{id}/runs` | `moira:flows:read` | read-only; keyset pagination |
+
+**What's deferred, explicitly**: there is **no execution endpoint** — no `POST
+/api/v1/admin/flows/{id}/run`, no way to score an eval suite. A flow can be fully authored (all
+its steps, in order, each naming a live agent profile) but cannot run; an eval suite can be fully
+populated with cases but cannot be graded. Both the offline-eval runner and the flow orchestrator
+that would walk the step DAG through the existing 11-step execution pipeline depend on rig tools
+(#84) and are that issue's follow-up, not this one's.
+
 ## These tables are not runtime configuration
 
 Unlike `agent_profiles`/`route_definitions`/`routing_policies`, none of the agent-platform tables
@@ -125,8 +180,9 @@ versioned registries (`skills`, `eval_suites`, `agent_flows`).
 
 - `migrations/0031_agent_platform.sql`
 - `src/domain/agent_platform.rs` — serde/`utoipa` types.
-- `src/infra/repositories/agent_platform.rs` — Postgres row/SQL surface for `skills` and
-  `skill_http_executors`.
+- `src/infra/repositories/agent_platform.rs` — Postgres row/SQL surface for `skills`,
+  `skill_http_executors`, `eval_suites`/`eval_cases`/`eval_runs`, and
+  `agent_flows`/`agent_flow_steps`/`agent_flow_runs`.
 - `src/application/agent_platform.rs` — `AgentPlatformService` (scope check, idempotency, audit,
   pagination, `If-Match`).
 - `src/http/agent_platform.rs` — admin handlers, registered additively in `src/http/mod.rs`.
@@ -135,3 +191,6 @@ versioned registries (`skills`, `eval_suites`, `agent_flows`).
   network or a database.
 - `tests/skill_import.rs` — end-to-end coverage over real Postgres: import, the operation cap,
   the SSRF block, and the executor CRUD lifecycle.
+- `tests/agent_platform.rs` — end-to-end coverage over real Postgres for skills, eval
+  suites/cases, and flows/steps: full CRUD lifecycles, stale `If-Match`, and idempotent create
+  replay.
