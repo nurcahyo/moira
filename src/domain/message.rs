@@ -153,3 +153,6 @@ mod tests {
         assert_eq!(decoded, message);
     }
 }
+
+// A throwaway comment for the #230 CI demonstration (case 2): a src/ change must run
+// every job exactly as it does today.
