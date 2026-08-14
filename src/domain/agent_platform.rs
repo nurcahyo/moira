@@ -96,6 +96,88 @@ pub struct SkillBulkEnableResponse {
 }
 
 // =====================================================================================
+// HTTP executors — the one-to-one HTTP execution template for a `kind = 'tool'` skill
+// (issue #237, plan 12 §5). Schema: `migrations/0031_agent_platform.sql`. There is
+// deliberately no live-execution `Tool` impl here — that is `HttpSkillTool`, deferred to
+// the rig tool loop (#84); this module only carries the admin-CRUD wire shapes.
+// =====================================================================================
+
+/// The HTTP methods `skill_http_executors.method` accepts (migration check constraint).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum HttpMethod {
+    Get,
+    Post,
+    Put,
+    Patch,
+    Delete,
+}
+
+/// `skill_http_executors` has no `version`/`deleted_at` columns — F's migration gives
+/// optimistic concurrency only to the three named registries (`skills`, `eval_suites`,
+/// `agent_flows`); this row is a versionless 1:1 child of a `skills` row, cascade-deleted
+/// with it. `updated_at` is therefore this resource's `If-Match` basis instead of an
+/// integer `version` — see `executor_etag_headers`/`require_executor_if_match` in
+/// `src/http/agent_platform.rs`, which encode/parse it as a quoted RFC 3339 timestamp
+/// (microsecond precision, matching Postgres `timestamptz`) rather than reusing the
+/// shared `etag_headers`/`require_if_match` helpers, which are hard-wired to an `i64`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SkillHttpExecutorRecord {
+    pub skill_id: Uuid,
+    pub method: HttpMethod,
+    pub url_template: String,
+    /// The exact host `url_template` resolves to, checked at execution time by
+    /// `security::ssrf::validate_outbound_url` without re-parsing the `{placeholder}`
+    /// template. Always derived server-side from `url_template`'s host — never a
+    /// client-settable field, or PATCH could point execution at a host the URL no longer
+    /// names.
+    pub allowed_host: String,
+    /// Static, non-secret headers only (migration comment, `0031_agent_platform.sql`).
+    pub header_template: Value,
+    /// References `provider_credentials` — no inline secrets (decision 21).
+    pub credential_id: Option<Uuid>,
+    pub timeout_ms: i32,
+    pub response_schema: Option<Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// `allowed_host` is intentionally absent — see [`SkillHttpExecutorRecord::allowed_host`].
+/// Changing `url_template` re-derives and re-validates it server-side rather than taking a
+/// client-supplied value. Follows `SkillPatchRequest`'s coalesce convention: an omitted
+/// field means "leave unchanged", so this cannot clear `response_schema` to `null` — the
+/// same limitation `SkillPatchRequest.description` already accepts.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SkillHttpExecutorPatchRequest {
+    pub method: Option<HttpMethod>,
+    pub url_template: Option<String>,
+    pub header_template: Option<Value>,
+    pub credential_id: Option<Uuid>,
+    pub timeout_ms: Option<i32>,
+    pub response_schema: Option<Value>,
+}
+
+/// `POST /api/v1/admin/skills/import` — the raw OpenAPI 3.x document to import (plan 12
+/// §5). Parsing is pure and lives in `orchestration::openapi_import`; this is only the
+/// wire envelope.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SkillImportRequest {
+    pub document: Value,
+}
+
+/// One row per imported operation (draft `skills` row + its `skill_http_executors` row),
+/// created together and returned together so the caller can review-then-enable
+/// (§5 decision 22) without a second round trip per skill.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SkillImportResponse {
+    pub imported_count: usize,
+    pub skills: Vec<SkillRecord>,
+    pub executors: Vec<SkillHttpExecutorRecord>,
+}
+
+// =====================================================================================
 // Evaluations — offline suites, cases, and runs.
 // =====================================================================================
 

@@ -649,6 +649,16 @@ fn admin_routes() -> OpenApiRouter<AppState> {
         .routes(routes!(agent_platform::enable_skill))
         .routes(routes!(agent_platform::disable_skill))
         .routes(routes!(agent_platform::bulk_enable_skills))
+        // Issue #237 (plan 12 §5, workstream H) — OpenAPI import + skill_http_executors CRUD.
+        // Kept immediately after F's skills block, contiguous, for the same rebase-friendly
+        // reason as that block's own comment.
+        .routes(routes!(agent_platform::import_skills))
+        .routes(routes!(agent_platform::list_skill_executors))
+        .routes(routes!(
+            agent_platform::get_skill_executor,
+            agent_platform::patch_skill_executor,
+            agent_platform::delete_skill_executor
+        ))
 }
 
 #[cfg(test)]
@@ -741,6 +751,9 @@ mod tests {
             "/api/v1/admin/skills/{id}/enable",
             "/api/v1/admin/skills/{id}/disable",
             "/api/v1/admin/skills/bulk-enable",
+            "/api/v1/admin/skills/import",
+            "/api/v1/admin/skill-executors",
+            "/api/v1/admin/skills/{id}/executor",
             "/api/v1/admin/runtime/diagnose",
             "/api/v1/admin/rag-collections",
             "/api/v1/admin/rag-collections/{id}",
@@ -802,7 +815,10 @@ mod tests {
         // + plan 12 workstream D's two: GET/PUT /api/v1/admin/applications/{id}/routing-defaults.
         // + issue #214 (plan 12 §3) agent-platform skills: list/create/get/patch/delete,
         //   enable/disable, and bulk-enable = 8.
-        assert_eq!(operation_count, 162);
+        // + issue #237 (plan 12 §5, workstream H) OpenAPI import + skill_http_executors CRUD:
+        //   POST .../skills/import, GET .../skill-executors,
+        //   GET/PATCH/DELETE .../skills/{id}/executor = 5.
+        assert_eq!(operation_count, 167);
     }
 
     #[test]
@@ -1461,7 +1477,7 @@ mod tests {
     /// runtime-policy `PUT` reads the header through `optional_if_match`, the
     /// context-router routing-defaults `PUT` (issue #213) mirrors that exact contract, and
     /// the agent-platform skill writes (issue #214) add their own If-Match operations.
-    const IF_MATCH_OPERATIONS: [(&str, &str, bool); 46] = [
+    const IF_MATCH_OPERATIONS: [(&str, &str, bool); 48] = [
         // Plan 09 wave 2. Ownership transfer takes a required precondition and grant
         // revocation deliberately does not: a `PATCH` that flips a flag is a lost-update
         // hazard, while a soft revoke is idempotent in intent and answers a repeat with
@@ -1537,6 +1553,13 @@ mod tests {
         ("/api/v1/admin/skills/{id}", "patch", true),
         ("/api/v1/admin/skills/{id}/disable", "post", true),
         ("/api/v1/admin/skills/{id}/enable", "post", true),
+        // Issue #237 (plan 12 §5, workstream H) — skill_http_executors. The header is still
+        // named `If-Match` on the wire (the table carries no separate `version` column, so
+        // the value is a quoted RFC 3339 `updated_at` instead of an integer — see
+        // `domain::SkillHttpExecutorRecord`'s doc comment), and it is required for both
+        // writes, same as every other single-row PATCH/DELETE in this inventory.
+        ("/api/v1/admin/skills/{id}/executor", "delete", true),
+        ("/api/v1/admin/skills/{id}/executor", "patch", true),
         (
             "/api/v1/admin/users/{external_user_id}/provider-credentials/{id}",
             "delete",
