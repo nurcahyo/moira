@@ -1500,6 +1500,21 @@ default would have reported the `setup_state` race as "flaky" and shipped the is
 Rejected: `[profile.dev.package."*"] opt-level = 3`. It optimises 405 dependencies to speed up test
 *runtime*, but this suite is Postgres-I/O-bound, and the cost is repaid on every dependency rebuild.
 
+> **Corrected 2026-08-14.** The rejection of the blanket `"*"` override stands; its stated *reason*
+> does not. This suite is not Postgres-I/O-bound at the top end — the heaviest targets are dominated
+> by Argon2id, which `ApiKeyHasher::verify` (`src/security/api_keys.rs:211`) runs per authenticated
+> request at m=19456 KiB, t=2 with no memoisation, compiled at opt-level 0. Optimising `argon2` and
+> `blake2` alone invalidates 3 units, not 405.
+>
+> **Measured** on an 8-core Apple M2, test binaries invoked directly, interleaved A/B on
+> byte-identical test source, median of the 4 cleanest samples per arm with the full range:
+> `secret_leak_snapshots` 18.30s [17.90–18.69] → 2.75s [2.70–2.77] (6.6x, no overlap) and
+> `content_leak_snapshots` 9.39s [9.24–9.68] → 2.01s [1.95–2.02] (4.7x; in the *all-samples* view,
+> which includes runs taken while another agent loaded the box, the content ranges **do** overlap —
+> 9.35s worst AFTER against 9.24s best BEFORE). In all 25 back-to-back pairs the AFTER member was
+> faster. **Not measured:** every other target, and the effect on `ubuntu-latest`. See `Cargo.toml`
+> `[profile.dev.package.argon2]`.
+
 ## STATE AT A GLANCE — update this before every compaction
 
 **Merged to `main` (12 plans):** 02a, 02b, 03, 04, 05, 06, 06b, 06c, **07** (`27b6e0c`),
