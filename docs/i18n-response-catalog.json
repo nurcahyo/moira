@@ -714,6 +714,26 @@
       "description": "Used when WorkerQueue::enqueue refuses a job because the pending backlog has reached workers.queue_max_pending_jobs. Returned as 429 rather than 503 because it is backpressure: the request is well-formed and retrying later is the correct client behaviour. Plan 10 ships the queue with no synchronous producer, so this has no HTTP surface yet; it gains one the moment a request-path caller enqueues, which is why the entry lands with the code rather than after it."
     },
     {
+      "key": "moira.error.import_cap_exceeded",
+      "default_message": "The OpenAPI document exceeds the maximum number of importable operations.",
+      "description": "Used by POST /api/v1/admin/skills/import (issue #237, plan 12 §5) when a document defines more than the 300-operation import cap (§5 decision 23). The document is rejected outright, never silently truncated, so the operator learns the true operation count and can split the import instead of discovering a partial one later. The envelope's details field carries operation_count and cap."
+    },
+    {
+      "key": "moira.error.invalid_openapi_spec",
+      "default_message": "The OpenAPI document could not be parsed.",
+      "description": "Used by POST /api/v1/admin/skills/import (issue #237, plan 12 §5) for every OpenAPI parse failure other than the operation cap: the document is not a JSON object, it does not declare an OpenAPI 3.x version, it declares no server URL or an unparseable one, or it defines no importable operations. See orchestration::openapi_import::OpenApiImportError for the full set of causes this one code covers."
+    },
+    {
+      "key": "moira.error.ssrf_blocked_host",
+      "default_message": "The server URL was rejected by the outbound SSRF policy.",
+      "description": "Used when a skill's server URL - the OpenAPI document's servers[0].url on import, or a new url_template on a skill_http_executors PATCH (issue #237, plan 12 §5) - fails security::ssrf::validate_outbound_url: a non-https scheme, a private/loopback/link-local/metadata-range address, or an address that fails to resolve. The specific denial reason and any resolved address are logged server-side only, never returned here, so this response can never be used as an SSRF oracle - the same posture security::ssrf already takes on the JWKS fetch path."
+    },
+    {
+      "key": "moira.error.executor_not_found",
+      "default_message": "The skill has no HTTP executor.",
+      "description": "Used by GET/PATCH/DELETE /api/v1/admin/skills/{id}/executor (issue #237, plan 12 §5) when the named skill has no skill_http_executors row - either because the skill was hand-authored without one, or because the row was already deleted."
+    },
+    {
       "key": "moira.notice.admin_identity_claimed",
       "default_message": "Admin access has been granted to this identity.",
       "description": "Used on both the 201 of a fresh admin-identity claim and the 200 of an idempotent replay, which returns the stored body verbatim. The status code, not the notice, distinguishes the two. Also carried by the admin-identity list and by an ownership transfer, whose response is the same grant record."

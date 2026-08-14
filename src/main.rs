@@ -269,6 +269,8 @@ async fn execute_test(settings: Settings) -> anyhow::Result<()> {
             "moira:execution:override-provider".to_string(),
             "moira:execution:override-model".to_string(),
             "moira:execution:override-credential".to_string(),
+            "moira:execution:override-priority".to_string(),
+            "moira:execution:override-complexity-hint".to_string(),
         ],
         ..Actor::default()
     };

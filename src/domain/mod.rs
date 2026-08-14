@@ -1,4 +1,5 @@
 mod admin;
+mod agent_platform;
 mod auth_settings;
 mod conversation;
 mod i18n;
@@ -22,6 +23,15 @@ pub use admin::{
     ScopeType, SetupCheckName, SetupCheckState, SetupChecks, SetupDeploymentEnvironment,
     SetupStatus, SetupStatusResponse, SystemKeyCreateRequest, TrustedJwtIssuerCreateRequest,
     TrustedJwtIssuerPatchRequest, TrustedJwtIssuerRecord,
+};
+pub use agent_platform::{
+    AgentFlowCreateRequest, AgentFlowPatchRequest, AgentFlowRecord, AgentFlowRunRecord,
+    AgentFlowStepCreateRequest, AgentFlowStepRecord, EvalCaseCreateRequest, EvalCaseRecord,
+    EvalRunRecord, EvalRunStatus, EvalSuiteCreateRequest, EvalSuitePatchRequest, EvalSuiteRecord,
+    EvalTriggerKind, FlowRunStatus, FlowStepOnFailure, FlowStepRunStatus, GradingKind, HttpMethod,
+    SkillBulkEnableRequest, SkillBulkEnableResponse, SkillCreateRequest,
+    SkillHttpExecutorPatchRequest, SkillHttpExecutorRecord, SkillImportRequest,
+    SkillImportResponse, SkillKind, SkillPatchRequest, SkillRecord, SkillStatus,
 };
 pub use auth_settings::{
     AuthMethod, AuthProviderSettingsCreateRequest, AuthProviderSettingsPatchRequest,
@@ -76,14 +86,16 @@ pub use public::{
 };
 pub use runtime::{
     AgentProfileCreateRequest, AgentProfilePatchRequest, AgentProfileRecord,
-    AgentProfileResolution, AttemptStatus, CallerRuntimeIdentity, CredentialDecision,
-    CredentialDecisionSource, DiagnosticExecutionRequest, DiagnosticExecutionResponse,
-    EffectiveExecutionPolicy, ExecutionCommand, ExecutionFailure, ExecutionFailureClass,
-    ExecutionOptions, ExecutionOutcome, ExecutionStatus, ExecutionStreamHandle, ModelCandidate,
-    ModelDecision, ModelSelectionReason, ProviderAttemptSummary, ProviderModelRuntimeConfig,
-    ProviderRuntimePolicyPutRequest, ProviderRuntimePolicyRecord, ResolvedCredential,
-    ResolvedProviderConfiguration, RouteDecision, RouteDefinitionCreateRequest,
-    RouteDefinitionPatchRequest, RouteDefinitionRecord, RouteSelectionReason,
-    RouteSelectionStrategy, RoutingPolicyCreateRequest, RoutingPolicyPatchRequest,
-    RoutingPolicyRecord, RuntimeEventEnvelope, RuntimeEventType, RuntimePolicyStatus, UsageSummary,
+    AgentProfileResolution, ApplicationRoutingDefaultsPutRequest, ApplicationRoutingDefaultsRecord,
+    AttemptSelectionReason, AttemptStatus, CallerRuntimeIdentity, ComplexityTier,
+    CredentialDecision, CredentialDecisionSource, DiagnosticExecutionRequest,
+    DiagnosticExecutionResponse, EffectiveExecutionPolicy, ExecutionCommand, ExecutionFailure,
+    ExecutionFailureClass, ExecutionOptions, ExecutionOutcome, ExecutionStatus,
+    ExecutionStreamHandle, ModelCandidate, ModelDecision, ModelSelectionReason,
+    ProviderAttemptSummary, ProviderModelRuntimeConfig, ProviderRuntimePolicyPutRequest,
+    ProviderRuntimePolicyRecord, ResolvedCredential, ResolvedProviderConfiguration, RouteDecision,
+    RouteDefinitionCreateRequest, RouteDefinitionPatchRequest, RouteDefinitionRecord,
+    RouteSelectionReason, RouteSelectionStrategy, RoutingPolicyCreateRequest,
+    RoutingPolicyPatchRequest, RoutingPolicyRecord, RuntimeEventEnvelope, RuntimeEventType,
+    RuntimePolicyStatus, UsageSummary,
 };

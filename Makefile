@@ -43,9 +43,10 @@ ROUTE ?= general
 
 .PHONY: help setup start env env-force env-rotate up down reset logs ps psql redis \
         build migrate run serve release bootstrap-key seed test-seed-local smoke execute-test \
+        branch-invariant test-branch-invariant docs-only test-docs-only \
         keyring rotate-keys rotation-gate health openapi docs \
         console-install console-db console-dev console-build console-start console-check \
-        fmt fmt-check clippy test gates gates-fast check doctor clean
+        fmt fmt-check clippy test nextest gates gates-fast check doctor clean
 
 ##@ Getting started
 
@@ -147,6 +148,20 @@ seed: ## Register a provider/model/credential/policy so a prompt has somewhere t
 test-seed-local: ## Unit-test scripts/seed-local.sh's pure logic — no server, no database
 	python3 -m unittest discover -s scripts -p 'seed_local_lib_test.py' -v
 
+branch-invariant: ## Check main ⊆ develop against origin (CONVENTIONS §1A) — no build, seconds
+	@scripts/branch-invariant.sh
+
+test-branch-invariant: ## Drive the main ⊆ develop guard through every state it classifies
+	@scripts/branch-invariant-test.sh
+
+docs-only: ## Ask CI's own classifier whether HEAD vs origin/develop is a docs-only change
+	@# Same script, same allowlist, same answer as the `changes` job — so "why did CI
+	@# run everything?" is answerable in a second, without pushing.
+	@scripts/ci-docs-only.sh origin/develop HEAD
+
+test-docs-only: ## Drive the docs-only filter and the required-check gate through every case
+	@scripts/ci-docs-only-test.sh
+
 smoke: ## End-to-end check: health, contract, and a real completion with real tokens
 	$(ENV) scripts/smoke.sh
 
@@ -218,6 +233,9 @@ clippy: ## Lint, warnings denied
 
 test: ## Run the test suite against the local database
 	$(ENV) cargo test --workspace --all-features
+
+nextest: ## Run the same suite under cargo-nextest — secondary/diagnostic, NOT the merge gate (see docs/ci-test-sharding.md)
+	$(ENV) cargo nextest run --workspace --all-features
 
 rotation-gate: ## The keyring-rotation gate — fails when the test database is absent, never skips
 	$(ENV) scripts/rotation-gate.sh

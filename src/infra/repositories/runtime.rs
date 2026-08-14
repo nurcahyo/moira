@@ -6,17 +6,20 @@ use uuid::Uuid;
 
 use crate::{
     domain::{
-        AgentProfileCreateRequest, AgentProfilePatchRequest, AgentProfileRecord, AttemptStatus,
-        AuditLogInsert, CredentialDecisionSource, CredentialRecord, CredentialType,
-        ExecutionFailureClass, ListCursor, ModelCandidate, ProviderRuntimePolicyPutRequest,
-        ProviderRuntimePolicyRecord, ResolvedProviderConfiguration, RouteDefinitionCreateRequest,
-        RouteDefinitionPatchRequest, RouteDefinitionRecord, RoutingPolicyCreateRequest,
-        RoutingPolicyPatchRequest, RoutingPolicyRecord, UsageSummary,
+        AgentProfileCreateRequest, AgentProfilePatchRequest, AgentProfileRecord,
+        ApplicationRoutingDefaultsPutRequest, ApplicationRoutingDefaultsRecord,
+        AttemptSelectionReason, AttemptStatus, AuditLogInsert, CredentialDecisionSource,
+        CredentialRecord, CredentialType, ExecutionFailureClass, ListCursor, ModelCandidate,
+        ProviderRuntimePolicyPutRequest, ProviderRuntimePolicyRecord,
+        ResolvedProviderConfiguration, RouteDefinitionCreateRequest, RouteDefinitionPatchRequest,
+        RouteDefinitionRecord, RoutingPolicyCreateRequest, RoutingPolicyPatchRequest,
+        RoutingPolicyRecord, UsageSummary,
     },
     error::AppError,
     infra::{
         pg_rows::{
-            agent_profile_record_from_row, credential_record_from_row, credential_type_to_db,
+            agent_profile_record_from_row, application_routing_defaults_record_from_row,
+            attempt_selection_reason_to_db, credential_record_from_row, credential_type_to_db,
             provider_runtime_policy_record_from_row, provider_type_from_db,
             route_definition_record_from_row, route_selection_strategy_to_db,
             routing_policy_record_from_row, runtime_policy_status_to_db,
@@ -52,6 +55,12 @@ pub struct ExecutionAttemptInsert {
     pub provider_model_id: Uuid,
     pub credential_id: Uuid,
     pub metadata: Value,
+    /// Context router (issue #213) — this candidate's 0-based position in the ordered list
+    /// `select_candidates` returned for this execution.
+    pub candidate_rank: i32,
+    /// Always `None` in this MVP-static slice; reserved for the deferred scoring phase.
+    pub candidate_score: Option<f64>,
+    pub selection_reason: AttemptSelectionReason,
 }
 
 #[derive(Debug, Clone)]
@@ -289,6 +298,26 @@ pub trait RuntimeRepository: Send + Sync {
         request: &ProviderRuntimePolicyPutRequest,
         audit: AuditLogInsert,
     ) -> Result<ProviderRuntimePolicyRecord, AppError>;
+
+    /// Context router (issue #213). Returns the default row (`default_priority: 100`, an empty
+    /// `complexity_weight_profile`) when the application has never had one, the same "no row yet
+    /// means the declared defaults" shape as [`Self::get_provider_runtime_policy`].
+    async fn get_application_routing_defaults(
+        &self,
+        application_id: Uuid,
+    ) -> Result<ApplicationRoutingDefaultsRecord, AppError>;
+
+    /// Upserts the row unconditionally. See [`Self::put_provider_runtime_policy`] for the
+    /// sibling contract this mirrors exactly: the optional `If-Match` comparison happens in
+    /// `RuntimeAdminService::put_application_routing_defaults` *before* this is called, by
+    /// reading the current record and comparing versions in Rust — not inside this method and
+    /// not inside one transaction with the write.
+    async fn put_application_routing_defaults(
+        &self,
+        application_id: Uuid,
+        request: &ApplicationRoutingDefaultsPutRequest,
+        audit: AuditLogInsert,
+    ) -> Result<ApplicationRoutingDefaultsRecord, AppError>;
 
     async fn ensure_application_active(&self, application_id: Uuid) -> Result<(), AppError>;
 
@@ -1028,6 +1057,56 @@ impl RuntimeRepository for PgRuntimeRepository {
         Ok(record)
     }
 
+    async fn get_application_routing_defaults(
+        &self,
+        application_id: Uuid,
+    ) -> Result<ApplicationRoutingDefaultsRecord, AppError> {
+        let row = sqlx::query(
+            "select application_id, default_priority, complexity_weight_profile, updated_at, \
+             version from application_routing_defaults where application_id = $1",
+        )
+        .bind(application_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(row) => application_routing_defaults_record_from_row(&row),
+            None => Ok(default_application_routing_defaults(application_id)),
+        }
+    }
+
+    async fn put_application_routing_defaults(
+        &self,
+        application_id: Uuid,
+        request: &ApplicationRoutingDefaultsPutRequest,
+        audit: AuditLogInsert,
+    ) -> Result<ApplicationRoutingDefaultsRecord, AppError> {
+        // A transaction for one upsert, so the audit row shares its fate — see the trait's
+        // `audit` contract.
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            r#"
+            insert into application_routing_defaults
+                (application_id, default_priority, complexity_weight_profile)
+            values ($1, coalesce($2, 100), coalesce($3, '{}'::jsonb))
+            on conflict (application_id) do update set
+                default_priority = coalesce($2, application_routing_defaults.default_priority),
+                complexity_weight_profile =
+                    coalesce($3, application_routing_defaults.complexity_weight_profile),
+                updated_at = now()
+            returning application_id, default_priority, complexity_weight_profile, updated_at,
+                      version
+            "#,
+        )
+        .bind(application_id)
+        .bind(request.default_priority)
+        .bind(&request.complexity_weight_profile)
+        .fetch_one(&mut *tx)
+        .await?;
+        let record = application_routing_defaults_record_from_row(&row)?;
+        commit_with_audit(tx, audit).await?;
+        Ok(record)
+    }
+
     async fn ensure_application_active(&self, application_id: Uuid) -> Result<(), AppError> {
         let exists = sqlx::query_scalar::<_, bool>(
             "select exists(select 1 from applications where id = $1 and status = 'active' and deleted_at is null)",
@@ -1265,8 +1344,9 @@ impl RuntimeRepository for PgRuntimeRepository {
             insert into execution_attempts
                 (id, request_id, execution_id, attempt_number, application_id,
                  external_tenant_id, external_user_id, route_id, provider_id,
-                 provider_model_id, credential_id, status, metadata)
-            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'started', $12)
+                 provider_model_id, credential_id, status, metadata,
+                 candidate_rank, candidate_score, selection_reason)
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'started', $12, $13, $14, $15)
             "#,
         )
         .bind(insert.id)
@@ -1281,6 +1361,9 @@ impl RuntimeRepository for PgRuntimeRepository {
         .bind(insert.provider_model_id)
         .bind(insert.credential_id)
         .bind(&insert.metadata)
+        .bind(insert.candidate_rank)
+        .bind(insert.candidate_score)
+        .bind(attempt_selection_reason_to_db(insert.selection_reason))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1512,6 +1595,16 @@ fn default_provider_runtime_policy(provider_id: Uuid) -> ProviderRuntimePolicyRe
         circuit_failure_threshold: 5,
         circuit_open_duration_ms: 30_000,
         status: crate::domain::RuntimePolicyStatus::Active,
+        updated_at: Utc::now(),
+        version: 1,
+    }
+}
+
+fn default_application_routing_defaults(application_id: Uuid) -> ApplicationRoutingDefaultsRecord {
+    ApplicationRoutingDefaultsRecord {
+        application_id,
+        default_priority: 100,
+        complexity_weight_profile: serde_json::json!({}),
         updated_at: Utc::now(),
         version: 1,
     }
@@ -2278,6 +2371,22 @@ impl RuntimeRepository for InMemoryRuntimeRepository {
         _audit: AuditLogInsert,
     ) -> Result<ProviderRuntimePolicyRecord, AppError> {
         Err(not_stubbed("put_provider_runtime_policy"))
+    }
+
+    async fn get_application_routing_defaults(
+        &self,
+        _application_id: Uuid,
+    ) -> Result<ApplicationRoutingDefaultsRecord, AppError> {
+        Err(not_stubbed("get_application_routing_defaults"))
+    }
+
+    async fn put_application_routing_defaults(
+        &self,
+        _application_id: Uuid,
+        _request: &ApplicationRoutingDefaultsPutRequest,
+        _audit: AuditLogInsert,
+    ) -> Result<ApplicationRoutingDefaultsRecord, AppError> {
+        Err(not_stubbed("put_application_routing_defaults"))
     }
 
     async fn ensure_application_active(&self, _application_id: Uuid) -> Result<(), AppError> {

@@ -62,6 +62,85 @@ env:
                    # `idx >= total`. It is still two numbers that must agree in one file.
 
 jobs:
+  # ── The docs-only skip, issue #230 ───────────────────────────────────────────────
+  #
+  # A documentation pull request used to wait ~6 minutes, 353s of which was
+  # `container-and-helm` building a Docker image whose contents a markdown file cannot
+  # change: the release stage copies exactly two artifacts out of the builder, the
+  # binary and `config/default.toml`, and both Trivy and the SBOM step read the built
+  # image. This job classifies the change set once and every heavy job below reads its
+  # answer.
+  #
+  # THE THING THAT MAKES THIS NON-OBVIOUS, and the reason it is not simply an `if:` on
+  # the seven required checks: **a required status check that reports `skipped` does not
+  # report success, and GitHub will not merge the pull request.** An `if:` on
+  # `container-and-helm` does not make documentation PRs fast, it makes them permanently
+  # unmergeable — and the only escape from that is an administrative override of the
+  # required checks, which issue #221 is open about precisely because normalising a
+  # bypass is the harm. Nothing here bypasses anything: every required check still runs,
+  # still reports, and can still go red.
+  #
+  # So the heavy work moves into a job with a NEW name, and the REQUIRED name becomes a
+  # seconds-long gate that runs unconditionally and reports on what its dependency did.
+  # This is not a new idea here: `rust` has been exactly that shape since the shards
+  # landed, and `docs/ci-test-sharding.md` already says to require the aggregator and
+  # never the jobs beneath it. The pairs are:
+  #
+  #     required check        does the work
+  #     ─────────────────     ───────────────────────────
+  #     rust                  rust-lint, rust-shard, rust-migrations   (already so)
+  #     rotation-gate         rotation-gate-run
+  #     supply-chain          supply-chain-scan
+  #     sast                  sast-scan
+  #     container-and-helm    container-and-helm-build
+  #     console               console-checks
+  #     secret-scan           itself — never skipped, see that job
+  #
+  # NOTE for branch protection: THE REQUIRED-CHECK LIST DOES NOT CHANGE. It stays
+  # `rust, secret-scan, sast, supply-chain, container-and-helm, console, rotation-gate`.
+  # Never require a `-run` / `-scan` / `-build` / `-checks` job: those are the jobs that
+  # legitimately skip, and requiring one reintroduces the deadlock this design exists to
+  # avoid.
+  #
+  # The allowlist, the fail-closed rules and the proof that `docs/**` is NOT inert all
+  # live in `scripts/ci-docs-only.sh`. `docs/ci-docs-only.md` is the prose version.
+  changes:
+    runs-on: ubuntu-latest
+    # Seconds. No cargo, no containers. The timeout is a stuck-network backstop.
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Mandatory. The classifier diffs two real commits; under the default shallow
+          # clone neither endpoint is present, and it is written to answer that with
+          # `docs_only=false` — correct, but it would mean this job never once produced
+          # a skip and nobody would notice for months.
+          fetch-depth: 0
+      # The guard's own guard, and it runs on EVERY run of this workflow — including the
+      # docs-only ones. A path filter fails silently and green, so the only defence is to
+      # drive it: 49 cases over real git objects, about a second. If it goes red, so does
+      # every gate below it, because `changes` is then not a job whose verdict anyone may
+      # act on. Kept a separate STEP so the log attributes "the filter is broken" apart
+      # from "the filter could not classify this change".
+      - name: Self-test the docs-only classifier and the gate reporter
+        run: scripts/ci-docs-only-test.sh
+      - name: Classify the change set
+        id: classify
+        env:
+          # Passed explicitly rather than interpolated into the script body: an
+          # attacker-controlled branch name expanded into a `run:` block is script
+          # injection, and `p/github-actions` has a rule for it.
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          PUSH_AFTER_SHA: ${{ github.sha }}
+        run: scripts/ci-docs-only.sh
+
   # ── The Rust half, sharded ───────────────────────────────────────────────────────
   #
   # Five jobs replace one. `rust` used to be a single 9-minute job that ran fmt,
@@ -81,6 +160,12 @@ jobs:
   rust-lint:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    needs: changes
+    # Reported through the `rust` aggregator, which accounts for this skip. Written as
+    # `!= 'true'` and not `== 'false'` on purpose: if `changes` somehow published no
+    # output at all, the empty string is not 'true' and the job RUNS. Every ambiguity in
+    # this file resolves towards running more.
+    if: needs.changes.outputs.docs_only != 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -105,6 +190,9 @@ jobs:
   rust-shard:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    needs: changes
+    # Reported through `rust`. See rust-lint above for why the comparison is `!=`.
+    if: needs.changes.outputs.docs_only != 'true'
     strategy:
       # REQUIRED: one failing shard must not cancel its siblings — that destroys the
       # evidence the `rust` aggregator needs, and reintroduces "a failure truncated the
@@ -192,6 +280,10 @@ jobs:
   rust-migrations:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    needs: changes
+    # Reported through `rust`. `migrations/**` is deliberately NOT on the inert
+    # allowlist, so any change this job could possibly fail on already runs it.
+    if: needs.changes.outputs.docs_only != 'true'
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -268,15 +360,20 @@ jobs:
   # asserts a non-zero count of EXECUTED rotation tests against the count declared in the
   # source, so it goes red.
   #
-  # NOTE for branch protection: require `rotation-gate` as its own check. The name is
-  # stable and this is not a matrix job.
+  # NOTE for branch protection: require `rotation-gate` — the gate job below this one,
+  # not `rotation-gate-run`. The name is stable and neither is a matrix job.
   #
   # No Redis service. These are lib tests over one table plus the five content tables;
   # nothing here builds an `AppState`, and a service container nothing connects to is
   # one more thing that can fail for a reason unrelated to what is being gated.
-  rotation-gate:
+  rotation-gate-run:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    needs: changes
+    # Skipped only for a change set every path of which is on the inert allowlist. This
+    # job asserts a count of EXECUTED rotation tests against the count declared in
+    # `src/`; a markdown file cannot move either number.
+    if: needs.changes.outputs.docs_only != 'true'
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -309,6 +406,26 @@ jobs:
       # A script file, not an inline `cargo` line — same reason `ci-shard-run.sh` is one.
       - run: scripts/rotation-gate.sh
 
+  # THE REQUIRED CHECK. Runs always, in seconds, and reports on the job above.
+  rotation-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [changes, rotation-gate-run]
+    if: always()
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Report the rotation gate's result
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+          # Through `env:`, never interpolated into the command line. `needs.*.result` is
+          # a closed enum and safe today, but every gate below follows the same shape and
+          # one of them will eventually want a value that is not.
+          WORK: ${{ needs.rotation-gate-run.result }}
+        run: scripts/ci-required-gate.sh "rotation-gate-run=$WORK"
+
   # The aggregator. Named `rust` because that is today's check name and the name the
   # EXECUTION-LEDGER's standing authority uses, and because it is invariant under
   # re-sharding: a future branch-protection rule can be written against it without
@@ -316,7 +433,7 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [rust-lint, rust-shard, rust-migrations]
+    needs: [changes, rust-lint, rust-shard, rust-migrations]
     # Runs even when a dependency fails — that is the whole point. A completeness gate
     # that only runs on the happy path proves nothing about the unhappy one.
     if: always()
@@ -325,41 +442,190 @@ jobs:
       # RESULT ASSERTION FIRST, union gate second. If a shard failed, that must be
       # reported as "a shard failed" — not as "ten targets never ran", which is what the
       # union gate would say about the same run.
-      - name: Assert every rust job succeeded
+      #
+      # The loop that used to be inline here now lives in `scripts/ci-required-gate.sh`,
+      # unchanged in the case that matters: anything other than `success` fails. The one
+      # thing it adds is the docs-only exemption — a dependency may be `skipped` if, and
+      # only if, the `changes` job succeeded AND classified every path in the change set
+      # as inert. A `skipped` with no such verdict is still red, which is the shape this
+      # repository has catalogued thirteen times and is not about to reintroduce.
+      #
+      # Extracted rather than copied because four other required checks below need the
+      # identical three-state rule, and two copies of a guard is two chances to loosen
+      # one — the same argument `scripts/test-log-lib.sh` already makes for itself.
+      - name: Assert every rust job succeeded, or was skipped for a reason
         env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
           LINT: ${{ needs.rust-lint.result }}
           SHARDS: ${{ needs.rust-shard.result }}
           MIGRATIONS: ${{ needs.rust-migrations.result }}
-        run: |
-          set -euo pipefail
-          rc=0
-          for pair in "rust-lint:$LINT" "rust-shard:$SHARDS" "rust-migrations:$MIGRATIONS"; do
-              name=${pair%%:*}; result=${pair#*:}
-              # Anything other than success — failure, cancelled, skipped — is not a pass.
-              # `if: always()` is what makes this job RUN when a dependency fails; without
-              # the loop, a *skipped* dependency would read as green, which is the
-              # toothless-guard shape this repo has catalogued thirteen times.
-              [ "$result" = "success" ] || { printf 'FAILED — %s: %s\n' "$name" "$result"; rc=1; }
-          done
-          exit "$rc"
+        run: >-
+          scripts/ci-required-gate.sh
+          "rust-lint=$LINT" "rust-shard=$SHARDS" "rust-migrations=$MIGRATIONS"
+      # The union gate needs shard manifests, and on a docs-only run no shard ran to
+      # produce one. Guarded rather than made `continue-on-error`: `if-no-files-found` on
+      # the download would leave `ci-assert-union.sh` diffing `ls tests/*.rs` against an
+      # empty set and reporting every target as never-run. The completeness question is
+      # simply not asked on a run where the suite was not asked to run either, and the
+      # step above is what makes that skip accountable.
       - uses: actions/download-artifact@v4
+        if: needs.changes.outputs.docs_only != 'true'
         with:
           pattern: rust-shard-manifest-*
           path: manifests
       # Derives the expected set from THIS job's own fresh checkout (`ls tests/*.rs` plus
       # the three pseudo-units) and diffs it against what the shards' logs say ran.
       # Never reads ci/test-costs.tsv, never a hardcoded count.
-      - run: scripts/ci-assert-union.sh manifests
+      - if: needs.changes.outputs.docs_only != 'true'
+        run: scripts/ci-assert-union.sh manifests
 
-  supply-chain:
+  # ── cargo-nextest, issue #208 ─────────────────────────────────────────────────────
+  #
+  # NOT a replacement for `rust-shard`/`rust-migrations` and NOT wired into the `rust`
+  # aggregator's `needs`. `.config/nextest.toml`'s header records the measurement this
+  # decision rests on: on this suite, `cargo nextest run --workspace --all-features` is
+  # ~28% SLOWER than `cargo test --workspace --all-features` (2m07s vs 1m39s on a warm
+  # local build), because per-process isolation means 600+ process spawns each building
+  # their own Postgres pool, and the advisory locks guarding shared singletons serialise
+  # across processes instead of within one. Isolation costs more here than the extra
+  # parallelism returns. `docs/ci-test-sharding.md` records the same finding under
+  # "Approaches rejected" and the reason the union/skip-detection machinery in
+  # `scripts/test-log-lib.sh` — built and tuned against `cargo test`'s own log format —
+  # is not retargeted at nextest's here: nextest captures a PASSING test's output by
+  # default, and the skip line this repo's DB-backed tests print is emitted by a test
+  # that then passes, so pointing the existing skip gate at an unmodified nextest log
+  # would read empty and report a suite that silently skipped every DB test as green —
+  # a strictly worse version of the failure that gate exists to catch.
+  #
+  # So this job exists for the reason `.config/nextest.toml` says nextest earns its keep
+  # at all: per-process isolation surfaces cross-process contention an in-process `Mutex`
+  # cannot, which is diagnostically valuable when hunting a shared-state bug (both plan 07
+  # shared-database fixes were re-verified under it). It is `workflow_dispatch`-only —
+  # run it on demand from the Actions tab — rather than on every `pull_request`/`push`, so
+  # a routine PR does not pay a second, slower, DB-backed full-suite run for a signal the
+  # five-way shard already gives it, and so a run that goes red for a reason unrelated to
+  # the change under review (cross-process contention this project has already measured
+  # and accepted, not a regression) does not train reviewers to click "re-run" or bypass.
+  #
+  # NOTE for branch protection: do NOT require this check. It is not part of the
+  # completeness/skip-detection contract `rust` enforces, and it does not run on the
+  # triggers a required check needs to answer on every PR.
+  rust-nextest:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.event_name == 'workflow_dispatch'
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: moira
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d moira"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      MOIRA_DATABASE__URL: postgres://postgres:postgres@localhost:5432/moira
+      MOIRA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/moira
+      MOIRA_DATABASE__REQUIRE: true
+      MOIRA_REDIS__ENABLED: true
+      MOIRA_REDIS__URL: redis://localhost:6379/0
+      MOIRA_SECRETS__ALLOW_INSECURE_DEV_KEY: true
+      MOIRA_API_KEYS__ALLOW_INSECURE_DEV_PEPPER: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-test
+          # Reader only, like `rust-migrations`/`rotation-gate`: a full-workspace nextest
+          # run builds every test target this repo has, and letting a fourth job fight
+          # `rust-shard`'s shard 0 for the one save slot on an immutable cache key risks
+          # publishing a thinner `target/` than the shards need. See the `rust-shard`
+          # cache-key comment above for what goes wrong when two jobs share a save.
+          save-if: false
+      # A pinned released binary, not a marketplace action — the same choice already made
+      # for gitleaks and kubeconform below, and for the same reason: one fewer action ref
+      # on the pinning surface. Version matches what CLAUDE.md's setup verified locally
+      # (`cargo nextest --version` → 0.9.140) so a CI-only regression cannot hide behind a
+      # version drift from what was checked by hand.
+      - name: Install cargo-nextest 0.9.140
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -fsSL "https://get.nexte.st/0.9.140/linux" \
+            | tar -xzf - -C "$HOME/.cargo/bin"
+      - run: cargo nextest run --workspace --all-features --profile ci
+      - name: Upload nextest JUnit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-junit
+          path: target/nextest/ci/junit.xml
+          retention-days: 7
+          if-no-files-found: warn
+
+  supply-chain-scan:
+    runs-on: ubuntu-latest
+    needs: changes
+    # Its inputs are `Cargo.toml`, `Cargo.lock` and `deny.toml`, none of which is on the
+    # inert allowlist, so any change that could move this job's verdict already runs it.
+    #
+    # DISCLOSED, because it is the one skip here that is not purely a function of the
+    # tree: `cargo audit` also reads RustSec's advisory database, which moves on its own.
+    # Skipping this on a documentation PR defers the "is there a NEW advisory against an
+    # unchanged lockfile" question to the next non-documentation push. The same is true
+    # of Trivy in `container-and-helm` and of semgrep's registry in `sast`. The clean fix
+    # is a scheduled run of these three; that is a separate change and is not smuggled in
+    # here. `secret-scan` is deliberately not in this category — see the job below.
+    if: needs.changes.outputs.docs_only != 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # PINNED TO THE OLD JOB NAME, and it has to be. `Swatinem/rust-cache` derives
+          # its key from `${{ github.job }}` when no `shared-key` is given, so renaming
+          # this job from `supply-chain` to `supply-chain-scan` silently orphaned its
+          # cache: `cargo install cargo-audit cargo-deny --locked` went from 19s to 302s
+          # on demonstration run 31834960269, measured. Nothing failed and nothing warned
+          # — the job was simply sixteen times slower, which is exactly the sort of thing
+          # a rename is not supposed to be able to do. `supply-chain` is this key's only
+          # user; `rust-lint` and `rust-test` are the other two in this file.
+          shared-key: supply-chain
       - run: cargo install cargo-audit cargo-deny --locked
       - run: cargo audit
       - run: cargo deny check
+
+  # THE REQUIRED CHECK.
+  supply-chain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [changes, supply-chain-scan]
+    if: always()
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Report the supply-chain scan's result
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+          WORK: ${{ needs.supply-chain-scan.result }}
+        run: scripts/ci-required-gate.sh "supply-chain-scan=$WORK"
 
   # ── Supply-chain scanning, issue #98 ─────────────────────────────────────────────
   #
@@ -381,6 +647,27 @@ jobs:
   # would blur what a red `rust` means. Require `secret-scan` and `sast` as their own
   # checks — both names are stable and neither is a matrix job.
 
+  # NEVER SKIPPED. No `needs: changes`, no `if:` — this job runs on every event, on every
+  # change set, including a one-word typo fix in a README.
+  #
+  # It is tempting to put it on the docs-only list because it is 9 seconds and because
+  # "documentation cannot break the build". Both are true and neither is the question.
+  # Every other job here is a function of the tree, and the docs-only skip is sound
+  # exactly because a markdown file cannot move any input those jobs read. This job's
+  # input is DIFFERENT: it is the commit's own content and the history leading to it, and
+  # a documentation commit changes that by definition. A markdown file is a perfectly
+  # good place to leak a credential — an example `curl` in a README with a real key in
+  # the header, a pasted log in a runbook, a config block in a migration guide. Those are
+  # not hypothetical shapes; they are the ordinary contents of documentation.
+  #
+  # And the cost of missing one is asymmetric and irreversible in a way no other check
+  # here is: this repository is PUBLIC, so a credential that reaches a branch is disclosed
+  # the moment it is pushed. A rotation-gate regression can be fixed on the next commit.
+  # A disclosed key cannot be un-disclosed by a later CI run.
+  #
+  # So this is the job that keeps a fast documentation PR from being a cheaper way to get
+  # a secret into a public repository than a code PR. 9 seconds; it also sets the floor
+  # for a docs-only run's wall clock, and that is the right thing to spend it on.
   secret-scan:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -444,9 +731,15 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-  sast:
+  sast-scan:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    needs: changes
+    # The five rulesets below are p/rust, p/typescript, p/javascript, p/github-actions
+    # and p/dockerfile. Not one of them has a markdown analyzer, and every file type they
+    # DO read — `.rs`, `.ts`, `.js`, `.github/**`, `Dockerfile` — is deliberately off the
+    # inert allowlist. Same registry-drift caveat as `supply-chain-scan` above.
+    if: needs.changes.outputs.docs_only != 'true'
     permissions:
       contents: read
     steps:
@@ -519,8 +812,41 @@ jobs:
             --config=p/github-actions \
             --config=p/dockerfile
 
-  container-and-helm:
+  # THE REQUIRED CHECK.
+  sast:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [changes, sast-scan]
+    if: always()
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Report the SAST scan's result
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+          WORK: ${{ needs.sast-scan.result }}
+        run: scripts/ci-required-gate.sh "sast-scan=$WORK"
+
+  container-and-helm-build:
+    runs-on: ubuntu-latest
+    needs: changes
+    # The long pole: 353s on the last develop run, almost all of it `docker build`. Its
+    # inputs are the `Dockerfile`, `charts/**` and the whole Rust source tree, none of
+    # which is on the inert allowlist.
+    #
+    # Do NOT reach for `.dockerignore` to justify this. An earlier draft of this comment
+    # claimed a documentation commit "cannot even change the bytes fed to docker build",
+    # and that is false: `.dockerignore` lists only `.git .github target *.log .env
+    # .env.* config/local.toml docs deploy charts`, while the `Dockerfile` opens with
+    # `COPY . .` — so root `README.md`, `plans/`, `.agents/`, `.claude/` and `skills/`
+    # are all IN the build context, and editing any of them does bust the layer cache.
+    # What makes this job's RESULT invariant is the other end: the release stage copies
+    # only `/app/target/release/moira` and `/app/config/default.toml` out of the
+    # builder, and Trivy and the SBOM step both scan `image-ref: moira:ci`. The output
+    # cannot differ, which is the property that matters — not the input.
+    if: needs.changes.outputs.docs_only != 'true'
     permissions:
       contents: read
       security-events: write
@@ -610,11 +936,34 @@ jobs:
             -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
             /tmp/moira-rendered-servicemonitor.yaml
 
+  # THE REQUIRED CHECK.
+  container-and-helm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [changes, container-and-helm-build]
+    if: always()
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Report the image and chart build's result
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+          WORK: ${{ needs.container-and-helm-build.result }}
+        run: scripts/ci-required-gate.sh "container-and-helm-build=$WORK"
+
   # Frontend gate for the Next.js admin console. Everything here is scoped to
   # `console/` and shares nothing with the Rust jobs, so it runs in parallel with
   # them rather than behind them.
-  console:
+  console-checks:
     runs-on: ubuntu-latest
+    needs: changes
+    # `console/**` is off the inert allowlist in full, and so are the two files outside
+    # it that console tests read: `docs/openapi.json` (the contract test) and
+    # `docs/i18n-response-catalog.json` (the key-mirror test). Those two are exactly why
+    # the allowlist entry is `*.md` and not `docs/**` — see scripts/ci-docs-only.sh.
+    if: needs.changes.outputs.docs_only != 'true'
     # Playwright can hang rather than fail; a job-level cap turns that into a red
     # run instead of a runner held for six hours.
     timeout-minutes: 25
@@ -708,6 +1057,23 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  # THE REQUIRED CHECK.
+  console:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [changes, console-checks]
+    if: always()
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Report the console suite's result
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+          WORK: ${{ needs.console-checks.result }}
+        run: scripts/ci-required-gate.sh "console-checks=$WORK"
+
   # A separate job from `container-and-helm`, not extra steps inside it.
   #
   # The two share no inputs: that job builds the Rust image from the repo root
@@ -720,6 +1086,11 @@ jobs:
   # kubeconform download, which is a two-second curl.
   console-container-and-helm:
     runs-on: ubuntu-latest
+    needs: changes
+    # NOT a required check (it never has been), so this one takes a plain `if:` with no
+    # gate job behind it: a skipped non-required check blocks nothing. Its inputs are
+    # `console/**` and `charts/moira-console/**`, neither on the inert allowlist.
+    if: needs.changes.outputs.docs_only != 'true'
     permissions:
       # Deliberately narrower than `container-and-helm`'s. Trivy runs with
       # `format: table` and uploads no SARIF, so `security-events: write` would

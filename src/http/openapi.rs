@@ -16,8 +16,8 @@ use utoipa::{
 use crate::{
     app::AppState,
     domain::{
-        AuditResult, ConversationStatus, CredentialType, MemoryStatus, MemoryType,
-        RagCollectionStatus, ResponseText, ScopeType,
+        AttemptSelectionReason, AuditResult, ConversationStatus, CredentialType, MemoryStatus,
+        MemoryType, RagCollectionStatus, ResponseText, ScopeType,
     },
     error::{AppError, ErrorDetail, ErrorResponse},
 };
@@ -30,6 +30,7 @@ use crate::{
         description = "Moira public responses, conversations, memory, retrieval, RAG, discovery, usage, observability, and administrative runtime configuration API."
     ),
     components(schemas(
+        AttemptSelectionReason,
         AuditResult,
         ConversationStatus,
         CredentialType,
@@ -67,6 +68,7 @@ use crate::{
         (name = "admin-routes", description = "Route definition administration"),
         (name = "admin-routing-policies", description = "Routing policy administration"),
         (name = "admin-agent-profiles", description = "Agent profile administration"),
+        (name = "admin-skills", description = "Skill (declarative tool/guard) administration"),
         (name = "admin-runtime", description = "Runtime policy and diagnostics"),
         (name = "admin-rag", description = "RAG collection and document administration")
     )

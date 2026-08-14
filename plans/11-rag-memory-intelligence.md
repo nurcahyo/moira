@@ -314,11 +314,11 @@ checking.
 
 Binding: `plans/CONVENTIONS.md` §1. Where anything below conflicts with CONVENTIONS.md, **CONVENTIONS.md wins**.
 
-**Branch of record:** `plan/11-rag-memory-intelligence` — branched from the **current `main`** (§1.1). This plan is **post-MVP**.
+**Branch of record:** `plan/11-rag-memory-intelligence` — branched from the **current `develop`** (§1 rule 1 and §1A: `develop` is the integration branch and the base for all plan work). This plan is **post-MVP**.
 
 **Shape: a STACKED SERIES of PRs, not one PR.** This is the deliberate exception to the usual one-plan-one-PR default, and the reason is concrete: plan 11 spans eight sub-phases (A–H) across seven internal waves, touches the highest-security-sensitivity code in the repository (the prompt-injection boundary and the cross-tenant vector-isolation SQL), and would otherwise produce a single unreviewable diff. CONVENTIONS.md §1.1 explicitly contemplates stacking; §1.4's description requirements and §1.5's "done means merged" apply **to every PR in the stack**, not just the last one.
 
-`plan/11-rag-memory-intelligence` is the **integration branch**. Nothing is committed to it directly — it only receives merges from sub-phase branches, and it is what finally opens a PR against `main`.
+`plan/11-rag-memory-intelligence` is the **integration branch**. Nothing is committed to it directly — it only receives merges from sub-phase branches, and it is what finally opens a PR against `develop`.
 
 | PR | Branch | Base branch / base PR | Sub-phase (Wave) | Independently reviewable deliverable |
 |---|---|---|---|---|

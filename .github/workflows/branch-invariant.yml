@@ -1,0 +1,90 @@
+# The `main ⊆ develop` guard — CONVENTIONS §1A, "Recommended: a CI guard".
+#
+# Separate from ci.yml on purpose. ci.yml runs on `pull_request`, and this check must
+# never become a pull-request check; see the trigger note below.
+#
+# All of the reasoning lives in scripts/branch-invariant.sh, which is where it can be
+# executed. scripts/branch-invariant-test.sh drives that script through every state it
+# classifies, using real git objects.
+name: branch-invariant
+
+on:
+  push:
+    branches:
+      # `main` is the load-bearing trigger: `main` advancing is the ONLY event that can
+      # break the invariant. A push to `develop` can only extend `develop`, which
+      # preserves or restores it, and `allow_force_pushes: false` on both branches rules
+      # out the reset case.
+      - main
+      # `develop` is here anyway, and it is cheap. It is the event that REPAIRS the
+      # invariant (§1A step 4a/4b), so running here is what lets the guard go quiet
+      # promptly after a repair instead of staying stale until the next release or the
+      # next scheduled run. It also covers the sequence "hotfix on main, then unrelated
+      # work on develop", where the failure needs to keep being visible.
+      - develop
+  schedule:
+    # Backstop for a merge whose workflow run was skipped or cancelled. Do NOT treat it
+    # as the primary: a hotfix on `main` and the release that reverts it can be minutes
+    # apart, and "daily" is longer than that window.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+# DELIBERATELY NO `pull_request` TRIGGER, and this is a design decision rather than an
+# omission — do not "fix" it by adding one.
+#
+# During a promotion the invariant is legitimately false for the minutes between the
+# merge into `main` and the repair in §1A step 4a/4b. A check that runs on pull requests
+# can be made a required check, and a required check that is red for the whole promotion
+# window blocks every unrelated PR into `develop` during it — punishing authors who had
+# nothing to do with the promotion for a state only the promoter can clear. The
+# invariant is a property of two long-lived branches, not of any individual PR, so it is
+# checked where it can actually be true or false: on the branches themselves.
+#
+# Consequently: never add this job to the required-checks list for `develop` or `main`.
+
+# Keyed on the ref, NOT a constant. With a constant group, a merge train into `develop`
+# cancels earlier runs — and the first casualty is the push-to-`main` run, which is the
+# one event that can actually break the invariant. The breaking commit would then show a
+# cancelled check rather than a red one. Per-ref grouping still collapses a burst of
+# pushes to the same branch, which is the only coalescing worth having here.
+concurrency:
+  group: branch-invariant-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  main-subset-develop:
+    name: main ⊆ develop
+    runs-on: ubuntu-latest
+    # Seconds, not minutes: no cargo, no containers, no service dependencies. The
+    # timeout is a stuck-network backstop, not a budget.
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Mandatory. The guard compares two branches by ancestry and by merge base; a
+          # shallow clone cannot see either, and the script exits 2 ("the guard could
+          # not run") rather than reporting a passing invariant it never checked.
+          fetch-depth: 0
+
+      - name: Check that everything released is present in develop
+        run: scripts/branch-invariant.sh
+
+  # A SEPARATE JOB on purpose. Run as a second step of the job above, a broken self-test
+  # turns the "main ⊆ develop" check red for a reason that has nothing to do with the
+  # invariant — which is exactly the misattribution this workflow exists to avoid. Split
+  # out, the two questions ("is the invariant true?" and "does the guard still classify
+  # correctly?") fail independently and are readable apart.
+  guard-self-test:
+    name: guard self-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      # Builds throwaway repositories from real git objects and drives the guard through
+      # every state it claims to classify, asserting the verdict and the exit code of
+      # each. A guard that has never been seen to fail is not a guard.
+      - name: Self-test the guard's own classification
+        run: scripts/branch-invariant-test.sh

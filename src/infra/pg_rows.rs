@@ -3,20 +3,21 @@ use sqlx::Row;
 
 use crate::{
     domain::{
-        ApiKeyRecord, ApplicationExecutionPolicyRecord, ApplicationRecord, AuditEvent,
-        AuditLogRecord, AuditResult, ConversationContentPersistence, ConversationMessageRecord,
+        ApiKeyRecord, ApplicationExecutionPolicyRecord, ApplicationRecord,
+        ApplicationRoutingDefaultsRecord, AttemptSelectionReason, AuditEvent, AuditLogRecord,
+        AuditResult, ConversationContentPersistence, ConversationMessageRecord,
         ConversationMessageRole, ConversationMessageType, ConversationPolicyRecord,
         ConversationRecord, ConversationStatus, CredentialRecord, CredentialScope,
         CredentialStatus, CredentialSummary, CredentialType, EmbeddingPolicyRecord,
-        ExecutionFailureClass, HistoryStrategy, KeyStatus, MemoryConsentMode, MemoryPolicyRecord,
-        MemoryRecord, MemoryScope, MemorySensitivity, MemoryStatus, MemoryType, OwnerScope,
-        ProviderConfig, ProviderKind, ProviderModelRecord, ProviderModelRuntimeConfig,
+        ExecutionFailureClass, HistoryStrategy, HttpMethod, KeyStatus, MemoryConsentMode,
+        MemoryPolicyRecord, MemoryRecord, MemoryScope, MemorySensitivity, MemoryStatus, MemoryType,
+        OwnerScope, ProviderConfig, ProviderKind, ProviderModelRecord, ProviderModelRuntimeConfig,
         ProviderRecord, ProviderRuntimePolicyRecord, ProviderType, PublicResponseRecord,
         PublicResponseStatus, PublicUsageSummary, RagCollectionRecord, RagCollectionStatus,
         RagCollectionVisibility, RagDocumentRecord, RagDocumentStatus, RagIngestionStatus,
         ResourceStatus, ResponsePersistenceMode, RetrievalPolicyRecord, RouteDefinitionRecord,
         RouteSelectionStrategy, RoutingPolicyRecord, RuntimePolicyStatus, ScopeType,
-        TrustedJwtIssuerRecord,
+        SkillHttpExecutorRecord, SkillKind, SkillRecord, SkillStatus, TrustedJwtIssuerRecord,
     },
     error::AppError,
     security::{ContentIdentity, ContentOpener, warn_content_storage_ambiguous},
@@ -315,6 +316,18 @@ pub fn provider_runtime_policy_record_from_row(
         circuit_failure_threshold: row.try_get("circuit_failure_threshold")?,
         circuit_open_duration_ms: row.try_get("circuit_open_duration_ms")?,
         status: runtime_policy_status_from_db(row.try_get::<String, _>("status")?)?,
+        updated_at: row.try_get("updated_at")?,
+        version: row.try_get("version")?,
+    })
+}
+
+pub fn application_routing_defaults_record_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<ApplicationRoutingDefaultsRecord, AppError> {
+    Ok(ApplicationRoutingDefaultsRecord {
+        application_id: row.try_get("application_id")?,
+        default_priority: row.try_get("default_priority")?,
+        complexity_weight_profile: row.try_get("complexity_weight_profile")?,
         updated_at: row.try_get("updated_at")?,
         version: row.try_get("version")?,
     })
@@ -855,6 +868,79 @@ pub fn resource_status_to_db(status: &ResourceStatus) -> &'static str {
     }
 }
 
+pub fn skill_status_from_db(value: String) -> Result<SkillStatus, AppError> {
+    match value.as_str() {
+        "draft" => Ok(SkillStatus::Draft),
+        "enabled" => Ok(SkillStatus::Enabled),
+        "disabled" => Ok(SkillStatus::Disabled),
+        _ => Err(AppError::Internal(format!("unknown skill status {value}"))),
+    }
+}
+
+pub fn skill_kind_from_db(value: String) -> Result<SkillKind, AppError> {
+    match value.as_str() {
+        "tool" => Ok(SkillKind::Tool),
+        "guard" => Ok(SkillKind::Guard),
+        _ => Err(AppError::Internal(format!("unknown skill kind {value}"))),
+    }
+}
+
+pub fn skill_record_from_row(row: &sqlx::postgres::PgRow) -> Result<SkillRecord, AppError> {
+    Ok(SkillRecord {
+        id: row.try_get("id")?,
+        skill_key: row.try_get("skill_key")?,
+        display_name: row.try_get("display_name")?,
+        description: row.try_get("description")?,
+        kind: skill_kind_from_db(row.try_get::<String, _>("kind")?)?,
+        params_schema: row.try_get("params_schema")?,
+        tags: row.try_get("tags")?,
+        status: skill_status_from_db(row.try_get::<String, _>("status")?)?,
+        metadata: row.try_get("metadata")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+        deleted_at: row.try_get("deleted_at")?,
+        version: row.try_get("version")?,
+    })
+}
+
+pub fn http_method_from_db(value: String) -> Result<HttpMethod, AppError> {
+    match value.as_str() {
+        "GET" => Ok(HttpMethod::Get),
+        "POST" => Ok(HttpMethod::Post),
+        "PUT" => Ok(HttpMethod::Put),
+        "PATCH" => Ok(HttpMethod::Patch),
+        "DELETE" => Ok(HttpMethod::Delete),
+        _ => Err(AppError::Internal(format!("unknown http method {value}"))),
+    }
+}
+
+pub fn http_method_to_db(method: &HttpMethod) -> &'static str {
+    match method {
+        HttpMethod::Get => "GET",
+        HttpMethod::Post => "POST",
+        HttpMethod::Put => "PUT",
+        HttpMethod::Patch => "PATCH",
+        HttpMethod::Delete => "DELETE",
+    }
+}
+
+pub fn skill_http_executor_record_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<SkillHttpExecutorRecord, AppError> {
+    Ok(SkillHttpExecutorRecord {
+        skill_id: row.try_get("skill_id")?,
+        method: http_method_from_db(row.try_get::<String, _>("method")?)?,
+        url_template: row.try_get("url_template")?,
+        allowed_host: row.try_get("allowed_host")?,
+        header_template: row.try_get("header_template")?,
+        credential_id: row.try_get("credential_id")?,
+        timeout_ms: row.try_get("timeout_ms")?,
+        response_schema: row.try_get("response_schema")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
 pub fn route_selection_strategy_from_db(value: String) -> Result<RouteSelectionStrategy, AppError> {
     match value.as_str() {
         "explicit" => Ok(RouteSelectionStrategy::Explicit),
@@ -881,6 +967,34 @@ pub fn runtime_policy_status_from_db(value: String) -> Result<RuntimePolicyStatu
         _ => Err(AppError::Internal(format!(
             "unknown runtime policy status {value}"
         ))),
+    }
+}
+
+/// `execution_attempts.selection_reason` (migration 0030), nullable — a `None` column reads as
+/// `None` rather than an error, since attempts written before this migration (and any write path
+/// that genuinely has nothing to report) carry no value.
+pub fn attempt_selection_reason_from_db(
+    value: Option<String>,
+) -> Result<Option<AttemptSelectionReason>, AppError> {
+    value
+        .map(|value| match value.as_str() {
+            "priority" => Ok(AttemptSelectionReason::Priority),
+            "explicit_hint" => Ok(AttemptSelectionReason::ExplicitHint),
+            "scored" => Ok(AttemptSelectionReason::Scored),
+            "fallback_after_failure" => Ok(AttemptSelectionReason::FallbackAfterFailure),
+            _ => Err(AppError::Internal(format!(
+                "unknown attempt selection reason {value}"
+            ))),
+        })
+        .transpose()
+}
+
+pub fn attempt_selection_reason_to_db(reason: AttemptSelectionReason) -> &'static str {
+    match reason {
+        AttemptSelectionReason::Priority => "priority",
+        AttemptSelectionReason::ExplicitHint => "explicit_hint",
+        AttemptSelectionReason::Scored => "scored",
+        AttemptSelectionReason::FallbackAfterFailure => "fallback_after_failure",
     }
 }
 

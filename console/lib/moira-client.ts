@@ -55,7 +55,9 @@ import type {
 import type {
   ApiKeyCredentialSecret,
   ConsoleApiKeyCredentialCreateRequest,
+  ConsoleOAuth2CredentialCreateRequest,
   CredentialRecord,
+  OAuth2CredentialSecret,
   RotateCredentialRequest,
 } from "./moira-credential-types";
 import type {
@@ -1042,6 +1044,28 @@ export function apiKeyCredentialSecret(apiKey: string): ApiKeyCredentialSecret {
 }
 
 /**
+ * Build the `oauth2` arm of `CredentialSecret` — the ONLY sanctioned way to
+ * construct one, for the same reason `apiKeyCredentialSecret` is: a fresh
+ * object literal, never a spread of caller input, so nothing extra rides along.
+ *
+ * Unlike `apiKeyCredentialSecret`, there is no untagged-union ambiguity to
+ * defend against here — see `OAuth2CredentialSecret`'s header in
+ * `lib/moira-credential-types.ts`. `refresh_token`/`token_type`/`expires_at`
+ * are accepted but always omitted by every shipped call site
+ * (`lib/claude-subscription.ts` stores a long-lived setup token, not a
+ * refresh-token pair), so this returns exactly `{ access_token }` when only
+ * that is supplied.
+ */
+export function oauth2CredentialSecret(accessToken: string): OAuth2CredentialSecret {
+  if (typeof accessToken !== "string" || accessToken.length === 0) {
+    throw new MoiraClientContractError(
+      "the credential secret requires a non-empty `access_token`",
+    );
+  }
+  return { access_token: accessToken };
+}
+
+/**
  * `POST /api/v1/admin/provider-credentials` guard.
  *
  * The two properties that are not restatements of the schema:
@@ -1096,6 +1120,26 @@ export function assertCredentialCreateIsSafe(body: Record<string, unknown>): voi
           "endpoint: a provider with no credential row fails `credential_not_found`",
       );
     }
+  } else if (credentialType === "oauth2") {
+    // No ambiguity to defend against here — `access_token` is the only
+    // required field on this arm and no other CredentialSecret variant shares
+    // it (see `OAuth2CredentialSecret`'s header). The check is therefore just:
+    // no unknown key, and a non-empty `access_token`.
+    const ALLOWED = new Set(["access_token", "refresh_token", "token_type", "expires_at"]);
+    const unknown = Object.keys(secret as Record<string, unknown>).filter(
+      (key) => !ALLOWED.has(key),
+    );
+    if (unknown.length > 0) {
+      throw new MoiraClientContractError(
+        `an \`oauth2\` credential secret carries unknown key(s): ${unknown.join(", ")}`,
+      );
+    }
+    const accessToken = (secret as { access_token?: unknown }).access_token;
+    if (typeof accessToken !== "string" || accessToken.length === 0) {
+      throw new MoiraClientContractError(
+        "the credential secret requires a non-empty `access_token`",
+      );
+    }
   }
 }
 
@@ -1125,6 +1169,12 @@ export function assertCredentialRotateIsSafe(body: Record<string, unknown>): voi
     throw new MoiraClientContractError(
       "`endpoint: null` makes the untagged CredentialSecret ambiguous between the api_key and " +
         "azure arms — omit the key entirely rather than sending null",
+    );
+  }
+  const accessToken = (secret as { access_token?: unknown }).access_token;
+  if (accessToken !== undefined && (typeof accessToken !== "string" || accessToken.length === 0)) {
+    throw new MoiraClientContractError(
+      "rotate body requires a non-empty `access_token` when the secret carries one",
     );
   }
 }
@@ -1698,12 +1748,13 @@ export class MoiraClient {
    * write the browser controls, and no check inside this client can tell a
    * verified id from an unverified one.
    *
-   * Build `body.secret` with `apiKeyCredentialSecret()`. Assembling the object
-   * by hand is how `endpoint: null` gets in, which makes the untagged union
-   * ambiguous and the request permanently refused.
+   * Build `body.secret` with `apiKeyCredentialSecret()` or, for the `oauth2`
+   * arm, `oauth2CredentialSecret()`. Assembling the object by hand is how
+   * `endpoint: null` gets in, which makes the untagged union ambiguous and the
+   * request permanently refused.
    */
   async createProviderCredential(
-    body: ConsoleApiKeyCredentialCreateRequest,
+    body: ConsoleApiKeyCredentialCreateRequest | ConsoleOAuth2CredentialCreateRequest,
     options: { readonly idempotencyKey?: string } = {},
   ): Promise<CredentialRecord> {
     assertCredentialCreateIsSafe(body as unknown as Record<string, unknown>);

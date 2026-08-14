@@ -49,7 +49,7 @@ Each iteration plan is executed on its **own branch** and lands via **its own pu
 | 11 | `plan/11-rag-memory-intelligence` |
 
 **Rules**
-1. Branch from the **current `main`** (not from another plan branch) unless the dependency graph in `01-roadmap-and-dependencies.md` requires stacking; if stacked, the PR description must name the base PR and the branch must be rebased once the base merges.
+1. Branch from the **current `develop`** (not from another plan branch) unless the dependency graph in `01-roadmap-and-dependencies.md` requires stacking; if stacked, the PR description must name the base PR and the branch must be rebased once the base merges. `develop` is the integration branch and the base for all plan work (§1A); plan PRs are opened against `develop` and squashed into it. Plans 02a–04 were executed before `develop` existed and their own text still says `main`; that is a record of what happened, not an instruction.
 2. **Conventional Commits** (`feat:`, `fix:`, `test:`, `docs:`, `refactor:`, `chore:`) — matching the existing history style (`feat: make admin commands atomic`).
 3. The PR **must not** be opened until every gate in §2 passes locally.
 4. PR description template (required sections): **Plan link** (`plans/NN-*.md`) · **Findings addressed** (P-IDs from `00-audit-report.md`) · **Migrations included** (filenames, or "none") · **Breaking API/OpenAPI changes** · **Test evidence** (unit + e2e output summary) · **Rollback procedure** · **Deferred follow-ups**.
@@ -61,15 +61,148 @@ Each iteration plan is executed on its **own branch** and lands via **its own pu
 
 ## 1A. Long-lived branches (`main` / `develop`) and merge method
 
-This repository has two long-lived branches. **`main`** is the default branch and the release branch; **`develop`** is the integration branch. Feature and plan branches land on `develop`; `develop` is periodically promoted to `main`, and `main` is occasionally synced back into `develop`.
+This repository has two long-lived branches. **`main`** is the default branch and the release branch; **`develop`** is the integration branch. Feature and plan branches land on `develop`; `develop` is periodically promoted to `main`. **Every merge into `main` — a promotion or anything else — is followed by a step that puts `main` back inside `develop`**; see "The ritual" below, which is mandatory rather than occasional.
 
 Unlike the rest of this file, this section is **not** scoped to the iteration plans. It binds **every** merge between `main` and `develop`, whoever or whatever performs it, plan-related or not.
 
-> **Note on §1.** §1 above was written before `develop` existed and still tells plan branches to branch from and land on `main`. Current practice is that all feature, fix, and plan branches target `develop` — of the last twelve merged pull requests, eleven based on `develop` and only the `develop` → `main` promotion based on `main`. Reconciling §1's wording is out of scope here; where the two differ on *base branch*, current practice governs, and nothing in §1 overrides the merge-method rule below.
+> **Note on §1.** §1 above was written before `develop` existed and originally told plan branches to branch from and land on `main`. Its rule 1 has since been reconciled with this section (issue #221) and now says `develop`, which is what current practice already was — of the last twelve merged pull requests, eleven based on `develop` and only the `develop` → `main` promotion based on `main`. Where any remaining plan text still says `main` for a *base branch*, this section governs, and nothing in §1 overrides the merge-method rule below.
 
 **A merge between the two long-lived branches — `develop` into `main`, or `main` into `develop`, in either direction — MUST use a merge commit. Never a squash, never a rebase.** On the command line that is `gh pr merge <N> --merge`; in the GitHub UI it is "Create a merge commit".
 
-**Feature and plan branches merging into `develop` continue to squash.** That rule is unchanged, and the `--squash` in `plans/RUNNER-PROMPT.md` §9.2 remains correct for those PRs. The prohibition here is deliberately narrow: it applies only to the two sync/promotion directions between `main` and `develop`. Do not generalise it, and do not generalise the squash habit into it.
+**Feature and plan branches merging into `develop` continue to squash.** That rule is unchanged. The prohibition here is deliberately narrow: it applies only to the two sync/promotion directions between `main` and `develop`. Do not generalise it, and do not generalise the squash habit into it.
+
+**Plan work is not an exception.** `plans/RUNNER-PROMPT.md` §9 implements this section for runners: plan PRs are opened against `develop` and merged with `gh pr merge <N> --squash --delete-branch`, with no `--admin`. A plan branch merged into `main` is content stranded on the release branch, and the next promotion from `develop` silently reverts it (issue #221).
+
+### The invariant this section maintains
+
+The goal is **not** that `main` and `develop` are identical. They are identical only in the moment after a promotion in which nothing else landed, and treating that moment as the target is exactly what makes the two branches feel permanently out of sync when nothing is wrong. There is one invariant, and it is directional:
+
+```
+main ⊆ develop        everything released is present in the integration branch
+```
+
+Mechanically: `git merge-base --is-ancestor origin/main origin/develop` exits `0`.
+
+**The reverse, `develop ⊆ main`, is not an invariant and must not be presented as one.** `develop` being ahead of `main` is the normal, healthy state of an integration branch — it holds everything merged since the last release. Do not "fix" it. Conflating the two directions is what turns an ordinary integration branch into a permanent alarm.
+
+Holding one invariant instead of two splits "out of sync" into three cases, and the right action differs for each:
+
+| Observed | What it means | Action |
+|---|---|---|
+| `main ⊆ develop` fails, `git diff origin/main origin/develop` is **empty** | Almost always an artifact of the promotion merge commit: zero content difference. | Try to fast-forward it away — ritual step 4a. An empty diff does not *guarantee* a fast-forward is possible (`develop` may carry commits whose net effect is zero), so if the push is refused, fall through to 4b. |
+| `main ⊆ develop` fails, the diff is **non-empty** | The branches have diverged in content — either `main` holds something `develop` lacks (a hotfix), or `develop` simply moved on after the promotion, or both. Either way a fast-forward is impossible. | Reverse sync by **merge commit** — ritual step 4b. Never squash, never rebase. |
+| `develop ⊆ main` fails | Normal: `develop` is ahead of the release. | Nothing. |
+
+**Why the asymmetry regenerates without the fast-forward step.** A promotion by merge commit puts one commit on `main` — the merge commit itself — that `develop` does not have, so `main ⊆ develop` fails the instant the promotion lands. Answering that with a second merge commit into `develop` puts a commit on `develop` that `main` does not have, and the next promotion carries it across and produces another merge commit, and so on. Each merge answers the previous asymmetry by creating its mirror image; the cycle never converges. A fast-forward converges precisely because it creates no commit: it moves `develop`'s ref onto the promotion merge commit, leaving nothing new for a later merge to reconcile. That is the whole reason step 4a exists.
+
+### Why the reverse sync exists at all — the hotfix case
+
+If `main` only ever receives promotions from `develop`, the only thing `main` can hold that `develop` lacks is the promotion merge commit, and the reverse sync is pure hygiene: it buys a truthful answer to "is everything released also in develop?", and nothing else. That is the empty-diff case, and it is why the case feels skippable.
+
+The moment `main` acquires content of its own, this changes completely. `develop` is now missing real content, and **the next release cut from `develop` will silently revert it.** No test fails, no gate goes red, no conflict is raised — the promotion simply carries a tree that never had the fix, and the bug returns in production. That is the case the ritual protects against, and it is why the reverse sync is mandatory rather than tidy. The empty-diff case is cheap enough that there is no reason to build the habit around anything else.
+
+**How `main` can acquire content, given that it is protected.** A literal `git commit` on `main` followed by `git push` is refused — two `pull_request` rules apply to `main` with no bypass actors (see the configuration snapshot), so nothing reaches `main` except through a pull request. The reachable forms are therefore:
+
+- **a hotfix PR based on `main`** and merged into `main` with `--merge` (the only method the ruleset allows), which is the legitimate emergency path and the one this section exists to make safe;
+- **any other PR mistakenly opened against `main`** — including plan work. `plans/RUNNER-PROMPT.md` §9 no longer instructs that (see above), but nothing in configuration prevents a human or an agent from choosing `main` as the base by hand: `conditions.ref_name` cannot tell a promotion from a feature branch.
+
+Both produce the same state and the same silent revert. The protection on `main` prevents a stray local commit; it does **not** prevent this. Steps 3–5 below are what prevent it, and they are keyed on *any* merge into `main` for exactly this reason.
+
+### The ritual — a merge into `main` is not finished when the PR merges
+
+**Trigger: steps 3–5 run after *every* merge into `main`, not only after a promotion.** Steps 1–2 describe the promotion because that is the common case, but the invariant is broken by any commit landing on `main`, and a hotfix is the one occasion where skipping the repair costs something. If you merged anything into `main`, you owe steps 3–5 before you walk away.
+
+Follow this in order. The only step requiring judgement is a conflict in 4b, flagged there.
+
+1. **Open the promotion PR** (`develop` → `main`). `--body` is not optional: `gh` fails when it has no TTY to prompt from, which is how agents run it, and §1.4 of this file requires the description sections anyway:
+
+   ```bash
+   gh pr create --base main --head develop \
+     --title "release: promote develop to main" \
+     --body "Promotion of develop to main. See CONVENTIONS.md §1A."
+   ```
+
+2. **Merge it with a merge commit.** This is the rule at the top of this section, and on `main` it is config-enforced (see the enforcement table):
+
+   ```bash
+   gh pr merge <N> --merge
+   ```
+
+   Never `--squash`, never `--rebase`. The merge commit is also the release marker in history.
+
+3. **Re-establish the invariant — check it:**
+
+   ```bash
+   git fetch origin
+   git merge-base --is-ancestor origin/main origin/develop && echo "ok: main ⊆ develop"
+   ```
+
+   If this prints `ok`, you are done. Otherwise continue.
+
+4. **Choose the repair by looking at the diff, not by preference:**
+
+   ```bash
+   git diff --quiet origin/main origin/develop && echo EMPTY || echo NON-EMPTY
+   ```
+
+   This test answers "which repair is possible", not "where the extra content lives" — a diff is also non-empty when `develop` merely moved on after the promotion, and 4b is still the right repair, because the branches have diverged either way. To answer the *separate* question of whether `main` is holding real content — the hotfix question, the one with production consequences — compare `main` against the merge base rather than against `develop`:
+
+   ```bash
+   git diff --quiet "$(git merge-base origin/main origin/develop)" origin/main \
+     && echo "main holds no content develop lacks" \
+     || git log --oneline origin/develop..origin/main
+   ```
+
+   That distinction matters: a non-empty `main`/`develop` diff is the ordinary state a few hours after any promotion and means nothing on its own.
+
+   4a. **EMPTY — fast-forward `develop` onto `main`:**
+
+   ```bash
+   git push origin origin/main:develop
+   ```
+
+   This creates no commit and changes no content; it only moves `develop`'s ref forward onto the promotion merge commit. Note that a plain `git push` refuses anything that is not a genuine fast-forward, and that refusal is a feature: if it is rejected, you were in case 4b. **Never add `--force` to make it go through.**
+
+   4b. **NON-EMPTY — reverse sync by merge commit, through a PR:**
+
+   ```bash
+   git switch -c sync/main-into-develop origin/develop
+   git merge --no-ff origin/main
+   git push -u origin sync/main-into-develop
+   gh pr create --base develop --head sync/main-into-develop \
+     --title "sync: main into develop" \
+     --body "Restores main ⊆ develop per CONVENTIONS.md §1A."
+   gh pr merge <N> --merge
+   ```
+
+   `--merge` is not optional here. `develop` permits all three merge methods because feature PRs squash, so nothing in configuration will stop you from squashing this one — see PR #102 below for what that costs.
+
+   **This is the path that needs no privilege**, and the one to reach for if 4a is refused or if you are unsure which case you are in. It goes through a pull request like any other change, so it works for anyone with write access; running it when a fast-forward would also have worked costs one extra merge commit on `develop` and nothing else.
+
+   **Conflicts are the one place this procedure stops being mechanical.** A reverse sync conflicts when `main`'s content touches files `develop` has since rewritten — the realistic hotfix case. Resolve on the sync branch and commit; that is the intended place, and resolving here is exactly what stops the same conflict reappearing at every future promotion. Resolve toward *keeping both* changes: the hotfix's effect must survive, and so must `develop`'s newer work. If you cannot establish that both survived, stop and get the author of the hotfix to confirm — a mis-resolved reverse sync reverts the fix just as silently as skipping the sync entirely, and this section's whole purpose is to prevent that outcome.
+
+5. **Verify, and only then call the merge done:**
+
+   ```bash
+   git fetch origin && git merge-base --is-ancestor origin/main origin/develop && echo "ok: main ⊆ develop"
+   ```
+
+**Honesty about step 4a: it worked, and the configuration says it should not have. Do not plan around it.** These are the observed facts, verified 2026-08-14, and they do not reconcile:
+
+- `develop` carries ruleset `20430947` with a `pull_request` rule, which ordinarily means nothing reaches `develop` except through a PR.
+- That ruleset lists `"bypass_actors": []`, and the API reports `"current_user_can_bypass": "never"` **for the very account that performed the push**. Rulesets have no implicit admin escape hatch; `bypass_actors` is the only one, and it is empty.
+- `develop` also carries classic branch protection with 7 required checks, `allow_force_pushes: false`, and `enforce_admins: false`.
+- `git push origin 91d1319:develop` nevertheless succeeded.
+
+An earlier revision of this paragraph explained that as an "administrative exemption because `enforce_admins` is disabled". **That explanation was wrong and has been removed.** `enforce_admins` is a classic-branch-protection field and has no bearing on whether a ruleset admits a push; `current_user_can_bypass: "never"` directly contradicts the story. The honest position is that the mechanism is unknown, so **no prediction should be derived from it** — not "an admin can do this", not "a non-admin cannot", not "turning `enforce_admins` on would stop it". Treat 4a as an operation that may simply be refused, discover which by trying it, and let the refusal route you to 4b. **4b is the path to rely on; 4a is an optimisation that avoids a pointless merge commit when it happens to be permitted.**
+
+**If the push is refused, do not force it and do not weaken the branch's protection to make it work.** Fall back to 4b, which needs no privilege at all.
+
+One thing 4a does not do is smuggle in unverified code: the commit being pushed is `main`'s head, which reached `main` through a PR. Note the seam, though — `main`'s required checks are `develop`'s minus `rotation-gate`, so the *required-check configuration* alone does not guarantee that everything arriving on `develop` this way has passed everything `develop` requires. In practice `.github/workflows/ci.yml` runs on pushes to both branches and `rotation-gate` was green on `91d1319`, so the gap is closed by the workflow's triggers rather than by branch protection. That is a weaker guarantee than it looks; if the two check lists are ever allowed to drift further apart, revisit this.
+
+**Worked example — 2026-08-14.** PR #198 ("release: promote develop to main") landed as merge commit `91d1319`, with two parents: `b91dc9e` (the previous `main`) and `1740376` (the promoted `develop` head). Step 3 then failed, and step 4's diff was empty — the only thing `main` had that `develop` lacked was `91d1319` itself, whose tree is byte-identical to its `develop` parent `1740376` — so step 4a applied: `git push origin 91d1319:develop`.
+
+For a few hours both branches pointed at `91d1319`. **They no longer do, and that is the point of the example.** PR #215 landed on `develop` the same day, so `develop` is ahead again and `git diff origin/main origin/develop` is non-empty — row 3 of the table, the normal state, nothing to do. `main ⊆ develop` still holds, which is the only thing that was ever being maintained. Equality was a coincidence of nothing having landed in between; had it been the goal, this section would already be reporting a problem that does not exist.
 
 ### Why (the reason is load-bearing — do not delete it and keep the rule)
 
@@ -82,10 +215,10 @@ A squash discards the incoming branch's commits and writes one brand-new commit 
 **The instance — PR #102** (`sync/main-into-develop` → `develop`, merged 2026-08-04) squashed an entire `main`-into-`develop` sync into a single commit, `85e9528`, which has exactly one parent. All of the following is verifiable in the repository today:
 
 - The work of PR #57 exists on `main` as commit `b083812` and on `develop` as commit `85e9528`. The two are **patch-identical** — the same 12 files, the same 1096 insertions and 28 deletions — with different SHAs and unrelated parents.
-- `git merge-base --is-ancestor origin/main origin/develop` consequently reports that `main` is **not** contained in `develop`. The only substantive commit causing that is `b083812`, whose content `develop` has had since PR #102.
+- `git merge-base --is-ancestor origin/main origin/develop` consequently reports that `main` is **not** contained in `develop`. The only substantive commit causing that is `b083812`, whose content `develop` has had since PR #102. *(Status note, 2026-08-14: that particular ancestry failure is gone — the promotion in PR #198 carried `b083812` across and the subsequent fast-forward put it in `develop`'s history, so the check passes today. What the squash cost is not undone: the same change still exists as two commits with unrelated parents, `b083812` and `85e9528`, permanently. The rule below is what stops that being re-created, not something that repaired it.)*
 - A later branch audit had to fall back on comparing **PR head SHAs** to establish what had actually shipped, because ancestry no longer answered the question. That fallback is a direct cost of PR #102, not a quirk of the audit.
 
-**The counter-example — PR #129** (`develop` → `main`, "release: promote develop to main", merged 2026-08-05) used a merge commit, `aa269e6`, which has two parents: the previous `main` and the promoted `develop` head. Because of that single choice, `git merge-base --is-ancestor origin/develop origin/main` answers cleanly, and the next promotion starts from a true common ancestor instead of replaying resolved conflicts. This is the shape every sync in both directions must have.
+**The counter-example — PR #129** (`develop` → `main`, "release: promote develop to main", merged 2026-08-05) used a merge commit, `aa269e6`, which has two parents: the previous `main` and the promoted `develop` head. Because of that single choice, `git merge-base --is-ancestor origin/develop origin/main` answers cleanly, and the next promotion starts from a true common ancestor instead of replaying resolved conflicts. This is the shape every sync in both directions must have. *(Read that as ancestry being **answerable at all** — which is what a squash destroys — not as an endorsement of that direction. `develop ⊆ main` is not an invariant and exits non-zero whenever `develop` is ahead, which is normal; see "The invariant this section maintains" above.)*
 
 ### Enforcement — what is configuration, and what is discipline
 
@@ -93,20 +226,81 @@ Stated plainly, because a rule that pretends to be enforced is worse than one th
 
 A GitHub repository ruleset can restrict merge methods (`pull_request.allowed_merge_methods`), but its `conditions.ref_name` matches only a pull request's **base** branch. **No condition in the ruleset or branch-protection schema inspects a PR's head branch.** Configuration therefore cannot express "no squash when the source is `main`" — only "no squash into this branch, from anywhere". That asymmetry decides what each half of this rule rests on:
 
-| Direction | Pinnable by configuration? | Why |
+| Rule | Pinnable by configuration? | Why |
 |---|---|---|
-| `develop` → `main` | **Yes** | `main` receives promotions only. Narrowing `allowed_merge_methods` on `main` to `["merge"]` costs nothing, because no feature branch targets `main`. |
-| `main` → `develop` | **No** | `develop` also receives feature PRs, which must keep squashing. A merge-method restriction on `develop` would hit both kinds of PR, and configuration cannot tell them apart. |
+| `develop` → `main` uses a merge commit | **Yes** | `main` receives promotions only. Narrowing `allowed_merge_methods` on `main` to `["merge"]` costs nothing, because no feature branch targets `main`. |
+| `main` → `develop` uses a merge commit | **No** | `develop` also receives feature PRs, which must keep squashing. A merge-method restriction on `develop` would hit both kinds of PR, and configuration cannot tell them apart. |
+| Every merge into `main` is followed by steps 3–5 (`main ⊆ develop` restored) | **No** | There is no event to attach a rule to. No GitHub setting can require that a merge be followed by a push, or that one branch be fast-forwarded onto another. It is the most forgettable step of the ritual and it is pure discipline — but unlike the two rules above, its *violation* is cheaply detectable after the fact, which the other two are not; see the CI guard below. That is the one place where adding configuration would genuinely change the outcome. |
 
 So: the `develop` → `main` half can and should be pinned in configuration. **The `main` → `develop` half rests entirely on the person or agent performing the merge choosing "Create a merge commit".** No setting will catch that mistake. Only a required status check that compares `head.ref` against `base.ref` could, and no such check exists in this repository.
 
-**Configuration state, verified 2026-08-06 — this is a snapshot, re-check it before relying on it:**
+**Configuration state, verified 2026-08-14 — this is a snapshot, re-check it before relying on it. It supersedes the 2026-08-06 snapshot, which recorded no branch protection and no merge-method restriction; both have changed.**
 
-- Neither `main` nor `develop` has classic branch protection; `GET /repos/nurcahyo/moira/branches/{branch}/protection` returns 404 for both.
-- One repository ruleset exists (id `20430947`, named `develop`, `enforcement: active`). Despite the name its conditions cover **both** long-lived branches (`~DEFAULT_BRANCH` and `refs/heads/develop`). It requires a pull request, but with `required_approving_review_count: 0`, and it declares **no required status checks**. Its `allowed_merge_methods` is `["merge", "squash", "rebase"]` — all three, so **no merge-method restriction is in force on either branch**.
+- **Two** repository rulesets exist, both `enforcement: active`. Both list an **empty `bypass_actors`**, and the API reports **`current_user_can_bypass: "never"`** for the admin account used to verify this — rulesets have no implicit admin override, and `gh pr merge --admin` does not bypass one:
+  - id `20430947`, named `develop`, conditions `~DEFAULT_BRANCH` **and** `refs/heads/develop` — a deletion rule plus a pull-request rule with `required_approving_review_count: 0` and `allowed_merge_methods: ["merge", "squash", "rebase"]`.
+  - id `20469084`, named `main: promotions land as merge commits`, conditions `~DEFAULT_BRANCH` only — a pull-request rule with `allowed_merge_methods: ["merge"]`.
+  - Two pull-request rules therefore apply to `main`, and GitHub enforces the most restrictive combination: the intersection of their allowed merge methods is `["merge"]`. **The `develop` → `main` half of this rule is now pinned in configuration**, which is the narrowing the previous snapshot asked for. On `develop` only the first ruleset applies, so all three methods stay available — as they must, because feature PRs squash.
+- Both branches now also carry **classic branch protection** (the previous snapshot recorded 404 for both). `develop` requires 7 checks — `rust`, `secret-scan`, `sast`, `supply-chain`, `container-and-helm`, `console`, `rotation-gate`; `main` requires the same set minus `rotation-gate`. Both have `allow_force_pushes: false` and `enforce_admins: false`, and `required_approving_review_count: 0`.
 - Repository-wide, all three merge methods remain enabled.
+- A force-push to `main` is refused outright ("Cannot force-push to this branch"). There is **no fast-forward merge method** in GitHub's PR UI or API — the three methods are merge, squash, and rebase — so fast-forward *promotion* is not available here, and obtaining it would mean weakening the release branch's protection. Do not attempt it. The fast-forward in step 4a goes the other way, onto `develop`, and is a direct push rather than a PR.
 
-**Until `allowed_merge_methods` on `main` is narrowed to `["merge"]`, both halves of this rule are convention only, enforced by whoever clicks merge.**
+**What is now pinned: the merge method for `develop` → `main`. What remains convention, enforced by whoever performs the merge: the merge method for `main` → `develop`, and steps 3–5 of the ritual after every merge into `main`.**
+
+### The CI guard for `main ⊆ develop` (implemented — `.github/workflows/branch-invariant.yml`)
+
+The merge-method rule cannot be fully enforced because no condition inspects a PR's head branch. The invariant has no such limitation — it is one command against two refs, needs no pull-request context, and can therefore be checked continuously:
+
+```bash
+git fetch origin main develop
+if git merge-base --is-ancestor origin/main origin/develop; then
+  echo "ok: main ⊆ develop"
+  exit 0
+fi
+
+# The invariant is broken. Two independent questions follow; do not conflate them.
+# (1) Is real content stranded on main?  Compare main against the MERGE BASE.
+#     Comparing main against develop answers nothing: that diff is non-empty
+#     whenever develop has merely moved on, which is the normal state.
+# (2) Which repair is mechanically possible?  Compare the two trees.
+
+if git diff --quiet "$(git merge-base origin/main origin/develop)" origin/main; then
+  echo "::warning::main is not an ancestor of develop, but holds no content develop lacks."
+  echo "Left-over promotion merge commit. Nothing is at risk. Repair: CONVENTIONS §1A step 4a,"
+  echo "  git push origin origin/main:develop   (if refused, use step 4b)"
+else
+  echo "::error::main holds content develop lacks. A release cut from develop would silently revert it."
+  echo "Repair: CONVENTIONS §1A step 4b (merge commit, never squash). Stranded commits:"
+  git --no-pager log --oneline origin/develop..origin/main
+fi
+exit 1
+```
+
+**Trigger it on pushes to `main`, plus a schedule as a backstop:**
+
+```yaml
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 6 * * *"
+```
+
+`push: [main]` is the load-bearing trigger, because `main` advancing is the *only* event that can break the invariant — a push to `develop` can only extend `develop`, which preserves or restores it, and `allow_force_pushes: false` on both branches rules out the reset case. Triggering on `develop` *instead of* `main` would fire on the one event structurally incapable of breaking what is being checked. (Triggering on `develop` *in addition* is a different proposition, and the shipped workflow does it — see "As implemented" below.) The schedule catches a merge whose workflow run was skipped or cancelled; keep it, but do not rely on it as the primary — a hotfix on `main` and the release that reverts it can be minutes apart, and "daily" is longer than that window.
+
+It needs full history, so `actions/checkout` must use `fetch-depth: 0`.
+
+Note what this guard does and does not do. It reports whether real content is stranded, and separately which repair is possible — it does **not** know a hotfix from any other content on `main`, and it cannot fire *before* the damage, only after `main` moves. It costs seconds and turns the ritual's most forgettable step into something that announces itself at the moment it becomes owed, which is the whole ask: the hotfix case is the only branch of this section that otherwise fails silently in production.
+
+**As implemented.** The sketch above states the intent; the shipped guard is `scripts/branch-invariant.sh`, invoked by `.github/workflows/branch-invariant.yml` on pushes to `main` and `develop`, on the daily schedule, and on `workflow_dispatch`. Where the two differ, **the script is authoritative** — the sketch was written before the states were enumerated properly, and five of its details are deliberately not followed:
+
+- **A warning exits `0`.** The sketch's code block ends in an unconditional `exit 1`, so its "nothing is at risk" branch still goes red. The script exits `0` for every warn state. This is the most important difference: a guard that goes red on the ordinary post-promotion state is a guard that gets muted, and then the one case worth going red for is invisible too.
+- **`develop` is also a push trigger.** The sketch is right that a push to `develop` cannot *break* the invariant, but it is the event that *repairs* it (step 4a/4b), so running there is what lets the guard go quiet promptly after a repair instead of staying stale until the next release or the next scheduled run. It costs seconds. The cost is real and is accepted: while content is genuinely stranded on `main`, every merge into `develop` produces a red run on an author who had nothing to do with it. The alternative — the failure staying invisible until the next release — is worse, and the job summary names the repair and the promoter's step rather than implying the author broke something.
+- **There is no `pull_request` trigger, and this job must never be added to the required-checks list.** During a promotion the invariant is legitimately false for the minutes between the merge into `main` and the repair. A required check that is red for that window blocks every unrelated PR into `develop` during it. The invariant is a property of two long-lived branches, not of any individual PR.
+- **The script separates four broken states, not two.** The sketch's empty/non-empty split is on the merge-base diff, which is the right axis but not sufficient. The script checks byte-identical trees *first* (identical trees prove nothing can be reverted regardless of what the merge-base diff says, and they select repair 4a), then "`main` introduced nothing since the merge base" (warn, 4b), then "`main` introduced something but `develop` already has its effect" (warn, 4b), and only then "content stranded on `main`" (fail, 4b). Note for anyone tempted to simplify it: keying the failure on `git diff origin/main origin/develop` instead of on the merge base makes the guard fail on row 3 of the table above — the repository's ordinary state after every release — and a guard that is red in the normal state is a guard that gets ignored.
+- **"Did `main` change anything?" is not the failure test.** A hotfix is routinely cherry-picked onto `develop` while the branches stay unmerged; `main` has then changed content since the merge base and *nothing is stranded*. The script decides by merging `main` into `develop` in memory (`git merge-tree --write-tree`) and asking whether `develop`'s tree would move at all. Known limitation, pinned by a test: if `develop` later rewrites the hotfix's own lines the in-memory merge conflicts, the guard cannot tell whether the fix survived, and it goes red saying so. That is a false alarm about stranded content, in the safe direction.
+- **The self-test is a separate job.** Run as a second step of the guard job, a broken self-test would turn the `main ⊆ develop` check red for a reason unrelated to the invariant — the same misattribution the missing `pull_request` trigger exists to avoid.
+
+`scripts/branch-invariant-test.sh` (`make test-branch-invariant`) drives the guard through every state above plus the repaired state and the conflict limitation, using real git objects in throwaway repositories. It was verified by mutation to catch a guard whose failure branch exits `0`, a guard with the ancestry direction reversed, a guard using the naive `main`/`develop` diff, and a guard with the cherry-pick state disabled.
 
 ---
 

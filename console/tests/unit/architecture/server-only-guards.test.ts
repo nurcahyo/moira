@@ -453,6 +453,10 @@ const CREDENTIAL_DTO_INTERFACES: ReadonlyArray<{
   { name: "ApiKeyCredentialSecret", members: ["api_key"] },
   { name: "AzureCredentialSecret", members: ["api_key", "endpoint"] },
   {
+    name: "OAuth2CredentialSecret",
+    members: ["access_token", "expires_at", "refresh_token", "token_type"],
+  },
+  {
     name: "CredentialCreateRequest",
     members: [
       "credential_type",
@@ -493,6 +497,8 @@ const CREDENTIAL_DTO_INTERFACES: ReadonlyArray<{
   // fields the narrowing exists to pin: `credential_type` to the literal
   // `"api_key"`, and `secret` to the single-key newtype.
   { name: "ConsoleApiKeyCredentialCreateRequest", members: ["credential_type", "secret"] },
+  // Same narrowing, for the oauth2 arm the Claude-subscription flow needs.
+  { name: "ConsoleOAuth2CredentialCreateRequest", members: ["credential_type", "secret"] },
 ];
 
 describe("the credential DTOs are contained rather than exempted", () => {

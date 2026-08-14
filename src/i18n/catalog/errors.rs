@@ -749,4 +749,24 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         default_message: "Only the primary admin identity may do that.",
         description: "Used when a caller who is not a primary admin attempts an ownership transfer, a grant revocation, or - since issue #185 - a WRITE to the auth-provider settings surface. Ownership is admin_identities.is_primary, not a scope: AuthorizationService::has_scope grants a moira:admin-holding trusted-JWT actor every scope by implication, so a scope could not express 'not every admin'. The message was widened from 'manage other admin identities' when the second surface arrived, because rewriting the sign-in configuration is not identity management and the copy named only the first caller. System-key callers pass this check, because break-glass remains the documented last resort - and on the auth-provider surface it is the ONLY way back in once a bad write has broken sign-in.",
     },
+    I18nEntry {
+        key: "moira.error.import_cap_exceeded",
+        default_message: "The OpenAPI document exceeds the maximum number of importable operations.",
+        description: "Used by POST /api/v1/admin/skills/import (issue #237, plan 12 §5) when a document defines more than the 300-operation import cap (§5 decision 23). The document is rejected outright, never silently truncated, so the operator learns the true operation count and can split the import instead of discovering a partial one later. The envelope's details field carries operation_count and cap.",
+    },
+    I18nEntry {
+        key: "moira.error.invalid_openapi_spec",
+        default_message: "The OpenAPI document could not be parsed.",
+        description: "Used by POST /api/v1/admin/skills/import (issue #237, plan 12 §5) for every OpenAPI parse failure other than the operation cap: the document is not a JSON object, it does not declare an OpenAPI 3.x version, it declares no server URL or an unparseable one, or it defines no importable operations. See orchestration::openapi_import::OpenApiImportError for the full set of causes this one code covers.",
+    },
+    I18nEntry {
+        key: "moira.error.ssrf_blocked_host",
+        default_message: "The server URL was rejected by the outbound SSRF policy.",
+        description: "Used when a skill's server URL - the OpenAPI document's servers[0].url on import, or a new url_template on a skill_http_executors PATCH (issue #237, plan 12 §5) - fails security::ssrf::validate_outbound_url: a non-https scheme, a private/loopback/link-local/metadata-range address, or an address that fails to resolve. The specific denial reason and any resolved address are logged server-side only, never returned here, so this response can never be used as an SSRF oracle - the same posture security::ssrf already takes on the JWKS fetch path.",
+    },
+    I18nEntry {
+        key: "moira.error.executor_not_found",
+        default_message: "The skill has no HTTP executor.",
+        description: "Used by GET/PATCH/DELETE /api/v1/admin/skills/{id}/executor (issue #237, plan 12 §5) when the named skill has no skill_http_executors row - either because the skill was hand-authored without one, or because the row was already deleted.",
+    },
 ];

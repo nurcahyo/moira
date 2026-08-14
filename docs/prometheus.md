@@ -50,6 +50,9 @@ matched no route is labelled `unmatched`. `method` is folded into a closed set.
 | `moira_execution_duration_seconds` | histogram | `provider_type`, `outcome` | buckets 50ms → 120s |
 | `moira_execution_ttft_seconds` | histogram | `provider_type` | streamed attempts only; buckets 25ms → 20s |
 | `moira_provider_outcome_total` | counter | `provider_type`, `model_key`, `outcome` | not seeded — series appear per configured model |
+| `moira_provider_tokens_total` | counter | `provider_type`, `direction` = `in` \| `out` | seeded (16 series); **declared, not yet emitted** — plan 12 workstream D calls this |
+| `moira_routing_decision_total` | counter | `route_key`, `selected_provider_type`, `reason` | not seeded — `route_key` is admin-configured, cardinality bounded by the operator's route catalogue; **declared, not yet emitted** — workstream D |
+| `moira_failover_total` | counter | `from_provider_type`, `to_provider_type`, `trigger` | not seeded — the full cross-product is too large to seed usefully; **declared, not yet emitted** — workstream D |
 
 `provider_type` is the `ProviderType` enum: `openai`, `openai_compatible`, `anthropic`,
 `gemini`, `deepseek`, `azure_openai`, `local`, `custom`. `outcome` is `succeeded`,
@@ -57,7 +60,29 @@ matched no route is labelled `unmatched`. `method` is folded into a closed set.
 `ExecutionFailureClass` name (`provider_timeout`, `circuit_open`,
 `credential_expired`, …). Provider error *text* is never a label. `model_key` is
 admin-configured runtime configuration, so its cardinality is bounded by the operator's
-model catalogue.
+model catalogue. `trigger` on `moira_failover_total` is the same bounded set of
+fallback-eligible `ExecutionFailureClass` names, plus `other`. `reason` on
+`moira_routing_decision_total` is `priority`, `explicit_hint`, `scored`,
+`fallback_after_failure`, or `other`. Routing-decision counting is metrics-only —
+per plan 12 decision 11, a successful selection never writes an audit row; only a
+denial does, through the existing audit path.
+
+### OAuth credential health
+
+| Family | Type | Labels | Notes |
+|---|---|---|---|
+| `moira_oauth_credential_status` | gauge | `provider_type`, `status` = `valid` \| `expiring` \| `expired` \| `refresh_failed` | seeded (32 series); **declared, not yet emitted** — plan 12 workstream F's oauth-token-refresh worker calls this |
+| `moira_oauth_refresh_total` | counter | `provider_type`, `outcome` = `succeeded` \| `failed` | seeded (16 series); **declared, not yet emitted** — workstream F |
+
+`moira_oauth_credential_status` is a count of stored OAuth2 credentials per lifecycle
+state, not a per-credential series — a credential id is never a label value.
+
+### Agent flows
+
+| Family | Type | Labels | Notes |
+|---|---|---|---|
+| `moira_flow_step_total` | counter | `flow_key`, `agent_key`, `status` = `completed` \| `failed` \| `skipped` | not seeded — `flow_key`/`agent_key` are admin-configured, same class as `model_key`; **declared, not yet emitted** — plan 12 workstream F |
+| `moira_flow_duration_seconds` | histogram | `flow_key` | buckets 500ms → 300s; not seeded, like every histogram here; **declared, not yet emitted** — workstream F |
 
 ### Database, Redis, runtime config
 
@@ -134,12 +159,17 @@ framing facts already readable by anyone holding the ciphertext.
 
 No metric exists for these, so nothing can chart or alert on them:
 
-- **token usage** — recorded per execution in the database and served on
-  `/api/v1/usage`, not as a metric family;
 - **worker queue depth** — the saturation signal is
   `moira_worker_queue_enqueue_rejected_total`;
 - **Redis latency** — only the failure counter above;
 - **SQL query timing** — only the pool-occupancy gauge.
+
+Token usage now has a declared family, `moira_provider_tokens_total` — but, like the
+routing-decision, failover, OAuth-credential and agent-flow families above, no call
+site increments it yet. It is a *registered* family (visible on `/metrics`, seeded at
+zero), not an *emitted* one, until plan 12 workstreams D and F wire their callers.
+Token usage is still recorded per execution in the database and served on
+`/api/v1/usage` regardless — that path is unaffected by this metric's addition.
 
 ## Cardinality rules
 

@@ -156,16 +156,51 @@ export interface AzureCredentialSecret {
 }
 
 /**
+ * The `oauth2` arm — added for the "Connect Claude subscription" flow
+ * (`lib/claude-subscription.ts`), which stores a long-lived subscription token
+ * (e.g. `claude setup-token` output) through this endpoint.
+ *
+ * ============================================================================
+ * NO UNTAGGED-UNION HAZARD HERE, UNLIKE THE api_key/azure PAIR ABOVE
+ * ============================================================================
+ *
+ * `access_token` is the only REQUIRED member, and no other `CredentialSecret`
+ * variant shares it — `ApiKeyCredentialSecret`/`AzureCredentialSecret` require
+ * `api_key`, `BearerToken` requires `bearer_token`, `BasicAuth` requires both
+ * `username` and `password`, `CustomHeaders` requires `headers`,
+ * `ServiceAccount` requires `payload`. A body of exactly `{ access_token }`
+ * therefore matches this arm and no other, so `endpoint: null`'s trap (see
+ * `ApiKeyCredentialSecret`'s header) simply does not apply to this shape.
+ *
+ * `refresh_token`/`token_type`/`expires_at` are modelled because the wire
+ * schema carries them, but `oauth2CredentialSecret()` in `lib/moira-client.ts`
+ * never sets them: `claude setup-token` prints a single long-lived token, not a
+ * refresh-token pair, and the `oauth-token-refresh` worker that would consume a
+ * refresh token does not exist yet (issue #90 — see
+ * `plans/12-feature-expansion-brainstorm.md` §1).
+ */
+export interface OAuth2CredentialSecret {
+  access_token: string;
+  refresh_token?: string | null;
+  token_type?: string | null;
+  expires_at?: string | null;
+}
+
+/**
  * `#/components/schemas/CredentialSecret`, restricted to the arms this console
  * builds.
  *
- * The other five (`oauth2`, `bearer_token`, `basic_auth`, `custom_headers`,
+ * The other four (`bearer_token`, `basic_auth`, `custom_headers`,
  * `service_account`) are real on the wire and deliberately unmodelled: each is a
  * distinct credential ceremony with its own storage and rotation story, and a
  * union arm nothing constructs is a shape the guards must still reason about.
- * They arrive with the flow that needs them.
+ * They arrive with the flow that needs them. `oauth2` used to be in this list;
+ * it left when the Claude-subscription flow needed it.
  */
-export type ConsoleCredentialSecret = ApiKeyCredentialSecret | AzureCredentialSecret;
+export type ConsoleCredentialSecret =
+  | ApiKeyCredentialSecret
+  | AzureCredentialSecret
+  | OAuth2CredentialSecret;
 
 /* -------------------------------------------------------------------------- */
 /* Request and record shapes                                                  */
@@ -206,9 +241,9 @@ assertKeyContract<
 >();
 
 /**
- * The only credential-create body this console constructs today: the plain API
- * key, at global scope, with both halves of the ambiguity above closed at the
- * type level.
+ * The plain API key at global scope, with both halves of the ambiguity above
+ * closed at the type level. The generic per-provider "add a credential" flow
+ * (`app/api/llm/providers/[id]/credentials/route.ts`) builds this.
  */
 export type ConsoleApiKeyCredentialCreateRequest = Omit<
   CredentialCreateRequest,
@@ -216,6 +251,19 @@ export type ConsoleApiKeyCredentialCreateRequest = Omit<
 > & {
   credential_type: "api_key";
   secret: ApiKeyCredentialSecret;
+};
+
+/**
+ * The `oauth2` credential-create body. `lib/claude-subscription.ts` builds
+ * this — see `OAuth2CredentialSecret`'s header for why it needs no ambiguity
+ * guard the way the api_key arm does.
+ */
+export type ConsoleOAuth2CredentialCreateRequest = Omit<
+  CredentialCreateRequest,
+  "credential_type" | "secret"
+> & {
+  credential_type: "oauth2";
+  secret: OAuth2CredentialSecret;
 };
 
 /**

@@ -15,7 +15,8 @@ use crate::{
         AgentProfileCreateRequest, AgentProfilePatchRequest, AgentProfileRecord, ApiKeyRecord,
         ApiKeyRotateRequest, ApiKeySecretResponse, ApplicationCreateRequest,
         ApplicationExecutionPolicyPutRequest, ApplicationExecutionPolicyRecord,
-        ApplicationPatchRequest, ApplicationRecord, AuditLogRecord, ConsumerKeyCreateRequest,
+        ApplicationPatchRequest, ApplicationRecord, ApplicationRoutingDefaultsPutRequest,
+        ApplicationRoutingDefaultsRecord, AuditLogRecord, ConsumerKeyCreateRequest,
         CredentialCreateRequest, CredentialPatchRequest, CredentialRecord, CredentialScope,
         DiagnosticExecutionRequest, DiagnosticExecutionResponse, ListResponse, PageQuery,
         ProviderCreateRequest, ProviderModelCreateRequest, ProviderModelPatchRequest,
@@ -2210,6 +2211,57 @@ pub async fn put_provider_runtime_policy(
             optional_if_match(&headers)?,
             request,
         )
+        .await?;
+    Ok((etag_headers(record.version), Json(record)))
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/admin/applications/{id}/routing-defaults", tag = "admin-runtime",
+    params(("id" = Uuid, Path, description = "Application identifier")),
+    responses(
+        (status = 200, description = "Application routing defaults", body = ApplicationRoutingDefaultsRecord, headers(("ETag" = String, description = "Current resource version"))),
+        (status = "4XX", description = "Authentication, authorization, or not-found error", body = ErrorResponse),
+        (status = "5XX", description = "Infrastructure or internal error", body = ErrorResponse)
+    ),
+    security(("bearerAuth" = []), ("systemKeyAuth" = []), ("consumerKeyAuth" = []))
+)]
+pub async fn get_application_routing_defaults(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<(HeaderMap, Json<ApplicationRoutingDefaultsRecord>), AppError> {
+    let actor = admin_actor(&state, &headers).await?;
+    let record = RuntimeAdminService::new(&state)?
+        .get_application_routing_defaults(&actor, id)
+        .await?;
+    Ok((etag_headers(record.version), Json(record)))
+}
+
+#[utoipa::path(
+    put, path = "/api/v1/admin/applications/{id}/routing-defaults", tag = "admin-runtime",
+    request_body = ApplicationRoutingDefaultsPutRequest,
+    params(
+        ("id" = Uuid, Path, description = "Application identifier"),
+        ("If-Match" = Option<i64>, Header, description = "Optional current resource version"),
+        ("Idempotency-Key" = Option<String>, Header, description = "Optional replay key")
+    ),
+    responses(
+        (status = 200, description = "Application routing defaults updated", body = ApplicationRoutingDefaultsRecord, headers(("ETag" = String, description = "Current resource version"))),
+        (status = "4XX", description = "Request, authentication, authorization, conflict, or not-found error", body = ErrorResponse),
+        (status = "5XX", description = "Infrastructure or internal error", body = ErrorResponse)
+    ),
+    security(("bearerAuth" = []), ("systemKeyAuth" = []), ("consumerKeyAuth" = []))
+)]
+pub async fn put_application_routing_defaults(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(request): Json<ApplicationRoutingDefaultsPutRequest>,
+) -> Result<(HeaderMap, Json<ApplicationRoutingDefaultsRecord>), AppError> {
+    let actor = admin_actor(&state, &headers).await?;
+    let ctx = RequestContext::from_headers(&headers);
+    let record = RuntimeAdminService::new(&state)?
+        .put_application_routing_defaults(&actor, &ctx, id, optional_if_match(&headers)?, request)
         .await?;
     Ok((etag_headers(record.version), Json(record)))
 }

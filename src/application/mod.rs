@@ -1,5 +1,6 @@
 mod admin;
 mod admin_command;
+mod agent_platform;
 mod auth_settings;
 mod context;
 mod context_planner;
@@ -46,6 +47,7 @@ pub use memory_extraction::{
 // `pub(crate)`, unlike the block above: the needle list is shared with
 // `conversation::validate_content` so the caller-supplied and model-supplied memory paths screen
 // against one list rather than two copies that can drift. It is not part of any public surface.
+pub use agent_platform::AgentPlatformService;
 pub(crate) use memory_extraction::SECRET_NEEDLES;
 pub use public::{ExecutionPipeline, PublicExecutionService};
 pub use runtime_admin::RuntimeAdminService;

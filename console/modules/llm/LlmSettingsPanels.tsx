@@ -30,6 +30,7 @@ import { useRouter } from "next/navigation";
 
 import type { LlmProviderView } from "@/lib/llm-view";
 
+import { ConnectClaudeSubscriptionPanel } from "./ConnectClaudeSubscriptionPanel";
 import { ConnectVllmPanel } from "./ConnectVllmPanel";
 import { ProviderForm } from "./ProviderForm";
 import { ProviderList } from "./ProviderList";
@@ -46,6 +47,7 @@ export function LlmSettingsPanels({ defaultBaseUrl, providers }: LlmSettingsPane
   return (
     <>
       <ConnectVllmPanel defaultBaseUrl={defaultBaseUrl} onConnected={reload} />
+      <ConnectClaudeSubscriptionPanel onConnected={reload} />
       <ProviderForm onCreated={reload} />
       <ProviderList providers={providers} onChanged={reload} />
     </>

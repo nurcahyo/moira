@@ -2785,6 +2785,89 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "Trace outcome for a step that had nothing to do - in practice, enabling a provider " +
       "that was already active.",
   },
+
+  /* --- the "Connect Claude subscription" panel (issue #211) --------------- */
+  [K.claude_subscription_heading]: {
+    key: K.claude_subscription_heading,
+    message: "Connect Claude subscription",
+    description:
+      "Heading of the panel that stores a long-lived Claude subscription token as an oauth2 " +
+      "provider credential.",
+  },
+  [K.claude_subscription_intro]: {
+    key: K.claude_subscription_intro,
+    message:
+      "Paste the output of `claude setup-token`, run on a machine where you are signed in to " +
+      "your Claude subscription. The console stores it encrypted and never shows it again.",
+    description:
+      "Rendered under the panel heading. Names the exact command an operator needs to run " +
+      "locally to produce the value this field wants.",
+  },
+  [K.claude_subscription_token_label]: {
+    key: K.claude_subscription_token_label,
+    message: "Subscription token",
+    description: "Label of the panel's single field.",
+  },
+  [K.claude_subscription_token_hint]: {
+    key: K.claude_subscription_token_hint,
+    message: "Never shown again after this is saved.",
+    description: "Hint under the token field, stating the write-once nature of the value.",
+  },
+  [K.claude_subscription_submit]: {
+    key: K.claude_subscription_submit,
+    message: "Save subscription token",
+    description: "Submit control for the panel's single field.",
+  },
+  [K.claude_subscription_pending]: {
+    key: K.claude_subscription_pending,
+    message: "Saving...",
+    description: "Announced politely while the save request is in flight.",
+  },
+  [K.claude_subscription_created]: {
+    key: K.claude_subscription_created,
+    message: "Saved. A new subscription credential was created.",
+    description:
+      "Announced after a successful save when no matching credential existed yet, so this " +
+      "run created one.",
+  },
+  [K.claude_subscription_rotated]: {
+    key: K.claude_subscription_rotated,
+    message: "Saved. The existing subscription credential was updated with this token.",
+    description:
+      "Announced after a successful save when a matching credential already existed, so this " +
+      "run replaced its value in place rather than creating a second row.",
+  },
+  [K.claude_subscription_token_required]: {
+    key: K.claude_subscription_token_required,
+    message: "Enter the subscription token before saving.",
+    description: "The field was submitted empty.",
+  },
+  [K.claude_subscription_token_too_long]: {
+    key: K.claude_subscription_token_too_long,
+    message: "That token is longer than the console will accept.",
+    description: "The pasted value exceeded the console's bound on a subscription token.",
+  },
+  [K.claude_subscription_token_invalid]: {
+    key: K.claude_subscription_token_invalid,
+    message: "That does not look like a single token - check for an extra line in the paste.",
+    description:
+      "The pasted value contained a control character, most likely a newline from a copy " +
+      "that grabbed more than one line.",
+  },
+  [K.claude_subscription_request_body_invalid]: {
+    key: K.claude_subscription_request_body_invalid,
+    message: "The console could not read that subscription-token request.",
+    description:
+      "Emitted by the /api/settings/llm/claude-subscription handler for a body that is not " +
+      "an object.",
+  },
+  [K.claude_subscription_list_truncated]: {
+    key: K.claude_subscription_list_truncated,
+    message: "Too many providers exist for the console to check safely. Contact an administrator.",
+    description:
+      "The provider list was truncated before a match could be confirmed absent, so the " +
+      "console refused to guess rather than risk creating a duplicate provider row.",
+  },
 };
 
 /** Every entry, as a plain array. */

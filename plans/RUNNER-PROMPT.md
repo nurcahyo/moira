@@ -31,20 +31,24 @@ If the repo is already quiet and clean when you start, skip straight to §1.
 
 ---
 
-## 1. Always begin merged with the latest `main`
+## 1. Always begin merged with the latest `develop`
 
-**Every session starts from the current `origin/main`. No exceptions.** This is what keeps parallel runners from diverging.
+**Every session starts from the current `origin/develop`. No exceptions.** `develop` is the integration branch and the base for all plan work; `main` is the release branch and is reached only by the promotion ritual in `CONVENTIONS.md` §1A, which is **not** a runner's job. Starting from `develop` is what keeps parallel runners from diverging.
 
 ```bash
 git fetch origin
-git checkout main
-git pull --ff-only origin main
+git checkout develop
+git pull --ff-only origin develop
 git log --oneline -1        # record this as your base commit
 ```
 
-If `git pull --ff-only` fails, `main` has diverged locally — reconcile it (`git reset --hard origin/main` is correct **only** when you have confirmed no local commits are worth keeping) and say what you did. Confirm `origin/main` is at or ahead of `9b73a8a`.
+If `git pull --ff-only` fails, `develop` has diverged locally — reconcile it (`git reset --hard origin/develop` is correct **only** when you have confirmed no local commits are worth keeping) and say what you did. Confirm `origin/develop` contains the audited base — this command is silent on success, so make it say so:
 
-Then create the plan branch **from that fresh `main`**:
+```bash
+git merge-base --is-ancestor 9b73a8a origin/develop && echo "OK: audited base present" || echo "STOP: audited base missing"
+```
+
+Then create the plan branch **from that fresh `develop`**:
 
 ```bash
 git checkout -b plan/<NN>-<slug>
@@ -68,7 +72,7 @@ git checkout -b plan/<NN>-<slug>
 
 Order: `02a` → `02b` → `03` → `04` → `05` → `06` → `07` → `08` → `09` → `10` → `11`
 
-Choose the **lowest-numbered plan not yet merged to `main`** (`gh pr list --state merged`, `git log origin/main`). Announce which and why. **Do not start a second plan in this session** — one plan per session is deliberate so each runner gets fresh context.
+Choose the **lowest-numbered plan not yet merged to `develop`** (`gh pr list --state merged`, `git log origin/develop`). Announce which and why. **Do not start a second plan in this session** — one plan per session is deliberate so each runner gets fresh context.
 
 Stacking rules: `02b` stacks on `02a`; `07` must diff against `03`'s post-hardening state; all spec-changing work (`02a`/`02b`/`03`/`04`) lands **before** `05` freezes the OpenAPI spec.
 
@@ -114,13 +118,13 @@ Pair the model with `effort` where the tool supports it: `low` for mechanical st
 
 ---
 
-## 6. Re-sync with `main` before the gates
+## 6. Re-sync with `develop` before the gates
 
 Other runners may have merged while you worked. Bring your branch up to date **before** running the gates, so you test what will actually land:
 
 ```bash
 git fetch origin
-git merge origin/main          # or: git rebase origin/main, if your branch is unpushed and unstacked
+git merge origin/develop       # or: git rebase origin/develop, if your branch is unpushed and unstacked
 ```
 
 Resolve conflicts by **reading both sides and the governing plan**, honoring `plans/README.md` "Coordinator action items" — notably: `src/infra/db.rs::listen_once` is edited by **both** plan 06 and plan 07; merge deliberately, **never blind-rebase**. Never resolve a conflict by discarding another plan's work without saying so in the report and in `NEED_CONFIRMATION.md`. Never force-push a branch another plan is stacked on.
@@ -137,7 +141,7 @@ cargo build --release --locked
 ```
 Plus clean-database migration validation if the plan adds migrations.
 
-`CONVENTIONS.md` §1.3 forbids opening the PR until these pass **locally**. GitHub Actions CI is deliberately **not** waited on (§9) — these local gates are the substitute and are non-negotiable. If a gate fails, fix it. If you cannot, **stop and report; do not merge.**
+`CONVENTIONS.md` §1.3 forbids opening the PR until these pass **locally**. These local gates are non-negotiable, but they are a **pre-condition for opening the PR, not the merge criterion** — `.github/workflows/ci.yml` runs jobs that have no local equivalent, and `develop` requires them. Green CI on the PR is what authorises the merge (§9). If a gate fails, fix it. If you cannot, **stop and report; do not merge.**
 
 ---
 
@@ -154,22 +158,34 @@ Instruct each to assume the implementation is wrong until proven otherwise. **Fi
 
 ---
 
-## 9. PR → merge to `main` → verify
+## 9. PR → merge to `develop` → verify
 
-1. Open the PR against `main` with the required `CONVENTIONS.md` §1.4 sections: Plan link · Findings addressed (P-IDs) · Migrations included · Breaking API/OpenAPI changes · Test evidence · Rollback procedure · Deferred follow-ups.
-2. **Merge to `main`** — squash, delete branch, do **not** wait on GitHub Actions:
+**Plan work lands on `develop`, never on `main`.** `CONVENTIONS.md` §1A governs: `main` is the release branch, and the only thing that may land on it is a `develop` → `main` promotion merged with a merge commit, or a genuine hotfix. A plan branch merged into `main` is content stranded on the release branch that the next promotion from `develop` silently reverts. **Promotion is not part of a runner's session** — finish on `develop` and stop.
+
+1. Open the PR **against `develop`** with the required `CONVENTIONS.md` §1.4 sections: Plan link · Findings addressed (P-IDs) · Migrations included · Breaking API/OpenAPI changes · Test evidence · Rollback procedure · Deferred follow-ups.
    ```bash
-   gh pr merge <N> --squash --admin --delete-branch
+   gh pr create --base develop --head plan/<NN>-<slug> --title "<type>: <summary>" --body "<the sections above>"
    ```
-3. **Post-merge check** (required):
+   `--body` is not optional: `gh` fails when it has no TTY to prompt from, which is how agents run it.
+2. **Wait for CI to go green.** The §7 local gates are a pre-condition for opening the PR, not a substitute for CI — `develop` requires seven checks, several of which have no local equivalent:
    ```bash
-   git checkout main && git pull --ff-only origin main
+   gh pr checks <N> --watch
+   ```
+   Red CI on a PR whose local gates passed is a real finding about the difference between the two environments. Fix it; do not retry the merge until every check is green.
+3. **Merge to `develop`** — squash, delete branch. **No `--admin`.** Feature and plan branches squash into `develop` (`CONVENTIONS.md` §1A); the merge-commit rule applies only to the two sync directions between `main` and `develop`, which this is not.
+   ```bash
+   gh pr merge <N> --squash --delete-branch
+   ```
+   If the merge is refused, the reason is a real one — read it rather than reaching for `--admin`. Note that on `develop` the seven checks are classic branch protection with `enforce_admins: false`, so `--admin` genuinely *would* bypass them: the prohibition here is a rule, not something configuration enforces for you. Nothing stops you from merging red except the decision not to.
+4. **Post-merge check** (required):
+   ```bash
+   git checkout develop && git pull --ff-only origin develop
    cargo fmt --check
    cargo clippy --workspace --all-targets --all-features -- -D warnings
    cargo test --workspace --all-features
    ```
-   If `main` is red after the merge, **fix it immediately on a follow-up branch and merge that** — never leave `main` broken. Report exactly what broke.
-4. Leave the local repo **on `main`, clean, and fast-forwarded**, so the next session's §1 succeeds without intervention.
+   If `develop` is red after the merge, **fix it immediately on a follow-up branch and merge that** — never leave `develop` broken. Report exactly what broke.
+5. Leave the local repo **on `develop`, clean, and fast-forwarded**, so the next session's §1 succeeds without intervention.
 
 ---
 
@@ -186,6 +202,6 @@ An item leaves `NEED_CONFIRMATION.md` **only when a human has answered it in wri
 
 ## 11. Finish
 
-Report: plan completed, PR number and merge commit, gate status, post-merge `main` status, QA report path, the model/effort mix you used, and **which plan is next**. Then **stop** — the user starts a fresh session for the next plan, which will begin at §1 from the `main` you just advanced.
+Report: plan completed, PR number and merge commit, gate status, CI status, post-merge `develop` status, QA report path, the model/effort mix you used, and **which plan is next**. Then **stop** — the user starts a fresh session for the next plan, which will begin at §1 from the `develop` you just advanced.
 
 If you hit a usage limit mid-run: commit work-in-progress to the plan branch (**do not merge**), record the exact stopping point in `TODO.md`, leave the tree committed and clean, and say plainly where you stopped so the next session resumes cleanly.

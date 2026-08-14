@@ -1,4 +1,5 @@
 mod admin;
+mod agent_platform;
 mod auth_settings;
 mod conversation;
 mod health;
@@ -547,6 +548,10 @@ fn admin_routes() -> OpenApiRouter<AppState> {
             admin::put_provider_runtime_policy
         ))
         .routes(routes!(
+            admin::get_application_routing_defaults,
+            admin::put_application_routing_defaults
+        ))
+        .routes(routes!(
             admin::list_provider_models,
             admin::create_provider_model
         ))
@@ -630,6 +635,30 @@ fn admin_routes() -> OpenApiRouter<AppState> {
         .routes(routes!(admin::disable_trusted_jwt_issuer))
         .routes(routes!(admin::list_audit_events))
         .routes(routes!(admin::get_audit_event))
+        // Issue #214 (plan 12 §3) — agent platform: skills CRUD. Kept in one contiguous
+        // block so a concurrent workstream editing this file rebases mechanically.
+        .routes(routes!(
+            agent_platform::list_skills,
+            agent_platform::create_skill
+        ))
+        .routes(routes!(
+            agent_platform::get_skill,
+            agent_platform::patch_skill,
+            agent_platform::delete_skill
+        ))
+        .routes(routes!(agent_platform::enable_skill))
+        .routes(routes!(agent_platform::disable_skill))
+        .routes(routes!(agent_platform::bulk_enable_skills))
+        // Issue #237 (plan 12 §5, workstream H) — OpenAPI import + skill_http_executors CRUD.
+        // Kept immediately after F's skills block, contiguous, for the same rebase-friendly
+        // reason as that block's own comment.
+        .routes(routes!(agent_platform::import_skills))
+        .routes(routes!(agent_platform::list_skill_executors))
+        .routes(routes!(
+            agent_platform::get_skill_executor,
+            agent_platform::patch_skill_executor,
+            agent_platform::delete_skill_executor
+        ))
 }
 
 #[cfg(test)]
@@ -703,6 +732,7 @@ mod tests {
             "/api/v1/admin/providers/{id}/enable",
             "/api/v1/admin/providers/{id}/disable",
             "/api/v1/admin/providers/{provider_id}/runtime-policy",
+            "/api/v1/admin/applications/{id}/routing-defaults",
             "/api/v1/admin/providers/{provider_id}/models",
             "/api/v1/admin/routes",
             "/api/v1/admin/routes/{id}",
@@ -716,6 +746,14 @@ mod tests {
             "/api/v1/admin/agent-profiles/{id}",
             "/api/v1/admin/agent-profiles/{id}/enable",
             "/api/v1/admin/agent-profiles/{id}/disable",
+            "/api/v1/admin/skills",
+            "/api/v1/admin/skills/{id}",
+            "/api/v1/admin/skills/{id}/enable",
+            "/api/v1/admin/skills/{id}/disable",
+            "/api/v1/admin/skills/bulk-enable",
+            "/api/v1/admin/skills/import",
+            "/api/v1/admin/skill-executors",
+            "/api/v1/admin/skills/{id}/executor",
             "/api/v1/admin/runtime/diagnose",
             "/api/v1/admin/rag-collections",
             "/api/v1/admin/rag-collections/{id}",
@@ -774,7 +812,13 @@ mod tests {
         // 142 + plan 09 wave 2's nine: create/list/get/revoke an admin invitation,
         // preview and redeem one, and list/patch/delete an admin identity grant.
         // + plan 11 Sub-Phase E's one: POST /api/v1/conversations/{id}/summarize.
-        assert_eq!(operation_count, 152);
+        // + plan 12 workstream D's two: GET/PUT /api/v1/admin/applications/{id}/routing-defaults.
+        // + issue #214 (plan 12 §3) agent-platform skills: list/create/get/patch/delete,
+        //   enable/disable, and bulk-enable = 8.
+        // + issue #237 (plan 12 §5, workstream H) OpenAPI import + skill_http_executors CRUD:
+        //   POST .../skills/import, GET .../skill-executors,
+        //   GET/PATCH/DELETE .../skills/{id}/executor = 5.
+        assert_eq!(operation_count, 167);
     }
 
     #[test]
@@ -1430,8 +1474,10 @@ mod tests {
     /// baked into the published contract.
     ///
     /// `false` is reserved for preconditions that are genuinely advisory: the provider
-    /// runtime-policy `PUT` reads the header through `optional_if_match`.
-    const IF_MATCH_OPERATIONS: [(&str, &str, bool); 41] = [
+    /// runtime-policy `PUT` reads the header through `optional_if_match`, the
+    /// context-router routing-defaults `PUT` (issue #213) mirrors that exact contract, and
+    /// the agent-platform skill writes (issue #214) add their own If-Match operations.
+    const IF_MATCH_OPERATIONS: [(&str, &str, bool); 48] = [
         // Plan 09 wave 2. Ownership transfer takes a required precondition and grant
         // revocation deliberately does not: a `PATCH` that flips a flag is a lost-update
         // hazard, while a soft revoke is idempotent in intent and answers a repeat with
@@ -1488,6 +1534,11 @@ mod tests {
             "put",
             false,
         ),
+        (
+            "/api/v1/admin/applications/{id}/routing-defaults",
+            "put",
+            false,
+        ),
         ("/api/v1/admin/routes/{id}", "delete", true),
         ("/api/v1/admin/routes/{id}", "patch", true),
         ("/api/v1/admin/routes/{id}/disable", "post", true),
@@ -1496,6 +1547,19 @@ mod tests {
         ("/api/v1/admin/routing-policies/{id}", "patch", true),
         ("/api/v1/admin/routing-policies/{id}/disable", "post", true),
         ("/api/v1/admin/routing-policies/{id}/enable", "post", true),
+        // Issue #214 (plan 12 §3) — agent-platform skills. Bulk-enable is deliberately
+        // absent: it is a multi-row operation with no single row version to precondition on.
+        ("/api/v1/admin/skills/{id}", "delete", true),
+        ("/api/v1/admin/skills/{id}", "patch", true),
+        ("/api/v1/admin/skills/{id}/disable", "post", true),
+        ("/api/v1/admin/skills/{id}/enable", "post", true),
+        // Issue #237 (plan 12 §5, workstream H) — skill_http_executors. The header is still
+        // named `If-Match` on the wire (the table carries no separate `version` column, so
+        // the value is a quoted RFC 3339 `updated_at` instead of an integer — see
+        // `domain::SkillHttpExecutorRecord`'s doc comment), and it is required for both
+        // writes, same as every other single-row PATCH/DELETE in this inventory.
+        ("/api/v1/admin/skills/{id}/executor", "delete", true),
+        ("/api/v1/admin/skills/{id}/executor", "patch", true),
         (
             "/api/v1/admin/users/{external_user_id}/provider-credentials/{id}",
             "delete",

@@ -340,6 +340,77 @@ pub const CONTENT_ENVELOPE_OPEN_FAILURE_REASONS: &[&str] = &[
     "other",
 ];
 
+// Plan 12 workstream E — declare-only MVP (#210).
+//
+// `docs/grafana.md` names five gaps explicitly: no token-usage metric exists at all; the
+// routing-decision log and failover events are only partially visible today (a
+// `FallbackSelected` runtime event exists, but no queryable rate); and OAuth credential health
+// and flow execution have no signal at all because neither OAuth credential machinery nor flows
+// exist in this tree yet. This block declares — names, describes, and (where the label domain is
+// closed and small) seeds at zero — the seven families that close those gaps. It does **not**
+// wire a single emit site: nothing in `src/application` or `src/orchestration` calls any of the
+// new recorder methods below. That lands with workstream D (context router, for the
+// token/routing/failover families) and workstream F (agent platform, for the OAuth and flow
+// families) — the same "declare ahead of the caller" shape plan 12 §1's oauth-token-refresh
+// worker and §3's flow orchestrator are specified against.
+const PROVIDER_TOKENS_TOTAL: &str = "moira_provider_tokens_total";
+const ROUTING_DECISION_TOTAL: &str = "moira_routing_decision_total";
+const FAILOVER_TOTAL: &str = "moira_failover_total";
+const OAUTH_CREDENTIAL_STATUS: &str = "moira_oauth_credential_status";
+const OAUTH_REFRESH_TOTAL: &str = "moira_oauth_refresh_total";
+const FLOW_STEP_TOTAL: &str = "moira_flow_step_total";
+const FLOW_DURATION_SECONDS: &str = "moira_flow_duration_seconds";
+
+/// The closed `status` domain for `moira_oauth_credential_status`. The four states
+/// `docs/grafana.md`'s gap table names for the OAuth credential health row this family backs.
+const OAUTH_CREDENTIAL_STATUSES: &[&str] = &["valid", "expiring", "expired", "refresh_failed"];
+
+/// The closed `outcome` domain for `moira_oauth_refresh_total`, the same two-value shape as
+/// [`RAG_INGESTION_OUTCOMES`] below: a refresh either replaced the token or it did not.
+const OAUTH_REFRESH_OUTCOMES: &[&str] = &["succeeded", "failed"];
+
+/// The closed `reason` domain for `moira_routing_decision_total`, mirroring the
+/// `selection_reason` column plan 12 §2's schema sketch proposes for `execution_attempts` — the
+/// metric and that column are meant to agree once workstream D wires both. `other` is the
+/// terminal bucket, the same convention every bounded-reason family in this module follows.
+const ROUTING_DECISION_REASONS: &[&str] = &[
+    "priority",
+    "explicit_hint",
+    "scored",
+    "fallback_after_failure",
+    "other",
+];
+
+/// The closed `trigger` domain for `moira_failover_total`: exactly the fallback-eligible
+/// `ExecutionFailureClass` variants `src/orchestration/controls.rs` already classifies as
+/// fallback-eligible (plan 12 §2's "Failover semantics"), spelled the same way
+/// `failure_class_label` spells them, plus `other` as the terminal bucket for a class this
+/// family has not been taught about.
+const FAILOVER_TRIGGERS: &[&str] = &[
+    "credential_not_found",
+    "provider_timeout",
+    "provider_connection_failed",
+    "provider_rate_limited",
+    "provider_unavailable",
+    "provider_upstream_error",
+    "circuit_open",
+    "capacity_exhausted",
+    "other",
+];
+
+/// The closed `status` domain for `moira_flow_step_total` — the three terminal states an
+/// executed step can end in. `pending`/`running` never reach this counter: those are progress
+/// states a gauge would carry, and this MVP declares no flow-progress gauge. An unrecognised
+/// value is dropped rather than folded into `other`, the same treatment `known_job_name` gives an
+/// unrecognised job name: the domain comes from `agent_flow_step_runs`'s own `CHECK` constraint,
+/// not from free-form caller input.
+const FLOW_STEP_STATUSES: &[&str] = &["completed", "failed", "skipped"];
+
+/// Flow duration is a whole DAG run, not a single provider round-trip, so its tail is sized for
+/// several sequential steps rather than one execution.
+const FLOW_DURATION_BUCKETS_SECONDS: &[f64] =
+    &[0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0];
+
 /// The closed `outcome` label domain for `moira_admin_invite_outcomes_total`.
 ///
 /// `created` and `redeemed` are the two successes; everything else is a denial reason
@@ -690,6 +761,52 @@ impl MetricsRegistry {
                  the row."
             );
 
+            describe_counter!(
+                PROVIDER_TOKENS_TOTAL,
+                "Token usage by provider type and direction (in = prompt/input tokens, out = \
+                 completion/output tokens). No emit site calls this yet — token usage today is \
+                 recorded per execution in the database and served on /api/v1/usage, never as a \
+                 metric; workstream D's execution path is what will call this recorder."
+            );
+            describe_counter!(
+                ROUTING_DECISION_TOTAL,
+                "Model-routing candidate selections, by route key, the provider type that was \
+                 selected, and a bounded reason. Metrics-only per plan 12 decision 11: a \
+                 successful selection never writes an audit row, only a denial does, and denials \
+                 already have their own audit precedent elsewhere."
+            );
+            describe_counter!(
+                FAILOVER_TOTAL,
+                "Fallback hops from one provider type to another, by the bounded \
+                 ExecutionFailureClass that triggered the hop. Complements the existing \
+                 FallbackSelected runtime event with a queryable rate."
+            );
+            describe_gauge!(
+                OAUTH_CREDENTIAL_STATUS,
+                "How many stored OAuth2 provider credentials are in each lifecycle state, by \
+                 provider type. Declared ahead of the oauth-token-refresh JobDispatcher plan 12 \
+                 §1 specifies; every series is seeded at zero so the panel renders before that \
+                 worker exists."
+            );
+            describe_counter!(
+                OAUTH_REFRESH_TOTAL,
+                "OAuth2 credential refresh attempts, by provider type and outcome. Declared \
+                 ahead of the oauth-token-refresh JobDispatcher that will call it."
+            );
+            describe_counter!(
+                FLOW_STEP_TOTAL,
+                "Agent-flow step completions, by flow key, agent key and a bounded terminal \
+                 status. Declared ahead of workstream F's flow orchestrator. flow_key and \
+                 agent_key are admin-configured identifiers, the same class as model_key on \
+                 moira_provider_outcome_total, so — like that family — this one is not seeded; \
+                 series appear per configured flow."
+            );
+            describe_histogram!(
+                FLOW_DURATION_SECONDS,
+                "Wall-clock time for one complete agent-flow run, by flow key, in seconds. Not \
+                 seeded, like every other histogram in this module: its label values are dynamic."
+            );
+
             gauge!(DB_POOL_CONNECTIONS, "state" => "total").set(0.0);
             gauge!(DB_POOL_CONNECTIONS, "state" => "idle").set(0.0);
             for job_name in WORKER_JOB_NAMES {
@@ -744,6 +861,42 @@ impl MetricsRegistry {
                         CONTENT_ENVELOPE_OPEN_FAILED_TOTAL,
                         "profile" => profile.label(),
                         "reason" => *reason
+                    )
+                    .increment(0);
+                }
+            }
+
+            // Plan 12 workstream E. Only the families whose label domain is closed and small
+            // enough to enumerate are seeded here: provider_type x direction (16 series),
+            // provider_type x status (32) and provider_type x outcome (16). The other three new
+            // families carry an admin-configured identifier that is open-ended (route_key,
+            // flow_key, agent_key) or whose full cross product is too large to be a useful seed
+            // (from_provider_type x to_provider_type x trigger), so — like
+            // moira_provider_outcome_total before them — they follow the "appears on first
+            // observation" precedent instead.
+            for provider_type in ALL_PROVIDER_TYPES {
+                let provider = provider_type_label(provider_type);
+                for direction in TokenDirection::ALL {
+                    counter!(
+                        PROVIDER_TOKENS_TOTAL,
+                        "provider_type" => provider,
+                        "direction" => direction.label()
+                    )
+                    .increment(0);
+                }
+                for status in OAUTH_CREDENTIAL_STATUSES {
+                    gauge!(
+                        OAUTH_CREDENTIAL_STATUS,
+                        "provider_type" => provider,
+                        "status" => *status
+                    )
+                    .set(0.0);
+                }
+                for outcome in OAUTH_REFRESH_OUTCOMES {
+                    counter!(
+                        OAUTH_REFRESH_TOTAL,
+                        "provider_type" => provider,
+                        "outcome" => *outcome
                     )
                     .increment(0);
                 }
@@ -1260,6 +1413,167 @@ impl MetricsRegistry {
         });
     }
 
+    // -----------------------------------------------------------------------------------
+    // Plan 12 workstream E — declare-only MVP (#210). No call site outside this module's own
+    // tests uses these yet; they exist so workstream D (context router) and workstream F (agent
+    // platform) have a recorder ready to call rather than inventing their own when they land.
+    // -----------------------------------------------------------------------------------
+
+    /// Counts `count` tokens moved in `direction` for one provider execution.
+    pub fn record_provider_tokens(
+        &self,
+        provider_type: ProviderType,
+        direction: TokenDirection,
+        count: u64,
+    ) {
+        if count == 0 {
+            return;
+        }
+        let provider = provider_type_label(provider_type);
+        let direction = direction.label();
+        with_local_recorder(&self.inner.recorder, || {
+            counter!(
+                PROVIDER_TOKENS_TOTAL,
+                "provider_type" => provider,
+                "direction" => direction
+            )
+            .increment(count);
+        });
+    }
+
+    /// Counts one model-routing candidate selection.
+    ///
+    /// `route_key` is an admin-configured route identifier — the same class as `model_key` on
+    /// [`Self::record_provider_outcome`], bounded by the operator's route catalogue, never
+    /// caller input. `reason` outside [`ROUTING_DECISION_REASONS`] is folded into `other`, the
+    /// same convention every bounded-reason family in this module follows.
+    pub fn record_routing_decision(
+        &self,
+        route_key: &str,
+        selected_provider_type: ProviderType,
+        reason: &str,
+    ) {
+        let route_key = route_key.to_string();
+        let provider = provider_type_label(selected_provider_type);
+        let reason = ROUTING_DECISION_REASONS
+            .iter()
+            .find(|candidate| **candidate == reason)
+            .copied()
+            .unwrap_or("other");
+        with_local_recorder(&self.inner.recorder, || {
+            counter!(
+                ROUTING_DECISION_TOTAL,
+                "route_key" => route_key,
+                "selected_provider_type" => provider,
+                "reason" => reason
+            )
+            .increment(1);
+        });
+    }
+
+    /// Counts one fallback hop from one provider type to another.
+    ///
+    /// `trigger` outside [`FAILOVER_TRIGGERS`] is folded into `other` — the same closed set
+    /// `src/orchestration/controls.rs` already classifies as fallback-eligible.
+    pub fn record_failover(
+        &self,
+        from_provider_type: ProviderType,
+        to_provider_type: ProviderType,
+        trigger: &str,
+    ) {
+        let from = provider_type_label(from_provider_type);
+        let to = provider_type_label(to_provider_type);
+        let trigger = FAILOVER_TRIGGERS
+            .iter()
+            .find(|candidate| **candidate == trigger)
+            .copied()
+            .unwrap_or("other");
+        with_local_recorder(&self.inner.recorder, || {
+            counter!(
+                FAILOVER_TOTAL,
+                "from_provider_type" => from,
+                "to_provider_type" => to,
+                "trigger" => trigger
+            )
+            .increment(1);
+        });
+    }
+
+    /// Sets `moira_oauth_credential_status{provider_type,status}` from a freshly counted
+    /// distribution for one provider type — the same whole-distribution-at-once shape as
+    /// [`Self::set_content_keyring_keys`], and for the same reason: a status that dropped to zero
+    /// has to be *written* as zero, or the gauge keeps its last value forever.
+    pub fn set_oauth_credential_status(
+        &self,
+        provider_type: ProviderType,
+        counts: &[(&'static str, usize)],
+    ) {
+        let provider = provider_type_label(provider_type);
+        with_local_recorder(&self.inner.recorder, || {
+            for (status, count) in counts {
+                #[allow(clippy::cast_precision_loss)]
+                gauge!(
+                    OAUTH_CREDENTIAL_STATUS,
+                    "provider_type" => provider,
+                    "status" => *status
+                )
+                .set(*count as f64);
+            }
+        });
+    }
+
+    /// Counts one OAuth2 credential refresh attempt.
+    pub fn record_oauth_refresh(&self, provider_type: ProviderType, succeeded: bool) {
+        let provider = provider_type_label(provider_type);
+        let outcome = if succeeded { "succeeded" } else { "failed" };
+        with_local_recorder(&self.inner.recorder, || {
+            counter!(
+                OAUTH_REFRESH_TOTAL,
+                "provider_type" => provider,
+                "outcome" => outcome
+            )
+            .increment(1);
+        });
+    }
+
+    /// Counts one agent-flow step reaching a terminal status.
+    ///
+    /// `flow_key` and `agent_key` are admin-configured identifiers — `agent_flows.flow_key` and
+    /// `agent_profiles.profile_key` — the same class as `model_key`, never caller input. A
+    /// `status` outside [`FLOW_STEP_STATUSES`] is dropped rather than folded into `other`, the
+    /// same treatment `known_job_name` gives an unrecognised job name: the domain comes from a
+    /// database `CHECK` constraint, not from free-form input, so a value outside it is a caller
+    /// bug, not a taxonomy gap.
+    pub fn record_flow_step(&self, flow_key: &str, agent_key: &str, status: &str) {
+        let Some(status) = FLOW_STEP_STATUSES
+            .iter()
+            .find(|candidate| **candidate == status)
+            .copied()
+        else {
+            return;
+        };
+        let flow_key = flow_key.to_string();
+        let agent_key = agent_key.to_string();
+        with_local_recorder(&self.inner.recorder, || {
+            counter!(
+                FLOW_STEP_TOTAL,
+                "flow_key" => flow_key,
+                "agent_key" => agent_key,
+                "status" => status
+            )
+            .increment(1);
+        });
+    }
+
+    /// Records the wall-clock duration of one complete agent-flow run.
+    pub fn record_flow_duration(&self, flow_key: &str, duration: Duration) {
+        let flow_key = flow_key.to_string();
+        let seconds = duration.as_secs_f64();
+        with_local_recorder(&self.inner.recorder, || {
+            histogram!(FLOW_DURATION_SECONDS, "flow_key" => flow_key).record(seconds);
+        });
+    }
+
     /// Renders the Prometheus exposition body served by `GET /metrics`.
     ///
     /// The first parameter is retained purely to keep this signature — and therefore
@@ -1341,6 +1655,47 @@ impl InvalidationChannel {
     }
 }
 
+/// The two directions of token usage `moira_provider_tokens_total` distinguishes.
+///
+/// An enum rather than a `&str` parameter, the same reasoning as [`RedisOperation`]: `direction`
+/// is a label key, so a caller passing an ad-hoc string would open the label set one call site at
+/// a time, and nothing would fail until the scrape body did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenDirection {
+    Input,
+    Output,
+}
+
+impl TokenDirection {
+    pub(crate) const ALL: [Self; 2] = [Self::Input, Self::Output];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Input => "in",
+            Self::Output => "out",
+        }
+    }
+}
+
+/// Every [`ProviderType`] variant, used only to seed the plan 12 workstream E families whose
+/// label domain is the full provider set (`moira_provider_tokens_total`,
+/// `moira_oauth_credential_status`, `moira_oauth_refresh_total`). `ProviderType` carries no `ALL`
+/// constant of its own in `src/domain/admin.rs`, and adding one there is out of scope for a
+/// change confined to this module, so this list is kept here instead — a variant added to the
+/// enum without a matching addition here would silently under-seed rather than fail to compile,
+/// which is why a test below pins this list's length against the number of arms
+/// `provider_type_label` has to stay exhaustive over.
+const ALL_PROVIDER_TYPES: [ProviderType; 8] = [
+    ProviderType::OpenAiCompatible,
+    ProviderType::OpenAi,
+    ProviderType::Anthropic,
+    ProviderType::Gemini,
+    ProviderType::DeepSeek,
+    ProviderType::AzureOpenAi,
+    ProviderType::Local,
+    ProviderType::Custom,
+];
+
 /// `job_name` as a label value, or `None` if Moira has never declared that job.
 fn known_job_name(job_name: &str) -> Option<&'static str> {
     WORKER_JOB_NAMES
@@ -1357,6 +1712,7 @@ const _: () = assert!(!EXECUTION_LATENCY_BUCKETS_SECONDS.is_empty());
 const _: () = assert!(!TTFT_BUCKETS_SECONDS.is_empty());
 const _: () = assert!(!EMBEDDING_BATCH_BUCKETS_SECONDS.is_empty());
 const _: () = assert!(!RETRIEVAL_LATENCY_BUCKETS_SECONDS.is_empty());
+const _: () = assert!(!FLOW_DURATION_BUCKETS_SECONDS.is_empty());
 
 fn build_recorder(service_name: &str) -> PrometheusRecorder {
     let mut builder =
@@ -1376,6 +1732,7 @@ fn build_recorder(service_name: &str) -> PrometheusRecorder {
             EMBEDDING_BATCH_BUCKETS_SECONDS,
         ),
         (RETRIEVAL_LATENCY_SECONDS, RETRIEVAL_LATENCY_BUCKETS_SECONDS),
+        (FLOW_DURATION_SECONDS, FLOW_DURATION_BUCKETS_SECONDS),
     ] {
         builder = builder
             .set_buckets_for_metric(Matcher::Full(name.to_string()), buckets)
@@ -1535,6 +1892,25 @@ mod tests {
         "profile",
         "reason",
         "data_key_id",
+        // Plan 12 workstream E (#210) — declare-only MVP. All seven new families are closed in
+        // code: `direction` by the two-variant `TokenDirection` enum; `route_key`, `flow_key`
+        // and `agent_key` are admin-configured identifiers in the same class as `model_key`
+        // above; `selected_provider_type`, `from_provider_type` and `to_provider_type` reuse
+        // `provider_type_label`'s closed set under a different key name because each names a
+        // *different* provider than a bare `provider_type` would on these particular families;
+        // `reason` is closed against `ROUTING_DECISION_REASONS` (reusing the key already used by
+        // the content-envelope failure family above); `trigger` is closed against
+        // `FAILOVER_TRIGGERS`; `status` is closed against `FLOW_STEP_STATUSES` for the counter
+        // and against `OAUTH_CREDENTIAL_STATUSES` for the gauge.
+        "direction",
+        "route_key",
+        "selected_provider_type",
+        "from_provider_type",
+        "to_provider_type",
+        "trigger",
+        "status",
+        "flow_key",
+        "agent_key",
         "le",
         "quantile",
     ];
@@ -2375,5 +2751,301 @@ mod tests {
             rendered.contains(r#"outcome="other""#),
             "an unrecognised denial reason must be folded into `other`, not dropped:\n{rendered}"
         );
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Plan 12 workstream E (#210) — declare-only MVP.
+    // -----------------------------------------------------------------------------------
+
+    /// `ALL_PROVIDER_TYPES` must stay in lock-step with the domain `provider_type_label` is
+    /// exhaustive over, which is the guarantee that module-level doc comment promises.
+    #[test]
+    fn all_provider_types_seed_list_matches_the_provider_type_domain() {
+        let mut labels: Vec<&str> = ALL_PROVIDER_TYPES
+            .iter()
+            .copied()
+            .map(provider_type_label)
+            .collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(
+            labels.len(),
+            8,
+            "ALL_PROVIDER_TYPES must carry one entry per ProviderType variant, no duplicates"
+        );
+    }
+
+    /// The three seedable plan 12 workstream E families — the ones whose label domain is closed
+    /// and small — render at zero before any observation, exactly like every other seeded family
+    /// in this module. The other four (dynamic-identifier or histogram families) are described
+    /// (`describe_counter!`/`describe_histogram!` were called) but carry no `# HELP`/`# TYPE`
+    /// lines and no series until their first observation — `metrics-exporter-prometheus` only
+    /// renders a family once something has actually been recorded against it, exactly like
+    /// `moira_provider_outcome_total`'s own `model_key` dimension, which `docs/prometheus.md`
+    /// documents as "not seeded — series appear per configured model".
+    #[test]
+    fn plan12_workstream_e_seedable_families_render_at_zero() {
+        let rendered = registry().render_prometheus("moira-test", false, false);
+
+        for family in [
+            PROVIDER_TOKENS_TOTAL,
+            OAUTH_CREDENTIAL_STATUS,
+            OAUTH_REFRESH_TOTAL,
+        ] {
+            assert!(
+                rendered.contains(family),
+                "{family} is absent from a fresh scrape body:\n{rendered}"
+            );
+        }
+        let anthropic = provider_type_label(ProviderType::Anthropic);
+        for direction in ["in", "out"] {
+            assert!(
+                rendered.lines().any(|line| {
+                    line.starts_with(PROVIDER_TOKENS_TOTAL)
+                        && line.contains(&format!("provider_type=\"{anthropic}\""))
+                        && line.contains(&format!("direction=\"{direction}\""))
+                        && line.ends_with(" 0")
+                }),
+                "{PROVIDER_TOKENS_TOTAL} is missing its seeded {direction} series for \
+                 {anthropic}:\n{rendered}"
+            );
+        }
+        for status in OAUTH_CREDENTIAL_STATUSES {
+            assert!(
+                rendered.lines().any(|line| {
+                    line.starts_with(OAUTH_CREDENTIAL_STATUS)
+                        && line.contains(&format!("provider_type=\"{anthropic}\""))
+                        && line.contains(&format!("status=\"{status}\""))
+                        && line.ends_with(" 0")
+                }),
+                "{OAUTH_CREDENTIAL_STATUS} is missing its seeded {status} series for \
+                 {anthropic}:\n{rendered}"
+            );
+        }
+        for outcome in OAUTH_REFRESH_OUTCOMES {
+            assert!(
+                rendered.lines().any(|line| {
+                    line.starts_with(OAUTH_REFRESH_TOTAL)
+                        && line.contains(&format!("provider_type=\"{anthropic}\""))
+                        && line.contains(&format!("outcome=\"{outcome}\""))
+                        && line.ends_with(" 0")
+                }),
+                "{OAUTH_REFRESH_TOTAL} is missing its seeded {outcome} series for \
+                 {anthropic}:\n{rendered}"
+            );
+        }
+
+        for family in [
+            ROUTING_DECISION_TOTAL,
+            FAILOVER_TOTAL,
+            FLOW_STEP_TOTAL,
+            FLOW_DURATION_SECONDS,
+        ] {
+            assert!(
+                !rendered.contains(&format!("# TYPE {family} ")),
+                "{family} rendered a # TYPE line before any observation; either it was \
+                 accidentally seeded, or the exporter's no-observation-no-render behaviour this \
+                 test pins has changed:\n{rendered}"
+            );
+            assert!(
+                !rendered
+                    .lines()
+                    .any(|line| line.starts_with(family) && line.contains('{')),
+                "{family} must carry no series before its first observation:\n{rendered}"
+            );
+        }
+    }
+
+    /// Each new recorder actually reaches its family, under the label values its own doc comment
+    /// promises. The seeding test above proves the *series exist*; this proves the *methods
+    /// write to them* — a different fact, and one this module's history has gotten wrong before
+    /// (five metric labels shipped seeded and never emitted, `HANDOFF.md` §2.3).
+    #[test]
+    fn plan12_workstream_e_recorders_emit_expected_series() {
+        let metrics = registry();
+        metrics.record_provider_tokens(ProviderType::OpenAi, TokenDirection::Input, 120);
+        metrics.record_provider_tokens(ProviderType::OpenAi, TokenDirection::Output, 45);
+        metrics.record_provider_tokens(ProviderType::OpenAi, TokenDirection::Input, 0);
+        metrics.record_routing_decision("chat-default", ProviderType::Anthropic, "priority");
+        metrics.record_routing_decision(
+            "chat-default",
+            ProviderType::Anthropic,
+            "an invented reason",
+        );
+        metrics.record_failover(
+            ProviderType::OpenAi,
+            ProviderType::Anthropic,
+            "provider_timeout",
+        );
+        metrics.record_failover(
+            ProviderType::OpenAi,
+            ProviderType::Anthropic,
+            "an invented trigger",
+        );
+        metrics
+            .set_oauth_credential_status(ProviderType::Anthropic, &[("valid", 2), ("expiring", 1)]);
+        metrics.record_oauth_refresh(ProviderType::Anthropic, true);
+        metrics.record_oauth_refresh(ProviderType::Anthropic, false);
+        metrics.record_flow_step("onboarding", "triage-agent", "completed");
+        metrics.record_flow_step("onboarding", "triage-agent", "not-a-real-status");
+        metrics.record_flow_duration("onboarding", Duration::from_secs(4));
+
+        let rendered = metrics.render_prometheus("moira-test", false, false);
+
+        let openai = provider_type_label(ProviderType::OpenAi);
+        let anthropic = provider_type_label(ProviderType::Anthropic);
+
+        let series_line = |family: &str, needles: &[String]| -> Option<String> {
+            rendered
+                .lines()
+                .find(|line| {
+                    line.starts_with(family)
+                        && line.contains('{')
+                        && needles.iter().all(|needle| line.contains(needle.as_str()))
+                })
+                .map(str::to_string)
+        };
+        let value_of = |line: &str| -> f64 {
+            line.rsplit(' ')
+                .next()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("no trailing value in line: {line}"))
+        };
+
+        let line = series_line(
+            PROVIDER_TOKENS_TOTAL,
+            &[
+                format!("provider_type=\"{openai}\""),
+                "direction=\"in\"".to_string(),
+            ],
+        )
+        .unwrap_or_else(|| panic!("no {PROVIDER_TOKENS_TOTAL} in-direction series:\n{rendered}"));
+        assert_eq!(value_of(&line), 120.0);
+        let line = series_line(
+            PROVIDER_TOKENS_TOTAL,
+            &[
+                format!("provider_type=\"{openai}\""),
+                "direction=\"out\"".to_string(),
+            ],
+        )
+        .unwrap_or_else(|| panic!("no {PROVIDER_TOKENS_TOTAL} out-direction series:\n{rendered}"));
+        assert_eq!(
+            value_of(&line),
+            45.0,
+            "a zero-token call must not have incremented this series further"
+        );
+
+        let line = series_line(
+            ROUTING_DECISION_TOTAL,
+            &[
+                "route_key=\"chat-default\"".to_string(),
+                format!("selected_provider_type=\"{anthropic}\""),
+                "reason=\"priority\"".to_string(),
+            ],
+        )
+        .unwrap_or_else(|| panic!("no {ROUTING_DECISION_TOTAL} priority series:\n{rendered}"));
+        assert_eq!(value_of(&line), 1.0);
+        let line = series_line(
+            ROUTING_DECISION_TOTAL,
+            &[
+                "route_key=\"chat-default\"".to_string(),
+                format!("selected_provider_type=\"{anthropic}\""),
+                "reason=\"other\"".to_string(),
+            ],
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "an unrecognised reason must fold into other, not open the label set:\n{rendered}"
+            )
+        });
+        assert_eq!(value_of(&line), 1.0);
+
+        let line = series_line(
+            FAILOVER_TOTAL,
+            &[
+                format!("from_provider_type=\"{openai}\""),
+                format!("to_provider_type=\"{anthropic}\""),
+                "trigger=\"provider_timeout\"".to_string(),
+            ],
+        )
+        .unwrap_or_else(|| panic!("no {FAILOVER_TOTAL} provider_timeout series:\n{rendered}"));
+        assert_eq!(value_of(&line), 1.0);
+        let line = series_line(
+            FAILOVER_TOTAL,
+            &[
+                format!("from_provider_type=\"{openai}\""),
+                format!("to_provider_type=\"{anthropic}\""),
+                "trigger=\"other\"".to_string(),
+            ],
+        )
+        .unwrap_or_else(|| panic!("an unrecognised trigger must fold into other:\n{rendered}"));
+        assert_eq!(value_of(&line), 1.0);
+
+        let line = series_line(
+            OAUTH_CREDENTIAL_STATUS,
+            &[
+                format!("provider_type=\"{anthropic}\""),
+                "status=\"valid\"".to_string(),
+            ],
+        )
+        .unwrap_or_else(|| panic!("no {OAUTH_CREDENTIAL_STATUS} valid series:\n{rendered}"));
+        assert_eq!(value_of(&line), 2.0);
+        let line = series_line(
+            OAUTH_CREDENTIAL_STATUS,
+            &[
+                format!("provider_type=\"{anthropic}\""),
+                "status=\"expiring\"".to_string(),
+            ],
+        )
+        .unwrap_or_else(|| panic!("no {OAUTH_CREDENTIAL_STATUS} expiring series:\n{rendered}"));
+        assert_eq!(value_of(&line), 1.0);
+
+        let line = series_line(
+            OAUTH_REFRESH_TOTAL,
+            &[
+                format!("provider_type=\"{anthropic}\""),
+                "outcome=\"succeeded\"".to_string(),
+            ],
+        )
+        .unwrap_or_else(|| panic!("no {OAUTH_REFRESH_TOTAL} succeeded series:\n{rendered}"));
+        assert_eq!(value_of(&line), 1.0);
+        let line = series_line(
+            OAUTH_REFRESH_TOTAL,
+            &[
+                format!("provider_type=\"{anthropic}\""),
+                "outcome=\"failed\"".to_string(),
+            ],
+        )
+        .unwrap_or_else(|| panic!("no {OAUTH_REFRESH_TOTAL} failed series:\n{rendered}"));
+        assert_eq!(value_of(&line), 1.0);
+
+        let line = series_line(
+            FLOW_STEP_TOTAL,
+            &[
+                "flow_key=\"onboarding\"".to_string(),
+                "agent_key=\"triage-agent\"".to_string(),
+                "status=\"completed\"".to_string(),
+            ],
+        )
+        .unwrap_or_else(|| panic!("no {FLOW_STEP_TOTAL} completed series:\n{rendered}"));
+        assert_eq!(value_of(&line), 1.0);
+        assert!(
+            !rendered.contains("not-a-real-status"),
+            "an unrecognised flow-step status must be dropped, not reach a label:\n{rendered}"
+        );
+
+        assert!(rendered.contains(&format!("{FLOW_DURATION_SECONDS}_count")));
+        assert_eq!(
+            scalar(&rendered, &format!("{FLOW_DURATION_SECONDS}_sum")),
+            4.0
+        );
+
+        for key in label_keys(&rendered) {
+            assert!(
+                ALLOWED_LABEL_KEYS.contains(&key.as_str()),
+                "unexpected label key {key:?}; add it to ALLOWED_LABEL_KEYS only after \
+                 confirming its value set is closed:\n{rendered}"
+            );
+        }
     }
 }

@@ -16,7 +16,8 @@ use crate::{
         admin::{actor_fingerprint, unkeyed_actor_fingerprint},
     },
     domain::{
-        AgentProfileCreateRequest, AgentProfilePatchRequest, AgentProfileRecord, AuditLogInsert,
+        AgentProfileCreateRequest, AgentProfilePatchRequest, AgentProfileRecord,
+        ApplicationRoutingDefaultsPutRequest, ApplicationRoutingDefaultsRecord, AuditLogInsert,
         AuditResult, CursorScope, IdempotencyRecord, ListCursor, ListResponse, Pagination,
         ProviderRuntimePolicyPutRequest, ProviderRuntimePolicyRecord, RouteDefinitionCreateRequest,
         RouteDefinitionPatchRequest, RouteDefinitionRecord, RoutingPolicyCreateRequest,
@@ -764,6 +765,108 @@ impl<'a> RuntimeAdminService<'a> {
         Ok(record)
     }
 
+    /// Context router (issue #213). Returns the declared defaults (`default_priority: 100`) for
+    /// an application that has never had a row, the same "no row yet" shape
+    /// [`Self::get_provider_runtime_policy`] gives.
+    pub async fn get_application_routing_defaults(
+        &self,
+        actor: &Actor,
+        application_id: Uuid,
+    ) -> Result<ApplicationRoutingDefaultsRecord, AppError> {
+        self.state
+            .authz
+            .require(actor, "moira:routing-defaults:read")?;
+        self.runtime_repo
+            .get_application_routing_defaults(application_id)
+            .await
+    }
+
+    /// Mirrors [`Self::put_provider_runtime_policy`] exactly: `If-Match` is optional, checked in
+    /// Rust against a fresh read rather than atomically in SQL (accepted here for the same
+    /// reason it is accepted there — a low-traffic admin-only settings row, not a resource under
+    /// concurrent write pressure).
+    pub async fn put_application_routing_defaults(
+        &self,
+        actor: &Actor,
+        ctx: &RequestContext,
+        application_id: Uuid,
+        expected_version: Option<i64>,
+        request: ApplicationRoutingDefaultsPutRequest,
+    ) -> Result<ApplicationRoutingDefaultsRecord, AppError> {
+        self.state
+            .authz
+            .require(actor, "moira:routing-defaults:write")?;
+        let idempotency_request = ApplicationRoutingDefaultsIdempotencyRequest {
+            application_id,
+            request: &request,
+        };
+        if let Some(replay) = self
+            .idempotency_replay(
+                ctx,
+                actor,
+                "application_routing_defaults.upsert",
+                &idempotency_request,
+            )
+            .await?
+        {
+            return Ok(replay);
+        }
+        validate_routing_defaults(&request)?;
+        match self
+            .runtime_repo
+            .get_application_routing_defaults(application_id)
+            .await
+        {
+            Ok(existing) => match expected_version {
+                Some(expected) if existing.version == expected => {}
+                Some(_) => {
+                    return Err(AppError::conflict(
+                        "resource_version_conflict",
+                        "resource version does not match If-Match",
+                    ));
+                }
+                None => {
+                    return Err(AppError::BadRequest(
+                        "If-Match header is required".to_string(),
+                    ));
+                }
+            },
+            Err(AppError::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        let record = self
+            .runtime_repo
+            .put_application_routing_defaults(
+                application_id,
+                &request,
+                self.runtime_audit(
+                    actor,
+                    ctx,
+                    "application_routing_defaults.upsert",
+                    "application_routing_defaults",
+                    Some(application_id.to_string()),
+                    json!({ "application_id": application_id }),
+                ),
+            )
+            .await?;
+        // No `invalidate_runtime`/Redis-publish call here (contrast with
+        // `put_provider_runtime_policy` above): `application_routing_defaults` carries no
+        // `runtime_config_notify` trigger and nothing in `RuntimeConfigCache` holds its data —
+        // see `migrations/0029_context_router_static_priority.sql`. `invalidate_all` is still
+        // called defensively, matching `PublicExecutionService::put_application_execution_policy`
+        // (`src/application/public.rs`), a structurally identical singleton-policy-row write.
+        self.state.runtime_cache.invalidate_all().await;
+        self.record_idempotency(
+            ctx,
+            actor,
+            "application_routing_defaults.upsert",
+            &idempotency_request,
+            &record,
+        )
+        .await?;
+        Ok(record)
+    }
+
     /// Drops both runtime caches, and clears exactly the breaker entries the write that
     /// just happened can plausibly have invalidated.
     ///
@@ -1039,6 +1142,12 @@ struct ProviderRuntimePolicyIdempotencyRequest<'a> {
     request: &'a ProviderRuntimePolicyPutRequest,
 }
 
+#[derive(Serialize)]
+struct ApplicationRoutingDefaultsIdempotencyRequest<'a> {
+    application_id: Uuid,
+    request: &'a ApplicationRoutingDefaultsPutRequest,
+}
+
 /// The fingerprint this module wrote **before** plan 06 unified the three formulas.
 ///
 /// Read-only, and deliberately not `pub`: `idempotency_replay` consults it so a ledger row
@@ -1262,6 +1371,20 @@ fn validate_runtime_policy(request: &ProviderRuntimePolicyPutRequest) -> Result<
         return Err(AppError::BadRequest(
             "runtime policy retry fields must be non-negative".to_string(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_routing_defaults(
+    request: &ApplicationRoutingDefaultsPutRequest,
+) -> Result<(), AppError> {
+    if request.default_priority.is_some_and(|value| value < 0) {
+        return Err(AppError::BadRequest(
+            "default_priority must be non-negative".to_string(),
+        ));
+    }
+    if let Some(profile) = &request.complexity_weight_profile {
+        validate_metadata(profile)?;
     }
     Ok(())
 }

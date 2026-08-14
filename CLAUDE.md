@@ -4,6 +4,8 @@ Use `skills/moira-project-structure/SKILL.md` before making structural changes, 
 
 Use `.claude/skills/moira-openapi/SKILL.md` whenever adding or changing HTTP routes, API DTOs, parameters, status codes, authentication, headers, streaming, metrics, or API documentation.
 
+Use `.claude/skills/moira-agent-orchestration-safety/SKILL.md` before authoring a multi-agent workflow, spawning parallel subagents, running any benchmark, or accepting work an agent reports as finished. Every rule in it exists because it was broken here and cost real work — parallel writers sharing one working tree lost a commit onto another branch, and three separate headline numbers were published from measurements taken under contention.
+
 Use `.claude/skills/moira-rig-integration/SKILL.md` for any work that touches Rig (`rig-core` 0.40): providers, completions, streaming, tools, agents/RAG, error mapping, or a version bump. It is the hub and routes to the specialist skills:
 
 - `.claude/skills/moira-rig-providers/SKILL.md` — provider clients, base URLs, credentials, Azure endpoints.

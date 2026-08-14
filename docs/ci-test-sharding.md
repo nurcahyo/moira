@@ -18,6 +18,14 @@ nothing.)
 `rust-shard (0)`…`(4)`: matrix check names embed the shard index and change whenever
 `SHARD_TOTAL` is re-tuned, which un-gates the branch without anything going red.
 
+`docs/ci-docs-only.md` extends this same require-the-aggregator arrangement to five more
+required checks, so that a documentation-only change can skip the jobs whose inputs it
+cannot have touched without any required check reporting `skipped`. `rust`'s assertion
+step now lives in `scripts/ci-required-gate.sh`, shared with those five; it is unchanged
+in the case that matters — anything other than `success` fails — and accepts `skipped`
+only when the `changes` job succeeded and classified every path in the change set as
+inert.
+
 ## Adding a test target
 
 Create `tests/new_thing.rs`. That is the whole procedure.
@@ -175,6 +183,29 @@ dozen lines apart with a comment at each site. Both mismatch directions fail clo
   *passes* — so a textual skip gate would read an empty log and go green while every DB
   suite skipped, a strictly worse version of the failure the gate exists to catch.
   `success-output = "final"` would be mandatory. nextest also does not run doctests.
+
+## Using nextest (issue #208)
+
+nextest is available, not adopted as the gate — the arithmetic above did not change, it
+was just given a Makefile target and a CI job so reaching for it does not mean
+hand-typing the invocation:
+
+- **`make nextest`** runs `cargo nextest run --workspace --all-features` under the
+  `default` profile against the same `MOIRA_TEST_DATABASE_URL` every other `make` target
+  uses. Same suite as `make test`, cross-process instead of in-process.
+- **`rust-nextest`** in `.github/workflows/ci.yml` runs the `ci` profile (JUnit output,
+  `retries = 0`, `fail-fast = false`) with its own Postgres/Redis services, uploading
+  `target/nextest/ci/junit.xml` as a build artifact. It is `workflow_dispatch`-only —
+  it does not run on `pull_request` or `push`, is not a dependency of the `rust`
+  aggregator, and must not be added to branch protection. Trigger it by hand (Actions
+  tab → this workflow → *Run workflow*) when hunting a cross-process isolation bug the
+  five-way shard's per-shard isolation would not surface — the same case the header
+  comment in `.config/nextest.toml` already describes.
+
+Neither path touches `make test`, `make gates`, or the `rust`/`rust-shard`/
+`rust-migrations` jobs. Those still run `cargo test`, and the union-completeness and
+skip-detection assertions in `scripts/test-log-lib.sh` still parse `cargo test`'s log
+format, per the tripwire above.
 - **sccache** — dependencies are already a 100% cache hit; only `moira` recompiles, so
   the hit rate would be ~0.
 - **cargo-chef** — a Docker build tool; there is no Docker layer here to cache.

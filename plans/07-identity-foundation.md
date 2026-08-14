@@ -167,7 +167,7 @@ the provider. `plans/06-architecture-test-hygiene.md:377` still refers to them b
 
 ## Branch & Pull Request (CONVENTIONS §1)
 
-- **Branch:** `plan/07-identity-foundation`, cut from the **current `main`**, after 03 and 05 have merged. If 03 has not merged when work begins, the branch stacks on `plan/03-security-hardening`; in that case the PR description must name the base PR and the branch must be rebased once 03 merges.
+- **Branch:** `plan/07-identity-foundation`, cut from the **current `develop`** (`CONVENTIONS.md` §1A: `develop` is the integration branch and the base for all plan work), after 03 and 05 have merged. If 03 has not merged when work begins, the branch stacks on `plan/03-security-hardening`; in that case the PR description must name the base PR and the branch must be rebased once 03 merges.
 - **Commits:** Conventional Commits (`feat: add admin identity claiming`, `feat: store non-secret auth provider settings`, `feat: resolve admin grants for trusted jwt actors`, `test: prove first-login-wins is impossible`, `docs: catalog identity error keys`).
 - The PR is **not opened** until every gate in CONVENTIONS §2 / Verification passes locally.
 - **PR description — required sections:**
