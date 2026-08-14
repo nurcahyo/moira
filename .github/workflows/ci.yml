@@ -117,10 +117,18 @@ jobs:
     # containers on its own runner, which is what makes "no two shards share a Postgres"
     # true by construction rather than by convention.
     #
-    # Service topology is UNIFORM across shards on purpose. Only 4 of 48 targets need no
-    # Postgres and only one needs Redis; packing by service would save ~4s and put
+    # Service topology is UNIFORM across shards on purpose. Only a handful of targets need
+    # no Postgres and only one needs Redis; packing by service would save ~4s and put
     # ci/test-costs.tsv on the correctness path — a target that starts using Redis would
     # land on a Redis-less shard.
+    #
+    # The denominator was "48" and is 50 as of #187, which consolidated five worker suites
+    # into one `workers` target. The numerator was not re-measured there and is not restated
+    # here for that reason. What #187 does settle is the DIRECTION: consolidation makes this
+    # argument stronger, never weaker. A merged target needs the union of its members'
+    # services, so every merge can only move targets from the "needs no Postgres" column into
+    # the "needs Postgres" one, and the saving service-aware packing could ever offer shrinks
+    # with each group consolidated.
     services:
       postgres:
         image: pgvector/pgvector:pg16

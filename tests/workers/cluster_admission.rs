@@ -1,14 +1,12 @@
 //! Cluster admission leases against a real PostgreSQL (plan 10 wave 1, P3-2).
 //!
 //! Every test here runs on its **own** database, cloned from the migrated
-//! template by [`support::TestDatabase`]. That is not tidiness: the admission
+//! template by [`crate::support::TestDatabase`]. That is not tidiness: the admission
 //! decision is a `count(*)` over the whole `cluster_replica_leases` table, so two
 //! suites sharing a database would count each other's replicas and every ceiling
 //! assertion would depend on what else happened to be running. The advisory lock
 //! that serialises admission is database-scoped too, so a private database also
-//! keeps it away from `b"MOIRARET"` in `tests/retention_worker.rs`.
-
-mod support;
+//! keeps it away from `b"MOIRARET"` in `tests/workers/retention_worker.rs`.
 
 use std::{sync::Arc, time::Duration};
 
@@ -29,7 +27,7 @@ use sqlx::PgPool;
 use tokio::{sync::Barrier, task::JoinSet};
 use uuid::Uuid;
 
-use support::TestDatabase;
+use crate::support::TestDatabase;
 
 /// Enough for a contended `CREATE DATABASE … TEMPLATE` plus the barrier-released
 /// acquisitions behind it. Spent only by a real failure.

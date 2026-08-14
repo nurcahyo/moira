@@ -103,7 +103,10 @@ Two things in there are measured rather than reasoned:
   *fails*, so a skip announced with `eprintln!` from a test that then reports `ok` never
   appeared in the capture at all. Measured on this branch, before the fix: with the
   no-database opt-out in force, `cargo test --test retention_worker` redirected to a file
-  held **zero** occurrences of `skipping` while all eight tests reported `ok`. Every skip
+  held **zero** occurrences of `skipping` while all eight tests reported `ok`. (That command
+  is how it was spelled when the measurement was taken; `retention_worker` became a module of
+  the `workers` target in #187, so reproducing it today reads
+  `cargo test --test workers retention_worker::`.) Every skip
   line in the tree is now written straight to `std::io::stderr()`
   (`tests/support/mod.rs::announce_skip`), which is below `libtest`'s capture, and the
   same measurement now yields **1**. The suites themselves also refuse to run without a
@@ -177,10 +180,13 @@ dozen lines apart with a comment at each site. Both mismatch directions fail clo
 - **cargo-chef** — a Docker build tool; there is no Docker layer here to cache.
 - **`CARGO_INCREMENTAL=1`** — incremental state does not survive between runners, and
   the cache action does not carry it.
-- **service-aware packing** (shards without Redis). Only 4 of 48 targets need no
+- **service-aware packing** (shards without Redis). Only a handful of targets need no
   Postgres and one needs Redis; it would save ~4s and put `ci/test-costs.tsv` on the
   correctness path, because a target that starts using Redis would land on a
-  Redis-less shard. Service topology is uniform on purpose.
+  Redis-less shard. Service topology is uniform on purpose. The denominator was 48 and is
+  50 as of #187; the numerator was not re-measured there, so it is not restated. The
+  direction is not in doubt, though: a merged target needs the union of its members'
+  services, so consolidating groups can only shrink the saving this option could offer.
 
 ## Test-target consolidation: one group measured, as a proof of concept
 

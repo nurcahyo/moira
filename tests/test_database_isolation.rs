@@ -24,7 +24,7 @@
 //! a disposable clone. Adding a suite to that set is then a visible, reviewable diff rather
 //! than a silent one.
 //!
-//! The allowlist has since shrunk by one. `tests/retention_worker.rs` was on it because
+//! The allowlist has since shrunk by one. `tests/workers/retention_worker.rs` was on it because
 //! `retention::run_once` sweeps every expired row in the database it is connected to, so on
 //! a shared database its delete counts included other suites' rows. That entry described a
 //! real constraint and a wrong conclusion: the sweep is *database*-wide, never
@@ -214,4 +214,140 @@ fn every_allowlist_entry_is_still_load_bearing() {
             "`{name}` must record why it cannot use a disposable database"
         );
     }
+}
+/// Directories under `tests/` that hold modules rather than test targets.
+///
+/// `support` is the long-standing one and predates any group. Everything else under
+/// `tests/` that is a directory is a **group member directory**: it belongs to a
+/// `tests/<group>.rs` root and is reachable only through that root.
+const NON_GROUP_TEST_DIRECTORIES: &[&str] = &["support"];
+
+/// A floor on the member files reachable from group roots, for exactly the reason
+/// [`SCANNED_ROOTS`] carries floors: without one, a `read_dir` that silently yielded nothing
+/// would leave the assertion below iterating an empty set and passing. It goes up as groups
+/// are consolidated and never comes down.
+const MINIMUM_GROUP_MEMBERS: usize = 5;
+
+/// The `#[path = "…"]` values a group root declares, in source order.
+///
+/// A group root reaches its members with an explicit path because a plain `mod <member>;`
+/// **does not work here** — this was measured, not assumed. `tests/<group>.rs` is itself a
+/// crate root, so its module directory is `tests/`, and `mod worker_queue;` resolves to
+/// `tests/worker_queue.rs` (E0583, "file not found for module"), never to
+/// `tests/<group>/worker_queue.rs`. The alternative shape that avoids `#[path]` on members —
+/// a root at `tests/<group>/main.rs` — was rejected because cargo would then name the target
+/// from the directory and `ls tests/*.rs` would stop listing it, which is the independent
+/// source `tl_expected_units` in `scripts/test-log-lib.sh` builds the completeness gate on.
+fn declared_member_paths(root_source: &str) -> Vec<String> {
+    root_source
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim().strip_prefix("#[path")?;
+            let rest = rest.trim_start().strip_prefix('=')?;
+            let rest = rest.trim_start().strip_prefix('"')?;
+            let (value, _) = rest.split_once('"')?;
+            Some(value.to_string())
+        })
+        .collect()
+}
+
+/// The group roots present in the tree, as `(group name, root path, member directory)`.
+fn test_groups() -> Vec<(String, PathBuf, PathBuf)> {
+    let tests = crate_root().join("tests");
+    let mut groups = Vec::new();
+    for entry in fs::read_dir(&tests).expect("read the tests directory") {
+        let path = entry.expect("read a tests/ entry").path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .expect("a directory has a name")
+            .to_string_lossy()
+            .to_string();
+        if NON_GROUP_TEST_DIRECTORIES.contains(&name.as_str()) {
+            continue;
+        }
+        groups.push((name.clone(), tests.join(format!("{name}.rs")), path));
+    }
+    groups.sort();
+    groups
+}
+
+/// A consolidated group's members are not test targets: cargo discovers `tests/*.rs` and
+/// `tests/*/main.rs`, and a member directory deliberately contains neither. The **only**
+/// thing that pulls a member into the build is its `#[path = "…"] mod <member>;` pair in the
+/// group root.
+///
+/// **That pair is the one silent failure this layout invents, and it is the reason this test
+/// exists.** Delete the two lines and the member file stays in `git ls-files`, cargo never
+/// compiles it — so even a syntax error inside it goes unnoticed — `cargo test --no-run`
+/// succeeds, the target still appears in the log, and `tl_assert_complete` diffs clean
+/// because the *target* set is unchanged. A whole suite leaves the build with every gate
+/// green. That is not hypothetical bookkeeping: it is the accident a rebase or a merge
+/// conflict in a hand-written root file produces most naturally.
+///
+/// `tl_assert_test_count` in `scripts/test-log-lib.sh` catches the resulting *count* falling.
+/// This test is what names the *file*, which is the difference between a two-second fix and
+/// bisecting a count across a fifty-target tree. The two are deliberately independent: that
+/// one reads a test log, this one reads the tree.
+#[test]
+fn every_group_member_is_declared_by_its_root() {
+    let groups = test_groups();
+    let mut total_members = 0usize;
+
+    for (name, root, directory) in &groups {
+        let source = fs::read_to_string(root).unwrap_or_else(|err| {
+            panic!(
+                "`tests/{name}/` is a group member directory but its root {} could not be \
+                 read: {err}. Either the root was deleted — which silently removes every \
+                 suite in that directory from the build — or the directory should be listed \
+                 in NON_GROUP_TEST_DIRECTORIES.",
+                root.display()
+            )
+        });
+
+        let declared: BTreeSet<String> = declared_member_paths(&source).into_iter().collect();
+
+        let mut present: BTreeSet<String> = BTreeSet::new();
+        for entry in fs::read_dir(directory).expect("read a group member directory") {
+            let path = entry.expect("read a member entry").path();
+            if path.extension().is_none_or(|extension| extension != "rs") {
+                continue;
+            }
+            let file = path
+                .file_name()
+                .expect("a file has a name")
+                .to_string_lossy();
+            present.insert(format!("{name}/{file}"));
+        }
+        total_members += present.len();
+
+        let undeclared: Vec<&String> = present.difference(&declared).collect();
+        assert!(
+            undeclared.is_empty(),
+            "these files sit in `tests/{name}/` but `tests/{name}.rs` declares no \
+             `#[path]` for them, so cargo never compiles them and every test they contain \
+             has silently left the build: {undeclared:?}.\n\nAdd, for each:\n    \
+             #[path = \"{name}/<member>.rs\"]\n    mod <member>;\n\nNothing else in this \
+             repository goes red for this — the target set is unchanged, so the \
+             completeness gate diffs clean."
+        );
+
+        let missing: Vec<&String> = declared.difference(&present).collect();
+        assert!(
+            missing.is_empty(),
+            "`tests/{name}.rs` declares a `#[path]` to files that do not exist: \
+             {missing:?}. This one at least fails to compile, so it is here only to make \
+             the set equality above total rather than one-directional."
+        );
+    }
+
+    assert!(
+        total_members >= MINIMUM_GROUP_MEMBERS,
+        "found {total_members} group member files across {} group(s), below the floor of \
+         {MINIMUM_GROUP_MEMBERS} — the scan is not reaching the tree, so the assertions \
+         above would pass vacuously",
+        groups.len()
+    );
 }

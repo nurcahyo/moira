@@ -2,7 +2,7 @@
 //! (plan 10 wave 2, finding P3-1).
 //!
 //! Redis is **off by default** — plan 10 §0.4b — so nothing here runs on a
-//! default build. Its companion is `tests/coordination_default_path.rs`, which
+//! default build. Its companion is `tests/workers/coordination_default_path.rs`, which
 //! asserts the shipped configuration still coordinates correctly with Redis
 //! absent; that file is the one that must never be allowed to fail.
 //!

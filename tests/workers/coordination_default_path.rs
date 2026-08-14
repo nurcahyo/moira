@@ -10,8 +10,6 @@
 //! of `tests/cluster_coordination.rs`, which only affects deployments that opted
 //! into Redis.
 
-mod support;
-
 use std::sync::Arc;
 
 use moira::{
@@ -30,7 +28,7 @@ use moira::{
 use serde_json::json;
 use uuid::Uuid;
 
-use support::TestDatabase;
+use crate::support::TestDatabase;
 
 async fn default_state() -> AppState {
     let settings = Settings::default();
