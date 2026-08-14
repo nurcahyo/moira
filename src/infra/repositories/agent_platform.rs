@@ -11,17 +11,25 @@
 //! other's internals. `commit_with_audit` is shared from `super::admin` because it writes the
 //! one audit-in-transaction shape every admin write uses.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::{
     domain::{
-        AuditLogInsert, ListCursor, SkillCreateRequest, SkillHttpExecutorPatchRequest,
+        AgentFlowCreateRequest, AgentFlowPatchRequest, AgentFlowRecord, AgentFlowRunRecord,
+        AgentFlowStepCreateRequest, AgentFlowStepRecord, AuditLogInsert, EvalCaseCreateRequest,
+        EvalCaseRecord, EvalRunRecord, EvalSuiteCreateRequest, EvalSuitePatchRequest,
+        EvalSuiteRecord, ListCursor, SkillCreateRequest, SkillHttpExecutorPatchRequest,
         SkillHttpExecutorRecord, SkillPatchRequest, SkillRecord,
     },
     error::AppError,
     infra::pg_rows::{
+        agent_flow_record_from_row, agent_flow_run_record_from_row,
+        agent_flow_step_record_from_row, eval_case_record_from_row, eval_run_record_from_row,
+        eval_suite_record_from_row, flow_step_on_failure_to_db, grading_kind_to_db,
         http_method_to_db, skill_http_executor_record_from_row, skill_record_from_row,
     },
     orchestration::ParsedOperation,
@@ -42,6 +50,39 @@ const SKILL_VERSION_FOR_UPDATE: &str =
 /// `domain::SkillHttpExecutorRecord`'s doc comment for why this table carries neither.
 const EXECUTOR_COLUMNS: &str = "skill_id, method, url_template, allowed_host, header_template, \
      credential_id, timeout_ms, response_schema, created_at, updated_at";
+
+/// The column list every `eval_suites` read and write returns.
+const EVAL_SUITE_COLUMNS: &str = "id, suite_key, display_name, description, status, metadata, \
+     created_at, updated_at, deleted_at, version";
+
+const EVAL_SUITE_VERSION_FOR_UPDATE: &str =
+    "select version from eval_suites where id = $1 and deleted_at is null for update";
+
+/// `eval_cases` carries no `version`/`deleted_at` — child rows have no PATCH surface
+/// (migration header, `0031_agent_platform.sql`).
+const EVAL_CASE_COLUMNS: &str = "id, suite_id, input, expected, grading_kind, metadata, created_at";
+
+/// `eval_runs` is append-only; produced by execution, never written through this admin
+/// surface (F2's read-only-runs decision).
+const EVAL_RUN_COLUMNS: &str = "id, suite_id, agent_profile_id, trigger_kind, execution_id, \
+     status, score, results, metadata, created_at, completed_at";
+
+/// The column list every `agent_flows` read and write returns.
+const FLOW_COLUMNS: &str = "id, flow_key, display_name, description, status, metadata, \
+     created_at, updated_at, deleted_at, version";
+
+const FLOW_VERSION_FOR_UPDATE: &str =
+    "select version from agent_flows where id = $1 and deleted_at is null for update";
+
+/// `agent_flow_steps` carries no `version`/`deleted_at` — same reason as [`EVAL_CASE_COLUMNS`].
+/// Steps are replaced wholesale through the owning flow's `PATCH`, never addressed
+/// individually.
+const FLOW_STEP_COLUMNS: &str = "id, flow_id, step_key, step_order, agent_profile_id, \
+     on_failure, input_mapping, metadata, created_at";
+
+/// `agent_flow_runs` is append-only; produced by the (not-yet-built) flow orchestrator, never
+/// written through this admin surface.
+const FLOW_RUN_COLUMNS: &str = "id, flow_id, status, metadata, created_at, completed_at";
 
 #[derive(Clone)]
 pub struct PgAgentPlatformRepository {
@@ -397,6 +438,481 @@ impl PgAgentPlatformRepository {
         commit_with_audit(tx, audit).await?;
         Ok(())
     }
+
+    // =================================================================================
+    // Eval suites (issue #214, plan 12 §3 — the deferred CRUD half of PR #227's schema).
+    // =================================================================================
+
+    pub async fn create_eval_suite(
+        &self,
+        id: Uuid,
+        request: &EvalSuiteCreateRequest,
+        audit: AuditLogInsert,
+    ) -> Result<EvalSuiteRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(&format!(
+            "insert into eval_suites (id, suite_key, display_name, description, metadata) \
+             values ($1, $2, $3, $4, $5) returning {EVAL_SUITE_COLUMNS}"
+        ))
+        .bind(id)
+        .bind(&request.suite_key)
+        .bind(&request.display_name)
+        .bind(&request.description)
+        .bind(&request.metadata)
+        .fetch_one(&mut *tx)
+        .await?;
+        let record = eval_suite_record_from_row(&row)?;
+        commit_with_audit(tx, audit).await?;
+        Ok(record)
+    }
+
+    pub async fn list_eval_suites(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<EvalSuiteRecord>, AppError> {
+        let rows = sqlx::query(&format!(
+            "select {EVAL_SUITE_COLUMNS} from eval_suites where deleted_at is null \
+             and ($1::timestamptz is null or (created_at, id) < ($1::timestamptz, $2::uuid)) \
+             order by created_at desc, id desc limit $3"
+        ))
+        .bind(cursor.map(|c| c.ts))
+        .bind(cursor.map(|c| c.id))
+        .bind(over_fetch_limit(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(eval_suite_record_from_row).collect()
+    }
+
+    pub async fn get_eval_suite(&self, id: Uuid) -> Result<EvalSuiteRecord, AppError> {
+        let row = sqlx::query(&format!(
+            "select {EVAL_SUITE_COLUMNS} from eval_suites where id = $1 and deleted_at is null"
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("eval suite {id}")))?;
+        eval_suite_record_from_row(&row)
+    }
+
+    pub async fn patch_eval_suite(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+        request: &EvalSuitePatchRequest,
+        audit: AuditLogInsert,
+    ) -> Result<EvalSuiteRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            EVAL_SUITE_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("eval suite {id}"),
+        )
+        .await?;
+        let row = sqlx::query(&format!(
+            "update eval_suites set \
+                display_name = coalesce($2, display_name), \
+                description = coalesce($3, description), \
+                metadata = coalesce($4, metadata), \
+                updated_at = now() \
+             where id = $1 and deleted_at is null and version = $5 returning {EVAL_SUITE_COLUMNS}"
+        ))
+        .bind(id)
+        .bind(&request.display_name)
+        .bind(&request.description)
+        .bind(&request.metadata)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(version_conflict)?;
+        let record = eval_suite_record_from_row(&row)?;
+        commit_with_audit(tx, audit).await?;
+        Ok(record)
+    }
+
+    pub async fn soft_delete_eval_suite(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+        audit: AuditLogInsert,
+    ) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            EVAL_SUITE_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("eval suite {id}"),
+        )
+        .await?;
+        let result = sqlx::query(
+            "update eval_suites set deleted_at = now(), updated_at = now() \
+             where id = $1 and deleted_at is null and version = $2",
+        )
+        .bind(id)
+        .bind(current_version)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(version_conflict());
+        }
+        commit_with_audit(tx, audit).await?;
+        Ok(())
+    }
+
+    // =================================================================================
+    // Eval cases — a child of one suite; no version/PATCH surface (migration header).
+    // =================================================================================
+
+    pub async fn create_eval_case(
+        &self,
+        id: Uuid,
+        suite_id: Uuid,
+        request: &EvalCaseCreateRequest,
+        audit: AuditLogInsert,
+    ) -> Result<EvalCaseRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(&format!(
+            "insert into eval_cases (id, suite_id, input, expected, grading_kind, metadata) \
+             values ($1, $2, $3, $4, $5, $6) returning {EVAL_CASE_COLUMNS}"
+        ))
+        .bind(id)
+        .bind(suite_id)
+        .bind(&request.input)
+        .bind(&request.expected)
+        .bind(grading_kind_to_db(&request.grading_kind))
+        .bind(&request.metadata)
+        .fetch_one(&mut *tx)
+        .await?;
+        let record = eval_case_record_from_row(&row)?;
+        commit_with_audit(tx, audit).await?;
+        Ok(record)
+    }
+
+    pub async fn list_eval_cases(
+        &self,
+        suite_id: Uuid,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<EvalCaseRecord>, AppError> {
+        let rows = sqlx::query(&format!(
+            "select {EVAL_CASE_COLUMNS} from eval_cases where suite_id = $1 \
+             and ($2::timestamptz is null or (created_at, id) < ($2::timestamptz, $3::uuid)) \
+             order by created_at desc, id desc limit $4"
+        ))
+        .bind(suite_id)
+        .bind(cursor.map(|c| c.ts))
+        .bind(cursor.map(|c| c.id))
+        .bind(over_fetch_limit(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(eval_case_record_from_row).collect()
+    }
+
+    /// Hard delete, scoped to `suite_id` so a case id from one suite can never delete a row
+    /// under another — the same "the path's ownership is part of the predicate" discipline
+    /// every other nested-resource delete in this codebase follows.
+    pub async fn delete_eval_case(
+        &self,
+        suite_id: Uuid,
+        case_id: Uuid,
+        audit: AuditLogInsert,
+    ) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query("delete from eval_cases where id = $1 and suite_id = $2")
+            .bind(case_id)
+            .bind(suite_id)
+            .execute(&mut *tx)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::NotFound(format!("eval case {case_id}")));
+        }
+        commit_with_audit(tx, audit).await?;
+        Ok(())
+    }
+
+    // =================================================================================
+    // Eval runs — read-only. Produced by execution, never written through this admin
+    // surface (F2's read-only-runs decision).
+    // =================================================================================
+
+    pub async fn list_eval_runs(
+        &self,
+        suite_id: Uuid,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<EvalRunRecord>, AppError> {
+        let rows = sqlx::query(&format!(
+            "select {EVAL_RUN_COLUMNS} from eval_runs where suite_id = $1 \
+             and ($2::timestamptz is null or (created_at, id) < ($2::timestamptz, $3::uuid)) \
+             order by created_at desc, id desc limit $4"
+        ))
+        .bind(suite_id)
+        .bind(cursor.map(|c| c.ts))
+        .bind(cursor.map(|c| c.id))
+        .bind(over_fetch_limit(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(eval_run_record_from_row).collect()
+    }
+
+    // =================================================================================
+    // Flows (issue #214, plan 12 §3). Steps live inside these methods, not as a separate
+    // CRUD surface — see `domain::AgentFlowRecord`'s doc comment.
+    // =================================================================================
+
+    pub async fn create_flow(
+        &self,
+        id: Uuid,
+        request: &AgentFlowCreateRequest,
+        audit: AuditLogInsert,
+    ) -> Result<AgentFlowRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(&format!(
+            "insert into agent_flows (id, flow_key, display_name, description, metadata) \
+             values ($1, $2, $3, $4, $5) returning {FLOW_COLUMNS}"
+        ))
+        .bind(id)
+        .bind(&request.flow_key)
+        .bind(&request.display_name)
+        .bind(&request.description)
+        .bind(&request.metadata)
+        .fetch_one(&mut *tx)
+        .await?;
+        let mut record = agent_flow_record_from_row(&row)?;
+        record.steps = insert_flow_steps(&mut tx, id, &request.steps).await?;
+        commit_with_audit(tx, audit).await?;
+        Ok(record)
+    }
+
+    pub async fn list_flows(
+        &self,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<AgentFlowRecord>, AppError> {
+        let rows = sqlx::query(&format!(
+            "select {FLOW_COLUMNS} from agent_flows where deleted_at is null \
+             and ($1::timestamptz is null or (created_at, id) < ($1::timestamptz, $2::uuid)) \
+             order by created_at desc, id desc limit $3"
+        ))
+        .bind(cursor.map(|c| c.ts))
+        .bind(cursor.map(|c| c.id))
+        .bind(over_fetch_limit(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        let mut records = rows
+            .iter()
+            .map(agent_flow_record_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        let flow_ids: Vec<Uuid> = records.iter().map(|record| record.id).collect();
+        let mut steps_by_flow = self.fetch_steps_for_flows(&flow_ids).await?;
+        for record in &mut records {
+            record.steps = steps_by_flow.remove(&record.id).unwrap_or_default();
+        }
+        Ok(records)
+    }
+
+    pub async fn get_flow(&self, id: Uuid) -> Result<AgentFlowRecord, AppError> {
+        let row = sqlx::query(&format!(
+            "select {FLOW_COLUMNS} from agent_flows where id = $1 and deleted_at is null"
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("flow {id}")))?;
+        let mut record = agent_flow_record_from_row(&row)?;
+        record.steps = self.fetch_flow_steps(id).await?;
+        Ok(record)
+    }
+
+    /// When `request.steps` is `Some`, the flow's entire step list is replaced atomically
+    /// (delete-then-reinsert, same transaction as the flow row's own `UPDATE`); when `None`
+    /// the existing steps are left untouched and simply re-read to build the response.
+    pub async fn patch_flow(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+        request: &AgentFlowPatchRequest,
+        audit: AuditLogInsert,
+    ) -> Result<AgentFlowRecord, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            FLOW_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("flow {id}"),
+        )
+        .await?;
+        let row = sqlx::query(&format!(
+            "update agent_flows set \
+                display_name = coalesce($2, display_name), \
+                description = coalesce($3, description), \
+                metadata = coalesce($4, metadata), \
+                updated_at = now() \
+             where id = $1 and deleted_at is null and version = $5 returning {FLOW_COLUMNS}"
+        ))
+        .bind(id)
+        .bind(&request.display_name)
+        .bind(&request.description)
+        .bind(&request.metadata)
+        .bind(current_version)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(version_conflict)?;
+        let mut record = agent_flow_record_from_row(&row)?;
+        record.steps = if let Some(steps) = &request.steps {
+            sqlx::query("delete from agent_flow_steps where flow_id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            insert_flow_steps(&mut tx, id, steps).await?
+        } else {
+            fetch_flow_steps_with_connection(&mut tx, id).await?
+        };
+        commit_with_audit(tx, audit).await?;
+        Ok(record)
+    }
+
+    pub async fn soft_delete_flow(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+        audit: AuditLogInsert,
+    ) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await?;
+        let current_version = lock_and_match_version(
+            &mut tx,
+            FLOW_VERSION_FOR_UPDATE,
+            id,
+            expected_version,
+            format!("flow {id}"),
+        )
+        .await?;
+        let result = sqlx::query(
+            "update agent_flows set deleted_at = now(), updated_at = now() \
+             where id = $1 and deleted_at is null and version = $2",
+        )
+        .bind(id)
+        .bind(current_version)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(version_conflict());
+        }
+        commit_with_audit(tx, audit).await?;
+        Ok(())
+    }
+
+    async fn fetch_flow_steps(&self, flow_id: Uuid) -> Result<Vec<AgentFlowStepRecord>, AppError> {
+        let rows = sqlx::query(&format!(
+            "select {FLOW_STEP_COLUMNS} from agent_flow_steps where flow_id = $1 \
+             order by step_order, id"
+        ))
+        .bind(flow_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(agent_flow_step_record_from_row).collect()
+    }
+
+    /// [`fetch_flow_steps`](Self::fetch_flow_steps)'s batched twin for [`list_flows`](Self::list_flows):
+    /// one query for every step of every flow on the page, grouped in Rust, so a page of `N`
+    /// flows costs two queries total rather than `N + 1`.
+    async fn fetch_steps_for_flows(
+        &self,
+        flow_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<AgentFlowStepRecord>>, AppError> {
+        if flow_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows = sqlx::query(&format!(
+            "select {FLOW_STEP_COLUMNS} from agent_flow_steps where flow_id = any($1) \
+             order by flow_id, step_order, id"
+        ))
+        .bind(flow_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut grouped: HashMap<Uuid, Vec<AgentFlowStepRecord>> = HashMap::new();
+        for row in &rows {
+            let step = agent_flow_step_record_from_row(row)?;
+            grouped.entry(step.flow_id).or_default().push(step);
+        }
+        Ok(grouped)
+    }
+
+    // =================================================================================
+    // Flow runs — read-only. Produced by the (not-yet-built) flow orchestrator, never
+    // written through this admin surface.
+    // =================================================================================
+
+    pub async fn list_flow_runs(
+        &self,
+        flow_id: Uuid,
+        cursor: Option<ListCursor>,
+        limit: i64,
+    ) -> Result<Vec<AgentFlowRunRecord>, AppError> {
+        let rows = sqlx::query(&format!(
+            "select {FLOW_RUN_COLUMNS} from agent_flow_runs where flow_id = $1 \
+             and ($2::timestamptz is null or (created_at, id) < ($2::timestamptz, $3::uuid)) \
+             order by created_at desc, id desc limit $4"
+        ))
+        .bind(flow_id)
+        .bind(cursor.map(|c| c.ts))
+        .bind(cursor.map(|c| c.id))
+        .bind(over_fetch_limit(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(agent_flow_run_record_from_row).collect()
+    }
+}
+
+/// Inserts `steps` (each with a fresh id) for `flow_id` inside the caller's transaction and
+/// returns them in `step_order` order. Shared by `create_flow` and `patch_flow`'s
+/// steps-replace path so the insert shape cannot drift between the two.
+async fn insert_flow_steps(
+    conn: &mut sqlx::PgConnection,
+    flow_id: Uuid,
+    steps: &[AgentFlowStepCreateRequest],
+) -> Result<Vec<AgentFlowStepRecord>, AppError> {
+    let mut inserted = Vec::with_capacity(steps.len());
+    for step in steps {
+        let row = sqlx::query(&format!(
+            "insert into agent_flow_steps (id, flow_id, step_key, step_order, agent_profile_id, \
+             on_failure, input_mapping, metadata) values ($1, $2, $3, $4, $5, $6, $7, $8) \
+             returning {FLOW_STEP_COLUMNS}"
+        ))
+        .bind(Uuid::now_v7())
+        .bind(flow_id)
+        .bind(&step.step_key)
+        .bind(step.step_order)
+        .bind(step.agent_profile_id)
+        .bind(flow_step_on_failure_to_db(&step.on_failure))
+        .bind(&step.input_mapping)
+        .bind(&step.metadata)
+        .fetch_one(&mut *conn)
+        .await?;
+        inserted.push(agent_flow_step_record_from_row(&row)?);
+    }
+    inserted.sort_by_key(|step| step.step_order);
+    Ok(inserted)
+}
+
+/// [`PgAgentPlatformRepository::fetch_flow_steps`]'s in-transaction twin, for `patch_flow`'s
+/// steps-unchanged path (must read inside the same transaction as the row lock it is
+/// serialized against).
+async fn fetch_flow_steps_with_connection(
+    conn: &mut sqlx::PgConnection,
+    flow_id: Uuid,
+) -> Result<Vec<AgentFlowStepRecord>, AppError> {
+    let rows = sqlx::query(&format!(
+        "select {FLOW_STEP_COLUMNS} from agent_flow_steps where flow_id = $1 order by step_order, id"
+    ))
+    .bind(flow_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    rows.iter().map(agent_flow_step_record_from_row).collect()
 }
 
 fn executor_not_found(skill_id: Uuid) -> AppError {

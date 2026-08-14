@@ -3,20 +3,22 @@ use sqlx::Row;
 
 use crate::{
     domain::{
-        AgentProfileGraphRow, AgentRouteEdgeRow, ApiKeyRecord, ApplicationExecutionPolicyRecord,
-        ApplicationRecord, ApplicationRoutingDefaultsRecord, AttemptSelectionReason, AuditEvent,
-        AuditLogRecord, AuditResult, ConversationContentPersistence, ConversationMessageRecord,
+        AgentFlowRecord, AgentFlowRunRecord, AgentFlowStepRecord, AgentProfileGraphRow,
+        AgentRouteEdgeRow, ApiKeyRecord, ApplicationExecutionPolicyRecord, ApplicationRecord,
+        ApplicationRoutingDefaultsRecord, AttemptSelectionReason, AuditEvent, AuditLogRecord,
+        AuditResult, ConversationContentPersistence, ConversationMessageRecord,
         ConversationMessageRole, ConversationMessageType, ConversationPolicyRecord,
         ConversationRecord, ConversationStatus, CredentialRecord, CredentialScope,
-        CredentialStatus, CredentialSummary, CredentialType, EmbeddingPolicyRecord,
-        ExecutionFailureClass, FlowStepGraphRow, HistoryStrategy, HttpMethod, KeyStatus,
-        MemoryConsentMode, MemoryPolicyRecord, MemoryRecord, MemoryScope, MemorySensitivity,
-        MemoryStatus, MemoryType, NamedStatusGraphRow, OwnerScope, ProviderConfig, ProviderKind,
-        ProviderModelRecord, ProviderModelRuntimeConfig, ProviderRecord,
-        ProviderRuntimePolicyRecord, ProviderType, PublicResponseRecord, PublicResponseStatus,
-        PublicUsageSummary, RagCollectionRecord, RagCollectionStatus, RagCollectionVisibility,
-        RagDocumentRecord, RagDocumentStatus, RagIngestionStatus, ResourceStatus,
-        ResponsePersistenceMode, RetrievalPolicyRecord, RouteDefinitionRecord,
+        CredentialStatus, CredentialSummary, CredentialType, EmbeddingPolicyRecord, EvalCaseRecord,
+        EvalRunRecord, EvalRunStatus, EvalSuiteRecord, EvalTriggerKind, ExecutionFailureClass,
+        FlowRunStatus, FlowStepGraphRow, FlowStepOnFailure, GradingKind, HistoryStrategy,
+        HttpMethod, KeyStatus, MemoryConsentMode, MemoryPolicyRecord, MemoryRecord, MemoryScope,
+        MemorySensitivity, MemoryStatus, MemoryType, NamedStatusGraphRow, OwnerScope,
+        ProviderConfig, ProviderKind, ProviderModelRecord, ProviderModelRuntimeConfig,
+        ProviderRecord, ProviderRuntimePolicyRecord, ProviderType, PublicResponseRecord,
+        PublicResponseStatus, PublicUsageSummary, RagCollectionRecord, RagCollectionStatus,
+        RagCollectionVisibility, RagDocumentRecord, RagDocumentStatus, RagIngestionStatus,
+        ResourceStatus, ResponsePersistenceMode, RetrievalPolicyRecord, RouteDefinitionRecord,
         RouteSelectionStrategy, RoutingPolicyRecord, RuntimePolicyStatus, ScopeType,
         SkillHttpExecutorRecord, SkillKind, SkillRecord, SkillStatus, TrustedJwtIssuerRecord,
     },
@@ -939,6 +941,177 @@ pub fn skill_http_executor_record_from_row(
         response_schema: row.try_get("response_schema")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+    })
+}
+
+// =====================================================================================
+// Evaluations and multi-agent flows (issue #214, plan 12 §3 — the deferred CRUD half of
+// PR #227's schema). `eval_suites`/`agent_flows` reuse the same `status` values as
+// `route_definitions`/`providers` (`ResourceStatus`), so they share
+// `resource_status_from_db`/`resource_status_to_db` rather than a dedicated pair.
+// =====================================================================================
+
+pub fn grading_kind_from_db(value: String) -> Result<GradingKind, AppError> {
+    match value.as_str() {
+        "exact_match" => Ok(GradingKind::ExactMatch),
+        "contains" => Ok(GradingKind::Contains),
+        "schema_valid" => Ok(GradingKind::SchemaValid),
+        _ => Err(AppError::Internal(format!("unknown grading kind {value}"))),
+    }
+}
+
+pub fn grading_kind_to_db(kind: &GradingKind) -> &'static str {
+    match kind {
+        GradingKind::ExactMatch => "exact_match",
+        GradingKind::Contains => "contains",
+        GradingKind::SchemaValid => "schema_valid",
+    }
+}
+
+pub fn eval_trigger_kind_from_db(value: String) -> Result<EvalTriggerKind, AppError> {
+    match value.as_str() {
+        "offline_manual" => Ok(EvalTriggerKind::OfflineManual),
+        "offline_ci" => Ok(EvalTriggerKind::OfflineCi),
+        "online_sampled" => Ok(EvalTriggerKind::OnlineSampled),
+        _ => Err(AppError::Internal(format!(
+            "unknown eval trigger kind {value}"
+        ))),
+    }
+}
+
+pub fn eval_run_status_from_db(value: String) -> Result<EvalRunStatus, AppError> {
+    match value.as_str() {
+        "pending" => Ok(EvalRunStatus::Pending),
+        "running" => Ok(EvalRunStatus::Running),
+        "completed" => Ok(EvalRunStatus::Completed),
+        "failed" => Ok(EvalRunStatus::Failed),
+        _ => Err(AppError::Internal(format!(
+            "unknown eval run status {value}"
+        ))),
+    }
+}
+
+pub fn flow_step_on_failure_from_db(value: String) -> Result<FlowStepOnFailure, AppError> {
+    match value.as_str() {
+        "abort" => Ok(FlowStepOnFailure::Abort),
+        "continue" => Ok(FlowStepOnFailure::Continue),
+        _ => Err(AppError::Internal(format!(
+            "unknown flow step on_failure {value}"
+        ))),
+    }
+}
+
+pub fn flow_step_on_failure_to_db(value: &FlowStepOnFailure) -> &'static str {
+    match value {
+        FlowStepOnFailure::Abort => "abort",
+        FlowStepOnFailure::Continue => "continue",
+    }
+}
+
+pub fn flow_run_status_from_db(value: String) -> Result<FlowRunStatus, AppError> {
+    match value.as_str() {
+        "running" => Ok(FlowRunStatus::Running),
+        "completed" => Ok(FlowRunStatus::Completed),
+        "failed" => Ok(FlowRunStatus::Failed),
+        "cancelled" => Ok(FlowRunStatus::Cancelled),
+        _ => Err(AppError::Internal(format!(
+            "unknown flow run status {value}"
+        ))),
+    }
+}
+
+pub fn eval_suite_record_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<EvalSuiteRecord, AppError> {
+    Ok(EvalSuiteRecord {
+        id: row.try_get("id")?,
+        suite_key: row.try_get("suite_key")?,
+        display_name: row.try_get("display_name")?,
+        description: row.try_get("description")?,
+        status: resource_status_from_db(row.try_get::<String, _>("status")?)?,
+        metadata: row.try_get("metadata")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+        deleted_at: row.try_get("deleted_at")?,
+        version: row.try_get("version")?,
+    })
+}
+
+pub fn eval_case_record_from_row(row: &sqlx::postgres::PgRow) -> Result<EvalCaseRecord, AppError> {
+    Ok(EvalCaseRecord {
+        id: row.try_get("id")?,
+        suite_id: row.try_get("suite_id")?,
+        input: row.try_get("input")?,
+        expected: row.try_get("expected")?,
+        grading_kind: grading_kind_from_db(row.try_get::<String, _>("grading_kind")?)?,
+        metadata: row.try_get("metadata")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+pub fn eval_run_record_from_row(row: &sqlx::postgres::PgRow) -> Result<EvalRunRecord, AppError> {
+    Ok(EvalRunRecord {
+        id: row.try_get("id")?,
+        suite_id: row.try_get("suite_id")?,
+        agent_profile_id: row.try_get("agent_profile_id")?,
+        trigger_kind: eval_trigger_kind_from_db(row.try_get::<String, _>("trigger_kind")?)?,
+        execution_id: row.try_get("execution_id")?,
+        status: eval_run_status_from_db(row.try_get::<String, _>("status")?)?,
+        score: row.try_get("score")?,
+        results: row.try_get("results")?,
+        metadata: row.try_get("metadata")?,
+        created_at: row.try_get("created_at")?,
+        completed_at: row.try_get("completed_at")?,
+    })
+}
+
+/// `steps` is always the empty vector here — `agent_flows` and `agent_flow_steps` are
+/// separate tables, so the caller (`PgAgentPlatformRepository`) attaches the real step list
+/// after a second, batched query. See that module's `fetch_flow_steps`/`fetch_steps_for_flows`.
+pub fn agent_flow_record_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<AgentFlowRecord, AppError> {
+    Ok(AgentFlowRecord {
+        id: row.try_get("id")?,
+        flow_key: row.try_get("flow_key")?,
+        display_name: row.try_get("display_name")?,
+        description: row.try_get("description")?,
+        status: resource_status_from_db(row.try_get::<String, _>("status")?)?,
+        metadata: row.try_get("metadata")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+        deleted_at: row.try_get("deleted_at")?,
+        version: row.try_get("version")?,
+        steps: Vec::new(),
+    })
+}
+
+pub fn agent_flow_step_record_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<AgentFlowStepRecord, AppError> {
+    Ok(AgentFlowStepRecord {
+        id: row.try_get("id")?,
+        flow_id: row.try_get("flow_id")?,
+        step_key: row.try_get("step_key")?,
+        step_order: row.try_get("step_order")?,
+        agent_profile_id: row.try_get("agent_profile_id")?,
+        on_failure: flow_step_on_failure_from_db(row.try_get::<String, _>("on_failure")?)?,
+        input_mapping: row.try_get("input_mapping")?,
+        metadata: row.try_get("metadata")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+pub fn agent_flow_run_record_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<AgentFlowRunRecord, AppError> {
+    Ok(AgentFlowRunRecord {
+        id: row.try_get("id")?,
+        flow_id: row.try_get("flow_id")?,
+        status: flow_run_status_from_db(row.try_get::<String, _>("status")?)?,
+        metadata: row.try_get("metadata")?,
+        created_at: row.try_get("created_at")?,
+        completed_at: row.try_get("completed_at")?,
     })
 }
 

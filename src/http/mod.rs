@@ -661,6 +661,36 @@ fn admin_routes() -> OpenApiRouter<AppState> {
             agent_platform::patch_skill_executor,
             agent_platform::delete_skill_executor
         ))
+        // Issue #214 (plan 12 §3) — the deferred remainder of workstream F: evals + flows
+        // CRUD. Kept immediately after F/H's skills block, contiguous, for the same
+        // rebase-friendly reason as that block's own comment. No execution endpoint for
+        // either — eval_runs/agent_flow_runs are read-only lists; the run/flow-orchestrator
+        // engines are the #84 follow-up.
+        .routes(routes!(
+            agent_platform::list_eval_suites,
+            agent_platform::create_eval_suite
+        ))
+        .routes(routes!(
+            agent_platform::get_eval_suite,
+            agent_platform::patch_eval_suite,
+            agent_platform::delete_eval_suite
+        ))
+        .routes(routes!(
+            agent_platform::list_eval_cases,
+            agent_platform::create_eval_case
+        ))
+        .routes(routes!(agent_platform::delete_eval_case))
+        .routes(routes!(agent_platform::list_eval_runs))
+        .routes(routes!(
+            agent_platform::list_flows,
+            agent_platform::create_flow
+        ))
+        .routes(routes!(
+            agent_platform::get_flow,
+            agent_platform::patch_flow,
+            agent_platform::delete_flow
+        ))
+        .routes(routes!(agent_platform::list_flow_runs))
         // Issue #234 (plan 12 §4) — the derived, read-only relationship graph.
         .routes(routes!(graph::get_graph))
 }
@@ -758,6 +788,14 @@ mod tests {
             "/api/v1/admin/skills/import",
             "/api/v1/admin/skill-executors",
             "/api/v1/admin/skills/{id}/executor",
+            "/api/v1/admin/eval-suites",
+            "/api/v1/admin/eval-suites/{id}",
+            "/api/v1/admin/eval-suites/{id}/cases",
+            "/api/v1/admin/eval-suites/{id}/cases/{case_id}",
+            "/api/v1/admin/eval-suites/{id}/runs",
+            "/api/v1/admin/flows",
+            "/api/v1/admin/flows/{id}",
+            "/api/v1/admin/flows/{id}/runs",
             "/api/v1/admin/graph",
             "/api/v1/admin/runtime/diagnose",
             "/api/v1/admin/rag-collections",
@@ -824,7 +862,11 @@ mod tests {
         //   POST .../skills/import, GET .../skill-executors,
         //   GET/PATCH/DELETE .../skills/{id}/executor = 5.
         // + issue #234 (plan 12 §4) the derived relationship graph: GET /api/v1/admin/graph = 1.
-        assert_eq!(operation_count, 168);
+        // + issue #214 (plan 12 §3) F2, the deferred evals + flows CRUD:
+        //   eval-suites list/create/get/patch/delete = 5, cases list/create/delete = 3,
+        //   eval-suite runs list = 1 (9); flows list/create/get/patch/delete = 5, flow
+        //   runs list = 1 (6). No execution endpoint for either. 9 + 6 = 15.
+        assert_eq!(operation_count, 183);
     }
 
     #[test]
@@ -1483,7 +1525,7 @@ mod tests {
     /// runtime-policy `PUT` reads the header through `optional_if_match`, the
     /// context-router routing-defaults `PUT` (issue #213) mirrors that exact contract, and
     /// the agent-platform skill writes (issue #214) add their own If-Match operations.
-    const IF_MATCH_OPERATIONS: [(&str, &str, bool); 48] = [
+    const IF_MATCH_OPERATIONS: [(&str, &str, bool); 52] = [
         // Plan 09 wave 2. Ownership transfer takes a required precondition and grant
         // revocation deliberately does not: a `PATCH` that flips a flag is a lost-update
         // hazard, while a soft revoke is idempotent in intent and answers a repeat with
@@ -1566,6 +1608,16 @@ mod tests {
         // writes, same as every other single-row PATCH/DELETE in this inventory.
         ("/api/v1/admin/skills/{id}/executor", "delete", true),
         ("/api/v1/admin/skills/{id}/executor", "patch", true),
+        // Issue #214 (plan 12 §3) F2 — evals + flows. `eval_cases` has no `version`/
+        // `updated_at` column (migration header), so its `DELETE .../cases/{case_id}`
+        // deliberately carries no `If-Match` and is absent from this inventory — there is
+        // nothing to precondition against, the same reasoning `bulk-enable` skills gets for
+        // being absent above. Flow steps travel inside the flow's own `PATCH` body, so they
+        // need no entry of their own either.
+        ("/api/v1/admin/eval-suites/{id}", "delete", true),
+        ("/api/v1/admin/eval-suites/{id}", "patch", true),
+        ("/api/v1/admin/flows/{id}", "delete", true),
+        ("/api/v1/admin/flows/{id}", "patch", true),
         (
             "/api/v1/admin/users/{external_user_id}/provider-credentials/{id}",
             "delete",
