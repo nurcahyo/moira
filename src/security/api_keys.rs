@@ -516,6 +516,17 @@ impl ApiKeyHasher {
             .expect("the verification gate is never closed")
     }
 
+    /// Permits currently **free** in the gate.
+    ///
+    /// Test-only, and deliberately not `verification_concurrency`: this is a racing sample of
+    /// what is available right now, which is the wrong number for anything except waiting for a
+    /// verification to have genuinely taken its permit. Production code that wanted it would be
+    /// about to make a scheduling decision from a value that is stale before it is read.
+    #[cfg(test)]
+    pub(crate) fn free_permits_for_test(&self) -> usize {
+        self.gate.available_permits()
+    }
+
     pub fn prefix(&self, raw_key: &str) -> String {
         raw_key.chars().take(self.prefix_length).collect()
     }
@@ -761,6 +772,90 @@ mod tests {
                 .verify(generated.raw_key.expose_secret(), &generated.key_hash)
                 .await
                 .expect("the clone proceeds once the shared permit is free")
+        );
+    }
+
+    /// The permit is held for the **whole** Argon2 computation, not merely taken before it.
+    ///
+    /// # Why the other gate tests cannot see this
+    ///
+    /// Every one of them holds a permit from *outside*, through
+    /// [`ApiKeyHasher::hold_one_permit_for_test`]. That proves the acquire happens and proves the
+    /// budget is shared, and it says nothing whatsoever about the *release*. Rewriting
+    /// `let _permit = permit;` inside the blocking closure to `let _ = permit;` — a one-character
+    /// edit that compiles, reads like a deliberate discard, and is a well-worn Rust footgun —
+    /// drops the permit on the closure's first line. Every other test in this module stays green,
+    /// `verification_concurrency` still reports the configured bound, the metrics still count
+    /// admissions, and the gate no longer bounds anything: concurrent Argon2 arenas go back to
+    /// being limited only by tokio's 512-thread blocking pool, which is 9.7 GiB against a 2 GiB
+    /// container. That is #176 restored while wearing a semaphore.
+    ///
+    /// # How this one sees it
+    ///
+    /// It contends against a verification that is genuinely *in flight*. The gate is waited down
+    /// to zero free permits — bounded by a deadline, so a permit that is never taken fails with a
+    /// message rather than hanging — and only then is the second verification issued. It must
+    /// shed.
+    ///
+    /// Under the broken variant the test reds either way: the free-permit count returns to 1
+    /// immediately, so either the wait never observes zero and trips its deadline, or it observes
+    /// the sliver between acquire and closure entry and the second verification then succeeds
+    /// where a shed was required.
+    ///
+    /// # The one inequality this rests on
+    ///
+    /// A 5 ms shed timeout against an Argon2id operation at `m=19456`, `t=2`, which costs tens of
+    /// milliseconds. That is three orders of margin on the wrong side of nothing, and it is not a
+    /// hardware assumption: if Argon2 here ever completes inside 5 ms the credential parameters
+    /// have been weakened, and this test going red is the correct alarm rather than a flake.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_verification_holds_its_permit_for_the_whole_computation() {
+        let hasher = ApiKeyHasher::new(b"pepper".to_vec(), "v1", 20).with_verification_gate(
+            1,
+            Duration::from_millis(5),
+            test_metrics(),
+        );
+        // Minted before the contention starts: `generate` draws on the same single permit, so
+        // doing this later would deadlock against the verification below rather than test it.
+        let generated = hasher.generate("moira_sys").await.expect("generate a key");
+        let hash = generated.key_hash.clone();
+        let secret = generated.raw_key.expose_secret().to_string();
+
+        let in_flight = tokio::spawn({
+            let hasher = hasher.clone();
+            let hash = hash.clone();
+            let secret = secret.clone();
+            async move { hasher.verify(&secret, &hash).await }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while hasher.free_permits_for_test() > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the in-flight verification never held the gate's only permit for as long as it \
+                 took to observe — the permit is being released before the Argon2 work it \
+                 accounts for, so the bound is not a bound"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        let error = hasher
+            .verify(&secret, &hash)
+            .await
+            .expect_err("a verification running under the only permit must make the next one shed");
+        assert_eq!(
+            error.error_response(None).error.code,
+            "auth_verification_overloaded",
+            "the second verification was admitted while the first was still computing, so the \
+             permit does not span the Argon2 work and the gate bounds nothing"
+        );
+
+        assert!(
+            in_flight
+                .await
+                .expect("the in-flight verification task")
+                .expect("the in-flight verification"),
+            "the verification that held the permit must still succeed"
         );
     }
 

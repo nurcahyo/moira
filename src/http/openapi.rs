@@ -181,9 +181,10 @@ pub(crate) fn finalize_document(document: &mut OpenApiDocument) {
         .into_iter()
         .flatten()
         {
-            // Order matters: the `504` is added first so `document_request_id` then stamps
-            // the correlation header onto it like every other response. Reversing these two
-            // would ship one response object in the whole document without `X-Request-Id`.
+            // Order matters: every response this function *adds* must be added before
+            // `document_request_id` runs, because that is what stamps the `X-Request-Id`
+            // correlation header onto each response object. A response inserted after it would
+            // be the one response in the whole document missing the header.
             document_gateway_timeout(operation);
             document_auth_verification_overload(operation);
             document_request_id(operation);
