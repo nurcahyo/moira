@@ -30,7 +30,7 @@ use crate::error::AppError;
 /// ASCII so `grep -r 'b"moira'` finds every advisory-lock key in the tree in one
 /// pass. The keys in use today are `b"moirastp"` (`src/application/identity.rs`),
 /// `b"moiraoid"` (`src/infra/repositories/auth_settings.rs`), `b"moiratdb"`
-/// (`tests/support/mod.rs`), `b"MOIRARET"` (`tests/retention_worker.rs`), the
+/// (`tests/support/mod.rs`), `b"MOIRARET"` (`tests/workers/retention_worker.rs`), the
 /// hashed transaction lock in `src/infra/repositories/admin.rs`, and this one
 /// plus `b"moiralrt"` in `src/infra/workers/leader.rs`.
 const CLUSTER_ADMISSION_LOCK_KEY: i64 = i64::from_be_bytes(*b"moiracll");

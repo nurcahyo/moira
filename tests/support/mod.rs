@@ -950,7 +950,7 @@ pub fn admin_actor() -> Actor {
 //   force-drops its own database per run, or migrates a pre-provisioned empty one named by
 //   `MOIRA_TEST_MIGRATION_DATABASE_URL` when the role has no `CREATEDB` (issue #77).
 //
-// `tests/retention_worker.rs` was the second entry until finding F10 item 1 was closed: the
+// `tests/workers/retention_worker.rs` was the second entry until finding F10 item 1 was closed: the
 // sweep it asserts on is database-wide, never cluster-wide, so a private clone made its
 // counts exactly assertable rather than weakening them.
 //
@@ -1044,6 +1044,26 @@ pub async fn maintenance_connection() -> Option<(PgConnection, String)> {
 /// changing any assertion.
 const CONCURRENT_FIXTURES: usize = 4;
 
+/// How long a fixture waits for a permit before treating the wait as a **deadlock** rather
+/// than as load.
+///
+/// A template clone takes seconds and only [`CONCURRENT_FIXTURES`] permits exist, so a wait
+/// this long does not mean a slow database — it means every permit is held by something that
+/// will never release one. The documented shape is a single test holding two fixtures at
+/// once, which the comment above `MAINTENANCE_DATABASE` records as the invariant this harness
+/// depends on.
+///
+/// **Consolidating test targets is what makes this worth paying for.** The invariant was
+/// nearly free to keep while a five-test binary could not saturate four permits; a binary
+/// holding 45 tests over 33 fixture creations can, so the invariant becomes load-bearing for
+/// the first time and a violation becomes easy to write by accident. Without this the symptom
+/// is a binary that hangs until CI's 20-minute timeout with no name attached to it; with it,
+/// the failure names the binary and says what to look for.
+///
+/// This is behaviour-preserving on any healthy run — nothing waits two minutes for a permit
+/// unless it is never getting one.
+const FIXTURE_BUDGET_WAIT: Duration = Duration::from_secs(120);
+
 static FIXTURE_BUDGET: Semaphore = Semaphore::const_new(CONCURRENT_FIXTURES);
 static DATABASE_ORIGIN: OnceCell<Option<DatabaseOrigin>> = OnceCell::const_new();
 
@@ -1127,10 +1147,16 @@ impl TestDatabase {
     pub async fn create_with_max_connections(max_connections: u32) -> Option<Self> {
         // Taken before anything else so the budget covers the clone itself, not just
         // the fixture's lifetime.
-        let budget = FIXTURE_BUDGET
-            .acquire()
-            .await
-            .expect("the fixture budget semaphore is never closed");
+        let budget = match timeout(FIXTURE_BUDGET_WAIT, FIXTURE_BUDGET.acquire()).await {
+            Ok(permit) => permit.expect("the fixture budget semaphore is never closed"),
+            Err(_) => panic!(
+                "waited {FIXTURE_BUDGET_WAIT:?} for one of {CONCURRENT_FIXTURES} \
+                 FIXTURE_BUDGET permits and every one is still held. This is not a slow \
+                 database. The invariant is that no test holds two fixtures at once — look \
+                 for a test in this binary that builds a second LifecycleFixture or \
+                 TestDatabase while the first is still alive."
+            ),
+        };
         let origin = database_origin().await?;
         let name = format!("moira_test_{}_{}", unix_seconds(), Uuid::now_v7().simple());
         let maintenance_url = origin.url_for(MAINTENANCE_DATABASE);
@@ -1855,7 +1881,7 @@ pub fn public_response_request(route: &str) -> moira::domain::PublicResponseRequ
 // it and no fixture creates one. These helpers exist for the suites that
 // deliberately turn it on to exercise the cluster-wide arm of rate limiting and
 // concurrency — everything else must keep passing with Redis absent, which is the
-// property `tests/coordination_default_path.rs` pins.
+// property `tests/workers/coordination_default_path.rs` pins.
 // ---------------------------------------------------------------------------
 
 /// A Redis client on a namespace private to one test, or `None` when Redis is not

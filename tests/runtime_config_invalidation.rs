@@ -38,7 +38,7 @@
 //! a regression to show up here.
 //!
 //! Where a bounded poll is unavoidable it paces itself with a `tokio::time::interval`
-//! rather than a `sleep`, matching `tests/retention_worker.rs::poll_until`: the first
+//! rather than a `sleep`, matching `tests/workers/retention_worker.rs::poll_until`: the first
 //! tick completes immediately, so a working system satisfies the condition on the first
 //! iteration and only a genuine failure pays the deadline.
 //!

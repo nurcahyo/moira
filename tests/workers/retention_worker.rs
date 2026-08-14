@@ -14,7 +14,7 @@
 //!
 //! This was the last suite writing to the long-lived database
 //! `MOIRA_TEST_DATABASE_URL` names, and so the last source of cross-run coupling
-//! in `tests/`. It now uses [`support::TestDatabase`] like every other suite: a
+//! in `tests/`. It now uses [`crate::support::TestDatabase`] like every other suite: a
 //! clone of the migrated template, dropped in `Drop` — including while the test
 //! is unwinding from a panic, which is exactly when a leak would otherwise be
 //! permanent.
@@ -51,8 +51,6 @@
 //! [`the_fixture_owns_a_disposable_database`] is the guard that says it has not
 //! been moved back.
 
-mod support;
-
 use std::{future::Future, time::Duration};
 
 use moira::{
@@ -67,7 +65,7 @@ use sqlx::PgPool;
 use tokio::{sync::oneshot, time::timeout};
 use uuid::Uuid;
 
-use support::TestDatabase;
+use crate::support::TestDatabase;
 
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -80,7 +78,7 @@ const SUPERVISOR_OBSERVATION_BUDGET: Duration = Duration::from_secs(15);
 /// A private, migrated database for one test.
 ///
 /// Returns `None` — and the caller returns early — when `MOIRA_TEST_DATABASE_URL`
-/// is unset outside CI, which is [`support::TestDatabase`]'s own fail-closed
+/// is unset outside CI, which is [`crate::support::TestDatabase`]'s own fail-closed
 /// behaviour: it panics when `CI=true` and prints the `skipping database-backed
 /// tests` line `scripts/gates.sh` asserts on otherwise. The skip message this
 /// suite used to print, `skipping retention worker tests: …`, matched neither of
@@ -722,7 +720,7 @@ async fn a_running_supervisor_dispatches_a_retention_sweep() {
 /// `MOIRA_TEST_DATABASE_URL` names.
 ///
 /// **What this establishes.** That [`test_database`] hands out a per-test clone owned
-/// by [`support::TestDatabase`], whose `Drop` drops the database unconditionally — on
+/// by [`crate::support::TestDatabase`], whose `Drop` drops the database unconditionally — on
 /// a dedicated thread with its own runtime, so it runs while the test is unwinding
 /// from a panic. That is the case that mattered here: this suite seeds expired rows
 /// and had no cleanup path a failing assertion did not skip, so before this change one
@@ -752,7 +750,8 @@ async fn the_fixture_owns_a_disposable_database() {
 
     // (a) Not the shared database. This is the assertion that turns red the moment
     //     this suite is pointed back at `MOIRA_TEST_DATABASE_URL`.
-    let shared = support::shared_database_name().expect("a fixture was built, so the URL parses");
+    let shared =
+        crate::support::shared_database_name().expect("a fixture was built, so the URL parses");
     assert_ne!(
         live, shared,
         "the retention suite is sweeping the shared test database `{shared}`. That is \

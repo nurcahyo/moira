@@ -49,7 +49,7 @@
 //! skip locked` sub-select steps over any row an in-flight
 //! `claim_idempotency` transaction has locked and picks it up on a later tick.
 //! Covered by `retention_run_does_not_block_a_concurrent_idempotency_claim` in
-//! `tests/retention_worker.rs`.
+//! `tests/workers/retention_worker.rs`.
 //!
 //! **Not protected: the sweep's locks *can* block a claim.** The claim path's
 //! own opportunistic prune (`src/infra/repositories/admin.rs`,
@@ -565,7 +565,7 @@ mod tests {
     /// in any Rust value — the load-bearing tokens are `as materialized` (a CTE is
     /// evaluated once, and PostgreSQL 12+ inlines un-annotated single-reference
     /// CTEs straight back into a sub-query) and the absence of the `in (select`
-    /// form. `tests/retention_worker.rs` pins the same property against a real
+    /// form. `tests/workers/retention_worker.rs` pins the same property against a real
     /// planner that has been pushed into the hostile plan on purpose.
     #[test]
     fn batch_delete_sql_computes_its_victim_set_exactly_once() {

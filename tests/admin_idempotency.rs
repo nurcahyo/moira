@@ -1263,7 +1263,7 @@ async fn request_with_id(
 /// Polls `condition` on a fixed tick until it holds or `budget` expires.
 ///
 /// The house pattern for waiting on something that has no signal to subscribe to —
-/// see `tests/retention_worker.rs::poll_until`, which this mirrors. It is *not* a
+/// see `tests/workers/retention_worker.rs::poll_until`, which this mirrors. It is *not* a
 /// `sleep`-based interleave (P2-12, `plans/CONVENTIONS.md` §3): every wait is bounded,
 /// so a condition that never holds fails the test loudly instead of a timing guess
 /// silently passing.

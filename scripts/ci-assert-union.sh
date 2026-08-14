@@ -94,7 +94,29 @@ if [ "$total_skips" -ne 0 ]; then
     rc=1
 fi
 
-# ── 4. Predicted-vs-actual cost table. WARN ONLY, NEVER FAILS.
+# ── 4. count-below-floor — the shards ran every target but lost tests inside them.
+# Assertions 1 and 2 are set assertions over TARGET NAMES, and both sides are re-derived
+# from disk, so a group root that stopped declaring one of its members satisfies them
+# perfectly: the target is present, it ran, it ran once. Only the count disagrees. The floor
+# and the source-derived expectation both live in `scripts/test-log-lib.sh` so this gate and
+# the local one in `scripts/gates.sh` can never drift apart.
+declared="$(tl_declared_tests "$ROOT")"
+union_passed=0
+while IFS= read -r f; do
+    n=$(grep -E '^test result' "$f" | awk '{p+=$4} END {print p+0}')
+    union_passed=$((union_passed + n))
+done < <(find "$dir" -name plain.log -type f | sort)
+printf 'tests passed:   %s (source declares %s, floor %s)\n' \
+    "$union_passed" "$declared" "$TL_TEST_COUNT_MINIMUM"
+if [ "$union_passed" -lt "$declared" ] || [ "$union_passed" -lt "$TL_TEST_COUNT_MINIMUM" ]; then
+    printf 'FAILED — count-below-floor: %s passed across the shards; source declares %s, floor %s.\n' \
+        "$union_passed" "$declared" "$TL_TEST_COUNT_MINIMUM"
+    printf '  A `mod <member>;` line missing from a group root produces exactly this and\n'
+    printf '  nothing else: the file stays in git, cargo never compiles it, every target runs.\n'
+    rc=1
+fi
+
+# ── 5. Predicted-vs-actual cost table. WARN ONLY, NEVER FAILS.
 # `ci/test-costs.tsv` is hand-maintained, which is the exact shape this repo has been
 # burned by. It is defensible only because it is quarantined from correctness — so
 # failing on drift would drag it straight back onto the correctness path. This table

@@ -68,7 +68,7 @@ pub async fn readyz(State(state): State<AppState>) -> Result<Json<HealthResponse
         // this response carries an English message. The constant still exists for
         // the structured `reason` fields in `src/app/cluster_lease.rs`, and
         // `readyz_returns_503_and_cluster_lease_denied...` in
-        // `tests/cluster_admission.rs` asserts the two agree.
+        // `tests/workers/cluster_admission.rs` asserts the two agree.
         return Err(AppError::coded(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "cluster_lease_denied",

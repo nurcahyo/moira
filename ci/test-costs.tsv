@@ -27,6 +27,17 @@
 # TO REFRESH: the `rust` aggregator prints a predicted-vs-actual table in the job
 # summary. It WARNS and never fails — putting drift on the correctness path would
 # put this hand-maintained list back on it too.
+#
+# THE `workers` ROW IS ARITHMETIC, NOT A MEASUREMENT (#187). Consolidating
+# `cluster_admission` 2.12 + `coordination_default_path` 0.60 + `retention_worker` 1.40
+# + `worker_leader_election` 5.70 + `worker_queue` 1.57 into one target replaced those
+# five rows with their sum, 11.39. Nobody has measured the merged binary on a CI runner.
+# The sum is used rather than nothing only because a missing row would draw DEFAULT_COST
+# (25s) and mis-pack the shard by more than the sum can. It is also very likely LOW: the
+# merged binary was measured locally at 54.34s wall clock, and the five predecessors ran
+# their template preparation once each in parallel across shards where the merged one
+# runs it once, serially, for 33 fixture creations. Replace this row from the
+# predicted-vs-actual table of the first green post-consolidation `rust` run.
 actor_fingerprint_unification	3.55
 admin_audit_atomicity	1.33
 admin_idempotency	5.86
@@ -34,12 +45,10 @@ admin_invite_lifecycle	21.99
 admin_query_contract	0.58
 agent_profile_wire	2.49
 auth_provider_settings	23.24
-cluster_admission	2.12
 cluster_coordination	1.00
 content_leak_snapshots	24.64
 context_planner_boundary	4.63
 conversation_summarization	24.47
-coordination_default_path	0.60
 execution_lifecycle	8.17
 execution_policy_if_match	1.32
 http_error_contract	0.56
@@ -62,7 +71,6 @@ rag_idempotency_replay	2.84
 rag_ingestion_honesty	2.91
 rag_retrieval_end_to_end	6.25
 response_output_honesty	3.30
-retention_worker	1.40
 retrieval_cross_tenant_isolation	2.07
 rig_boundary	0.04
 runtime_config_invalidation	2.16
@@ -72,8 +80,7 @@ security_foundation	0.48
 structured_output	1.83
 supply_chain_policy	0.00
 test_database_isolation	0.03
-worker_leader_election	5.70
-worker_queue	1.57
+workers	11.39
 # Pseudo-units. These are targets `ls tests/*.rs` cannot see, and each one is a
 # target that would otherwise be covered by no shard and vanish with nothing red.
 #

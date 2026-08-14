@@ -6,12 +6,10 @@
 //! that claims a winner runs at least two contenders released together by a
 //! [`Barrier`], never staggered by a `sleep`.
 //!
-//! Each test takes its own database from [`support::TestDatabase`]. PostgreSQL
+//! Each test takes its own database from [`crate::support::TestDatabase`]. PostgreSQL
 //! advisory locks are database-scoped, which is what keeps the `b"moiralrt"`
-//! leader key away from `b"MOIRARET"` in `tests/retention_worker.rs` — a
+//! leader key away from `b"MOIRARET"` in `tests/workers/retention_worker.rs` — a
 //! test-only guard, but one taken against the same server.
-
-mod support;
 
 use std::{sync::Arc, time::Duration};
 
@@ -26,7 +24,7 @@ use moira::{
 use sqlx::PgPool;
 use tokio::{sync::Barrier, task::JoinSet};
 
-use support::TestDatabase;
+use crate::support::TestDatabase;
 
 /// Enough for barrier-released contenders on a contended database. Spent only by
 /// a real failure.
