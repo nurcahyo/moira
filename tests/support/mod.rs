@@ -1044,6 +1044,26 @@ pub async fn maintenance_connection() -> Option<(PgConnection, String)> {
 /// changing any assertion.
 const CONCURRENT_FIXTURES: usize = 4;
 
+/// How long a fixture waits for a permit before treating the wait as a **deadlock** rather
+/// than as load.
+///
+/// A template clone takes seconds and only [`CONCURRENT_FIXTURES`] permits exist, so a wait
+/// this long does not mean a slow database — it means every permit is held by something that
+/// will never release one. The documented shape is a single test holding two fixtures at
+/// once, which the comment above `MAINTENANCE_DATABASE` records as the invariant this harness
+/// depends on.
+///
+/// **Consolidating test targets is what makes this worth paying for.** The invariant was
+/// nearly free to keep while a five-test binary could not saturate four permits; a binary
+/// holding 45 tests over 33 fixture creations can, so the invariant becomes load-bearing for
+/// the first time and a violation becomes easy to write by accident. Without this the symptom
+/// is a binary that hangs until CI's 20-minute timeout with no name attached to it; with it,
+/// the failure names the binary and says what to look for.
+///
+/// This is behaviour-preserving on any healthy run — nothing waits two minutes for a permit
+/// unless it is never getting one.
+const FIXTURE_BUDGET_WAIT: Duration = Duration::from_secs(120);
+
 static FIXTURE_BUDGET: Semaphore = Semaphore::const_new(CONCURRENT_FIXTURES);
 static DATABASE_ORIGIN: OnceCell<Option<DatabaseOrigin>> = OnceCell::const_new();
 
@@ -1127,10 +1147,16 @@ impl TestDatabase {
     pub async fn create_with_max_connections(max_connections: u32) -> Option<Self> {
         // Taken before anything else so the budget covers the clone itself, not just
         // the fixture's lifetime.
-        let budget = FIXTURE_BUDGET
-            .acquire()
-            .await
-            .expect("the fixture budget semaphore is never closed");
+        let budget = match timeout(FIXTURE_BUDGET_WAIT, FIXTURE_BUDGET.acquire()).await {
+            Ok(permit) => permit.expect("the fixture budget semaphore is never closed"),
+            Err(_) => panic!(
+                "waited {FIXTURE_BUDGET_WAIT:?} for one of {CONCURRENT_FIXTURES} \
+                 FIXTURE_BUDGET permits and every one is still held. This is not a slow \
+                 database. The invariant is that no test holds two fixtures at once — look \
+                 for a test in this binary that builds a second LifecycleFixture or \
+                 TestDatabase while the first is still alive."
+            ),
+        };
         let origin = database_origin().await?;
         let name = format!("moira_test_{}_{}", unix_seconds(), Uuid::now_v7().simple());
         let maintenance_url = origin.url_for(MAINTENANCE_DATABASE);
