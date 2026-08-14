@@ -139,9 +139,13 @@ today rather than being silently accepted. What it *does* do is satisfy the
 "OAuth tokens live encrypted in the database" requirement and give the two
 future consumers a row to read once they exist:
 
-- the `oauth-token-refresh` `JobDispatcher` — **blocked on issue #90** (no real
-  `JobDispatcher` exists in the codebase yet; see
-  `plans/12-feature-expansion-brainstorm.md` §1's current-state note), and
+- the `oauth-token-refresh` worker — issue #90 landed the real, per-`job_name`
+  `JobDispatcher` (`infra::workers::dispatch::RealJobDispatcher`) and left
+  `oauth-token-refresh` an explicit registration seam
+  (`dispatch::default_dispatcher`'s doc comment names the one line it takes),
+  but no handler is registered yet: the OAuth refresh logic itself is still
+  unbuilt (see `plans/12-feature-expansion-brainstorm.md` §1's current-state
+  note), and
 - a future native-runner execution backend (option (b) in the table above), if
   the sidecar's operational cost or stability ever makes that the better
   choice.
