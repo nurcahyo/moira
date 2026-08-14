@@ -1,4 +1,5 @@
 mod admin;
+mod agent_platform;
 mod auth_settings;
 mod cluster;
 mod conversation;
@@ -21,6 +22,9 @@ pub use admin::{
     AdminIdempotencyClaim, AdminIdempotencyClaimOutcome, AdminRepository, KeyMaterial,
     PgAdminCommandTransaction, PgAdminRepository, StoredCredentialSecret,
 };
+// Issue #214 (plan 12 §3). The agent-platform registries (skills now; evals/flows to follow)
+// as one Postgres repository, sibling to `runtime` and `admin` and owning disjoint tables.
+pub use agent_platform::PgAgentPlatformRepository;
 // Plan 07 modules 5-6. Both ship as a trait plus one Postgres implementation from their
 // first commit, so no later plan has to retrofit the seam onto a surface that already has
 // callers — the retrofit P2-3 had to perform for `AdminRepository` and `SetupRepository`.

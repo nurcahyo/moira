@@ -1,4 +1,5 @@
 mod admin;
+mod agent_platform;
 mod auth_settings;
 mod conversation;
 mod health;
@@ -634,6 +635,20 @@ fn admin_routes() -> OpenApiRouter<AppState> {
         .routes(routes!(admin::disable_trusted_jwt_issuer))
         .routes(routes!(admin::list_audit_events))
         .routes(routes!(admin::get_audit_event))
+        // Issue #214 (plan 12 §3) — agent platform: skills CRUD. Kept in one contiguous
+        // block so a concurrent workstream editing this file rebases mechanically.
+        .routes(routes!(
+            agent_platform::list_skills,
+            agent_platform::create_skill
+        ))
+        .routes(routes!(
+            agent_platform::get_skill,
+            agent_platform::patch_skill,
+            agent_platform::delete_skill
+        ))
+        .routes(routes!(agent_platform::enable_skill))
+        .routes(routes!(agent_platform::disable_skill))
+        .routes(routes!(agent_platform::bulk_enable_skills))
 }
 
 #[cfg(test)]
@@ -721,6 +736,11 @@ mod tests {
             "/api/v1/admin/agent-profiles/{id}",
             "/api/v1/admin/agent-profiles/{id}/enable",
             "/api/v1/admin/agent-profiles/{id}/disable",
+            "/api/v1/admin/skills",
+            "/api/v1/admin/skills/{id}",
+            "/api/v1/admin/skills/{id}/enable",
+            "/api/v1/admin/skills/{id}/disable",
+            "/api/v1/admin/skills/bulk-enable",
             "/api/v1/admin/runtime/diagnose",
             "/api/v1/admin/rag-collections",
             "/api/v1/admin/rag-collections/{id}",
@@ -780,7 +800,9 @@ mod tests {
         // preview and redeem one, and list/patch/delete an admin identity grant.
         // + plan 11 Sub-Phase E's one: POST /api/v1/conversations/{id}/summarize.
         // + plan 12 workstream D's two: GET/PUT /api/v1/admin/applications/{id}/routing-defaults.
-        assert_eq!(operation_count, 154);
+        // + issue #214 (plan 12 §3) agent-platform skills: list/create/get/patch/delete,
+        //   enable/disable, and bulk-enable = 8.
+        assert_eq!(operation_count, 162);
     }
 
     #[test]
@@ -1436,9 +1458,10 @@ mod tests {
     /// baked into the published contract.
     ///
     /// `false` is reserved for preconditions that are genuinely advisory: the provider
-    /// runtime-policy `PUT` reads the header through `optional_if_match`, and the
-    /// context-router routing-defaults `PUT` (issue #213) mirrors that exact contract.
-    const IF_MATCH_OPERATIONS: [(&str, &str, bool); 42] = [
+    /// runtime-policy `PUT` reads the header through `optional_if_match`, the
+    /// context-router routing-defaults `PUT` (issue #213) mirrors that exact contract, and
+    /// the agent-platform skill writes (issue #214) add their own If-Match operations.
+    const IF_MATCH_OPERATIONS: [(&str, &str, bool); 46] = [
         // Plan 09 wave 2. Ownership transfer takes a required precondition and grant
         // revocation deliberately does not: a `PATCH` that flips a flag is a lost-update
         // hazard, while a soft revoke is idempotent in intent and answers a repeat with
@@ -1508,6 +1531,12 @@ mod tests {
         ("/api/v1/admin/routing-policies/{id}", "patch", true),
         ("/api/v1/admin/routing-policies/{id}/disable", "post", true),
         ("/api/v1/admin/routing-policies/{id}/enable", "post", true),
+        // Issue #214 (plan 12 §3) — agent-platform skills. Bulk-enable is deliberately
+        // absent: it is a multi-row operation with no single row version to precondition on.
+        ("/api/v1/admin/skills/{id}", "delete", true),
+        ("/api/v1/admin/skills/{id}", "patch", true),
+        ("/api/v1/admin/skills/{id}/disable", "post", true),
+        ("/api/v1/admin/skills/{id}/enable", "post", true),
         (
             "/api/v1/admin/users/{external_user_id}/provider-credentials/{id}",
             "delete",

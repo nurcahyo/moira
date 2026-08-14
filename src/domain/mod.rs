@@ -1,4 +1,5 @@
 mod admin;
+mod agent_platform;
 mod auth_settings;
 mod conversation;
 mod i18n;
@@ -22,6 +23,14 @@ pub use admin::{
     ScopeType, SetupCheckName, SetupCheckState, SetupChecks, SetupDeploymentEnvironment,
     SetupStatus, SetupStatusResponse, SystemKeyCreateRequest, TrustedJwtIssuerCreateRequest,
     TrustedJwtIssuerPatchRequest, TrustedJwtIssuerRecord,
+};
+pub use agent_platform::{
+    AgentFlowCreateRequest, AgentFlowPatchRequest, AgentFlowRecord, AgentFlowRunRecord,
+    AgentFlowStepCreateRequest, AgentFlowStepRecord, EvalCaseCreateRequest, EvalCaseRecord,
+    EvalRunRecord, EvalRunStatus, EvalSuiteCreateRequest, EvalSuitePatchRequest, EvalSuiteRecord,
+    EvalTriggerKind, FlowRunStatus, FlowStepOnFailure, FlowStepRunStatus, GradingKind,
+    SkillBulkEnableRequest, SkillBulkEnableResponse, SkillCreateRequest, SkillKind,
+    SkillPatchRequest, SkillRecord, SkillStatus,
 };
 pub use auth_settings::{
     AuthMethod, AuthProviderSettingsCreateRequest, AuthProviderSettingsPatchRequest,
