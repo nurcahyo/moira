@@ -779,7 +779,8 @@ mod tests {
         // 142 + plan 09 wave 2's nine: create/list/get/revoke an admin invitation,
         // preview and redeem one, and list/patch/delete an admin identity grant.
         // + plan 11 Sub-Phase E's one: POST /api/v1/conversations/{id}/summarize.
-        assert_eq!(operation_count, 152);
+        // + plan 12 workstream D's two: GET/PUT /api/v1/admin/applications/{id}/routing-defaults.
+        assert_eq!(operation_count, 154);
     }
 
     #[test]
