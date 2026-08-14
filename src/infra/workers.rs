@@ -1,5 +1,8 @@
 pub mod dispatch;
+pub mod latency_stats;
 pub mod leader;
+pub mod oauth_refresh;
+pub mod provider_health_check;
 pub mod queue;
 pub mod retention;
 
@@ -25,6 +28,13 @@ pub const MEMORY_EXTRACTION_RETRY_WORKER: &str = "memory-extraction-retry";
 pub const CONVERSATION_SUMMARIZATION_RETRY_WORKER: &str = "conversation-summarization-retry";
 pub const EMBEDDING_RETRY_WORKER: &str = "embedding-retry";
 pub const DOCUMENT_INGESTION_RETRY_WORKER: &str = "document-ingestion-retry";
+/// Spec name of the naive last-N latency aggregation job (plan 12 §2, consolidated
+/// decision 7; issue #211). Newly declared by this change — unlike the other five
+/// job names below, it did not exist before the dispatcher that registers a real
+/// handler for it.
+pub const LATENCY_STATS_AGGREGATION_WORKER: &str = "latency-stats-aggregation";
+pub const OAUTH_TOKEN_REFRESH_WORKER: &str = "oauth-token-refresh";
+pub const PROVIDER_HEALTH_CHECK_WORKER: &str = "provider-health-check";
 
 /// Every job name the queue and the metrics layer will ever see.
 ///
@@ -39,10 +49,22 @@ pub const WORKER_JOB_NAMES: &[&str] = &[
     CONVERSATION_SUMMARIZATION_RETRY_WORKER,
     EMBEDDING_RETRY_WORKER,
     DOCUMENT_INGESTION_RETRY_WORKER,
-    "oauth-token-refresh",
-    "provider-health-check",
+    LATENCY_STATS_AGGREGATION_WORKER,
+    OAUTH_TOKEN_REFRESH_WORKER,
+    PROVIDER_HEALTH_CHECK_WORKER,
     RETENTION_CLEANUP_WORKER,
     "runtime-cache-warmer",
+];
+
+/// The three periodic maintenance job names with no leader-gated or on-demand
+/// producer — `run_supervisor`'s `maintenance_interval` arm enqueues each on its
+/// own idle-check cadence when [`WorkerRegistry::is_configured`] says it is on.
+/// See `WorkerSettings::maintenance_enqueue_interval_seconds` for why this is not
+/// leader-gated the way the retention sweep is.
+const PERIODIC_MAINTENANCE_WORKERS: &[&str] = &[
+    LATENCY_STATS_AGGREGATION_WORKER,
+    OAUTH_TOKEN_REFRESH_WORKER,
+    PROVIDER_HEALTH_CHECK_WORKER,
 ];
 
 /// Jobs that are leader-gated, and therefore the only ones with a meaningful
@@ -128,12 +150,17 @@ impl WorkerRegistry {
                     enabled_by_default: true,
                 },
                 WorkerSpec {
-                    name: "oauth-token-refresh",
+                    name: LATENCY_STATS_AGGREGATION_WORKER,
+                    description: "Aggregates measured provider/model latency into rolling p50/p95 stats.",
+                    enabled_by_default: true,
+                },
+                WorkerSpec {
+                    name: OAUTH_TOKEN_REFRESH_WORKER,
                     description: "Refreshes OAuth credentials before expiration.",
                     enabled_by_default: false,
                 },
                 WorkerSpec {
-                    name: "provider-health-check",
+                    name: PROVIDER_HEALTH_CHECK_WORKER,
                     description: "Continuously records provider health windows.",
                     enabled_by_default: true,
                 },
@@ -264,9 +291,19 @@ impl WorkerRegistry {
         });
         // The registry-backed dispatcher (issue #90). See `dispatch::default_dispatcher`
         // for which job names have a real handler, which are documented stubs pending
-        // plan 11's pipeline extraction, and the seams left for `oauth-token-refresh`
-        // and a future latency-aggregation job.
-        let dispatcher = dispatch::default_dispatcher();
+        // plan 11's pipeline extraction, and which three (latency-stats-aggregation,
+        // oauth-token-refresh, provider-health-check) get the real handlers this change
+        // adds. `None` when there is no database — the handlers all need one, and
+        // `queue` is `None` in exactly the same case, so `run_queue_poll` never drives
+        // this dispatcher when the four plan-11 stub-only registrations would be the
+        // only ones anyway.
+        let dispatcher = dispatch::default_dispatcher(
+            state.pool.clone(),
+            state.cipher.clone(),
+            state.http.clone(),
+            state.metrics.clone(),
+            self.settings.clone(),
+        );
         let mut queue_interval = tokio::time::interval(Duration::from_secs(
             self.settings.queue_poll_interval_seconds.max(1),
         ));
@@ -274,6 +311,15 @@ impl WorkerRegistry {
         // overruns its period must defer the next one rather than build a backlog
         // of ticks against a database that is evidently already busy.
         queue_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        // Enqueues the three periodic maintenance jobs that have no leader-gated or
+        // on-demand producer. See `WorkerSettings::maintenance_enqueue_interval_seconds`
+        // and `enqueue_due_maintenance_jobs` below for why this is a plain interval
+        // rather than a leader election.
+        let mut maintenance_interval = tokio::time::interval(Duration::from_secs(
+            self.settings.maintenance_enqueue_interval_seconds.max(1),
+        ));
+        maintenance_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         info!(
             max_concurrent_jobs = self.settings.max_concurrent_jobs,
@@ -313,6 +359,10 @@ impl WorkerRegistry {
                     let Some(queue) = queue.as_ref() else { continue };
                     Self::run_queue_poll(queue, &dispatcher, &state).await;
                 }
+                _ = maintenance_interval.tick(), if queue.is_some() => {
+                    let Some(queue) = queue.as_ref() else { continue };
+                    self.enqueue_due_maintenance_jobs(queue, &state).await;
+                }
             }
         }
 
@@ -348,6 +398,35 @@ impl WorkerRegistry {
             // `AppError::Sqlx` renders as a constant string, so no database detail
             // leaks here.
             Err(error) => warn!(%error, "worker queue poll failed; retrying on the next tick"),
+        }
+    }
+
+    /// Enqueues each of [`PERIODIC_MAINTENANCE_WORKERS`] that is configured and does
+    /// not already have a `pending`/`running` row — see
+    /// `WorkerSettings::maintenance_enqueue_interval_seconds` for the full reasoning
+    /// on why this is a plain per-replica interval rather than a leader election.
+    ///
+    /// Never propagates, for the same reason `run_queue_poll` and
+    /// `run_retention_cleanup` do not: a failure to enqueue must not take the
+    /// supervisor down, and the next tick retries.
+    async fn enqueue_due_maintenance_jobs(&self, queue: &queue::WorkerQueue, state: &AppState) {
+        for job_name in PERIODIC_MAINTENANCE_WORKERS {
+            if !self.is_configured(job_name) {
+                continue;
+            }
+            match queue.enqueue_periodic(job_name, &state.metrics).await {
+                Ok(Some(id)) => debug!(job_name, %id, "enqueued periodic maintenance job"),
+                // Already idle-checked as "nothing pending or running" or the
+                // pending-depth cap was hit; either way there is nothing to log at
+                // more than trace, since this is the expected steady state between
+                // a job's own runs.
+                Ok(None) => {}
+                Err(error) => warn!(
+                    job_name,
+                    %error,
+                    "failed to enqueue periodic maintenance job; retrying next tick"
+                ),
+            }
         }
     }
 

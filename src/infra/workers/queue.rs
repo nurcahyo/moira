@@ -245,6 +245,48 @@ impl WorkerQueue {
         }
     }
 
+    /// Enqueues `job_name` unless it already has a `pending`/`running` row, or the
+    /// pending-depth cap is reached.
+    ///
+    /// `Ok(None)` covers both refusals and is not an error: an idle-checked
+    /// periodic maintenance enqueue finding its own name already queued is the
+    /// expected steady state, not a capacity problem a caller needs to react to
+    /// the way [`Self::enqueue`]'s callers do. See
+    /// `WorkerRegistry::enqueue_due_maintenance_jobs` in `src/infra/workers.rs`
+    /// for the only caller today.
+    pub async fn enqueue_periodic(
+        &self,
+        job_name: &str,
+        metrics: &MetricsRegistry,
+    ) -> Result<Option<Uuid>, AppError> {
+        if !super::is_known_job_name(job_name) {
+            return Err(AppError::Internal(format!(
+                "worker queue asked to enqueue unknown job {job_name:?}; declare it in \
+                 WORKER_JOB_NAMES in src/infra/workers.rs"
+            )));
+        }
+        let inserted = self
+            .repository
+            .enqueue_if_idle(
+                WorkerJobInsert {
+                    job_name: job_name.to_string(),
+                    payload: Value::Null,
+                    run_at: None,
+                    max_attempts: DEFAULT_MAX_ATTEMPTS,
+                },
+                self.settings.queue_max_pending_jobs,
+            )
+            .await?;
+        if inserted.is_none() {
+            // Distinguishing "already idle-checked out" from "capacity cap hit" would
+            // need a second query on every miss; neither warrants a metric or a log
+            // above debug in `enqueue_due_maintenance_jobs`, so the caller does not
+            // need the distinction.
+            metrics.record_worker_queue_enqueue_rejected();
+        }
+        Ok(inserted)
+    }
+
     /// One poll: reclaim, claim, dispatch, settle.
     ///
     /// Reclaim runs **first**. A replica that died mid-job left its row `running`,

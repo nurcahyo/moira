@@ -50,6 +50,24 @@ pub trait WorkerJobRepository: Send + Sync {
         max_pending: i64,
     ) -> Result<Option<Uuid>, AppError>;
 
+    /// Inserts a job **if** the pending backlog is below `max_pending` **and** no
+    /// `pending`/`running` row for `job.job_name` already exists.
+    ///
+    /// The idle check and the insert are one statement, for the same reason
+    /// [`Self::enqueue`]'s capacity check is: two concurrent callers racing this
+    /// method for the same job name must not both observe "nothing pending" and
+    /// both insert. A rare double-insert across that race window is still
+    /// possible when two replicas evaluate concurrently (this is not a `for
+    /// update` claim, just an atomic read-then-insert), which is why every
+    /// caller of this method must be safe under an occasional duplicate row —
+    /// see `WorkerSettings::maintenance_enqueue_interval_seconds` for the
+    /// callers this exists for and why that duplicate is acceptable there.
+    async fn enqueue_if_idle(
+        &self,
+        job: WorkerJobInsert,
+        max_pending: i64,
+    ) -> Result<Option<Uuid>, AppError>;
+
     /// Claims up to `limit` due jobs for `claimed_by`.
     ///
     /// Safe to run on every replica simultaneously — that is what
@@ -113,6 +131,22 @@ impl WorkerJobRepository for PgWorkerJobRepository {
         max_pending: i64,
     ) -> Result<Option<Uuid>, AppError> {
         let id: Option<Uuid> = sqlx::query_scalar(ENQUEUE_SQL)
+            .bind(job.job_name)
+            .bind(job.payload)
+            .bind(job.run_at)
+            .bind(job.max_attempts)
+            .bind(max_pending)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(id)
+    }
+
+    async fn enqueue_if_idle(
+        &self,
+        job: WorkerJobInsert,
+        max_pending: i64,
+    ) -> Result<Option<Uuid>, AppError> {
+        let id: Option<Uuid> = sqlx::query_scalar(ENQUEUE_IF_IDLE_SQL)
             .bind(job.job_name)
             .bind(job.payload)
             .bind(job.run_at)
@@ -197,6 +231,20 @@ const ENQUEUE_SQL: &str = r#"
     insert into worker_jobs (job_name, payload, run_at, max_attempts)
     select $1, $2, coalesce($3, now()), $4
      where (select count(*) from worker_jobs where status = 'pending') < $5
+    returning id
+"#;
+
+/// As [`ENQUEUE_SQL`], with one more predicate: nothing already `pending` or
+/// `running` under the same `job_name`. See [`WorkerJobRepository::enqueue_if_idle`]
+/// for why this is a "rare duplicate is acceptable" guard rather than a hard
+/// exclusivity lock.
+const ENQUEUE_IF_IDLE_SQL: &str = r#"
+    insert into worker_jobs (job_name, payload, run_at, max_attempts)
+    select $1, $2, coalesce($3, now()), $4
+     where not exists (
+         select 1 from worker_jobs where job_name = $1 and status in ('pending', 'running')
+     )
+     and (select count(*) from worker_jobs where status = 'pending') < $5
     returning id
 "#;
 
@@ -361,6 +409,16 @@ mod tests {
     fn the_capacity_check_and_the_insert_are_one_statement() {
         assert!(ENQUEUE_SQL.contains("insert into worker_jobs"));
         assert!(ENQUEUE_SQL.contains("where (select count(*) from worker_jobs"));
+    }
+
+    /// The idle check, the depth check and the insert must all be one statement,
+    /// for the same race-freedom reason [`ENQUEUE_SQL`]'s single statement is.
+    #[test]
+    fn the_idle_check_and_the_insert_are_one_statement() {
+        assert!(ENQUEUE_IF_IDLE_SQL.contains("insert into worker_jobs"));
+        assert!(ENQUEUE_IF_IDLE_SQL.contains("where not exists"));
+        assert!(ENQUEUE_IF_IDLE_SQL.contains("status in ('pending', 'running')"));
+        assert!(ENQUEUE_IF_IDLE_SQL.contains("and (select count(*) from worker_jobs"));
     }
 
     /// A prune bounded by `limit` would be exposed to the re-execution hazard

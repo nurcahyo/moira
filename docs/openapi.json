@@ -6936,6 +6936,95 @@
         ],
         "type": "object"
       },
+      "ProviderHealthEntry": {
+        "description": "One provider's rolling health window (issue #83), as `GET\n/api/v1/admin/providers/health` serves it.",
+        "properties": {
+          "average_latency_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "last_failure_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_probe_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_success_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "probes_successful": {
+            "description": "Probes that reached the provider at all — `healthy` or `degraded`, not `unhealthy`.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "probes_total": {
+            "description": "Total reachability probes observed within the rolling window.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "provider_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "provider_type": {
+            "$ref": "#/components/schemas/ProviderType"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ProviderHealthStatus"
+          }
+        },
+        "required": [
+          "provider_id",
+          "provider_type",
+          "display_name",
+          "status",
+          "probes_total",
+          "probes_successful"
+        ],
+        "type": "object"
+      },
+      "ProviderHealthResponse": {
+        "properties": {
+          "providers": {
+            "items": {
+              "$ref": "#/components/schemas/ProviderHealthEntry"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "providers"
+        ],
+        "type": "object"
+      },
+      "ProviderHealthStatus": {
+        "description": "The classification `src/infra/workers/provider_health_check.rs::classify_probe` produces,\nplus `Unknown` for a provider with no snapshot inside the rolling window at all (never\nprobed, or not probed recently enough to still be in window).",
+        "enum": [
+          "healthy",
+          "degraded",
+          "unhealthy",
+          "unknown"
+        ],
+        "type": "string"
+      },
       "ProviderModelCreateRequest": {
         "additionalProperties": false,
         "properties": {
@@ -22779,6 +22868,92 @@
               }
             },
             "description": "Request, authentication, authorization, or conflict error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-providers"
+        ]
+      }
+    },
+    "/api/v1/admin/providers/health": {
+      "get": {
+        "operationId": "get_provider_health",
+        "parameters": [
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderHealthResponse"
+                }
+              }
+            },
+            "description": "Rolling reachability window for every enabled provider (issue #83)",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Authentication or authorization error",
             "headers": {
               "X-Request-Id": {
                 "description": "Request correlation identifier",

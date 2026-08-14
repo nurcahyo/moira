@@ -101,7 +101,7 @@ pub enum ResourceStatus {
     Deleted,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderType {
     OpenAiCompatible,
@@ -407,6 +407,41 @@ pub enum CredentialSecret {
     ServiceAccount {
         payload: Value,
     },
+}
+
+/// One provider's rolling health window (issue #83), as `GET
+/// /api/v1/admin/providers/health` serves it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ProviderHealthEntry {
+    pub provider_id: Uuid,
+    pub provider_type: ProviderType,
+    pub display_name: String,
+    pub status: ProviderHealthStatus,
+    /// Total reachability probes observed within the rolling window.
+    pub probes_total: i64,
+    /// Probes that reached the provider at all — `healthy` or `degraded`, not `unhealthy`.
+    pub probes_successful: i64,
+    pub average_latency_ms: Option<f64>,
+    pub last_probe_at: Option<DateTime<Utc>>,
+    pub last_success_at: Option<DateTime<Utc>>,
+    pub last_failure_at: Option<DateTime<Utc>>,
+}
+
+/// The classification `src/infra/workers/provider_health_check.rs::classify_probe` produces,
+/// plus `Unknown` for a provider with no snapshot inside the rolling window at all (never
+/// probed, or not probed recently enough to still be in window).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderHealthStatus {
+    Healthy,
+    Degraded,
+    Unhealthy,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ProviderHealthResponse {
+    pub providers: Vec<ProviderHealthEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

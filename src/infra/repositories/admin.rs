@@ -20,8 +20,8 @@ use crate::{
     infra::pg_rows::{
         api_key_record_from_row, application_record_from_row, audit_log_record_from_row,
         audit_result_to_db, credential_record_from_row, credential_type_to_db,
-        provider_model_record_from_row, provider_record_from_row, provider_type_to_db,
-        scope_type_to_db,
+        provider_model_record_from_row, provider_record_from_row, provider_type_from_db,
+        provider_type_to_db, scope_type_to_db,
     },
     security::EncryptedSecret,
 };
@@ -407,6 +407,63 @@ pub trait AdminRepository {
         &self,
         record: &IdempotencyRecord,
     ) -> Result<IdempotencyRecord, AppError>;
+
+    // -----------------------------------------------------------------------------------
+    // `oauth-token-refresh` (plan 12 §1, issue #90's declared seam) — the two narrow
+    // `provider_credentials` operations this worker needs beyond what already exists
+    // (`load_credential_secret` for the decrypt, `get_provider` for the token endpoint).
+    // -----------------------------------------------------------------------------------
+
+    /// Ids of `oauth2` credentials whose `expires_at` falls before `threshold` — the set
+    /// `src/infra/workers/oauth_refresh.rs` attempts to refresh this run. Ordered soonest
+    /// first, so a due set larger than one run's `limit` drains in expiry order rather than
+    /// in an arbitrary one.
+    async fn list_oauth_credentials_due_for_refresh(
+        &self,
+        threshold: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Vec<Uuid>, AppError>;
+
+    /// Applies a refreshed token to `id`, guarded by `expected_version`.
+    ///
+    /// Optimistic, not a `for update` claim: the caller decrypts and calls the provider's
+    /// token endpoint — a network round trip — between reading `expected_version` and calling
+    /// this, and a `for update` lock held across that round trip would tie up a pool
+    /// connection and a row lock for the provider's response latency. `Ok(None)` means the
+    /// version had already moved (a concurrent refresh from another replica, or an admin
+    /// edit) — a benign, expected race under `WorkerSettings::maintenance_enqueue_interval_seconds`'s
+    /// non-leader-gated enqueue, not an error; the caller logs it and moves to the next due
+    /// credential rather than retrying this one.
+    async fn apply_oauth_refresh(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+        encrypted: &EncryptedSecret,
+        fingerprint: &str,
+        masked: &str,
+        new_expires_at: Option<DateTime<Utc>>,
+    ) -> Result<Option<i64>, AppError>;
+
+    /// The `valid`/`expiring`/`expired` distribution of active `oauth2` credentials, grouped
+    /// by provider type, as of `threshold` (the same `now + oauth_refresh_lead_seconds` cutoff
+    /// `list_oauth_credentials_due_for_refresh` uses — "expiring" here means the same thing
+    /// "due" means there). Backs three of the four `moira_oauth_credential_status` buckets;
+    /// the fourth (`refresh_failed`) is a fact about *this run's* attempts, not the stored
+    /// rows, so `src/infra/workers/oauth_refresh.rs` supplies it from its own tally rather
+    /// than asking this repository to persist a failure history no other feature needs.
+    async fn oauth_credential_lifecycle_counts(
+        &self,
+        threshold: DateTime<Utc>,
+    ) -> Result<Vec<OauthCredentialLifecycleCounts>, AppError>;
+}
+
+/// One provider type's row from [`AdminRepository::oauth_credential_lifecycle_counts`].
+#[derive(Debug, Clone, Copy)]
+pub struct OauthCredentialLifecycleCounts {
+    pub provider_type: crate::domain::ProviderType,
+    pub valid: i64,
+    pub expiring: i64,
+    pub expired: i64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2377,6 +2434,118 @@ impl AdminRepository for PgAdminRepository {
             resource_id: row.try_get("resource_id")?,
             expires_at: row.try_get("expires_at")?,
         })
+    }
+
+    async fn list_oauth_credentials_due_for_refresh(
+        &self,
+        threshold: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Vec<Uuid>, AppError> {
+        let rows = sqlx::query(
+            r#"
+            select id
+            from provider_credentials
+            where credential_type = 'oauth2'
+              and status = 'active'
+              and deleted_at is null
+              and expires_at is not null
+              and expires_at < $1
+            order by expires_at asc
+            limit $2
+            "#,
+        )
+        .bind(threshold)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| row.try_get::<Uuid, _>("id").map_err(AppError::from))
+            .collect()
+    }
+
+    async fn apply_oauth_refresh(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+        encrypted: &EncryptedSecret,
+        fingerprint: &str,
+        masked: &str,
+        new_expires_at: Option<DateTime<Utc>>,
+    ) -> Result<Option<i64>, AppError> {
+        let row = sqlx::query(
+            r#"
+            update provider_credentials
+            set encrypted_payload = $3,
+                encryption_algorithm = $4,
+                encryption_version = $5,
+                encrypted_data_key = $6,
+                nonce = $7,
+                secret_fingerprint = $8,
+                masked_secret = $9,
+                expires_at = coalesce($10, expires_at),
+                last_validated_at = now(),
+                status = 'active',
+                updated_at = now()
+            where id = $1
+              and version = $2
+              and deleted_at is null
+            returning version
+            "#,
+        )
+        .bind(id)
+        .bind(expected_version)
+        .bind(&encrypted.ciphertext)
+        .bind(&encrypted.algorithm)
+        .bind(encrypted.version)
+        .bind(&encrypted.encrypted_data_key)
+        .bind(&encrypted.nonce)
+        .bind(fingerprint)
+        .bind(masked)
+        .bind(new_expires_at)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| row.try_get::<i64, _>("version").map_err(AppError::from))
+            .transpose()
+    }
+
+    async fn oauth_credential_lifecycle_counts(
+        &self,
+        threshold: DateTime<Utc>,
+    ) -> Result<Vec<OauthCredentialLifecycleCounts>, AppError> {
+        let rows = sqlx::query(
+            r#"
+            select
+                p.provider_type,
+                count(*) filter (
+                    where c.expires_at is null or c.expires_at > $1
+                ) as valid_count,
+                count(*) filter (
+                    where c.expires_at is not null and c.expires_at <= $1 and c.expires_at > now()
+                ) as expiring_count,
+                count(*) filter (
+                    where c.expires_at is not null and c.expires_at <= now()
+                ) as expired_count
+            from provider_credentials c
+            join providers p on p.id = c.provider_id
+            where c.credential_type = 'oauth2'
+              and c.status = 'active'
+              and c.deleted_at is null
+            group by p.provider_type
+            "#,
+        )
+        .bind(threshold)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(OauthCredentialLifecycleCounts {
+                    provider_type: provider_type_from_db(row.try_get("provider_type")?)?,
+                    valid: row.try_get("valid_count")?,
+                    expiring: row.try_get("expiring_count")?,
+                    expired: row.try_get("expired_count")?,
+                })
+            })
+            .collect()
     }
 }
 

@@ -361,6 +361,20 @@ const OAUTH_REFRESH_TOTAL: &str = "moira_oauth_refresh_total";
 const FLOW_STEP_TOTAL: &str = "moira_flow_step_total";
 const FLOW_DURATION_SECONDS: &str = "moira_flow_duration_seconds";
 
+// Issue #83 — provider health, wired immediately (not "declare ahead of the caller" like the
+// block above): `src/infra/workers/provider_health_check.rs` is this family's first and only
+// caller today, landing in the same change that declares it.
+const PROVIDER_HEALTH_PROBE_TOTAL: &str = "moira_provider_health_probe_total";
+const PROVIDER_HEALTH_STATUS: &str = "moira_provider_health_status";
+
+/// The closed `status` domain both provider-health families share — exactly
+/// `classify_probe`'s three possible outputs (`src/infra/workers/provider_health_check.rs`).
+/// `unknown` (the fourth value `provider_health_snapshots.status` allows) is deliberately
+/// absent: no probe this worker runs ever classifies as `unknown`, that value only ever
+/// appears as the *absence* of a recent snapshot, which is a fact about the read side
+/// (`GET /api/v1/admin/providers/health`), not a value either metric family emits.
+const PROVIDER_HEALTH_STATUSES: &[&str] = &["healthy", "degraded", "unhealthy"];
+
 /// The closed `status` domain for `moira_oauth_credential_status`. The four states
 /// `docs/grafana.md`'s gap table names for the OAuth credential health row this family backs.
 const OAUTH_CREDENTIAL_STATUSES: &[&str] = &["valid", "expiring", "expired", "refresh_failed"];
@@ -806,6 +820,18 @@ impl MetricsRegistry {
                 "Wall-clock time for one complete agent-flow run, by flow key, in seconds. Not \
                  seeded, like every other histogram in this module: its label values are dynamic."
             );
+            describe_counter!(
+                PROVIDER_HEALTH_PROBE_TOTAL,
+                "Provider reachability probes performed by the provider-health-check worker, \
+                 by provider type and the bounded status the probe classified as."
+            );
+            describe_gauge!(
+                PROVIDER_HEALTH_STATUS,
+                "How many enabled providers of each type are currently in each health status, \
+                 as of the most recent provider-health-check run. A provider not yet probed \
+                 (worker disabled, or newly created) counts toward none of the three buckets, \
+                 which is why the three need not sum to the provider count."
+            );
 
             gauge!(DB_POOL_CONNECTIONS, "state" => "total").set(0.0);
             gauge!(DB_POOL_CONNECTIONS, "state" => "idle").set(0.0);
@@ -899,6 +925,20 @@ impl MetricsRegistry {
                         "outcome" => *outcome
                     )
                     .increment(0);
+                }
+                for status in PROVIDER_HEALTH_STATUSES {
+                    counter!(
+                        PROVIDER_HEALTH_PROBE_TOTAL,
+                        "provider_type" => provider,
+                        "status" => *status
+                    )
+                    .increment(0);
+                    gauge!(
+                        PROVIDER_HEALTH_STATUS,
+                        "provider_type" => provider,
+                        "status" => *status
+                    )
+                    .set(0.0);
                 }
             }
         });
@@ -1533,6 +1573,59 @@ impl MetricsRegistry {
                 "outcome" => outcome
             )
             .increment(1);
+        });
+    }
+
+    /// Counts one provider-health-check reachability probe.
+    ///
+    /// `status` outside [`PROVIDER_HEALTH_STATUSES`] is folded to `unhealthy` — the same
+    /// fail-closed convention `record_routing_decision`'s `other` bucket follows for an
+    /// unrecognised reason, applied to the family whose whole point is signalling trouble
+    /// rather than hiding an unrecognised value in a silently-dropped series.
+    pub fn record_provider_health_probe(&self, provider_type: ProviderType, status: &str) {
+        let provider = provider_type_label(provider_type);
+        let status = PROVIDER_HEALTH_STATUSES
+            .iter()
+            .find(|candidate| **candidate == status)
+            .copied()
+            .unwrap_or("unhealthy");
+        with_local_recorder(&self.inner.recorder, || {
+            counter!(
+                PROVIDER_HEALTH_PROBE_TOTAL,
+                "provider_type" => provider,
+                "status" => status
+            )
+            .increment(1);
+        });
+    }
+
+    /// Sets `moira_provider_health_status{provider_type,status}` from a freshly counted
+    /// distribution for one provider type — the same whole-distribution-at-once shape as
+    /// [`Self::set_oauth_credential_status`], for the same reason: a bucket that dropped to
+    /// zero (every provider of this type moved out of `degraded`, say) has to be *written* as
+    /// zero or the gauge keeps its last value forever.
+    pub fn set_provider_health_status(
+        &self,
+        provider_type: ProviderType,
+        healthy: usize,
+        degraded: usize,
+        unhealthy: usize,
+    ) {
+        let provider = provider_type_label(provider_type);
+        with_local_recorder(&self.inner.recorder, || {
+            for (status, count) in [
+                ("healthy", healthy),
+                ("degraded", degraded),
+                ("unhealthy", unhealthy),
+            ] {
+                #[allow(clippy::cast_precision_loss)]
+                gauge!(
+                    PROVIDER_HEALTH_STATUS,
+                    "provider_type" => provider,
+                    "status" => status
+                )
+                .set(count as f64);
+            }
         });
     }
 

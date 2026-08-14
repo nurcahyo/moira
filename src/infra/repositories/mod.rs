@@ -17,6 +17,7 @@ mod keyset;
 // because the five members live in two repositories and had drifted into two different
 // wrong answers — four that wrote on every read, one that raced on first touch.
 mod policy_row;
+mod provider_observability;
 mod public;
 mod runtime;
 mod setup;
@@ -24,7 +25,8 @@ mod worker_jobs;
 
 pub use admin::{
     AdminIdempotencyClaim, AdminIdempotencyClaimOutcome, AdminRepository, KeyMaterial,
-    PgAdminCommandTransaction, PgAdminRepository, StoredCredentialSecret,
+    OauthCredentialLifecycleCounts, PgAdminCommandTransaction, PgAdminRepository,
+    StoredCredentialSecret,
 };
 // Issue #214 (plan 12 §3). The agent-platform registries (skills now; evals/flows to follow)
 // as one Postgres repository, sibling to `runtime` and `admin` and owning disjoint tables.
@@ -96,6 +98,13 @@ pub(crate) use conversation::{
     ConversationSummaryInsert, ConversationSummaryRow, SummarizationLock,
     count_messages_after_sequence, find_active_conversation_summary, find_conversation_route_hint,
     find_messages_after_sequence, insert_conversation_summary,
+};
+// Issues #211/#83 (plan 12 §2 "Later" phase). One repository for the two tables a periodic
+// maintenance worker writes and `GET /api/v1/admin/providers/health` reads — see the module's
+// header for why this is one trait rather than two.
+pub use provider_observability::{
+    HealthSnapshotInsert, PgProviderObservabilityRepository, ProviderHealthSummaryRow,
+    ProviderObservabilityRepository, ProviderProbeTarget,
 };
 pub use public::{
     IdempotencyClaim, PgPublicRepository, PublicAccess, PublicRepository, ResponseStartedInsert,
