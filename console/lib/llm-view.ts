@@ -76,6 +76,14 @@ export const GENERAL_ROUTE_KEY = "general";
 export const LLM_ENDPOINTS = {
   providers: "/api/llm/providers",
   connectVllm: "/api/llm/connect-vllm",
+  /**
+   * NOT nested under `/api/llm/**`, unlike everything above. It lives at
+   * `/api/settings/llm/**` — alongside `/api/settings/auth` — because it does
+   * not touch the generic provider/model/credential/routing chain those paths
+   * manage; it stores a subscription token as an `oauth2` credential on its
+   * own dedicated provider row. See `lib/claude-subscription.ts`.
+   */
+  claudeSubscription: "/api/settings/llm/claude-subscription",
 } as const;
 
 /** `/api/llm/providers/{id}` and the collections nested under it. */
