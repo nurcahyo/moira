@@ -682,6 +682,15 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "Heading above any refusal state. Rendered INSTEAD of a button, never alongside one — a " +
       "button that 503s on click is the failure this surface exists to avoid.",
   },
+  [K.sign_in_go_to_setup]: {
+    key: K.sign_in_go_to_setup,
+    message: "Start the first-run setup",
+    description:
+      "Link to `/setup`, rendered under the refusal ONLY when the setup window is actually open " +
+      'so it can never be a dead end. Without it "Finish setting up this deployment first" was ' +
+      "advice with no way to act on it: `/` sends a signed-out visitor to `/login`, and nothing " +
+      "on that page named the route that fixes it.",
+  },
   [K.sign_in_request_failed]: {
     key: K.sign_in_request_failed,
     message: "The console could not start the sign-in. Try again in a moment.",

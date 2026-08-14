@@ -138,6 +138,7 @@ export const CONSOLE_MESSAGE_KEYS = {
   sign_in_button_generic: "console.signIn.button_generic",
   sign_in_pending: "console.signIn.pending",
   sign_in_unavailable_heading: "console.signIn.unavailable_heading",
+  sign_in_go_to_setup: "console.signIn.go_to_setup",
   sign_in_request_failed: "console.signIn.request_failed",
   sign_in_rate_limited: "console.signIn.rate_limited",
   sign_in_no_redirect_url: "console.signIn.no_redirect_url",
