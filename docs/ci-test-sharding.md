@@ -171,6 +171,68 @@ dozen lines apart with a comment at each site. Both mismatch directions fail clo
   correctness path, because a target that starts using Redis would land on a
   Redis-less shard. Service topology is uniform on purpose.
 
+## Test-target consolidation: one group measured, as a proof of concept
+
+The 54 targets under `tests/*.rs` compile to 54 separate binaries, each paying its own
+process-start and link cost. Merging related targets into one binary was tried on exactly
+one group — the five worker/coordination suites (`admin_idempotency` was left out;
+`cluster_admission`, `coordination_default_path`, `retention_worker`,
+`worker_leader_election`, `worker_queue` went into a single `tests/workers.rs`, cases split
+across `tests/workers/*.rs` modules reached via `#[path]`) — deliberately scoped to one
+group rather than done across the board, specifically so the result could be measured
+before committing to the rest. It has not been repeated on the other groups.
+
+**Measured**, same 45 tests, build time excluded, n=3 per arm on the same M2, with the test
+executable invoked **directly** so that `cargo`'s own per-invocation cost is out of the loop:
+
+| | mean wall time | spread |
+|---|---|---|
+| 5 separate binaries | 11.67s | ±0.13s |
+| 1 merged binary | 7.74s | ±0.08s |
+
+**−3.93s, a 33.7% cut on these five suites — and roughly 1% of a 328–431s full suite.**
+
+An earlier pass reported this as 58.4s → 18.6s, a 68% cut. **That figure was wrong and is
+retained here only as a warning.** It failed three independent checks: it contradicted its own
+per-suite table (58.4s total against a 38.38s sum, twenty seconds unexplained); it disagreed
+with this repo's own CI measurements in `ci/test-costs.tsv`, which sum to 11.39s against the
+verified 11.56s and put `cluster_admission` at 2.12s rather than the claimed 20.22s, a factor
+of 9.5; and it was taken while two concurrent `make gates` process trees were running on the
+same machine. **Timings taken on a contended machine are contention, not signal** — this repo
+has produced 81s, 118s and 472s for one identical command purely from background load. Interleave
+A/B, repeat at least three times, report the spread, and treat overlapping ranges as "no effect".
+
+The mechanism survived that correction even though the magnitude did not, and it is not what
+"fewer binaries link faster" would predict: `cargo test --no-run` link time showed **no measurable
+difference** between 54 targets and 50 (signs disagreed across repeats). Nor is it process-start
+savings — cargo's warm per-invocation cost measures at 0.2–1.2s. The win is that `FIXTURE_BUDGET`
+(the 4-permit semaphore in `tests/support/mod.rs` bounding concurrent database fixtures) is applied
+**per process**, so five binaries serialise through five separate budgets while one binary lets all
+45 tests overlap within a single one. Full end-to-end suite wall-clock impact was **not resolved**:
+runs of the *same* configuration varied by up to ~300s, far larger than the ~4s effect, so no
+full-suite number is asserted either way.
+
+**Recommendation: do not consolidate the remaining nine groups on these numbers.** ~1% of a
+full suite does not pay for restructuring 44 more files and dismantling nine quarantine
+boundaries. The link-time premise that originally justified the plan measured at zero effect,
+and the runtime payoff is an order of magnitude smaller than first reported. Reopen the question
+only if a cheaper lever measures well and points back here.
+
+**The cheaper lever to measure first is `FIXTURE_BUDGET` headroom.**
+If most of the group-level win comes from unused fixture-concurrency slack — which the
+mechanism above suggests — then raising `CONCURRENT_FIXTURES` (checked against PostgreSQL's
+`max_connections`) could capture a similar win across all 50 remaining targets with no file
+moves, no lost per-target tripwires in `tests/test_database_isolation.rs`'s
+`SHARED_DATABASE_ALLOWLIST`/`SCANNED_ROOTS` guards, and no rework of the mutation scripts
+that name targets by file (`scripts/f32-mutate.sh`, `scripts/verify-mutants.sh`,
+`scripts/p11f-mutate.sh`). That measurement has not been done. Do it before consolidating
+the remaining nine candidate groups, not after — it may make most of the remaining work
+unnecessary, or it may confirm the merge is still worth it on top of a wider budget. Either
+way, do not read "merging one group won" as "merge everything": the pending groups were not
+all safe by the same reasoning (see the per-file risk notes maintained alongside the
+consolidated `tests/workers.rs`), and `tests/security_foundation.rs` and
+`tests/test_database_sweep.rs` must stay solo regardless — see their own comments.
+
 ## What sharding costs
 
 Billed Rust minutes roughly double (10 → 20): five runners each pay ~46s of fixed

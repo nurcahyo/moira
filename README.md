@@ -235,6 +235,60 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
+### Fast inner loop
+
+`cargo test` compiles and links every test binary before running anything, and this repo
+has 54 of them under `tests/*.rs` — that is the wrong tool to run after every edit. Reach
+for the right one:
+
+```bash
+cargo check --all-targets        # does it compile — the loop you run after every edit
+cargo test --test <name>         # one test target, once the area you're changing is known
+make gates-fast                  # fmt, clippy, test — before pushing, NOT sufficient to merge
+make gates                       # the full six merge gates — before opening/merging a PR
+```
+
+**A bare `cargo test` does not read `.env`, and it fails silently, not loudly.**
+`MOIRA_TEST_DATABASE_URL` and `MOIRA_TEST_REDIS_URL` normally come from `.env`, and every
+`make` target sources it first (`$(ENV) cargo test …` in the Makefile). Run `cargo test`
+directly in a shell that never sourced `.env` and the database- and Redis-backed suites
+report a skip line rather than a failure — the run finishes green having proven nothing
+about them. Always go through `make test`, `make gates-fast` or `make gates`, or `source
+.env` yourself first. `scripts/gates.sh` treats any skip line as a failed gate for exactly
+this reason.
+
+Never run `cargo clean`. `target/` is expensive to rebuild — 406 dependencies, edition
+2024 — and there is no linker or build-cache override in place yet to make a cold rebuild
+fast (`.cargo/config.toml` does not exist on a stock checkout; no `lld`/`sccache`/`mold`
+installed by default). Losing `target/` turns every command above back into a multi-minute
+wait.
+
+**Measured, so this is not left as folklore:** on an Apple M2 with a warm `target/`,
+`cargo check --all-targets` after touching a core source file lands in the low single-digit
+seconds, and `cargo test --no-run` — codegen and link of every test binary under `tests/*.rs`
+— takes well over a minute. Both are workspace-wide; neither shortcut exists per-crate here.
+A linker swap (`lld`) was investigated as a way to cut the link side of that further: it is
+not installed on this machine, Apple's active linker is already the modern parallel `ld-prime`
+rather than the old `ld-classic` most "swap in lld" advice targets, and — the reason not to
+add one casually — a linker or codegen flag committed to a tracked `.cargo/config.toml` is
+copied straight into the production Docker image (`Dockerfile` does `COPY . .` before `cargo
+build --release --locked`) and would need to hold on the CI runner too, or the release build
+breaks. If you want a faster linker locally, configure it in a **gitignored** `.cargo/config.toml`,
+not a committed one. `[profile.dev] debug = 1` / `[profile.test] debug = 1` in `Cargo.toml`
+are deliberate, not oversights — see the comment there — and are not a place to cut corners
+for a speed win without re-reading why first.
+
+**Local gates are a pre-filter, not the merge criterion.** `make gates` runs six checks —
+fmt, clippy, test, release build, `cargo deny`, `cargo audit`. `.github/workflows/ci.yml`
+defines eleven jobs, and seven of them have **no local equivalent at all**: `rust-migrations`,
+`rotation-gate`, `secret-scan`, `sast`, `container-and-helm`, `console`,
+`console-container-and-helm`. A green `make gates` says nothing about any of those seven —
+in particular, a linker or profile setting that only exists in your local environment (see
+above) can pass `make gates` cleanly and still break `container-and-helm`, which builds from
+a clean checkout with none of your local overrides. Treat `make gates` as what it is: the
+thing to run before pushing, not the thing that decides whether a PR is safe to merge. Real
+CI (`gh pr checks <n> --watch`) is what decides that.
+
 ### The test database
 
 `cargo test` needs PostgreSQL. `MOIRA_TEST_DATABASE_URL` names the **cluster** the test
