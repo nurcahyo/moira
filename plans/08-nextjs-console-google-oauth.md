@@ -628,7 +628,7 @@ rather than substituting a module for it.
 
 **Why ordered here.** Plan 01 §3/§4 makes this dependency explicit: "no Next.js line is written until the identity foundation (07) exists in Moira, because 'first login becomes admin' is unsafe." Iteration 07 adds the unauthenticated `GET /api/v1/admin/setup/claim-status` endpoint, the `admin_identities (issuer, subject)` grant table, and `POST /api/v1/admin/setup/claim`. Iteration 08 is the **first and only** iteration that creates the Next.js project — everything UI/OAuth-shaped before this plan is backend-only (02a, 02b, 03, 05, 07 — plan 02 is split per CONVENTIONS §0 D2 into **02a** honesty and **02b** idempotency replay). This plan binds to plan 07's **Frozen contract** table (`plans/07-identity-foundation.md` § Interfaces & Contracts) verbatim, not to the `plans/01` §4.5 sketch.
 
-**Branch & PR (CONVENTIONS §1).** Branch `plan/08-nextjs-console-google-oauth`, cut from current `main`, stacked on `plan/07-identity-foundation` only if 07 has not merged (PR description must then name the base PR and the branch is rebased once 07 lands). Conventional Commits. One plan = one branch = one PR.
+**Branch & PR (CONVENTIONS §1).** Branch `plan/08-nextjs-console-google-oauth`, cut from current `develop` (§1A: `develop` is the integration branch and the base for all plan work), stacked on `plan/07-identity-foundation` only if 07 has not merged (PR description must then name the base PR and the branch is rebased once 07 lands). Conventional Commits. One plan = one branch = one PR.
 
 **Identity stack decision (CONVENTIONS §7.4, verified 2026-07-25).** The console uses **Better Auth**, not Auth.js/NextAuth. The Auth.js/NextAuth team joined Better Auth in September 2025; Auth.js is security-patch-only and Better Auth is the recommended choice for new projects. Concretely:
 
@@ -1525,7 +1525,7 @@ Notes carried forward: **credentials never render a plaintext secret** — the o
 
 ### Pull request (CONVENTIONS §1.4)
 
-One PR against `main` from `plan/08-nextjs-console-google-oauth`, opened only after every §2 gate passes locally, with the required sections: **Plan link** (`plans/08-nextjs-console-google-oauth.md`) · **Findings addressed** (P1-11, P0-3, P1-10, P1-4) · **Migrations included** (none in `migrations/`; console-side Better Auth schema in `console/db/`) · **Breaking API/OpenAPI changes** (none) · **Test evidence** (`bun test` + `bunx playwright test` summaries) · **Rollback procedure** · **Deferred follow-ups**.
+One PR against `develop` from `plan/08-nextjs-console-google-oauth`, opened only after every §2 gate passes locally, with the required sections: **Plan link** (`plans/08-nextjs-console-google-oauth.md`) · **Findings addressed** (P1-11, P0-3, P1-10, P1-4) · **Migrations included** (none in `migrations/`; console-side Better Auth schema in `console/db/`) · **Breaking API/OpenAPI changes** (none) · **Test evidence** (`bun test` + `bunx playwright test` summaries) · **Rollback procedure** · **Deferred follow-ups**.
 
 ---
 

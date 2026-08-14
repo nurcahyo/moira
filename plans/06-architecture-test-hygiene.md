@@ -47,7 +47,7 @@ Two claims in the previous draft were re-checked and found **still correct**, an
 
 ## Branch & Pull Request (CONVENTIONS §1)
 
-- **Branch:** `plan/06-architecture-test-hygiene`, cut from the **current `main`** (`0b3301c`). Not stacked on any other plan branch.
+- **Branch:** `plan/06-architecture-test-hygiene`, cut from the **current `develop`** (`CONVENTIONS.md` §1A: `develop` is the integration branch and the base for all plan work; the `main` commit `0b3301c` named here when this plan was written is long superseded). Not stacked on any other plan branch.
 - **Commits:** Conventional Commits, matching existing history style. Commit #1 is fixed: `fix(security): make GeneratedApiKey.raw_key a SecretString so plaintext cannot be serialized`. Thereafter: `refactor: split AdminService into per-context services`, `refactor: unify the actor fingerprint across admin, runtime-admin, and public`, `test: isolate integration tests per Postgres schema`, `fix: scope circuit reset to the changed resource`, `docs: record src/application and src/i18n in project-structure`.
 - The PR is **not opened** until every gate in §2 / Verification passes locally.
 - **PR description — required sections:**
