@@ -489,6 +489,21 @@ export const CONSOLE_MESSAGE_KEYS = {
   llm_outcome_reused: "console.llm.outcome_reused",
   llm_outcome_enabled: "console.llm.outcome_enabled",
   llm_outcome_skipped: "console.llm.outcome_skipped",
+
+  /* --- the "Connect Claude subscription" panel (issue #211) --------------- */
+  claude_subscription_heading: "console.claudeSubscription.heading",
+  claude_subscription_intro: "console.claudeSubscription.intro",
+  claude_subscription_token_label: "console.claudeSubscription.token_label",
+  claude_subscription_token_hint: "console.claudeSubscription.token_hint",
+  claude_subscription_submit: "console.claudeSubscription.submit",
+  claude_subscription_pending: "console.claudeSubscription.pending",
+  claude_subscription_created: "console.claudeSubscription.created",
+  claude_subscription_rotated: "console.claudeSubscription.rotated",
+  claude_subscription_token_required: "console.claudeSubscription.token_required",
+  claude_subscription_token_too_long: "console.claudeSubscription.token_too_long",
+  claude_subscription_token_invalid: "console.claudeSubscription.token_invalid",
+  claude_subscription_request_body_invalid: "console.claudeSubscription.request_body_invalid",
+  claude_subscription_list_truncated: "console.claudeSubscription.list_truncated",
 } as const;
 
 /** Every console-originated key, as a union of string literals. */
