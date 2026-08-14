@@ -16,7 +16,8 @@ Rows, in order:
 - **HTTP traffic and latency** — responses by status class, latency quantiles, top
   routes by rate and by p95.
 - **Provider execution** — outcomes by class, failure ratio by provider type,
-  execution latency, time to first token, attempts by model key.
+  execution latency, time to first token, attempts by model key, token usage by
+  direction, routing decisions, and failover events.
 - **Database, Redis and runtime config** — pool occupancy, Redis operation failures,
   runtime-config invalidations by channel, retention sweeps.
 - **Background workers** — queue throughput, failures and dead letters by job name,
@@ -24,6 +25,19 @@ Rows, in order:
 - **RAG, retrieval, memory and summarization** — ingestion volume, retrieval and
   embedding latency, and the run outcomes of the three subsystems that fail silently.
 - **Admin identity** — invitation outcomes and grant lifecycle events.
+- **Credential health** — OAuth2 credential status by lifecycle state, refresh
+  outcomes.
+- **Agent flows** — flow step outcomes by status, flow run duration.
+
+The last two rows query families plan 12 workstream E declares but nothing emits yet
+(`moira_oauth_credential_status`, `moira_oauth_refresh_total`, `moira_flow_step_total`,
+`moira_flow_duration_seconds`), so they render flat at zero — or, for the two
+non-seeded families, render no series at all — until workstream F wires their
+callers. The panels are committed ahead of the callers deliberately, so the row exists
+the moment the metric does rather than being forgotten until someone remembers to add
+it (see `docs/prometheus.md`'s "Not emitted" section for the same caveat applied to
+`moira_provider_tokens_total`, `moira_routing_decision_total` and
+`moira_failover_total`, which workstream D wires instead).
 
 ## The constraint the dashboard is built under
 
@@ -32,9 +46,13 @@ the full list is in [prometheus.md](./prometheus.md). The single exception is `u
 which Prometheus synthesises per scrape target; no counter emitted by a process can
 express that the process stopped answering.
 
-That constraint rules some things out. There is no token-usage panel, no queue-depth
-panel, no Redis-latency panel and no SQL-timing panel, because no such metric exists
-today. Adding one is a change to `src/infra/metrics.rs`, not to the dashboard.
+That constraint rules some things out. There is no queue-depth panel, no
+Redis-latency panel and no SQL-timing panel, because no such metric exists today.
+Adding one is a change to `src/infra/metrics.rs`, not to the dashboard. A metric
+family existing is a weaker claim than it being emitted, though: a handful of panels
+above (see the callout under "What it covers") query families that are declared and
+seeded but that no code increments yet — the constraint is "no metric, no panel", not
+"no caller, no panel".
 
 ## Prerequisites
 

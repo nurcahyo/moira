@@ -24,8 +24,6 @@ use `up`. Both say so in their own description.
 
 These have no metric behind them today, so nothing charts or alerts on them:
 
-- **Token usage.** Moira records usage per execution in the database and exposes it
-  on `/api/v1/usage`; there is no `moira_*_tokens_total` family.
 - **Worker queue depth.** There is no depth gauge. The saturation signal is
   `moira_worker_queue_enqueue_rejected_total` — the queue refusing an enqueue
   because the pending cap was reached — and that is what the panel and the
@@ -36,6 +34,20 @@ These have no metric behind them today, so nothing charts or alerts on them:
   `moira_db_pool_connections{state="total"|"idle"}` exists.
 
 Adding any of those is a change to `src/infra/metrics.rs`, not to this directory.
+
+### Declared, not yet emitted
+
+Plan 12 workstream E declared seven families ahead of their callers — token usage,
+routing decisions, failover events, OAuth credential health and agent-flow execution
+(`moira_provider_tokens_total`, `moira_routing_decision_total`, `moira_failover_total`,
+`moira_oauth_credential_status`, `moira_oauth_refresh_total`, `moira_flow_step_total`,
+`moira_flow_duration_seconds`) — and this dashboard carries their panels in the
+"Provider execution", "Credential health" and "Agent flows" rows. No code increments
+any of them yet: three are seeded at zero so their panels render a flat line, and the
+other four (open-ended admin-configured labels, plus the one histogram) carry no
+series at all until workstream D (token/routing/failover) or workstream F
+(credential/flow) wires a caller. This is deliberate, not a gap — see
+`docs/prometheus.md` for the full rationale.
 
 ## Prerequisites
 
