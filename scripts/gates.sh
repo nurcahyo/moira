@@ -86,6 +86,11 @@ labels=$(mktemp)
 tl_strip_ansi "$log" "$plain"
 tl_assert_complete "$ROOT" "$plain" "$labels" || true
 tl_assert_no_skips "$plain" "$labels" || true
+# The count floor. `tl_assert_complete` proves N binaries started; this proves the tests are
+# still inside them, which is a different property and is the one consolidating targets puts
+# at risk — see the comment above `tl_declared_tests`. The `passed` figure line 51 already
+# computed was printed and thrown away; this is the line that makes it load-bearing.
+tl_assert_test_count "$ROOT" "$plain" "$labels" || true
 while IFS= read -r label; do
     [ -n "$label" ] && failures+=("$label")
 done < "$labels"

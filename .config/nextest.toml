@@ -13,6 +13,21 @@
 # advisory locks guarding shared singletons now serialise across processes instead of within one.
 # Isolation costs more here than parallelism returns.
 #
+# **BOTH NUMBERS IN THAT TABLE ARE STALE, AND THE COUNT WAS STALE BY MORE THAN THE SUITE.**
+# Re-measured 2026-08-14 at c79264a, same machine, warm build, `/usr/bin/make gates`:
+#
+#     cargo test --workspace --all-features      1352 passed
+#     wall clock, two consecutive warm runs      431.75s  and  328.05s
+#
+# The "622" was wrong by 730 tests — more tests than it claimed existed — and the "1m39s" is
+# from the same run, so it is wrong by roughly the same factor and is not a target anyone
+# should measure against. Note the 24% spread between two back-to-back runs on an idle-ish
+# machine: this suite's wall clock is dominated by real Postgres work and Argon2id verifies,
+# so any timing claim about it needs repeats, and a change smaller than ~100s is inside the
+# noise. The pass count is now asserted rather than printed — `tl_assert_test_count` in
+# `scripts/test-log-lib.sh` carries the floor, which is the mechanism that stops the next
+# number here from rotting for months the way this one did.
+#
 # It is kept anyway, as a *second* way to run the suite rather than the default gate, because the
 # isolation is diagnostically valuable: running under nextest forces every test to contend
 # cross-process, which is the case an in-process `Mutex` would silently not cover. Both plan 07
