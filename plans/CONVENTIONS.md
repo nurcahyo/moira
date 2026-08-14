@@ -49,7 +49,7 @@ Each iteration plan is executed on its **own branch** and lands via **its own pu
 | 11 | `plan/11-rag-memory-intelligence` |
 
 **Rules**
-1. Branch from the **current `main`** (not from another plan branch) unless the dependency graph in `01-roadmap-and-dependencies.md` requires stacking; if stacked, the PR description must name the base PR and the branch must be rebased once the base merges.
+1. Branch from the **current `develop`** (not from another plan branch) unless the dependency graph in `01-roadmap-and-dependencies.md` requires stacking; if stacked, the PR description must name the base PR and the branch must be rebased once the base merges. `develop` is the integration branch and the base for all plan work (§1A); plan PRs are opened against `develop` and squashed into it. Plans 02a–04 were executed before `develop` existed and their own text still says `main`; that is a record of what happened, not an instruction.
 2. **Conventional Commits** (`feat:`, `fix:`, `test:`, `docs:`, `refactor:`, `chore:`) — matching the existing history style (`feat: make admin commands atomic`).
 3. The PR **must not** be opened until every gate in §2 passes locally.
 4. PR description template (required sections): **Plan link** (`plans/NN-*.md`) · **Findings addressed** (P-IDs from `00-audit-report.md`) · **Migrations included** (filenames, or "none") · **Breaking API/OpenAPI changes** · **Test evidence** (unit + e2e output summary) · **Rollback procedure** · **Deferred follow-ups**.
@@ -65,13 +65,13 @@ This repository has two long-lived branches. **`main`** is the default branch an
 
 Unlike the rest of this file, this section is **not** scoped to the iteration plans. It binds **every** merge between `main` and `develop`, whoever or whatever performs it, plan-related or not.
 
-> **Note on §1.** §1 above was written before `develop` existed and still tells plan branches to branch from and land on `main`. Current practice is that all feature, fix, and plan branches target `develop` — of the last twelve merged pull requests, eleven based on `develop` and only the `develop` → `main` promotion based on `main`. Reconciling §1's wording is out of scope here; where the two differ on *base branch*, current practice governs, and nothing in §1 overrides the merge-method rule below.
+> **Note on §1.** §1 above was written before `develop` existed and originally told plan branches to branch from and land on `main`. Its rule 1 has since been reconciled with this section (issue #221) and now says `develop`, which is what current practice already was — of the last twelve merged pull requests, eleven based on `develop` and only the `develop` → `main` promotion based on `main`. Where any remaining plan text still says `main` for a *base branch*, this section governs, and nothing in §1 overrides the merge-method rule below.
 
 **A merge between the two long-lived branches — `develop` into `main`, or `main` into `develop`, in either direction — MUST use a merge commit. Never a squash, never a rebase.** On the command line that is `gh pr merge <N> --merge`; in the GitHub UI it is "Create a merge commit".
 
 **Feature and plan branches merging into `develop` continue to squash.** That rule is unchanged. The prohibition here is deliberately narrow: it applies only to the two sync/promotion directions between `main` and `develop`. Do not generalise it, and do not generalise the squash habit into it.
 
-> **`plans/RUNNER-PROMPT.md` §9 contradicts this section and is now unrunnable — do not follow it.** An earlier revision of this paragraph cited that file's `--squash` as "correct for feature PRs". That citation was wrong: RUNNER-PROMPT §9 is titled "PR → merge to `main`", its step 1 says "Open the PR against `main`", and its step 2 is `gh pr merge <N> --squash --admin --delete-branch` — a squash **into `main`**, not into `develop`. Two things follow. First, ruleset `20469084` now pins `main` to `allowed_merge_methods: ["merge"]` with an empty `bypass_actors`, and `--admin` does not bypass a ruleset, so that command fails outright today. Second, and worse, the workaround it invites — retrying as `--merge --admin` — lands feature work directly on `main`, which is precisely the hotfix shape described below: real content on `main` that `develop` lacks, which the next release silently reverts. Until RUNNER-PROMPT §9 is rewritten to target `develop`, treat this section as governing and route plan work through `develop`. Reconciling that file is tracked in issue #221; this section does not bless any command in it.
+**Plan work is not an exception.** `plans/RUNNER-PROMPT.md` §9 implements this section for runners: plan PRs are opened against `develop` and merged with `gh pr merge <N> --squash --delete-branch`, with no `--admin`. A plan branch merged into `main` is content stranded on the release branch, and the next promotion from `develop` silently reverts it (issue #221).
 
 ### The invariant this section maintains
 
@@ -104,7 +104,7 @@ The moment `main` acquires content of its own, this changes completely. `develop
 **How `main` can acquire content, given that it is protected.** A literal `git commit` on `main` followed by `git push` is refused — two `pull_request` rules apply to `main` with no bypass actors (see the configuration snapshot), so nothing reaches `main` except through a pull request. The reachable forms are therefore:
 
 - **a hotfix PR based on `main`** and merged into `main` with `--merge` (the only method the ruleset allows), which is the legitimate emergency path and the one this section exists to make safe;
-- **any other PR mistakenly opened against `main`** — including plan work, which `plans/RUNNER-PROMPT.md` §9 still instructs agents to do (see the warning above).
+- **any other PR mistakenly opened against `main`** — including plan work. `plans/RUNNER-PROMPT.md` §9 no longer instructs that (see above), but nothing in configuration prevents a human or an agent from choosing `main` as the base by hand: `conditions.ref_name` cannot tell a promotion from a feature branch.
 
 Both produce the same state and the same silent revert. The protection on `main` prevents a stray local commit; it does **not** prevent this. Steps 3–5 below are what prevent it, and they are keyed on *any* merge into `main` for exactly this reason.
 
