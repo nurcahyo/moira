@@ -122,10 +122,17 @@ tl_count_skips() {
 # deletion — a deletion is the event this is here to make visible, and editing this line to
 # make a red run green is the one change that turns the guard back into decoration.
 #
-# Measured 2026-08-14 at c79264a, pre-consolidation, by `/usr/bin/make gates` on the tree at
-# 54 test targets. The `.config/nextest.toml` header carried "622 passed" for months and was
-# wrong by ~730; this number was taken from a run, not copied from a comment.
-TL_TEST_COUNT_MINIMUM=1352
+# Measured 2026-08-14 by `/usr/bin/make gates`, twice: **1352** at c79264a, pre-consolidation,
+# on the tree at 54 test targets, and **1353** on this branch, which adds exactly one test
+# (`every_group_member_is_declared_by_its_root`). The floor below is the second number, not
+# the first. Leaving it at 1352 after the suite grew to 1353 would have left one test of
+# slack — enough for a later change to delete a test and still pass, which is precisely the
+# event this constant exists to make visible, and it would have quietly falsified the
+# "set at the exact measured count" claim on `tl_assert_test_count` below.
+#
+# The `.config/nextest.toml` header carried "622 passed" for months and was wrong by ~730;
+# both numbers here were taken from a run, not copied from a comment.
+TL_TEST_COUNT_MINIMUM=1353
 
 # ---------------------------------------------------------------------------------
 # tl_declared_tests <repo-root>
@@ -165,8 +172,13 @@ tl_declared_tests() {
 #
 # WHAT IT CATCHES, stated precisely, because a guard described loosely gets trusted loosely.
 # The floor is set at the exact measured count, so ANY net drop reds it — one test, not just
-# a whole suite. Verified by fabricating logs at 1351 and 1342 against a floor of 1352; both
-# emit the label.
+# a whole suite. Verified by fabricating logs one and ten below the floor; both emit the label.
+#
+# That claim is only true while the constant tracks the measurement, and it briefly was not:
+# this branch grew the suite to 1353 while the floor still read 1352, leaving exactly one test
+# of slack. Caught in review, not by the gate — the gate cannot detect its own floor drifting
+# below the truth. **When you add or remove a test, move `TL_TEST_COUNT_MINIMUM` in the same
+# commit**, or this paragraph becomes a lie the next reader will trust.
 #
 # WHAT IT DOES NOT CATCH. It is a count, not an identity. Deleting three tests while adding
 # three leaves it perfectly green, and it can never name *which* test went missing. That

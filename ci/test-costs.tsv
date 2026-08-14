@@ -38,19 +38,6 @@
 # their template preparation once each in parallel across shards where the merged one
 # runs it once, serially, for 33 fixture creations. Replace this row from the
 # predicted-vs-actual table of the first green post-consolidation `rust` run.
-#
-# It holds `generated_openapi_covers_every_registered_route`, the whole-route-table
-# Measured 0.00s of run time, but `all doctests ran in 0.91s; merged doctests
-# Pseudo-units. These are targets `ls tests/*.rs` cannot see, and each one is a
-# `__lib__` is padded above its measured 6.16s to 26.16 to carry its share of the
-# compilation took 0.88s` — and it is a SEPARATE `cargo test --doc` invocation,
-# per-shard link/startup cost: whichever shard holds it pays `--lib`'s link.
-# pin, and `committed_openapi_matches_the_generated_document`.
-# so it pays its own startup. Charged 3.00s.
-# target that would otherwise be covered by no shard and vanish with nothing red.
-__bins__	0.50
-__doc__	3.00
-__lib__	26.16
 actor_fingerprint_unification	3.55
 admin_audit_atomicity	1.33
 admin_idempotency	5.86
@@ -94,3 +81,16 @@ structured_output	1.83
 supply_chain_policy	0.00
 test_database_isolation	0.03
 workers	11.39
+# Pseudo-units. These are targets `ls tests/*.rs` cannot see, and each one is a
+# target that would otherwise be covered by no shard and vanish with nothing red.
+#
+# `__lib__` is padded above its measured 6.16s to 26.16 to carry its share of the
+# per-shard link/startup cost: whichever shard holds it pays `--lib`'s link.
+# It holds `generated_openapi_covers_every_registered_route`, the whole-route-table
+# pin, and `committed_openapi_matches_the_generated_document`.
+__lib__	26.16
+__bins__	0.50
+# Measured 0.00s of run time, but `all doctests ran in 0.91s; merged doctests
+# compilation took 0.88s` — and it is a SEPARATE `cargo test --doc` invocation,
+# so it pays its own startup. Charged 3.00s.
+__doc__	3.00
