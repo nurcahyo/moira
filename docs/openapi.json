@@ -28621,6 +28621,24 @@
               }
             }
           },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The instance is at capacity for Argon2id credential checks and refused this request before verifying the presented key (`auth_verification_overloaded`). The credential itself was neither accepted nor rejected, so this is not an authentication failure: retry after a short delay. Raised once a request has waited `api_keys.verification_queue_timeout_ms` for one of the `api_keys.verification_concurrency` permits.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "504": {
             "content": {
               "application/json": {
@@ -29879,6 +29897,24 @@
               }
             }
           },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The instance is at capacity for Argon2id credential checks and refused this request before verifying the presented key (`auth_verification_overloaded`). The credential itself was neither accepted nor rejected, so this is not an authentication failure: retry after a short delay. Raised once a request has waited `api_keys.verification_queue_timeout_ms` for one of the `api_keys.verification_concurrency` permits.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "504": {
             "content": {
               "application/json": {
@@ -30037,6 +30073,24 @@
               }
             },
             "description": "Internal server error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The instance is at capacity for Argon2id credential checks and refused this request before verifying the presented key (`auth_verification_overloaded`). The credential itself was neither accepted nor rejected, so this is not an authentication failure: retry after a short delay. Raised once a request has waited `api_keys.verification_queue_timeout_ms` for one of the `api_keys.verification_concurrency` permits.",
             "headers": {
               "X-Request-Id": {
                 "description": "Request correlation identifier",
@@ -30715,6 +30769,24 @@
               }
             }
           },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The instance is at capacity for Argon2id credential checks and refused this request before verifying the presented key (`auth_verification_overloaded`). The credential itself was neither accepted nor rejected, so this is not an authentication failure: retry after a short delay. Raised once a request has waited `api_keys.verification_queue_timeout_ms` for one of the `api_keys.verification_concurrency` permits.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "504": {
             "content": {
               "application/json": {
@@ -31380,6 +31452,24 @@
               }
             }
           },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The instance is at capacity for Argon2id credential checks and refused this request before verifying the presented key (`auth_verification_overloaded`). The credential itself was neither accepted nor rejected, so this is not an authentication failure: retry after a short delay. Raised once a request has waited `api_keys.verification_queue_timeout_ms` for one of the `api_keys.verification_concurrency` permits.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "504": {
             "content": {
               "application/json": {
@@ -31530,6 +31620,24 @@
               }
             },
             "description": "Internal server error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The instance is at capacity for Argon2id credential checks and refused this request before verifying the presented key (`auth_verification_overloaded`). The credential itself was neither accepted nor rejected, so this is not an authentication failure: retry after a short delay. Raised once a request has waited `api_keys.verification_queue_timeout_ms` for one of the `api_keys.verification_concurrency` permits.",
             "headers": {
               "X-Request-Id": {
                 "description": "Request correlation identifier",
@@ -31759,6 +31867,24 @@
               }
             },
             "description": "Internal server error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The instance is at capacity for Argon2id credential checks and refused this request before verifying the presented key (`auth_verification_overloaded`). The credential itself was neither accepted nor rejected, so this is not an authentication failure: retry after a short delay. Raised once a request has waited `api_keys.verification_queue_timeout_ms` for one of the `api_keys.verification_concurrency` permits.",
             "headers": {
               "X-Request-Id": {
                 "description": "Request correlation identifier",

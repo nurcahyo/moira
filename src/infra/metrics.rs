@@ -199,6 +199,38 @@ const ADMIN_IDENTITY_GRANT_EVENTS_TOTAL: &str = "moira_admin_identity_grant_even
 const CONTENT_KEYRING_REFRESH_FAILED_TOTAL: &str = "moira_content_keyring_refresh_failed_total";
 const CONTENT_KEYRING_AGE_SECONDS: &str = "moira_content_keyring_age_seconds";
 
+// The API-key verification gate (#176), `src/security/api_keys.rs`.
+//
+// Two families for one control, and the pair is the point. The counter says whether the process
+// is refusing credential checks; the histogram says how close it is to doing so before the first
+// refusal appears. Neither alone answers the operator's question, which is "is my
+// `api_keys.verification_concurrency` too small for this traffic, and how long have I got".
+//
+// Written at all because the gate is otherwise invisible in the good case and indistinguishable
+// from a client bug in the bad one: an `auth_verification_overloaded` reaches the caller as a
+// `503`, and without `outcome="shed"` climbing on a dashboard the natural reading of a burst of
+// `503`s from an authenticated client is "the database is down".
+//
+// `outcome` is the existing closed key, taking exactly two values here. There is deliberately no
+// `route`, no `application_id` and no key id: the gate is process-wide, so a per-caller
+// breakdown would be unbounded cardinality answering a question this control cannot ask.
+const API_KEY_VERIFICATION_TOTAL: &str = "moira_api_key_verification_total";
+const API_KEY_VERIFICATION_QUEUE_SECONDS: &str = "moira_api_key_verification_queue_seconds";
+
+/// The closed `outcome` domain for `moira_api_key_verification_total`. Both are seeded at zero,
+/// so "the auth gate started shedding" alerts on a rate rather than on a series appearing.
+const API_KEY_VERIFICATION_OUTCOMES: &[&str] = &["admitted", "shed"];
+
+/// Queue wait for one Argon2 permit, in seconds.
+///
+/// Resolution is concentrated far below the 250 ms default shed timeout, because the interesting
+/// region is "waits have started to exist at all" — an uncontended acquire is sub-microsecond, and
+/// by the time the p99 reaches the timeout the counter above is already telling the story. The
+/// tail stops just past the largest timeout an operator would plausibly configure.
+const API_KEY_VERIFICATION_QUEUE_BUCKETS_SECONDS: &[f64] = &[
+    0.000_1, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
+];
+
 // How many data keys this replica holds, per lifecycle state. Written by the keyring on every
 // successful load, which is the only moment the answer can change for this process.
 //
@@ -762,6 +794,23 @@ impl MetricsRegistry {
             );
 
             describe_counter!(
+                API_KEY_VERIFICATION_TOTAL,
+                "Argon2id credential-hashing admissions, by outcome. admitted is one API-key \
+                 verification or mint that took a permit from the api_keys.verification_concurrency \
+                 gate; shed is one refused with a 503 auth_verification_overloaded after waiting \
+                 api_keys.verification_queue_timeout_ms for one. Any sustained shed rate means the \
+                 gate is smaller than the authenticated traffic needs — raise resources.limits.cpu \
+                 and the bound together, because the bound is sized from cores."
+            );
+            describe_histogram!(
+                API_KEY_VERIFICATION_QUEUE_SECONDS,
+                "Time an Argon2id credential operation spent waiting for a gate permit, in \
+                 seconds. Admitted operations only: a shed one waited exactly the configured \
+                 timeout by construction, so recording it would pile a constant onto the \
+                 distribution and hide the rise that precedes it. This is the leading indicator; \
+                 moira_api_key_verification_total{outcome=\"shed\"} is the lagging one."
+            );
+            describe_counter!(
                 PROVIDER_TOKENS_TOTAL,
                 "Token usage by provider type and direction (in = prompt/input tokens, out = \
                  completion/output tokens). No emit site calls this yet — token usage today is \
@@ -848,6 +897,9 @@ impl MetricsRegistry {
             }
             for event in ADMIN_IDENTITY_GRANT_EVENTS {
                 counter!(ADMIN_IDENTITY_GRANT_EVENTS_TOTAL, "event" => *event).increment(0);
+            }
+            for outcome in API_KEY_VERIFICATION_OUTCOMES {
+                counter!(API_KEY_VERIFICATION_TOTAL, "outcome" => *outcome).increment(0);
             }
             // Both envelope families that *can* be seeded are, across their full closed domains:
             // five profiles for seals, and five profiles times sixteen reasons for refusals. The
@@ -1155,6 +1207,24 @@ impl MetricsRegistry {
                 "outcome" => outcome
             )
             .increment(1);
+        });
+    }
+
+    /// Records one attempt to take a permit from the Argon2id credential-hashing gate (#176).
+    ///
+    /// `queue_wait` is `Some` exactly when `admitted` is true. That is not a convenience: a shed
+    /// waited the configured timeout by construction, so histogramming it would add a spike at a
+    /// constant and bury the rising p99 that is the only early warning this control has. The
+    /// `Option` makes "there is nothing meaningful to record here" a shape the caller has to
+    /// state, rather than a value it could plausibly pass by accident.
+    pub fn record_api_key_verification(&self, admitted: bool, queue_wait: Option<Duration>) {
+        let outcome = if admitted { "admitted" } else { "shed" };
+        let seconds = queue_wait.map(|wait| wait.as_secs_f64());
+        with_local_recorder(&self.inner.recorder, || {
+            counter!(API_KEY_VERIFICATION_TOTAL, "outcome" => outcome).increment(1);
+            if let Some(seconds) = seconds {
+                histogram!(API_KEY_VERIFICATION_QUEUE_SECONDS).record(seconds);
+            }
         });
     }
 
@@ -1733,6 +1803,10 @@ fn build_recorder(service_name: &str) -> PrometheusRecorder {
         ),
         (RETRIEVAL_LATENCY_SECONDS, RETRIEVAL_LATENCY_BUCKETS_SECONDS),
         (FLOW_DURATION_SECONDS, FLOW_DURATION_BUCKETS_SECONDS),
+        (
+            API_KEY_VERIFICATION_QUEUE_SECONDS,
+            API_KEY_VERIFICATION_QUEUE_BUCKETS_SECONDS,
+        ),
     ] {
         builder = builder
             .set_buckets_for_metric(Matcher::Full(name.to_string()), buckets)
@@ -2601,6 +2675,59 @@ mod tests {
         assert!(rendered.contains(&format!(
             "{RUNTIME_INVALIDATIONS_TOTAL}{{service=\"moira-test\",channel=\"redis\"}} 0"
         )));
+    }
+
+    /// The Argon2 gate's two families (#176).
+    ///
+    /// Both `outcome` series are asserted seeded, and that is the load-bearing half: the alert an
+    /// operator writes is `rate(moira_api_key_verification_total{outcome="shed"}[5m])`, and on a
+    /// process that has never shed one, an unseeded family evaluates to "no data" rather than to
+    /// zero — which is indistinguishable from the exporter having lost the family.
+    ///
+    /// The histogram is asserted to move on an admission and **not** on a shed. That asymmetry is
+    /// deliberate (a shed waited exactly the timeout, so it carries no information and would
+    /// distort the tail) and it is the sort of intent that quietly inverts on a later edit.
+    #[test]
+    fn the_api_key_verification_gate_seeds_both_outcomes_and_times_only_admissions() {
+        let metrics = registry();
+        let seeded = metrics.render_prometheus("moira-test", false, false);
+        for outcome in API_KEY_VERIFICATION_OUTCOMES {
+            assert!(
+                seeded.contains(&format!(
+                    "{API_KEY_VERIFICATION_TOTAL}{{service=\"moira-test\",outcome=\"{outcome}\"}} 0"
+                )),
+                "{API_KEY_VERIFICATION_TOTAL} is missing its zero-seeded {outcome} series:\n{seeded}"
+            );
+        }
+
+        metrics.record_api_key_verification(true, Some(Duration::from_millis(4)));
+        metrics.record_api_key_verification(false, None);
+        metrics.record_api_key_verification(false, None);
+        let rendered = metrics.render_prometheus("moira-test", false, false);
+
+        assert!(rendered.contains(&format!(
+            "{API_KEY_VERIFICATION_TOTAL}{{service=\"moira-test\",outcome=\"admitted\"}} 1"
+        )));
+        assert!(rendered.contains(&format!(
+            "{API_KEY_VERIFICATION_TOTAL}{{service=\"moira-test\",outcome=\"shed\"}} 2"
+        )));
+
+        // One observation in the histogram, from the one admission — not three.
+        assert_eq!(
+            bucket_count(&rendered, API_KEY_VERIFICATION_QUEUE_SECONDS, "+Inf"),
+            1,
+            "the queue histogram must record admissions only:\n{rendered}"
+        );
+        // And it landed in a bucket that can see a 4 ms wait, which is what makes the bucket
+        // choice a measurement rather than decoration.
+        assert_eq!(
+            bucket_count(&rendered, API_KEY_VERIFICATION_QUEUE_SECONDS, "0.001"),
+            0
+        );
+        assert_eq!(
+            bucket_count(&rendered, API_KEY_VERIFICATION_QUEUE_SECONDS, "0.005"),
+            1
+        );
     }
 
     /// The three envelope families' label keys and values, checked at the registry.

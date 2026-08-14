@@ -137,6 +137,24 @@ surfaces.
 | `moira_admin_invite_outcomes_total` | counter | `outcome` | `created`, `redeemed`, plus bounded denial reasons and `other`; seeded |
 | `moira_admin_identity_grant_events_total` | counter | `event` | `granted`, `revoked`, `ownership_transferred`; seeded |
 
+### Credential hashing
+
+| Family | Type | Labels | Notes |
+|---|---|---|---|
+| `moira_api_key_verification_total` | counter | `outcome` = `admitted` \| `shed` | Argon2id gate admissions; seeded across both values |
+| `moira_api_key_verification_queue_seconds` | histogram | — | wait for a gate permit; **admitted only**; buckets 100µs → 1s |
+
+`shed` is one API-key verification or mint refused with
+`503 auth_verification_overloaded` after waiting `api_keys.verification_queue_timeout_ms` for one
+of the `api_keys.verification_concurrency` permits. The credential was never checked, so a
+sustained `shed` rate is a capacity signal, not an authentication problem — raise
+`resources.limits.cpu` and the bound together, because the default bound is derived from the core
+count. See [concurrency-and-backpressure.md](concurrency-and-backpressure.md).
+
+The histogram deliberately excludes sheds: a shed waited exactly the configured timeout by
+construction, so recording it would pile a constant onto the distribution and hide the rise that
+is the only early warning this control has.
+
 ### Content envelopes
 
 | Family | Type | Labels | Notes |

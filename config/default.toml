@@ -82,6 +82,26 @@ allow_insecure_dev_pepper = true
 # than clamping it; see `src/security/api_keys.rs`.
 prefix_length = 20
 
+# Concurrent Argon2id operations (verify on every authenticated request, hash on every key mint).
+# This is a MEMORY budget as much as a concurrency one: one operation holds a 19 MiB arena
+# resident, so the peak is this number x 19 MiB against `resources.limits.memory` in
+# `charts/moira/values.yaml` — 2Gi as shipped. Commented out, which means "derive it": one permit
+# per core, clamped to [1, 8]. Rust reads the cgroup CPU quota, so the chart's `limits.cpu: "2"`
+# derives 2 permits and a 38 MiB peak, 1.9% of the limit.
+#
+# Argon2id at p=1 is single-threaded per call, so raising this above the core count buys ZERO
+# throughput and costs 19 MiB and queueing latency per extra permit. Raise `resources.limits.cpu`
+# and this together, or leave it derived. `Settings::validate` refuses 0 and anything above 64.
+# verification_concurrency = 2
+
+# How long a request waits for one of those permits before being refused with a
+# `503 auth_verification_overloaded`. Not zero: instant shedding at a bound of 2 would refuse a
+# well-behaved caller's two-request burst. Not the route timeout either, which is never below
+# 30 s — a thirty-second wait for a credential check is a different outage, not a fix. 250 ms is
+# roughly five service times at a bound of 2, so a burst absorbs and a real overload is refused
+# in a quarter of a second. See `src/security/api_keys.rs`.
+verification_queue_timeout_ms = 250
+
 [provider_security]
 allow_private_provider_urls = false
 allow_http_provider_urls = false
