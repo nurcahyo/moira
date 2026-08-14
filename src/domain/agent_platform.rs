@@ -305,6 +305,11 @@ pub enum FlowStepRunStatus {
     Skipped,
 }
 
+/// A flow's steps are managed as an ordered array inside this record rather than through a
+/// separate `agent_flow_steps` sub-resource (decision 13: simplest contract, matches the
+/// sequential-only MVP) — `create`/`patch` accept the whole ordered list in the request body
+/// and this record echoes the current list back, so a client never has to reconcile a
+/// separately-paginated child collection with its parent.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AgentFlowRecord {
     pub id: Uuid,
@@ -317,6 +322,7 @@ pub struct AgentFlowRecord {
     pub updated_at: DateTime<Utc>,
     pub deleted_at: Option<DateTime<Utc>>,
     pub version: i64,
+    pub steps: Vec<AgentFlowStepRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -327,6 +333,11 @@ pub struct AgentFlowCreateRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub metadata: Value,
+    /// The flow's steps, in the order they execute. May be empty — a flow can be authored
+    /// before its steps are decided; it simply cannot run yet (there is no execution engine
+    /// in this MVP regardless).
+    #[serde(default)]
+    pub steps: Vec<AgentFlowStepCreateRequest>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
@@ -335,6 +346,10 @@ pub struct AgentFlowPatchRequest {
     pub display_name: Option<String>,
     pub description: Option<String>,
     pub metadata: Option<Value>,
+    /// `Some(steps)` atomically replaces the flow's entire ordered step list; `None` (the
+    /// field omitted) leaves the existing steps untouched — the same coalesce convention
+    /// every other patch request in this module follows for its scalar fields.
+    pub steps: Option<Vec<AgentFlowStepCreateRequest>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
