@@ -36,10 +36,10 @@ use crate::{
         ListResponse, PageQuery, SetupClaimStatusResponse,
     },
     error::{AppError, ErrorResponse},
-    security::{Actor, header_string},
+    security::header_string,
 };
 
-use super::admin::{etag_headers, require_if_match};
+use super::admin::{admin_actor_with_issuer, etag_headers, require_if_match};
 
 #[utoipa::path(
     get, path = "/api/v1/admin/setup/claim-status", tag = "admin-setup",
@@ -179,21 +179,6 @@ fn claim_body_rejection(rejection: JsonRejection) -> AppError {
 // admin timeout. `claim-status` is anonymous and stays under the prefix for exactly that
 // reason. The prefix is about layers and spec visibility, not about scope gating.
 // =======================================================================================
-
-/// `authenticate_admin` plus the **verified** issuer, which the two ownership operations
-/// need because ownership is row state keyed by `(issuer, subject)`.
-///
-/// Delegates to the same `AuthService` entry point `admin_actor` does, so there is one
-/// transcription of "authenticate the admin plane".
-async fn admin_actor_with_issuer(
-    state: &AppState,
-    headers: &HeaderMap,
-) -> Result<(Actor, Option<String>), AppError> {
-    state
-        .auth
-        .authenticate_admin_with_issuer(state.pool()?, headers)
-        .await
-}
 
 #[utoipa::path(
     post, path = "/api/v1/admin/admin-invites", tag = "admin-invites",

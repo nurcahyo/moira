@@ -151,6 +151,11 @@ const ROUTES_NOT_AUDITED_PENDING_AUTHENTICATED_E2E: readonly string[] = [
   // the authenticated stack, and that stack's Moira fixture has no application
   // or consumer-key surface yet.
   "/settings/keys",
+  // Issue #185. Gated like the rest of `(console)`, so the walker asserts the
+  // redirect and audits nothing. A real gap, like `/settings/keys`: no
+  // authenticated spec renders it, and the surface it hides is the one that
+  // decides whether anybody can sign in at all.
+  "/settings/auth",
 ];
 
 /** The pathname a route's fixture URL resolves to. */

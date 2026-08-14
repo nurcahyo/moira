@@ -884,7 +884,19 @@ impl<'a> AdminIdentityService<'a> {
     /// is the safe direction to be wrong in. System-key and dev-admin callers pass
     /// because break-glass must keep working — that is the documented last resort when
     /// no primary remains, and this wave does not remove it.
-    async fn require_primary_actor(
+    ///
+    /// # It is `pub` because a second surface needs the same answer (issue #185)
+    ///
+    /// `AuthProviderSettingsService`'s write methods call this. Rewriting the
+    /// deployment's sign-in configuration is the one administrative act that can lock
+    /// every other admin out — a wrong `client_id`, a wrong discovery URL or a disable
+    /// takes the console's only door with it — so it belongs to the owner for the same
+    /// reason ownership transfer does, and it must be the *same* check rather than a
+    /// second implementation that can drift from this one.
+    ///
+    /// It is exported rather than duplicated, and the copy on
+    /// `moira.error.admin_identity_not_primary` was widened to cover both surfaces.
+    pub async fn require_primary_actor(
         &self,
         actor: &Actor,
         issuer: Option<&str>,

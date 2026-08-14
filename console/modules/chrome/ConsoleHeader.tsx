@@ -62,6 +62,7 @@ const NAV_ITEMS: readonly NavItem[] = [
   { href: "/", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_home },
   { href: "/settings/llm", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_llm_settings },
   { href: "/settings/keys", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_keys },
+  { href: "/settings/auth", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_auth_settings },
   { href: "/admins", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_admins },
 ];
 

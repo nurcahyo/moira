@@ -1282,6 +1282,125 @@ async fn a_non_primary_admin_cannot_promote_itself_to_primary() {
     );
 }
 
+/// Issue #185 — the SAME ownership rule, on the surface where getting it wrong is worst.
+///
+/// # Why this test lives beside the identity one rather than in `auth_provider_settings.rs`
+///
+/// It needs a non-primary admin, and building one takes the whole invite/redeem harness in
+/// this file: a provider, a console issuer, an owner grant to occupy the ownership slot,
+/// and a second grant to act as. Duplicating that into the auth-settings suite would be a
+/// second copy of the premise, and a premise that drifts is how an ownership test starts
+/// passing against an implementation with no check in it.
+///
+/// # What it holds
+///
+/// Rewriting `auth_provider_settings` rewrites the deployment's only sign-in door, and the
+/// client secret it needs lives in the console rather than in Moira — so a bad write cannot
+/// be repaired through this API at all. Before #185 every admin could make one:
+/// `moira:auth-settings:write` is implied by `moira:admin`, which every grant carries.
+#[tokio::test]
+async fn a_non_primary_admin_cannot_rewrite_the_auth_provider() {
+    let Some(fixture) = LifecycleFixture::new().await else {
+        return;
+    };
+    let issuer = ConsoleIssuer::start(&fixture.pool).await;
+    let router = moira::build_router(fixture.state.clone()).expect("router");
+    let (provider_id, provider_version) = configure_and_enable_policy(
+        &router,
+        PolicyBinding::ByIssuerString {
+            issuer: &issuer.issuer,
+            id: issuer.id,
+        },
+        &["example.com"],
+    )
+    .await;
+
+    // The owner slot has to be occupied by somebody else, for the same reason as the test
+    // above: the first grant takes ownership, so without this the caller under test would
+    // BE the owner and the refusal would never be due.
+    let (_, owner_token) = create_invite(&router, "email", "owner@example.com").await;
+    let owner = redeem(&router, &issuer, "owner", &owner_token).await;
+    assert_eq!(owner.status, StatusCode::CREATED, "{:?}", owner.body);
+
+    let (_, token) = create_invite(&router, "email", "member@example.com").await;
+    let redeemed = post_json(
+        router.clone(),
+        "/api/v1/admin/admin-invites/redeem",
+        issuer.bearer("member-subject"),
+        redeem_body(&token, "member@example.com"),
+    )
+    .await;
+    assert_eq!(redeemed.status, StatusCode::CREATED, "{:?}", redeemed.body);
+
+    // The premise, asserted rather than assumed: this bearer IS admin on this plane. A 403
+    // below could otherwise be an authentication failure wearing the same status code, and
+    // the test would pass against an implementation with no ownership check at all.
+    let read_back = get_with(
+        router.clone(),
+        &format!("/api/v1/admin/auth/providers/{provider_id}"),
+        issuer.bearer("member-subject"),
+    )
+    .await;
+    assert_eq!(
+        read_back.status,
+        StatusCode::OK,
+        "reads stay open to every admin: {:?}",
+        read_back.body
+    );
+
+    let refused = send_json(
+        router.clone(),
+        "PATCH",
+        &format!("/api/v1/admin/auth/providers/{provider_id}"),
+        issuer.bearer("member-subject"),
+        Some(provider_version),
+        json!({ "client_id": "an-attackers-client-id" }),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN, "{:?}", refused.body);
+    assert_eq!(refused.code(), "admin_identity_not_primary");
+
+    // Disable is the other half of the lockout, and it is gated too.
+    let refused_disable = send_json(
+        router.clone(),
+        "POST",
+        &format!("/api/v1/admin/auth/providers/{provider_id}/disable"),
+        issuer.bearer("member-subject"),
+        Some(provider_version),
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        refused_disable.status,
+        StatusCode::FORBIDDEN,
+        "{:?}",
+        refused_disable.body
+    );
+
+    // And the row is untouched, which is the property the status code only implies.
+    let client_id: Option<String> =
+        sqlx::query_scalar("select client_id from auth_provider_settings where id = $1")
+            .bind(provider_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("re-read the provider row");
+    assert_ne!(
+        client_id.as_deref(),
+        Some("an-attackers-client-id"),
+        "a non-primary admin rewrote the deployment's sign-in configuration"
+    );
+    let enabled: bool =
+        sqlx::query_scalar("select enabled from auth_provider_settings where id = $1")
+            .bind(provider_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("re-read the provider row");
+    assert!(
+        enabled,
+        "a non-primary admin disabled the only sign-in door"
+    );
+}
+
 /// The invite's own constraint and the provider allow-list are checked separately and
 /// reported separately, because the remedies differ: reissue the invite versus widen the
 /// allow-list. A console that merged them would send the operator to the wrong screen.

@@ -746,7 +746,7 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
     },
     I18nEntry {
         key: "moira.error.admin_identity_not_primary",
-        default_message: "Only a primary admin identity may manage other admin identities.",
-        description: "Used when a caller who is not a primary admin attempts an ownership transfer or a grant revocation. Ownership is admin_identities.is_primary, not a scope: AuthorizationService::has_scope grants a moira:admin-holding trusted-JWT actor every scope by implication, so a scope could not express 'not every admin'. System-key callers pass this check, because break-glass remains the documented last resort.",
+        default_message: "Only the primary admin identity may do that.",
+        description: "Used when a caller who is not a primary admin attempts an ownership transfer, a grant revocation, or - since issue #185 - a WRITE to the auth-provider settings surface. Ownership is admin_identities.is_primary, not a scope: AuthorizationService::has_scope grants a moira:admin-holding trusted-JWT actor every scope by implication, so a scope could not express 'not every admin'. The message was widened from 'manage other admin identities' when the second surface arrived, because rewriting the sign-in configuration is not identity management and the copy named only the first caller. System-key callers pass this check, because break-glass remains the documented last resort - and on the auth-provider surface it is the ONLY way back in once a bad write has broken sign-in.",
     },
 ];

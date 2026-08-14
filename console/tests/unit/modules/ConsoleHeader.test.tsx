@@ -39,6 +39,18 @@ describe("navigation", () => {
     expect(link.getAttribute("href")).toBe("/settings/llm");
   });
 
+  test("/settings/auth is reachable without typing the URL", () => {
+    // Issue #185. Shown to EVERY admin, not only the owner: reading the sign-in
+    // configuration escalates nothing, and a menu entry that disappears for some
+    // people is a support question nobody can answer from a screenshot. The
+    // screen itself says who may change it.
+    render(<ConsoleHeader />);
+    const link = screen.getByRole("link", {
+      name: copy(CONSOLE_MESSAGE_KEYS.chrome_nav_auth_settings),
+    });
+    expect(link.getAttribute("href")).toBe("/settings/auth");
+  });
+
   test("/settings/keys is reachable without typing the URL", () => {
     // Issue #180's screen, and the same failure mode as the one above: it is the
     // last step of a first run — the credential the operator's own software

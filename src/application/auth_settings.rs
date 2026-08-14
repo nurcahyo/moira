@@ -28,7 +28,7 @@ use uuid::Uuid;
 use crate::{
     app::AppState,
     application::{
-        AdminCommandMutation, AdminCommandRunner, RequestContext,
+        AdminCommandMutation, AdminCommandRunner, AdminIdentityService, RequestContext,
         admin::shared::{
             PageRequest, admin_command_spec, command_hasher, paginate, require_non_empty,
             success_audit,
@@ -66,15 +66,52 @@ impl<'a> AuthProviderSettingsService<'a> {
         })
     }
 
+    /// **Ownership, not scope.** Issue #185's enforcement point on this surface.
+    ///
+    /// # Why this surface, and why it was not gated before
+    ///
+    /// Every write below rewrites the configuration the console signs operators in
+    /// with. A wrong `client_id`, a wrong discovery URL, or a `disable` takes the
+    /// deployment's only door with it — and the OAuth client *secret* lives in the
+    /// console's own store rather than here, so a bad write cannot even be repaired
+    /// through this API. That makes these the most dangerous administrative writes in
+    /// Moira, and until #185 they were the least protected: `moira:auth-settings:write`
+    /// is implied by `moira:admin`, which every grant Moira writes carries, so any
+    /// admin — including one invited minutes earlier — could rewrite them.
+    ///
+    /// # The check is delegated, deliberately
+    ///
+    /// `AdminIdentityService::require_primary_actor` is the SAME check ownership
+    /// transfer and grant revocation use (decision D1). A second implementation here
+    /// would be a second thing to keep in step with `admin_identities.is_primary`, and
+    /// the first time they disagreed one of the two surfaces would be wrong.
+    ///
+    /// System-key and dev-admin callers pass, which is load-bearing rather than
+    /// incidental: the bootstrap system key is what the setup wizard provisions with,
+    /// and — because a broken sign-in configuration cannot be repaired by anyone who
+    /// has to sign in first — it is the documented last way back in.
+    /// See `docs/console-architecture.md`.
+    ///
+    /// READS ARE NOT GATED. Any admin may list and get these rows; the console's
+    /// `/admins` screen reads them to warn about the allow-list, and a read escalates
+    /// nothing.
+    async fn require_owner(&self, actor: &Actor, issuer: Option<&str>) -> Result<(), AppError> {
+        AdminIdentityService::new(self.state)?
+            .require_primary_actor(actor, issuer)
+            .await
+    }
+
     pub async fn create(
         &self,
         actor: &Actor,
+        issuer: Option<&str>,
         ctx: &RequestContext,
         request: AuthProviderSettingsCreateRequest,
     ) -> Result<(AuthProviderSettingsRecord, bool), AppError> {
         self.state
             .authz
             .require(actor, "moira:auth-settings:write")?;
+        self.require_owner(actor, issuer).await?;
         require_non_empty("display_name", &request.display_name)?;
         validate_method_shape(
             request.method,
@@ -180,6 +217,7 @@ impl<'a> AuthProviderSettingsService<'a> {
     pub async fn patch(
         &self,
         actor: &Actor,
+        issuer: Option<&str>,
         ctx: &RequestContext,
         id: Uuid,
         expected_version: i64,
@@ -188,6 +226,7 @@ impl<'a> AuthProviderSettingsService<'a> {
         self.state
             .authz
             .require(actor, "moira:auth-settings:write")?;
+        self.require_owner(actor, issuer).await?;
         if let Some(display_name) = &request.display_name {
             require_non_empty("display_name", display_name)?;
         }
@@ -268,6 +307,7 @@ impl<'a> AuthProviderSettingsService<'a> {
     pub async fn set_enabled(
         &self,
         actor: &Actor,
+        issuer: Option<&str>,
         ctx: &RequestContext,
         id: Uuid,
         expected_version: i64,
@@ -276,6 +316,7 @@ impl<'a> AuthProviderSettingsService<'a> {
         self.state
             .authz
             .require(actor, "moira:auth-settings:write")?;
+        self.require_owner(actor, issuer).await?;
         if enabled {
             let current = self.settings.get(id).await?;
             validate_method_shape(
@@ -320,6 +361,7 @@ impl<'a> AuthProviderSettingsService<'a> {
     pub async fn delete(
         &self,
         actor: &Actor,
+        issuer: Option<&str>,
         ctx: &RequestContext,
         id: Uuid,
         expected_version: i64,
@@ -327,6 +369,7 @@ impl<'a> AuthProviderSettingsService<'a> {
         self.state
             .authz
             .require(actor, "moira:auth-settings:delete")?;
+        self.require_owner(actor, issuer).await?;
         self.settings
             .soft_delete(
                 id,
