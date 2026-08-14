@@ -592,6 +592,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # PINNED TO THE OLD JOB NAME, and it has to be. `Swatinem/rust-cache` derives
+          # its key from `${{ github.job }}` when no `shared-key` is given, so renaming
+          # this job from `supply-chain` to `supply-chain-scan` silently orphaned its
+          # cache: `cargo install cargo-audit cargo-deny --locked` went from 19s to 302s
+          # on demonstration run 31834960269, measured. Nothing failed and nothing warned
+          # — the job was simply sixteen times slower, which is exactly the sort of thing
+          # a rename is not supposed to be able to do. `supply-chain` is this key's only
+          # user; `rust-lint` and `rust-test` are the other two in this file.
+          shared-key: supply-chain
       - run: cargo install cargo-audit cargo-deny --locked
       - run: cargo audit
       - run: cargo deny check

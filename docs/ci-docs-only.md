@@ -135,6 +135,23 @@ docker-compose.yml   .gitleaks.toml   .dockerignore   .env.example
 
 `scripts/**` includes this mechanism itself: a change to the filter runs the full suite.
 
+### Renaming a job orphans its build cache
+
+`Swatinem/rust-cache` derives its key from `${{ github.job }}` unless given an explicit
+`shared-key`. Renaming `supply-chain` to `supply-chain-scan` therefore pointed it at a
+key nothing had ever written, and `cargo install cargo-audit cargo-deny --locked` went
+from 19s to 302s — measured on demonstration run `31834960269`. Nothing failed and
+nothing warned; the job was simply sixteen times slower.
+
+`supply-chain-scan` now pins `shared-key: supply-chain`, which is the key the job had
+before the rename. The other renamed jobs were unaffected and were checked, not assumed:
+`rotation-gate-run` already pinned `shared-key: rust-test`, `console-checks` caches
+through `setup-bun` on the lockfile hash, and `sast-scan` and `container-and-helm-build`
+use no `rust-cache` at all. Their durations across the demonstration runs match the
+develop baseline.
+
+**If you rename a job in this file, check what its cache key was derived from.**
+
 ## Fail closed, always towards running more
 
 Every uncertainty resolves to `docs_only=false`:
