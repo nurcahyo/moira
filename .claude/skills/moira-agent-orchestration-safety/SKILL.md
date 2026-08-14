@@ -1,6 +1,6 @@
 ---
 name: moira-agent-orchestration-safety
-description: Rules for running multiple agents against this repository — working-tree and cargo-lock isolation, and how to verify what an agent claims it did. Use when authoring a multi-agent workflow, spawning parallel subagents, running any benchmark, or reviewing work an agent reports as finished.
+description: Rules for running multiple agents against this repository — never mutating repository settings, working-tree and cargo-lock isolation, and how to verify what an agent claims it did. Use when authoring a multi-agent workflow, spawning parallel subagents, running any benchmark, or reviewing work an agent reports as finished.
 ---
 
 # Agent orchestration safety
