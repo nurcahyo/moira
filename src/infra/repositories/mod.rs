@@ -3,6 +3,10 @@ mod agent_platform;
 mod auth_settings;
 mod cluster;
 mod conversation;
+// Issue #234 (plan 12 §4). Read-only reads for the derived relationship graph, sibling to
+// `agent_platform` and `runtime` and owning no table of its own — see the module's header for
+// why this is one repository rather than five bespoke additions elsewhere.
+mod graph;
 mod identity;
 // Issue #93. The keyset SQL builder plan 04 wrote for the nine admin lists, lifted out of
 // `admin` so the four public lists page on the same predicate rather than a second copy of
@@ -25,6 +29,7 @@ pub use admin::{
 // Issue #214 (plan 12 §3). The agent-platform registries (skills now; evals/flows to follow)
 // as one Postgres repository, sibling to `runtime` and `admin` and owning disjoint tables.
 pub use agent_platform::PgAgentPlatformRepository;
+pub use graph::PgGraphRepository;
 // Plan 07 modules 5-6. Both ship as a trait plus one Postgres implementation from their
 // first commit, so no later plan has to retrofit the seam onto a surface that already has
 // callers — the retrofit P2-3 had to perform for `AdminRepository` and `SetupRepository`.

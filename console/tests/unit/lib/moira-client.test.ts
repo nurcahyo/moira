@@ -695,6 +695,11 @@ const OPERATIONS_OUTSIDE_THE_LLM_AND_AUTH_PROVIDER_SURFACES = [
   "deleteAdminIdentity",
   "enableTrustedJwtIssuer",
   "getAdminInvite",
+  // Issue #234 (plan 12 §4). The derived relationship graph is a read over the
+  // agent-platform and provider/model registries, not LLM runtime configuration
+  // itself (it names no provider, model, or routing knob to change) and not an
+  // auth-provider operation.
+  "getGraph",
   "getSetupAuthMethods",
   "getSetupClaimStatus",
   "getSetupSignInMethods",

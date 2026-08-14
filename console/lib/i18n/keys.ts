@@ -46,6 +46,7 @@
 //   console.admins.*  the /admins screen — grants, invitations, ownership
 //   console.invite.*  the public /invite/[token] redemption page
 //   console.llm.*     the /settings/llm screen — providers, models, routing
+//   console.graph.*   the /graph screen — the derived relationship graph (plan 12 §4)
 
 /* -------------------------------------------------------------------------- */
 /* The table                                                                  */
@@ -145,6 +146,7 @@ export const CONSOLE_MESSAGE_KEYS = {
 
   page_admins_title: "console.page.admins_title",
   page_invite_title: "console.page.invite_title",
+  page_graph_title: "console.page.graph_title",
 
   /* --- generic actions ---------------------------------------------------- */
   action_copy: "console.action.copy",
@@ -157,6 +159,7 @@ export const CONSOLE_MESSAGE_KEYS = {
   chrome_nav_home: "console.chrome.nav_home",
   chrome_nav_admins: "console.chrome.nav_admins",
   chrome_nav_llm_settings: "console.chrome.nav_llm_settings",
+  chrome_nav_graph: "console.chrome.nav_graph",
   chrome_nav_keys: "console.chrome.nav_keys",
   chrome_nav_auth_settings: "console.chrome.nav_auth_settings",
   chrome_sign_out: "console.chrome.sign_out",
@@ -504,6 +507,20 @@ export const CONSOLE_MESSAGE_KEYS = {
   claude_subscription_token_invalid: "console.claudeSubscription.token_invalid",
   claude_subscription_request_body_invalid: "console.claudeSubscription.request_body_invalid",
   claude_subscription_list_truncated: "console.claudeSubscription.list_truncated",
+
+  /* --- the /graph screen (plan 12 §4, issue #234) -------------------------- */
+  graph_intro: "console.graph.intro",
+  graph_request_failed: "console.graph.request_failed",
+  graph_empty: "console.graph.empty",
+  graph_legend_label: "console.graph.legend_label",
+  graph_node_type_agent: "console.graph.node_type_agent",
+  graph_node_type_skill: "console.graph.node_type_skill",
+  graph_node_type_eval_suite: "console.graph.node_type_eval_suite",
+  graph_node_type_flow: "console.graph.node_type_flow",
+  graph_node_type_provider: "console.graph.node_type_provider",
+  graph_node_type_model: "console.graph.node_type_model",
+  graph_node_type_memory_scope: "console.graph.node_type_memory_scope",
+  graph_canvas_label: "console.graph.canvas_label",
 } as const;
 
 /** Every console-originated key, as a union of string literals. */

@@ -2,6 +2,7 @@ mod admin;
 mod agent_platform;
 mod auth_settings;
 mod conversation;
+mod graph;
 mod i18n;
 mod identity;
 mod ids;
@@ -52,6 +53,14 @@ pub use conversation::{
     RagCollectionVisibility, RagDocumentCreateRequest, RagDocumentIngestRequest, RagDocumentRecord,
     RagDocumentStatus, RagIngestionStatus, ResponseConversationInput, RetrievalPolicyPutRequest,
     RetrievalPolicyRecord,
+};
+// Issue #234 (plan 12 §4). `assemble_graph` and the raw row types are exported alongside the
+// wire types (`GraphNode`/`GraphEdge`/`GraphResponse`) so `infra::repositories::graph` can
+// decode into them and `application::graph` can call the pure assembler — both need more than
+// the OpenAPI-facing shapes.
+pub use graph::{
+    AgentProfileGraphRow, AgentRouteEdgeRow, FlowStepGraphRow, GraphEdge, GraphEdgeKind, GraphNode,
+    GraphNodeType, GraphRawData, GraphResponse, NamedStatusGraphRow, assemble_graph,
 };
 pub use i18n::{ResponseText, ResponseTextArgs};
 pub use identity::{

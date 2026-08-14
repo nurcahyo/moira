@@ -1,0 +1,186 @@
+.wrapper {
+  display: flex;
+  gap: 1.5rem;
+  align-items: flex-start;
+}
+
+.canvas {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 70vh;
+  min-height: 420px;
+  border: 1px solid #e5e7eb;
+  border-radius: 0.5rem;
+  background-color: #f9fafb;
+}
+
+.legend {
+  flex: 0 0 auto;
+  width: 220px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.legendHeading {
+  margin: 0 0 0.25rem;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: #374151;
+}
+
+.legendItem {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.8125rem;
+  color: #374151;
+}
+
+.swatch {
+  width: 0.75rem;
+  height: 0.75rem;
+  border-radius: 0.1875rem;
+  flex: 0 0 auto;
+}
+
+.empty {
+  padding: 2rem;
+  text-align: center;
+  color: #4b5563;
+  border: 1px dashed #d1d5db;
+  border-radius: 0.5rem;
+}
+
+/* --- node colors, one per GraphNodeType ------------------------------------ */
+
+.nodeAgent,
+.swatchAgent {
+  background-color: #dbeafe;
+  color: #1e40af;
+  border-color: #93c5fd;
+}
+
+.nodeSkill,
+.swatchSkill {
+  background-color: #dcfce7;
+  color: #166534;
+  border-color: #86efac;
+}
+
+.nodeEvalSuite,
+.swatchEvalSuite {
+  background-color: #ede9fe;
+  color: #5b21b6;
+  border-color: #c4b5fd;
+}
+
+.nodeFlow,
+.swatchFlow {
+  background-color: #fef3c7;
+  color: #92400e;
+  border-color: #fcd34d;
+}
+
+.nodeProvider,
+.swatchProvider {
+  background-color: #f3f4f6;
+  color: #374151;
+  border-color: #d1d5db;
+}
+
+.nodeModel,
+.swatchModel {
+  background-color: #cffafe;
+  color: #155e75;
+  border-color: #67e8f9;
+}
+
+.nodeMemoryScope,
+.swatchMemoryScope {
+  background-color: #fce7f3;
+  color: #9d174d;
+  border-color: #f9a8d4;
+}
+
+.node {
+  border-width: 1px;
+  border-style: solid;
+  border-radius: 0.375rem;
+  padding: 0.375rem 0.625rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  text-align: center;
+}
+
+/* Synthetic memory_scope nodes carry no lifecycle status of their own — a dashed border
+   marks that visually, matching the plan's "one visual style per node type" guidance. */
+.nodeMemoryScope {
+  border-style: dashed;
+}
+
+@media (prefers-color-scheme: dark) {
+  .canvas {
+    border-color: #374151;
+    background-color: #111827;
+  }
+
+  .legendHeading,
+  .legendItem {
+    color: #e5e7eb;
+  }
+
+  .empty {
+    color: #9ca3af;
+    border-color: #374151;
+  }
+
+  .nodeAgent,
+  .swatchAgent {
+    background-color: #1e3a8a;
+    color: #dbeafe;
+    border-color: #1d4ed8;
+  }
+
+  .nodeSkill,
+  .swatchSkill {
+    background-color: #14532d;
+    color: #dcfce7;
+    border-color: #15803d;
+  }
+
+  .nodeEvalSuite,
+  .swatchEvalSuite {
+    background-color: #4c1d95;
+    color: #ede9fe;
+    border-color: #6d28d9;
+  }
+
+  .nodeFlow,
+  .swatchFlow {
+    background-color: #78350f;
+    color: #fef3c7;
+    border-color: #b45309;
+  }
+
+  .nodeProvider,
+  .swatchProvider {
+    background-color: #374151;
+    color: #f3f4f6;
+    border-color: #4b5563;
+  }
+
+  .nodeModel,
+  .swatchModel {
+    background-color: #164e63;
+    color: #cffafe;
+    border-color: #0e7490;
+  }
+
+  .nodeMemoryScope,
+  .swatchMemoryScope {
+    background-color: #831843;
+    color: #fce7f3;
+    border-color: #be185d;
+  }
+}

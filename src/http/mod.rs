@@ -2,6 +2,8 @@ mod admin;
 mod agent_platform;
 mod auth_settings;
 mod conversation;
+// Issue #234 (plan 12 §4). The read-only relationship-graph admin handler.
+mod graph;
 mod health;
 mod identity;
 mod observability;
@@ -659,6 +661,8 @@ fn admin_routes() -> OpenApiRouter<AppState> {
             agent_platform::patch_skill_executor,
             agent_platform::delete_skill_executor
         ))
+        // Issue #234 (plan 12 §4) — the derived, read-only relationship graph.
+        .routes(routes!(graph::get_graph))
 }
 
 #[cfg(test)]
@@ -754,6 +758,7 @@ mod tests {
             "/api/v1/admin/skills/import",
             "/api/v1/admin/skill-executors",
             "/api/v1/admin/skills/{id}/executor",
+            "/api/v1/admin/graph",
             "/api/v1/admin/runtime/diagnose",
             "/api/v1/admin/rag-collections",
             "/api/v1/admin/rag-collections/{id}",
@@ -818,7 +823,8 @@ mod tests {
         // + issue #237 (plan 12 §5, workstream H) OpenAPI import + skill_http_executors CRUD:
         //   POST .../skills/import, GET .../skill-executors,
         //   GET/PATCH/DELETE .../skills/{id}/executor = 5.
-        assert_eq!(operation_count, 167);
+        // + issue #234 (plan 12 §4) the derived relationship graph: GET /api/v1/admin/graph = 1.
+        assert_eq!(operation_count, 168);
     }
 
     #[test]

@@ -2868,6 +2868,92 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "The provider list was truncated before a match could be confirmed absent, so the " +
       "console refused to guess rather than risk creating a duplicate provider row.",
   },
+
+  /* --- the /graph screen (plan 12 §4, issue #234) --------------------------- */
+  [K.page_graph_title]: {
+    key: K.page_graph_title,
+    message: "Relationship graph",
+    description: "Heading of the /graph page.",
+  },
+  [K.chrome_nav_graph]: {
+    key: K.chrome_nav_graph,
+    message: "Graph",
+    description: "Chrome nav link to /graph.",
+  },
+  [K.graph_intro]: {
+    key: K.graph_intro,
+    message:
+      "How agents, skills, evaluation suites, flows, providers and models reference each " +
+      "other, read straight off their configuration — nothing here is a separate record kept " +
+      "in sync by hand.",
+    description: "Introductory copy on the /graph page, stating the derived-not-stored design.",
+  },
+  [K.graph_request_failed]: {
+    key: K.graph_request_failed,
+    message: "Could not reach Moira to build the graph. Try again shortly.",
+    description:
+      "Shown when GET /api/v1/admin/graph could not be reached, mirroring " +
+      "admins_request_failed's fail-as-a-page-not-a-500 posture.",
+  },
+  [K.graph_empty]: {
+    key: K.graph_empty,
+    message:
+      "Nothing to show yet — no agents, skills, evaluation suites, flows, providers or models are configured.",
+    description: "Shown when the graph has no nodes at all.",
+  },
+  [K.graph_legend_label]: {
+    key: K.graph_legend_label,
+    message: "Node types",
+    description: "Accessible label for the node-type legend beside the canvas.",
+  },
+  [K.graph_node_type_agent]: {
+    key: K.graph_node_type_agent,
+    message: "Agent",
+    description: "Legend label for the agent node type.",
+  },
+  [K.graph_node_type_skill]: {
+    key: K.graph_node_type_skill,
+    message: "Skill",
+    description: "Legend label for the skill node type.",
+  },
+  [K.graph_node_type_eval_suite]: {
+    key: K.graph_node_type_eval_suite,
+    message: "Evaluation suite",
+    description: "Legend label for the eval_suite node type.",
+  },
+  [K.graph_node_type_flow]: {
+    key: K.graph_node_type_flow,
+    message: "Flow",
+    description: "Legend label for the flow node type.",
+  },
+  [K.graph_node_type_provider]: {
+    key: K.graph_node_type_provider,
+    message: "LLM provider",
+    description:
+      'Legend label for the provider node type. "LLM provider", not the bare "Provider" ' +
+      "console.llm.step_provider already uses, so the two entries read distinctly and the " +
+      "no-duplicate-English catalog test can tell them apart.",
+  },
+  [K.graph_node_type_model]: {
+    key: K.graph_node_type_model,
+    message: "LLM model",
+    description:
+      'Legend label for the model node type. "LLM model", not the bare "Model" ' +
+      "console.llm.step_provider_model already uses, for the same reason as the provider " +
+      "entry above.",
+  },
+  [K.graph_node_type_memory_scope]: {
+    key: K.graph_node_type_memory_scope,
+    message: "Memory scope",
+    description:
+      "Legend label for the synthetic memory_scope node type — one per distinct scope in " +
+      "use, not one per memory record.",
+  },
+  [K.graph_canvas_label]: {
+    key: K.graph_canvas_label,
+    message: "Relationship graph canvas",
+    description: "Accessible label for the react-flow canvas region.",
+  },
 };
 
 /** Every entry, as a plain array. */
