@@ -106,6 +106,56 @@ describe("each refusal state renders its own message and no button", () => {
   }
 });
 
+describe("a refusal with an open setup window offers the way out of it", () => {
+  test("the link appears only when the SERVER said the window is open", () => {
+    // `/` sends a signed-out visitor to `/login`, and the first-run copy there
+    // says "Finish setting up this deployment first" — advice with nothing to
+    // click until this link existed. It is opt-in per render precisely because
+    // the same refusal shows on a CLAIMED deployment whose provider broke, and
+    // `/setup` cannot help that operator.
+    render(
+      <SignInPanel
+        state={{
+          kind: "unavailable",
+          messageKey: CONSOLE_MESSAGE_KEYS.no_enabled_auth_provider,
+          setupOpen: true,
+        }}
+      />,
+    );
+    const link = screen.getByRole("link", {
+      name: copy(CONSOLE_MESSAGE_KEYS.sign_in_go_to_setup),
+    });
+    expect(link.getAttribute("href")).toBe("/setup");
+  });
+
+  test("the same refusal without the flag stays a dead end, deliberately", () => {
+    render(
+      <SignInPanel
+        state={{
+          kind: "unavailable",
+          messageKey: CONSOLE_MESSAGE_KEYS.no_enabled_auth_provider,
+        }}
+      />,
+    );
+    expect(screen.queryAllByRole("link")).toEqual([]);
+  });
+
+  test("it is a link, not a button — the refusal renders with no client bundle", () => {
+    // The panel's own invariant is that a refusal state renders ZERO buttons,
+    // and this remedy must not become the exception that erodes it.
+    render(
+      <SignInPanel
+        state={{
+          kind: "unavailable",
+          messageKey: CONSOLE_MESSAGE_KEYS.no_enabled_auth_provider,
+          setupOpen: true,
+        }}
+      />,
+    );
+    expect(screen.queryAllByRole("button")).toEqual([]);
+  });
+});
+
 describe("the server-supplied message is the fallback, and the catalog wins", () => {
   test("a key the console catalogues ignores the server's prose", () => {
     render(

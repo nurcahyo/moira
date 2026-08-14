@@ -106,6 +106,9 @@ const SIGN_IN_ENDPOINT = "/api/auth/sign-in/oauth2";
 /** Where a completed sign-in lands. Relative on purpose — never an absolute URL. */
 const CALLBACK_PATH = "/";
 
+/** The first-run wizard. Relative for the same reason as the callback. */
+const SETUP_PATH = "/setup";
+
 /**
  * What the server resolved.
  *
@@ -149,6 +152,17 @@ export type SignInPanelState =
       readonly messageKey: string;
       readonly message?: string;
       readonly messageArgs?: JsonValue;
+      /**
+       * The first-run wizard is still open, so the refusal has a remedy the
+       * visitor can reach (issue #182).
+       *
+       * Resolved SERVER-SIDE, by the same `GET /api/setup` gate the wizard
+       * itself answers to — never assumed from the refusal key. `/setup` on a
+       * claimed deployment renders its own closed state, so a link offered
+       * whenever sign-in is unavailable would send an operator whose provider
+       * merely broke to a page that cannot help them.
+       */
+      readonly setupOpen?: boolean;
     };
 
 export interface SignInPanelProps {
@@ -191,6 +205,15 @@ export function SignInPanel({ state, fetchImpl, navigate }: SignInPanelProps) {
         <p className={styles.problem} role="alert">
           {t(state.messageKey, state.messageArgs, state.message)}
         </p>
+        {/* A plain anchor, not the sign-in Button: this is navigation to another
+            page, and `/setup` must stay reachable even if the client bundle
+            never hydrates — which on a deployment with no provider configured is
+            exactly the state the visitor is stuck in. */}
+        {state.setupOpen === true && (
+          <a className={styles.setuplink} href={SETUP_PATH}>
+            {t(CONSOLE_MESSAGE_KEYS.sign_in_go_to_setup)}
+          </a>
+        )}
       </section>
     );
   }
