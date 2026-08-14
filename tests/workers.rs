@@ -62,6 +62,8 @@ mod support;
 mod cluster_admission;
 #[path = "workers/coordination_default_path.rs"]
 mod coordination_default_path;
+#[path = "workers/job_dispatch.rs"]
+mod job_dispatch;
 #[path = "workers/retention_worker.rs"]
 mod retention_worker;
 #[path = "workers/worker_leader_election.rs"]

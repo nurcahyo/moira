@@ -17,14 +17,16 @@
 //!
 //! # There is no production producer yet, deliberately
 //!
-//! Plan 10's scope is the queue and the dispatch loop; the job *bodies* —
-//! memory extraction, summarisation, embedding, document ingestion — belong to
-//! plan 11, and the retention sweep runs directly rather than through the queue
-//! because it is leader-gated and needs no per-job durability. So
-//! [`WorkerQueue::enqueue`] currently has tests as its only callers. That is the
-//! plan's stated shape, not an oversight: shipping the plumbing separately is
-//! what lets plan 11 swap a stub handler for a real body without touching any of
-//! this.
+//! Plan 10's scope was the queue itself; issue #90 added the per-name dispatch loop on top
+//! of it (`super::dispatch::RealJobDispatcher`). The job *bodies* — memory extraction,
+//! summarisation, embedding, document ingestion — still belong to plan 11: those pipelines
+//! run inline on the response path today (see `extract_memories` in
+//! `src/application/conversation.rs`), and reaching them from a queue job needs an `Actor`
+//! and a `RequestContext` a bare job payload does not carry. So [`WorkerQueue::enqueue`]
+//! currently has tests as its only callers. That is deliberate, not an oversight: shipping
+//! the queue and the dispatch plumbing separately from the pipeline bodies is what lets
+//! plan 11 swap `dispatch::DeferredPipelineHandler` for a real handler per job name without
+//! touching any of this.
 
 use std::{sync::Arc, time::Duration};
 
@@ -95,12 +97,19 @@ pub trait JobDispatcher: Send + Sync {
     async fn dispatch(&self, job: &ClaimedJob) -> Result<(), String>;
 }
 
-/// The dispatcher Moira ships today: every declared job name completes
-/// immediately with a log line.
+/// A dispatcher that completes every declared job name immediately with a log line,
+/// regardless of what it is.
 ///
-/// Not `todo!()` and not a panic. A stub that completes is what makes the queue
-/// and the leader election independently testable *now*, and it means plan 11
-/// replaces one `impl` rather than reshaping the loop around it.
+/// **No longer what `run_supervisor` drives** — issue #90 replaced that with
+/// `super::dispatch::RealJobDispatcher`, which routes by `job_name` to a registered
+/// per-name handler instead of treating every declared name identically. This type is
+/// retained because it is still useful for exercising the queue's claim/retry/dead-letter
+/// mechanics (`tests/workers/worker_queue.rs`, `tests/workers/coordination_default_path.rs`)
+/// independently of job semantics — those tests care that a claimed job gets *completed*,
+/// not which handler completed it.
+///
+/// Not `todo!()` and not a panic, for the same reason it never was: completing a declared
+/// name is what makes the queue testable with no handler in the loop at all.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StubJobDispatcher;
 
