@@ -141,7 +141,7 @@ surfaces.
 
 | Family | Type | Labels | Notes |
 |---|---|---|---|
-| `moira_api_key_verification_total` | counter | `outcome` = `admitted` \| `shed` | Argon2id gate admissions; seeded across both values |
+| `moira_api_key_verification_total` | counter | `operation` = `verify` \| `mint`, `outcome` = `admitted` \| `shed` | Argon2id gate admissions; all four series seeded |
 | `moira_api_key_verification_queue_seconds` | histogram | — | wait for a gate permit; **admitted only**; buckets 100µs → 1s |
 
 `shed` is one API-key verification or mint refused with
@@ -150,6 +150,20 @@ of the `api_keys.verification_concurrency` permits. The credential was never che
 sustained `shed` rate is a capacity signal, not an authentication problem — raise
 `resources.limits.cpu` and the bound together, because the default bound is derived from the core
 count. See [concurrency-and-backpressure.md](concurrency-and-backpressure.md).
+
+**Read `operation` before concluding anything from a shed spike.** Verification and minting draw
+on the same gate, because they are the same 19 MiB Argon2id arena against the same memory budget.
+At the derived bound of 2 on a two-core container, three concurrent admin key mints can therefore
+shed authenticated traffic for a queue timeout. A spike carrying `operation="mint"` is a key
+rotation and will pass on its own; a spike on `operation="verify"` alone is the capacity signal
+above. Alert on the second:
+
+```promql
+rate(moira_api_key_verification_total{operation="verify",outcome="shed"}[5m]) > 0
+```
+
+The histogram carries no `operation` label. Queue wait is a property of the gate, and the split
+would double its bucket series to answer a question nobody asks of a shared FIFO.
 
 The histogram deliberately excludes sheds: a shed waited exactly the configured timeout by
 construction, so recording it would pile a constant onto the distribution and hide the rise that

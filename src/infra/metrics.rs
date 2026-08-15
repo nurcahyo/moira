@@ -221,6 +221,38 @@ const API_KEY_VERIFICATION_QUEUE_SECONDS: &str = "moira_api_key_verification_que
 /// so "the auth gate started shedding" alerts on a rate rather than on a series appearing.
 const API_KEY_VERIFICATION_OUTCOMES: &[&str] = &["admitted", "shed"];
 
+/// Which Argon2id operation took — or was refused — a gate permit.
+///
+/// Verification and minting share one gate because they are the same class of work against the
+/// same memory budget, and that sharing is deliberate. Without this label it is also invisible:
+/// three concurrent admin key mints can shed authenticated traffic for a queue timeout, and the
+/// operator watching `outcome="shed"` rise would have no way to tell that from a genuine auth
+/// overload. The two have completely different responses — one is "someone is rotating keys",
+/// the other is "raise the bound and the CPU limit together".
+///
+/// An enum rather than a `&str` parameter, for the reason #173 was about: the label domain has
+/// to be closed at the type level, not by the discipline of every future caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiKeyHashOperation {
+    /// Checking a presented credential against a stored hash — the request path.
+    Verify,
+    /// Minting a new stored hash — admin key issuance and invite creation.
+    Mint,
+}
+
+impl ApiKeyHashOperation {
+    /// The closed `operation` domain, seeded at zero across both outcomes.
+    pub const ALL: [Self; 2] = [Self::Verify, Self::Mint];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Verify => "verify",
+            Self::Mint => "mint",
+        }
+    }
+}
+
 /// Queue wait for one Argon2 permit, in seconds.
 ///
 /// Resolution is concentrated far below the 250 ms default shed timeout, because the interesting
@@ -795,12 +827,16 @@ impl MetricsRegistry {
 
             describe_counter!(
                 API_KEY_VERIFICATION_TOTAL,
-                "Argon2id credential-hashing admissions, by outcome. admitted is one API-key \
-                 verification or mint that took a permit from the api_keys.verification_concurrency \
-                 gate; shed is one refused with a 503 auth_verification_overloaded after waiting \
-                 api_keys.verification_queue_timeout_ms for one. Any sustained shed rate means the \
-                 gate is smaller than the authenticated traffic needs — raise resources.limits.cpu \
-                 and the bound together, because the bound is sized from cores."
+                "Argon2id credential-hashing admissions, by operation and outcome. admitted is one \
+                 operation that took a permit from the api_keys.verification_concurrency gate; \
+                 shed is one refused with a 503 auth_verification_overloaded after waiting \
+                 api_keys.verification_queue_timeout_ms for one. operation=verify is the request \
+                 path, operation=mint is key issuance; both draw on the same gate, so read the \
+                 two together before concluding anything — a shed spike alongside mint traffic is \
+                 a key rotation, not an auth overload. A sustained shed rate on verify alone means \
+                 the gate is smaller than the authenticated traffic needs: raise \
+                 resources.limits.cpu and the bound together, because the bound is sized from \
+                 cores."
             );
             describe_histogram!(
                 API_KEY_VERIFICATION_QUEUE_SECONDS,
@@ -898,8 +934,15 @@ impl MetricsRegistry {
             for event in ADMIN_IDENTITY_GRANT_EVENTS {
                 counter!(ADMIN_IDENTITY_GRANT_EVENTS_TOTAL, "event" => *event).increment(0);
             }
-            for outcome in API_KEY_VERIFICATION_OUTCOMES {
-                counter!(API_KEY_VERIFICATION_TOTAL, "outcome" => *outcome).increment(0);
+            for operation in ApiKeyHashOperation::ALL {
+                for outcome in API_KEY_VERIFICATION_OUTCOMES {
+                    counter!(
+                        API_KEY_VERIFICATION_TOTAL,
+                        "operation" => operation.label(),
+                        "outcome" => *outcome
+                    )
+                    .increment(0);
+                }
             }
             // Both envelope families that *can* be seeded are, across their full closed domains:
             // five profiles for seals, and five profiles times sixteen reasons for refusals. The
@@ -1217,11 +1260,27 @@ impl MetricsRegistry {
     /// constant and bury the rising p99 that is the only early warning this control has. The
     /// `Option` makes "there is nothing meaningful to record here" a shape the caller has to
     /// state, rather than a value it could plausibly pass by accident.
-    pub fn record_api_key_verification(&self, admitted: bool, queue_wait: Option<Duration>) {
+    ///
+    /// `operation` separates the request path from key minting, which share the gate. Four series
+    /// total, and the counter carries the label while the histogram does not: queue wait is a
+    /// property of the *gate*, and splitting its buckets would double the series to answer a
+    /// question — "do mints wait longer than verifies?" — nobody is asking of a shared FIFO.
+    pub fn record_api_key_verification(
+        &self,
+        operation: ApiKeyHashOperation,
+        admitted: bool,
+        queue_wait: Option<Duration>,
+    ) {
         let outcome = if admitted { "admitted" } else { "shed" };
+        let operation = operation.label();
         let seconds = queue_wait.map(|wait| wait.as_secs_f64());
         with_local_recorder(&self.inner.recorder, || {
-            counter!(API_KEY_VERIFICATION_TOTAL, "outcome" => outcome).increment(1);
+            counter!(
+                API_KEY_VERIFICATION_TOTAL,
+                "operation" => operation,
+                "outcome" => outcome
+            )
+            .increment(1);
             if let Some(seconds) = seconds {
                 histogram!(API_KEY_VERIFICATION_QUEUE_SECONDS).record(seconds);
             }
@@ -2687,32 +2746,63 @@ mod tests {
     /// The histogram is asserted to move on an admission and **not** on a shed. That asymmetry is
     /// deliberate (a shed waited exactly the timeout, so it carries no information and would
     /// distort the tail) and it is the sort of intent that quietly inverts on a later edit.
+    ///
+    /// All four `operation` x `outcome` series are asserted seeded and asserted to move
+    /// independently. The pair that matters is `verify`/`shed` against `mint`/`shed`: they share
+    /// one gate, so without the split an operator cannot tell an authentication overload from
+    /// somebody rotating keys, and the two have different responses.
     #[test]
     fn the_api_key_verification_gate_seeds_both_outcomes_and_times_only_admissions() {
         let metrics = registry();
         let seeded = metrics.render_prometheus("moira-test", false, false);
-        for outcome in API_KEY_VERIFICATION_OUTCOMES {
-            assert!(
-                seeded.contains(&format!(
-                    "{API_KEY_VERIFICATION_TOTAL}{{service=\"moira-test\",outcome=\"{outcome}\"}} 0"
-                )),
-                "{API_KEY_VERIFICATION_TOTAL} is missing its zero-seeded {outcome} series:\n{seeded}"
-            );
+        for operation in ApiKeyHashOperation::ALL {
+            for outcome in API_KEY_VERIFICATION_OUTCOMES {
+                let operation = operation.label();
+                assert!(
+                    seeded.contains(&format!(
+                        "{API_KEY_VERIFICATION_TOTAL}{{service=\"moira-test\",\
+                         operation=\"{operation}\",outcome=\"{outcome}\"}} 0"
+                    )),
+                    "{API_KEY_VERIFICATION_TOTAL} is missing its zero-seeded \
+                     {operation}/{outcome} series:\n{seeded}"
+                );
+            }
         }
 
-        metrics.record_api_key_verification(true, Some(Duration::from_millis(4)));
-        metrics.record_api_key_verification(false, None);
-        metrics.record_api_key_verification(false, None);
+        metrics.record_api_key_verification(
+            ApiKeyHashOperation::Verify,
+            true,
+            Some(Duration::from_millis(4)),
+        );
+        metrics.record_api_key_verification(ApiKeyHashOperation::Verify, false, None);
+        metrics.record_api_key_verification(ApiKeyHashOperation::Verify, false, None);
+        metrics.record_api_key_verification(ApiKeyHashOperation::Mint, false, None);
         let rendered = metrics.render_prometheus("moira-test", false, false);
 
         assert!(rendered.contains(&format!(
-            "{API_KEY_VERIFICATION_TOTAL}{{service=\"moira-test\",outcome=\"admitted\"}} 1"
+            "{API_KEY_VERIFICATION_TOTAL}{{service=\"moira-test\",operation=\"verify\",\
+             outcome=\"admitted\"}} 1"
         )));
         assert!(rendered.contains(&format!(
-            "{API_KEY_VERIFICATION_TOTAL}{{service=\"moira-test\",outcome=\"shed\"}} 2"
+            "{API_KEY_VERIFICATION_TOTAL}{{service=\"moira-test\",operation=\"verify\",\
+             outcome=\"shed\"}} 2"
+        )));
+        // The whole point of the label: the mint shed did not land in the verify series, so a
+        // key rotation cannot be read off the dashboard as an authentication overload.
+        assert!(
+            rendered.contains(&format!(
+                "{API_KEY_VERIFICATION_TOTAL}{{service=\"moira-test\",operation=\"mint\",\
+                 outcome=\"shed\"}} 1"
+            )),
+            "the mint shed was folded into another series:\n{rendered}"
+        );
+        assert!(rendered.contains(&format!(
+            "{API_KEY_VERIFICATION_TOTAL}{{service=\"moira-test\",operation=\"mint\",\
+             outcome=\"admitted\"}} 0"
         )));
 
-        // One observation in the histogram, from the one admission — not three.
+        // One observation in the histogram, from the one admission — not four. The histogram
+        // carries no `operation` label, so this also pins that the split did not reach it.
         assert_eq!(
             bucket_count(&rendered, API_KEY_VERIFICATION_QUEUE_SECONDS, "+Inf"),
             1,

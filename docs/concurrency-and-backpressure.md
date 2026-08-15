@@ -58,8 +58,26 @@ authenticate no API key, take no permit, and do not declare it — which is the 
 hashing off the runtime in the first place: probes keep answering while authenticated traffic is
 queued.
 
-Watch `moira_api_key_verification_total{outcome="shed"}` for the condition and
-`moira_api_key_verification_queue_seconds` for the rise that precedes it.
+Watch `moira_api_key_verification_total{operation="verify",outcome="shed"}` for the condition and
+`moira_api_key_verification_queue_seconds` for the rise that precedes it. Key **minting** draws on
+the same gate and is labelled `operation="mint"`: a shed spike beside mint traffic is somebody
+rotating keys, not an authentication overload, and it clears on its own. See
+[prometheus.md](prometheus.md).
+
+### One coupling the arithmetic above does not price
+
+The permit is acquired *before* `tokio::task::spawn_blocking`, so it is held for the queue wait in
+tokio's blocking pool plus the Argon2 work — not the Argon2 work alone. That pool is shared: it
+also serves `getaddrinfo` for every provider call and JWKS fetch. If it ever saturates, gate
+permits are held far longer than the tens of milliseconds that make `250` ms a sensible timeout,
+and authenticated traffic sheds for a reason with nothing to do with credentials.
+
+It needs roughly 512 concurrent blocking tasks against a `global_execution_concurrency` of 100, so
+it is remote. It is recorded because the alternative — acquiring the permit *inside* the closure —
+is strictly worse: it parks a blocking thread per waiter and silently restores the 512-thread pool
+as the real bound, which is the failure the gate exists to prevent. If this is ever suspected, the
+tell is `moira_api_key_verification_queue_seconds` rising while `operation="verify"` admissions
+stay flat.
 
 ### Why a bounded wait rather than an instant refusal
 

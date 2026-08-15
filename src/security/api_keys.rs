@@ -13,7 +13,10 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use secrecy::SecretString;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::{error::AppError, infra::metrics::MetricsRegistry};
+use crate::{
+    error::AppError,
+    infra::metrics::{ApiKeyHashOperation, MetricsRegistry},
+};
 
 use super::masking::secret_fingerprint;
 
@@ -80,19 +83,22 @@ pub const MIN_API_KEY_PREFIX_LENGTH: usize = min_api_key_prefix_length();
 // this* — see the notes on [`MAX_VERIFY_M_COST_KIB`].
 // ===========================================================================================
 
-/// Resident bytes one Argon2id operation at [`Params::DEFAULT_M_COST`] allocates.
+/// Largest `m` (KiB) any hash this deployment has ever written to the database asks for.
 ///
-/// Not an estimate. `Argon2::hash_password_into` allocates `vec![Block::default();
-/// params.block_count()]` and `fill_blocks` writes every byte of it, so the whole arena is
-/// resident rather than merely reserved: 19456 blocks x 1024 B = 19,922,944 B = 19.0 MiB.
+/// # Why this is a literal and not `Params::DEFAULT_M_COST`
 ///
-/// It is the multiplicand in the only arithmetic that matters for the gate's size. At tokio's
-/// default blocking-pool bound of 512 threads, 512 x 19 MiB is 9,728 MiB against the chart's
-/// `resources.limits.memory: 2Gi` — 4.75x over, which converts an executor stall into an
-/// OOMKill. Rust *aborts* on allocation failure, so there is no graceful path to write for that
-/// outcome. This is why [`ApiKeyHasher`] carries its own semaphore instead of relying on
-/// `spawn_blocking` alone.
-pub const ARGON2_ARENA_BYTES: usize = Params::DEFAULT_M_COST as usize * 1024;
+/// [`MAX_VERIFY_M_COST_KIB`] refuses a stored hash whose `m` exceeds it, and a ceiling that
+/// tracked the crate default alone would be a *downgrade tripwire pointed at ourselves*: an
+/// `argon2` release that **lowered** `DEFAULT_M_COST` would lower the ceiling underneath every
+/// row already in the table, and every one of them would start failing closed on a `500`. That
+/// is a total authentication outage produced by a dependency bump, and nothing else in the tree
+/// would go red first.
+///
+/// Rows are written by [`ApiKeyHasher::hash`] at `Argon2::default()`, which has been 19456 KiB
+/// for the whole life of this table. So the ceiling floors at what we have written. Raise this
+/// only in the same change that raises the minting parameters, and never lower it: the value it
+/// records is a property of the *data*, not of the crate.
+pub const HISTORICAL_MINTED_M_COST_KIB: u32 = 19456;
 
 /// Largest `m` (KiB) this process will allocate to verify a **stored** hash.
 ///
@@ -108,7 +114,54 @@ pub const ARGON2_ARENA_BYTES: usize = Params::DEFAULT_M_COST as usize * 1024;
 /// parses the stored hash on the async side and refuses anything above this ceiling **before**
 /// spending a permit. It fails closed — an unreadable or oversized stored hash is a `500`, never
 /// a silent `Ok(false)`.
-pub const MAX_VERIFY_M_COST_KIB: u32 = Params::DEFAULT_M_COST;
+///
+/// It is the *maximum* of the crate default and [`HISTORICAL_MINTED_M_COST_KIB`] rather than
+/// either one alone, so it moves up with a crate that hardens and refuses to move down under a
+/// crate that softens. See [`HISTORICAL_MINTED_M_COST_KIB`] for the outage that second half
+/// prevents.
+pub const MAX_VERIFY_M_COST_KIB: u32 = if Params::DEFAULT_M_COST > HISTORICAL_MINTED_M_COST_KIB {
+    Params::DEFAULT_M_COST
+} else {
+    HISTORICAL_MINTED_M_COST_KIB
+};
+
+// The ceiling may rise with the crate; it may **not** fall below the rows already stored.
+//
+// Asserted at *compile time* rather than in a test, deliberately: the failure it guards is a
+// dependency bump lowering `Params::DEFAULT_M_COST`, which would drop the ceiling underneath every
+// row minted at 19456 KiB and fail every existing api key closed on a 500. That is a total
+// authentication outage, and it should stop `cargo build` rather than wait for someone to run the
+// suite. Deleting `HISTORICAL_MINTED_M_COST_KIB` to "simplify" the constant back to the bare crate
+// default is exactly the edit these refuse.
+const _: () = assert!(
+    MAX_VERIFY_M_COST_KIB >= HISTORICAL_MINTED_M_COST_KIB,
+    "the Argon2 verification ceiling fell below the m this deployment has already written to \
+     system_api_keys / consumer_api_keys / admin_invites — every stored credential would now fail \
+     closed on a 500"
+);
+const _: () = assert!(
+    MAX_VERIFY_M_COST_KIB >= Params::DEFAULT_M_COST,
+    "the Argon2 verification ceiling is below what `ApiKeyHasher::hash` mints today, so this \
+     process would write rows it then refuses to verify"
+);
+
+/// Resident bytes the largest Argon2id arena this process will allocate occupies.
+///
+/// Not an estimate. `Argon2::hash_password_into` allocates `vec![Block::default();
+/// params.block_count()]` and `fill_blocks` writes every byte of it, so the whole arena is
+/// resident rather than merely reserved: 19456 blocks x 1024 B = 19,922,944 B = 19.0 MiB.
+///
+/// Derived from [`MAX_VERIFY_M_COST_KIB`] and not from `Params::DEFAULT_M_COST`, because the
+/// worst case is what [`ApiKeyHasher::verify`] will *admit*, not what [`ApiKeyHasher::hash`]
+/// writes. The two are the same number today and the ceiling is what keeps them so.
+///
+/// It is the multiplicand in the only arithmetic that matters for the gate's size. At tokio's
+/// default blocking-pool bound of 512 threads, 512 x 19 MiB is 9,728 MiB against the chart's
+/// `resources.limits.memory: 2Gi` — 4.75x over, which converts an executor stall into an
+/// OOMKill. Rust *aborts* on allocation failure, so there is no graceful path to write for that
+/// outcome. This is why [`ApiKeyHasher`] carries its own semaphore instead of relying on
+/// `spawn_blocking` alone.
+pub const ARGON2_ARENA_BYTES: usize = MAX_VERIFY_M_COST_KIB as usize * 1024;
 
 /// Upper clamp on the bound derived from [`std::thread::available_parallelism`].
 ///
@@ -393,13 +446,20 @@ impl ApiKeyHasher {
     /// Lower frequency than [`Self::verify`], same class of work, so it takes the same permit and
     /// runs off the runtime for the same reason.
     pub async fn hash(&self, raw_key: &str) -> Result<String, AppError> {
-        let permit = self.acquire_argon2_permit().await?;
+        let permit = self
+            .acquire_argon2_permit(ApiKeyHashOperation::Mint)
+            .await?;
         let peppered = self.peppered(raw_key);
 
         tokio::task::spawn_blocking(move || {
             // Owned by the closure, never by the caller's future: `spawn_blocking` is not
             // cancellable, so a permit tied to the caller would be released while the arena it
             // accounts for is still allocated.
+            //
+            // Do not delete this line as unused. A `move` closure captures only what its body
+            // mentions, so removing it leaves the permit in `hash`'s frame — dropped when the
+            // caller is cancelled, while the detached task keeps computing. It is not a discard;
+            // it is the capture.
             let _permit = permit;
             let salt = SaltString::generate(&mut PasswordOsRng);
             Argon2::default()
@@ -447,11 +507,16 @@ impl ApiKeyHasher {
             )));
         }
 
-        let permit = self.acquire_argon2_permit().await?;
+        let permit = self
+            .acquire_argon2_permit(ApiKeyHashOperation::Verify)
+            .await?;
         let peppered = self.peppered(raw_key);
         let stored = encoded_hash.to_string();
 
         tokio::task::spawn_blocking(move || {
+            // The capture, not a discard — see `hash` above and
+            // `a_verification_holds_its_permit_for_the_whole_computation`, which reds on
+            // `drop(permit);` here.
             let _permit = permit;
             let parsed = PasswordHash::new(&stored)
                 .map_err(|err| AppError::Internal(format!("parse api key hash: {err}")))?;
@@ -469,12 +534,22 @@ impl ApiKeyHasher {
     /// shortcut and is wrong: it answers "invalid credential" to a caller whose credential was
     /// never checked, turning an overload into a `401` that operators chase for days as a client
     /// bug.
-    async fn acquire_argon2_permit(&self) -> Result<OwnedSemaphorePermit, AppError> {
+    ///
+    /// `operation` only reaches the metric. Both callers wait the same timeout on the same gate
+    /// and neither is prioritised: a mint that arrives first holds a permit a verification then
+    /// queues behind, deliberately, because they cost the same 19 MiB arena and the budget is the
+    /// memory. The label exists so an operator can *see* that happening — a shed spike next to
+    /// `operation="mint"` traffic is a key rotation, not an authentication overload, and the two
+    /// have different responses.
+    async fn acquire_argon2_permit(
+        &self,
+        operation: ApiKeyHashOperation,
+    ) -> Result<OwnedSemaphorePermit, AppError> {
         let queued_at = Instant::now();
         match tokio::time::timeout(self.queue_timeout, self.gate.clone().acquire_owned()).await {
             Ok(Ok(permit)) => {
                 if let Some(metrics) = &self.metrics {
-                    metrics.record_api_key_verification(true, Some(queued_at.elapsed()));
+                    metrics.record_api_key_verification(operation, true, Some(queued_at.elapsed()));
                 }
                 Ok(permit)
             }
@@ -486,7 +561,7 @@ impl ApiKeyHasher {
             )),
             Err(_elapsed) => {
                 if let Some(metrics) = &self.metrics {
-                    metrics.record_api_key_verification(false, None);
+                    metrics.record_api_key_verification(operation, false, None);
                 }
                 // Spelled as a literal, not a constant: `every_coded_error_literal_in_src_has_a
                 // _catalog_entry` resolves codes by reading the source, and a constant here would
@@ -677,13 +752,31 @@ mod tests {
     ///
     /// # The threshold is derived from the window, not written down
     ///
-    /// An absolute tick count would be a machine-speed constant in disguise: measured here the
-    /// fixed arrangement fires 37 ticks and the broken one fires **0**, so a literal `20` reads
-    /// like a wide margin and would in fact go red on any machine twice as fast, for no reason
-    /// connected to the defect. So the floor is a *fraction of the window that was actually
-    /// measured* — the ticker must manage at least one tick per 8 ms of a window it nominally
-    /// ticks through every 1 ms. That is an eighth of its nominal rate against zero, and it holds
-    /// whatever the hardware does to the numerator and denominator together.
+    /// An absolute tick count would be a machine-speed constant in disguise: it would go red on
+    /// any machine fast enough to shorten the window, for no reason connected to the defect. So
+    /// the floor is a *fraction of the window this run actually measured* — the ticker must
+    /// manage at least one tick per 8 ms of a window it nominally ticks through every 1 ms. That
+    /// is an eighth of its nominal rate, and it holds whatever the hardware does to the numerator
+    /// and denominator together.
+    ///
+    /// The separation it is reading is qualitative, not a margin to be tuned: with the fix the
+    /// lone worker is free between spawns and the ticker fires throughout; with `verify` back on
+    /// that worker the ticker is barely polled at all until the last verification returns. Any
+    /// floor above that and below the nominal rate separates the two states.
+    ///
+    /// # Verified by mutation, not by argument
+    ///
+    /// The pre-#176 arrangement — the `spawn_blocking` removed and `Argon2::verify_password` run
+    /// directly on the caller's runtime thread — was restored and measured: **6 runs, 6 red**,
+    /// every one on this assertion, and the other thirteen tests in this module green in all six.
+    /// The regressed arm fired **0, 0, 1, 1, 1, 1** ticks against derived floors of 50–61. The
+    /// fixed arm clears its floor on every run; the two do not come within an order of magnitude
+    /// of overlapping, which is what makes a derived threshold safe here.
+    ///
+    /// Those six samples are the *separation*, and they are all this comment will claim. No
+    /// absolute tick count for the healthy arm is recorded on purpose: it is a machine-speed
+    /// figure, this repository has published three wrong headline numbers taken under build
+    /// contention, and the next reader would take it for the margin's calibration.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn an_unrelated_future_keeps_running_while_verifications_are_in_flight() {
         use std::sync::{
@@ -781,33 +874,44 @@ mod tests {
     ///
     /// Every one of them holds a permit from *outside*, through
     /// [`ApiKeyHasher::hold_one_permit_for_test`]. That proves the acquire happens and proves the
-    /// budget is shared, and it says nothing whatsoever about the *release*. Rewriting
-    /// `let _permit = permit;` inside the blocking closure to `let _ = permit;` — a one-character
-    /// edit that compiles, reads like a deliberate discard, and is a well-worn Rust footgun —
-    /// drops the permit on the closure's first line. Every other test in this module stays green,
-    /// `verification_concurrency` still reports the configured bound, the metrics still count
-    /// admissions, and the gate no longer bounds anything: concurrent Argon2 arenas go back to
-    /// being limited only by tokio's 512-thread blocking pool, which is 9.7 GiB against a 2 GiB
-    /// container. That is #176 restored while wearing a semaphore.
+    /// budget is shared, and it says nothing whatsoever about the *release*. An edit that returned
+    /// the permit at the top of the blocking closure would leave all of them green,
+    /// `verification_concurrency` still reporting the configured bound and the metrics still
+    /// counting admissions, while the gate bounded nothing: concurrent Argon2 arenas would go back
+    /// to being limited only by tokio's 512-thread blocking pool, 9.7 GiB against a 2 GiB
+    /// container. That is #176 restored while wearing a semaphore, and it is what this test is
+    /// pointed at.
     ///
     /// # How this one sees it
     ///
     /// It contends against a verification that is genuinely *in flight*. The gate is waited down
     /// to zero free permits — bounded by a deadline, so a permit that is never taken fails with a
     /// message rather than hanging — and only then is the second verification issued. It must
-    /// shed.
+    /// shed. Under an early release the free-permit count returns to 1 while the arena is still
+    /// allocated, the second verification is admitted, and the `expect_err` below reds.
     ///
-    /// Under the broken variant the test reds either way: the free-permit count returns to 1
-    /// immediately, so either the wait never observes zero and trips its deadline, or it observes
-    /// the sliver between acquire and closure entry and the second verification then succeeds
-    /// where a shed was required.
+    /// # Verified by mutation, not by argument
+    ///
+    /// `drop(permit);` as the closure's first statement: **5 runs, 5 red**, all on this
+    /// assertion's `expect_err`, and the other thirteen tests in this module green in every one.
+    ///
+    /// One correction worth keeping, because the earlier note here got it backwards and the next
+    /// reader would inherit the error. `let _ = permit;` is **not** an early release and was not a
+    /// mutant: `_` is a wildcard pattern, not a binding, so `let _ = <place>;` neither moves nor
+    /// drops — the permit stays in the closure's captured state and is released at the end of the
+    /// closure exactly as `let _permit = permit;` does. Measured: that edit is 14/14 green, which
+    /// is correct behaviour and not a hole in the test. What the statement is really load-bearing
+    /// for is *capture*: a `move` closure captures only the variables its body mentions, so
+    /// deleting the line entirely would leave the permit owned by `verify`'s own frame — released
+    /// on caller cancellation while the detached blocking task still holds the arena. Keep the
+    /// binding; the name is what says so out loud.
     ///
     /// # The one inequality this rests on
     ///
     /// A 5 ms shed timeout against an Argon2id operation at `m=19456`, `t=2`, which costs tens of
-    /// milliseconds. That is three orders of margin on the wrong side of nothing, and it is not a
-    /// hardware assumption: if Argon2 here ever completes inside 5 ms the credential parameters
-    /// have been weakened, and this test going red is the correct alarm rather than a flake.
+    /// milliseconds. That is not a hardware assumption: if Argon2 here ever completes inside 5 ms
+    /// the credential parameters have been weakened, and this test going red is the correct alarm
+    /// rather than a flake.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_verification_holds_its_permit_for_the_whole_computation() {
         let hasher = ApiKeyHasher::new(b"pepper".to_vec(), "v1", 20).with_verification_gate(
