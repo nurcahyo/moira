@@ -181,7 +181,17 @@ tl_count_skips() {
 # `fix/plan12-1-credentials-r2`: **1588** passed, source declaring 1582, by `/usr/bin/make gates`
 # with Postgres and Redis up and zero skip lines. It supersedes both 1466 and the branch's own
 # 1562, neither of which had seen the other side's tests. The +6 doctest offset holds again.
-TL_TEST_COUNT_MINIMUM=1588
+#
+# Re-measured 2026-08-16 on `feat/runner-service-docker-engine` (issue #273, workstream R1 of
+# #272), rebased on `develop` at 05dbf9c: **1699** passed, source declaring 1693, by
+# `scripts/gates.sh` with Postgres and Redis up and zero skip lines. That branch adds 108 tests
+# — 92 unit tests under `src/runner/**` and 16 in `tests/runner_control_plane.rs` — so 1588 +
+# 108 = 1696, and the remaining 3 are `tests/runner_docker_engine.rs`, which is opt-in against
+# a real Docker daemon and *passes by returning early* when the opt-in is absent. That is worth
+# naming: those three count toward `passed` in every environment, including CI, precisely
+# because they are early-return-and-pass rather than `#[ignore]`d, which would count toward
+# `declared` and never toward `passed`. The +6 doctest offset holds again.
+TL_TEST_COUNT_MINIMUM=1699
 
 # ---------------------------------------------------------------------------------
 # tl_declared_tests <repo-root>
