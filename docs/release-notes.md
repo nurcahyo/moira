@@ -8,11 +8,12 @@ changelog.
 
 ## Unreleased
 
-### DeepSeek routing policies are repointed off the retired aliases, and `0030` can stall a busy fleet on the way in
+### DeepSeek routing policies are repointed off the retired aliases, and `0030` no longer stalls a busy fleet on the way in
 
 Two migration findings from the plan-12 review: [#256](https://github.com/nurcahyo/moira/issues/256)
 finding 1 and [#250](https://github.com/nurcahyo/moira/issues/250) finding 1. One changes rows on
-upgrade; the other is a cost you may want to avoid paying during traffic.
+upgrade; the other used to be a cost you paid during traffic and is now taken off the deploy path
+for you, with one path left where it still applies.
 
 **Your DeepSeek routing policies move to the v4 ids.** `0028` retired `deepseek-chat` and
 `deepseek-reasoner` to `deprecated`, and `deprecated` removes a model from candidate resolution —
@@ -35,20 +36,53 @@ of them gets a `409` and must re-read.
 **`0030` takes ACCESS EXCLUSIVE on `execution_attempts` and holds it across a full scan.** That is
 one row per upstream provider attempt — the highest-volume table in the schema — and the lock is
 on the table, so for the length of the scan every execution in the fleet blocks, not just the
-migrating replica. `0034` re-installs the constraint in the non-blocking `NOT VALID` + `VALIDATE`
-shape this repository documents in `0027`, but **it cannot undo `0030`**: nothing appended after a
-migration changes what that migration does, and a shipped migration's bytes are not edited here
-because `sqlx` checksums them and a database that applied the old bytes then refuses to boot.
+migrating replica.
 
-If your `execution_attempts` is small, or this install is new, ignore this — the scan is instant on
-an empty table. Otherwise check first:
+**If you migrate with `moira migrate`, there is nothing for you to do.** Every Moira process that
+migrates — `moira migrate`, `moira serve` with `database.migrate_on_startup`,
+`bootstrap-system-key`, `execute-test` — now runs a preflight before handing control to `sqlx`. If
+`0030` is still pending and `execution_attempts` already exists, the preflight applies `0030`'s own
+three statements in the non-blocking order (`ADD COLUMN`, then `ADD CONSTRAINT … NOT VALID`, then a
+commit, then `VALIDATE CONSTRAINT` under SHARE UPDATE EXCLUSIVE, which blocks neither readers nor
+writers) and records `0030` as applied, so the migrator skips it. The scan still happens; nothing
+waits behind it. The ledger says which path was taken:
+
+```sql
+select version, description from _sqlx_migrations where version = 30;
+-- 30 | execution attempt candidate observability (pre-applied NOT VALID + VALIDATE, issue #250)
+```
+
+That stock description without the suffix means `0030` ran as written on this database — which is
+correct and costs nothing if the table was empty at the time.
+
+**Why the repair is in the process and not in a migration.** `0030` shipped, and migrations are
+append-only here: `sqlx` checksums every file, so a database that applied the old bytes would
+refuse to boot if the file changed. Appending a migration does not help either — it runs *after*
+`0030` has already taken the lock and done the scan. The only code that runs before the migrator is
+the code that calls it. `0034` still re-installs the constraint in the safe shape, so the
+definition a fresh install ends on, and the one the next author copies, is the correct one; it does
+not and cannot make `0030` cheap.
+
+**`0034` costs one extra scan of `execution_attempts`, and that scan is not free.** It drops the
+constraint and re-adds it `NOT VALID` before validating it, which clears PostgreSQL's
+`convalidated` flag — so its `VALIDATE CONSTRAINT` performs a full scan even though every row
+already satisfies the check. It takes SHARE UPDATE EXCLUSIVE, so it blocks nothing, but on a large
+table it is minutes of I/O rather than a no-op. (An earlier draft of this entry said `0034` would
+be "cheap, because it validates a constraint that already holds". That was wrong: PostgreSQL skips
+validation only for a constraint already *marked* valid, and `0034` is the thing that un-marks it.)
+
+**If you migrate with `sqlx-cli`, or anything else that is not a Moira process, the preflight never
+runs and `0030` executes as written.** If your `execution_attempts` is small, or this install is
+new, ignore this — the scan is instant on an empty table. Otherwise check first:
 
 ```sql
 select count(*) from execution_attempts;
 ```
 
-To skip the scan on a large table, apply `0030`'s effect by hand in the safe order **before**
-deploying, then record it as applied so the migrator does not repeat it:
+To skip the blocking scan on a large table, apply `0030`'s effect by hand in the safe order
+**before** deploying, then record it as applied so the migrator does not repeat it. Run these as
+four separate statements, not inside one transaction — the point of the split is the commit
+between the `ADD` and the `VALIDATE`, and locks are held to commit:
 
 ```sql
 alter table execution_attempts
@@ -77,8 +111,7 @@ values (30, 'execution attempt candidate observability', now(), true, '\x…'::b
 ```
 
 A wrong checksum is not silent: the next boot fails with `VersionMismatch(30)` and applies nothing.
-`0034` then runs normally on top and is cheap, because it validates a constraint that already
-holds.
+`0034` then runs on top and re-scans the table once, non-blocking, as described above.
 
 ### Breaking: `encrypted_content` now actually encrypts, and rolling back past this release hides those rows
 
