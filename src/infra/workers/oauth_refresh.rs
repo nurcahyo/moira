@@ -23,6 +23,38 @@
 //! no client secret is supported, matching the public-client (PKCE / device-code) shape
 //! subscription OAuth flows use.
 //!
+//! # …and it is SSRF-validated before a refresh token is sent to it
+//!
+//! "Admin-configured" is not "trusted". `providers.metadata` is a free-form
+//! `serde_json::Value` on both `ProviderCreateRequest` and `ProviderPatchRequest`, and
+//! nothing on the write path validates it — only `base_url` goes through
+//! `validate_provider_base_url`. The body of this exchange is a **decrypted refresh token**,
+//! the longest-lived secret Moira stores, so an unvalidated destination here is not an SSRF
+//! probe, it is credential exfiltration: `{"oauth_token_endpoint":
+//! "http://169.254.169.254/…"}` or `"http://127.0.0.1:6379/"` and the token is posted to
+//! whatever answers.
+//!
+//! Two things close that, and both are needed:
+//!
+//! 1. [`validate_token_endpoint`] runs the configured value through
+//!    `security::ssrf::validate_outbound_url` — the shared guard already applied to JWKS and
+//!    to skill-executor URLs — **immediately before every exchange**, not once at write time.
+//!    Use-time is the enforcement point because it is the only one nothing can get behind: a
+//!    metadata value can arrive from a future admin route, a migration, or a direct database
+//!    edit, and a write-time check would bless none of those.
+//! 2. The exchange runs on a **dedicated client with `redirect::Policy::none()`**, never
+//!    `AppState::http`, which is documented at `src/app/state.rs` as deliberately keeping
+//!    reqwest's default `redirect::Policy::limited(10)`. The form body is a buffered
+//!    `String`, so a 307/308 from a validated public host would re-send the refresh token to
+//!    the redirect target — a validated URL is only validated for the request Moira actually
+//!    issues, which is the same reasoning `src/security/ssrf.rs` gives for the JWKS client.
+//!
+//! ## May a loopback or private-range token endpoint still be configured?
+//!
+//! Only in a deployment that has already declared itself non-production, and it takes
+//! **both** `provider_security` escape hatches to do it — see [`TokenEndpointPolicy`].
+//! Neither flag alone relaxes anything here.
+//!
 //! # Optimistic concurrency, not a held lock
 //!
 //! `WorkerSettings::maintenance_enqueue_interval_seconds`'s doc comment explains why this job
@@ -36,15 +68,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use reqwest::Client;
+use reqwest::{Client, redirect};
 use serde::Deserialize;
 use serde_json::Value;
 use sqlx::PgPool;
 use tracing::{info, warn};
+use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    config::WorkerSettings,
+    config::{ProviderSecuritySettings, WorkerSettings},
     domain::{CredentialSecret, ProviderRecord, ProviderType},
     error::AppError,
     infra::{
@@ -54,8 +87,9 @@ use crate::{
         workers::dispatch::JobHandler,
     },
     security::{
-        CredentialAadParts, ENVELOPE_VERSION_V1, LocalSecretCipher, SecretCipher, credential_aad,
-        mask_plain_secret, secret_fingerprint,
+        CredentialAadParts, ENVELOPE_VERSION_V1, LocalSecretCipher, OutboundUrlPolicy,
+        SecretCipher, SystemResolver, credential_aad, mask_plain_secret, secret_fingerprint,
+        validate_outbound_url,
     },
 };
 
@@ -65,6 +99,103 @@ use crate::{
 /// `maintenance_enqueue_interval_seconds`), not a per-tick probe, so there is no reason to
 /// race a slow-but-working identity provider.
 const REFRESH_HTTP_TIMEOUT_SECONDS: u64 = 10;
+
+/// DNS-resolution budget for the SSRF guard applied to the configured token endpoint.
+///
+/// A local constant for the same reason `application::agent_platform`'s
+/// `SKILL_URL_DNS_TIMEOUT_MS` is one: this hardening is mandatory for every deployment, not
+/// an operator-tunable knob the way `auth.jwks.timeout_ms` is for JWKS fetches. The value is
+/// the resolution budget only — the exchange itself is bounded by
+/// [`REFRESH_HTTP_TIMEOUT_SECONDS`].
+const TOKEN_ENDPOINT_DNS_TIMEOUT_MS: u64 = 5_000;
+
+/// Whether this deployment permits a token endpoint the address-space guard would otherwise
+/// refuse (plain `http`, loopback, RFC1918, link-local, the cloud-metadata ranges).
+///
+/// # Why this reuses `provider_security` instead of adding a fourth `allow_insecure_dev_urls`
+///
+/// `oauth_token_endpoint` is a `providers.metadata` value. It sits on exactly the surface
+/// [`ProviderSecuritySettings`] already governs for `providers.base_url`, written by the same
+/// admin scope in the same request, so giving it a *separate* switch would let the two halves
+/// of one provider row disagree about what address space this deployment lives in.
+///
+/// # Why **both** flags, and not either
+///
+/// `OutboundUrlPolicy::allow_insecure` is a single all-or-nothing bypass: it waives the
+/// scheme rule *and* the address-range rules at once. `provider_security` spells those out as
+/// two separate concessions — `allow_http_provider_urls` is the scheme one,
+/// `allow_private_provider_urls` the address one — so the combined bypass requires both to
+/// have been granted. An operator who has relaxed only one has not relaxed the other, and a
+/// refresh token is not the payload to infer the missing half from.
+///
+/// # Why this cannot be turned on in production
+///
+/// `Settings::validate_production` rejects `provider_security.allow_http_provider_urls`
+/// outright, so the conjunction is unsatisfiable there by construction, and
+/// `Settings::unsafe_development_features` already reports it as `http_provider_urls` in the
+/// startup WARN wherever it *is* set. That is the whole answer to "may an admin-configured
+/// loopback endpoint remain permitted": in development yes, in production never, and the
+/// enforcement is a startup rejection rather than this module's good behaviour.
+///
+/// Note that `allow_private_provider_urls` alone — which production *may* legitimately set,
+/// for an in-cluster provider on a private address — deliberately buys nothing here. A
+/// prompt sent to an in-cluster model and a refresh token posted to an in-cluster address are
+/// not the same risk, and the remedy for a genuinely private IdP is to give it a public
+/// `https` name, not to widen this.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenEndpointPolicy {
+    pub allow_insecure: bool,
+}
+
+impl TokenEndpointPolicy {
+    pub fn from_provider_security(security: &ProviderSecuritySettings) -> Self {
+        Self {
+            allow_insecure: security.allow_private_provider_urls
+                && security.allow_http_provider_urls,
+        }
+    }
+}
+
+/// Runs a provider's configured token endpoint through the shared outbound-URL guard.
+///
+/// A free function rather than a method so the decision is unit-testable with no pool, no
+/// cipher and no HTTP client. `reject_credentials: true` because the destination is chosen by
+/// stored configuration rather than by Moira: `https://user:pass@host/` would send those
+/// embedded credentials to whoever `host` turns out to be, on the same request that carries
+/// the refresh token.
+///
+/// The `Err` string lands in `worker_jobs.last_error`, so it carries the denial *class* and
+/// nothing else — the denial `detail` can name a resolved internal address and is logged
+/// server-side only, the same posture `security::ssrf` takes on the JWKS path.
+pub async fn validate_token_endpoint(
+    raw_url: &str,
+    policy: TokenEndpointPolicy,
+) -> Result<Url, String> {
+    let outbound = OutboundUrlPolicy {
+        subject: "oauth token endpoint",
+        dns_timeout: std::time::Duration::from_millis(TOKEN_ENDPOINT_DNS_TIMEOUT_MS),
+        // No egress allow-list: this call closes the redirect hole at the transport instead
+        // (`redirect::Policy::none()` on the dedicated client), which is the same trade
+        // `validate_jwks_url` documents for the JWKS fetch.
+        allowed_hosts: Vec::new(),
+        reject_credentials: true,
+        allow_insecure: policy.allow_insecure,
+    };
+    validate_outbound_url(raw_url, &outbound, &SystemResolver)
+        .await
+        .map_err(|denial| {
+            tracing::warn!(
+                reason = denial.reason().as_str(),
+                detail = denial.detail(),
+                "oauth token endpoint blocked by the outbound SSRF policy; no refresh token \
+                 was sent"
+            );
+            format!(
+                "oauth token endpoint was refused by the outbound SSRF policy ({})",
+                denial.reason().as_str()
+            )
+        })
+}
 
 /// Whether a credential is due for refresh, given `now` and how far ahead of expiry Moira
 /// should act.
@@ -121,25 +252,47 @@ struct TokenResponse {
 pub struct OAuthTokenRefreshHandler {
     pool: PgPool,
     cipher: LocalSecretCipher,
-    http: Client,
+    /// The dedicated no-redirect client, built once per process.
+    ///
+    /// Deliberately **not** `AppState::http`, and deliberately not a fallback to it: `None`
+    /// (the client could not be built at all, which in practice means the TLS backend failed
+    /// to initialise) fails every refresh loudly rather than quietly restoring the
+    /// redirect-following client this field exists to avoid.
+    http: Option<Client>,
     metrics: MetricsRegistry,
     settings: Arc<WorkerSettings>,
+    endpoint_policy: TokenEndpointPolicy,
 }
 
 impl OAuthTokenRefreshHandler {
+    /// Takes no `reqwest::Client` on purpose — see [`Self::http`]. Every other worker handler
+    /// is handed `AppState::http`; this one must not be, so the parameter is absent rather
+    /// than present-and-ignored.
     pub fn new(
         pool: PgPool,
         cipher: LocalSecretCipher,
-        http: Client,
         metrics: MetricsRegistry,
         settings: Arc<WorkerSettings>,
+        endpoint_policy: TokenEndpointPolicy,
     ) -> Self {
+        let http = Client::builder()
+            .redirect(redirect::Policy::none())
+            .build()
+            .inspect_err(|error| {
+                tracing::error!(
+                    %error,
+                    "the oauth-token-refresh HTTP client could not be built; every refresh \
+                     will fail rather than fall back to a redirect-following client"
+                );
+            })
+            .ok();
         Self {
             pool,
             cipher,
             http,
             metrics,
             settings,
+            endpoint_policy,
         }
     }
 
@@ -204,8 +357,24 @@ impl OAuthTokenRefreshHandler {
         };
         let client_id = configured_client_id(&provider);
 
+        // Validated here — after the credential is known to be due and before a single byte
+        // of the refresh token is handed to `reqwest`. A refusal is an ordinary per-credential
+        // failure: it is counted, logged and retried on the next poll like any other, because
+        // one misconfigured provider must not dead-letter the whole job.
+        let token_endpoint =
+            match validate_token_endpoint(&token_endpoint, self.endpoint_policy).await {
+                Ok(url) => url,
+                Err(error) => {
+                    // Counted exactly as a failed exchange is: from an operator's dashboard a
+                    // refusal to send the token and a rejected send are both "this credential is
+                    // not being refreshed", and the distinction is in the log line, not the metric.
+                    self.metrics.record_oauth_refresh(provider_type, false);
+                    return Err(error);
+                }
+            };
+
         let response = self
-            .exchange_refresh_token(&token_endpoint, &refresh_token, client_id.as_deref())
+            .exchange_refresh_token(token_endpoint, &refresh_token, client_id.as_deref())
             .await;
         let response = match response {
             Ok(response) => response,
@@ -273,9 +442,12 @@ impl OAuthTokenRefreshHandler {
         }
     }
 
+    /// `token_endpoint` is a [`Url`], not a `&str`, so this method cannot be reached with a
+    /// value that has not been through [`validate_token_endpoint`] — the guard is a type
+    /// obligation rather than a convention a later edit can forget.
     async fn exchange_refresh_token(
         &self,
-        token_endpoint: &str,
+        token_endpoint: Url,
         refresh_token: &str,
         client_id: Option<&str>,
     ) -> Result<TokenResponse, String> {
@@ -298,8 +470,10 @@ impl OAuthTokenRefreshHandler {
             form.finish()
         };
 
-        let response = self
-            .http
+        let http = self.http.as_ref().ok_or_else(|| {
+            "the oauth-token-refresh HTTP client could not be built at start-up".to_string()
+        })?;
+        let response = http
             .post(token_endpoint)
             .timeout(std::time::Duration::from_secs(REFRESH_HTTP_TIMEOUT_SECONDS))
             .header(
@@ -314,6 +488,9 @@ impl OAuthTokenRefreshHandler {
             .map_err(|error| format!("oauth token endpoint request failed: {error}"))?;
         let status = response.status();
         if !status.is_success() {
+            // Covers the redirect case too: the client is built with
+            // `redirect::Policy::none()`, so a 3xx arrives here as a plain non-success status
+            // and the token is never re-sent to the `Location` target.
             return Err(format!("oauth token endpoint returned HTTP {status}"));
         }
         response.json::<TokenResponse>().await.map_err(|error| {
@@ -484,5 +661,127 @@ mod tests {
         let now = now();
         let almost_expired = now + ChronoDuration::seconds(1);
         assert!(!is_due_for_refresh(Some(almost_expired), now, -100));
+    }
+
+    // -------------------------------------------------------------------------------
+    // The token endpoint's SSRF guard.
+    //
+    // Every URL below is an IP literal or an unparseable string, so `validate_outbound_url`
+    // classifies it with the pure `is_denied_ip` alone and no test here touches DNS — the
+    // same technique `src/security/ssrf.rs`'s own unit tests and `tests/skill_import.rs`
+    // use.
+    // -------------------------------------------------------------------------------
+
+    fn strict() -> TokenEndpointPolicy {
+        TokenEndpointPolicy {
+            allow_insecure: false,
+        }
+    }
+
+    fn security(private: bool, http: bool) -> ProviderSecuritySettings {
+        ProviderSecuritySettings {
+            allow_private_provider_urls: private,
+            allow_http_provider_urls: http,
+            ..ProviderSecuritySettings::default()
+        }
+    }
+
+    #[test]
+    fn a_default_deployment_gets_no_insecure_token_endpoints() {
+        assert!(
+            !TokenEndpointPolicy::from_provider_security(&security(false, false)).allow_insecure
+        );
+    }
+
+    /// Both concessions, or neither. See [`TokenEndpointPolicy`] for why either alone is not
+    /// enough to send a refresh token off the public internet.
+    #[test]
+    fn one_provider_security_flag_alone_does_not_relax_the_token_endpoint() {
+        assert!(
+            !TokenEndpointPolicy::from_provider_security(&security(true, false)).allow_insecure
+        );
+        assert!(
+            !TokenEndpointPolicy::from_provider_security(&security(false, true)).allow_insecure
+        );
+        assert!(TokenEndpointPolicy::from_provider_security(&security(true, true)).allow_insecure);
+    }
+
+    #[tokio::test]
+    async fn a_loopback_token_endpoint_is_refused() {
+        assert!(
+            validate_token_endpoint("http://127.0.0.1:6379/token", strict())
+                .await
+                .is_err()
+        );
+        assert!(
+            validate_token_endpoint("https://127.0.0.1/token", strict())
+                .await
+                .is_err()
+        );
+    }
+
+    /// The exact metadata value issue #251 names: a cloud metadata endpoint reached with a
+    /// live refresh token in the request body.
+    #[tokio::test]
+    async fn the_cloud_metadata_endpoint_is_refused() {
+        assert!(
+            validate_token_endpoint("http://169.254.169.254/latest/meta-data/", strict())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_private_range_or_plain_http_token_endpoint_is_refused() {
+        for raw in [
+            "https://10.0.0.5/token",
+            "https://192.168.1.10/token",
+            "http://8.8.8.8/token",
+        ] {
+            assert!(
+                validate_token_endpoint(raw, strict()).await.is_err(),
+                "{raw} must be refused under the default policy"
+            );
+        }
+    }
+
+    /// Embedded credentials would be sent to whoever the host turns out to be, on the very
+    /// request that carries the refresh token.
+    #[tokio::test]
+    async fn a_token_endpoint_that_embeds_credentials_is_refused() {
+        assert!(
+            validate_token_endpoint("https://user:pass@8.8.8.8/token", strict())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_token_endpoint_is_refused_rather_than_posted_to() {
+        assert!(
+            validate_token_endpoint("not-a-url", strict())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_public_https_token_endpoint_is_permitted() {
+        assert!(
+            validate_token_endpoint("https://8.8.8.8/oauth/token", strict())
+                .await
+                .is_ok()
+        );
+    }
+
+    /// The development escape hatch, and the only shape that reaches it.
+    #[tokio::test]
+    async fn a_deployment_with_both_flags_may_use_a_loopback_token_endpoint() {
+        let permissive = TokenEndpointPolicy::from_provider_security(&security(true, true));
+        assert!(
+            validate_token_endpoint("http://127.0.0.1:8080/token", permissive)
+                .await
+                .is_ok()
+        );
     }
 }

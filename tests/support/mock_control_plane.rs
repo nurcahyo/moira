@@ -43,12 +43,28 @@ pub enum TokenScript {
     HttpError {
         status: StatusCode,
     },
+    /// A 307/308 to another absolute URL.
+    ///
+    /// Exists for one test: the refresh client is built with `redirect::Policy::none()`, and
+    /// 307/308 are the two statuses that make `reqwest`'s *default* policy re-issue the
+    /// original **POST with the original body** — which on this path is a decrypted refresh
+    /// token. A 301/302 would degrade to a bodyless GET and would not prove the mechanism.
+    Redirect {
+        status: StatusCode,
+        location: String,
+    },
 }
 
 #[derive(Debug)]
 struct MockState {
     token_script: Mutex<TokenScript>,
     token_calls: AtomicUsize,
+    /// Every `/oauth/token` request body this plane received, verbatim.
+    ///
+    /// The token-endpoint assertions want to say "the secret never arrived here", which is a
+    /// strictly stronger claim than "no request arrived" and the only one that distinguishes
+    /// a control from a coincidence.
+    token_bodies: Mutex<Vec<String>>,
     health_status: Mutex<StatusCode>,
     health_delay: Mutex<Duration>,
     health_calls: AtomicUsize,
@@ -70,6 +86,7 @@ impl MockControlPlane {
                 expires_in: 3_600,
             }),
             token_calls: AtomicUsize::new(0),
+            token_bodies: Mutex::new(Vec::new()),
             health_status: Mutex::new(StatusCode::OK),
             health_delay: Mutex::new(Duration::ZERO),
             health_calls: AtomicUsize::new(0),
@@ -122,6 +139,22 @@ impl MockControlPlane {
         self.state.token_calls.load(Ordering::SeqCst)
     }
 
+    /// Every `/oauth/token` request body this plane received.
+    pub async fn token_bodies(&self) -> Vec<String> {
+        self.state.token_bodies.lock().await.clone()
+    }
+
+    /// Whether `needle` appeared in any body this plane received — the direct form of "the
+    /// secret never left the process".
+    pub async fn observed_secret(&self, needle: &str) -> bool {
+        self.state
+            .token_bodies
+            .lock()
+            .await
+            .iter()
+            .any(|body| body.contains(needle))
+    }
+
     pub fn health_call_count(&self) -> usize {
         self.state.health_calls.load(Ordering::SeqCst)
     }
@@ -151,8 +184,9 @@ pub async fn unreachable_url() -> String {
     format!("http://{address}/")
 }
 
-async fn handle_token(State(state): State<Arc<MockState>>) -> Response {
+async fn handle_token(State(state): State<Arc<MockState>>, body: String) -> Response {
     state.token_calls.fetch_add(1, Ordering::SeqCst);
+    state.token_bodies.lock().await.push(body);
     let script = state.token_script.lock().await.clone();
     match script {
         TokenScript::Success {
@@ -169,6 +203,12 @@ async fn handle_token(State(state): State<Arc<MockState>>) -> Response {
             (StatusCode::OK, Json(body)).into_response()
         }
         TokenScript::HttpError { status } => (status, "mock token error").into_response(),
+        TokenScript::Redirect { status, location } => (
+            status,
+            [(axum::http::header::LOCATION, location)],
+            "mock token redirect",
+        )
+            .into_response(),
     }
 }
 

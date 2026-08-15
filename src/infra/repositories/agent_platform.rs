@@ -26,7 +26,8 @@ use crate::{
         AuditLogInsert, EvalCaseCreateRequest, EvalCaseRecord, EvalRunRecord, EvalRunStatus,
         EvalSuiteCreateRequest, EvalSuitePatchRequest, EvalSuiteRecord, EvalTriggerKind,
         FlowRunStatus, FlowStepRunStatus, ListCursor, ResolvedCredential, SkillCreateRequest,
-        SkillHttpExecutorPatchRequest, SkillHttpExecutorRecord, SkillPatchRequest, SkillRecord,
+        SkillCredentialOutcome, SkillHttpExecutorPatchRequest, SkillHttpExecutorRecord,
+        SkillPatchRequest, SkillRecord, credential_binding_permits_host,
     },
     error::AppError,
     infra::pg_rows::{
@@ -422,32 +423,74 @@ impl PgAgentPlatformRepository {
     /// executor row names one exact credential id, chosen by the operator who configured
     /// the skill, and no caller-supplied scope may redirect it to a different row. The
     /// active/not-expired/not-deleted filters are the same, so a revoked or expired
-    /// credential yields `None` here just as it yields no candidate there.
+    /// credential yields [`SkillCredentialOutcome::Unusable`] here just as it yields no
+    /// candidate there. A soft-deleted provider is refused for the same reason: it no longer
+    /// declares anything, so nothing it owns is entitled to a destination — and a credential
+    /// nobody can see on the admin plane must not keep being sent by a skill.
     ///
-    /// Returns `Ok(None)` when the row is absent or unusable. The caller decides what that
-    /// means; this never falls back to an unauthenticated call.
+    /// That last rule is tested for in Rust rather than joined away with
+    /// `and p.deleted_at is null`, so the outcome can be
+    /// [`SkillCredentialOutcome::ProviderDeleted`] instead of an indistinguishable
+    /// [`SkillCredentialOutcome::Unusable`]. The behaviour is identical — nothing is
+    /// decrypted either way — but the operator-facing message can then name the table that is
+    /// actually wrong. `providers.id` is `credential.provider_id`'s foreign key, so the join
+    /// still matches exactly one row.
+    ///
+    /// Never returns a secret the executor's destination is not entitled to. `allowed_host`
+    /// is the executor's SSRF-validated host, and the credential's owning provider must
+    /// declare the same host in its `base_url` — see
+    /// [`credential_binding_permits_host`](crate::domain::credential_binding_permits_host)
+    /// for why that is the rule and why a provider with no `base_url` is refused. The check
+    /// runs **before** `cipher.decrypt`, and it is enforced here rather than only on the
+    /// admin write path because a row stored before that rule existed is otherwise still
+    /// live. The provider is joined into the same statement, so this costs no extra round
+    /// trip.
+    ///
+    /// Returns [`SkillCredentialOutcome::Unusable`] when the row is absent or carries no
+    /// usable secret. The caller decides what that means; this never falls back to an
+    /// unauthenticated call.
     pub async fn resolve_skill_credential(
         &self,
         cipher: &LocalSecretCipher,
         credential_id: Uuid,
-    ) -> Result<Option<ResolvedCredential>, AppError> {
+        allowed_host: &str,
+    ) -> Result<SkillCredentialOutcome, AppError> {
+        // Every credential column is qualified because `providers` shares eight column names
+        // with `provider_credentials` (`id`, `status`, `metadata`, `display_name`, the four
+        // timestamps, `version`); an unqualified list would silently bind the wrong side.
         let Some(row) = sqlx::query(
-            "select id, provider_id, credential_type, scope_type, external_tenant_id, \
-                    application_id, external_user_id, encryption_algorithm, \
-                    encryption_version, encrypted_data_key, nonce, encrypted_payload, \
-                    secret_fingerprint, masked_secret, status, priority, expires_at, \
-                    last_validated_at, last_used_at, metadata, display_name, \
-                    created_at, updated_at, deleted_at, version \
-             from provider_credentials \
-             where id = $1 and status = 'active' and deleted_at is null \
-               and (expires_at is null or expires_at > now())",
+            "select c.id, c.provider_id, c.credential_type, c.scope_type, \
+                    c.external_tenant_id, c.application_id, c.external_user_id, \
+                    c.encryption_algorithm, c.encryption_version, c.encrypted_data_key, \
+                    c.nonce, c.encrypted_payload, c.secret_fingerprint, c.masked_secret, \
+                    c.status, c.priority, c.expires_at, c.last_validated_at, c.last_used_at, \
+                    c.metadata, c.display_name, c.created_at, c.updated_at, c.deleted_at, \
+                    c.version, p.base_url as provider_base_url, \
+                    p.deleted_at as provider_deleted_at \
+             from provider_credentials c \
+             join providers p on p.id = c.provider_id \
+             where c.id = $1 and c.status = 'active' and c.deleted_at is null \
+               and (c.expires_at is null or c.expires_at > now())",
         )
         .bind(credential_id)
         .fetch_optional(&self.pool)
         .await?
         else {
-            return Ok(None);
+            return Ok(SkillCredentialOutcome::Unusable);
         };
+
+        // Checked before the host rule, and the inventory query in `docs/agent-platform.md`
+        // classifies in the same order: repairing the `base_url` of a deleted provider fixes
+        // nothing, so an operator must not be sent down that path first.
+        let provider_deleted_at: Option<DateTime<Utc>> = row.try_get("provider_deleted_at")?;
+        if provider_deleted_at.is_some() {
+            return Ok(SkillCredentialOutcome::ProviderDeleted);
+        }
+
+        let provider_base_url: Option<String> = row.try_get("provider_base_url")?;
+        if !credential_binding_permits_host(provider_base_url.as_deref(), allowed_host) {
+            return Ok(SkillCredentialOutcome::HostNotEntitled);
+        }
 
         let record = credential_record_from_row(&row)?;
         let encrypted = EncryptedSecret {
@@ -472,22 +515,24 @@ impl PgAgentPlatformRepository {
         let config: Value = serde_json::from_slice(&plaintext)
             .map_err(|_| AppError::Config("provider credential payload is invalid".to_string()))?;
         let Some(field) = credential_secret_field(record.credential_type) else {
-            return Ok(None);
+            return Ok(SkillCredentialOutcome::Unusable);
         };
         let Some(secret) = config
             .get(field)
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
         else {
-            return Ok(None);
+            return Ok(SkillCredentialOutcome::Unusable);
         };
-        Ok(Some(ResolvedCredential {
-            credential_id: record.id,
-            credential_version: record.version,
-            credential_type: record.credential_type,
-            secret: SecretString::new(secret.to_string()),
-            config,
-        }))
+        Ok(SkillCredentialOutcome::Resolved(Box::new(
+            ResolvedCredential {
+                credential_id: record.id,
+                credential_version: record.version,
+                credential_type: record.credential_type,
+                secret: SecretString::new(secret.to_string()),
+                config,
+            },
+        )))
     }
 
     pub async fn get_executor(&self, skill_id: Uuid) -> Result<SkillHttpExecutorRecord, AppError> {

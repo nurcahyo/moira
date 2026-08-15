@@ -147,6 +147,15 @@ tl_count_skips() {
 # assertion it briefly had, because clippy correctly asked for `const { assert!(..) }` and a
 # compile-time check is the better home for it.
 #
+# Re-measured 2026-08-15 on `fix/plan12-1-credentials-r2`: **1562** passed, source declaring
+# 1556, by `/usr/bin/make gates` with Postgres and Redis up and zero skip lines. 1561 of those
+# were already there before this branch's last commit; the +1 is
+# `the_documented_inventory_query_finds_every_row_the_binding_rule_refuses`. So 103 of the 104
+# this line moves is drift the constant accumulated across the merges since the measurement
+# above — the same drift the paragraph above records happening once already, which is the
+# argument for moving it on every commit that touches the count rather than when someone
+# notices. While it sat at 1458 the "any net drop reds it" claim was false by that margin.
+#
 # The gap between passed and declared is the doctests. `tl_declared_tests` counts `#[test]` /
 # `#[tokio::test]` attributes only, while both the local `cargo test --workspace` and CI's
 # `__doc__` shard (`scripts/ci-shard-run.sh`, `cargo test --all-features --doc`) also run the
@@ -159,15 +168,20 @@ tl_count_skips() {
 # to whoever merges next: a change that lands concurrently and nets one test *down* reds CI
 # until this number moves with it. That is the intended failure, not a flake.
 #
-# +8 on the `fix/plan12-4-backend` branch (issues #251 finding 1, #253 finding 2): one SQL-shape
-# unit test and one end-to-end HTTP test for the provider-health average-latency decode, and six
-# unit tests for the OpenAPI import byte budget. **Derived, not measured** — this branch's tests
-# were run targeted rather than through a full `/usr/bin/make gates`, because five units were
-# working in parallel worktrees and a full gate run each would have serialised them. 1458 + 8
-# is therefore the arithmetic on the last measured figure, and it is safe in the direction that
-# matters: a floor below the truth leaves slack, never a false red. Re-measure at the next
-# `/usr/bin/make gates` and, if this line is under the real count, move it up.
-TL_TEST_COUNT_MINIMUM=1466
+# Both sides of the merge below moved this line, so both histories are kept. `develop` carried
+# **1466** — 1458 + 8 derived, not measured, from `fix/plan12-4-backend` (issues #251 finding 1,
+# #253 finding 2: one SQL-shape unit test and one end-to-end HTTP test for the provider-health
+# average-latency decode, plus six unit tests for the OpenAPI import byte budget). That branch
+# ran its tests targeted rather than through a full `/usr/bin/make gates`, because five units
+# were working in parallel worktrees and a full gate run each would have serialised them. It was
+# therefore arithmetic on the last measured figure, safe in the direction that matters and
+# explicitly asking to be re-measured.
+#
+# This is that re-measurement. Re-measured 2026-08-16 on the merge of `develop` into
+# `fix/plan12-1-credentials-r2`: **1588** passed, source declaring 1582, by `/usr/bin/make gates`
+# with Postgres and Redis up and zero skip lines. It supersedes both 1466 and the branch's own
+# 1562, neither of which had seen the other side's tests. The +6 doctest offset holds again.
+TL_TEST_COUNT_MINIMUM=1588
 
 # ---------------------------------------------------------------------------------
 # tl_declared_tests <repo-root>

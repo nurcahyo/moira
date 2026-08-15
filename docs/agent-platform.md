@@ -117,6 +117,171 @@ never drift apart. `credential_id`, when set, must reference a live `provider_cr
 checked at PATCH time — and carries no inline secret (decision 21). There is no `POST` to
 hand-author an executor in this MVP; every row today comes from the import pipeline.
 
+#### A credential may only be bound to its own provider's host
+
+**This rule is a behaviour change. Read it before upgrading if any skill executor carries a
+`credential_id`.**
+
+Issue #253 finding 1: the bound credential is decrypted at call time and sent as
+`Authorization: Bearer <plaintext>`, and an existence-only check on `credential_id` made
+`moira:skills:write` equivalent to reading the plaintext of *every* row in
+`provider_credentials` — bind one to `https://collector.attacker.example`, which passes the
+SSRF guard like any other public host, and read it off the wire. No other admin scope grants
+that; the credentials surface only ever returns masked values.
+
+The rule is entitlement by destination: the credential's owning provider must declare the
+executor's `allowed_host` as its `providers.base_url` host. A provider with **no** `base_url`
+(one left on its vendor default) entitles nothing — there is no host to compare against, and
+inventing the vendor default would tie the rule to a hostname table kept in step with
+`rig-core`. It is enforced at PATCH time and again at execution time, before decryption.
+
+**The failure mode this introduces.** An executor row that was legal before the rule and is not
+legal under it keeps existing, and nothing rejects it at deploy time — but at execution the
+credential is refused, and because `skill_refs` resolution is fail-closed the **whole
+execution** fails with `SkillUnavailable`, not just the one tool call. The refusal is logged
+server-side with the `credential_id` and the `allowed_host`; the caller sees only the class.
+There is no migration, because no automatic repair is safe: silently unbinding the credential
+would make the skill call unauthenticated, and silently widening the provider's `base_url`
+would grant the entitlement the rule exists to withhold.
+
+**A soft-deleted provider is the second way a working row stops working, and no host
+comparison can see it.** The execution-time lookup requires the credential's owning
+`providers` row to be live, because a provider that no longer exists declares no host and so
+entitles no destination. That refuses a credential whose own row is still `active`, unexpired
+and undeleted — nothing about the credential changed — and it is invisible to the host rule,
+because such a provider's `base_url` may name the executor's `allowed_host` exactly. The
+inventory query below therefore checks `providers.deleted_at` **first** and reports these
+separately as `reason = 'provider_deleted'`; repairing the `base_url` of a deleted provider
+fixes nothing. At execution the message names the real cause ("belongs to a provider that has
+been deleted; the credential itself is still live") rather than blaming the credential. Only
+repairs 2 and 3 below apply — never repair 1.
+
+**Find the affected rows before you deploy:**
+
+```sql
+with binding as (
+    select e.skill_id,
+           e.allowed_host,
+           c.id         as credential_id,
+           p.id         as provider_id,
+           p.base_url,
+           p.deleted_at as provider_deleted_at,
+           -- The authority: base_url with the scheme, any userinfo, and everything from the
+           -- first '/', '?' or '#' removed. btrim matches the code's own base_url.trim().
+           regexp_replace(
+             regexp_replace(
+               regexp_replace(btrim(p.base_url), '^[A-Za-z][A-Za-z0-9+.-]*://', ''),
+               '^[^/?#]*@', ''),
+             '[/?#].*$', '') as authority,
+           -- Whether the value is shaped like something Url::parse can turn into a host at
+           -- all. Without a 'scheme://' there is no host to extract, whatever the characters
+           -- spell: 'api.vendor.example/v1' is not a URL, and 'api.vendor.example:8443/v1'
+           -- parses as a *scheme* named api.vendor.example carrying an opaque path. The code
+           -- refuses both, while the string extraction above happily returns
+           -- 'api.vendor.example' for both -- so the shape is tested, not assumed.
+           btrim(p.base_url) ~ '^[A-Za-z][A-Za-z0-9+.-]*://' as has_authority
+    from skill_http_executors e
+    join provider_credentials c on c.id = e.credential_id
+    join providers p            on p.id = c.provider_id
+    where e.credential_id is not null
+), split as (
+    select b.*,
+           -- An IPv6 literal keeps its brackets, because Url::host_str() returns them and
+           -- allowed_host is stored as that function produced it. Splitting on ':' here
+           -- would return '[' and report every IPv6 provider as broken.
+           case when b.authority like '[%'
+                then lower(left(b.authority, position(']' in b.authority)))
+                else lower(split_part(b.authority, ':', 1))
+           end as base_url_host,
+           -- Whatever the ':' split dropped, kept so it can be checked rather than ignored.
+           case when b.authority like '[%'
+                then substr(b.authority, position(']' in b.authority) + 1)
+                else substr(b.authority, length(split_part(b.authority, ':', 1)) + 1)
+           end as port_suffix
+    from binding b
+), resolved as (
+    select s.*,
+           -- What follows the host must be nothing, or a port Url::parse would accept.
+           -- ':nope' and ':99999' both fail it outright, and a bare ':' split would throw
+           -- them away and compare a host the code never produced.
+           s.has_authority
+             and s.port_suffix ~ '^(:[0-9]{0,5})?$'
+             and case when s.port_suffix ~ '^:[0-9]{1,5}$'
+                      then substr(s.port_suffix, 2)::int <= 65535
+                      else true
+                 end as base_url_parses
+    from split s
+)
+select skill_id,
+       allowed_host,
+       credential_id,
+       provider_id,
+       base_url,
+       case when provider_deleted_at is not null              then 'provider_deleted'
+            when base_url is not null and not base_url_parses then 'base_url_unparseable'
+            else 'host_mismatch' end as reason
+from resolved
+where provider_deleted_at is not null
+   or base_url is null
+   or not base_url_parses
+   or base_url_host is distinct from lower(allowed_host)
+order by reason, skill_id;
+```
+
+**The query over-reports, and you must not treat a hit as proof.** Postgres has no URL parser,
+so the host above is extracted with string operations while `credential_binding_permits_host`
+uses `Url::host_str()`. The extraction handles the forms that actually diverge in practice —
+scheme, userinfo (`https://api.vendor.example@evil.example/`), port, path/query/fragment,
+surrounding whitespace, bracketed IPv6 literals — but it does not normalise an IPv6 address
+(`[0:0:0:0:0:0:0:1]` against `[::1]`), apply IDNA/punycode, or percent-decode. Those forms
+compare unequal in SQL and equal in the code, so the query can name a row the code accepts.
+"The query returned N rows" is not the set that is broken — confirm each one before repairing
+it, especially before repair 1.
+
+**An empty result means "nothing found", not "nothing broken".** Silence in the other
+direction — a row the code refuses that the query never names — is the one that sends an
+operator into a deploy, so be exact about what is established here and what is not. This
+section used to claim the query "cannot miss a row the code refuses". It could: with
+`allowed_host = 'api.vendor.example'`, a `base_url` of `api.vendor.example/v1` went unreported,
+because a string extraction returns the host a value appears to spell while `Url::parse`
+rejects a value with no scheme at all. `api.vendor.example:8443/v1` was missed the same way,
+and that one does parse — as a *scheme* named `api.vendor.example` with no host. The
+`has_authority` and port checks above exist to close exactly those, and `:nope` and `:99999`
+with them. None of those shapes can be written through `PATCH /api/v1/admin/providers/{id}`,
+which rejects them; they arrive by migration, restore or direct SQL, which is precisely the
+population this query exists to survey.
+
+What is established is bounded by a test rather than by argument:
+`tests/skill_import.rs::the_documented_inventory_query_finds_every_row_the_binding_rule_refuses`
+executes *this block*, unmodified, against a real database and compares its verdict on each
+seeded row against what `resolve_skill_credential` returns for that same row. The shapes it
+seeds are the shapes the query and the code are known to agree on. A shape outside that set has
+been proved in neither direction — if you meet one, seed it there rather than reasoning about
+it here.
+
+**Repair each one, in whichever way is actually true of your deployment:**
+
+1. **Give the provider a `base_url` naming the executor's host — only if that provider really
+   is served there.** `providers.base_url` is not a label for this rule: it is that provider's
+   live completion endpoint. `RigRuntimeFactory::build_completion_model` hands it to the
+   openai / anthropic / gemini / deepseek client builder **together with the decrypted API
+   key**, so setting it redirects every completion for that provider, and that provider's key,
+   to the host you name. For the case this section singles out — a provider left on its vendor
+   default with `base_url = NULL` — that is exactly the wrong repair: it does not grant the
+   skill an exception, it moves the provider. Use repair 2 or 3 there.
+   (`PATCH /api/v1/admin/providers/{id}`, an audited write.)
+2. Repoint the executor at a credential whose provider does serve that host
+   (`PATCH /api/v1/admin/skills/{id}/executor` with a new `credential_id`).
+3. `DELETE /api/v1/admin/skills/{id}/executor` and re-import, if the executor was wrong.
+
+**A non-conforming row stays editable.** PATCH refuses only patches that *move* the binding —
+a different `credential_id`, or a `url_template` whose host differs from the stored
+`allowed_host`. A patch that leaves both exactly as they are is allowed, so `timeout_ms`,
+`method`, `header_template` and `response_schema` can still be edited, and the row can still be
+deleted. (The first release of this rule re-validated on every patch, which made such a row
+un-patchable for unrelated edits — a refusal that moved no secret, since execution already
+refuses to send one, and only blocked cleanup.)
+
 ## Evaluations
 
 Issue #214, F2 (plan 12 §3, decision 14). An eval suite is a named, versioned registry of
